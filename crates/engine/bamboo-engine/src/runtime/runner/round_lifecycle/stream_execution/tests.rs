@@ -1182,10 +1182,152 @@ fn envelope_ir_continuation_delta_is_byte_equal_to_legacy_delta() {
         last_committed_assistant_id: last_assistant_id,
     });
 
+    let ir_delta = ir.continuation_delta();
     assert_eq!(
-        message_shape(&ir.continuation_delta()),
+        message_shape(&ir_delta),
         message_shape(&planned.continuation_messages),
         "ir.continuation_delta() must be byte-equal to the legacy delta"
+    );
+    // Beyond (role, content): the delta carries the EXACT same message instances,
+    // so compare ids too. The migration debug_assert is content-only, so this is
+    // the strong guard (review finding #6).
+    let ir_ids: Vec<&String> = ir_delta.iter().map(|m| &m.id).collect();
+    let legacy_ids: Vec<&String> = planned
+        .continuation_messages
+        .iter()
+        .map(|m| &m.id)
+        .collect();
+    assert_eq!(
+        ir_ids, legacy_ids,
+        "delta must carry the same message ids, not just the same content"
+    );
+}
+
+#[test]
+fn responses_continuation_uses_full_input_not_the_delta() {
+    // Locks review finding #1: on a Responses continuation the request sends the
+    // FULL input view (== ir.responses_input()) via input_messages +
+    // previous_response_id. select_responses_input_messages prefers the Explicit
+    // input_messages over the delta `messages` arg, so the continuation_delta is
+    // NOT what rides the Responses wire. Byte-faithful to legacy — this test makes
+    // that intentional rather than accidental, so a future "real delta" change
+    // fails loudly.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-resp-cont", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let planned =
+        super::plan_llm_request(&envelope, Some("resp_prev"), "session-resp-cont", None, 0);
+    let responses = planned
+        .request_options
+        .responses
+        .as_ref()
+        .expect("responses options present");
+
+    let input = responses
+        .input_messages
+        .as_ref()
+        .expect("input_messages present");
+    assert_eq!(
+        message_shape(input),
+        message_shape(&envelope.ir.responses_input()),
+        "Responses continuation sends the FULL input view, not the delta"
+    );
+    assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
+    assert!(
+        input.len() > planned.continuation_messages.len(),
+        "FULL Responses input must exceed the smaller continuation delta"
+    );
+}
+
+#[test]
+fn ir_cache_matches_request_options_cache() {
+    // Locks review finding #4: the cache plan lives in both ir.cache and
+    // options.cache (the provider reads options.cache; the IR carries its own copy
+    // for observability). They must stay identical so the two can never diverge.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-cache-dup", "test-model");
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let planned = super::plan_llm_request(&envelope, None, "session-cache-dup", None, 0);
+    let options_cache = planned
+        .request_options
+        .cache
+        .as_ref()
+        .expect("cache plan present");
+
+    assert_eq!(envelope.ir.cache.cache_system, options_cache.cache_system);
+    assert_eq!(envelope.ir.cache.cache_tools, options_cache.cache_tools);
+    assert_eq!(envelope.ir.cache.ttl, options_cache.ttl);
+    assert_eq!(
+        envelope.ir.cache.breakpoint_message_ids,
+        options_cache.breakpoint_message_ids
+    );
+}
+
+#[test]
+fn cache_anchor_marks_only_the_last_system_block() {
+    // Review finding #3: the engine marks `cache_anchor` on the LAST system block,
+    // and the Anthropic builder hardcodes `cache_control` onto the last system
+    // block (without reading `cache_anchor`). They agree only because the anchor is
+    // last — lock that so moving the anchor (or adding a second) is caught here
+    // instead of silently diverging from the Anthropic breakpoint.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-anchor", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let blocks = &envelope.ir.system_blocks;
+    assert!(
+        !blocks.is_empty(),
+        "tool guide present → structured system blocks"
+    );
+    let anchor_indices: Vec<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.cache_anchor)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        anchor_indices,
+        vec![blocks.len() - 1],
+        "exactly one cache_anchor, on the LAST system block (where Anthropic places cache_control)"
     );
 }
 

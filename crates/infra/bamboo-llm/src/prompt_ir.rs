@@ -365,4 +365,65 @@ mod tests {
         let ir = fixture_ir();
         assert_eq!(shape(&ir.to_lanes().flatten()), shape(&ir.flatten()));
     }
+
+    #[test]
+    fn to_lanes_reconstructs_the_fields_a_block_native_provider_reads() {
+        // The Anthropic adapter consumes lane FIELDS directly (stable_prefix /
+        // dynamic_context / conversation), not flatten() — the system rides
+        // `system_blocks`. So the bridge must reconstruct each field, not just the
+        // flattened concatenation (review finding #5).
+        let ir = fixture_ir();
+        let lanes = ir.to_lanes();
+        assert_eq!(
+            shape(&lanes.stable_prefix_messages),
+            shape(ir.run(SegmentRole::StablePrefix))
+        );
+        assert_eq!(
+            shape(&lanes.dynamic_context_messages),
+            shape(ir.run(SegmentRole::DynamicContext))
+        );
+        // The conversation lane re-merges remainder ++ conversation ++ volatile.
+        let mut expected_conversation = Vec::new();
+        expected_conversation.extend_from_slice(ir.run(SegmentRole::SystemRemainder));
+        expected_conversation.extend_from_slice(ir.run(SegmentRole::Conversation));
+        expected_conversation.extend_from_slice(ir.run(SegmentRole::VolatileTail));
+        assert_eq!(
+            shape(&lanes.conversation_messages),
+            shape(&expected_conversation)
+        );
+        assert_eq!(lanes.stable_instructions, ir.system_text);
+        assert_eq!(lanes.system_blocks.len(), ir.system_blocks.len());
+    }
+
+    #[test]
+    fn dynamic_context_and_remainder_swap_between_chat_and_delta() {
+        // The two runs are ORDERED OPPOSITELY across the boundary: chat puts
+        // DynamicContext before SystemRemainder; the delta puts SystemRemainder
+        // first. Locking the swap guards against a future "unify" that would
+        // silently desync the stored-turn layout from the delta layout (review
+        // finding #2).
+        let ir = PromptIR {
+            continuation: Some(Continuation {
+                previous_response_id: "r".to_string(),
+                last_committed_assistant_id: None,
+            }),
+            ..fixture_ir()
+        };
+
+        let chat = shape(&ir.body_chat());
+        let dynamic_chat = chat.iter().position(|(_, c)| c == "DYNAMIC").unwrap();
+        let remainder_chat = chat.iter().position(|(_, c)| c == "REMAINDER").unwrap();
+        assert!(
+            dynamic_chat < remainder_chat,
+            "chat: dynamic context precedes the system remainder"
+        );
+
+        let delta = shape(&ir.continuation_delta());
+        let dynamic_delta = delta.iter().position(|(_, c)| c == "DYNAMIC").unwrap();
+        let remainder_delta = delta.iter().position(|(_, c)| c == "REMAINDER").unwrap();
+        assert!(
+            remainder_delta < dynamic_delta,
+            "delta: the system remainder precedes dynamic context (swapped vs chat)"
+        );
+    }
 }
