@@ -35,7 +35,7 @@ pub use protocol::{
     AnthropicProtocol, FromProvider, GeminiProtocol, OpenAIProtocol, ProtocolError, ProtocolResult,
     ToProvider,
 };
-pub use provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, PromptLanes};
+pub use provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
 pub use provider_factory::{
     create_provider, create_provider_by_name, create_provider_with_dir, validate_provider_config,
     AVAILABLE_PROVIDERS,

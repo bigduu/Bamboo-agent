@@ -559,15 +559,14 @@ fn stable_prefix_is_byte_stable_across_rounds() {
 
     // The static system identity is unchanged across rounds.
     assert_eq!(
-        e1.lanes.stable_instructions, e2.lanes.stable_instructions,
+        e1.ir.system_text, e2.ir.system_text,
         "system prompt must stay byte-stable across rounds"
     );
 
     // The relocated guide message content is unchanged (its id may differ — only
     // content is what the provider caches).
     let guide = |e: &super::PreparedRequestEnvelope| -> String {
-        e.lanes
-            .stable_prefix_messages
+        e.ir.run(bamboo_llm::SegmentRole::StablePrefix)
             .iter()
             .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
             .map(|m| m.content.clone())
@@ -675,25 +674,19 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     // The lane's system prompt keeps the static identity but NO LONGER carries the
     // tool/connected-server guide — that is the "system stays static" property.
     assert!(
-        envelope
-            .lanes
-            .stable_instructions
-            .contains("BASE_SYSTEM_IDENTITY"),
+        envelope.ir.system_text.contains("BASE_SYSTEM_IDENTITY"),
         "lane system keeps the static base identity"
     );
     assert!(
-        !envelope
-            .lanes
-            .stable_instructions
-            .contains("NOVA_GUIDANCE_MARKER"),
+        !envelope.ir.system_text.contains("NOVA_GUIDANCE_MARKER"),
         "tool/server guide must be removed from the lane system prompt"
     );
 
     // It rides as a fixed stable-prefix MESSAGE (a typed, never-compressed context
     // block at a known position) instead.
     let guide = envelope
-        .lanes
-        .stable_prefix_messages
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
         .iter()
         .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
         .expect("tool guide relocated into a stable-prefix message");
@@ -750,15 +743,12 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
 
     // Not in the cacheable, invariant system field.
     assert!(
-        !envelope
-            .lanes
-            .stable_instructions
-            .contains("SKILL_CONTEXT_MARKER"),
+        !envelope.ir.system_text.contains("SKILL_CONTEXT_MARKER"),
         "session-variable skill context must leave the system prompt"
     );
 
     // Rides as a typed, never-compressed, session-stable context-block message.
-    let msgs = &envelope.lanes.stable_prefix_messages;
+    let msgs = envelope.ir.run(bamboo_llm::SegmentRole::StablePrefix);
     let skill_pos = msgs
         .iter()
         .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
@@ -809,13 +799,12 @@ fn lane_system_is_invariant_to_session_variable_context() {
     let e_without = super::build_request_envelope(&without_skill, &ctx(), &config, &[]);
 
     assert_eq!(
-        e_with.lanes.stable_instructions, e_without.lanes.stable_instructions,
+        e_with.ir.system_text, e_without.ir.system_text,
         "system field must be invariant to session-variable context"
     );
     // The relocated invariant guide block is identical too (same cached block).
     let guide = |e: &super::PreparedRequestEnvelope| {
-        e.lanes
-            .stable_prefix_messages
+        e.ir.run(bamboo_llm::SegmentRole::StablePrefix)
             .iter()
             .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
             .map(|m| m.content.clone())
@@ -848,7 +837,7 @@ fn system_field_is_assembled_as_discrete_base_core_env_blocks() {
     };
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
-    let blocks = &envelope.lanes.system_blocks;
+    let blocks = &envelope.ir.system_blocks;
 
     // Discrete, structured, and non-empty.
     assert!(!blocks.is_empty(), "system field must be structured blocks");
@@ -902,18 +891,18 @@ fn system_blocks_join_is_byte_identical_to_lane_system_string() {
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
     let joined = envelope
-        .lanes
+        .ir
         .system_blocks
         .iter()
         .map(|b| b.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
     assert_eq!(
-        envelope.lanes.stable_instructions, joined,
+        envelope.ir.system_text, joined,
         "joined system blocks must reproduce the string system field byte-for-byte"
     );
     // `system_text()` is the provider-facing accessor; it returns the same bytes.
-    assert_eq!(envelope.lanes.system_text(), joined);
+    assert_eq!(envelope.ir.system_field(), joined);
 }
 
 #[test]
@@ -945,14 +934,11 @@ fn goal_rides_volatile_tail_and_never_leaks_into_system_blocks() {
 
     // Goal does NOT leak into any system block, nor the joined system string.
     assert!(envelope
-        .lanes
+        .ir
         .system_blocks
         .iter()
         .all(|b| !b.text.contains("SHIP_THE_RELEASE_GOAL")));
-    assert!(!envelope
-        .lanes
-        .stable_instructions
-        .contains("SHIP_THE_RELEASE_GOAL"));
+    assert!(!envelope.ir.system_text.contains("SHIP_THE_RELEASE_GOAL"));
 
     // It rides the volatile tail as a typed GoalState context block.
     let goal_msg = envelope
@@ -983,13 +969,10 @@ fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
     assert!(
-        envelope.lanes.system_blocks.is_empty(),
+        envelope.ir.system_blocks.is_empty(),
         "no relocation → no structured system blocks"
     );
-    assert!(envelope
-        .lanes
-        .stable_instructions
-        .contains("BASE_SYSTEM_IDENTITY"));
+    assert!(envelope.ir.system_text.contains("BASE_SYSTEM_IDENTITY"));
 }
 
 #[test]
@@ -1078,9 +1061,9 @@ fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)>
 }
 
 #[test]
-fn envelope_ir_flatten_is_byte_equal_to_lanes() {
-    // GOLDEN: the rich IR's flat lowering reproduces the exact bytes the lanes
-    // path sends today — across a non-empty SystemRemainder + VolatileTail.
+fn envelope_ir_flatten_orders_runs_canonically() {
+    // The rich IR's flat lowering orders the runs canonically across a non-empty
+    // SystemRemainder + VolatileTail (the case that exposes the run ordering).
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ir-golden", "test-model");
     // A persisted System message that diverges from the assembled system field
@@ -1132,12 +1115,32 @@ fn envelope_ir_flatten_is_byte_equal_to_lanes() {
             .is_empty(),
         "fixture should produce a VolatileTail run"
     );
-    assert_eq!(
-        message_shape(&envelope.ir.flatten()),
-        message_shape(&envelope.lanes.flatten()),
-        "ir.flatten() must be byte-equal to lanes.flatten()"
+    // The flat lowering orders the runs canonically: system field first, then the
+    // stable prefix (incl. the relocated tool guide), then the SystemRemainder,
+    // then the conversation, then the volatile tail. The IR is the sole authority
+    // now — there is no lanes to compare against.
+    let flat = message_shape(&envelope.ir.flatten());
+    assert!(matches!(flat[0].0, Role::System));
+    assert!(flat[0].1.contains("BASE_IDENTITY"), "system field leads");
+    let pos = |needle: &str| flat.iter().position(|(_, c)| c.contains(needle));
+    let guide = pos("NOVA_GUIDANCE_MARKER").expect("relocated tool guide present");
+    let remainder = pos("PERSISTED OPERATOR NOTE").expect("system remainder present");
+    let conversation = pos("u1").expect("conversation present");
+    let volatile = pos("do it").expect("task volatile tail present");
+    assert!(
+        0 < guide && guide < remainder,
+        "stable prefix (guide) before the system remainder"
     );
-    assert_eq!(envelope.ir.system_field(), envelope.lanes.system_text());
+    assert!(
+        remainder < conversation,
+        "remainder before the conversation"
+    );
+    assert!(
+        conversation < volatile,
+        "conversation before the volatile tail"
+    );
+    // system_field() returns the byte-authoritative system string.
+    assert_eq!(envelope.ir.system_field(), envelope.ir.system_text);
 }
 
 #[test]

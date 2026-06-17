@@ -146,11 +146,6 @@ impl LLMProvider for AnthropicProvider {
             .await
     }
 
-    /// Canonical entry point: render Bamboo's [`PromptLanes`] into the Anthropic
-    /// wire. When the lanes carry structured `system_blocks`, the system field is
-    /// built per-block (and the conversation lanes flow straight through, never
-    /// collapsing the system into the message list); otherwise this flattens the
-    /// lanes, byte-identical to the legacy request.
     /// Render the canonical [`PromptIR`] into the Anthropic wire: the structured
     /// system field rides `system_blocks` (per-block `cache_control`), and the
     /// body is `ir.body_chat()`. Anthropic re-sends the full message array each

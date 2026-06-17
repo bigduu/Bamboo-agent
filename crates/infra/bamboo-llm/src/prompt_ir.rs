@@ -20,16 +20,15 @@
 use bamboo_domain::{Message, PromptBlock};
 
 use crate::cache::PromptCachePlan;
-use crate::provider::PromptLanes;
 
-/// The provider-agnostic canonical request the engine emits once per round.
-/// Supersedes `PromptLanes` as the provider entry point.
+/// The single, provider-agnostic canonical request the engine emits once per
+/// round. Every provider renders its wire from this via `chat_stream_ir`.
 #[derive(Debug, Clone, Default)]
 pub struct PromptIR {
     /// Byte-authoritative system text (non-block providers + flatten). Empty →
-    /// fall back to joining `system_blocks` with `"\n\n"`. Same semantics as
-    /// `PromptLanes::stable_instructions`, so the auto-prefix cache keys on the
-    /// exact same bytes.
+    /// fall back to joining `system_blocks` with `"\n\n"`. The engine assembles
+    /// the exact wire string here, so an auto-prefix cache keys on the exact same
+    /// bytes regardless of how `system_blocks` is structured.
     pub system_text: String,
     /// Parallel structured system field for block-native providers (Anthropic).
     pub system_blocks: Vec<PromptBlock>,
@@ -103,8 +102,7 @@ impl PromptIR {
     }
 
     /// Byte-authoritative system text: `system_text` when non-empty, else the
-    /// non-empty `system_blocks` joined by `"\n\n"`. Identical to
-    /// `PromptLanes::system_text`.
+    /// non-empty `system_blocks` joined by `"\n\n"`.
     pub fn system_field(&self) -> String {
         if !self.system_text.is_empty() {
             self.system_text.clone()
@@ -133,7 +131,6 @@ impl PromptIR {
     }
 
     /// Flat message list for chat / non-block providers: `[system?] ++ body_chat`.
-    /// Byte-identical to `PromptLanes::flatten()`.
     pub fn flatten(&self) -> Vec<Message> {
         let mut out = Vec::new();
         let system = self.system_field();
@@ -142,26 +139,6 @@ impl PromptIR {
         }
         out.extend(self.body_chat());
         out
-    }
-
-    /// Reconstruct the legacy [`PromptLanes`] from the IR — the `SystemRemainder`
-    /// and `VolatileTail` runs are merged back into the conversation lane, exactly
-    /// as the engine built the lanes before the IR. A transitional bridge so a
-    /// provider that still consumes lanes (its `chat_stream_lanes` override)
-    /// renders byte-identically during the migration. `to_lanes().flatten()`
-    /// equals [`flatten`](Self::flatten).
-    pub fn to_lanes(&self) -> PromptLanes {
-        let mut conversation_messages = Vec::new();
-        conversation_messages.extend_from_slice(self.run(SegmentRole::SystemRemainder));
-        conversation_messages.extend_from_slice(self.run(SegmentRole::Conversation));
-        conversation_messages.extend_from_slice(self.run(SegmentRole::VolatileTail));
-        PromptLanes {
-            stable_instructions: self.system_text.clone(),
-            system_blocks: self.system_blocks.clone(),
-            stable_prefix_messages: self.run(SegmentRole::StablePrefix).to_vec(),
-            dynamic_context_messages: self.run(SegmentRole::DynamicContext).to_vec(),
-            conversation_messages,
-        }
     }
 
     /// Responses-API input view (system rides `instructions`, not the array):
@@ -212,7 +189,6 @@ impl PromptIR {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::PromptLanes;
     use bamboo_domain::Role;
 
     fn shape(messages: &[Message]) -> Vec<(Role, String)> {
@@ -250,28 +226,21 @@ mod tests {
     }
 
     #[test]
-    fn flatten_byte_matches_legacy_lanes_with_remainder_and_volatile() {
+    fn flatten_orders_runs_with_remainder_and_volatile() {
         let ir = fixture_ir();
-        // Legacy lanes merge remainder ++ conversation ++ volatile into the single
-        // conversation lane, exactly as build_request_envelope does today.
-        let conversation_messages = vec![
-            Message::system("REMAINDER"),
-            Message::user("u1"),
-            Message::assistant("a1", None),
-            Message::user("u2"),
-            Message::user("VOLATILE"),
+        // [system] ++ StablePrefix ++ DynamicContext ++ SystemRemainder ++ Conversation ++ VolatileTail
+        let expected: Vec<(Role, String)> = vec![
+            (Role::System, "SYSTEM".to_string()),
+            (Role::User, "PREFIX".to_string()),
+            (Role::User, "DYNAMIC".to_string()),
+            (Role::System, "REMAINDER".to_string()),
+            (Role::User, "u1".to_string()),
+            (Role::Assistant, "a1".to_string()),
+            (Role::User, "u2".to_string()),
+            (Role::User, "VOLATILE".to_string()),
         ];
-        let lanes = PromptLanes {
-            stable_instructions: "SYSTEM".to_string(),
-            stable_prefix_messages: vec![Message::user("PREFIX")],
-            dynamic_context_messages: vec![Message::user("DYNAMIC")],
-            conversation_messages,
-            ..PromptLanes::default()
-        };
-        // Byte-identical effective flat list (compare role+content; the synthesized
-        // system message gets a fresh id in each flatten()).
-        assert_eq!(shape(&ir.flatten()), shape(&lanes.flatten()));
-        assert_eq!(ir.system_field(), lanes.system_text());
+        assert_eq!(shape(&ir.flatten()), expected);
+        assert_eq!(ir.system_field(), "SYSTEM");
     }
 
     #[test]
@@ -359,40 +328,29 @@ mod tests {
     }
 
     #[test]
-    fn to_lanes_round_trips_flatten() {
-        // The transitional bridge must reproduce the exact flat bytes, so a
-        // provider routed through the reconstructed lanes is byte-identical.
-        let ir = fixture_ir();
-        assert_eq!(shape(&ir.to_lanes().flatten()), shape(&ir.flatten()));
-    }
-
-    #[test]
-    fn to_lanes_reconstructs_the_fields_a_block_native_provider_reads() {
-        // The Anthropic adapter consumes lane FIELDS directly (stable_prefix /
-        // dynamic_context / conversation), not flatten() — the system rides
-        // `system_blocks`. So the bridge must reconstruct each field, not just the
-        // flattened concatenation (review finding #5).
-        let ir = fixture_ir();
-        let lanes = ir.to_lanes();
-        assert_eq!(
-            shape(&lanes.stable_prefix_messages),
-            shape(ir.run(SegmentRole::StablePrefix))
-        );
-        assert_eq!(
-            shape(&lanes.dynamic_context_messages),
-            shape(ir.run(SegmentRole::DynamicContext))
-        );
-        // The conversation lane re-merges remainder ++ conversation ++ volatile.
-        let mut expected_conversation = Vec::new();
-        expected_conversation.extend_from_slice(ir.run(SegmentRole::SystemRemainder));
-        expected_conversation.extend_from_slice(ir.run(SegmentRole::Conversation));
-        expected_conversation.extend_from_slice(ir.run(SegmentRole::VolatileTail));
-        assert_eq!(
-            shape(&lanes.conversation_messages),
-            shape(&expected_conversation)
-        );
-        assert_eq!(lanes.stable_instructions, ir.system_text);
-        assert_eq!(lanes.system_blocks.len(), ir.system_blocks.len());
+    fn system_field_prefers_authoritative_text_else_joins_blocks() {
+        use bamboo_domain::{ContextBlockType, PromptBlock};
+        let blocks = vec![
+            PromptBlock::new("base", ContextBlockType::Base, "base"),
+            // an empty block is skipped in the fallback join
+            PromptBlock::new("skill", ContextBlockType::SkillContext, "   "),
+            PromptBlock::new("env", ContextBlockType::EnvSnapshot, "env"),
+        ];
+        // Authoritative: `system_text` wins even when `system_blocks` is present, so
+        // the non-block providers' wire bytes never change as the blocks evolve.
+        let authoritative = PromptIR {
+            system_text: "AUTHORITATIVE".to_string(),
+            system_blocks: blocks.clone(),
+            ..PromptIR::default()
+        };
+        assert_eq!(authoritative.system_field(), "AUTHORITATIVE");
+        // Fallback: empty `system_text` → join the non-empty blocks by "\n\n".
+        let fallback = PromptIR {
+            system_text: String::new(),
+            system_blocks: blocks,
+            ..PromptIR::default()
+        };
+        assert_eq!(fallback.system_field(), "base\n\nenv");
     }
 
     #[test]

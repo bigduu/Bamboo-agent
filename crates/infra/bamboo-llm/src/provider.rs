@@ -7,7 +7,6 @@ use crate::prompt_ir::PromptIR;
 use crate::types::LLMChunk;
 use async_trait::async_trait;
 use bamboo_domain::Message;
-use bamboo_domain::PromptBlock;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 use futures::Stream;
@@ -121,93 +120,6 @@ pub struct LLMRequestOptions {
     /// (Anthropic `cache_control` breakpoints; OpenAI/Gemini rely on the stable
     /// prefix automatically). `None` means "no explicit cache hints".
     pub cache: Option<crate::cache::PromptCachePlan>,
-}
-
-/// Canonical, provider-facing prompt structure: the engine assembles these four
-/// layers ONCE, and each provider adapter renders them into its own wire format
-/// (system field + message array + cache breakpoints) instead of re-deriving the
-/// structure from a pre-flattened message list. This is what lets every provider
-/// be a pure adapter — the prompt-assembly logic lives in Bamboo, not duplicated
-/// across providers.
-///
-/// Concatenation order is fixed and defines the message layout:
-/// `[system(stable_instructions)] + stable_prefix_messages + dynamic_context_messages + conversation_messages`.
-///
-/// The lane boundaries are also the natural cache breakpoints: everything up to
-/// (and including) `stable_prefix_messages` is the stable, cacheable prefix;
-/// `dynamic_context_messages` onward changes per round.
-#[derive(Debug, Clone, Default)]
-pub struct PromptLanes {
-    /// Static system instructions — the cacheable base. Rendered into the
-    /// provider's dedicated system field, NOT the message array.
-    ///
-    /// Legacy concatenated form. During the content-block migration this is the
-    /// fallback when [`system_blocks`](Self::system_blocks) is empty; once the
-    /// engine populates `system_blocks`, the effective system text comes from
-    /// [`PromptLanes::system_text`] (blocks joined by `"\n\n"`, byte-identical).
-    pub stable_instructions: String,
-    /// Structured system field: the cacheable base/core-directives/env as
-    /// discrete [`PromptBlock`]s. Empty until the engine assembly is migrated;
-    /// when present it supersedes `stable_instructions`. A block-aware provider
-    /// (e.g. Anthropic) can render one wire block per entry with per-block
-    /// `cache_control`; other providers flatten it via `system_text()`.
-    pub system_blocks: Vec<PromptBlock>,
-    /// Session-stable context messages (tool guide, connected MCP servers'
-    /// guidance, workspace, env, skills): fixed positions that change rarely. The
-    /// stable cache prefix ends after these.
-    pub stable_prefix_messages: Vec<Message>,
-    /// Per-round dynamic context (task snapshot, recalled memory, conversation
-    /// summary): changes turn to turn, so it sits AFTER the cache breakpoint.
-    pub dynamic_context_messages: Vec<Message>,
-    /// The actual user / assistant / tool conversation history.
-    pub conversation_messages: Vec<Message>,
-}
-
-impl PromptLanes {
-    /// The effective system-field text for the flatten / non-block-native path
-    /// (OpenAI/Gemini/Copilot and the default trait impl).
-    ///
-    /// [`stable_instructions`] is the **byte-authoritative** source: the engine
-    /// assembles the exact wire string there, so the auto-prefix cache on those
-    /// providers stays byte-identical regardless of how [`system_blocks`] is
-    /// structured. [`system_blocks`] is the parallel structured form used by a
-    /// block-native provider (Anthropic) to render one wire block per entry with
-    /// per-block `cache_control`; it is only the fallback here when
-    /// `stable_instructions` is empty.
-    ///
-    /// [`system_blocks`]: Self::system_blocks
-    /// [`stable_instructions`]: Self::stable_instructions
-    pub fn system_text(&self) -> String {
-        if !self.stable_instructions.is_empty() {
-            self.stable_instructions.clone()
-        } else {
-            self.system_blocks
-                .iter()
-                .map(|b| b.text.as_str())
-                .filter(|t| !t.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        }
-    }
-
-    /// Flatten the lanes into one message list in canonical order — the exact
-    /// shape a provider that has NOT yet been migrated to consume lanes still
-    /// expects, so the default trait path stays byte-identical to today.
-    pub fn flatten(&self) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(
-            1 + self.stable_prefix_messages.len()
-                + self.dynamic_context_messages.len()
-                + self.conversation_messages.len(),
-        );
-        let system = self.system_text();
-        if !system.trim().is_empty() {
-            messages.push(Message::system(system.trim().to_string()));
-        }
-        messages.extend(self.stable_prefix_messages.iter().cloned());
-        messages.extend(self.dynamic_context_messages.iter().cloned());
-        messages.extend(self.conversation_messages.iter().cloned());
-        messages
-    }
 }
 
 /// Trait for LLM provider implementations
@@ -346,24 +258,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn prompt_lanes_flatten_preserves_canonical_order() {
-        let lanes = PromptLanes {
-            stable_instructions: "  base system  ".to_string(),
-            stable_prefix_messages: vec![Message::user("tool-guide")],
-            dynamic_context_messages: vec![Message::user("task-snapshot")],
-            conversation_messages: vec![Message::user("real ask")],
-            ..PromptLanes::default()
-        };
-        let flat = lanes.flatten();
-        assert_eq!(flat.len(), 4);
-        assert!(matches!(flat[0].role, bamboo_domain::Role::System));
-        assert_eq!(flat[0].content, "base system"); // trimmed
-        assert_eq!(flat[1].content, "tool-guide");
-        assert_eq!(flat[2].content, "task-snapshot");
-        assert_eq!(flat[3].content, "real ask");
-    }
-
     #[tokio::test]
     async fn chat_stream_ir_default_flattens_and_delegates() {
         use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
@@ -422,49 +316,6 @@ mod tests {
         // system + guide + dyn + ask
         assert_eq!(seen.len(), 4);
         assert!(matches!(seen[0].role, bamboo_domain::Role::System));
-    }
-
-    #[test]
-    fn prompt_lanes_flatten_omits_empty_system() {
-        let lanes = PromptLanes {
-            stable_instructions: "   ".to_string(),
-            conversation_messages: vec![Message::user("hi")],
-            ..PromptLanes::default()
-        };
-        let flat = lanes.flatten();
-        assert_eq!(flat.len(), 1);
-        assert!(matches!(flat[0].role, bamboo_domain::Role::User));
-    }
-
-    #[test]
-    fn system_text_prefers_authoritative_string_else_joins_blocks() {
-        use bamboo_domain::{ContextBlockType, PromptBlock};
-        let blocks = vec![
-            PromptBlock::new("base", ContextBlockType::Base, "base"),
-            // an empty block is skipped in the fallback join
-            PromptBlock::new("skill", ContextBlockType::SkillContext, "   "),
-            PromptBlock::new("env", ContextBlockType::EnvSnapshot, "env"),
-        ];
-
-        // Authoritative: stable_instructions is the byte-frozen wire source for
-        // the flatten path — it wins even when system_blocks is present, so
-        // OpenAI/GLM bytes never change as the structured side-channel evolves.
-        let authoritative = PromptLanes {
-            stable_instructions: "AUTHORITATIVE".into(),
-            system_blocks: blocks.clone(),
-            ..PromptLanes::default()
-        };
-        assert_eq!(authoritative.system_text(), "AUTHORITATIVE");
-        assert_eq!(authoritative.flatten()[0].content, "AUTHORITATIVE");
-
-        // Fallback: when stable_instructions is empty, the blocks are joined by
-        // "\n\n" (empties skipped) — the path a future block-native engine uses.
-        let fallback = PromptLanes {
-            stable_instructions: String::new(),
-            system_blocks: blocks,
-            ..PromptLanes::default()
-        };
-        assert_eq!(fallback.system_text(), "base\n\nenv");
     }
 
     #[derive(Clone, Default)]

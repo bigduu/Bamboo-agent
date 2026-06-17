@@ -29,8 +29,8 @@ use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
-    CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, PromptLanes,
-    Segment, SegmentRole,
+    CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, Segment,
+    SegmentRole,
 };
 use bamboo_tools::exposure::activated_discoverable_tools;
 
@@ -239,17 +239,10 @@ struct PreparedRequestEnvelope {
     /// final cleanup phase deletes the legacy path.
     #[allow(dead_code)]
     chat_messages: Vec<Message>,
-    /// Legacy four-lane structure. Superseded by `ir` for dispatch (Phase C); the
-    /// golden test asserts `ir.flatten()` is byte-equal to `lanes.flatten()`, so
-    /// it is kept as the reference until the final cleanup phase.
-    #[allow(dead_code)]
-    lanes: PromptLanes,
-    /// Rich canonical request IR (supersedes `lanes` as the provider entry point
-    /// during the migration). Built from the SAME pieces as `lanes` but with
-    /// `system_remainder` and the volatile tail as their OWN addressable runs, so
-    /// an adapter can derive the chat / Responses-input / continuation-delta views
-    /// itself. `continuation` is filled in at dispatch time. Verified byte-equal
-    /// to `lanes`/the legacy delta by the golden tests.
+    /// The single canonical request: system field + ordered, addressable message
+    /// runs (system_remainder and the volatile tail are their OWN runs), plus the
+    /// cache plan. `continuation` is filled in at dispatch time. Every provider
+    /// renders its wire from this via `chat_stream_ir`.
     ir: PromptIR,
     responses_input_messages: Vec<Message>,
     system_remainder_messages: Vec<Message>,
@@ -510,18 +503,6 @@ fn build_request_envelope(
     }
     stable_prefix_messages.extend(session_context_messages);
 
-    let lanes = PromptLanes {
-        stable_instructions: lane_system,
-        system_blocks,
-        stable_prefix_messages,
-        dynamic_context_messages: envelope.dynamic_context_messages.clone(),
-        conversation_messages: {
-            let mut tail = envelope.conversation_messages.clone();
-            tail.extend(volatile_context_messages.clone());
-            tail
-        },
-    };
-
     // tools + system + (summary) + (conversation tail) — at most the
     // 4-breakpoint Anthropic budget. Providers without explicit breakpoints
     // (OpenAI/Gemini/Copilot) still benefit from the stable-prefix ordering.
@@ -556,22 +537,18 @@ fn build_request_envelope(
         ttl: CacheTtl::Extended,
     };
 
-    // Rich canonical IR built from the SAME pieces as `lanes`, but keeping
-    // `system_remainder` and the volatile tail as their OWN addressable runs (in
-    // `lanes` they are merged into the conversation tail). `continuation` is set
-    // at dispatch time. The golden tests assert `ir.flatten()` is byte-equal to
-    // `lanes.flatten()` and `ir.continuation_delta()` to the legacy delta.
+    // The single canonical request: the system field plus the ordered, addressable
+    // message runs (system_remainder and the volatile tail are their OWN runs, so
+    // an adapter can derive the chat / Responses-input / continuation-delta views
+    // itself). `continuation` is set at dispatch time.
     let ir = PromptIR {
-        system_text: lanes.stable_instructions.clone(),
-        system_blocks: lanes.system_blocks.clone(),
+        system_text: lane_system,
+        system_blocks,
         segments: vec![
-            Segment::new(
-                SegmentRole::StablePrefix,
-                lanes.stable_prefix_messages.clone(),
-            ),
+            Segment::new(SegmentRole::StablePrefix, stable_prefix_messages),
             Segment::new(
                 SegmentRole::DynamicContext,
-                lanes.dynamic_context_messages.clone(),
+                envelope.dynamic_context_messages.clone(),
             ),
             Segment::new(
                 SegmentRole::SystemRemainder,
@@ -586,7 +563,6 @@ fn build_request_envelope(
 
     PreparedRequestEnvelope {
         chat_messages,
-        lanes,
         ir,
         responses_input_messages,
         system_remainder_messages,
@@ -652,8 +628,8 @@ impl RequestRenderObservability {
 
 /// The fully-resolved provider request the engine will dispatch, plus its
 /// observability. Produced once per round by [`plan_llm_request`] — the single
-/// home for turning the canonical envelope/[`PromptLanes`] into a concrete
-/// provider request and choosing the wire path. This consolidates what used to
+/// home for turning the canonical [`PromptIR`] into a concrete provider request
+/// and choosing the wire path. This consolidates what used to
 /// be inline branching in `execute_llm_stream`, so the request-shaping capability
 /// is one testable unit with a structured, inspectable result.
 struct LlmRequestPlan {
