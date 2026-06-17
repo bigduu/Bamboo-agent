@@ -7,29 +7,27 @@ mod plan_runtime;
 mod system_sections;
 mod task;
 
-pub(crate) use external_memory::{PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY};
+pub(crate) use external_memory::{
+    PromptMemoryRuntimeContext, EXTERNAL_MEMORY_RENDERED_KEY, PROMPT_MEMORY_OBSERVABILITY_KEY,
+};
 
-pub(crate) async fn inject_external_memory_into_system_message(
+pub(crate) async fn refresh_external_memory_context(
     session: &mut bamboo_agent_core::Session,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    external_memory::inject_external_memory_into_system_message(
-        session,
-        prompt_memory_flags,
-        runtime_context,
-    )
-    .await;
+    external_memory::refresh_external_memory_context(session, prompt_memory_flags, runtime_context)
+        .await;
 }
 
 #[cfg(test)]
-pub(super) async fn inject_external_memory_into_system_message_with_store(
+pub(super) async fn refresh_external_memory_context_with_store(
     session: &mut bamboo_agent_core::Session,
     memory: &bamboo_memory::memory_store::MemoryStore,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    external_memory::inject_external_memory_into_system_message_with_store(
+    external_memory::refresh_external_memory_context_with_store(
         session,
         memory,
         prompt_memory_flags,
@@ -40,6 +38,15 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
 
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     external_memory::strip_existing_external_memory(prompt)
+}
+
+/// The rendered external-memory section for this round, read from the session
+/// field the async refresh populates (`None` when there is none). Built into a
+/// volatile `ExternalMemory` block by the request assembler.
+pub(crate) fn render_external_memory_section(
+    session: &bamboo_agent_core::Session,
+) -> Option<String> {
+    external_memory::rendered_external_memory_section(session)
 }
 
 pub(super) fn merge_system_prompt_with_contexts(
@@ -74,15 +81,14 @@ pub(super) fn strip_existing_env_context(prompt: &str) -> String {
     system_sections::strip_existing_env_context(prompt)
 }
 
-pub(crate) fn inject_task_list_into_system_message(session: &mut bamboo_agent_core::Session) {
-    task::inject_task_list_into_system_message(session);
+/// Render the session-goal section body (for the volatile [`GoalState`] block).
+pub(crate) fn render_goal_section(objective: &str) -> String {
+    goal::render_goal_section(objective)
 }
 
-pub(crate) fn inject_goal_into_system_message(
-    session: &mut bamboo_agent_core::Session,
-    goal: Option<&str>,
-) {
-    goal::inject_goal_into_system_message(session, goal);
+/// Strip a legacy goal block from a (possibly persisted) system prompt.
+pub(super) fn strip_existing_goal(prompt: &str) -> String {
+    goal::strip_existing_goal(prompt)
 }
 
 pub(super) fn strip_existing_task_list(prompt: &str) -> String {
@@ -97,15 +103,21 @@ pub(super) fn strip_existing_plan_runtime_context(prompt: &str) -> String {
     plan_runtime::strip_existing_plan_runtime_context(prompt)
 }
 
-pub(crate) fn inject_plan_mode_instructions(session: &mut bamboo_agent_core::Session) {
-    plan_mode::inject_plan_mode_instructions(session);
+/// Render the plan-mode section text from session state (`None` when inactive).
+/// The agent loop builds this into a volatile `PlanModeState` block rather than
+/// injecting it into the system message.
+pub(crate) fn render_plan_mode_section(session: &bamboo_agent_core::Session) -> Option<String> {
+    plan_mode::render_plan_mode_section(session)
 }
 
-pub(crate) fn inject_plan_runtime_context_into_system_message(
-    session: &mut bamboo_agent_core::Session,
+/// Render the durable plan-execution context text from session state plus
+/// persisted plan artifacts (`None` when plan mode is inactive). Built into a
+/// volatile `PlanRuntimeState` block.
+pub(crate) fn render_plan_runtime_section(
+    session: &bamboo_agent_core::Session,
     app_data_dir: Option<&std::path::Path>,
-) {
-    plan_runtime::inject_plan_runtime_context_into_system_message(session, app_data_dir);
+) -> Option<String> {
+    plan_runtime::build_plan_runtime_context(session, app_data_dir)
 }
 
 #[cfg(test)]

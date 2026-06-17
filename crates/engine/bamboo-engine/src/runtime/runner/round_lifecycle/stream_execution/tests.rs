@@ -34,8 +34,8 @@ struct MockLlmProvider {
     requested_text_verbosity: Mutex<Option<String>>,
     requested_instructions: Mutex<Option<String>>,
     /// Set when the engine routed this request through the canonical
-    /// `chat_stream_lanes` entry point (the normal, non-continuation path).
-    lanes_invoked: Mutex<bool>,
+    /// `chat_stream_ir` entry point.
+    ir_invoked: Mutex<bool>,
 }
 
 #[async_trait]
@@ -50,18 +50,35 @@ impl LLMProvider for MockLlmProvider {
         panic!("chat_stream should not be called directly in this test");
     }
 
-    async fn chat_stream_lanes(
+    async fn chat_stream_ir(
         &self,
-        lanes: &bamboo_llm::PromptLanes,
+        ir: &bamboo_llm::PromptIR,
         tools: &[bamboo_agent_core::tools::ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> bamboo_llm::provider::Result<LLMStream> {
-        *self.lanes_invoked.lock().expect("lanes_invoked lock") = true;
-        // Mirror the default behavior so `requested_messages` is still captured.
-        self.chat_stream_with_options(&lanes.flatten(), tools, max_output_tokens, model, options)
-            .await
+        *self.ir_invoked.lock().expect("ir_invoked lock") = true;
+        // Faithful Responses-provider adapter: derive the flat messages AND the
+        // Responses wire options (instructions / input_messages / previous_response_id)
+        // from the IR, exactly like the OpenAI/Copilot overrides — so the captured
+        // request reflects what a real adapter sends, not an engine pre-bake.
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+        self.chat_stream_with_options(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            Some(&effective_options),
+        )
+        .await
     }
 
     async fn chat_stream_with_options(
@@ -126,7 +143,7 @@ fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
         requested_include: Mutex::new(None),
         requested_text_verbosity: Mutex::new(None),
         requested_instructions: Mutex::new(None),
-        lanes_invoked: Mutex::new(false),
+        ir_invoked: Mutex::new(false),
     })
 }
 
@@ -182,6 +199,22 @@ fn system_remainder_keeps_genuinely_extra_persisted_content() {
     let remainder = super::derive_system_remainder_message(&persisted, &stable)
         .expect("genuinely-extra persisted content must be re-emitted");
     assert!(remainder.content.contains("Extra operator note"));
+}
+
+#[test]
+fn system_remainder_strips_legacy_goal_block() {
+    // The goal now rides the volatile tail (built from the active goal). A legacy
+    // persisted System message still carrying a `<!-- BAMBOO_GOAL_START -->` block
+    // must NOT resurface it in the SystemRemainder run (it would duplicate the
+    // active volatile-tail goal). Once stripped, only the bare base remains, which
+    // matches the system field → no remainder.
+    let goal_block = "<!-- BAMBOO_GOAL_START -->\nSHIP THE RELEASE\n<!-- BAMBOO_GOAL_END -->";
+    let persisted = bamboo_agent_core::Message::system(format!("Base.\n\n{goal_block}"));
+    let stable = expected_system_field("Base.");
+    assert!(
+        super::derive_system_remainder_message(&persisted, &stable).is_none(),
+        "legacy goal block must be stripped from the remainder (goal rides the volatile tail)"
+    );
 }
 
 fn usage(summary_tokens: u32, total_tokens: u32) -> TokenUsageBreakdown {
@@ -256,7 +289,10 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         .clone();
     assert_eq!(requested_messages.len(), 1);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert_eq!(requested_messages[0].content, expected_system_field("system"));
+    assert_eq!(
+        requested_messages[0].content,
+        expected_system_field("system")
+    );
     assert_eq!(
         llm.requested_instructions
             .lock()
@@ -493,22 +529,24 @@ fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
     // Volatile task context is rendered and placed at the very tail, out of the
-    // cacheable prefix.
-    assert_eq!(envelope.volatile_context_messages.len(), 1);
-    let last = envelope
-        .chat_messages
-        .last()
-        .expect("chat messages present");
+    // cacheable prefix — it is its own run AND the last message of the flat wire.
+    assert_eq!(
+        envelope.ir.run(bamboo_llm::SegmentRole::VolatileTail).len(),
+        1
+    );
+    let last = envelope.ir.flatten();
+    let last = last.last().expect("flat messages present");
     assert!(last.content.contains("context_type: task_snapshot"));
 
     // Plan caches system + tools and puts a rolling breakpoint on the last
-    // conversation message (just before the volatile tail).
-    assert!(envelope.cache_plan.cache_system);
-    assert!(envelope.cache_plan.cache_tools);
-    assert!(envelope.cache_plan.is_breakpoint(&last_user_id));
+    // conversation message (just before the volatile tail). The cache plan is the
+    // IR's (`ir.cache`), the SOLE authority.
+    assert!(envelope.ir.cache.cache_system);
+    assert!(envelope.ir.cache.cache_tools);
+    assert!(envelope.ir.cache.is_breakpoint(&last_user_id));
     // The stable prefix uses the 1-hour extended TTL so the cache survives
     // pauses longer than the 5-minute default and big tool results keep hitting.
-    assert_eq!(envelope.cache_plan.ttl, bamboo_llm::CacheTtl::Extended);
+    assert_eq!(envelope.ir.cache.ttl, bamboo_llm::CacheTtl::Extended);
 }
 
 #[test]
@@ -551,15 +589,14 @@ fn stable_prefix_is_byte_stable_across_rounds() {
 
     // The static system identity is unchanged across rounds.
     assert_eq!(
-        e1.lanes.stable_instructions, e2.lanes.stable_instructions,
+        e1.ir.system_text, e2.ir.system_text,
         "system prompt must stay byte-stable across rounds"
     );
 
     // The relocated guide message content is unchanged (its id may differ — only
     // content is what the provider caches).
     let guide = |e: &super::PreparedRequestEnvelope| -> String {
-        e.lanes
-            .stable_prefix_messages
+        e.ir.run(bamboo_llm::SegmentRole::StablePrefix)
             .iter()
             .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
             .map(|m| m.content.clone())
@@ -567,11 +604,20 @@ fn stable_prefix_is_byte_stable_across_rounds() {
     };
     assert_eq!(guide(&e1), guide(&e2), "guide prefix must stay byte-stable");
 
-    // The cacheable-prefix drift hash is unchanged, so the cache hits.
-    assert!(e1.envelope_observability.stable_prefix_hash.is_some());
+    // The cacheable-prefix sections are byte-identical across rounds, so the cache
+    // hits. Compare the (name, content) of every section directly — the strongest
+    // form of the old drift-hash check.
+    let sections = |e: &super::PreparedRequestEnvelope| -> Vec<(String, String)> {
+        e.stable_prefix_sections
+            .iter()
+            .map(|s| (s.name.to_string(), s.content.clone()))
+            .collect()
+    };
+    assert!(!e1.stable_prefix_sections.is_empty());
     assert_eq!(
-        e1.envelope_observability.stable_prefix_hash, e2.envelope_observability.stable_prefix_hash,
-        "stable prefix must not drift between rounds"
+        sections(&e1),
+        sections(&e2),
+        "stable prefix sections must not drift between rounds"
     );
 }
 
@@ -616,10 +662,10 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
     .await
     .expect("execute llm stream");
 
-    // Normal (non-continuation) requests go through the canonical lanes entry.
+    // Requests go through the single canonical IR entry point.
     assert!(
-        *llm.lanes_invoked.lock().expect("lanes_invoked lock"),
-        "normal request must route through chat_stream_lanes"
+        *llm.ir_invoked.lock().expect("ir_invoked lock"),
+        "request must route through chat_stream_ir"
     );
 
     // What the provider actually received: the leading system message keeps the
@@ -667,25 +713,19 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     // The lane's system prompt keeps the static identity but NO LONGER carries the
     // tool/connected-server guide — that is the "system stays static" property.
     assert!(
-        envelope
-            .lanes
-            .stable_instructions
-            .contains("BASE_SYSTEM_IDENTITY"),
+        envelope.ir.system_text.contains("BASE_SYSTEM_IDENTITY"),
         "lane system keeps the static base identity"
     );
     assert!(
-        !envelope
-            .lanes
-            .stable_instructions
-            .contains("NOVA_GUIDANCE_MARKER"),
+        !envelope.ir.system_text.contains("NOVA_GUIDANCE_MARKER"),
         "tool/server guide must be removed from the lane system prompt"
     );
 
     // It rides as a fixed stable-prefix MESSAGE (a typed, never-compressed context
     // block at a known position) instead.
     let guide = envelope
-        .lanes
-        .stable_prefix_messages
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
         .iter()
         .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
         .expect("tool guide relocated into a stable-prefix message");
@@ -693,13 +733,15 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     assert!(guide.never_compress);
 
     // And that relocated, session-stable message earns its own cache breakpoint.
-    assert!(envelope.cache_plan.is_breakpoint(&guide.id));
+    assert!(envelope.ir.cache.is_breakpoint(&guide.id));
 
-    // The Responses-API view mirrors the relocation: the guide leaves
-    // `instructions` and rides at the FRONT of the input messages — so every
-    // provider family gets the same static-system structure.
+    // The Responses-API view (derived by the adapter from the IR) mirrors the
+    // relocation: the guide leaves `instructions` (the system field) and rides at
+    // the FRONT of the input messages — so every provider family gets the same
+    // static-system structure.
+    let responses = envelope.ir.responses_request_options(None);
     assert!(
-        !envelope
+        !responses
             .instructions
             .as_deref()
             .unwrap_or_default()
@@ -707,9 +749,10 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
         "tool/server guide must be removed from Responses instructions"
     );
     assert!(
-        envelope
-            .responses_input_messages
-            .first()
+        responses
+            .input_messages
+            .as_deref()
+            .and_then(|m| m.first())
             .is_some_and(|m| m.content.contains("NOVA_GUIDANCE_MARKER")),
         "tool/server guide leads the Responses input messages"
     );
@@ -742,15 +785,12 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
 
     // Not in the cacheable, invariant system field.
     assert!(
-        !envelope
-            .lanes
-            .stable_instructions
-            .contains("SKILL_CONTEXT_MARKER"),
+        !envelope.ir.system_text.contains("SKILL_CONTEXT_MARKER"),
         "session-variable skill context must leave the system prompt"
     );
 
     // Rides as a typed, never-compressed, session-stable context-block message.
-    let msgs = &envelope.lanes.stable_prefix_messages;
+    let msgs = envelope.ir.run(bamboo_llm::SegmentRole::StablePrefix);
     let skill_pos = msgs
         .iter()
         .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
@@ -801,19 +841,670 @@ fn lane_system_is_invariant_to_session_variable_context() {
     let e_without = super::build_request_envelope(&without_skill, &ctx(), &config, &[]);
 
     assert_eq!(
-        e_with.lanes.stable_instructions, e_without.lanes.stable_instructions,
+        e_with.ir.system_text, e_without.ir.system_text,
         "system field must be invariant to session-variable context"
     );
     // The relocated invariant guide block is identical too (same cached block).
     let guide = |e: &super::PreparedRequestEnvelope| {
-        e.lanes
-            .stable_prefix_messages
+        e.ir.run(bamboo_llm::SegmentRole::StablePrefix)
             .iter()
             .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
             .map(|m| m.content.clone())
             .expect("guide present")
     };
     assert_eq!(guide(&e_with), guide(&e_without));
+}
+
+#[test]
+fn system_field_is_assembled_as_discrete_base_core_env_blocks() {
+    // Step 4 invariant: the cross-session-invariant system field is carried as a
+    // STRUCTURED ARRAY of typed PromptBlocks (identity `base`, framework
+    // `core_directives`, globally-stable `env`) — not one glued string. A
+    // block-native provider can render one wire block per entry; the single
+    // system cache breakpoint anchors on the LAST block.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-sysblocks", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    // A non-empty tool/server guide triggers the static-system relocation under
+    // which the system field is emitted as discrete blocks.
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let blocks = &envelope.ir.system_blocks;
+
+    // Discrete, structured, and non-empty.
+    assert!(!blocks.is_empty(), "system field must be structured blocks");
+    // Identity `base` leads and carries the configured base identity.
+    assert_eq!(blocks[0].id, "base");
+    assert_eq!(blocks[0].kind, bamboo_domain::ContextBlockType::Base);
+    assert!(blocks[0].text.contains("BASE_SYSTEM_IDENTITY"));
+    // Framework `core_directives` is its own block (always present, non-empty).
+    let core = blocks
+        .iter()
+        .find(|b| b.id == "core_directives")
+        .expect("core_directives is a discrete block");
+    assert_eq!(core.kind, bamboo_domain::ContextBlockType::CoreDirectives);
+    assert!(!core.text.trim().is_empty());
+    // Every system block is marked Stable (it forms the cacheable head).
+    assert!(blocks
+        .iter()
+        .all(|b| b.stability == bamboo_domain::ContextBlockStability::Stable));
+    // Exactly the LAST block is the cache anchor (one system breakpoint).
+    assert!(blocks.last().expect("non-empty").cache_anchor);
+    assert_eq!(
+        blocks.iter().filter(|b| b.cache_anchor).count(),
+        1,
+        "exactly one system cache breakpoint, on the last block"
+    );
+    // The tool guide is NOT a system block — it rides as a relocated message.
+    assert!(blocks
+        .iter()
+        .all(|b| !b.text.contains("NOVA_GUIDANCE_MARKER")));
+}
+
+#[test]
+fn system_blocks_join_is_byte_identical_to_lane_system_string() {
+    // The structured `system_blocks` and the legacy joined `stable_instructions`
+    // string are two views of the SAME bytes: their `"\n\n"` join must reproduce
+    // the string wire exactly, so flipping a provider to the structured form
+    // changes nothing on the wire.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-sysblocks-join", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let joined = envelope
+        .ir
+        .system_blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert_eq!(
+        envelope.ir.system_text, joined,
+        "joined system blocks must reproduce the string system field byte-for-byte"
+    );
+    // `system_text()` is the provider-facing accessor; it returns the same bytes.
+    assert_eq!(envelope.ir.system_field(), joined);
+}
+
+#[test]
+fn goal_rides_volatile_tail_and_never_leaks_into_system_blocks() {
+    // Goal-leak fix (step 6a): a per-session goal is built as a dedicated volatile
+    // GoalState block in the tail — NOT injected into the cached system prefix —
+    // so changing the goal never invalidates the cached system head.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-goal-block", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    config.gold_config = Some(crate::runtime::config::GoldConfig {
+        enabled: true,
+        goal: Some("SHIP_THE_RELEASE_GOAL".to_string()),
+        ..Default::default()
+    });
+    assert_eq!(config.active_goal(), Some("SHIP_THE_RELEASE_GOAL"));
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // Goal does NOT leak into any system block, nor the joined system string.
+    assert!(envelope
+        .ir
+        .system_blocks
+        .iter()
+        .all(|b| !b.text.contains("SHIP_THE_RELEASE_GOAL")));
+    assert!(!envelope.ir.system_text.contains("SHIP_THE_RELEASE_GOAL"));
+
+    // It rides the volatile tail as a typed GoalState context block.
+    let goal_msg = envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::VolatileTail)
+        .iter()
+        .find(|m| m.content.contains("context_type: goal_state"))
+        .expect("goal rides the volatile tail as a goal_state block");
+    assert!(goal_msg.content.contains("SHIP_THE_RELEASE_GOAL"));
+}
+
+#[test]
+fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
+    // When there is no tool/server guide (no tools, no MCP guidance), the static
+    // relocation does not apply: the system field stays the legacy merged string
+    // and `system_blocks` is empty (the string remains byte-authoritative).
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-zero-tools", "test-model");
+    let config = test_config("BASE_SYSTEM_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    assert!(
+        envelope.ir.system_blocks.is_empty(),
+        "no relocation → no structured system blocks"
+    );
+    assert!(envelope.ir.system_text.contains("BASE_SYSTEM_IDENTITY"));
+}
+
+#[test]
+fn plan_llm_request_lanes_path_records_observability() {
+    // The single request-planning seam: a normal request takes the canonical
+    // lanes path and the render descriptor captures the system shape + cache plan.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-plan", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3);
+
+    // No continuation set on the IR → the canonical lanes wire.
+    assert!(envelope.ir.continuation.is_none());
+    assert_eq!(planned.render.wire, "lanes");
+    // System rendered as structured blocks (tool guide present → relocation on).
+    assert!(planned.render.system_block_count >= 1);
+    assert_eq!(planned.render.tool_count, 3);
+    // Cache plan surfaced into the observability + carried in the request options.
+    assert!(planned.render.cache_system);
+    assert_eq!(planned.render.cache_ttl, "1h");
+    assert!(planned.request_options.cache.is_some());
+    assert!(planned.request_options.responses.is_some());
+}
+
+#[test]
+fn plan_llm_request_continuation_path_builds_delta() {
+    // A Responses-API continuation takes the flat delta path: only the messages
+    // after the last assistant turn are sent, and the render reflects that.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-plan-cont", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+
+    let planned = super::plan_llm_request(&envelope, "session-plan-cont", None, 0);
+
+    assert_eq!(planned.render.wire, "responses_continuation");
+    // Delta is the tool result after the last assistant turn — NOT the full convo.
+    let delta = envelope.ir.continuation_delta();
+    assert!(!delta.is_empty());
+    assert_eq!(planned.render.request_message_count, delta.len());
+    // The provider derives previous_response_id from the IR continuation (the engine
+    // no longer pre-bakes it into the request options).
+    let responses = envelope
+        .ir
+        .responses_request_options(planned.request_options.responses.as_ref());
+    assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
+}
+
+fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)> {
+    messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect()
+}
+
+/// Mirror the engine dispatch: set the stateful Responses continuation on the IR
+/// (boundary = the last assistant turn in the Conversation run), as
+/// `execute_llm_stream` does before planning/dispatch.
+fn with_ir_continuation(
+    mut envelope: super::PreparedRequestEnvelope,
+    previous_response_id: &str,
+) -> super::PreparedRequestEnvelope {
+    let last_committed_assistant_id = envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::Conversation)
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .map(|m| m.id.clone());
+    envelope.ir.continuation = Some(bamboo_llm::Continuation {
+        previous_response_id: previous_response_id.to_string(),
+        last_committed_assistant_id,
+    });
+    envelope
+}
+
+#[test]
+fn envelope_ir_flatten_orders_runs_canonically() {
+    // The rich IR's flat lowering orders the runs canonically across a non-empty
+    // SystemRemainder + VolatileTail (the case that exposes the run ordering).
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-golden", "test-model");
+    // A persisted System message that diverges from the assembled system field
+    // becomes a SystemRemainder run — the case that must stay byte-stable.
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "t1".to_string(),
+            description: "do it".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // The fixture must actually exercise the runs we care about.
+    assert!(
+        !envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::SystemRemainder)
+            .is_empty(),
+        "fixture should produce a SystemRemainder run"
+    );
+    assert!(
+        !envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::VolatileTail)
+            .is_empty(),
+        "fixture should produce a VolatileTail run"
+    );
+    // The flat lowering orders the runs canonically: system field first, then the
+    // stable prefix (incl. the relocated tool guide), then the SystemRemainder,
+    // then the conversation, then the volatile tail. The IR is the sole authority
+    // now — there is no lanes to compare against.
+    let flat = message_shape(&envelope.ir.flatten());
+    assert!(matches!(flat[0].0, Role::System));
+    assert!(flat[0].1.contains("BASE_IDENTITY"), "system field leads");
+    let pos = |needle: &str| flat.iter().position(|(_, c)| c.contains(needle));
+    let guide = pos("NOVA_GUIDANCE_MARKER").expect("relocated tool guide present");
+    let remainder = pos("PERSISTED OPERATOR NOTE").expect("system remainder present");
+    let conversation = pos("u1").expect("conversation present");
+    let volatile = pos("do it").expect("task volatile tail present");
+    assert!(
+        0 < guide && guide < remainder,
+        "stable prefix (guide) before the system remainder"
+    );
+    assert!(
+        remainder < conversation,
+        "remainder before the conversation"
+    );
+    assert!(
+        conversation < volatile,
+        "conversation before the volatile tail"
+    );
+    // system_field() returns the byte-authoritative system string.
+    assert_eq!(envelope.ir.system_field(), envelope.ir.system_text);
+}
+
+#[test]
+fn engine_continuation_delta_orders_all_four_runs() {
+    // GOLDEN: the engine's continuation delta exercises ALL FOUR runs in the
+    // canonical delta order — SystemRemainder FIRST, then DynamicContext (summary),
+    // then the conversation tail after the committed assistant turn, then the
+    // VolatileTail — the deliberately-different ordering from the chat view. The
+    // fixture populates EVERY run so the full ordering is verified (not just
+    // remainder + tail), and the tail is id-pinned to the exact post-boundary
+    // message instance.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-delta-golden", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    // DynamicContext run: a conversation summary (rides the front/dynamic context).
+    session.conversation_summary = Some(ConversationSummary::new("DELTA_SUMMARY_MARKER", 2, 50));
+    // VolatileTail run: a task list.
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "t1".to_string(),
+            description: "DELTA_TASK_MARKER".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(2, 40),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+
+    let delta = envelope.ir.continuation_delta();
+    let shape = message_shape(&delta);
+    let pos = |needle: &str| {
+        shape
+            .iter()
+            .position(|(_, c)| c.contains(needle))
+            .unwrap_or_else(|| panic!("delta missing {needle}: {shape:?}"))
+    };
+    // All four runs present, in canonical delta order.
+    assert_eq!(
+        pos("PERSISTED OPERATOR NOTE"),
+        0,
+        "SystemRemainder is FIRST"
+    );
+    assert!(matches!(shape[0].0, Role::System));
+    assert!(
+        pos("PERSISTED OPERATOR NOTE") < pos("DELTA_SUMMARY_MARKER"),
+        "remainder before the dynamic-context summary"
+    );
+    assert!(
+        pos("DELTA_SUMMARY_MARKER") < pos("{\"ok\":true}"),
+        "dynamic-context summary before the conversation tail"
+    );
+    assert!(
+        pos("{\"ok\":true}") < pos("DELTA_TASK_MARKER"),
+        "conversation tail before the volatile tail"
+    );
+
+    // The tail is ONLY the post-assistant message (the tool result), pinned by the
+    // exact message id from the Conversation run — NOT the whole conversation.
+    let conversation = envelope.ir.run(bamboo_llm::SegmentRole::Conversation);
+    let tool_result_id = &conversation.last().expect("tool result present").id;
+    assert!(
+        delta
+            .iter()
+            .any(|m| &m.id == tool_result_id && matches!(m.role, Role::Tool)),
+        "delta carries the exact post-boundary message instance (id-pinned)"
+    );
+    assert!(
+        !delta
+            .iter()
+            .any(|m| m.content == "run a tool" || m.content == "calling tool"),
+        "pre-boundary turns (user + committed assistant) are NOT in the delta"
+    );
+}
+
+#[test]
+fn responses_continuation_uses_full_input_not_the_delta() {
+    // Locks review finding #1: on a Responses continuation the request sends the
+    // FULL input view (== ir.responses_input()) via input_messages +
+    // previous_response_id. select_responses_input_messages prefers the Explicit
+    // input_messages over the delta `messages` arg, so the continuation_delta is
+    // NOT what rides the Responses wire. Byte-faithful to legacy — this test makes
+    // that intentional rather than accidental, so a future "real delta" change
+    // fails loudly.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-resp-cont", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+    let planned = super::plan_llm_request(&envelope, "session-resp-cont", None, 0);
+
+    // The adapter derives the Responses wire view from the IR + the engine's request
+    // POLICY (planned.request_options.responses).
+    let responses = envelope
+        .ir
+        .responses_request_options(planned.request_options.responses.as_ref());
+
+    let input = responses
+        .input_messages
+        .as_ref()
+        .expect("input_messages present");
+    assert_eq!(
+        message_shape(input),
+        message_shape(&envelope.ir.responses_input()),
+        "Responses continuation sends the FULL input view, not the delta"
+    );
+    assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
+    assert!(
+        input.len() > envelope.ir.continuation_delta().len(),
+        "FULL Responses input must exceed the smaller continuation delta"
+    );
+}
+
+#[test]
+fn ir_cache_matches_request_options_cache() {
+    // Locks review finding #4: the cache plan lives in both ir.cache and
+    // options.cache (the provider reads options.cache; the IR carries its own copy
+    // for observability). They must stay identical so the two can never diverge.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-cache-dup", "test-model");
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let planned = super::plan_llm_request(&envelope, "session-cache-dup", None, 0);
+    let options_cache = planned
+        .request_options
+        .cache
+        .as_ref()
+        .expect("cache plan present");
+
+    assert_eq!(envelope.ir.cache.cache_system, options_cache.cache_system);
+    assert_eq!(envelope.ir.cache.cache_tools, options_cache.cache_tools);
+    assert_eq!(envelope.ir.cache.ttl, options_cache.ttl);
+    assert_eq!(
+        envelope.ir.cache.breakpoint_message_ids,
+        options_cache.breakpoint_message_ids
+    );
+}
+
+#[test]
+fn cache_anchor_marks_only_the_last_system_block() {
+    // Review finding #3: the engine marks `cache_anchor` on the LAST system block,
+    // and the Anthropic builder hardcodes `cache_control` onto the last system
+    // block (without reading `cache_anchor`). They agree only because the anchor is
+    // last — lock that so moving the anchor (or adding a second) is caught here
+    // instead of silently diverging from the Anthropic breakpoint.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-anchor", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let blocks = &envelope.ir.system_blocks;
+    assert!(
+        !blocks.is_empty(),
+        "tool guide present → structured system blocks"
+    );
+    let anchor_indices: Vec<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.cache_anchor)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        anchor_indices,
+        vec![blocks.len() - 1],
+        "exactly one cache_anchor, on the LAST system block (where Anthropic places cache_control)"
+    );
+}
+
+#[test]
+fn ir_responses_view_orders_guide_skill_conversation_and_lifts_system_to_instructions() {
+    // GOLDEN: the adapter-derived Responses view (`PromptIR::responses_request_options`)
+    // is the canonical Responses wire — the tool guide leads the input array, the
+    // relocated skill context follows, the conversation comes after, and the stable
+    // system field is lifted to top-level `instructions` (NOT a leading system
+    // message in the array).
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-resp", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "SKILL_CONTEXT_MARKER body".to_string(),
+    );
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    // responses_input() == body_chat() (system rides instructions, not the array).
+    let input = message_shape(&envelope.ir.responses_input());
+    let pos = |needle: &str| input.iter().position(|(_, c)| c.contains(needle));
+    let guide = pos("NOVA_GUIDANCE_MARKER").expect("tool guide present");
+    let skill = pos("SKILL_CONTEXT_MARKER").expect("relocated skill context present");
+    let conversation = pos("u1").expect("conversation present");
+    assert!(
+        guide < skill && skill < conversation,
+        "guide leads, then relocated skill context, then the conversation"
+    );
+    assert!(
+        !matches!(input.first(), Some((Role::System, _))),
+        "the stable system rides instructions, so the input array does not LEAD with a system message"
+    );
+
+    // The adapter lifts the stable system to top-level instructions. Asserted by
+    // CONTENT (not by re-deriving from system_field, which would be tautological):
+    // instructions carries the base identity but NOT the relocated guide/skill —
+    // proving the guide/skill left the system and ride the input array instead.
+    let responses = envelope.ir.responses_request_options(None);
+    let instructions = responses.instructions.expect("instructions lifted");
+    assert!(
+        instructions.contains("BASE_IDENTITY"),
+        "instructions carries the stable base identity"
+    );
+    assert!(
+        !instructions.contains("NOVA_GUIDANCE_MARKER")
+            && !instructions.contains("SKILL_CONTEXT_MARKER"),
+        "the relocated guide + skill are NOT in instructions (they ride the input array)"
+    );
+    assert!(
+        instructions == instructions.trim(),
+        "instructions are trimmed (byte-faithful to build_responses_body)"
+    );
+    // The adapter wires the responses_input view as the Responses input array.
+    let wired = responses
+        .input_messages
+        .expect("input_messages derived")
+        .iter()
+        .any(|m| m.content.contains("NOVA_GUIDANCE_MARKER"));
+    assert!(
+        wired,
+        "input_messages carries the relocated guide (the responses_input view)"
+    );
 }
 
 #[tokio::test]
@@ -941,16 +1632,18 @@ async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block(
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
     );
+    // External memory rides a session field now (the async refresh populates it),
+    // not a system-message marker.
+    session.metadata.insert(
+        crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+        "## External Memory (Persistent)\n\nSession note body".to_string(),
+    );
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
-    let config = test_config(
-        "system\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nSession note body\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
-    );
+    let config = test_config("system");
     let prepared_context = PreparedContext {
         messages: vec![
-            Message::system(
-                "system\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nSession note body\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
-            ),
+            Message::system("system"),
             Message::user("run a tool"),
             Message::assistant("calling tool", None),
             Message::tool_result("call_1", "{\"ok\":true}"),
@@ -1015,9 +1708,23 @@ async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
     );
+    // Plan mode active in session STATE — the plan_runtime/plan_mode volatile
+    // blocks are now built directly from this, not reparsed from system markers.
+    {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, PlanModeState, PlanModeStatus,
+        };
+        session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+        session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+    }
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
-    let system_prompt = "system\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\n=== DURABLE PLAN EXECUTION CONTEXT ===\n\nResume rule\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->\n\n<!-- BAMBOO_PLAN_MODE_START -->\n=== PLAN MODE ACTIVE ===\n\nEXPLORE\n<!-- BAMBOO_PLAN_MODE_END -->";
+    let system_prompt = "system";
     let config = test_config(system_prompt);
     let prepared_context = PreparedContext {
         messages: vec![

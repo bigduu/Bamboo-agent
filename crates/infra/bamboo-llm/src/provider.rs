@@ -3,6 +3,7 @@
 //! This module defines the interface for LLM (Large Language Model) providers,
 //! enabling support for multiple LLM backends through a common trait.
 
+use crate::prompt_ir::PromptIR;
 use crate::types::LLMChunk;
 use async_trait::async_trait;
 use bamboo_domain::Message;
@@ -121,55 +122,6 @@ pub struct LLMRequestOptions {
     pub cache: Option<crate::cache::PromptCachePlan>,
 }
 
-/// Canonical, provider-facing prompt structure: the engine assembles these four
-/// layers ONCE, and each provider adapter renders them into its own wire format
-/// (system field + message array + cache breakpoints) instead of re-deriving the
-/// structure from a pre-flattened message list. This is what lets every provider
-/// be a pure adapter — the prompt-assembly logic lives in Bamboo, not duplicated
-/// across providers.
-///
-/// Concatenation order is fixed and defines the message layout:
-/// `[system(stable_instructions)] + stable_prefix_messages + dynamic_context_messages + conversation_messages`.
-///
-/// The lane boundaries are also the natural cache breakpoints: everything up to
-/// (and including) `stable_prefix_messages` is the stable, cacheable prefix;
-/// `dynamic_context_messages` onward changes per round.
-#[derive(Debug, Clone, Default)]
-pub struct PromptLanes {
-    /// Static system instructions — the cacheable base. Rendered into the
-    /// provider's dedicated system field, NOT the message array.
-    pub stable_instructions: String,
-    /// Session-stable context messages (tool guide, connected MCP servers'
-    /// guidance, workspace, env, skills): fixed positions that change rarely. The
-    /// stable cache prefix ends after these.
-    pub stable_prefix_messages: Vec<Message>,
-    /// Per-round dynamic context (task snapshot, recalled memory, conversation
-    /// summary): changes turn to turn, so it sits AFTER the cache breakpoint.
-    pub dynamic_context_messages: Vec<Message>,
-    /// The actual user / assistant / tool conversation history.
-    pub conversation_messages: Vec<Message>,
-}
-
-impl PromptLanes {
-    /// Flatten the lanes into one message list in canonical order — the exact
-    /// shape a provider that has NOT yet been migrated to consume lanes still
-    /// expects, so the default trait path stays byte-identical to today.
-    pub fn flatten(&self) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(
-            1 + self.stable_prefix_messages.len()
-                + self.dynamic_context_messages.len()
-                + self.conversation_messages.len(),
-        );
-        if !self.stable_instructions.trim().is_empty() {
-            messages.push(Message::system(self.stable_instructions.trim().to_string()));
-        }
-        messages.extend(self.stable_prefix_messages.iter().cloned());
-        messages.extend(self.dynamic_context_messages.iter().cloned());
-        messages.extend(self.conversation_messages.iter().cloned());
-        messages
-    }
-}
-
 /// Trait for LLM provider implementations
 ///
 /// This trait defines the interface that all LLM providers must implement
@@ -242,29 +194,50 @@ pub trait LLMProvider: Send + Sync {
             .await
     }
 
-    /// Stream a completion from the canonical [`PromptLanes`] contract — the
-    /// structure-preserving entry point.
+    /// Stream from the canonical [`PromptIR`] — the single, rich, provider-agnostic
+    /// request the engine emits once per round.
     ///
-    /// The provider receives the prompt LAYERS (static system, stable prefix,
-    /// dynamic context, conversation) and is expected to render them into its own
-    /// dialect: place the system block in its system field and the cache
-    /// breakpoint at the structural stable↔dynamic boundary, rather than
-    /// re-deriving both from a flattened message list.
+    /// A provider renders the IR into its own wire format by calling the lowering
+    /// methods ([`PromptIR::system_field`], [`PromptIR::body_chat`],
+    /// [`PromptIR::responses_input`], [`PromptIR::continuation_delta`]). The IR
+    /// carries the stateful Responses continuation, so an adapter derives the
+    /// delta itself rather than the engine pre-baking it.
     ///
-    /// The default implementation flattens the lanes ([`PromptLanes::flatten`])
-    /// and delegates to [`LLMProvider::chat_stream_with_options`], so a provider
-    /// that has not yet been migrated produces exactly the request it does today.
-    async fn chat_stream_lanes(
+    /// The default implementation lowers the IR for BOTH wire families and
+    /// delegates to [`chat_stream_with_options`](Self::chat_stream_with_options):
+    /// - the flat message list (`continuation_delta` mid-tool-loop, else `flatten`)
+    ///   for the Chat-Completions path;
+    /// - the Responses-API view (`instructions` / `input_messages` /
+    ///   `previous_response_id`) derived via [`PromptIR::responses_request_options`]
+    ///   and merged onto the request POLICY, so a Responses provider works WITHOUT
+    ///   overriding this method (Chat-Completions providers ignore those options).
+    ///
+    /// This is byte-identical to the pre-IR request. Block-native providers (e.g.
+    /// Anthropic) still override this to consume `system_blocks` structurally.
+    async fn chat_stream_ir(
         &self,
-        lanes: &PromptLanes,
+        ir: &PromptIR,
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        let messages = lanes.flatten();
-        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
-            .await
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+        self.chat_stream_with_options(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            Some(&effective_options),
+        )
+        .await
     }
 
     /// Lists available models from this provider
@@ -299,29 +272,15 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn prompt_lanes_flatten_preserves_canonical_order() {
-        let lanes = PromptLanes {
-            stable_instructions: "  base system  ".to_string(),
-            stable_prefix_messages: vec![Message::user("tool-guide")],
-            dynamic_context_messages: vec![Message::user("task-snapshot")],
-            conversation_messages: vec![Message::user("real ask")],
-        };
-        let flat = lanes.flatten();
-        assert_eq!(flat.len(), 4);
-        assert!(matches!(flat[0].role, bamboo_domain::Role::System));
-        assert_eq!(flat[0].content, "base system"); // trimmed
-        assert_eq!(flat[1].content, "tool-guide");
-        assert_eq!(flat[2].content, "task-snapshot");
-        assert_eq!(flat[3].content, "real ask");
-    }
-
     #[tokio::test]
-    async fn chat_stream_lanes_default_flattens_and_delegates() {
-        // A provider that captures whatever message list it is handed.
+    async fn chat_stream_ir_default_flattens_and_delegates() {
+        use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
+
+        // A provider that captures the message list AND the options it is handed.
         #[derive(Default)]
         struct Capture {
             seen: Arc<Mutex<Vec<Message>>>,
+            seen_responses: Arc<Mutex<Option<crate::provider::ResponsesRequestOptions>>>,
         }
         #[async_trait]
         impl LLMProvider for Capture {
@@ -332,7 +291,7 @@ mod tests {
                 _mt: Option<u32>,
                 _model: &str,
             ) -> Result<LLMStream> {
-                unreachable!("default chat_stream_lanes must route via chat_stream_with_options")
+                unreachable!("default chat_stream_ir must route via chat_stream_with_options")
             }
             async fn chat_stream_with_options(
                 &self,
@@ -340,28 +299,33 @@ mod tests {
                 _t: &[ToolSchema],
                 _mt: Option<u32>,
                 _model: &str,
-                _o: Option<&LLMRequestOptions>,
+                o: Option<&LLMRequestOptions>,
             ) -> Result<LLMStream> {
                 *self.seen.lock().expect("seen lock") = messages.to_vec();
+                *self.seen_responses.lock().expect("resp lock") =
+                    o.and_then(|value| value.responses.clone());
                 Ok(Box::pin(stream::iter(Vec::<Result<LLMChunk>>::new())))
             }
         }
 
         let cap = Capture::default();
-        let lanes = PromptLanes {
-            stable_instructions: "sys".into(),
-            stable_prefix_messages: vec![Message::user("guide")],
-            dynamic_context_messages: vec![Message::user("dyn")],
-            conversation_messages: vec![Message::user("ask")],
+        let ir = PromptIR {
+            system_text: "sys".into(),
+            segments: vec![
+                Segment::new(SegmentRole::StablePrefix, vec![Message::user("guide")]),
+                Segment::new(SegmentRole::DynamicContext, vec![Message::user("dyn")]),
+                Segment::new(SegmentRole::Conversation, vec![Message::user("ask")]),
+            ],
+            ..PromptIR::default()
         };
         let _ = cap
-            .chat_stream_lanes(&lanes, &[], None, "m", None)
+            .chat_stream_ir(&ir, &[], None, "m", None)
             .await
-            .expect("lanes stream");
+            .expect("ir stream");
 
         let seen = cap.seen.lock().expect("seen lock").clone();
-        let expected = lanes.flatten();
-        assert_eq!(seen.len(), expected.len(), "delegates the flattened lanes");
+        let expected = ir.flatten();
+        assert_eq!(seen.len(), expected.len(), "delegates the flattened IR");
         for (got, want) in seen.iter().zip(expected.iter()) {
             assert_eq!(got.role, want.role);
             assert_eq!(got.content, want.content);
@@ -369,18 +333,24 @@ mod tests {
         // system + guide + dyn + ask
         assert_eq!(seen.len(), 4);
         assert!(matches!(seen[0].role, bamboo_domain::Role::System));
-    }
 
-    #[test]
-    fn prompt_lanes_flatten_omits_empty_system() {
-        let lanes = PromptLanes {
-            stable_instructions: "   ".to_string(),
-            conversation_messages: vec![Message::user("hi")],
-            ..PromptLanes::default()
-        };
-        let flat = lanes.flatten();
-        assert_eq!(flat.len(), 1);
-        assert!(matches!(flat[0].role, bamboo_domain::Role::User));
+        // SAFETY NET: the default also derives the Responses-API view from the IR, so
+        // a Responses provider works without overriding `chat_stream_ir`. instructions
+        // = the (trimmed) system field; input_messages = the full responses_input view
+        // (system lifted out, so it does not lead with a system message).
+        let responses = cap
+            .seen_responses
+            .lock()
+            .expect("resp lock")
+            .clone()
+            .expect("default derives Responses options from the IR");
+        assert_eq!(responses.instructions.as_deref(), Some("sys"));
+        let input = responses.input_messages.expect("input_messages derived");
+        assert_eq!(
+            input.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            vec!["guide".to_string(), "dyn".to_string(), "ask".to_string()],
+            "input_messages is the responses_input view: NO leading system message"
+        );
     }
 
     #[derive(Clone, Default)]

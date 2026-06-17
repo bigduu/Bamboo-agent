@@ -4,7 +4,7 @@
 //!
 //! There is exactly **one** implementation of the spawn/execute/finalize logic:
 //! [`spawn::run_child_spawn`]. Both the background [`SpawnScheduler`] (via
-//! `run_spawn_job`) and the ergonomic [`runner::ProfileRunner`] funnel into it.
+//! `run_spawn_job`) and the ergonomic [`runner::ChildRunner`] funnel into it.
 //! No caller may duplicate the event ordering, heartbeat/watchdog, runner
 //! reservation, `ExecuteRequest` construction, or terminal status strings.
 //!

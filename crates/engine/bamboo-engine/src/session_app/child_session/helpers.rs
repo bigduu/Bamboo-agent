@@ -3,10 +3,7 @@
 use bamboo_domain::Session;
 use serde_json::json;
 
-use super::{
-    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, CHILD_SYSTEM_PROMPT,
-    PLAN_AGENT_SYSTEM_PROMPT,
-};
+use super::{ChildRunnerInfo, ChildSessionEntry, ChildSessionError};
 
 pub fn normalize_non_empty_optional(
     value: Option<String>,
@@ -40,29 +37,6 @@ pub fn normalize_required_text(
         )));
     }
     Ok(trimmed.to_string())
-}
-
-/// Resolve the system prompt for a child session.
-///
-/// - When `override_prompt` is `Some`, that value is used verbatim. Callers
-///   resolve this from the [`SubagentProfileRegistry`] before invoking
-///   `create_child_action`.
-/// - When `override_prompt` is `None`, falls back to the legacy hard-coded
-///   prompts: [`PLAN_AGENT_SYSTEM_PROMPT`] when `subagent_type == "plan"`
-///   (case-insensitive, surrounding whitespace ignored), and
-///   [`CHILD_SYSTEM_PROMPT`] otherwise. This keeps unwired call paths
-///   byte-for-byte equivalent to pre-PR-3 behaviour.
-pub fn resolve_system_prompt<'a>(
-    subagent_type: &str,
-    override_prompt: Option<&'a str>,
-) -> std::borrow::Cow<'a, str> {
-    if let Some(prompt) = override_prompt {
-        std::borrow::Cow::Borrowed(prompt)
-    } else if subagent_type.trim().eq_ignore_ascii_case("plan") {
-        std::borrow::Cow::Borrowed(PLAN_AGENT_SYSTEM_PROMPT)
-    } else {
-        std::borrow::Cow::Borrowed(CHILD_SYSTEM_PROMPT)
-    }
 }
 
 pub fn metadata_text(session: &Session, key: &str) -> Option<String> {

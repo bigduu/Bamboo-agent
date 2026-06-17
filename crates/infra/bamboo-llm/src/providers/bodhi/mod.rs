@@ -18,6 +18,7 @@ use crate::providers::common::openai_compat::{
 };
 use crate::providers::common::sse::llm_stream_from_sse;
 use crate::types::LLMChunk;
+use bamboo_config::KeywordMaskingConfig;
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 
 const DEFAULT_MAX_TOKENS: u32 = 16384;
@@ -28,6 +29,7 @@ pub struct BodhiProvider {
     base_url: String,
     target_provider: String,
     default_reasoning_effort: Option<ReasoningEffort>,
+    masking_config: KeywordMaskingConfig,
 }
 
 impl BodhiProvider {
@@ -38,7 +40,15 @@ impl BodhiProvider {
             base_url: "http://localhost:8080".to_string(),
             target_provider: "openai".to_string(),
             default_reasoning_effort: None,
+            masking_config: KeywordMaskingConfig::default(),
         }
+    }
+
+    /// Configure keyword masking applied as a last-moment scan of every outbound
+    /// request body (see [`crate::masking`]).
+    pub fn with_masking(mut self, masking_config: KeywordMaskingConfig) -> Self {
+        self.masking_config = masking_config;
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -178,7 +188,7 @@ impl BodhiProvider {
         reasoning_effort: Option<ReasoningEffort>,
         parallel_tool_calls: Option<bool>,
     ) -> Result<LLMStream> {
-        let body = build_openai_compat_body(
+        let mut body = build_openai_compat_body(
             model,
             messages,
             tools,
@@ -187,6 +197,8 @@ impl BodhiProvider {
             reasoning_effort,
             parallel_tool_calls,
         );
+        // Last-moment scan: mask every text value in the fully-assembled body.
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
 
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/chat/completions");
@@ -236,7 +248,7 @@ impl BodhiProvider {
 
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
-        let body = build_anthropic_request(
+        let mut body = build_anthropic_request(
             messages,
             tools,
             model,
@@ -245,6 +257,7 @@ impl BodhiProvider {
             reasoning_effort,
             None,
         );
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
 
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/messages");
@@ -314,6 +327,10 @@ impl BodhiProvider {
             request.generation_config = Some(serde_json::Value::Object(generation_config));
         }
 
+        // Serialize then run the last-moment scan over the body Value before send.
+        let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
+
         let headers = self.build_headers()?;
         let url = self.proxy_url(&format!("v1beta/models/{}:streamGenerateContent", model));
 
@@ -321,7 +338,7 @@ impl BodhiProvider {
             .client
             .post(&url)
             .headers(headers)
-            .json(&request)
+            .json(&request_json)
             .send()
             .await?;
 

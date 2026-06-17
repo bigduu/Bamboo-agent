@@ -42,6 +42,5 @@ pub(crate) mod llm_compat;
 pub mod openai;
 pub mod settings;
 pub mod skill;
-pub mod subagent_profiles;
 pub mod tools;
 pub mod workspace;

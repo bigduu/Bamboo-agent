@@ -6,7 +6,6 @@ use uuid::Uuid;
 
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
-use bamboo_domain::subagent::SubagentProfileRegistry;
 use bamboo_domain::ReasoningEffort;
 use bamboo_engine::session_app::child_session::{
     self, ChildSessionError, ChildSessionPort, CreateChildInput, ModelCatalogPort,
@@ -28,8 +27,9 @@ enum SubAgentArgs {
         #[serde(default)]
         responsibility: Option<String>,
         prompt: String,
-        /// Subagent profile/role. Optional: defaults to `general-purpose` when
-        /// omitted or empty, so a missing value never hard-fails a create.
+        /// Optional free-text label for this child (cosmetic only — used for
+        /// display and as the warm-worker reuse key). It has NO effect on the
+        /// child's tools or system prompt; every sub-agent is a full agent.
         #[serde(default)]
         subagent_type: Option<String>,
         /// Working directory for the child. Optional: defaults to the parent
@@ -139,11 +139,6 @@ enum SubAgentArgs {
     Delete {
         child_session_id: String,
     },
-    /// Enumerate the available subagent profiles (built-ins plus any
-    /// user/project overrides). Read-only; does not touch any session.
-    /// Useful both for the LLM (to discover roles before calling
-    /// `create`) and for the frontend (to populate a role dropdown).
-    ListProfiles,
     /// Enumerate the models the parent can pin a child to via
     /// `create.model`. Read-only; best-effort per configured provider.
     ListModels,
@@ -239,11 +234,8 @@ fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
 pub struct SubAgentTool {
     /// Child-session CRUD/lifecycle operations (load/save/run/cancel/…).
     sessions: Arc<dyn ChildSessionPort>,
-    /// Subagent-type resolution (model, runtime metadata, prompt, active ids).
+    /// Subagent-type resolution (model, runtime metadata, active ids).
     resolver: Arc<dyn SubagentResolutionPort>,
-    /// Registry consulted by `action=list_profiles`. Held as `Arc` so the
-    /// tool stays cheap to clone and share across executors.
-    profiles: Arc<SubagentProfileRegistry>,
     /// Optional model catalog consulted by `action=list_models` and used to
     /// resolve a bare `create.model` id to a provider. `None` keeps the tool
     /// constructible without a live provider registry (tests, embedded use).
@@ -254,12 +246,10 @@ impl SubAgentTool {
     pub fn new(
         sessions: Arc<dyn ChildSessionPort>,
         resolver: Arc<dyn SubagentResolutionPort>,
-        profiles: Arc<SubagentProfileRegistry>,
     ) -> Self {
         Self {
             sessions,
             resolver,
-            profiles,
             catalog: None,
         }
     }
@@ -312,6 +302,14 @@ fn parse_model_spec(
     Ok(bamboo_domain::ProviderModelRef::new(provider, spec))
 }
 
+/// The `SubAgent` tool description. Exposed standalone so a nested worker's
+/// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
+pub fn subagent_tool_description() -> &'static str {
+    "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session is a full agent that runs independently under the current root session with its own conversation context and the full toolset, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
+PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
+Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+}
+
 #[async_trait]
 impl Tool for SubAgentTool {
     fn name(&self) -> &str {
@@ -319,9 +317,7 @@ impl Tool for SubAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context, can use a specialized subagent profile, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
-PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
-Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children; use list_profiles to enumerate subagent roles. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. Child sessions cannot spawn nested child sessions. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+        subagent_tool_description()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -330,9 +326,9 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles", "list_models"],
-                    "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_profiles to enumerate available subagent roles before choosing subagent_type; list_models to enumerate the models you can pin a child to via create.model. \
-        A create call requires: title, responsibility, prompt, and subagent_type (workspace and subagent_type are optional and default to the parent's workspace / general-purpose). EXAMPLE create: {\"action\":\"create\",\"subagent_type\":\"researcher\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
+                    "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_models"],
+                    "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_models to enumerate the models you can pin a child to via create.model. \
+        A create call requires: title, responsibility, and prompt (workspace is optional and defaults to the parent's workspace). EXAMPLE create: {\"action\":\"create\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
                 },
                 "child_session_id": {
                     "type": "string",
@@ -370,7 +366,7 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "For create: the specialized child agent profile/role, e.g. general-purpose, researcher, coder, plan. Use plan/researcher for read-only exploration and coder/general-purpose for implementation when allowed. Optional — omitting it defaults to general-purpose — but you should pick the most fitting role. Call list_profiles to see the available roles."
+                    "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the child's tools or system prompt; every sub-agent is a full agent. Optional; omit it if you have no useful label."
                 },
                 "workspace": {
                     "type": "string",
@@ -403,7 +399,7 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                 },
                 "model": {
                     "type": "string",
-                    "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-role model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the chosen subagent_type."
+                    "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-subagent_type model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the given subagent_type label."
                 },
                 "lifecycle": {
                     "type": "string",
@@ -451,15 +447,7 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
             ToolError::InvalidArguments(format!("Invalid SubAgent args: {error}"))
         })?;
 
-        // `list_profiles` is read-only and operates purely on the
-        // in-memory profile registry, so we short-circuit before doing
-        // any session lookup. This also lets the LLM call `list_profiles`
-        // safely from any context (root or otherwise).
-        if let SubAgentArgs::ListProfiles = parsed {
-            return tool_result(self.list_profiles_payload());
-        }
-
-        // `list_models` is likewise read-only and session-independent.
+        // `list_models` is read-only and session-independent.
         if let SubAgentArgs::ListModels = parsed {
             let Some(catalog) = self.catalog.as_ref() else {
                 return Err(ToolError::Execution(
@@ -500,14 +488,13 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = normalize_required_text(Some(prompt), "prompt")?;
-                // subagent_type is optional: an omitted/blank value falls back to
-                // the catch-all `general-purpose` profile (the same fallback
-                // resolve_subagent_prompt already applies), so the model never
-                // hard-fails a create just for leaving the role unspecified.
+                // subagent_type is an optional cosmetic label only (display +
+                // warm-worker reuse key); it has no behavioral effect. An
+                // omitted/blank value falls back to the neutral "worker" label.
                 let subagent_type = subagent_type
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "general-purpose".to_string());
+                    .unwrap_or_else(|| "worker".to_string());
                 // workspace is optional: default to the parent's workspace.
                 let workspace = workspace
                     .map(|value| value.trim().to_string())
@@ -551,9 +538,8 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                     .to_string();
                 let existing_resident = match resident_name.as_deref() {
                     Some(rname) => {
-                        // Children are created with `root_session_id == parent.id`
-                        // (a flat tree; children cannot spawn children), so the
-                        // parent's id is the tree root key for the lookup.
+                        // Children are created with `root_session_id == parent.id`,
+                        // so the parent's id is the tree root key for the lookup.
                         self.sessions.find_resident_child(&parent.id, rname).await
                     }
                     None => None,
@@ -638,8 +624,6 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                             .map(|model_ref| model_ref.model.clone());
                         let runtime_metadata =
                             self.resolver.resolve_runtime_metadata(&subagent_type).await;
-                        let system_prompt_override =
-                            Some(self.resolver.resolve_subagent_prompt(&subagent_type));
                         let result = child_session::create_child_action(
                             self.sessions.as_ref(),
                             CreateChildInput {
@@ -653,7 +637,6 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                                 model_override,
                                 model_ref_override,
                                 runtime_metadata,
-                                system_prompt_override,
                                 auto_run: should_auto_run,
                                 reasoning_effort,
                                 lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),
@@ -900,66 +883,9 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                 .map_err(tool_error_from_child_session)?;
                 tool_result(result)
             }
-            // Already short-circuited above; kept here so the match stays
-            // exhaustive without a wildcard.
-            SubAgentArgs::ListProfiles => tool_result(self.list_profiles_payload()),
             // Handled by the session-independent short-circuit above.
             SubAgentArgs::ListModels => unreachable!("list_models short-circuits earlier"),
         }
-    }
-}
-
-impl SubAgentTool {
-    /// Build the JSON payload returned by `action=list_profiles`.
-    ///
-    /// Shape (kept stable as a public contract for the frontend and for
-    /// the LLM):
-    ///
-    /// ```jsonc
-    /// {
-    ///   "profiles": [
-    ///     {
-    ///       "id": "researcher",
-    ///       "display_name": "Researcher",
-    ///       "description": "...",
-    ///       "tools": { "mode": "allowlist", "allow": ["Read", "Grep"] },
-    ///       "model_hint": null,
-    ///       "default_responsibility": null,
-    ///       "ui": { "icon": "🔎", "color": "blue" }
-    ///       // NOTE: `system_prompt` is intentionally omitted from the
-    ///       // listing — it can be lengthy and is not needed for UI/LLM
-    ///       // selection. Use `action=get` on a child to inspect the
-    ///       // resolved prompt of an active session.
-    ///     }
-    ///   ],
-    ///   "fallback_id": "general-purpose",
-    ///   "count": 6
-    /// }
-    /// ```
-    fn list_profiles_payload(&self) -> serde_json::Value {
-        // Project each profile into a UI-friendly shape that excludes the
-        // (potentially large) `system_prompt`. This keeps the payload
-        // small for both the LLM context window and the frontend list.
-        let profiles: Vec<serde_json::Value> = self
-            .profiles
-            .iter()
-            .map(|p| {
-                json!({
-                    "id": p.id,
-                    "display_name": p.display_name,
-                    "description": p.description,
-                    "tools": p.tools,
-                    "model_hint": p.model_hint,
-                    "default_responsibility": p.default_responsibility,
-                    "ui": p.ui,
-                })
-            })
-            .collect();
-        json!({
-            "profiles": profiles,
-            "fallback_id": self.profiles.fallback_id(),
-            "count": self.profiles.len(),
-        })
     }
 }
 

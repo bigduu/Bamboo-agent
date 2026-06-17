@@ -12,7 +12,7 @@ pub struct DefaultMemoryManager;
 impl MemoryManager for DefaultMemoryManager {
     async fn recall_memories(&self, session: &mut Session, config: &AgentLoopConfig) -> bool {
         let msg_count_before = session.messages.len();
-        crate::runtime::runner::prompt_context::inject_external_memory_into_system_message(
+        crate::runtime::runner::prompt_context::refresh_external_memory_context(
             session,
             config.prompt_memory_flags,
             None,

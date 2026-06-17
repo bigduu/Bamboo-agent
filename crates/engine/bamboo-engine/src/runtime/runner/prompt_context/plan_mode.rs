@@ -58,38 +58,21 @@ The plan should include:
     )
 }
 
-/// Inject plan mode instructions into the system message if plan mode is active,
-/// or strip them if plan mode is not active.
-pub(crate) fn inject_plan_mode_instructions(session: &mut Session) {
+/// Render the plan-mode section text from session state, or `None` when plan
+/// mode is inactive.
+///
+/// The agent loop builds this into a dedicated volatile
+/// [`ContextBlockType::PlanModeState`] block (see `build_plan_mode_context_block`)
+/// rather than injecting it into the system message, so an inactive↔active plan
+/// transition never rewrites the cached system prefix.
+///
+/// [`ContextBlockType::PlanModeState`]: bamboo_agent_core::ContextBlockType::PlanModeState
+pub(super) fn render_plan_mode_section(session: &Session) -> Option<String> {
     let plan_mode = session
         .agent_runtime_state
         .as_ref()
-        .and_then(|state| state.plan_mode.as_ref());
-
-    if let Some(system_message) = session
-        .messages
-        .iter_mut()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-    {
-        let base_prompt = strip_existing_plan_mode_instructions(&system_message.content);
-
-        if let Some(plan_mode) = plan_mode {
-            let instructions = build_plan_mode_instructions(plan_mode);
-            system_message.content = format!(
-                "{}\n\n{}\n{}\n{}",
-                base_prompt.trim_end(),
-                PLAN_MODE_START_MARKER,
-                instructions.trim(),
-                PLAN_MODE_END_MARKER,
-            );
-            tracing::debug!(
-                "Injected plan mode instructions into system message ({} chars)",
-                instructions.len()
-            );
-        } else {
-            system_message.content = base_prompt;
-        }
-    }
+        .and_then(|state| state.plan_mode.as_ref())?;
+    Some(build_plan_mode_instructions(plan_mode))
 }
 
 /// Strip existing plan mode instructions from a prompt.
@@ -133,12 +116,8 @@ mod tests {
     }
 
     #[test]
-    fn inject_plan_mode_adds_instructions_when_active() {
+    fn render_plan_mode_section_returns_instructions_when_active() {
         let mut session = bamboo_agent_core::Session::new("test", "gpt-4");
-        session.messages.insert(
-            0,
-            bamboo_agent_core::Message::system("Base prompt".to_string()),
-        );
         session.agent_runtime_state =
             Some(bamboo_domain::session::runtime_state::AgentRuntimeState::new("run-1"));
         if let Some(ref mut state) = session.agent_runtime_state {
@@ -150,32 +129,14 @@ mod tests {
             });
         }
 
-        inject_plan_mode_instructions(&mut session);
-
-        let system_msg = session
-            .messages
-            .iter()
-            .find(|m| matches!(m.role, bamboo_agent_core::Role::System))
-            .unwrap();
-        assert!(system_msg.content.contains("PLAN MODE ACTIVE"));
-        assert!(system_msg.content.contains("Base prompt"));
+        let section =
+            render_plan_mode_section(&session).expect("active plan mode renders a section");
+        assert!(section.contains("PLAN MODE ACTIVE"));
     }
 
     #[test]
-    fn inject_plan_mode_removes_instructions_when_inactive() {
-        let mut session = bamboo_agent_core::Session::new("test", "gpt-4");
-        session.messages.insert(0, bamboo_agent_core::Message::system(
-            "Base prompt\n\n<!-- BAMBOO_PLAN_MODE_START -->\nPlan mode content\n<!-- BAMBOO_PLAN_MODE_END -->".to_string()
-        ));
-
-        inject_plan_mode_instructions(&mut session);
-
-        let system_msg = session
-            .messages
-            .iter()
-            .find(|m| matches!(m.role, bamboo_agent_core::Role::System))
-            .unwrap();
-        assert!(!system_msg.content.contains("PLAN MODE ACTIVE"));
-        assert!(system_msg.content.contains("Base prompt"));
+    fn render_plan_mode_section_is_none_when_inactive() {
+        let session = bamboo_agent_core::Session::new("test", "gpt-4");
+        assert!(render_plan_mode_section(&session).is_none());
     }
 }

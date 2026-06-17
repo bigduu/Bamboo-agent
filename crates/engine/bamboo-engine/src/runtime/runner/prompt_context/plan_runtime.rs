@@ -1,4 +1,4 @@
-use bamboo_agent_core::{Message, Session};
+use bamboo_agent_core::Session;
 use bamboo_domain::{PlanModeStatus, TaskItem, TaskItemStatus};
 use bamboo_memory::plan_store::{
     PlanCursorArtifact, PlanSection, PlanSectionArtifact, PlanStateArtifact, PlanStore,
@@ -584,7 +584,10 @@ fn select_plan_content_for_prompt(
     }
 }
 
-fn build_plan_runtime_context(session: &Session, app_data_dir: Option<&Path>) -> Option<String> {
+pub(super) fn build_plan_runtime_context(
+    session: &Session,
+    app_data_dir: Option<&Path>,
+) -> Option<String> {
     let plan_mode = session
         .agent_runtime_state
         .as_ref()
@@ -715,46 +718,6 @@ Current execution anchor from task list:\n{}\n",
     );
 
     Some(context)
-}
-
-pub(super) fn inject_plan_runtime_context_into_system_message(
-    session: &mut Session,
-    app_data_dir: Option<&Path>,
-) {
-    let plan_runtime_context = build_plan_runtime_context(session, app_data_dir);
-
-    if let Some(system_message) = session
-        .messages
-        .iter_mut()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-    {
-        let base_prompt = strip_existing_plan_runtime_context(&system_message.content);
-
-        if let Some(plan_runtime_context) = plan_runtime_context {
-            if base_prompt.trim().is_empty() {
-                system_message.content = format!(
-                    "{PLAN_RUNTIME_CONTEXT_START_MARKER}\n{}\n{PLAN_RUNTIME_CONTEXT_END_MARKER}",
-                    plan_runtime_context.trim()
-                );
-            } else {
-                system_message.content = format!(
-                    "{}\n\n{PLAN_RUNTIME_CONTEXT_START_MARKER}\n{}\n{PLAN_RUNTIME_CONTEXT_END_MARKER}",
-                    base_prompt.trim_end(),
-                    plan_runtime_context.trim(),
-                );
-            }
-        } else {
-            system_message.content = base_prompt;
-        }
-    } else if let Some(plan_runtime_context) = plan_runtime_context {
-        session.messages.insert(
-            0,
-            Message::system(format!(
-                "{PLAN_RUNTIME_CONTEXT_START_MARKER}\n{}\n{PLAN_RUNTIME_CONTEXT_END_MARKER}",
-                plan_runtime_context.trim()
-            )),
-        );
-    }
 }
 
 pub(super) fn strip_existing_plan_runtime_context(prompt: &str) -> String {
@@ -898,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_plan_runtime_context_adds_persisted_plan_and_active_task() {
+    fn build_plan_runtime_context_includes_persisted_plan_and_active_task() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = PlanStore::new(temp_dir.path()).expect("plan store");
         let session_id = "session-plan-runtime";
@@ -937,9 +900,6 @@ mod tests {
             .expect("write cursor");
 
         let mut session = Session::new(session_id, "model");
-        session
-            .messages
-            .insert(0, Message::system("Base prompt".to_string()));
         session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
         session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
             entered_at: Utc::now(),
@@ -960,51 +920,24 @@ mod tests {
             updated_at: Utc::now(),
         });
 
-        inject_plan_runtime_context_into_system_message(&mut session, Some(temp_dir.path()));
-
-        let system_msg = session
-            .messages
-            .iter()
-            .find(|m| matches!(m.role, bamboo_agent_core::Role::System))
-            .expect("system message");
-        assert!(system_msg
-            .content
-            .contains("DURABLE PLAN EXECUTION CONTEXT"));
-        assert!(system_msg.content.contains("Machine plan state:"));
-        assert!(system_msg.content.contains("last_completed_task_id: t0"));
-        assert!(system_msg.content.contains("round_hint: 5"));
-        assert!(system_msg.content.contains("Execution cursor:"));
-        assert!(system_msg.content.contains("current_task_ordinal: 2"));
-        assert!(system_msg.content.contains("next_task_id: t2"));
-        assert!(system_msg.content.contains("round_id_hint: round-5"));
-        assert!(system_msg
-            .content
-            .contains("tool_call_boundary: ExitPlanMode"));
-        assert!(system_msg.content.contains("Plan section index:"));
-        assert!(system_msg.content.contains("- mode: full"));
+        let context = build_plan_runtime_context(&session, Some(temp_dir.path()))
+            .expect("active plan mode yields runtime context");
+        assert!(context.contains("DURABLE PLAN EXECUTION CONTEXT"));
+        assert!(context.contains("Machine plan state:"));
+        assert!(context.contains("last_completed_task_id: t0"));
+        assert!(context.contains("round_hint: 5"));
+        assert!(context.contains("Execution cursor:"));
+        assert!(context.contains("current_task_ordinal: 2"));
+        assert!(context.contains("next_task_id: t2"));
+        assert!(context.contains("round_id_hint: round-5"));
+        assert!(context.contains("tool_call_boundary: ExitPlanMode"));
+        assert!(context.contains("Plan section index:"));
+        assert!(context.contains("- mode: full"));
     }
 
     #[test]
-    fn inject_plan_runtime_context_removes_block_when_plan_mode_inactive() {
-        let mut session = Session::new("session-1", "model");
-        session.messages.insert(
-            0,
-            Message::system(
-                "Base prompt\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\nOld\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->"
-                    .to_string(),
-            ),
-        );
-
-        inject_plan_runtime_context_into_system_message(&mut session, None);
-
-        let system_msg = session
-            .messages
-            .iter()
-            .find(|m| matches!(m.role, bamboo_agent_core::Role::System))
-            .expect("system message");
-        assert!(!system_msg
-            .content
-            .contains("BAMBOO_PLAN_RUNTIME_CONTEXT_START"));
-        assert!(system_msg.content.contains("Base prompt"));
+    fn build_plan_runtime_context_is_none_when_plan_mode_inactive() {
+        let session = Session::new("session-1", "model");
+        assert!(build_plan_runtime_context(&session, None).is_none());
     }
 }

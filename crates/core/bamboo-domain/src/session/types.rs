@@ -604,15 +604,49 @@ impl Session {
         }
     }
 
+    /// Create a child session directly under `root_session_id` — a flat,
+    /// depth-1 child of the root. Use [`Session::new_child_of`] when the parent
+    /// may itself be a child (nested sub-agents).
     pub fn new_child(
         id: impl Into<String>,
         root_session_id: impl Into<String>,
         model: impl Into<String>,
         title: impl Into<String>,
     ) -> Self {
+        let root_session_id = root_session_id.into();
+        Self::new_child_inner(id, root_session_id.clone(), root_session_id, 1, model, title)
+    }
+
+    /// Create a child session whose parent is `parent`, supporting arbitrary
+    /// nesting depth. The child inherits the parent's tree root and sits one
+    /// level deeper, so completion/SSE bookkeeping (which keys on
+    /// `root_session_id`) sees the whole tree regardless of depth.
+    pub fn new_child_of(
+        id: impl Into<String>,
+        parent: &Session,
+        model: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
+        Self::new_child_inner(
+            id,
+            parent.id.clone(),
+            parent.root_session_id.clone(),
+            parent.spawn_depth.saturating_add(1),
+            model,
+            title,
+        )
+    }
+
+    fn new_child_inner(
+        id: impl Into<String>,
+        parent_session_id: String,
+        root_session_id: String,
+        spawn_depth: u32,
+        model: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
         let now = Utc::now();
         let id = id.into();
-        let root_session_id = root_session_id.into();
         Self {
             id: id.clone(),
             title: title.into(),
@@ -620,9 +654,9 @@ impl Session {
             title_version: 0,
             metadata_version: 0,
             kind: SessionKind::Child,
-            parent_session_id: Some(root_session_id.clone()),
+            parent_session_id: Some(parent_session_id),
             root_session_id,
-            spawn_depth: 1,
+            spawn_depth,
             messages: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -1340,5 +1374,27 @@ mod tests {
         let session = Session::new("test-session", "test-model");
         let json = serde_json::to_string(&session).unwrap();
         assert!(!json.contains("compression_instructions"));
+    }
+
+    #[test]
+    fn new_child_is_depth_one_under_root() {
+        let root = Session::new("root-1", "m");
+        let child = Session::new_child_of("child-1", &root, "m", "c");
+        assert_eq!(child.kind, SessionKind::Child);
+        assert_eq!(child.parent_session_id.as_deref(), Some("root-1"));
+        assert_eq!(child.root_session_id, "root-1");
+        assert_eq!(child.spawn_depth, 1);
+    }
+
+    #[test]
+    fn new_child_of_supports_nesting_lineage() {
+        // root -> child -> grandchild: parent walks one level, root stays
+        // constant, depth increments.
+        let root = Session::new("root-1", "m");
+        let child = Session::new_child_of("child-1", &root, "m", "c");
+        let grandchild = Session::new_child_of("gc-1", &child, "m", "g");
+        assert_eq!(grandchild.parent_session_id.as_deref(), Some("child-1"));
+        assert_eq!(grandchild.root_session_id, "root-1");
+        assert_eq!(grandchild.spawn_depth, 2);
     }
 }

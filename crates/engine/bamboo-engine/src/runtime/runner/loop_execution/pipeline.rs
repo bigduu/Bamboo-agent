@@ -739,8 +739,6 @@ pub(super) async fn run_pipeline(
             session,
             config.prompt_memory_flags,
             Some(&runtime_context),
-            config.app_data_dir.as_deref(),
-            config.active_goal(),
         )
         .await;
 
@@ -1593,7 +1591,10 @@ mod tests {
         assert!(!outcome.sent_complete);
         let st = read_goal_state(&session).expect("goal state persisted");
         assert_eq!(st.status, GoalRuntimeStatus::Active);
-        assert_eq!(st.declared_status, None, "stale declaration cleared on veto");
+        assert_eq!(
+            st.declared_status, None,
+            "stale declaration cleared on veto"
+        );
         assert_eq!(st.continuation_count, 1);
     }
 
@@ -1670,17 +1671,16 @@ mod tests {
             } else {
                 // Round 2: finish with a plain message (no tool calls) → terminal.
                 Ok(Box::pin(stream::iter(vec![
-                    Ok(LLMChunk::Token(
-                        "Done — shipped and verified.".to_string(),
-                    )),
+                    Ok(LLMChunk::Token("Done — shipped and verified.".to_string())),
                     Ok(LLMChunk::Done),
                 ])))
             }
         }
     }
 
-    fn e2e_loop_state(session_id: &str) -> crate::runtime::runner::loop_execution::startup::LoopRunState
-    {
+    fn e2e_loop_state(
+        session_id: &str,
+    ) -> crate::runtime::runner::loop_execution::startup::LoopRunState {
         use crate::runtime::runner::loop_execution::startup::{
             GoldEvaluationState, LoopRunState, OverflowRecoveryState, TaskEvaluationState,
         };
@@ -1739,17 +1739,10 @@ mod tests {
         let mut state = e2e_loop_state("session-full-e2e");
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let sent_complete = super::run_pipeline(
-            &mut session,
-            &tx,
-            llm,
-            tools,
-            &cancel,
-            &config,
-            &mut state,
-        )
-        .await
-        .expect("pipeline runs to completion");
+        let sent_complete =
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+                .await
+                .expect("pipeline runs to completion");
 
         assert!(sent_complete, "the run emits a terminal Complete");
 

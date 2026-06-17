@@ -75,6 +75,10 @@ Follow the latest real user request and recent tool results over this block when
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextBlockType {
+    /// System base identity / persona (the `base` system block).
+    Base,
+    /// Framework-invariant operating directives folded on top of base.
+    CoreDirectives,
     Workspace,
     InstructionOverlay,
     ToolGuide,
@@ -85,6 +89,9 @@ pub enum ContextBlockType {
     MemoryRecall,
     PlanModeState,
     PlanRuntimeState,
+    /// Per-round session-goal block (placed in the volatile tail so a goal
+    /// change never invalidates the cached prefix).
+    GoalState,
     EnvSnapshot,
     RecoverySnapshot,
 }
@@ -92,6 +99,8 @@ pub enum ContextBlockType {
 impl ContextBlockType {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Base => "base",
+            Self::CoreDirectives => "core_directives",
             Self::Workspace => "workspace",
             Self::InstructionOverlay => "instruction_overlay",
             Self::ToolGuide => "tool_guide",
@@ -102,6 +111,7 @@ impl ContextBlockType {
             Self::MemoryRecall => "memory_recall",
             Self::PlanModeState => "plan_mode_state",
             Self::PlanRuntimeState => "plan_runtime_state",
+            Self::GoalState => "goal_state",
             Self::EnvSnapshot => "env_snapshot",
             Self::RecoverySnapshot => "recovery_snapshot",
         }

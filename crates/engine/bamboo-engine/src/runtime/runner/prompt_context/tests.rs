@@ -101,7 +101,7 @@ fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_marker
 }
 
 #[tokio::test]
-async fn inject_external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown(
+async fn external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown(
 ) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -117,7 +117,7 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
     let mut session = bamboo_agent_core::Session::new("session-dream-test", "test-model");
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -125,12 +125,8 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("Global Dream Summary (fallback)"));
     assert!(system_prompt.contains("Durable cross-session insight"));
@@ -142,7 +138,7 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
 }
 
 #[tokio::test]
-async fn inject_external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
+async fn external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-alpha");
@@ -175,7 +171,7 @@ async fn inject_external_memory_includes_project_memory_index_and_omits_global_d
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -183,12 +179,8 @@ async fn inject_external_memory_includes_project_memory_index_and_omits_global_d
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("Release freeze begins next week"));
@@ -198,7 +190,7 @@ async fn inject_external_memory_includes_project_memory_index_and_omits_global_d
 }
 
 #[tokio::test]
-async fn inject_external_memory_excludes_other_project_memory_index_content() {
+async fn external_memory_excludes_other_project_memory_index_content() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace_a = temp_dir.path().join("workspace-project-a");
@@ -244,7 +236,7 @@ async fn inject_external_memory_excludes_other_project_memory_index_content() {
         workspace_a.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -252,12 +244,8 @@ async fn inject_external_memory_excludes_other_project_memory_index_content() {
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("Project A release rule"));
@@ -267,7 +255,7 @@ async fn inject_external_memory_excludes_other_project_memory_index_content() {
 }
 
 #[tokio::test]
-async fn inject_external_memory_truncates_project_memory_index_and_adds_freshness_note() {
+async fn external_memory_truncates_project_memory_index_and_adds_freshness_note() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-beta");
@@ -297,7 +285,7 @@ async fn inject_external_memory_truncates_project_memory_index_and_adds_freshnes
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -305,12 +293,8 @@ async fn inject_external_memory_truncates_project_memory_index_and_adds_freshnes
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("showing "));
@@ -321,7 +305,7 @@ async fn inject_external_memory_truncates_project_memory_index_and_adds_freshnes
 }
 
 #[tokio::test]
-async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent() {
+async fn external_memory_truncates_multi_topic_content_and_is_idempotent() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     store
@@ -336,14 +320,14 @@ async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent(
     let mut session = bamboo_agent_core::Session::new("session-memory-many", "test-model");
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
     .await;
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -351,12 +335,8 @@ async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent(
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert_eq!(
         system_prompt
@@ -371,7 +351,7 @@ async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent(
 }
 
 #[tokio::test]
-async fn inject_external_memory_renders_relevant_memory_section_for_project_hits() {
+async fn external_memory_renders_relevant_memory_section_for_project_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-project");
@@ -403,7 +383,7 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
         "请记住我更喜欢 concise answers 并减少 recap",
     ));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -411,12 +391,8 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("User prefers concise answers"));
@@ -425,7 +401,7 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
 }
 
 #[tokio::test]
-async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
+async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-stale");
@@ -469,7 +445,7 @@ async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits
     );
     session.add_message(bamboo_agent_core::Message::user("release freeze policy"));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -477,12 +453,8 @@ async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("Release freeze policy"));
@@ -494,7 +466,7 @@ async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits
 }
 
 #[tokio::test]
-async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exists() {
+async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-none");
@@ -510,7 +482,7 @@ async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exis
         "this query should not match anything relevant",
     ));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -518,18 +490,14 @@ async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exis
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Relevant Durable Memories"));
 }
 
 #[tokio::test]
-async fn inject_external_memory_limits_relevant_memories_to_top_k() {
+async fn external_memory_limits_relevant_memories_to_top_k() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-topk");
@@ -562,7 +530,7 @@ async fn inject_external_memory_limits_relevant_memories_to_top_k() {
     );
     session.add_message(bamboo_agent_core::Message::user("release freeze"));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -570,19 +538,15 @@ async fn inject_external_memory_limits_relevant_memories_to_top_k() {
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert_eq!(system_prompt.matches("Summary:").count(), 3);
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits()
+async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits()
 {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -627,7 +591,7 @@ async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_p
     );
     session.add_message(bamboo_agent_core::Message::user("release checklist"));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -635,12 +599,8 @@ async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_p
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("Global release guidance"));
@@ -649,7 +609,7 @@ async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_p
 }
 
 #[tokio::test]
-async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
+async fn external_memory_prefers_project_dream_over_global_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-project-dream");
@@ -675,7 +635,7 @@ async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -683,12 +643,8 @@ async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Dream Summary"));
     assert!(system_prompt.contains("Project dream context"));
@@ -697,7 +653,7 @@ async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing(
+async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing(
 ) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -717,7 +673,7 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
@@ -725,12 +681,8 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
     assert!(system_prompt.contains("Global fallback dream"));
@@ -738,7 +690,7 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
 }
 
 #[tokio::test]
-async fn inject_external_memory_omits_project_index_when_project_prompt_injection_disabled() {
+async fn external_memory_omits_project_index_when_project_prompt_injection_disabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-no-project-index");
@@ -767,7 +719,7 @@ async fn inject_external_memory_omits_project_index_when_project_prompt_injectio
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {
@@ -778,12 +730,8 @@ async fn inject_external_memory_omits_project_index_when_project_prompt_injectio
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Project Durable Memory Index"));
     assert!(!system_prompt.contains("Project release rule"));
@@ -807,7 +755,7 @@ async fn inject_external_memory_omits_project_index_when_project_prompt_injectio
 }
 
 #[tokio::test]
-async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled(
+async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled(
 ) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -849,7 +797,7 @@ async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when
     );
     session.add_message(bamboo_agent_core::Message::user("concise answers"));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {
@@ -861,12 +809,8 @@ async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
@@ -890,7 +834,7 @@ async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
+async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-rerank-recall");
@@ -946,7 +890,7 @@ async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_ena
         "release freeze for mobile launch",
     ));
 
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {
@@ -957,12 +901,8 @@ async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_ena
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     let reranked_pos = system_prompt
         .find("Mobile launch blocker")
@@ -989,7 +929,7 @@ async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_ena
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_latest_background_model_on_repeated_refresh() {
+async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-rerank-reload");
@@ -1045,7 +985,7 @@ async fn inject_external_memory_uses_latest_background_model_on_repeated_refresh
         llm: Arc::new(provider.clone()),
         background_model_name: Some("bg-1".to_string()),
     };
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {
@@ -1060,7 +1000,7 @@ async fn inject_external_memory_uses_latest_background_model_on_repeated_refresh
         llm: Arc::new(provider.clone()),
         background_model_name: Some("bg-2".to_string()),
     };
-    super::inject_external_memory_into_system_message_with_store(
+    super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {

@@ -6,18 +6,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::{
-    strip_existing_core_directives, strip_existing_external_memory,
+    strip_existing_core_directives, strip_existing_external_memory, strip_existing_goal,
     strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
     strip_existing_task_list,
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
     assemble_prompt_envelope, build_conversation_summary_context_block,
-    build_external_memory_context_block_from_messages, build_plan_mode_context_block_from_messages,
-    build_plan_runtime_context_block_from_messages, build_task_list_context_block,
-    envelope_to_chat_messages, envelope_to_responses_view,
+    build_external_memory_context_block, build_goal_context_block, build_plan_mode_context_block,
+    build_plan_runtime_context_block, build_task_list_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
-    build_stable_prompt_frame_with_sections, merge_with_optional_contexts, StablePrefixSection,
+    build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
 use bamboo_agent_core::agent::events::TokenBudgetUsage;
 use bamboo_agent_core::tools::ToolSchema;
@@ -28,7 +27,10 @@ use bamboo_agent_core::{
 use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::provider::ResponsesRequestOptions;
-use bamboo_llm::{CacheTtl, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptLanes};
+use bamboo_llm::{
+    CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, Segment,
+    SegmentRole,
+};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -56,14 +58,6 @@ fn session_previous_response_id(session: &Session) -> Option<&str> {
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
-    let last_assistant_index = messages
-        .iter()
-        .rposition(|message| matches!(message.role, Role::Assistant))?;
-    let continuation = messages.get(last_assistant_index + 1..)?;
-    (!continuation.is_empty()).then_some(continuation)
 }
 
 fn provider_supports_previous_response_id(provider_type: Option<&str>) -> bool {
@@ -182,6 +176,10 @@ fn derive_system_remainder_message(
     let without_task_list = strip_existing_task_list(&without_external_memory);
     let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
     let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
+    // Strip a legacy goal block too: the goal now rides the volatile tail (built from
+    // the active goal), so a stale `<!-- BAMBOO_GOAL_START -->` left in an old
+    // persisted System message must not resurface as a duplicate in the remainder.
+    let without_goal = strip_existing_goal(&without_plan_runtime);
     // Framework directives always live in the assembled system field and are not
     // part of the persisted base, so strip them from both sides before comparing.
     // The directives are inserted INTO the `base` section (between the base text
@@ -193,7 +191,7 @@ fn derive_system_remainder_message(
     // the entire base as a redundant system message. Stripping both sides also
     // discards a STALE directive block in an old persisted message, so the current
     // directives (already in the system field) win.
-    let without_directives = strip_existing_core_directives(&without_plan_runtime);
+    let without_directives = strip_existing_core_directives(&without_goal);
     let trimmed = without_directives.trim();
     if trimmed.is_empty() {
         return None;
@@ -231,28 +229,15 @@ fn derive_system_remainder_message(
 }
 
 struct PreparedRequestEnvelope {
-    chat_messages: Vec<Message>,
-    /// Canonical, provider-facing prompt structure (the four lanes). Its
-    /// `flatten()` reproduces `chat_messages` exactly, so routing the normal
-    /// (non-continuation) request through `chat_stream_lanes` is byte-identical
-    /// until providers override it to consume the lanes structurally.
-    lanes: PromptLanes,
-    responses_input_messages: Vec<Message>,
-    system_remainder_messages: Vec<Message>,
-    dynamic_context_messages: Vec<Message>,
-    conversation_messages: Vec<Message>,
-    /// Per-round volatile context (recalled memory, task list, plan state),
-    /// rendered as messages and placed after the conversation history so it
-    /// never sits inside the cached prefix.
-    volatile_context_messages: Vec<Message>,
-    instructions: Option<String>,
-    envelope_observability:
-        crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
-    /// Prompt-cache plan for this request (cacheable system/tools plus rolling
-    /// summary and conversation-tail breakpoints).
-    cache_plan: PromptCachePlan,
+    /// The single canonical request and SOLE source of truth: system field +
+    /// ordered, addressable message runs (system_remainder and the volatile tail are
+    /// their OWN runs) + the cache plan (`ir.cache`). `continuation` is filled in at
+    /// dispatch time. Every provider renders its wire from this via `chat_stream_ir`;
+    /// every wire view (chat / Responses-input / continuation-delta) is derived by
+    /// the IR's lowering methods, so there are no parallel pre-baked message vecs.
+    ir: PromptIR,
     /// Per-section breakdown of the cacheable stable prefix, kept for prompt-cache
-    /// drift diagnostics (not sent to the provider).
+    /// drift diagnostics (not sent to the provider; not part of the wire IR).
     stable_prefix_sections: Vec<StablePrefixSection>,
 }
 
@@ -274,19 +259,26 @@ fn build_request_envelope(
     // it is cache-friendly there and gets its own (mostly stable) breakpoint.
     let mut front_blocks = Vec::new();
     let mut volatile_blocks = Vec::new();
-    if let Some(block) =
-        build_external_memory_context_block_from_messages(&prepared_context.messages)
-    {
+    if let Some(block) = build_external_memory_context_block(session) {
         volatile_blocks.push(block);
     }
     if let Some(block) = build_task_list_context_block(session) {
         volatile_blocks.push(block);
     }
-    if let Some(block) = build_plan_runtime_context_block_from_messages(&prepared_context.messages)
-    {
+    // Session goal rides the volatile tail (built directly from the active goal),
+    // NOT injected into the system message — so a goal change never invalidates
+    // the cached system prefix (goal-leak fix).
+    if let Some(block) = build_goal_context_block(config.active_goal()) {
         volatile_blocks.push(block);
     }
-    if let Some(block) = build_plan_mode_context_block_from_messages(&prepared_context.messages) {
+    // Plan runtime + plan mode blocks are built DIRECTLY from session state (the
+    // active PlanModeState + persisted plan artifacts), not reparsed from markers
+    // injected into the system message — so the system prefix stays cache-stable
+    // across plan transitions.
+    if let Some(block) = build_plan_runtime_context_block(session, config.app_data_dir.as_deref()) {
+        volatile_blocks.push(block);
+    }
+    if let Some(block) = build_plan_mode_context_block(session) {
         volatile_blocks.push(block);
     }
     if let Some(block) = build_conversation_summary_context_block(session) {
@@ -312,32 +304,21 @@ fn build_request_envelope(
         }
     }
 
-    let mut envelope_conversation_messages = system_remainder_messages.clone();
-    envelope_conversation_messages.extend(conversation_messages.clone());
-    // Last message of the cached region (before the volatile context appended
-    // below). A rolling breakpoint here lets the growing conversation cache
-    // incrementally turn over turn.
-    let conversation_breakpoint_id = envelope_conversation_messages
+    // Last message of the cached region (the SystemRemainder+Conversation runs,
+    // before the volatile context appended below). A rolling breakpoint here lets
+    // the growing conversation cache incrementally turn over turn.
+    let conversation_breakpoint_id = conversation_messages
         .last()
+        .or_else(|| system_remainder_messages.last())
         .map(|message| message.id.clone());
 
-    let mut envelope =
-        assemble_prompt_envelope(stable_frame, front_blocks, envelope_conversation_messages);
-    // Fill the (otherwise unset) stable-prefix hash so per-round drift can be
-    // observed and so the value surfaces in envelope observability/logs.
-    envelope.observability.stable_prefix_hash =
-        Some(super::prefix_drift::hash_sections(&stable_prefix_sections));
+    let envelope = assemble_prompt_envelope(stable_frame, front_blocks);
     // The only front block is the conversation summary (if present); its rendered
     // message id becomes the summary breakpoint.
     let summary_breakpoint_id = envelope
         .dynamic_context_messages
         .last()
         .map(|message| message.id.clone());
-
-    let responses_view = envelope_to_responses_view(&envelope);
-    let mut chat_messages = envelope_to_chat_messages(&envelope);
-    chat_messages.extend(volatile_context_messages.clone());
-    let envelope_observability = envelope.observability.clone();
 
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
     // pure adapters.
@@ -347,10 +328,9 @@ fn build_request_envelope(
     // of the system prompt and INTO a fixed prefix MESSAGE: the system keeps only
     // the static identity/workspace/env/skill, and the large, session-stable guide
     // rides as a typed context block at a known position with its own cache
-    // breakpoint. Applied to BOTH the chat lanes and the Responses-API view, so
-    // every provider family gets the same static-system structure. (The legacy
-    // `chat_messages` keeps the merged system, used only for the continuation
-    // delta and logging.)
+    // breakpoint — so every provider family gets the same static-system structure.
+    // The IR's lowering methods derive the chat / Responses-input / continuation
+    // views from these runs; the engine no longer pre-bakes any of them.
     let section = |name: &str| -> String {
         stable_prefix_sections
             .iter()
@@ -369,16 +349,43 @@ fn build_request_envelope(
     // sessions and across a mid-session workspace/skill injection, which is what
     // lets an automatic prefix cache (OpenAI/GLM-style, which has no explicit
     // breakpoints) actually hit on the big block instead of re-reading it.
+    // Assemble the cross-session-invariant system field as DISCRETE structured
+    // blocks (identity `base`, framework `core_directives`, globally-stable
+    // `env`) instead of one glued string. `system_blocks` is the structured form
+    // (observability/analysis + a block-native provider can render one wire block
+    // per entry); `lane_system` is their byte join for the legacy string wire
+    // path. Session-variable context (workspace/instruction/skill) is still
+    // relocated into context-block MESSAGES after the tool guide below.
+    let mut system_blocks: Vec<bamboo_domain::PromptBlock> = [
+        ("base", bamboo_domain::ContextBlockType::Base),
+        (
+            "core_directives",
+            bamboo_domain::ContextBlockType::CoreDirectives,
+        ),
+        ("env", bamboo_domain::ContextBlockType::EnvSnapshot),
+    ]
+    .into_iter()
+    .filter_map(|(name, kind)| {
+        let text = section(name);
+        (!text.trim().is_empty()).then(|| {
+            bamboo_domain::PromptBlock::new(name, kind, text)
+                .with_stability(bamboo_domain::ContextBlockStability::Stable)
+        })
+    })
+    .collect();
+    // The single system cache breakpoint anchors on the last system block.
+    if let Some(last) = system_blocks.last_mut() {
+        last.cache_anchor = true;
+    }
     let lane_system = if relocate_tool_guide {
-        merge_with_optional_contexts(
-            &section("base"),
-            None,
-            None,
-            Some(&section("env")),
-            "",
-            "", // tool guide + session context move to fixed prefix messages below
-        )
+        system_blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     } else {
+        // Zero-tools fallback: keep the legacy merged system string and no blocks.
+        system_blocks.clear();
         envelope.stable_instructions.clone()
     };
     let tool_guide_message = relocate_tool_guide.then(|| {
@@ -437,38 +444,15 @@ fn build_request_envelope(
         Vec::new()
     };
 
-    // Responses-API view mirrors the relocation: the guide leaves `instructions`
-    // and rides at the front of the input messages.
-    let instructions = if relocate_tool_guide {
-        let trimmed = lane_system.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    } else {
-        responses_view.instructions
-    };
-    let mut responses_input_messages = Vec::new();
-    if let Some(message) = tool_guide_message.clone() {
-        responses_input_messages.push(message);
-    }
-    responses_input_messages.extend(session_context_messages.clone());
-    responses_input_messages.extend(responses_view.input_messages);
-    responses_input_messages.extend(volatile_context_messages.clone());
-
+    // The Responses-API view (instructions = stable system, guide leading the input
+    // array) is no longer pre-baked here: the IR carries the system field + the
+    // ordered runs, and the OpenAI/Copilot adapter derives `instructions` /
+    // `input_messages` from it via `PromptIR::responses_request_options`.
     let mut stable_prefix_messages = envelope.stable_prefix_messages.clone();
     if let Some(message) = tool_guide_message {
         stable_prefix_messages.push(message);
     }
     stable_prefix_messages.extend(session_context_messages);
-
-    let lanes = PromptLanes {
-        stable_instructions: lane_system,
-        stable_prefix_messages,
-        dynamic_context_messages: envelope.dynamic_context_messages.clone(),
-        conversation_messages: {
-            let mut tail = envelope.conversation_messages.clone();
-            tail.extend(volatile_context_messages.clone());
-            tail
-        },
-    };
 
     // tools + system + (summary) + (conversation tail) — at most the
     // 4-breakpoint Anthropic budget. Providers without explicit breakpoints
@@ -504,18 +488,177 @@ fn build_request_envelope(
         ttl: CacheTtl::Extended,
     };
 
+    // The single canonical request: the system field plus the ordered, addressable
+    // message runs (system_remainder and the volatile tail are their OWN runs, so
+    // an adapter can derive the chat / Responses-input / continuation-delta views
+    // itself). `continuation` is set at dispatch time.
+    let ir = PromptIR {
+        system_text: lane_system,
+        system_blocks,
+        segments: vec![
+            Segment::new(SegmentRole::StablePrefix, stable_prefix_messages),
+            Segment::new(
+                SegmentRole::DynamicContext,
+                envelope.dynamic_context_messages.clone(),
+            ),
+            Segment::new(
+                SegmentRole::SystemRemainder,
+                system_remainder_messages.clone(),
+            ),
+            Segment::new(SegmentRole::Conversation, conversation_messages.clone()),
+            Segment::new(SegmentRole::VolatileTail, volatile_context_messages.clone()),
+        ],
+        cache: cache_plan,
+        continuation: None,
+    };
+
     PreparedRequestEnvelope {
-        chat_messages,
-        lanes,
-        responses_input_messages,
-        system_remainder_messages,
-        dynamic_context_messages: envelope.dynamic_context_messages.clone(),
-        conversation_messages,
-        volatile_context_messages,
-        instructions,
-        envelope_observability,
-        cache_plan,
+        ir,
         stable_prefix_sections,
+    }
+}
+
+/// Session metadata key holding the latest [`RequestRenderObservability`] JSON.
+const SESSION_REQUEST_RENDER_KEY: &str = "llm_request_render";
+
+/// Structured, observable record of how the canonical request was rendered for
+/// the provider this round — the single place the engine's request-shaping
+/// decision is captured: the wire path, the system-field shape, per-lane message
+/// counts, and the cache plan. Logged and persisted to session metadata so the
+/// rendered request is inspectable after the fact.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct RequestRenderObservability {
+    /// `"lanes"` (canonical structured path) or `"responses_continuation"` (delta).
+    pub wire: &'static str,
+    /// Structured system blocks (0 → the system field is a single joined string).
+    pub system_block_count: usize,
+    pub system_chars: usize,
+    pub stable_prefix_messages: usize,
+    pub dynamic_context_messages: usize,
+    pub conversation_messages: usize,
+    pub volatile_context_messages: usize,
+    /// Messages actually sent: the continuation delta size, or the full chat list.
+    pub request_message_count: usize,
+    pub tool_count: usize,
+    pub cache_system: bool,
+    pub cache_tools: bool,
+    pub cache_breakpoints: usize,
+    pub cache_ttl: &'static str,
+}
+
+impl RequestRenderObservability {
+    fn log(&self, session_id: &str) {
+        tracing::info!(
+            "[{}] LLM request render: wire={} system_blocks={} system_chars={} stable_prefix_msgs={} dynamic_ctx_msgs={} conversation_msgs={} volatile_ctx_msgs={} request_msgs={} tools={} cache(system={}, tools={}, breakpoints={}, ttl={})",
+            session_id,
+            self.wire,
+            self.system_block_count,
+            self.system_chars,
+            self.stable_prefix_messages,
+            self.dynamic_context_messages,
+            self.conversation_messages,
+            self.volatile_context_messages,
+            self.request_message_count,
+            self.tool_count,
+            self.cache_system,
+            self.cache_tools,
+            self.cache_breakpoints,
+            self.cache_ttl,
+        );
+    }
+}
+
+/// The fully-resolved provider request the engine will dispatch, plus its
+/// observability. Produced once per round by [`plan_llm_request`] — the single
+/// home for turning the canonical [`PromptIR`] into a concrete provider request
+/// and choosing the wire path. This consolidates what used to
+/// be inline branching in `execute_llm_stream`, so the request-shaping capability
+/// is one testable unit with a structured, inspectable result.
+struct LlmRequestPlan {
+    request_options: LLMRequestOptions,
+    render: RequestRenderObservability,
+}
+
+fn cache_ttl_label(ttl: CacheTtl) -> &'static str {
+    if ttl == CacheTtl::Extended {
+        "1h"
+    } else {
+        "5m"
+    }
+}
+
+/// Turn the canonical request envelope into a concrete provider request. The
+/// envelope's `ir.continuation` must already be set (at dispatch time) when this is
+/// a stateful Responses turn. This builds only the request POLICY — store /
+/// verbosity / reasoning / include / cache — and never the prompt wire view: the
+/// provider derives `instructions` / `input_messages` / the continuation delta from
+/// the IR itself. The returned [`LlmRequestPlan::render`] records the decision.
+fn plan_llm_request(
+    envelope: &PreparedRequestEnvelope,
+    session_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    tool_count: usize,
+) -> LlmRequestPlan {
+    let is_continuation = envelope.ir.continuation.is_some();
+
+    // The engine sets request POLICY only. The Responses prompt wire view
+    // (instructions / input_messages / previous_response_id) is derived by the
+    // OpenAI/Copilot adapter from the IR via `responses_request_options`.
+    let responses_options = ResponsesRequestOptions {
+        store: Some(false),
+        // Encourage the model to emit visible narration alongside tool calls.
+        text_verbosity: Some("high".to_string()),
+        reasoning_summary: Some("auto".to_string()),
+        include: Some(vec!["reasoning.encrypted_content".to_string()]),
+        ..Default::default()
+    };
+
+    let request_options = LLMRequestOptions {
+        session_id: Some(session_id.to_string()),
+        reasoning_effort,
+        parallel_tool_calls: Some(true),
+        responses: Some(responses_options),
+        request_purpose: Some("agent_loop".to_string()),
+        cache: Some(envelope.ir.cache.clone()),
+    };
+
+    // Observability is sourced from the IR (the single canonical structure), so the
+    // recorded shape can't drift from what the lowering methods actually send.
+    let render = RequestRenderObservability {
+        wire: if is_continuation {
+            "responses_continuation"
+        } else {
+            "lanes"
+        },
+        system_block_count: envelope.ir.system_blocks.len(),
+        system_chars: envelope.ir.system_field().len(),
+        stable_prefix_messages: envelope.ir.run(SegmentRole::StablePrefix).len(),
+        dynamic_context_messages: envelope.ir.run(SegmentRole::DynamicContext).len(),
+        conversation_messages: envelope.ir.run(SegmentRole::Conversation).len(),
+        volatile_context_messages: envelope.ir.run(SegmentRole::VolatileTail).len(),
+        request_message_count: if is_continuation {
+            envelope.ir.continuation_delta().len()
+        } else {
+            envelope.ir.flatten().len()
+        },
+        tool_count,
+        cache_system: envelope.ir.cache.cache_system,
+        cache_tools: envelope.ir.cache.cache_tools,
+        cache_breakpoints: envelope.ir.cache.breakpoint_message_ids.len(),
+        cache_ttl: cache_ttl_label(envelope.ir.cache.ttl),
+    };
+
+    LlmRequestPlan {
+        request_options,
+        render,
+    }
+}
+
+fn persist_request_render_metadata(session: &mut Session, render: &RequestRenderObservability) {
+    if let Ok(value) = serde_json::to_string(render) {
+        session
+            .metadata
+            .insert(SESSION_REQUEST_RENDER_KEY.to_string(), value);
     }
 }
 
@@ -548,7 +691,8 @@ pub(super) async fn execute_llm_stream(
         None
     };
 
-    let prepared_envelope = build_request_envelope(session, prepared_context, config, tool_schemas);
+    let mut prepared_envelope =
+        build_request_envelope(session, prepared_context, config, tool_schemas);
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -557,114 +701,66 @@ pub(super) async fn execute_llm_stream(
         config.app_data_dir.as_deref(),
         &prepared_envelope.stable_prefix_sections,
     );
-    let request_messages_buf = if previous_response_id.is_some() {
-        let mut delta_messages = prepared_envelope.system_remainder_messages.clone();
-        delta_messages.extend(prepared_envelope.dynamic_context_messages.clone());
-        if let Some(conversation_delta) =
-            continuation_messages(&prepared_envelope.conversation_messages)
-        {
-            delta_messages.extend_from_slice(conversation_delta);
-        } else {
-            delta_messages.extend(prepared_envelope.conversation_messages.clone());
-        }
-        // Volatile context is re-sent each turn (it changes every round) and
-        // belongs at the tail, matching the non-delta ordering.
-        delta_messages.extend(prepared_envelope.volatile_context_messages.clone());
-        delta_messages
-    } else {
-        prepared_envelope.chat_messages.clone()
-    };
-    let request_messages = request_messages_buf.as_slice();
-
-    let mut responses_options = ResponsesRequestOptions {
-        store: Some(false),
-        // Encourage the model to emit visible narration alongside tool calls.
-        text_verbosity: Some("high".to_string()),
-        reasoning_summary: Some("auto".to_string()),
-        include: Some(vec!["reasoning.encrypted_content".to_string()]),
-        instructions: prepared_envelope.instructions.clone(),
-        input_messages: Some(prepared_envelope.responses_input_messages.clone()),
-        ..Default::default()
-    };
+    // Set the stateful Responses continuation on the IR (boundary = the last
+    // assistant turn in the conversation run) BEFORE planning, so the provider — or
+    // the default lowering — derives the delta itself from addressable runs and the
+    // plan's wire label reflects it.
     if let Some(response_id) = previous_response_id.as_deref() {
-        responses_options.previous_response_id = Some(response_id.to_string());
+        let last_committed_assistant_id = prepared_envelope
+            .ir
+            .run(SegmentRole::Conversation)
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::Assistant))
+            .map(|message| message.id.clone());
+        prepared_envelope.ir.continuation = Some(Continuation {
+            previous_response_id: response_id.to_string(),
+            last_committed_assistant_id,
+        });
     }
-    // Cache plan computed by the envelope: stable system prompt + tool
-    // definitions, plus rolling summary and conversation-tail breakpoints. The
-    // envelope keeps per-round volatile content (task list, recalled memory, plan
-    // state) in trailing context-block messages, so everything up to the
-    // conversation-tail breakpoint is byte-stable across rounds and caches
-    // incrementally — a stable, growing cache read instead of one that swings or
-    // drops to zero.
-    let request_options = LLMRequestOptions {
-        session_id: Some(session_id.to_string()),
-        reasoning_effort,
-        parallel_tool_calls: Some(true),
-        responses: Some(responses_options),
-        request_purpose: Some("agent_loop".to_string()),
-        cache: Some(prepared_envelope.cache_plan.clone()),
-    };
 
+    // Single home for turning the canonical envelope into a concrete provider
+    // request (request POLICY + observability). The cache plan keeps per-round
+    // volatile content in trailing context-block messages, so everything up to the
+    // conversation-tail breakpoint is byte-stable across rounds and caches
+    // incrementally.
+    let planned = plan_llm_request(
+        &prepared_envelope,
+        session_id,
+        reasoning_effort,
+        tool_schemas.len(),
+    );
     if !supports_previous_response_id {
         tracing::debug!(
             "[{}] Responses API previous_response_id disabled for provider={}",
             session_id,
             provider_name.unwrap_or("unknown")
         );
-    } else if let Some(response_id) = previous_response_id.as_deref() {
-        tracing::debug!(
-            "[{}] Continuing Responses API turn with previous_response_id={} using {} delta messages ({} total messages in context)",
-            session_id,
-            response_id,
-            request_messages.len(),
-            request_messages_buf.len()
-        );
     }
+    // Structured, inspectable record of how this request was rendered.
+    planned.render.log(session_id);
+    persist_request_render_metadata(session, &planned.render);
 
-    tracing::info!(
-        "[{}] LLM request: model={}, parallel_tool_calls={:?}, reasoning_effort={:?}, tools={}, messages={}, responses_input_messages={}, dynamic_context_messages={}, envelope_blocks={:?}",
-        session_id,
-        model,
-        request_options.parallel_tool_calls,
-        request_options.reasoning_effort,
-        tool_schemas.len(),
-        request_messages.len(),
-        prepared_envelope.responses_input_messages.len(),
-        prepared_envelope.envelope_observability.dynamic_context_message_count,
-        prepared_envelope.envelope_observability.included_block_types,
-    );
-    // Normal request → canonical lanes (provider renders system + cache
-    // breakpoints structurally; default impl flattens to the same bytes as
-    // `request_messages`). The Responses-API continuation path sends only a delta
-    // of messages, which the lane model doesn't represent, so it stays on the
-    // flat `chat_stream_with_options` entry point.
-    let stream = if previous_response_id.is_some() {
-        llm.chat_stream_with_options(
-            request_messages,
+    // ONE canonical dispatch: every provider renders the IR. The default lowering
+    // (chat / continuation-delta) and the provider overrides (Anthropic block-native
+    // system, OpenAI/Copilot Responses view) all derive their wire from this IR.
+    let stream = llm
+        .chat_stream_ir(
+            &prepared_envelope.ir,
             tool_schemas,
             Some(max_output_tokens),
             model,
-            Some(&request_options),
+            Some(&planned.request_options),
         )
         .await
-    } else {
-        llm.chat_stream_lanes(
-            &prepared_envelope.lanes,
-            tool_schemas,
-            Some(max_output_tokens),
-            model,
-            Some(&request_options),
-        )
-        .await
-    }
-    .map_err(|error| {
-        let message = format_provider_error(error);
-        if is_llm_overflow_error(&message) {
-            AgentError::LLMOverflow(message)
-        } else {
-            AgentError::LLM(message)
-        }
-    })?;
+        .map_err(|error| {
+            let message = format_provider_error(error);
+            if is_llm_overflow_error(&message) {
+                AgentError::LLMOverflow(message)
+            } else {
+                AgentError::LLM(message)
+            }
+        })?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.

@@ -11,7 +11,7 @@ use bamboo_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
 use super::super::prompt_context::{
     append_core_agent_directives, merge_system_prompt_with_contexts,
-    strip_existing_core_directives, strip_existing_external_memory,
+    strip_existing_core_directives, strip_existing_external_memory, strip_existing_goal,
     strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
     strip_existing_task_list,
 };
@@ -285,14 +285,15 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
         .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
     let env_context = extract_env_context(&raw_base_prompt)
         .or_else(crate::runtime::context::build_env_prompt_context);
-    // Framework-invariant operating directives ride on top of the (user-swappable)
-    // base so they survive a custom `system-prompt.md` override. Folded into the
-    // `base` section here so they land in the cacheable system field without
-    // touching the lane/cache-breakpoint assembly downstream.
-    let base_prompt = append_core_agent_directives(
-        &normalize_base_prompt(&raw_base_prompt),
-        crate::runtime::context::CORE_AGENT_DIRECTIVES,
-    );
+    // Base identity and the framework-invariant operating directives are kept as
+    // SEPARATE structured sections (`base` / `core_directives`) so downstream
+    // assembly can emit them as discrete content blocks instead of one glued
+    // string. `base_prompt` (the two folded together, the way it shipped before)
+    // is still produced for the legacy `stable_instructions` string consumed by
+    // the non-relocate fallback path.
+    let base_only = normalize_base_prompt(&raw_base_prompt);
+    let core_directives = crate::runtime::context::CORE_AGENT_DIRECTIVES.to_string();
+    let base_prompt = append_core_agent_directives(&base_only, &core_directives);
 
     let skill_context = session
         .metadata
@@ -320,7 +321,11 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
     let sections = vec![
         StablePrefixSection {
             name: "base",
-            content: base_prompt,
+            content: base_only,
+        },
+        StablePrefixSection {
+            name: "core_directives",
+            content: core_directives,
         },
         StablePrefixSection {
             name: "workspace",
@@ -658,11 +663,15 @@ fn normalize_base_prompt(prompt: &str) -> String {
     let without_task_list = strip_existing_task_list(&without_external_memory);
     let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
     let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
+    // The session goal now rides a dedicated volatile block, never the system
+    // field. Strip any goal left in a legacy persisted System message so it can't
+    // re-leak into the cached `base` block (the goal-leak fix).
+    let without_goal = strip_existing_goal(&without_plan_runtime);
     // Strip framework directives too, so normalize yields a clean base uniformly
     // with every other framework-injected section. They are re-added (idempotent)
     // by `append_core_agent_directives` during assembly; stripping here keeps a
     // clean base even if directives ever leak into a persisted System message.
-    let without_directives = strip_existing_core_directives(&without_plan_runtime);
+    let without_directives = strip_existing_core_directives(&without_goal);
     merge_system_prompt_with_contexts(&without_directives, "", "")
 }
 
@@ -894,4 +903,29 @@ fn persist_runtime_prompt_metadata(session: &mut Session, report: &PromptAssembl
         RUNTIME_PROMPT_SECTION_LAYOUT_KEY.to_string(),
         report.section_layout_value(),
     );
+}
+
+#[cfg(test)]
+mod block_refactor_tests {
+    use super::normalize_base_prompt;
+
+    /// Regression guard for the goal-leak fix: a goal block left in a legacy
+    /// persisted System message must be stripped by `normalize_base_prompt`, so
+    /// it never re-enters the cached `base` system block. The goal now rides a
+    /// dedicated volatile tail block instead.
+    #[test]
+    fn normalize_strips_legacy_goal_block_so_it_cannot_leak_into_base() {
+        let with_goal = "You are Bodhi.\n\n\
+<!-- BAMBOO_GOAL_START -->\n## Session Goal\nship the feature\n<!-- BAMBOO_GOAL_END -->";
+        let base = normalize_base_prompt(with_goal);
+        assert!(base.contains("You are Bodhi."));
+        assert!(
+            !base.contains("BAMBOO_GOAL_START"),
+            "goal markers must be stripped from base"
+        );
+        assert!(
+            !base.contains("ship the feature"),
+            "goal text must not leak into the cached base block"
+        );
+    }
 }

@@ -4,7 +4,7 @@
 //! its runner, wires the event forwarder + heartbeat + watchdog, builds the full
 //! [`ExecuteRequest`], runs the child loop, and publishes the terminal child
 //! completion. Both the background scheduler (`run_spawn_job`) and the ergonomic
-//! [`crate::sdk::runner::ProfileRunner`] delegate here so behavior — event
+//! [`crate::sdk::runner::ChildRunner`] delegate here so behavior — event
 //! ordering, status strings, and field set — stays identical across entry points.
 
 use std::sync::Arc;

@@ -729,9 +729,29 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
     );
 }
 
+/// Put the session into active plan mode so the canonical plan-mode/plan-runtime
+/// blocks (built directly from session state, not reparsed from markers) render.
+fn activate_plan_mode(session: &mut Session) {
+    use bamboo_domain::session::runtime_state::{AgentRuntimeState, PlanModeState, PlanModeStatus};
+    session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+    session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+        entered_at: chrono::Utc::now(),
+        pre_permission_mode: "default".to_string(),
+        plan_file_path: None,
+        status: PlanModeStatus::Designing,
+    });
+}
+
 #[tokio::test]
 async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
+    activate_plan_mode(&mut session);
+    // External memory now rides a session field (the async refresh populates it),
+    // not a system-message marker.
+    session.metadata.insert(
+        crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+        "## External Memory (Persistent)\n\nSession memory note".to_string(),
+    );
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 1200,
         max_output_tokens: 200,
@@ -832,6 +852,7 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
 #[tokio::test]
 async fn pre_turn_host_context_compression_includes_available_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-pre-turn-context-blocks", "test-model");
+    activate_plan_mode(&mut session);
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 1200,
         max_output_tokens: 200,
@@ -1342,7 +1363,10 @@ async fn multi_round_compression_cycle() {
 }
 
 #[tokio::test]
-async fn five_level_degradation_strips_in_order() {
+async fn degradation_strips_system_sections_in_order() {
+    // Degradation only strips sections that still live in the system message:
+    // tool_guide -> skill_context -> env_context. External memory and the task
+    // list ride volatile blocks now, so their markers are NOT touched here.
     let mut session = Session::new("session-5-level-degrade", "test-model");
     session.messages.push(Message::system(
         "Base prompt\n\
@@ -1391,9 +1415,10 @@ async fn five_level_degradation_strips_in_order() {
     assert!(applied);
     let prompt = system_prompt(&session);
     assert!(!prompt.contains("BAMBOO_SKILL_CONTEXT"));
-    assert!(prompt.contains("BAMBOO_EXTERNAL_MEMORY"));
+    assert!(prompt.contains("BAMBOO_ENV_CONTEXT"));
 
-    // 3rd call: strips external_memory
+    // 3rd call: strips env_context. External memory + task list markers are left
+    // untouched (they are no longer system-message sections).
     let applied = super::force_overflow_context_recovery(
         &mut session,
         &config,
@@ -1406,39 +1431,9 @@ async fn five_level_degradation_strips_in_order() {
     .expect("third degradation");
     assert!(applied);
     let prompt = system_prompt(&session);
-    assert!(!prompt.contains("BAMBOO_EXTERNAL_MEMORY"));
-    assert!(prompt.contains("BAMBOO_TASK_LIST"));
-
-    // 4th call: strips task_list
-    let applied = super::force_overflow_context_recovery(
-        &mut session,
-        &config,
-        "test-model",
-        "session-5-level-degrade",
-        &llm,
-        None,
-    )
-    .await
-    .expect("fourth degradation");
-    assert!(applied);
-    let prompt = system_prompt(&session);
-    assert!(!prompt.contains("BAMBOO_TASK_LIST"));
-    assert!(prompt.contains("BAMBOO_ENV_CONTEXT"));
-
-    // 5th call: strips env_context
-    let applied = super::force_overflow_context_recovery(
-        &mut session,
-        &config,
-        "test-model",
-        "session-5-level-degrade",
-        &llm,
-        None,
-    )
-    .await
-    .expect("fifth degradation");
-    assert!(applied);
-    let prompt = system_prompt(&session);
     assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
+    assert!(prompt.contains("BAMBOO_EXTERNAL_MEMORY"));
+    assert!(prompt.contains("BAMBOO_TASK_LIST"));
     assert!(prompt.contains("Base prompt"));
 }
 

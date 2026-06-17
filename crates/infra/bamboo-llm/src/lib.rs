@@ -3,8 +3,10 @@
 pub mod cache;
 pub mod error;
 pub mod http_client;
+pub mod masking;
 pub mod model_catalog;
 pub mod models;
+pub mod prompt_ir;
 pub mod protocol;
 pub mod provider;
 pub mod provider_factory;
@@ -29,11 +31,12 @@ pub use cache::{CacheTtl, PromptCachePlan};
 pub use error::ProxyAuthRequiredError;
 pub use model_catalog::ModelCatalogService;
 pub use models::*;
+pub use prompt_ir::{Continuation, PromptIR, Segment, SegmentRole};
 pub use protocol::{
     AnthropicProtocol, FromProvider, GeminiProtocol, OpenAIProtocol, ProtocolError, ProtocolResult,
     ToProvider,
 };
-pub use provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, PromptLanes};
+pub use provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
 pub use provider_factory::{
     create_provider, create_provider_by_name, create_provider_with_dir, validate_provider_config,
     AVAILABLE_PROVIDERS,

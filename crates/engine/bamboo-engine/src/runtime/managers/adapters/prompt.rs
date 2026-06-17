@@ -82,15 +82,11 @@ impl PromptManager for DefaultPromptManager {
     }
 
     async fn refresh_external_memory(&self, session: &mut Session, config: &AgentLoopConfig) {
-        crate::runtime::runner::prompt_context::inject_external_memory_into_system_message(
+        crate::runtime::runner::prompt_context::refresh_external_memory_context(
             session,
             config.prompt_memory_flags,
             None,
         )
         .await;
-    }
-
-    fn refresh_task_list(&self, session: &mut Session) {
-        crate::runtime::runner::prompt_context::inject_task_list_into_system_message(session);
     }
 }

@@ -1,8 +1,8 @@
 use crate::llm_summarizer::LlmSummarizer;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    build_external_memory_context_block_from_messages, build_plan_mode_context_block_from_messages,
-    build_plan_runtime_context_block_from_messages, build_task_list_context_block,
+    build_external_memory_context_block, build_plan_mode_context_block,
+    build_plan_runtime_context_block, build_task_list_context_block,
 };
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
@@ -19,8 +19,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use super::super::prompt_context::{
-    strip_existing_env_context, strip_existing_external_memory, strip_existing_skill_context,
-    strip_existing_task_list, strip_existing_tool_guide_context,
+    strip_existing_env_context, strip_existing_skill_context, strip_existing_tool_guide_context,
 };
 
 mod logging;
@@ -106,11 +105,12 @@ fn emit_context_pressure_notification(
 type DegradationStripFn = fn(&str) -> String;
 type DegradationLevel = (&'static str, DegradationStripFn);
 
+// External memory and task list no longer live in the system message (they ride
+// volatile blocks built from session state/field), so they are not strippable
+// here — overflow sheds them via conversation/tail compression instead.
 const DEGRADATION_LEVELS: &[DegradationLevel] = &[
     ("tool_guide", strip_existing_tool_guide_context),
     ("skill_context", strip_existing_skill_context),
-    ("external_memory", strip_existing_external_memory),
-    ("task_list", strip_existing_task_list),
     ("env_context", strip_existing_env_context),
 ];
 
@@ -131,18 +131,22 @@ fn degrade_prompt_context_sections_for_overflow(session: &mut Session) -> Option
     None
 }
 
-fn build_compression_context_blocks(session: &Session) -> Vec<ContextBlock> {
+fn build_compression_context_blocks(
+    session: &Session,
+    app_data_dir: Option<&std::path::Path>,
+) -> Vec<ContextBlock> {
     let mut blocks = Vec::new();
     if let Some(block) = build_task_list_context_block(session) {
         blocks.push(block);
     }
-    if let Some(block) = build_external_memory_context_block_from_messages(&session.messages) {
+    if let Some(block) = build_external_memory_context_block(session) {
         blocks.push(block);
     }
-    if let Some(block) = build_plan_runtime_context_block_from_messages(&session.messages) {
+    // Plan blocks come straight from session state, not reparsed markers.
+    if let Some(block) = build_plan_runtime_context_block(session, app_data_dir) {
         blocks.push(block);
     }
-    if let Some(block) = build_plan_mode_context_block_from_messages(&session.messages) {
+    if let Some(block) = build_plan_mode_context_block(session) {
         blocks.push(block);
     }
     blocks
@@ -293,7 +297,8 @@ async fn maybe_apply_host_context_compression_with_budget(
         .conversation_summary
         .as_ref()
         .map(|summary| summary.content.clone());
-    let compression_context_blocks = build_compression_context_blocks(session);
+    let compression_context_blocks =
+        build_compression_context_blocks(session, config.app_data_dir.as_deref());
 
     let base_instructions = session
         .compression_instructions

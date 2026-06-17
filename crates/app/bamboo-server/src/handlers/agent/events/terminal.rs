@@ -121,17 +121,30 @@ pub(super) fn session_prevents_terminal_event(session: Option<&Session>) -> bool
         .is_some_and(|runtime| matches!(runtime.status, AgentStatusState::Suspended))
 }
 
+/// Whether the watched session still has any running **descendant** (transitive,
+/// not just direct children). The root's SSE stream stays open until every
+/// descendant in its tree finishes — required once sub-agents nest, since an
+/// intermediate child can suspend (its runner gone) while a grandchild still
+/// runs. For a flat tree (every child directly under the root) this is identical
+/// to the old direct-child check, because a direct child's `root_session_id`
+/// equals the root's.
 pub(super) async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
+    // The tree root the watched session belongs to (a Root is its own root).
+    let watched_root = state
+        .session_store
+        .get_index_entry(session_id)
+        .await
+        .map(|entry| entry.root_session_id)
+        .unwrap_or_else(|| session_id.to_string());
+
     let running_session_ids: Vec<String> = {
         let runners = state.agent_runners.read().await;
         runners
             .iter()
-            .filter_map(|(session_id, runner)| {
-                if matches!(runner.status, AgentStatus::Running) {
-                    Some(session_id.clone())
-                } else {
-                    None
-                }
+            .filter_map(|(running_id, runner)| {
+                (matches!(runner.status, AgentStatus::Running)
+                    && running_id.as_str() != session_id)
+                    .then(|| running_id.clone())
             })
             .collect()
     };
@@ -144,9 +157,7 @@ pub(super) async fn has_running_child(state: &web::Data<AppState>, session_id: &
         else {
             continue;
         };
-        if entry.kind == SessionKind::Child
-            && entry.parent_session_id.as_deref() == Some(session_id)
-        {
+        if entry.kind == SessionKind::Child && entry.root_session_id == watched_root {
             return true;
         }
     }
