@@ -101,7 +101,7 @@ fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_marker
 }
 
 #[tokio::test]
-async fn inject_external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown(
+async fn external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown(
 ) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -138,7 +138,7 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
 }
 
 #[tokio::test]
-async fn inject_external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
+async fn external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-alpha");
@@ -190,7 +190,7 @@ async fn inject_external_memory_includes_project_memory_index_and_omits_global_d
 }
 
 #[tokio::test]
-async fn inject_external_memory_excludes_other_project_memory_index_content() {
+async fn external_memory_excludes_other_project_memory_index_content() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace_a = temp_dir.path().join("workspace-project-a");
@@ -255,7 +255,7 @@ async fn inject_external_memory_excludes_other_project_memory_index_content() {
 }
 
 #[tokio::test]
-async fn inject_external_memory_truncates_project_memory_index_and_adds_freshness_note() {
+async fn external_memory_truncates_project_memory_index_and_adds_freshness_note() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-beta");
@@ -305,7 +305,7 @@ async fn inject_external_memory_truncates_project_memory_index_and_adds_freshnes
 }
 
 #[tokio::test]
-async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent() {
+async fn external_memory_truncates_multi_topic_content_and_is_idempotent() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     store
@@ -351,7 +351,7 @@ async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent(
 }
 
 #[tokio::test]
-async fn inject_external_memory_renders_relevant_memory_section_for_project_hits() {
+async fn external_memory_renders_relevant_memory_section_for_project_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-project");
@@ -401,7 +401,7 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
 }
 
 #[tokio::test]
-async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
+async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-stale");
@@ -466,7 +466,7 @@ async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits
 }
 
 #[tokio::test]
-async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exists() {
+async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-none");
@@ -497,7 +497,7 @@ async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exis
 }
 
 #[tokio::test]
-async fn inject_external_memory_limits_relevant_memories_to_top_k() {
+async fn external_memory_limits_relevant_memories_to_top_k() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-topk");
@@ -546,7 +546,7 @@ async fn inject_external_memory_limits_relevant_memories_to_top_k() {
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits()
+async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits()
 {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -609,7 +609,7 @@ async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_p
 }
 
 #[tokio::test]
-async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
+async fn external_memory_prefers_project_dream_over_global_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-project-dream");
@@ -653,7 +653,7 @@ async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing(
+async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing(
 ) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -690,7 +690,7 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
 }
 
 #[tokio::test]
-async fn inject_external_memory_omits_project_index_when_project_prompt_injection_disabled() {
+async fn external_memory_omits_project_index_when_project_prompt_injection_disabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-no-project-index");
@@ -755,7 +755,7 @@ async fn inject_external_memory_omits_project_index_when_project_prompt_injectio
 }
 
 #[tokio::test]
-async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled(
+async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled(
 ) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
@@ -834,7 +834,7 @@ async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
+async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-rerank-recall");
@@ -929,7 +929,7 @@ async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_ena
 }
 
 #[tokio::test]
-async fn inject_external_memory_uses_latest_background_model_on_repeated_refresh() {
+async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-rerank-reload");
