@@ -23,13 +23,13 @@ pub const DEFAULT_MODEL_PATTERN: &str = "default";
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 1_000_000;
 
 /// Global default maximum output tokens.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64_000;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
 /// Default safety margin for token counting errors (floor; scales with context
 /// window via [`ModelLimit::get_safety_margin`]).
 pub const DEFAULT_SAFETY_MARGIN: u32 = 1000;
 
-/// Build the single global default limit (`1M` context / `64K` output).
+/// Build the single global default limit (`1M` context / `128K` output).
 pub fn default_model_limit() -> ModelLimit {
     builtin_limit(
         DEFAULT_MODEL_PATTERN,
@@ -289,11 +289,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_limit_is_1m_64k() {
+    fn default_limit_is_1m_128k() {
         let limit = default_model_limit();
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(limit.max_context_tokens, 1_000_000);
-        assert_eq!(limit.get_max_output_tokens(), 64_000);
+        assert_eq!(limit.get_max_output_tokens(), 128_000);
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
         let limit = registry.get_or_default("unknown-model-xyz");
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(limit.max_context_tokens, 1_000_000);
-        assert_eq!(limit.get_max_output_tokens(), 64_000);
+        assert_eq!(limit.get_max_output_tokens(), 128_000);
     }
 
     #[test]
@@ -458,13 +458,13 @@ mod tests {
         let unknown = registry.get_or_default("brand-new-frontier-model");
         assert_eq!(unknown.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(unknown.max_context_tokens, 1_000_000);
-        assert_eq!(unknown.get_max_output_tokens(), 64_000);
+        assert_eq!(unknown.get_max_output_tokens(), 128_000);
     }
 
     #[test]
     fn create_budget_for_model_uses_global_default_for_any_model() {
         let budget = create_budget_for_model("anything-at-all", crate::BudgetStrategy::default());
         assert_eq!(budget.max_context_tokens, 1_000_000);
-        assert_eq!(budget.max_output_tokens, 64_000);
+        assert_eq!(budget.max_output_tokens, 128_000);
     }
 }
