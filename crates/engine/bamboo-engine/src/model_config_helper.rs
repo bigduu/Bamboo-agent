@@ -991,5 +991,4 @@ mod tests {
         assert_eq!(infer_provider("  "), None);
         assert_eq!(infer_provider(""), None);
     }
-
 }

@@ -3,13 +3,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::gold_evaluation::{
-    apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold,
-    execute_async_gold_evaluation, AsyncGoldEvaluationRequest, GoldEvaluationResult,
-};
 use crate::runtime::goal_state::{
     ensure_goal_state, write_goal_state, GoalDeclaredStatus, GoalEvalRecord, GoalRuntimeStatus,
     GoalState,
+};
+use crate::runtime::gold_evaluation::{
+    apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold,
+    execute_async_gold_evaluation, AsyncGoldEvaluationRequest, GoldEvaluationResult,
 };
 use crate::runtime::runner::loop_execution::startup::{InFlightGoldEvaluation, LoopRunState};
 use crate::runtime::task_context::TaskLoopContext;
@@ -648,7 +648,10 @@ mod tests {
             &verdict(GoldDecision::Continue, GoldConfidence::Low),
             GoldConfidence::Medium,
         );
-        assert_eq!(action, GoalTerminalAction::Stop(GoalRuntimeStatus::Complete));
+        assert_eq!(
+            action,
+            GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
+        );
     }
 
     #[test]
@@ -658,7 +661,10 @@ mod tests {
             &verdict(GoldDecision::Achieved, GoldConfidence::High),
             GoldConfidence::Medium,
         );
-        assert_eq!(action, GoalTerminalAction::Stop(GoalRuntimeStatus::Complete));
+        assert_eq!(
+            action,
+            GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
+        );
     }
 
     #[test]
@@ -680,7 +686,10 @@ mod tests {
             &verdict(GoldDecision::Achieved, GoldConfidence::High),
             GoldConfidence::Medium,
         );
-        assert_eq!(action, GoalTerminalAction::Stop(GoalRuntimeStatus::Complete));
+        assert_eq!(
+            action,
+            GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
+        );
     }
 
     #[test]
@@ -813,7 +822,10 @@ mod tests {
 
         // A hidden continuation message was injected, carrying the untrusted
         // objective and the update_goal instruction.
-        let last = session.messages.last().expect("continuation message appended");
+        let last = session
+            .messages
+            .last()
+            .expect("continuation message appended");
         assert!(matches!(last.role, Role::User));
         assert!(last.never_compress);
         let metadata = last.metadata.as_ref().expect("runtime metadata");
@@ -874,7 +886,10 @@ mod tests {
         assert!(matches!(decision, GoldTerminalDecision::Stop));
         let state = read_goal_state(&session).expect("goal state persisted");
         assert_eq!(state.status, GoalRuntimeStatus::Complete);
-        assert_eq!(state.declared_status, None, "declaration cleared after acting");
+        assert_eq!(
+            state.declared_status, None,
+            "declaration cleared after acting"
+        );
     }
 
     #[tokio::test]
@@ -906,7 +921,10 @@ mod tests {
         ));
         let state = read_goal_state(&session).expect("goal state persisted");
         assert_eq!(state.status, GoalRuntimeStatus::Active);
-        assert_eq!(state.declared_status, None, "stale declaration cleared on veto");
+        assert_eq!(
+            state.declared_status, None,
+            "stale declaration cleared on veto"
+        );
     }
 
     #[tokio::test]
@@ -947,7 +965,10 @@ mod tests {
                 saw_goal_event = true;
             }
         }
-        assert!(saw_goal_event, "expected a GoalStatusChanged event on continue");
+        assert!(
+            saw_goal_event,
+            "expected a GoalStatusChanged event on continue"
+        );
     }
 
     /// Provider whose evaluator call always errors, to exercise the

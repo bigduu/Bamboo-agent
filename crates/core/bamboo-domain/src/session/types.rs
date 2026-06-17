@@ -614,7 +614,14 @@ impl Session {
         title: impl Into<String>,
     ) -> Self {
         let root_session_id = root_session_id.into();
-        Self::new_child_inner(id, root_session_id.clone(), root_session_id, 1, model, title)
+        Self::new_child_inner(
+            id,
+            root_session_id.clone(),
+            root_session_id,
+            1,
+            model,
+            title,
+        )
     }
 
     /// Create a child session whose parent is `parent`, supporting arbitrary
