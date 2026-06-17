@@ -201,6 +201,22 @@ fn system_remainder_keeps_genuinely_extra_persisted_content() {
     assert!(remainder.content.contains("Extra operator note"));
 }
 
+#[test]
+fn system_remainder_strips_legacy_goal_block() {
+    // The goal now rides the volatile tail (built from the active goal). A legacy
+    // persisted System message still carrying a `<!-- BAMBOO_GOAL_START -->` block
+    // must NOT resurface it in the SystemRemainder run (it would duplicate the
+    // active volatile-tail goal). Once stripped, only the bare base remains, which
+    // matches the system field → no remainder.
+    let goal_block = "<!-- BAMBOO_GOAL_START -->\nSHIP THE RELEASE\n<!-- BAMBOO_GOAL_END -->";
+    let persisted = bamboo_agent_core::Message::system(format!("Base.\n\n{goal_block}"));
+    let stable = expected_system_field("Base.");
+    assert!(
+        super::derive_system_remainder_message(&persisted, &stable).is_none(),
+        "legacy goal block must be stripped from the remainder (goal rides the volatile tail)"
+    );
+}
+
 fn usage(summary_tokens: u32, total_tokens: u32) -> TokenUsageBreakdown {
     TokenUsageBreakdown {
         system_tokens: 10,

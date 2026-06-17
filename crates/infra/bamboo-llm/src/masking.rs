@@ -36,6 +36,7 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "id",
     "call_id",
     "tool_call_id",
+    "tool_use_id", // Anthropic tool-result correlation
     "item_id",
     "response_id",
     "previous_response_id",
@@ -247,5 +248,26 @@ mod tests {
             body["input"][0]["arguments"], "{\"[MASKED]\":\"hello\"}",
             "documented residual: keyword==JSON key corrupts tool-arg JSON (accepted trade-off)"
         );
+    }
+
+    #[test]
+    fn exempts_anthropic_tool_use_id_but_masks_tool_result_text() {
+        // Anthropic correlates a tool_result to its tool_use via `tool_use_id`;
+        // masking that opaque id would break correlation, so it is exempt while the
+        // result text is masked.
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_secret123",
+                    "content": "the secret result"
+                }]
+            }]
+        });
+        mask_outbound_body(&mut body, &config("secret"));
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["tool_use_id"], "toolu_secret123"); // correlation id exempt
+        assert_eq!(block["content"], "the [MASKED] result"); // result text masked
     }
 }

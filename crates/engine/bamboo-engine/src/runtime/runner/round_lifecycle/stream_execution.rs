@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::{
-    strip_existing_core_directives, strip_existing_external_memory,
+    strip_existing_core_directives, strip_existing_external_memory, strip_existing_goal,
     strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
     strip_existing_task_list,
 };
@@ -176,6 +176,10 @@ fn derive_system_remainder_message(
     let without_task_list = strip_existing_task_list(&without_external_memory);
     let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
     let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
+    // Strip a legacy goal block too: the goal now rides the volatile tail (built from
+    // the active goal), so a stale `<!-- BAMBOO_GOAL_START -->` left in an old
+    // persisted System message must not resurface as a duplicate in the remainder.
+    let without_goal = strip_existing_goal(&without_plan_runtime);
     // Framework directives always live in the assembled system field and are not
     // part of the persisted base, so strip them from both sides before comparing.
     // The directives are inserted INTO the `base` section (between the base text
@@ -187,7 +191,7 @@ fn derive_system_remainder_message(
     // the entire base as a redundant system message. Stripping both sides also
     // discards a STALE directive block in an old persisted message, so the current
     // directives (already in the system field) win.
-    let without_directives = strip_existing_core_directives(&without_plan_runtime);
+    let without_directives = strip_existing_core_directives(&without_goal);
     let trimmed = without_directives.trim();
     if trimmed.is_empty() {
         return None;

@@ -81,6 +81,20 @@ pub enum SegmentRole {
 }
 
 /// Stateful Responses-API continuation directive.
+///
+/// WIRE BEHAVIOR — the two wire families lower this DIFFERENTLY, and the
+/// difference is deliberate + byte-faithful to the pre-IR engine:
+/// - OpenAI/Copilot **Responses** path: sends the FULL [`PromptIR::responses_input`]
+///   as `input` together with `previous_response_id` (NOT the delta). This mirrors
+///   the legacy `responses_input_messages` exactly; `store=false` is used, so the
+///   request is effectively stateless and `previous_response_id` rides along for
+///   reasoning continuity rather than to elide history.
+/// - Chat-Completions path: sends [`PromptIR::continuation_delta`] (the delta after
+///   `last_committed_assistant_id`). No Responses-only provider takes this path
+///   today, so the delta lowering is currently exercised only by tests.
+///
+/// (Whether `store=false` + `previous_response_id` is the ideal Responses contract
+/// is a PRE-EXISTING question, untouched by the IR rewrite — see the PR discussion.)
 #[derive(Debug, Clone)]
 pub struct Continuation {
     pub previous_response_id: String,
