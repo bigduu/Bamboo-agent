@@ -320,13 +320,20 @@ impl ActorChildRunner {
         tools.sort();
         let caps = &spec.capabilities;
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}\u{1}nha={}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
             caps.bypass,
             caps.enforce_permissions,
             caps.max_spawn_depth.unwrap_or(0),
+            // #73 review (P1): a worker bakes `no_human_review` ONCE from this flag
+            // at build() and never re-reads it per run, so the pool MUST NOT hand a
+            // worker baked for one approval posture to a run of the opposite one —
+            // else a scheduled-root worker reused for an interactive child would
+            // silently model-review instead of asking the human (and vice-versa,
+            // reintroducing the 300s-deny). Split the bucket on it.
+            caps.no_human_approver,
         )
     }
 
@@ -957,6 +964,17 @@ mod tests {
             base_fp,
             ActorChildRunner::fingerprint(&cap),
             "max_spawn_depth must split"
+        );
+
+        // #73 (P1): the worker bakes `no_human_review` from this flag once at
+        // build(), so it MUST split the pool or a worker baked for one approval
+        // posture is reused for the opposite one.
+        let mut nha = spec_with("explorer", "p", "m", Some("/ws"), None);
+        nha.capabilities.no_human_approver = true;
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&nha),
+            "no_human_approver must split"
         );
     }
 

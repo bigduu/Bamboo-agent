@@ -550,9 +550,22 @@ fn sanitize_review_field(value: &str) -> String {
 
 /// Parse an LLM review verdict: approve ONLY on a clear APPROVE with no DENY
 /// (fail closed on anything ambiguous/empty). Phase 6, Part B.
+///
+/// #73 review (P2): this is now the SOLE authority over every unattended
+/// sub-agent's dangerous action, so it must fail closed on NEGATED/COMPOUND
+/// verdicts that contain the substring "APPROVE" — `DISAPPROVE`, `NOT APPROVE`,
+/// `CANNOT APPROVE`, `DO NOT APPROVE` — which the old `contains("APPROVE")`
+/// accepted as approvals.
 fn parse_review_verdict(content: &str) -> bool {
     let upper = content.to_uppercase();
-    upper.contains("APPROVE") && !upper.contains("DENY")
+    let denied = upper.contains("DENY")
+        || upper.contains("DISAPPROVE")
+        || upper.contains("NOT APPROVE")
+        || upper.contains("CANNOT APPROVE")
+        || upper.contains("CAN'T APPROVE")
+        || upper.contains("CAN NOT APPROVE")
+        || upper.contains("DON'T APPROVE");
+    !denied && upper.contains("APPROVE")
 }
 
 /// LLM-judge reviewer for a BYPASSED parent worker's children (Phase 6, Part B).
@@ -665,6 +678,17 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
                 .bypass_permissions = true;
+        }
+        // #73 review (P1): mirror the bypass re-stamp for "no human approver", so
+        // create_child_action propagates it to in-process grandchildren. Without
+        // this, a depth-2+ child of an unattended run does NOT inherit the flag,
+        // its gated action escalates to an absent human and 300s-denies — the #73
+        // regression, still live one level down.
+        if self.no_human_review.is_some() {
+            session
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .no_human_approver = true;
         }
         let rehydrated: Vec<Message> = run
             .messages
@@ -945,6 +969,12 @@ mod tests {
         // Anything unrecognized ⇒ deny.
         assert!(!parse_review_verdict("maybe"));
         assert!(!parse_review_verdict(""));
+        // #73 review (P2): negated/compound verdicts that CONTAIN "APPROVE" must
+        // still fail closed (the old contains("APPROVE") wrongly accepted these).
+        assert!(!parse_review_verdict("DISAPPROVE"));
+        assert!(!parse_review_verdict("I do not approve this action"));
+        assert!(!parse_review_verdict("I cannot approve — too risky"));
+        assert!(!parse_review_verdict("NOT APPROVE"));
     }
 
     fn spec_with(provider: &str, key: &str, model: Option<(&str, &str)>) -> ProvisionSpec {
