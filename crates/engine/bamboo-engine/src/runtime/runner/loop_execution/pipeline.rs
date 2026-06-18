@@ -27,7 +27,8 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForChildrenState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
+    WaitingForChildrenState,
 };
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
@@ -192,6 +193,97 @@ async fn maybe_suspend_for_orphaned_children(
             config.persistence.as_ref(),
             active,
             ChildWaitPolicy::All,
+        )
+        .await,
+    )
+}
+
+/// Runner primitive: durably suspend `session` to wait on a known set of still
+/// running background Bash shells, returning the canonical "stop the turn, do
+/// not send complete" outcome (issue #84 Phase 2b).
+///
+/// A structural peer to [`suspend_to_wait_for_children`]: build the durable
+/// [`WaitingForBashState`], mirror it into the session via
+/// [`state_bridge::write_runtime_state`], stamp the `runtime.suspend_reason`
+/// metadata — always `"waiting_for_bash"`, the discriminant the suspend
+/// finalization keys on — bump `updated_at`, and persist so a future resume
+/// coordinator (Phase 2c) can resume this session. The wait policy is fixed
+/// ("all bash ids must finish"), so, unlike children, no policy enum is taken.
+async fn suspend_to_wait_for_bash(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    bash_ids: Vec<String>,
+) -> TurnOutcome {
+    let now = Utc::now();
+    let count = bash_ids.len();
+    runtime_state.waiting_for_bash = Some(WaitingForBashState::for_bash(bash_ids, now));
+    state_bridge::write_runtime_state(session, runtime_state);
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "waiting_for_bash".to_string(),
+    );
+    session.updated_at = now;
+
+    if let Some(persistence) = persistence {
+        if let Err(error) = persistence.save_runtime_session(session).await {
+            tracing::warn!(
+                "[{}] suspend-to-wait-bash failed to persist bash wait on {} shell(s): {}",
+                session.id,
+                count,
+                error
+            );
+        }
+    }
+
+    TurnOutcome {
+        should_break: true,
+        sent_complete: false,
+    }
+}
+
+/// End-of-turn safety net for background Bash shells (issue #84 Phase 2b).
+///
+/// A background shell (`run_in_background: true`) runs detached from the agent
+/// loop, so the model can finish its turn (no tool calls) while the shell is
+/// still producing output. To avoid silently dropping that background work, we
+/// suspend here on the session's behalf. The opt-in is implicit: only
+/// `run_in_background` shells land in the session-aware registry, so the default
+/// foreground path never trips this.
+///
+/// Returns `Some` suspend outcome (with the durable wait persisted) when it
+/// engages, or `None` to let the run proceed. No-ops when no background shells
+/// are still running or a bash wait is already registered. This is an
+/// independent check from [`maybe_suspend_for_orphaned_children`]; the call site
+/// runs the children gate first, so a session already suspending for children
+/// never reaches this in the same pass.
+async fn maybe_suspend_for_outstanding_bash(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime_state: &mut AgentRuntimeState,
+) -> Option<TurnOutcome> {
+    if runtime_state.waiting_for_bash.is_some() {
+        return None;
+    }
+
+    let mut bash_ids = bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id);
+    if bash_ids.is_empty() {
+        return None;
+    }
+    bash_ids.sort();
+    bash_ids.dedup();
+
+    tracing::info!(
+        "[{}] end-of-turn safety net: suspending to wait for {} background bash shell(s) still running",
+        session.id,
+        bash_ids.len(),
+    );
+    Some(
+        suspend_to_wait_for_bash(
+            session,
+            runtime_state,
+            config.persistence.as_ref(),
+            bash_ids,
         )
         .await,
     )
@@ -1141,6 +1233,18 @@ pub(super) async fn run_pipeline(
                     turn_outcome = Some(suspend);
                     break;
                 }
+                // Safety net (issue #84 Phase 2b): if the model is about to finish
+                // but left a `run_in_background` Bash shell still running for this
+                // session, suspend instead of completing so background output is not
+                // silently dropped. Independent of the children gate; runs only when
+                // children did not already suspend this pass.
+                if let Some(suspend) =
+                    maybe_suspend_for_outstanding_bash(session, config, &mut state.runtime_state)
+                        .await
+                {
+                    turn_outcome = Some(suspend);
+                    break;
+                }
                 // Adversarial guardian review: before completing, spawn a
                 // read-only reviewer child to verify the work and suspend until
                 // its verdict returns. Inert unless a guardian config + spawner
@@ -1373,6 +1477,56 @@ pub(super) async fn run_pipeline(
                     }
                 }
             }
+            Some("waiting_for_bash") => {
+                state.runtime_state.status = AgentStatusState::Suspended;
+                state.runtime_state.suspension = Some(SuspensionState {
+                    reason: "waiting_for_bash".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: Some("AfterToolExecution".to_string()),
+                });
+
+                // Defensive mirror of the `waiting_for_children` arm: the bash
+                // suspend is single-writer (suspend_to_wait_for_bash already set
+                // and persisted `waiting_for_bash`), but load the persisted record
+                // so a concurrent/external update is never clobbered, and preserve
+                // any hidden runtime resume message the Phase 2c bash coordinator
+                // may have appended before this suspended runner's final save.
+                if let Some(storage) = config.storage.as_ref() {
+                    if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
+                        if let Some(runtime_state) = persisted.agent_runtime_state {
+                            state.runtime_state.waiting_for_bash = runtime_state.waiting_for_bash;
+                        }
+
+                        let existing_ids: std::collections::HashSet<String> = session
+                            .messages
+                            .iter()
+                            .map(|message| message.id.clone())
+                            .collect();
+                        let mut appended = 0usize;
+                        for message in persisted.messages {
+                            let hidden_runtime_resume = message
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.get("runtime_kind"))
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|kind| matches!(kind, "bash_completion_resume"));
+                            if hidden_runtime_resume && !existing_ids.contains(message.id.as_str())
+                            {
+                                session.messages.push(message);
+                                appended += 1;
+                            }
+                        }
+                        if appended > 0 {
+                            tracing::info!(
+                                "[{}] Preserved {} hidden bash-completion resume message(s) during suspension save",
+                                state.session_id,
+                                appended
+                            );
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -1488,7 +1642,8 @@ mod tests {
     use super::super::startup::OverflowRecoveryState;
     use super::{
         is_overflow_recoverable, is_terminal_child_status, map_turn_error_status,
-        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children, should_retry_turn_error,
+        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
@@ -2749,6 +2904,63 @@ mod tests {
             maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_to_wait_for_bash_sets_reason_and_state() {
+        // The suspend primitive must register the durable bash wait, stamp the
+        // `runtime.suspend_reason` discriminant, and break the turn without
+        // sending complete — mirroring suspend_to_wait_for_children. No
+        // persistence is exercised here (None), keeping the test harness-free.
+        let mut session = Session::new("s-bash", "model");
+        let mut runtime_state = AgentRuntimeState::new("s-bash");
+
+        let outcome = suspend_to_wait_for_bash(
+            &mut session,
+            &mut runtime_state,
+            None,
+            vec!["bg-1".to_string(), "bg-2".to_string()],
+        )
+        .await;
+
+        assert!(outcome.should_break, "must break the turn");
+        assert!(!outcome.sent_complete, "must not send complete");
+
+        let wait = runtime_state
+            .waiting_for_bash
+            .expect("durable bash wait should be registered");
+        assert_eq!(wait.bash_ids, vec!["bg-1".to_string(), "bg-2".to_string()]);
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_bash"),
+            "metadata reason must match the discriminant arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_safety_net_noop_when_already_waiting() {
+        // A session already registered a bash wait must not re-suspend (and must
+        // not even query the global shell registry), mirroring the children
+        // safety net's already-waiting guard. This is the deterministic guard
+        // path that does not depend on the process-global registry.
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("s-bash-waiting", "model");
+        let mut runtime_state = AgentRuntimeState::new("s-bash-waiting");
+        runtime_state.waiting_for_bash = Some(super::WaitingForBashState {
+            bash_ids: vec!["bg-1".to_string()],
+            registered_at: chrono::Utc::now(),
+            timeout_at: None,
+        });
+
+        assert!(
+            maybe_suspend_for_outstanding_bash(&mut session, &config, &mut runtime_state)
+                .await
+                .is_none(),
+            "must not re-suspend when a bash wait is already registered"
         );
     }
 }

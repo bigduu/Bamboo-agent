@@ -273,14 +273,24 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // the parent's completion coordinator does not resume the parent
         // prematurely. The child is resumed once the human decides, then runs to
         // a real terminal completion that re-enters this path.
-        let suspended_for_parent_approval = session
+        //
+        // Issue #84 Phase 2b: a child that suspended mid-background-Bash is
+        // likewise NOT done — it must not publish a premature terminal
+        // "completed" to its parent while a `run_in_background` shell is still
+        // running for it.
+        let suspended_non_terminal = session
             .metadata
             .get("runtime.suspend_reason")
-            .map(|reason| reason == "awaiting_parent_approval")
+            .map(|reason| {
+                matches!(
+                    reason.as_str(),
+                    "awaiting_parent_approval" | "waiting_for_bash"
+                )
+            })
             .unwrap_or(false);
         let (status, error) = if let Some(reason) = timeout_error {
             ("timeout".to_string(), Some(reason))
-        } else if suspended_for_parent_approval && result.is_ok() {
+        } else if suspended_non_terminal && result.is_ok() {
             ("suspended".to_string(), None)
         } else {
             match &result {
