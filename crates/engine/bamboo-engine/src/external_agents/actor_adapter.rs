@@ -456,6 +456,12 @@ impl ActorChildRunner {
         // down the tree without any extra config threading.
         spec.capabilities.nested_spawn = session.spawn_depth < MAX_SPAWN_DEPTH;
         spec.capabilities.max_spawn_depth = Some(MAX_SPAWN_DEPTH);
+        // #69: activate child-approval review. Sub-agents enforce permissions so
+        // their DANGEROUS actions (the worker uses a HIGH threshold) reach the
+        // parent for review — escalated to the human, or model-reviewed off-loop
+        // when the parent is in bypass. The worker installs no checker without
+        // this, so the whole review chain would otherwise stay dormant.
+        spec.capabilities.enforce_permissions = true;
         // Propagate "bypass permissions" so a self-orchestrating worker knows it
         // is a bypassed parent and installs the off-loop model-reviewer for its
         // children's forced-ask actions (Phase 6, Part B). The child session
