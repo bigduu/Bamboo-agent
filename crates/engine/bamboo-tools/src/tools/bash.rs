@@ -1002,9 +1002,11 @@ mod tests {
             vec![b.id.clone()]
         );
 
-        // Cleanup: kill the still-running shells so the GC isn't left holding them.
+        // Cleanup: kill the still-running shells so the GC isn't left holding them,
+        // and drop the already-completed `done` shell from the process-global registry.
         for shell in [a1, a2, b, untagged] {
             let _ = shell.kill().await;
         }
+        let _ = super::bash_runtime::remove_shell(&done.id);
     }
 }

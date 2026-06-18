@@ -294,6 +294,10 @@ pub fn remove_shell(id: &str) -> Option<Arc<ShellSession>> {
 /// stored `session_id` equals `Some(session_id)` and `status()` is `"running"`,
 /// so completed shells and shells belonging to another session (or none) are
 /// excluded.
+///
+/// The result is a point-in-time snapshot: a returned shell may finish between
+/// this call and the caller acting on its id, so callers must re-check liveness
+/// (e.g. via `get_shell(id).status()`) before treating an id as still running.
 pub fn running_shells_for_session(session_id: &str) -> Vec<String> {
     sessions()
         .iter()
