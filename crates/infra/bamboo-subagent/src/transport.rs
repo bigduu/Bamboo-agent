@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -17,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::executor::{ChildExecutor, EventSink, HostBridge, HostRequestKind, SteerInbox};
 use crate::proto::{ChildFrame, ParentFrame, RunSpec};
@@ -258,10 +258,13 @@ fn start_run<E: ChildExecutor + ?Sized>(
     let sink = sink.with_host_bridge(bridge);
     let out_req = out_tx.clone();
     let pending_for_pump = pending.clone();
-    let ids = AtomicU64::new(0);
     let pump = tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
-            let id = format!("sa-{}", ids.fetch_add(1, Ordering::Relaxed));
+            // Random + unguessable: the worker's pending map and the host-side
+            // pending-approval registry both key on this exact string, so a
+            // sequential `sa-{n}` would let an external POST guess a live
+            // request_id. A v4 uuid removes that. Keep the `sa-` prefix.
+            let id = format!("sa-{}", Uuid::new_v4());
             pending_for_pump
                 .lock()
                 .expect("pending lock")

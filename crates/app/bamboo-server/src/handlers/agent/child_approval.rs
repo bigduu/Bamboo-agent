@@ -38,7 +38,7 @@ pub async fn handler(
         approved,
     } = body.into_inner();
 
-    let delivered = bamboo_engine::external_agents::live::deliver_approval(
+    let delivered = bamboo_engine::external_agents::live::deliver_approval_checked(
         &child_session_id,
         &request_id,
         approved,
@@ -53,10 +53,12 @@ pub async fn handler(
         );
         HttpResponse::Ok().json(ChildApprovalResponse { delivered: true })
     } else {
-        // The child isn't live (finished, timed out, or already answered) — there
-        // is no connection to carry the decision.
+        // Not delivered: the request_id isn't a currently-pending human-loop
+        // approval — unknown/guessed, already answered, timed out, or the child
+        // isn't live (finished/disconnected). The checked entry consumes pending
+        // ids one-shot, so a replay also lands here.
         tracing::warn!(
-            "[{}] child approval not delivered (request_id={}): child not live",
+            "[{}] child approval not delivered (request_id={}): not a pending request",
             child_session_id,
             request_id
         );
