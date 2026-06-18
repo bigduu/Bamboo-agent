@@ -569,6 +569,12 @@ struct ModelApprovalReviewer {
 impl bamboo_engine::external_agents::ChildApprovalReviewer for ModelApprovalReviewer {
     async fn review(&self, _child_session_id: &str, request: &serde_json::Value) -> bool {
         if self.model.trim().is_empty() {
+            // No model to judge with → fail closed. In an unattended (no-human)
+            // run this denies EVERY gated action, so the sub-agent can't do gated
+            // work; warn so the misconfiguration is diagnosable rather than silent.
+            tracing::warn!(
+                "model approval review: no model configured; denying gated action (fail closed)"
+            );
             return false;
         }
         // Sanitize the CHILD-CONTROLLED fields before interpolating: a hostile
