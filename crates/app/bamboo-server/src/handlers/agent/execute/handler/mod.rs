@@ -161,6 +161,7 @@ pub async fn handler(
                     model_source,
                     reasoning_source,
                     is_child_session,
+                    no_human_approver: req.no_human_approver,
                 },
                 &config,
                 &config_snapshot,

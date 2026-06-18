@@ -129,6 +129,15 @@ pub struct ExecuteRequest {
     /// Optional server-confirmed client cursor used for pre-execution sync checks.
     #[serde(default)]
     pub client_sync: Option<ExecuteClientSync>,
+    /// Whether this run has NO interactive human approver (headless `-p`, a
+    /// scheduled job, a deployed broker). #74: this is re-derived per
+    /// user-initiated execute and OVERWRITES the session's persisted
+    /// `no_human_approver`, so a session first run headlessly and later reopened
+    /// interactively (UI omits this → `false`) correctly resets to the
+    /// human-present posture. Suspend/resume does NOT go through this handler,
+    /// so a within-run resume keeps the persisted posture.
+    #[serde(default)]
+    pub no_human_approver: bool,
 }
 
 #[cfg(test)]

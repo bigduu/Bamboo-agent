@@ -171,6 +171,12 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
 
     // Append the prompt as the driving user message (execute runs the session's
     // last user turn — same contract as the HTTP API).
+    //
+    // #74: the `no_human_approver` posture is no longer set here. It rides on the
+    // `ExecuteRequest` below (`no_human_approver: true`) and is re-derived +
+    // OVERWRITTEN per execute by the handler, so a session first run headlessly
+    // and later reopened interactively correctly resets to the human-present
+    // posture instead of staying sticky-true.
     {
         let mut session = state
             .storage
@@ -179,15 +185,6 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             .map_err(|e| format!("load session: {e}"))?
             .ok_or_else(|| "session vanished".to_string())?;
         session.add_message(Message::user(args.prompt.clone()));
-        // #73: a headless `-p` run has no interactive approver. Mark the root
-        // session so its sub-agents (which inherit the flag) decide gated actions
-        // with the off-loop model-reviewer locally instead of escalating to an
-        // absent human — which would otherwise 300s-deny. Sticky; carried forward
-        // each run by startup.
-        session
-            .agent_runtime_state
-            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-            .no_human_approver = true;
         state
             .storage
             .save_session(&session)
@@ -225,6 +222,11 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             skill_mode: None,
             reasoning_effort: None,
             client_sync: None,
+            // #74: a headless `-p` run has no interactive approver. The handler
+            // re-derives + persists this onto the root session each execute, so
+            // its sub-agents (which inherit it) route gated actions to the
+            // off-loop model-reviewer instead of escalating to an absent human.
+            no_human_approver: true,
         }),
     )
     .await;
