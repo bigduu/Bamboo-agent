@@ -52,6 +52,16 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
             "No matching external child runner found for session metadata".to_string(),
         ))
     }
+
+    /// #68: fan the per-run escalation bridge out to every inner runner. The
+    /// composite is what `build_external_child_runner` returns and what the
+    /// worker retains, so without this forward the bind would hit the trait's
+    /// no-op default and the wrapped `ActorChildRunner`s would never see it.
+    fn set_escalation_bridge(&self, bridge: Option<bamboo_subagent::executor::HostBridge>) {
+        for runner in &self.runners {
+            runner.set_escalation_bridge(bridge.clone());
+        }
+    }
 }
 
 /// Build the child runner from the application config.

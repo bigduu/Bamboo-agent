@@ -152,6 +152,12 @@ pub struct BambooRuntimeExecutor {
     /// instead of forwarding the approval to a host whose human-loop would
     /// 300s-deny it. `None` (interactive) ⇒ forward to the host as usual.
     no_human_review: Option<Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer>>,
+    /// #68: this worker's own external-child runner (the spawn stack that drives
+    /// grandchildren), retained so each `run()` can bind its host bridge onto it
+    /// as the PER-RUN escalation bridge — replacing the old process-global slot.
+    /// `Some` only for a sub-cap worker with `nested_spawn` (the only one that
+    /// drives grandchildren); `None` otherwise (a leaf worker never escalates).
+    child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
 }
 
 impl BambooRuntimeExecutor {
@@ -398,7 +404,9 @@ impl BambooRuntimeExecutor {
         // REAL SubAgent tool against them (no host proxy). `nested_spawn` is set
         // by the host's build_spec purely from depth (< MAX_SPAWN_DEPTH), so it
         // auto-propagates down the tree and bottoms out at the cap.
-        let run_tools: Option<Arc<dyn bamboo_agent_core::tools::ToolExecutor>> =
+        type RunTools = Arc<dyn bamboo_agent_core::tools::ToolExecutor>;
+        type ChildRunner = Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>;
+        let (run_tools, child_runner): (Option<RunTools>, Option<ChildRunner>) =
             if spec.capabilities.nested_spawn {
                 // Point the worker's own actor runner at the shared fabric so
                 // grandchildren are discoverable; the worker binary itself is
@@ -413,6 +421,10 @@ impl BambooRuntimeExecutor {
                     let cfg = config_for_stack.read().await;
                     bamboo_engine::external_agents::runtime::build_external_child_runner(&cfg)
                 };
+                // #68: retain this exact runner so `run()` can bind its host
+                // bridge onto it per-run (the runner the scheduler drives is the
+                // one whose `ActorChildRunner`s capture the bridge at spawn).
+                let child_runner = external_runner.clone();
                 let scheduler = bamboo_server::app_state::init::build_spawn_scheduler(
                     agent.clone(),
                     default_tools.clone(),
@@ -440,13 +452,13 @@ impl BambooRuntimeExecutor {
                     adapter.clone(),
                     adapter,
                 ));
-                Some(Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
+                let run_tools = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
                     default_tools,
                     sub_agent,
-                ))
-                    as Arc<dyn bamboo_agent_core::tools::ToolExecutor>)
+                )) as RunTools;
+                (Some(run_tools), Some(child_runner))
             } else {
-                None
+                (None, None)
             };
 
         // The off-loop model-reviewer (provider + model). Built once and shared:
@@ -494,6 +506,7 @@ impl BambooRuntimeExecutor {
             spawn_depth: spec.identity.depth,
             bypass: spec.capabilities.bypass,
             no_human_review,
+            child_runner,
         })
     }
 }
@@ -790,10 +803,17 @@ impl ChildExecutor for BambooRuntimeExecutor {
             } else {
                 None
             };
-        // Phase 6, Part B: install our host bridge as the process escalation
-        // bridge so this worker's `drive()` can re-proxy a (non-bypass) child's
-        // approval request UP to our own parent — chaining it to the top human.
-        bamboo_engine::external_agents::set_escalation_host_bridge(events.host().cloned());
+        // Phase 6, Part B (#68): bind our host bridge onto THIS worker's own child
+        // runner as the per-run escalation bridge, so when it drives a grandchild
+        // that grandchild captures the bridge at spawn and its `drive()` can
+        // re-proxy a (non-bypass) child's approval request UP to our own parent —
+        // chaining it to the top human. Per-runner (was a process-global slot), so
+        // a fire-and-forget grandchild outliving this run still escalates through
+        // the run's own bridge rather than a stale/overwritten global. `None` for
+        // a leaf worker (no spawn stack), which never drives grandchildren.
+        if let Some(runner) = &self.child_runner {
+            runner.set_escalation_bridge(events.host().cloned());
+        }
 
         // AgentEvents stream to the parent verbatim (zero mapping).
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
