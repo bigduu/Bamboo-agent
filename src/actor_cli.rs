@@ -276,9 +276,6 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                         }
                         print_event(&event, raw);
                     }
-                    Ok(Some(ChildFrame::SubagentRequest { .. })) => {
-                        // This CLI does not host nested spawning; ignore.
-                    }
                     Ok(Some(ChildFrame::ApprovalRequest { .. })) => {
                         // This CLI does not route gated-tool approvals; ignore.
                         // (The production host in actor_adapter answers these.)

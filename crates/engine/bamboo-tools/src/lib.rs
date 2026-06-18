@@ -8,7 +8,6 @@ pub mod events;
 pub mod executor;
 pub mod exposure;
 pub mod guide;
-pub mod nested_spawn;
 pub mod orchestrator;
 pub mod output_manager;
 pub mod parallel;
@@ -22,9 +21,6 @@ pub use executor::{BuiltinToolExecutor, BuiltinToolExecutorBuilder};
 
 // Re-export cross-process approval proxy (Phase 2: child → parent delegation)
 pub use approval::{current_approval_proxy, with_approval_proxy, ApprovalAsk, ApprovalProxy};
-
-// Re-export nested-spawn proxy (Phase 6: nested execution)
-pub use nested_spawn::{current_nested_spawn_proxy, with_nested_spawn_proxy, NestedSpawnProxy};
 
 // Re-export tool name utilities
 pub use bamboo_domain::tool_names::{

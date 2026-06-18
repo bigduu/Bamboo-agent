@@ -82,9 +82,6 @@ pub struct ActorChildRunner {
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
     approval_decider: Option<Arc<dyn ChildApprovalDecider>>,
-    /// Host-side fulfilment of a child's nested SubAgent spawn request (Phase 6).
-    /// `None` ⇒ graceful "not available" error (the safe default).
-    nested_spawn_handler: Option<Arc<dyn NestedSpawnHandler>>,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -133,71 +130,6 @@ fn approval_request_fields(body: &serde_json::Value) -> (String, String, String)
             .to_string()
     };
     (field("tool_name"), field("permission"), field("resource"))
-}
-
-/// Fulfils a child worker's nested SubAgent spawn request on the host (Phase 6:
-/// nested execution). When a child wants a grandchild, its `host.subagent_call`
-/// arrives as a `ChildFrame::SubagentRequest`; an implementation runs the real
-/// spawn (parenting the grandchild under the requesting child) and returns the
-/// SubAgent tool's result JSON. With no handler wired the host replies with a
-/// graceful error so the child's tool fails cleanly instead of hanging.
-#[async_trait]
-pub trait NestedSpawnHandler: Send + Sync {
-    /// Run a nested SubAgent spawn requested by `child_session_id`; `request` is
-    /// the SubAgent tool-call body. Returns the tool-result JSON, or an error
-    /// string (surfaced to the child as a failed tool result).
-    async fn spawn_nested(
-        &self,
-        child_session_id: &str,
-        request: serde_json::Value,
-    ) -> Result<serde_json::Value, String>;
-}
-
-/// The graceful "not available" reply body for an unfulfilled nested spawn.
-fn nested_spawn_unavailable(reason: &str) -> serde_json::Value {
-    serde_json::json!({
-        "success": false,
-        "result": reason,
-        "display_preference": null,
-    })
-}
-
-/// Resolve a nested-spawn request to a `SubagentReply` body. With no handler
-/// wired, returns the graceful "not available" error body (unchanged default).
-async fn fulfil_nested_spawn(
-    handler: Option<&Arc<dyn NestedSpawnHandler>>,
-    child_session_id: &str,
-    request: serde_json::Value,
-) -> serde_json::Value {
-    match handler {
-        Some(handler) => match handler.spawn_nested(child_session_id, request).await {
-            Ok(result) => result,
-            Err(e) => nested_spawn_unavailable(&format!("nested sub-agent spawn failed: {e}")),
-        },
-        None => nested_spawn_unavailable("nested sub-agent spawn is not available in this build"),
-    }
-}
-
-/// Process-global slot for the singleton host-side nested-spawn handler.
-///
-/// Set once at server startup — AFTER the `ChildSessionAdapter` exists, which is
-/// how we resolve the runner→scheduler→adapter construction-order cycle (the
-/// runner is built before the adapter that would be its handler, and it's then
-/// dyn-erased into the composite runner so it can't be reached for a setter).
-/// Read by `drive()` for every child run. Mirrors the `super::live` registry.
-fn nested_spawn_handler_slot() -> &'static std::sync::OnceLock<Arc<dyn NestedSpawnHandler>> {
-    static SLOT: std::sync::OnceLock<Arc<dyn NestedSpawnHandler>> = std::sync::OnceLock::new();
-    &SLOT
-}
-
-/// Install the process-global nested-spawn handler (idempotent; first wins).
-pub fn set_nested_spawn_handler(handler: Arc<dyn NestedSpawnHandler>) {
-    let _ = nested_spawn_handler_slot().set(handler);
-}
-
-/// The process-global nested-spawn handler, if installed.
-pub fn nested_spawn_handler() -> Option<Arc<dyn NestedSpawnHandler>> {
-    nested_spawn_handler_slot().get().cloned()
 }
 
 /// Off-loop reviewer for a child's gated-tool approval request (Phase 6, Part B).
@@ -279,7 +211,6 @@ impl ActorChildRunner {
             pool: Arc::new(Mutex::new(HashMap::new())),
             max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
             approval_decider: None,
-            nested_spawn_handler: None,
         }
     }
 
@@ -287,13 +218,6 @@ impl ActorChildRunner {
     /// (Phase 2). Without this the host fail-closed DENYs every request.
     pub fn with_approval_decider(mut self, decider: Arc<dyn ChildApprovalDecider>) -> Self {
         self.approval_decider = Some(decider);
-        self
-    }
-
-    /// Wire the host-side nested SubAgent spawn handler (Phase 6). Without it, a
-    /// child's nested spawn request fails gracefully ("not available").
-    pub fn with_nested_spawn_handler(mut self, handler: Arc<dyn NestedSpawnHandler>) -> Self {
-        self.nested_spawn_handler = Some(handler);
         self
     }
 
@@ -582,18 +506,10 @@ impl ExternalChildRunner for ActorChildRunner {
         let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
         let live_guard = super::live::register(&job.child_session_id, live_tx);
 
-        // The nested-spawn handler is normally the process-global installed at
-        // startup (see `set_nested_spawn_handler`); an explicit per-runner field
-        // overrides it (used in tests).
-        let nested_handler = self
-            .nested_spawn_handler
-            .clone()
-            .or_else(nested_spawn_handler);
         let result = drive(
             &mut client,
             &job.child_session_id,
             self.approval_decider.as_ref(),
-            nested_handler.as_ref(),
             &event_tx,
             &cancel_token,
             &mut live_rx,
@@ -634,12 +550,10 @@ impl ExternalChildRunner for ActorChildRunner {
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
 /// `live_rx` carries in-band frames (steering messages) from the live registry.
-#[allow(clippy::too_many_arguments)]
 async fn drive(
     client: &mut ChildClient,
     child_session_id: &str,
     approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
-    nested_spawn_handler: Option<&Arc<dyn NestedSpawnHandler>>,
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
     live_rx: &mut mpsc::UnboundedReceiver<ParentFrame>,
@@ -662,23 +576,6 @@ async fn drive(
                         // AgentEvent is serialized verbatim on the wire (zero mapping).
                         if let Ok(ev) = serde_json::from_value::<AgentEvent>(event) {
                             let _ = event_tx.send(ev).await;
-                        }
-                    }
-                    Ok(Some(ChildFrame::SubagentRequest { id, body })) => {
-                        // Phase 6: a nested worker child proxied a SubAgent tool
-                        // call back to the host. A wired `NestedSpawnHandler` runs
-                        // the real spawn (parenting a grandchild under this child)
-                        // and returns the tool result; with none wired we reply
-                        // with a graceful "not available" error so the worker's
-                        // tool call fails cleanly instead of hanging.
-                        let reply =
-                            fulfil_nested_spawn(nested_spawn_handler, child_session_id, body).await;
-                        if client
-                            .send(ParentFrame::SubagentReply { id, body: reply })
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("failed to answer subagent_request; connection failing");
                         }
                     }
                     Ok(Some(ChildFrame::ApprovalRequest { id, body })) => {
@@ -1002,40 +899,6 @@ mod tests {
         let deny: Arc<dyn ChildApprovalDecider> = Arc::new(StaticDecider(false));
         assert!(decide_child_approval(Some(&approve), "child-1", &body).await);
         assert!(!decide_child_approval(Some(&deny), "child-1", &body).await);
-    }
-
-    struct StaticSpawn(Result<serde_json::Value, String>);
-
-    #[async_trait]
-    impl NestedSpawnHandler for StaticSpawn {
-        async fn spawn_nested(
-            &self,
-            _child: &str,
-            _req: serde_json::Value,
-        ) -> Result<serde_json::Value, String> {
-            self.0.clone()
-        }
-    }
-
-    #[tokio::test]
-    async fn nested_spawn_unavailable_without_handler() {
-        let reply = fulfil_nested_spawn(None, "child-1", serde_json::json!({})).await;
-        assert_eq!(reply["success"], serde_json::json!(false));
-        assert!(reply["result"].as_str().unwrap().contains("not available"));
-    }
-
-    #[tokio::test]
-    async fn nested_spawn_returns_handler_result_or_error_body() {
-        let ok: Arc<dyn NestedSpawnHandler> = Arc::new(StaticSpawn(Ok(
-            serde_json::json!({"success": true, "result": "spawned"}),
-        )));
-        let reply = fulfil_nested_spawn(Some(&ok), "child-1", serde_json::json!({})).await;
-        assert_eq!(reply["result"], serde_json::json!("spawned"));
-
-        let err: Arc<dyn NestedSpawnHandler> = Arc::new(StaticSpawn(Err("boom".to_string())));
-        let reply = fulfil_nested_spawn(Some(&err), "child-1", serde_json::json!({})).await;
-        assert_eq!(reply["success"], serde_json::json!(false));
-        assert!(reply["result"].as_str().unwrap().contains("boom"));
     }
 
     #[test]

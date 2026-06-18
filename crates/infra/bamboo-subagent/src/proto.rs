@@ -47,18 +47,11 @@ pub enum ParentFrame {
     Message {
         text: String,
     },
-    /// Reply to a [`ChildFrame::SubagentRequest`] — the host's result for a
-    /// SubAgent tool call the worker proxied back over this same WS. `id`
-    /// correlates to the request; `body` is the proxied tool result JSON.
-    SubagentReply {
-        id: String,
-        body: serde_json::Value,
-    },
     /// Reply to a [`ChildFrame::ApprovalRequest`] — the host's human/policy
     /// decision on a gated tool the worker proxied back (Phase 2 child→parent
     /// approval delegation). `id` correlates to the request. When
     /// `approved == true` the worker records the grant locally and proceeds;
-    /// `false` denies the tool. Mirrors the `SubagentReply` proxy pattern.
+    /// `false` denies the tool.
     ApprovalReply {
         id: String,
         approved: bool,
@@ -71,17 +64,11 @@ pub enum ParentFrame {
 pub enum ChildFrame {
     /// One agent event, serialized verbatim (the real `AgentEvent` lands here as JSON).
     Event { event: serde_json::Value },
-    /// The worker's `SubAgent` tool call, proxied to the host over this WS so a
-    /// nested sub-agent's grandchildren are created in the host store (parented
-    /// to this worker's host session). The host answers with
-    /// [`ParentFrame::SubagentReply`] carrying the same `id`.
-    SubagentRequest { id: String, body: serde_json::Value },
     /// The worker hit a tool needing human approval (Phase 2 child→parent
     /// approval delegation). Proxied to the host — which surfaces it to the
-    /// human via the parent session's pending-question / notification path —
-    /// mirroring [`ChildFrame::SubagentRequest`]. The host answers with
-    /// [`ParentFrame::ApprovalReply`] carrying the same `id`. `body` carries
-    /// `{tool_name, permission_type, resource, question}`.
+    /// human via the parent session's pending-question / notification path. The
+    /// host answers with [`ParentFrame::ApprovalReply`] carrying the same `id`.
+    /// `body` carries `{tool_name, permission_type, resource, question}`.
     ApprovalRequest { id: String, body: serde_json::Value },
     Terminal {
         status: TerminalStatus,
@@ -168,18 +155,6 @@ mod tests {
             transcript: vec![serde_json::json!({"role":"assistant","content":"x"})],
         };
         assert_eq!(ChildFrame::from_text(&s.to_text()).unwrap(), s);
-
-        // SubAgent request/reply round-trip over the per-child WS.
-        let req = ChildFrame::SubagentRequest {
-            id: "r1".into(),
-            body: serde_json::json!({"action":"create"}),
-        };
-        assert_eq!(ChildFrame::from_text(&req.to_text()).unwrap(), req);
-        let reply = ParentFrame::SubagentReply {
-            id: "r1".into(),
-            body: serde_json::json!({"success":true}),
-        };
-        assert_eq!(ParentFrame::from_text(&reply.to_text()).unwrap(), reply);
 
         // Phase 2 approval request/reply round-trip over the per-child WS.
         let areq = ChildFrame::ApprovalRequest {
