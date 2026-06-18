@@ -21,6 +21,8 @@ const BLOCKED_DEVICE_PATHS: &[&str] = &[
     "/dev/fd/2",
 ];
 
+const MAX_READ_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
 #[derive(Debug, Deserialize)]
 struct ReadArgs {
     file_path: String,
@@ -237,6 +239,16 @@ impl Tool for ReadTool {
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
             });
+        }
+
+        if metadata.len() > MAX_READ_SIZE {
+            return Err(ToolError::Execution(format!(
+                "File is {} bytes, which exceeds the maximum readable size of {} bytes ({} MB). \
+                 Use Grep to search within this file instead.",
+                metadata.len(),
+                MAX_READ_SIZE,
+                MAX_READ_SIZE / 1024 / 1024
+            )));
         }
 
         let bytes = tokio::fs::read(path)
