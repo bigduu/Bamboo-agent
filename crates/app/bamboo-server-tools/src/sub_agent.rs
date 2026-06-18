@@ -1022,7 +1022,10 @@ mod tests {
         async fn spawn(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
             // Echo the action back so the test can assert the args were forwarded.
             let mut reply = self.0.clone();
-            reply["action_seen"] = args.get("action").cloned().unwrap_or(serde_json::Value::Null);
+            reply["action_seen"] = args
+                .get("action")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             Ok(reply)
         }
     }
@@ -1060,7 +1063,9 @@ mod tests {
         let r = SubAgentProxyTool
             .execute(serde_json::json!({"action": "create"}))
             .await;
-        assert!(matches!(r, Err(ToolError::Execution(ref m)) if m.contains("not running in a nested-worker")));
+        assert!(
+            matches!(r, Err(ToolError::Execution(ref m)) if m.contains("not running in a nested-worker"))
+        );
     }
 
     #[test]

@@ -44,7 +44,9 @@ pub struct RunSpec {
 pub enum ParentFrame {
     Run(RunSpec),
     Cancel,
-    Message { text: String },
+    Message {
+        text: String,
+    },
     /// Reply to a [`ChildFrame::SubagentRequest`] — the host's result for a
     /// SubAgent tool call the worker proxied back over this same WS. `id`
     /// correlates to the request; `body` is the proxied tool result JSON.
@@ -73,20 +75,14 @@ pub enum ChildFrame {
     /// nested sub-agent's grandchildren are created in the host store (parented
     /// to this worker's host session). The host answers with
     /// [`ParentFrame::SubagentReply`] carrying the same `id`.
-    SubagentRequest {
-        id: String,
-        body: serde_json::Value,
-    },
+    SubagentRequest { id: String, body: serde_json::Value },
     /// The worker hit a tool needing human approval (Phase 2 child→parent
     /// approval delegation). Proxied to the host — which surfaces it to the
     /// human via the parent session's pending-question / notification path —
     /// mirroring [`ChildFrame::SubagentRequest`]. The host answers with
     /// [`ParentFrame::ApprovalReply`] carrying the same `id`. `body` carries
     /// `{tool_name, permission_type, resource, question}`.
-    ApprovalRequest {
-        id: String,
-        body: serde_json::Value,
-    },
+    ApprovalRequest { id: String, body: serde_json::Value },
     Terminal {
         status: TerminalStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -190,12 +190,16 @@ mod tests {
         let mut state = ApprovalDelegationState::default();
         state.upsert(req("child-1", "q-1"));
         write_approval_delegation_state(&mut parent, state);
-        assert!(parent.metadata.contains_key(APPROVAL_DELEGATION_METADATA_KEY));
+        assert!(parent
+            .metadata
+            .contains_key(APPROVAL_DELEGATION_METADATA_KEY));
 
         // Resolving the only pending → empty → key removed.
         let mut state = ensure_approval_delegation_state(&parent);
         state.take_by_question("q-1");
         write_approval_delegation_state(&mut parent, state);
-        assert!(!parent.metadata.contains_key(APPROVAL_DELEGATION_METADATA_KEY));
+        assert!(!parent
+            .metadata
+            .contains_key(APPROVAL_DELEGATION_METADATA_KEY));
     }
 }

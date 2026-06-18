@@ -1041,11 +1041,7 @@ impl Storage for SessionStoreV2 {
             .collect())
     }
 
-    async fn append_token_usage_record(
-        &self,
-        session_id: &str,
-        json_line: &str,
-    ) -> io::Result<()> {
+    async fn append_token_usage_record(&self, session_id: &str, json_line: &str) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
         validate_session_id(session_id)?;
@@ -1156,7 +1152,10 @@ mod tests {
 
         let rel = storage.resolve_rel_path("tu-1").await.unwrap();
         let path = storage.abs_path_from_rel(&rel).join(TOKEN_USAGE_FILE);
-        assert!(path.exists(), "token-usage.jsonl should sit in the session dir");
+        assert!(
+            path.exists(),
+            "token-usage.jsonl should sit in the session dir"
+        );
 
         let contents = tokio::fs::read_to_string(&path).await?;
         let lines: Vec<&str> = contents.lines().collect();

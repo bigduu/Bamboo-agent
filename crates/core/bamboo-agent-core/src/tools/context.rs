@@ -138,7 +138,9 @@ mod session_flags_tests {
         let session = Session::new("s-none", "test-model");
         assert_eq!(
             ToolExecutionSessionFlags::from_session(&session),
-            ToolExecutionSessionFlags { bypass_permissions: false }
+            ToolExecutionSessionFlags {
+                bypass_permissions: false
+            }
         );
     }
 
@@ -159,7 +161,9 @@ mod session_flags_tests {
             "call-1",
             &tx,
             &[],
-            ToolExecutionSessionFlags { bypass_permissions: true },
+            ToolExecutionSessionFlags {
+                bypass_permissions: true,
+            },
         );
         assert_eq!(ctx.session_id, Some("s1"));
         assert!(ctx.bypass_permissions);

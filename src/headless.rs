@@ -39,9 +39,7 @@ fn parse_permission_mode(s: &str) -> Result<PermissionMode, String> {
 fn pick_option(options: &[String], needle: &str) -> String {
     options
         .iter()
-        .find(|opt| {
-            opt.eq_ignore_ascii_case(needle) || opt.to_ascii_lowercase().contains(needle)
-        })
+        .find(|opt| opt.eq_ignore_ascii_case(needle) || opt.to_ascii_lowercase().contains(needle))
         .cloned()
         .unwrap_or_else(|| needle.to_string())
 }

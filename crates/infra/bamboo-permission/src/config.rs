@@ -712,11 +712,7 @@ impl PermissionConfig {
     /// - the command is a built-in hard-dangerous shell command (a
     ///   `bash_security` `Deny` verdict), or
     /// - it matches a configured "always ask" rule.
-    pub fn requires_forced_confirmation(
-        &self,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> bool {
+    pub fn requires_forced_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
         // Built-in backstop: hard-dangerous shell commands always ask.
         if tool_name.eq_ignore_ascii_case("Bash") {
             if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
@@ -1675,10 +1671,8 @@ mod integration_tests {
             &serde_json::json!({ "command": "eval 'cat /etc/passwd'" }),
         ));
         // A benign command is not forced.
-        assert!(!config.requires_forced_confirmation(
-            "Bash",
-            &serde_json::json!({ "command": "ls -la" }),
-        ));
+        assert!(!config
+            .requires_forced_confirmation("Bash", &serde_json::json!({ "command": "ls -la" }),));
     }
 
     #[test]
@@ -1695,10 +1689,12 @@ mod integration_tests {
             &serde_json::json!({ "file_path": "/etc/hosts" }),
         ));
         // Non-matching call is not forced.
-        assert!(!config.requires_forced_confirmation(
-            "Bash",
-            &serde_json::json!({ "command": "git status" }),
-        ));
+        assert!(
+            !config.requires_forced_confirmation(
+                "Bash",
+                &serde_json::json!({ "command": "git status" }),
+            )
+        );
     }
 
     #[test]

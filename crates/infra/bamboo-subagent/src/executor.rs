@@ -69,7 +69,8 @@ impl HostBridge {
         self.req_tx
             .send(HostRequest { kind, body, reply })
             .map_err(|_| "host bridge closed".to_string())?;
-        rx.await.map_err(|_| "host bridge dropped reply".to_string())
+        rx.await
+            .map_err(|_| "host bridge dropped reply".to_string())
     }
 }
 

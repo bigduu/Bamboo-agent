@@ -32,10 +32,7 @@ tokio::task_local! {
 
 /// Run `fut` with `proxy` installed as the ambient nested-spawn proxy for the
 /// duration of the future. The worker scopes this around a single child run.
-pub async fn with_nested_spawn_proxy<F, T>(
-    proxy: Option<Arc<dyn NestedSpawnProxy>>,
-    fut: F,
-) -> T
+pub async fn with_nested_spawn_proxy<F, T>(proxy: Option<Arc<dyn NestedSpawnProxy>>, fut: F) -> T
 where
     F: Future<Output = T>,
 {
@@ -71,7 +68,10 @@ mod tests {
         let proxy: Arc<dyn NestedSpawnProxy> = Arc::new(EchoProxy);
         with_nested_spawn_proxy(Some(proxy), async {
             let got = current_nested_spawn_proxy().expect("proxy installed in scope");
-            let out = got.spawn(serde_json::json!({"action": "create"})).await.unwrap();
+            let out = got
+                .spawn(serde_json::json!({"action": "create"}))
+                .await
+                .unwrap();
             assert_eq!(out["echoed"]["action"], serde_json::json!("create"));
         })
         .await;

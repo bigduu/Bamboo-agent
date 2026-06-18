@@ -367,8 +367,7 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
             parent_session: parent_session.clone(),
             child_id: format!("guardian-{}", uuid::Uuid::new_v4()),
             title: "Guardian review".to_string(),
-            responsibility: "Adversarially verify the parent agent's completed work."
-                .to_string(),
+            responsibility: "Adversarially verify the parent agent's completed work.".to_string(),
             assignment_prompt: review_prompt,
             // The coordinator branches on this subagent_type to recognize a
             // guardian completion and parse its verdict.
@@ -423,7 +422,10 @@ impl ChildSessionAdapter {
             let still_active: Vec<String> = if explicit.is_empty() {
                 active
             } else {
-                active.into_iter().filter(|id| explicit.contains(id)).collect()
+                active
+                    .into_iter()
+                    .filter(|id| explicit.contains(id))
+                    .collect()
             };
             if still_active.is_empty() {
                 break;
@@ -511,8 +513,12 @@ impl bamboo_engine::external_agents::NestedSpawnHandler for ChildSessionAdapter 
             .map_err(|e| format!("load requesting child {child_session_id}: {e}"))?
             .ok_or_else(|| format!("requesting child {child_session_id} not found"))?;
 
-        let str_field =
-            |k: &str| request.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let str_field = |k: &str| {
+            request
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
         let prompt = str_field("prompt").unwrap_or_default();
         if prompt.trim().is_empty() {
             return Err("nested SubAgent create requires a 'prompt'".to_string());

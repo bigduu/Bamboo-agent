@@ -253,7 +253,9 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
             body.push_str(&format!("\n{}. {}", idx + 1, finding));
         }
     }
-    body.push_str("\n\nIf you need the full guardian transcript, call SubAgent.get(child_session_id).");
+    body.push_str(
+        "\n\nIf you need the full guardian transcript, call SubAgent.get(child_session_id).",
+    );
 
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({

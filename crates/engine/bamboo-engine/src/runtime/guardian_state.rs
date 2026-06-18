@@ -425,8 +425,7 @@ mod tests {
         let mut state = GuardianState::new();
         state.record_spawn("guardian-child-1");
         state.record_verdict(
-            GuardianVerdict::rejected(vec!["missing test".to_string()])
-                .with_summary("one bug"),
+            GuardianVerdict::rejected(vec!["missing test".to_string()]).with_summary("one bug"),
             7,
         );
 
@@ -434,7 +433,10 @@ mod tests {
         let loaded = read_guardian_state(&session).expect("state persists");
 
         assert_eq!(loaded.phase, GuardianPhase::Reviewed);
-        assert_eq!(loaded.guardian_child_id.as_deref(), Some("guardian-child-1"));
+        assert_eq!(
+            loaded.guardian_child_id.as_deref(),
+            Some("guardian-child-1")
+        );
         assert_eq!(loaded.review_count, 1);
         assert_eq!(loaded.last_reviewed_at_round, 7);
         let verdict = loaded.last_verdict.expect("verdict persisted");
@@ -500,8 +502,9 @@ mod tests {
 
     #[test]
     fn parse_verdict_bare_object() {
-        let v = parse_guardian_verdict(r#"{"approve": false, "summary": "bug", "findings": ["x"]}"#)
-            .expect("parses");
+        let v =
+            parse_guardian_verdict(r#"{"approve": false, "summary": "bug", "findings": ["x"]}"#)
+                .expect("parses");
         assert!(!v.approve);
         assert_eq!(v.summary.as_deref(), Some("bug"));
         assert_eq!(v.findings, vec!["x".to_string()]);
@@ -515,7 +518,8 @@ mod tests {
                 .expect("fenced parses")
                 .approve
         );
-        let embedded = "Here is my verdict:\n{\"approve\": false, \"findings\": [\"nope\"]}\nThanks.";
+        let embedded =
+            "Here is my verdict:\n{\"approve\": false, \"findings\": [\"nope\"]}\nThanks.";
         let v = parse_guardian_verdict(embedded).expect("embedded parses");
         assert!(!v.approve);
         assert_eq!(v.findings, vec!["nope".to_string()]);

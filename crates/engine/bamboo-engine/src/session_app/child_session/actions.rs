@@ -267,7 +267,15 @@ pub fn assemble_session_tree(
         }
     }
     let mut visited = std::collections::HashSet::new();
-    build(root_id, root_title, None, 0, max_depth, adjacency, &mut visited)
+    build(
+        root_id,
+        root_title,
+        None,
+        0,
+        max_depth,
+        adjacency,
+        &mut visited,
+    )
 }
 
 /// Materialize the full transitive parent→child session graph rooted at

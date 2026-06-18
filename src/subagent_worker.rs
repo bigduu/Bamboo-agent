@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_llm::{create_provider_by_name, Config, LLMChunk, LLMProvider};
-use futures::StreamExt;
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
@@ -34,6 +33,7 @@ use bamboo_subagent::executor::{
 use bamboo_subagent::proto::{AgentRecord, RunSpec};
 use bamboo_subagent::provision::{ExecutorSpec, ProvisionSpec};
 use bamboo_subagent::transport::WsServer;
+use futures::StreamExt;
 
 /// How long a finished actor's isolated storage is retained for debugging
 /// before background GC removes it.
@@ -418,7 +418,8 @@ impl BambooRuntimeExecutor {
                 Some(Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
                     default_tools,
                     sub_agent,
-                )) as Arc<dyn bamboo_agent_core::tools::ToolExecutor>)
+                ))
+                    as Arc<dyn bamboo_agent_core::tools::ToolExecutor>)
             } else {
                 None
             };
@@ -432,7 +433,11 @@ impl BambooRuntimeExecutor {
             bamboo_engine::external_agents::set_child_approval_reviewer(Arc::new(
                 ModelApprovalReviewer {
                     provider: provider_for_review,
-                    model: spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
+                    model: spec
+                        .model
+                        .as_ref()
+                        .map(|m| m.model.clone())
+                        .unwrap_or_default(),
                 },
             ));
         }

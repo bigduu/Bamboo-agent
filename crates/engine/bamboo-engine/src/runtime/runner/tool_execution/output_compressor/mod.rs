@@ -529,11 +529,9 @@ fn truncate_to_token_budget(
 ) -> String {
     use bamboo_compression::TokenCounter;
 
-    let preserved = task_hint
-        .filter(|hint| !hint.is_empty())
-        .and_then(|hint| {
-            collect_task_relevant_lines(text, hint, (max_tokens as f64 * 0.15) as u32, counter)
-        });
+    let preserved = task_hint.filter(|hint| !hint.is_empty()).and_then(|hint| {
+        collect_task_relevant_lines(text, hint, (max_tokens as f64 * 0.15) as u32, counter)
+    });
 
     if let Some(lines) = preserved {
         // Reserve ~15% of the budget for task-relevant lines and shrink head/tail
@@ -1093,10 +1091,16 @@ mod tests {
         let mut lines: Vec<String> = (0..400)
             .map(|i| format!("filler line number {i} with some padding words"))
             .collect();
-        lines.insert(200, "CRITICAL zephyrqux module test FAILED here".to_string());
+        lines.insert(
+            200,
+            "CRITICAL zephyrqux module test FAILED here".to_string(),
+        );
         let text = lines.join("\n");
         let max_tokens = 80;
-        assert!(counter.count_text(&text) > max_tokens, "text must exceed budget");
+        assert!(
+            counter.count_text(&text) > max_tokens,
+            "text must exceed budget"
+        );
 
         let hint = TaskCompressionHint::from_phrases(vec!["zephyrqux module passes".to_string()]);
         let out = truncate_to_token_budget(&text, max_tokens, &counter, Some(&hint));

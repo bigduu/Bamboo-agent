@@ -302,7 +302,10 @@ mod tests {
         // The runtime goal state is surfaced so the frontend can show live progress.
         assert_eq!(resp["goal_state"]["status"], "complete");
         assert_eq!(resp["goal_state"]["continuation_count"], 1);
-        assert_eq!(resp["goal_state"]["eval_history"][0]["decision"], "achieved");
+        assert_eq!(
+            resp["goal_state"]["eval_history"][0]["decision"],
+            "achieved"
+        );
         assert_eq!(
             resp["goal_state"]["eval_history"][0]["checkpoint"],
             "terminal"

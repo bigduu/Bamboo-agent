@@ -283,8 +283,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // commands) force a confirmation even under bypass. Everything
                 // else is skipped when this session is in "bypass permissions"
                 // mode (scoped per-session via its runtime state).
-                let force_ask =
-                    permission_checker.requires_forced_confirmation(&tool_name, &args);
+                let force_ask = permission_checker.requires_forced_confirmation(&tool_name, &args);
                 for context in contexts {
                     if ctx.bypass_permissions && !force_ask {
                         continue;
@@ -960,7 +959,10 @@ mod tests {
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = make_executor(Some(checker));
 
-        let call = make_tool_call("Write", json!({"file_path": "/etc/forced.conf", "content": "x"}));
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": "/etc/forced.conf", "content": "x"}),
+        );
         let ctx = ToolExecutionContext {
             session_id: Some("s-forced"),
             tool_call_id: &call.id,
@@ -1020,7 +1022,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "host grant should let the write through: {result:?}");
+        assert!(
+            result.is_ok(),
+            "host grant should let the write through: {result:?}"
+        );
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "ok");
     }
 

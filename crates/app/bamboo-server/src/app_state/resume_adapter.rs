@@ -236,8 +236,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         (tool_result.result, tool_result.success)
                     }
                     Err(error) => {
-                        let message =
-                            format!("Tool re-execution after approval failed: {error}");
+                        let message = format!("Tool re-execution after approval failed: {error}");
                         let _ = mpsc_tx
                             .send(emitter.error(message.clone()).clone().into_agent_event())
                             .await;

@@ -508,10 +508,7 @@ impl AgentLoopConfig {
     /// config is present and enabled.
     pub fn guardian_active(&self) -> bool {
         self.guardian_spawner.is_some()
-            && self
-                .guardian_config
-                .as_ref()
-                .is_some_and(|cfg| cfg.enabled)
+            && self.guardian_config.as_ref().is_some_and(|cfg| cfg.enabled)
     }
 
     /// Maximum guardian review passes for this run (the budget). `0` when no

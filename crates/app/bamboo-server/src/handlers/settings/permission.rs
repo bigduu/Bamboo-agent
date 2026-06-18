@@ -57,8 +57,7 @@ pub async fn update_permission_ask_rules(
     config.set_ask_rules(rules.clone());
 
     // ...then persist to the same store `load_permission_checker` reads at boot.
-    let storage =
-        bamboo_tools::permission::PermissionStorage::new(app_state.app_data_dir.clone());
+    let storage = bamboo_tools::permission::PermissionStorage::new(app_state.app_data_dir.clone());
     storage.save(config.as_ref()).await.map_err(|error| {
         AppError::InternalError(anyhow::anyhow!(
             "Failed to persist permission rules: {error}"

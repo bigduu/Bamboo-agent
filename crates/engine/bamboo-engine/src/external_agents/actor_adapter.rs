@@ -238,8 +238,8 @@ pub fn child_approval_reviewer() -> Option<Arc<dyn ChildApprovalReviewer>> {
 /// reply back down. The top server never installs one ⇒ its drive() falls to the
 /// human-loop. Set per-run (a worker serves runs sequentially, so one active
 /// bridge); a stale bridge from a finished run errors on call ⇒ fail-closed.
-fn escalation_bridge_slot() -> &'static std::sync::Mutex<Option<bamboo_subagent::executor::HostBridge>>
-{
+fn escalation_bridge_slot(
+) -> &'static std::sync::Mutex<Option<bamboo_subagent::executor::HostBridge>> {
     static SLOT: std::sync::Mutex<Option<bamboo_subagent::executor::HostBridge>> =
         std::sync::Mutex::new(None);
     &SLOT
@@ -907,15 +907,27 @@ mod tests {
 
         let mut depth = spec_with("explorer", "p", "m", Some("/ws"), None);
         depth.identity.depth = 2;
-        assert_ne!(base_fp, ActorChildRunner::fingerprint(&depth), "depth must split");
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&depth),
+            "depth must split"
+        );
 
         let mut nested = spec_with("explorer", "p", "m", Some("/ws"), None);
         nested.capabilities.nested_spawn = true;
-        assert_ne!(base_fp, ActorChildRunner::fingerprint(&nested), "nested_spawn must split");
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&nested),
+            "nested_spawn must split"
+        );
 
         let mut bypass = spec_with("explorer", "p", "m", Some("/ws"), None);
         bypass.capabilities.bypass = true;
-        assert_ne!(base_fp, ActorChildRunner::fingerprint(&bypass), "bypass must split");
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&bypass),
+            "bypass must split"
+        );
 
         let mut enforce = spec_with("explorer", "p", "m", Some("/ws"), None);
         enforce.capabilities.enforce_permissions = true;
@@ -927,7 +939,11 @@ mod tests {
 
         let mut cap = spec_with("explorer", "p", "m", Some("/ws"), None);
         cap.capabilities.max_spawn_depth = Some(8);
-        assert_ne!(base_fp, ActorChildRunner::fingerprint(&cap), "max_spawn_depth must split");
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&cap),
+            "max_spawn_depth must split"
+        );
     }
 
     struct StaticDecider(bool);
@@ -942,8 +958,7 @@ mod tests {
     #[tokio::test]
     async fn child_approval_fails_closed_without_decider() {
         // No decider wired ⇒ the host denies (safe default), unchanged behavior.
-        let body =
-            serde_json::json!({"tool_name":"Bash","permission":"run","resource":"rm -rf /"});
+        let body = serde_json::json!({"tool_name":"Bash","permission":"run","resource":"rm -rf /"});
         assert!(!decide_child_approval(None, "child-1", &body).await);
     }
 
@@ -974,16 +989,14 @@ mod tests {
     async fn nested_spawn_unavailable_without_handler() {
         let reply = fulfil_nested_spawn(None, "child-1", serde_json::json!({})).await;
         assert_eq!(reply["success"], serde_json::json!(false));
-        assert!(reply["result"]
-            .as_str()
-            .unwrap()
-            .contains("not available"));
+        assert!(reply["result"].as_str().unwrap().contains("not available"));
     }
 
     #[tokio::test]
     async fn nested_spawn_returns_handler_result_or_error_body() {
-        let ok: Arc<dyn NestedSpawnHandler> =
-            Arc::new(StaticSpawn(Ok(serde_json::json!({"success": true, "result": "spawned"}))));
+        let ok: Arc<dyn NestedSpawnHandler> = Arc::new(StaticSpawn(Ok(
+            serde_json::json!({"success": true, "result": "spawned"}),
+        )));
         let reply = fulfil_nested_spawn(Some(&ok), "child-1", serde_json::json!({})).await;
         assert_eq!(reply["result"], serde_json::json!("spawned"));
 
@@ -995,8 +1008,7 @@ mod tests {
 
     #[test]
     fn approval_request_fields_extracts_and_defaults() {
-        let full =
-            serde_json::json!({"tool_name":"Bash","permission":"run","resource":"ls"});
+        let full = serde_json::json!({"tool_name":"Bash","permission":"run","resource":"ls"});
         assert_eq!(
             approval_request_fields(&full),
             ("Bash".to_string(), "run".to_string(), "ls".to_string())

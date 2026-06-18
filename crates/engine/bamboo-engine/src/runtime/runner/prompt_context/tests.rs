@@ -101,8 +101,7 @@ fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_marker
 }
 
 #[tokio::test]
-async fn external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown(
-) {
+async fn external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     store
@@ -546,8 +545,7 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
 }
 
 #[tokio::test]
-async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits()
-{
+async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-recall-fallback");
@@ -653,8 +651,7 @@ async fn external_memory_prefers_project_dream_over_global_fallback() {
 }
 
 #[tokio::test]
-async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing(
-) {
+async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-global-dream-fallback");
@@ -755,8 +752,7 @@ async fn external_memory_omits_project_index_when_project_prompt_injection_disab
 }
 
 #[tokio::test]
-async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled(
-) {
+async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-global-dream-mode");
