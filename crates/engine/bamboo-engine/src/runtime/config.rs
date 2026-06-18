@@ -120,6 +120,111 @@ impl GoldConfig {
     }
 }
 
+fn default_guardian_max_reviews() -> u32 {
+    2
+}
+
+/// Configuration for the guardian adversarial-review terminal gate.
+///
+/// Mirrors [`GoldConfig`]: a plain, serde-defaulting struct surfaced per run.
+/// When `enabled` is false (the default) the guardian gate is inactive and the
+/// terminal completion path is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GuardianConfig {
+    /// Master switch for the guardian review gate.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional dedicated reviewer model. Falls back to the run's main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Maximum guardian review passes per run (budget; mirrors
+    /// [`GoldConfig::max_auto_continuations`]).
+    #[serde(default = "default_guardian_max_reviews")]
+    pub max_reviews: u32,
+}
+
+impl Default for GuardianConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_name: None,
+            max_reviews: default_guardian_max_reviews(),
+        }
+    }
+}
+
+/// Late-bound spawner for the guardian reviewer child.
+///
+/// The runner cannot construct a child directly: the `SpawnScheduler` is built
+/// *after* the `Agent` that drives the runner (a construction-order cycle), so
+/// the terminal gate spawns the reviewer through this trait object, injected
+/// per-request on [`AgentLoopConfig`] exactly like `auxiliary_model_resolver`.
+/// The implementation lives in the server (it captures the already-built
+/// scheduler + child-session adapter); the engine holds only the trait, keeping
+/// the engine free of any dependency on server/AppState types.
+#[async_trait::async_trait]
+pub trait GuardianSpawner: Send + Sync {
+    /// Create a read-only reviewer child for `parent_session_id`, seeded with
+    /// `review_prompt`, enqueue it to run, and return its session id so the
+    /// caller can register a wait on it.
+    async fn spawn_guardian_review(
+        &self,
+        parent_session: &bamboo_agent_core::Session,
+        review_prompt: String,
+        model: String,
+        disabled_tools: Option<BTreeSet<String>>,
+    ) -> Result<String, String>;
+}
+
+/// A child sub-agent's request to have a gated tool approved by its parent.
+///
+/// A non-bypassed child cannot answer its own permission prompt (no human is
+/// attached to a child session), so the request is delegated up to the parent.
+#[derive(Debug, Clone)]
+pub struct ChildApprovalRequest {
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    /// The gated tool call on the child to re-execute once approved.
+    pub child_tool_call_id: String,
+    pub tool_name: String,
+    /// Permission type as a string (e.g. "WriteFile", "ExecuteCommand").
+    pub permission_type: String,
+    /// The concrete resource the permission applies to (path, command, …).
+    pub resource: String,
+    /// Human-facing approval question to surface on the parent.
+    pub question: String,
+    /// The raw `awaiting_permission_approval` payload the child's executor built,
+    /// so the parent can reuse the existing grant-extraction path verbatim.
+    pub approval_payload: serde_json::Value,
+}
+
+/// What the executor should do after delegating a child's approval upward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildApprovalOutcome {
+    /// Registered on the parent; the child must SUSPEND and await the decision.
+    Delegated,
+    /// Parent policy auto-approved (bypass / existing grant); proceed to execute.
+    AutoApproved,
+    /// Parent policy auto-denied; the executor must deny the tool.
+    AutoDenied,
+}
+
+/// Late-bound delegate that routes a child's approval request up to its parent.
+///
+/// Injected per-request on [`AgentLoopConfig`] exactly like [`GuardianSpawner`];
+/// the trait lives in the engine, the implementation in the server (it owns the
+/// parent session store + pending-question + notification machinery).
+#[async_trait::async_trait]
+pub trait ApprovalDelegate: Send + Sync {
+    /// Register `request` on its parent (or auto-resolve by policy) and report
+    /// what the child's executor should do next.
+    async fn delegate_child_approval(
+        &self,
+        request: ChildApprovalRequest,
+    ) -> Result<ChildApprovalOutcome, String>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFallbackMode {
     Placeholder,
@@ -280,6 +385,17 @@ pub struct AgentLoopConfig {
     /// When `None` or `enabled == false`, Gold evaluation is disabled and the
     /// existing execute/respond/resume loop remains unchanged.
     pub(crate) gold_config: Option<GoldConfig>,
+    /// Optional guardian adversarial-review gate configuration. When `None` or
+    /// `enabled == false`, the guardian terminal gate is inactive.
+    pub(crate) guardian_config: Option<GuardianConfig>,
+    /// Late-bound spawner for the guardian reviewer child. `None` (the default)
+    /// leaves the guardian gate inert even when `guardian_config.enabled` is set,
+    /// since the runner cannot create a child without it. Wired by the server.
+    pub(crate) guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
+    /// Late-bound delegate that routes a child's gated-tool approval request up
+    /// to its parent (Phase 2). `None` (the default) leaves child gating on its
+    /// legacy path. Wired by the server.
+    pub(crate) approval_delegate: Option<Arc<dyn ApprovalDelegate>>,
     /// Enable dynamic per-round model routing based on task complexity.
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
@@ -353,6 +469,9 @@ impl Default for AgentLoopConfig {
             parallel_batch_timeout_secs: 300,
             permission_mode: None,
             gold_config: None,
+            guardian_config: None,
+            guardian_spawner: None,
+            approval_delegate: None,
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,
             mcp_tool_guidance: None,
@@ -382,6 +501,34 @@ impl AgentLoopConfig {
         self.gold_config.as_ref().is_some_and(|cfg| {
             cfg.enabled && cfg.auto_continue_enabled && cfg.effective_goal().is_some()
         })
+    }
+
+    /// Whether the guardian review gate is active for this run: a spawner is
+    /// wired (so the runner can actually create the reviewer child) AND the
+    /// config is present and enabled.
+    pub fn guardian_active(&self) -> bool {
+        self.guardian_spawner.is_some()
+            && self.guardian_config.as_ref().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// Maximum guardian review passes for this run (the budget). `0` when no
+    /// guardian config is set.
+    pub fn guardian_max_reviews(&self) -> u32 {
+        self.guardian_config
+            .as_ref()
+            .map_or(0, |cfg| cfg.max_reviews)
+    }
+
+    /// The reviewer model override, if a guardian config sets one.
+    pub fn guardian_model(&self) -> Option<&str> {
+        self.guardian_config
+            .as_ref()
+            .and_then(|cfg| cfg.model_name.as_deref())
+    }
+
+    /// Whether child→parent approval delegation is wired for this run.
+    pub fn delegation_active(&self) -> bool {
+        self.approval_delegate.is_some()
     }
 }
 

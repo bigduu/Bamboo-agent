@@ -132,7 +132,10 @@ pub fn classify(
                 if !prefs.on_clarification {
                     return None;
                 }
-                (NotificationCategory::NeedsClarification, "Your input needed")
+                (
+                    NotificationCategory::NeedsClarification,
+                    "Your input needed",
+                )
             };
             Some(ClassifiedNotification {
                 category,

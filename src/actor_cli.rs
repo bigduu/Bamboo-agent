@@ -279,6 +279,10 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                     Ok(Some(ChildFrame::SubagentRequest { .. })) => {
                         // This CLI does not host nested spawning; ignore.
                     }
+                    Ok(Some(ChildFrame::ApprovalRequest { .. })) => {
+                        // This CLI does not route gated-tool approvals; ignore.
+                        // (The production host in actor_adapter answers these.)
+                    }
                     Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
                         println!();
                         match status {
@@ -346,6 +350,7 @@ fn prepare_spec(
             parent_id: None,
             project_key: None,
             role: role.to_string(),
+            depth: 0,
         },
         if echo {
             ExecutorSpec::Echo

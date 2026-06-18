@@ -373,6 +373,7 @@ pub(super) async fn maybe_compress(
     mut outcome: ToolExecutionOutcome,
     max_tool_output_tokens: u32,
     context_pressure: Option<ContextPressure>,
+    task_hint: Option<&TaskCompressionHint>,
 ) -> ToolExecutionOutcome {
     let result = match outcome.result {
         Ok(ref mut result) => result,
@@ -416,8 +417,12 @@ pub(super) async fn maybe_compress(
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
         if tokens > max_tool_output_tokens {
-            let truncated =
-                truncate_to_token_budget(&result.result, max_tool_output_tokens, &counter);
+            let truncated = truncate_to_token_budget(
+                &result.result,
+                max_tool_output_tokens,
+                &counter,
+                task_hint,
+            );
             tracing::info!(
                 "[{}] Tool output truncated: {} tokens > {} limit, {} chars → {} chars",
                 session_id,
@@ -433,13 +438,121 @@ pub(super) async fn maybe_compress(
     outcome
 }
 
+/// Task-aware compression hint: significant terms from the ACTIVE task's
+/// completion criteria (+ description). When a tool output must be truncated to
+/// fit the token budget, lines matching any term are preferentially preserved so
+/// task-relevant evidence (e.g. the criterion the agent is verifying) survives
+/// the cut. Built once per round from the `TaskLoopContext`
+/// (see `build_task_compression_hint`). This is the Phase-4 "task-aware" masking:
+/// truncation is biased toward what the active task needs, not just head/tail.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TaskCompressionHint {
+    keywords: Vec<String>,
+}
+
+impl TaskCompressionHint {
+    /// Build from raw phrases (criteria / description): split into lowercased
+    /// significant terms (≥4 chars), deduped, capped.
+    pub(crate) fn from_phrases<I: IntoIterator<Item = String>>(phrases: I) -> Self {
+        let mut keywords: Vec<String> = Vec::new();
+        'outer: for phrase in phrases {
+            for term in phrase.split(|c: char| !c.is_alphanumeric()) {
+                let term = term.trim().to_lowercase();
+                if term.len() >= 4 && !keywords.contains(&term) {
+                    keywords.push(term);
+                }
+                if keywords.len() >= 32 {
+                    break 'outer;
+                }
+            }
+        }
+        Self { keywords }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keywords.is_empty()
+    }
+
+    fn matches(&self, line: &str) -> bool {
+        let lower = line.to_lowercase();
+        self.keywords.iter().any(|k| lower.contains(k.as_str()))
+    }
+}
+
+/// Collect up to `max_tokens` worth of lines from `text` that match the task
+/// hint, for preservation when the output is otherwise truncated. Returns `None`
+/// when no lines match (or the hint is empty).
+fn collect_task_relevant_lines(
+    text: &str,
+    hint: &TaskCompressionHint,
+    max_tokens: u32,
+    counter: &bamboo_compression::TiktokenTokenCounter,
+) -> Option<String> {
+    use bamboo_compression::TokenCounter;
+    if hint.is_empty() || max_tokens == 0 {
+        return None;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0u32;
+    for line in text.lines() {
+        if !hint.matches(line) {
+            continue;
+        }
+        let cost = counter.count_text(line).saturating_add(1);
+        if used.saturating_add(cost) > max_tokens {
+            break;
+        }
+        used += cost;
+        kept.push(line);
+        if kept.len() >= 50 {
+            break;
+        }
+    }
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join("\n"))
+    }
+}
+
 /// Truncate text to fit within a token budget by keeping head + tail portions.
+///
+/// When a [`TaskCompressionHint`] is present AND some lines in the dropped middle
+/// match it, a slice of the budget is reserved to preserve those task-relevant
+/// lines (Phase-4 task-aware masking). With no hint (or no match) the behaviour
+/// is the original 70/30 head/tail split, byte-for-byte.
 fn truncate_to_token_budget(
     text: &str,
     max_tokens: u32,
     counter: &bamboo_compression::TiktokenTokenCounter,
+    task_hint: Option<&TaskCompressionHint>,
 ) -> String {
     use bamboo_compression::TokenCounter;
+
+    let preserved = task_hint.filter(|hint| !hint.is_empty()).and_then(|hint| {
+        collect_task_relevant_lines(text, hint, (max_tokens as f64 * 0.15) as u32, counter)
+    });
+
+    if let Some(lines) = preserved {
+        // Reserve ~15% of the budget for task-relevant lines and shrink head/tail
+        // to 0.5/0.2, leaving ~15% headroom for the truncation marker + role/
+        // newline boilerplate so the assembled output stays within `max_tokens`
+        // (head + tail are sliced from the full text, so their sum must stay
+        // comfortably under budget rather than at it).
+        let head_tokens = (max_tokens as f64 * 0.5) as u32;
+        let tail_tokens = (max_tokens as f64 * 0.2) as u32;
+        let head = find_prefix_within_tokens(text, head_tokens, counter);
+        let tail = find_suffix_within_tokens(text, tail_tokens, counter);
+        return format!(
+            "{}\n\n[... tool output truncated: {} tokens → {} token budget; task-relevant lines preserved ...]\n{}\n\n{}",
+            head,
+            counter.count_text(text),
+            max_tokens,
+            lines,
+            tail,
+        );
+    }
+
     let head_tokens = (max_tokens as f64 * 0.7) as u32;
     let tail_tokens = max_tokens.saturating_sub(head_tokens);
 
@@ -967,5 +1080,58 @@ mod tests {
     fn detect_command_with_env_prefix() {
         let args = r#"{"command": "CI=true cargo test"}"#;
         assert_eq!(detect_scenario("Bash", args), OutputScenario::BashTest);
+    }
+
+    // ── Task-aware truncation (Phase 4) ──
+
+    #[test]
+    fn truncate_preserves_task_relevant_middle_lines() {
+        use bamboo_compression::TokenCounter;
+        let counter = bamboo_compression::TiktokenTokenCounter::default();
+        let mut lines: Vec<String> = (0..400)
+            .map(|i| format!("filler line number {i} with some padding words"))
+            .collect();
+        lines.insert(
+            200,
+            "CRITICAL zephyrqux module test FAILED here".to_string(),
+        );
+        let text = lines.join("\n");
+        let max_tokens = 80;
+        assert!(
+            counter.count_text(&text) > max_tokens,
+            "text must exceed budget"
+        );
+
+        let hint = TaskCompressionHint::from_phrases(vec!["zephyrqux module passes".to_string()]);
+        let out = truncate_to_token_budget(&text, max_tokens, &counter, Some(&hint));
+        assert!(
+            out.contains("task-relevant lines preserved"),
+            "preserved-section marker present"
+        );
+        assert!(
+            out.contains("zephyrqux"),
+            "the matching middle line must survive truncation"
+        );
+    }
+
+    #[test]
+    fn truncate_without_hint_keeps_original_format() {
+        let counter = bamboo_compression::TiktokenTokenCounter::default();
+        let text = (0..400)
+            .map(|i| format!("line {i} content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = truncate_to_token_budget(&text, 50, &counter, None);
+        assert!(out.contains("[... tool output truncated:"));
+        assert!(!out.contains("task-relevant lines preserved"));
+    }
+
+    #[test]
+    fn task_hint_extracts_significant_terms_and_matches() {
+        let hint =
+            TaskCompressionHint::from_phrases(vec!["All tests pass for module X".to_string()]);
+        assert!(!hint.is_empty());
+        assert!(hint.matches("re-running the module checks"));
+        assert!(!hint.matches("xyz qrs unrelated"));
     }
 }

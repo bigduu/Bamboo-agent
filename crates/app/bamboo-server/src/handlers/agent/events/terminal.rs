@@ -142,8 +142,7 @@ pub(super) async fn has_running_child(state: &web::Data<AppState>, session_id: &
         runners
             .iter()
             .filter_map(|(running_id, runner)| {
-                (matches!(runner.status, AgentStatus::Running)
-                    && running_id.as_str() != session_id)
+                (matches!(runner.status, AgentStatus::Running) && running_id.as_str() != session_id)
                     .then(|| running_id.clone())
             })
             .collect()

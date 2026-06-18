@@ -82,6 +82,7 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
                 .role
                 .clone()
                 .unwrap_or_else(|| "general-purpose".into()),
+            depth: 0,
         },
         ExecutorSpec::BambooRuntime,
         std::env::temp_dir()
@@ -93,22 +94,18 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     // Model precedence: explicit --model > config defaults.sub_agent > defaults.chat.
     // A deployed worker given no --model must still inherit the configured default,
     // otherwise its AgentLoopConfig has no model_name and every LLM call fails.
-    spec.model = args
-        .model
-        .as_deref()
-        .and_then(parse_model)
-        .or_else(|| {
-            config.defaults.as_ref().and_then(|defaults| {
-                defaults
-                    .sub_agent
-                    .as_ref()
-                    .or(Some(&defaults.chat))
-                    .map(|r| ModelRefSpec {
-                        provider: r.provider.clone(),
-                        model: r.model.clone(),
-                    })
-            })
-        });
+    spec.model = args.model.as_deref().and_then(parse_model).or_else(|| {
+        config.defaults.as_ref().and_then(|defaults| {
+            defaults
+                .sub_agent
+                .as_ref()
+                .or(Some(&defaults.chat))
+                .map(|r| ModelRefSpec {
+                    provider: r.provider.clone(),
+                    model: r.model.clone(),
+                })
+        })
+    });
     spec.workspace = args.workspace.clone();
     spec.secrets.provider_credentials = credentials;
 

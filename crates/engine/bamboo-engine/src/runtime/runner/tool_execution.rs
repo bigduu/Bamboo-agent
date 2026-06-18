@@ -28,6 +28,24 @@ fn build_context_pressure(session: &Session) -> Option<output_compressor::Contex
     })
 }
 
+/// Build the task-aware compression hint from the ACTIVE task item's completion
+/// criteria (+ description), so a truncated tool output preferentially preserves
+/// lines relevant to what the task is verifying (Phase 4). `None` when there is
+/// no active task or it yields no significant terms.
+fn build_task_compression_hint(
+    task_context: &Option<TaskLoopContext>,
+) -> Option<output_compressor::TaskCompressionHint> {
+    let ctx = task_context.as_ref()?;
+    let item = ctx
+        .items
+        .iter()
+        .find(|item| Some(&item.id) == ctx.active_item_id.as_ref())?;
+    let mut phrases = item.completion_criteria.clone();
+    phrases.push(item.description.clone());
+    let hint = output_compressor::TaskCompressionHint::from_phrases(phrases);
+    (!hint.is_empty()).then_some(hint)
+}
+
 /// Tools exempt from plan-mode blocking (UI pause/clarification tools).
 const PLAN_MODE_EXEMPT_TOOLS: &[&str] = &[
     "EnterPlanMode",
@@ -124,6 +142,7 @@ async fn execute_and_apply_single_tool_call(
                 tool_duration: std::time::Duration::ZERO,
             };
             policy_guard.observe_outcome(tool_call, &outcome.result);
+            let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
                 &tool_call.function.arguments,
@@ -135,6 +154,7 @@ async fn execute_and_apply_single_tool_call(
                     .map(|b| b.max_tool_output_tokens)
                     .unwrap_or(0),
                 build_context_pressure(session),
+                task_hint.as_ref(),
             )
             .await;
             let should_break = per_call::apply_tool_execution_outcome(
@@ -214,6 +234,7 @@ async fn execute_and_apply_single_tool_call(
     policy_guard.observe_outcome(tool_call, &outcome.result);
 
     // Compress tool output before applying
+    let task_hint = build_task_compression_hint(task_context);
     let outcome = output_compressor::maybe_compress(
         &tool_call.function.name,
         &tool_call.function.arguments,
@@ -225,6 +246,7 @@ async fn execute_and_apply_single_tool_call(
             .map(|b| b.max_tool_output_tokens)
             .unwrap_or(0),
         build_context_pressure(session),
+        task_hint.as_ref(),
     )
     .await;
 
@@ -564,6 +586,7 @@ pub(crate) async fn execute_round_tool_calls(
                 .map(|b| b.max_tool_output_tokens)
                 .unwrap_or(0);
             let pressure = build_context_pressure(session);
+            let task_hint = build_task_compression_hint(task_context);
             let compressed: Vec<_> =
                 join_all(batch.iter().zip(outcomes).map(|(batch_call, outcome)| {
                     let tool_name = batch_call.function.name.clone();
@@ -575,6 +598,7 @@ pub(crate) async fn execute_round_tool_calls(
                             usage_percent: p.usage_percent,
                             remaining_tokens: p.remaining_tokens,
                         });
+                    let task_hint = task_hint.clone();
                     async move {
                         output_compressor::maybe_compress(
                             &tool_name,
@@ -583,6 +607,7 @@ pub(crate) async fn execute_round_tool_calls(
                             outcome,
                             max_tool_tokens,
                             pressure,
+                            task_hint.as_ref(),
                         )
                         .await
                     }

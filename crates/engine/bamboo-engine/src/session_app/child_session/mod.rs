@@ -16,8 +16,9 @@ mod helpers;
 mod tests;
 
 pub use actions::{
-    cancel_child_action, create_child_action, delete_child_action, get_child_action,
-    list_children_action, run_child_action, send_message_to_child_action, update_child_action,
+    assemble_session_tree, build_session_tree_action, cancel_child_action, create_child_action,
+    delete_child_action, get_child_action, list_children_action, run_child_action,
+    send_message_to_child_action, update_child_action, SessionTreeNode,
 };
 pub use helpers::{
     compute_status_guidance, format_child_assignment, map_child_entry, metadata_text,
@@ -125,6 +126,17 @@ pub struct CreateChildInput {
     /// For a resident agent, how successive tasks treat prior context:
     /// `"reset"` (default — independent tasks) or `"accumulate"` (remember).
     pub resident_context: Option<String>,
+    /// Tool names to disable for this child (denylist; matched by EXACT
+    /// `ToolSchema.function.name`). `None` (the default) = full toolset. A
+    /// read-only Guardian reviewer sets e.g. {"Edit","Write","SubAgent",...}.
+    /// Carried to the child's `SpawnJob.disabled_tools` via the child session
+    /// metadata (see `create_child_action`) so the worker trims its toolset.
+    pub disabled_tools: Option<std::collections::BTreeSet<String>>,
+    /// Model-controllable context fork (Phase 3): when `Some(n)` with `n > 0`,
+    /// the last `n` non-system parent messages are rendered into a "Forked
+    /// context from parent" block prepended to the child's task brief. `None`
+    /// (the default) keeps the child on a clean, freshly-seeded context.
+    pub context_fork: Option<usize>,
 }
 
 /// Result of creating a child session.

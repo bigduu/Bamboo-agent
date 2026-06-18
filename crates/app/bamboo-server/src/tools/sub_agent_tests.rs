@@ -319,6 +319,60 @@ async fn create_without_subagent_type_defaults_to_worker_label() {
 }
 
 #[tokio::test]
+async fn create_refused_at_max_spawn_depth() {
+    // Phase 6: an agent at the depth cap cannot create more sub-agents (bounds
+    // worker→worker→… recursion). Put the parent run session at the cap.
+    let harness = build_test_harness().await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.spawn_depth = bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH;
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let err = harness
+        .tool
+        .execute_with_context(
+            json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":"/tmp/ws"}),
+            ctx_for(&harness.parent_session_id, "tc_depth_cap"),
+        )
+        .await
+        .expect_err("create at the depth cap must be refused");
+    assert!(
+        matches!(err, bamboo_agent_core::tools::ToolError::InvalidArguments(ref m) if m.contains("depth limit")),
+        "expected a depth-limit InvalidArguments, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_allowed_just_below_max_spawn_depth() {
+    // One level below the cap, create proceeds (depth gate does not fire).
+    let harness = build_test_harness().await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.spawn_depth = bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH - 1;
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let result = harness
+        .tool
+        .execute_with_context(
+            json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":"/tmp/ws"}),
+            ctx_for(&harness.parent_session_id, "tc_depth_ok"),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "create just below the cap should proceed, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn create_with_wait_true_suspends_and_registers_wait() {
     let harness = build_test_harness().await;
     let result = harness

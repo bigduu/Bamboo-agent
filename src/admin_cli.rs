@@ -88,7 +88,12 @@ pub async fn status(conn: ConnArgs) -> anyhow::Result<()> {
     match health {
         Ok(r) if r.status().is_success() => println!("{:<10}{}", "health:".bold(), "ok".green()),
         Ok(r) => {
-            println!("{:<10}{} (HTTP {})", "health:".bold(), "down".red(), r.status());
+            println!(
+                "{:<10}{} (HTTP {})",
+                "health:".bold(),
+                "down".red(),
+                r.status()
+            );
             return Ok(());
         }
         Err(e) => {
@@ -200,7 +205,11 @@ pub async fn stop(conn: ConnArgs, session_id: &str) -> anyhow::Result<()> {
         .unwrap_or("")
         .to_string();
     if status.is_success() {
-        let msg = if message.is_empty() { "stopped" } else { &message };
+        let msg = if message.is_empty() {
+            "stopped"
+        } else {
+            &message
+        };
         println!("{} {msg}", "✓".green());
         Ok(())
     } else if status.as_u16() == 404 {

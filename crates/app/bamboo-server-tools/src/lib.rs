@@ -23,5 +23,5 @@ pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;
 pub use session_inspector::SessionInspectorTool;
 pub use skill_runtime::{LoadSkillTool, ReadSkillResourceTool};
-pub use sub_agent::SubAgentTool;
+pub use sub_agent::{SubAgentProxyTool, SubAgentTool, DEFAULT_MAX_SPAWN_DEPTH};
 pub use surface::{ToolSurface, ToolSurfaceFactory};

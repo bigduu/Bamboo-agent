@@ -60,6 +60,92 @@ pub fn format_child_assignment(
     )
 }
 
+/// Render the last `n` non-system messages of `parent` into a compact
+/// "forked context" block for seeding a child sub-session (Phase 3
+/// model-controllable context fork). Returns `None` when `n == 0` or there is no
+/// non-system content. Rendered as `role: content` lines (content trimmed to a
+/// sane length) — a single text block, NOT spliced raw messages, so it can be
+/// safely prepended to the child's task brief without breaking role structure.
+pub fn render_forked_parent_context(parent: &Session, n: usize) -> Option<String> {
+    use bamboo_agent_core::Role;
+    if n == 0 {
+        return None;
+    }
+    let mut recent: Vec<&bamboo_agent_core::Message> = parent
+        .messages
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .rev()
+        .take(n)
+        .collect();
+    recent.reverse();
+
+    let rendered: Vec<String> = recent
+        .into_iter()
+        .filter_map(|m| {
+            let content = m.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                _ => "context",
+            };
+            let snippet = if content.chars().count() > 2000 {
+                let truncated: String = content.chars().take(2000).collect();
+                format!("{truncated}…")
+            } else {
+                content.to_string()
+            };
+            Some(format!("{role}: {snippet}"))
+        })
+        .collect();
+
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "## Forked context from parent (last {} message(s))\n{}",
+            rendered.len(),
+            rendered.join("\n")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod fork_context_tests {
+    use super::render_forked_parent_context;
+    use bamboo_agent_core::{Message, Session};
+
+    #[test]
+    fn renders_recent_non_system_messages() {
+        let mut parent = Session::new("p", "model");
+        parent.add_message(Message::system("you are root"));
+        parent.add_message(Message::user("first user msg"));
+        parent.add_message(Message::assistant("assistant reply", None));
+        parent.add_message(Message::user("latest ask"));
+
+        let forked = render_forked_parent_context(&parent, 2).expect("renders");
+        assert!(forked.contains("Forked context from parent"));
+        // Last 2 non-system messages, oldest-first.
+        assert!(forked.contains("assistant: assistant reply"));
+        assert!(forked.contains("user: latest ask"));
+        // The older user msg + the system msg are excluded by n=2 / system filter.
+        assert!(!forked.contains("first user msg"));
+        assert!(!forked.contains("you are root"));
+    }
+
+    #[test]
+    fn none_when_zero_or_empty() {
+        let mut parent = Session::new("p", "model");
+        parent.add_message(Message::user("hi"));
+        assert!(render_forked_parent_context(&parent, 0).is_none());
+        let empty = Session::new("p2", "model");
+        assert!(render_forked_parent_context(&empty, 5).is_none());
+    }
+}
+
 pub fn replace_or_append_last_user_message(session: &mut Session, content: String) -> usize {
     use bamboo_agent_core::Role;
 

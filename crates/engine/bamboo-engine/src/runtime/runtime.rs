@@ -23,7 +23,8 @@ use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
 
 use crate::runtime::config::{
-    AgentLoopConfig, AuxiliaryModelConfig, GoldConfig, ImageFallbackConfig, PromptMemoryFlags,
+    AgentLoopConfig, AuxiliaryModelConfig, GoldConfig, GuardianConfig, GuardianSpawner,
+    ImageFallbackConfig, PromptMemoryFlags,
 };
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
@@ -288,6 +289,11 @@ pub struct ExecuteRequest {
     pub selected_skill_mode: Option<String>,
     pub image_fallback: Option<ImageFallbackConfig>,
     pub gold_config: Option<GoldConfig>,
+    /// Optional guardian adversarial-review gate configuration.
+    pub guardian_config: Option<GuardianConfig>,
+    /// Late-bound spawner for the guardian reviewer child (wired by the server;
+    /// the runner cannot construct a child directly).
+    pub guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
 }
@@ -334,6 +340,8 @@ pub struct ExecuteRequestBuilder {
     selected_skill_mode: Option<String>,
     image_fallback: Option<ImageFallbackConfig>,
     gold_config: Option<GoldConfig>,
+    guardian_config: Option<GuardianConfig>,
+    guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
     app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -368,6 +376,8 @@ impl ExecuteRequestBuilder {
             selected_skill_mode: None,
             image_fallback: None,
             gold_config: None,
+            guardian_config: None,
+            guardian_spawner: None,
             app_data_dir: None,
         }
     }
@@ -512,6 +522,20 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the internal `guardian_config` feature flag (crate-visible, like
+    /// [`Self::gold_config`]). Public SDK callers leave it `None`.
+    pub(crate) fn guardian_config(mut self, v: Option<GuardianConfig>) -> Self {
+        self.guardian_config = v;
+        self
+    }
+
+    /// Set the late-bound guardian reviewer spawner (crate-visible; wired by the
+    /// server's spawn path so the runner can create the reviewer child).
+    pub(crate) fn guardian_spawner(mut self, v: Option<Arc<dyn GuardianSpawner>>) -> Self {
+        self.guardian_spawner = v;
+        self
+    }
+
     /// Set the Bamboo application data directory.
     pub fn app_data_dir(mut self, v: std::path::PathBuf) -> Self {
         self.app_data_dir = Some(v);
@@ -552,6 +576,8 @@ impl ExecuteRequestBuilder {
             selected_skill_mode: self.selected_skill_mode,
             image_fallback: self.image_fallback,
             gold_config: self.gold_config,
+            guardian_config: self.guardian_config,
+            guardian_spawner: self.guardian_spawner,
             app_data_dir: self.app_data_dir,
         }
     }
@@ -601,6 +627,8 @@ impl AgentRuntime {
             selected_skill_mode,
             image_fallback,
             gold_config,
+            guardian_config,
+            guardian_spawner,
             app_data_dir,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
@@ -680,6 +708,8 @@ impl AgentRuntime {
                 .and_then(|state| state.plan_mode.as_ref())
                 .map(|_| PermissionMode::Plan),
             gold_config,
+            guardian_config,
+            guardian_spawner,
             // Capture the tool executor's server-level guidance (connected MCP
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.

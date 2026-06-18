@@ -17,7 +17,9 @@ use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 
-use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, ImageFallbackConfig};
+use crate::runtime::config::{
+    AuxiliaryModelConfig, GoldConfig, GuardianConfig, GuardianSpawner, ImageFallbackConfig,
+};
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -133,6 +135,11 @@ pub struct SessionExecutionArgs {
     pub mpsc_tx: mpsc::Sender<AgentEvent>,
     pub image_fallback: Option<ImageFallbackConfig>,
     pub gold_config: Option<GoldConfig>,
+    /// Optional guardian adversarial-review gate configuration.
+    pub guardian_config: Option<GuardianConfig>,
+    /// Late-bound guardian reviewer spawner (server-provided; the runner cannot
+    /// construct a child directly).
+    pub guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
     pub app_data_dir: Option<std::path::PathBuf>,
 
     // Post-execution resources.
@@ -165,6 +172,8 @@ struct ExecuteRequestParams {
     selected_skill_mode: Option<String>,
     image_fallback: Option<ImageFallbackConfig>,
     gold_config: Option<GoldConfig>,
+    guardian_config: Option<GuardianConfig>,
+    guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
     app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -192,12 +201,16 @@ fn build_execute_request(
         selected_skill_mode,
         image_fallback,
         gold_config,
+        guardian_config,
+        guardian_spawner,
         app_data_dir,
     } = params;
 
     let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token)
         .model_roster(model_roster)
-        .gold_config(gold_config);
+        .gold_config(gold_config)
+        .guardian_config(guardian_config)
+        .guardian_spawner(guardian_spawner);
 
     if let Some(tools) = tools {
         builder = builder.tools(tools);
@@ -265,6 +278,8 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 mpsc_tx,
                 image_fallback,
                 gold_config,
+                guardian_config,
+                guardian_spawner,
                 app_data_dir,
                 runners,
                 sessions_cache,
@@ -325,6 +340,8 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                     selected_skill_mode,
                     image_fallback,
                     gold_config,
+                    guardian_config,
+                    guardian_spawner,
                     app_data_dir,
                 },
             );

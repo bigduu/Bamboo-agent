@@ -12,6 +12,11 @@ use crate::execution::{
     create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
     ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
 };
+use crate::runtime::config::GuardianSpawner;
+use crate::runtime::guardian_state::{
+    parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
+    GuardianVerdict,
+};
 use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
@@ -224,6 +229,47 @@ fn runtime_resume_message(
     message
 }
 
+/// The hidden resume message for a completed **guardian** review: a directive,
+/// verdict-tailored note that carries the reviewer's findings straight into the
+/// parent (so it can act without a `SubAgent.get`), mirroring
+/// [`runtime_resume_message`]'s hidden/compressible shape.
+fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdict) -> Message {
+    let mut body = if verdict.approve {
+        String::from(
+            "Guardian review APPROVED: an independent reviewer verified the work and found no blocking issues. You may finalize the task.",
+        )
+    } else {
+        String::from(
+            "Guardian review REJECTED: an independent reviewer found issues. Address every finding below before completing — do NOT declare the task complete until they are resolved.",
+        )
+    };
+    if let Some(summary) = verdict.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+        body.push_str("\n\nReviewer summary: ");
+        body.push_str(summary);
+    }
+    if !verdict.findings.is_empty() {
+        body.push_str("\n\nFindings:");
+        for (idx, finding) in verdict.findings.iter().enumerate() {
+            body.push_str(&format!("\n{}. {}", idx + 1, finding));
+        }
+    }
+    body.push_str(
+        "\n\nIf you need the full guardian transcript, call SubAgent.get(child_session_id).",
+    );
+
+    let mut message = Message::user(body);
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY: "guardian_review_resume",
+        "child_session_id": completion.child_session_id,
+        "child_status": completion.status,
+        "guardian_approved": verdict.approve,
+        "completed_at": completion.completed_at,
+    }));
+    message.never_compress = false;
+    message
+}
+
 #[derive(Clone)]
 pub struct ChildCompletionCoordinator {
     storage: Arc<dyn Storage>,
@@ -238,6 +284,10 @@ pub struct ChildCompletionCoordinator {
     app_data_dir: std::path::PathBuf,
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
+    /// Late-bound guardian reviewer spawner, set post-construction by the server
+    /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
+    /// reject→fix verdict can be re-reviewed across the suspend/resume boundary.
+    guardian_spawner: Arc<RwLock<Option<Arc<dyn GuardianSpawner>>>>,
 }
 
 impl ChildCompletionCoordinator {
@@ -268,11 +318,18 @@ impl ChildCompletionCoordinator {
             app_data_dir,
             account_feed_inbox,
             root_tools: Arc::new(RwLock::new(None)),
+            guardian_spawner: Arc::new(RwLock::new(None)),
         }
     }
 
     pub async fn set_root_tools(&self, tools: Arc<dyn ToolExecutor>) {
         *self.root_tools.write().await = Some(tools);
+    }
+
+    /// Wire the guardian reviewer spawner (server-provided), so resumed runs can
+    /// re-spawn a guardian to re-review a fix after a reject verdict.
+    pub async fn set_guardian_spawner(&self, spawner: Arc<dyn GuardianSpawner>) {
+        *self.guardian_spawner.write().await = Some(spawner);
     }
 
     fn build_resume_config(
@@ -388,18 +445,16 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         if should_resume {
             parent.metadata.remove("runtime.suspend_reason");
-            // Best-effort: load the child session so we can include its final
-            // assistant content in the hidden resume message. This avoids the
-            // root LLM having to make an extra `SubAgent.get` call after
-            // resume just to read what the child concluded — which would cost
-            // an additional LLM round trip.
-            let child_final_response = match self
+            // Load the completed child once. The guardian branch inspects its
+            // subagent_type + final verdict; the generic path folds its final
+            // assistant content into the hidden resume message (avoiding an extra
+            // `SubAgent.get` round trip after resume).
+            let loaded_child = match self
                 .storage
                 .load_session(&completion.child_session_id)
                 .await
             {
-                Ok(Some(child)) => child_final_assistant_text(&child),
-                Ok(None) => None,
+                Ok(child) => child,
                 Err(error) => {
                     tracing::warn!(
                         child_session_id = %completion.child_session_id,
@@ -409,11 +464,82 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     None
                 }
             };
-            parent.add_message(runtime_resume_message(
-                &completion,
-                remaining_children,
-                child_final_response.as_deref(),
-            ));
+
+            // Guardian branch: a completing guardian reviewer that matches the
+            // parent's recorded review advances GuardianState (phase → Reviewed)
+            // and resumes with a verdict-tailored, findings-carrying message. Any
+            // id mismatch or unparseable verdict falls through to the generic
+            // resume, so the parent is never stranded.
+            let reviewed_round = runtime_state.round.current_round;
+            let guardian_resume = loaded_child.as_ref().and_then(|child| {
+                if child.subagent_type().as_deref() != Some("guardian") {
+                    return None;
+                }
+                let mut guardian_state = read_guardian_state(&parent)?;
+                if guardian_state.guardian_child_id.as_deref()
+                    != Some(completion.child_session_id.as_str())
+                {
+                    // A *different* guardian is legitimately still in flight —
+                    // leave its Pending state intact and use the generic resume.
+                    tracing::warn!(
+                        parent_session_id = %completion.parent_session_id,
+                        child_session_id = %completion.child_session_id,
+                        expected = ?guardian_state.guardian_child_id,
+                        "guardian completion does not match recorded guardian_child_id; using generic resume"
+                    );
+                    return None;
+                }
+                // This IS the guardian we dispatched, so we MUST advance the
+                // phase out of `Pending` — otherwise the next terminal gate's
+                // `Pending => return None` would let the run complete unreviewed.
+                // A reviewer that errored or produced unparseable output is
+                // treated as a SYNTHETIC REJECT (never a silent pass), so the
+                // budgeted re-review loop governs the outcome: fail-closed, but
+                // still bounded by `max_reviews`.
+                let verdict = child_final_assistant_text(child)
+                    .and_then(|text| match parse_guardian_verdict(&text) {
+                        Ok(verdict) => Some(verdict),
+                        Err(error) => {
+                            tracing::warn!(
+                                child_session_id = %completion.child_session_id,
+                                %error,
+                                "guardian verdict unparseable; recording a synthetic reject"
+                            );
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        GuardianVerdict::rejected(vec![
+                            "The guardian reviewer did not return a usable verdict (it errored or \
+                             emitted unparseable output); the work has NOT been independently \
+                             verified."
+                                .to_string(),
+                        ])
+                    });
+                let approved = verdict.approve;
+                let message = guardian_resume_message(&completion, &verdict);
+                guardian_state.record_verdict(verdict, reviewed_round);
+                write_guardian_state(&mut parent, guardian_state);
+                tracing::info!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    approved,
+                    "guardian verdict recorded; resuming parent"
+                );
+                Some(message)
+            });
+
+            let resume_message = guardian_resume.unwrap_or_else(|| {
+                runtime_resume_message(
+                    &completion,
+                    remaining_children,
+                    loaded_child
+                        .as_ref()
+                        .and_then(child_final_assistant_text)
+                        .as_deref(),
+                )
+            });
+            parent.add_message(resume_message);
         } else if runtime_state.waiting_for_children.is_some() {
             runtime_state.status = AgentStatusState::Suspended;
             runtime_state.suspension = Some(SuspensionState {
@@ -588,6 +714,14 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 config.summarization_model_provider,
             ),
         };
+
+        // Re-inject guardian state on resume so a reject→fix verdict can be
+        // re-reviewed: config from the session (persisted at first spawn),
+        // spawner from the coordinator-held handle. Absent guardian config this
+        // stays `None`, and the approve→complete path is unchanged.
+        let guardian_config = read_guardian_config(&session);
+        let guardian_spawner = self.guardian_spawner.read().await.clone();
+
         spawn_session_execution(SessionExecutionArgs {
             agent: self.agent.clone(),
             session_id,
@@ -606,6 +740,8 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             mpsc_tx,
             image_fallback: config.image_fallback,
             gold_config,
+            guardian_config,
+            guardian_spawner,
             app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),

@@ -80,6 +80,11 @@ enum SubAgentArgs {
         /// create; honored on reuse.
         #[serde(default)]
         context: Option<String>,
+        /// Phase 3 model-controllable context fork: when `> 0`, carry the last N
+        /// of the parent's messages into the child's task brief. `None`/0 (the
+        /// default) gives the child a clean, freshly-seeded context.
+        #[serde(default)]
+        fork_last_messages: Option<usize>,
     },
     /// Suspend the parent run until its background child sessions finish.
     ///
@@ -302,12 +307,201 @@ fn parse_model_spec(
     Ok(bamboo_domain::ProviderModelRef::new(provider, spec))
 }
 
+/// Default max nesting depth for sub-agent spawning (Phase 6: direct nested
+/// execution). An agent at `spawn_depth >= this` may not create more children,
+/// bounding worker→worker→… recursion. Root orchestrator = depth 0, so this
+/// allows 4 levels of sub-agents below the root.
+pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
+
 /// The `SubAgent` tool description. Exposed standalone so a nested worker's
 /// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
 pub fn subagent_tool_description() -> &'static str {
     "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session is a full agent that runs independently under the current root session with its own conversation context and the full toolset, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
 PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
 Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+}
+
+/// The `SubAgent` parameters schema. Exposed standalone (mirroring
+/// [`subagent_tool_description`]) so a nested worker's SubAgent proxy advertises
+/// the IDENTICAL schema to its own LLM — no drift between the real tool and the
+/// proxy.
+pub fn subagent_parameters_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_models"],
+                "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_models to enumerate the models you can pin a child to via create.model. \
+        A create call requires: title, responsibility, and prompt (workspace is optional and defaults to the parent's workspace). EXAMPLE create: {\"action\":\"create\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
+            },
+            "child_session_id": {
+                "type": "string",
+                "description": "Existing child session id. Required for get/update/run/send_message/cancel/delete."
+            },
+            "child_session_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "For wait: optional explicit subset of child sessions to wait on. Omit to wait on every currently-active child."
+            },
+            "wait_for": {
+                "type": "string",
+                "enum": ["all", "any", "first_error"],
+                "description": "For wait: resume policy. all (default) resumes when every tracked child is done; any resumes on the first; first_error resumes early on any error/timeout/cancel."
+            },
+            "wait": {
+                "type": "boolean",
+                "description": "For create: if true, suspend immediately and wait for just THIS child (legacy one-shot behavior). Defaults to false — create returns immediately and the child runs in the background; suspend later with action=wait."
+            },
+            "title": {
+                "type": "string",
+                "description": "Short title for a new or updated child session. Required for create. Displayed in the Sub-agents panel."
+            },
+            "description": {
+                "type": "string",
+                "description": "Legacy alias of title; prefer title."
+            },
+            "responsibility": {
+                "type": "string",
+                "description": "Single explicit responsibility for the child session. Required for create. Keep this narrow and non-overlapping with other child sessions."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Detailed task instructions, context, constraints, and expected output for the child session. Required for create; optional for update."
+            },
+            "subagent_type": {
+                "type": "string",
+                "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the child's tools or system prompt; every sub-agent is a full agent. Optional; omit it if you have no useful label."
+            },
+            "workspace": {
+                "type": "string",
+                "description": "For create: absolute path to the child session's working directory for file operations. Optional — defaults to the parent session's workspace when omitted."
+            },
+            "auto_run": {
+                "type": "boolean",
+                "description": "For create/send_message/update: whether to enqueue the child session immediately. Defaults to true for create/send_message and false for update."
+            },
+            "fork_last_messages": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "For create: model-controllable context fork. When > 0, the last N messages of YOUR (the parent's) conversation are carried into the child's task brief as a 'Forked context from parent' block, so the child starts with the recent context it needs. Omit/0 (default) gives the child a clean, freshly-seeded context. Use a small N (e.g. 2-6) to share just the immediately relevant turns; omit it when the task brief is already self-contained."
+            },
+            "reset_after_update": {
+                "type": "boolean",
+                "description": "For update: whether to truncate messages after refreshed assignment. Defaults to true."
+            },
+            "reset_to_last_user": {
+                "type": "boolean",
+                "description": "For run: whether to truncate messages after the last user message before rerun. Defaults to true."
+            },
+            "message": {
+                "type": "string",
+                "description": "Follow-up instruction to append as a new user message for send_message. Required for send_message."
+            },
+            "interrupt_running": {
+                "type": "boolean",
+                "description": "For send_message/cancel: if true, cancel a currently running child session before appending or returning. Defaults to false for send_message. When false on a running child, the message is queued and will be picked up at the next turn boundary without canceling progress."
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "xhigh", "max"],
+                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
+            },
+            "model": {
+                "type": "string",
+                "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-subagent_type model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the given subagent_type label."
+            },
+            "lifecycle": {
+                "type": "string",
+                "enum": ["oneshot", "resident"],
+                "description": "For create: 'oneshot' (default) spins up a fresh throwaway child for this task. 'resident' reuses ONE long-lived agent (identified by 'name', scoped to this conversation) across many tasks — the first resident create spins it up, later creates with the same name route the new task to that same agent instead of spawning another. Use resident for recurring task types (e.g. an 'essayist' that writes many essays — one agent, one panel entry, not N); use oneshot for independent throwaway work."
+            },
+            "name": {
+                "type": "string",
+                "description": "For create with lifecycle=resident: the resident agent's stable reuse key, e.g. 'essayist'. Required to reuse a resident; defaults to subagent_type when omitted. Reusing the same name routes the new task to the existing resident agent."
+            },
+            "context": {
+                "type": "string",
+                "enum": ["reset", "accumulate"],
+                "description": "For create with lifecycle=resident: how the resident treats prior tasks. 'reset' (default) makes each task independent (clears prior context). 'accumulate' makes the agent remember earlier tasks (useful for a researcher building up knowledge). Set on first create; honored on reuse."
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Worker-side stand-in for [`SubAgentTool`] (Phase 6: nested execution).
+///
+/// A subagent worker runs out-of-process and cannot spawn its own children
+/// directly. This tool advertises the IDENTICAL `SubAgent` tool (same name,
+/// description, and schema) to the worker's LLM, but its execution forwards the
+/// call to the host over the actor protocol via the task-local
+/// [`bamboo_tools::NestedSpawnProxy`]. The host runs the real [`SubAgentTool`]
+/// (parenting a grandchild under this worker's child session) and returns the
+/// result. Outside a nested-worker run (no proxy installed) the tool errors.
+pub struct SubAgentProxyTool;
+
+/// Map a host `SubagentReply` body (`{success, result, display_preference}`)
+/// back into a `ToolResult` for the worker's engine. Tolerant of shape: a
+/// non-string `result` is stringified; missing `success` defaults to true.
+fn reply_to_tool_result(reply: serde_json::Value) -> ToolResult {
+    let success = reply
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let result = match reply.get("result") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => reply.to_string(),
+    };
+    let display_preference = reply
+        .get("display_preference")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    ToolResult {
+        success,
+        result,
+        display_preference,
+        images: Vec::new(),
+    }
+}
+
+#[async_trait]
+impl Tool for SubAgentProxyTool {
+    fn name(&self) -> &str {
+        "SubAgent"
+    }
+
+    fn description(&self) -> &str {
+        subagent_tool_description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        subagent_parameters_schema()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let Some(proxy) = bamboo_tools::current_nested_spawn_proxy() else {
+            return Err(ToolError::Execution(
+                "SubAgent is unavailable: not running in a nested-worker context".to_string(),
+            ));
+        };
+        let reply = proxy
+            .spawn(args)
+            .await
+            .map_err(|e| ToolError::Execution(format!("nested SubAgent spawn failed: {e}")))?;
+        Ok(reply_to_tool_result(reply))
+    }
 }
 
 #[async_trait]
@@ -321,104 +515,7 @@ impl Tool for SubAgentTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_models"],
-                    "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_models to enumerate the models you can pin a child to via create.model. \
-        A create call requires: title, responsibility, and prompt (workspace is optional and defaults to the parent's workspace). EXAMPLE create: {\"action\":\"create\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
-                },
-                "child_session_id": {
-                    "type": "string",
-                    "description": "Existing child session id. Required for get/update/run/send_message/cancel/delete."
-                },
-                "child_session_ids": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "For wait: optional explicit subset of child sessions to wait on. Omit to wait on every currently-active child."
-                },
-                "wait_for": {
-                    "type": "string",
-                    "enum": ["all", "any", "first_error"],
-                    "description": "For wait: resume policy. all (default) resumes when every tracked child is done; any resumes on the first; first_error resumes early on any error/timeout/cancel."
-                },
-                "wait": {
-                    "type": "boolean",
-                    "description": "For create: if true, suspend immediately and wait for just THIS child (legacy one-shot behavior). Defaults to false — create returns immediately and the child runs in the background; suspend later with action=wait."
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Short title for a new or updated child session. Required for create. Displayed in the Sub-agents panel."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Legacy alias of title; prefer title."
-                },
-                "responsibility": {
-                    "type": "string",
-                    "description": "Single explicit responsibility for the child session. Required for create. Keep this narrow and non-overlapping with other child sessions."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Detailed task instructions, context, constraints, and expected output for the child session. Required for create; optional for update."
-                },
-                "subagent_type": {
-                    "type": "string",
-                    "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the child's tools or system prompt; every sub-agent is a full agent. Optional; omit it if you have no useful label."
-                },
-                "workspace": {
-                    "type": "string",
-                    "description": "For create: absolute path to the child session's working directory for file operations. Optional — defaults to the parent session's workspace when omitted."
-                },
-                "auto_run": {
-                    "type": "boolean",
-                    "description": "For create/send_message/update: whether to enqueue the child session immediately. Defaults to true for create/send_message and false for update."
-                },
-                "reset_after_update": {
-                    "type": "boolean",
-                    "description": "For update: whether to truncate messages after refreshed assignment. Defaults to true."
-                },
-                "reset_to_last_user": {
-                    "type": "boolean",
-                    "description": "For run: whether to truncate messages after the last user message before rerun. Defaults to true."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Follow-up instruction to append as a new user message for send_message. Required for send_message."
-                },
-                "interrupt_running": {
-                    "type": "boolean",
-                    "description": "For send_message/cancel: if true, cancel a currently running child session before appending or returning. Defaults to false for send_message. When false on a running child, the message is queued and will be picked up at the next turn boundary without canceling progress."
-                },
-                "reasoning_effort": {
-                    "type": "string",
-                    "enum": ["low", "medium", "high", "xhigh", "max"],
-                    "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-subagent_type model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the given subagent_type label."
-                },
-                "lifecycle": {
-                    "type": "string",
-                    "enum": ["oneshot", "resident"],
-                    "description": "For create: 'oneshot' (default) spins up a fresh throwaway child for this task. 'resident' reuses ONE long-lived agent (identified by 'name', scoped to this conversation) across many tasks — the first resident create spins it up, later creates with the same name route the new task to that same agent instead of spawning another. Use resident for recurring task types (e.g. an 'essayist' that writes many essays — one agent, one panel entry, not N); use oneshot for independent throwaway work."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "For create with lifecycle=resident: the resident agent's stable reuse key, e.g. 'essayist'. Required to reuse a resident; defaults to subagent_type when omitted. Reusing the same name routes the new task to the existing resident agent."
-                },
-                "context": {
-                    "type": "string",
-                    "enum": ["reset", "accumulate"],
-                    "description": "For create with lifecycle=resident: how the resident treats prior tasks. 'reset' (default) makes each task independent (clears prior context). 'accumulate' makes the agent remember earlier tasks (useful for a researcher building up knowledge). Set on first create; honored on reuse."
-                }
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        })
+        subagent_parameters_schema()
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
@@ -484,7 +581,19 @@ impl Tool for SubAgentTool {
                 lifecycle,
                 name,
                 context,
+                fork_last_messages,
             } => {
+                // Phase 6: enforce the max nesting-depth cap. `parent` is this
+                // agent's run session; its `spawn_depth` is the current nesting
+                // level (workers stamp it from the actor spec, so it accumulates
+                // across the actor boundary). Refuse to spawn beyond the cap so
+                // worker→worker→… recursion is bounded.
+                if parent.spawn_depth >= DEFAULT_MAX_SPAWN_DEPTH {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "spawn depth limit ({}) reached: this agent is at depth {} and cannot create more sub-agents. Finish the work here, or delegate to a sibling.",
+                        DEFAULT_MAX_SPAWN_DEPTH, parent.spawn_depth
+                    )));
+                }
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = normalize_required_text(Some(prompt), "prompt")?;
@@ -644,6 +753,10 @@ impl Tool for SubAgentTool {
                                 resident_context: resident_name
                                     .as_ref()
                                     .map(|_| resident_context.clone()),
+                                disabled_tools: None,
+                                // Phase 3: model-controllable context fork — carry
+                                // the last N parent messages into the child's brief.
+                                context_fork: fork_last_messages.filter(|n| *n > 0),
                             },
                         )
                         .await
@@ -901,6 +1014,73 @@ impl Tool for SubAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubNestedSpawn(serde_json::Value);
+
+    #[async_trait]
+    impl bamboo_tools::NestedSpawnProxy for StubNestedSpawn {
+        async fn spawn(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+            // Echo the action back so the test can assert the args were forwarded.
+            let mut reply = self.0.clone();
+            reply["action_seen"] = args
+                .get("action")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Ok(reply)
+        }
+    }
+
+    #[test]
+    fn proxy_tool_advertises_identical_name_and_schema() {
+        // Same name the real SubAgentTool exposes, and schema/description from the
+        // shared standalone fns (no drift between the real tool and the proxy).
+        assert_eq!(SubAgentProxyTool.name(), "SubAgent");
+        assert_eq!(
+            SubAgentProxyTool.parameters_schema(),
+            subagent_parameters_schema()
+        );
+        assert_eq!(SubAgentProxyTool.description(), subagent_tool_description());
+    }
+
+    #[tokio::test]
+    async fn proxy_tool_forwards_to_nested_spawn_proxy() {
+        let proxy: Arc<dyn bamboo_tools::NestedSpawnProxy> = Arc::new(StubNestedSpawn(
+            serde_json::json!({"success": true, "result": "grandchild-1", "display_preference": null}),
+        ));
+        let out = bamboo_tools::with_nested_spawn_proxy(Some(proxy), async {
+            SubAgentProxyTool
+                .execute(serde_json::json!({"action": "create", "title": "t"}))
+                .await
+        })
+        .await
+        .expect("proxy tool execute");
+        assert!(out.success);
+        assert_eq!(out.result, "grandchild-1");
+    }
+
+    #[tokio::test]
+    async fn proxy_tool_errors_without_a_proxy_installed() {
+        let r = SubAgentProxyTool
+            .execute(serde_json::json!({"action": "create"}))
+            .await;
+        assert!(
+            matches!(r, Err(ToolError::Execution(ref m)) if m.contains("not running in a nested-worker"))
+        );
+    }
+
+    #[test]
+    fn reply_to_tool_result_maps_fields_and_stringifies_nonstring() {
+        let r = reply_to_tool_result(
+            serde_json::json!({"success": false, "result": "boom", "display_preference": "Collapsible"}),
+        );
+        assert!(!r.success);
+        assert_eq!(r.result, "boom");
+        assert_eq!(r.display_preference.as_deref(), Some("Collapsible"));
+        // Non-string result is stringified; missing success defaults true.
+        let r2 = reply_to_tool_result(serde_json::json!({"result": {"child_session_id": "c1"}}));
+        assert!(r2.success);
+        assert!(r2.result.contains("child_session_id"));
+    }
 
     #[test]
     fn normalize_title_accepts_legacy_description() {

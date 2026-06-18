@@ -420,6 +420,9 @@ async fn run_schedule_job(
         mpsc_tx,
         image_fallback: None,
         gold_config: resolved.gold_config.clone(),
+        // Guardian review is not wired into the schedule path for now.
+        guardian_config: None,
+        guardian_spawner: None,
         app_data_dir: ctx.app_data_dir.clone(),
         runners: ctx.agent_runners.clone(),
         sessions_cache: ctx.sessions_cache.clone(),

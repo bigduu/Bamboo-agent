@@ -211,6 +211,12 @@ pub struct AppState {
     /// Coordinates child completion notifications into parent resume.
     pub child_completion_coordinator: Arc<bamboo_engine::ChildCompletionCoordinator>,
 
+    /// Spawner for the guardian adversarial-review child, injected into each run
+    /// so the terminal gate can create a read-only reviewer (the engine runner
+    /// cannot construct a child directly — see [`bamboo_engine::GuardianSpawner`]).
+    /// Backed by a dedicated [`crate::tools::ChildSessionAdapter`].
+    pub guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner>,
+
     /// Schedule store (timed tasks).
     pub schedule_store: Arc<ScheduleStore>,
 

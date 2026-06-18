@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::{ChildExecutor, EventSink, HostBridge, SteerInbox};
+use crate::executor::{ChildExecutor, EventSink, HostBridge, HostRequestKind, SteerInbox};
 use crate::proto::{ChildFrame, ParentFrame, RunSpec};
 
 /// Pending host-callback replies, keyed by request id, shared between the
@@ -162,6 +162,15 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(
                         let _ = reply.send(body);
                     }
                 }
+                // Phase 2: the host's decision on a proxied gated-tool approval.
+                // Routed through the same `pending` correlation map as
+                // `SubagentReply` (body = {"approved": bool}); a worker that
+                // proxied an `ApprovalRequest` awaits its oneshot here.
+                Ok(ParentFrame::ApprovalReply { id, approved }) => {
+                    if let Some(reply) = pending.lock().expect("pending lock").remove(&id) {
+                        let _ = reply.send(serde_json::json!({ "approved": approved }));
+                    }
+                }
                 Ok(ParentFrame::Run(spec)) => {
                     // A new run supersedes any active run: cancel the previous
                     // task *before* starting the new one so the old run stops
@@ -261,10 +270,11 @@ fn start_run<E: ChildExecutor + ?Sized>(
                 .lock()
                 .expect("pending lock")
                 .insert(id.clone(), req.reply);
-            if out_req
-                .send(ChildFrame::SubagentRequest { id, body: req.body })
-                .is_err()
-            {
+            let frame = match req.kind {
+                HostRequestKind::Subagent => ChildFrame::SubagentRequest { id, body: req.body },
+                HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },
+            };
+            if out_req.send(frame).is_err() {
                 break;
             }
         }
@@ -352,6 +362,7 @@ mod tests {
             match frame {
                 ChildFrame::Event { event } => events.push(event),
                 ChildFrame::SubagentRequest { .. } => {}
+                ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::Terminal { status, result, .. } => {
                     terminal = Some((status, result));
                     break;
@@ -481,6 +492,86 @@ mod tests {
         let _ = srv.await;
     }
 
+    /// Phase 2: a worker that hits a gated tool proxies an approval to the host
+    /// over the per-child WS and blocks for the decision — the FULL cross-process
+    /// round-trip (worker `approval_call` → `ChildFrame::ApprovalRequest` →
+    /// host `ParentFrame::ApprovalReply` → the awaiting call resolves).
+    #[tokio::test]
+    async fn approval_request_round_trips_to_host_and_back() {
+        use crate::executor::{ChildExecutor, ChildOutcome, SteerInbox};
+
+        /// Proxies one approval to the host and reports the decision.
+        struct ApprovalProber;
+        #[async_trait::async_trait]
+        impl ChildExecutor for ApprovalProber {
+            async fn run(
+                &self,
+                _spec: RunSpec,
+                events: EventSink,
+                _steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> ChildOutcome {
+                let Some(host) = events.host() else {
+                    return ChildOutcome::error("no host bridge wired");
+                };
+                match host
+                    .approval_call(serde_json::json!({
+                        "tool_name": "Write",
+                        "permission_type": "WriteFile",
+                        "resource": "/tmp/x",
+                        "question": "approve?",
+                    }))
+                    .await
+                {
+                    Ok(decision) => ChildOutcome::completed(format!(
+                        "approved: {}",
+                        decision["approved"].as_bool().unwrap_or(false)
+                    )),
+                    Err(e) => ChildOutcome::error(format!("bridge: {e}")),
+                }
+            }
+        }
+
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let srv = tokio::spawn(async move { server.serve_one(Arc::new(ApprovalProber)).await });
+
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: "go".into(),
+                reasoning_effort: None,
+                messages: Vec::new(),
+            }))
+            .await
+            .unwrap();
+
+        let mut terminal = None;
+        while let Some(frame) = client.next_frame().await.unwrap() {
+            match frame {
+                ChildFrame::ApprovalRequest { id, body } => {
+                    assert_eq!(body["resource"], "/tmp/x");
+                    assert_eq!(body["tool_name"], "Write");
+                    client
+                        .send(ParentFrame::ApprovalReply { id, approved: true })
+                        .await
+                        .unwrap();
+                }
+                ChildFrame::Terminal { status, result, .. } => {
+                    terminal = Some((status, result));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (status, result) = terminal.expect("terminal");
+        assert_eq!(status, TerminalStatus::Completed);
+        assert_eq!(result.as_deref(), Some("approved: true"));
+
+        let _ = client.close().await;
+        let _ = srv.await;
+    }
+
     /// Service-agent mode: two concurrent connections to one `serve()` must be
     /// fully isolated — each client sees only its own run's events/terminal,
     /// and per-connection cancel state (the round-2 fix) must not cross talk.
@@ -553,6 +644,7 @@ mod tests {
                     }
                 }
                 ChildFrame::SubagentRequest { .. } => {}
+                ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::Terminal {
                     status, result: r, ..
                 } => {

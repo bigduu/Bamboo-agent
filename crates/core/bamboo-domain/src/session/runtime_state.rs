@@ -159,6 +159,30 @@ pub struct WaitingForChildrenState {
     pub registered_by_tool_call_id: Option<String>,
 }
 
+impl WaitingForChildrenState {
+    /// Construct a parent wait over `child_session_ids` with the default
+    /// 6-hour wait lease (`timeout_at = now + 6h`) and no registering tool
+    /// call. Callers needing a specific lease or originating tool-call id set
+    /// those fields on the returned value afterward.
+    ///
+    /// Centralizes the wait-record defaults so every runner-initiated suspend
+    /// (the orphaned-children safety net, the guardian review gate, ...) and the
+    /// adapter's merge default-branch build the record identically.
+    pub fn for_children(
+        child_session_ids: Vec<String>,
+        wait_for: ChildWaitPolicy,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            child_session_ids,
+            wait_for,
+            registered_at: now,
+            timeout_at: Some(now + chrono::Duration::hours(6)),
+            registered_by_tool_call_id: None,
+        }
+    }
+}
+
 /// Suspension reason and context for resumable runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SuspensionState {

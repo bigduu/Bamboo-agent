@@ -168,6 +168,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             // sessions (multi-client sync, replaces session-index polling).
             .route("/stream", web::get().to(agent::stream::handler))
             .route("/stop/{session_id}", web::post().to(agent::stop::handler))
+            // Phase 2: deliver a human approval decision to a child sub-agent's
+            // blocked gated tool (surfaced via AgentEvent::ChildApprovalRequested).
+            .route(
+                "/child-approval/{child_session_id}",
+                web::post().to(agent::child_approval::handler),
+            )
             .route(
                 "/history/{session_id}",
                 web::get().to(agent::history::handler),

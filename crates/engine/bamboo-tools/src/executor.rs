@@ -283,8 +283,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // commands) force a confirmation even under bypass. Everything
                 // else is skipped when this session is in "bypass permissions"
                 // mode (scoped per-session via its runtime state).
-                let force_ask =
-                    permission_checker.requires_forced_confirmation(&tool_name, &args);
+                let force_ask = permission_checker.requires_forced_confirmation(&tool_name, &args);
                 for context in contexts {
                     if ctx.bypass_permissions && !force_ask {
                         continue;
@@ -309,6 +308,35 @@ impl ToolExecutor for BuiltinToolExecutor {
                             permission_type,
                             resource: _,
                         }) => {
+                            // Phase 2 (cross-process): a subagent worker installs a
+                            // task-local `ApprovalProxy` for the duration of its run.
+                            // When present, forward the decision to the worker's host
+                            // (parent) and block this tool inline for the reply —
+                            // approve proceeds (treated like a granted context), deny
+                            // fails closed. Checked BEFORE the interactive sink below
+                            // so a worker (which also has an `event_tx`) proxies to its
+                            // parent instead of trying to prompt a human itself. The
+                            // proxy is unset on every non-worker path, so the behavior
+                            // there is unchanged.
+                            if let Some(proxy) = crate::approval::current_approval_proxy() {
+                                let approved = proxy
+                                    .request_approval(crate::approval::ApprovalAsk {
+                                        tool_name: tool_name.clone(),
+                                        permission: permission_type.description().to_string(),
+                                        resource: resource.clone(),
+                                    })
+                                    .await;
+                                if approved {
+                                    // Treat as a granted context: check any remaining
+                                    // contexts, then fall through to execution.
+                                    continue;
+                                }
+                                return Err(ToolError::Execution(format!(
+                                    "Permission denied by host for: {}",
+                                    resource
+                                )));
+                            }
+
                             // Interactive sessions pause for approval by reusing the
                             // same pending-question pipeline as `request_permissions`:
                             // synthesize an "awaiting_permission_approval" result that
@@ -931,7 +959,10 @@ mod tests {
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = make_executor(Some(checker));
 
-        let call = make_tool_call("Write", json!({"file_path": "/etc/forced.conf", "content": "x"}));
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": "/etc/forced.conf", "content": "x"}),
+        );
         let ctx = ToolExecutionContext {
             session_id: Some("s-forced"),
             tool_call_id: &call.id,
@@ -946,6 +977,91 @@ mod tests {
             "forced ask rule should block under bypass: {result:?}"
         );
         assert!(fs::metadata("/etc/forced.conf").await.is_err());
+    }
+
+    // ---- Phase 2: cross-process approval proxy ----------------------------
+
+    struct HostStub {
+        approve: bool,
+    }
+
+    #[async_trait]
+    impl crate::approval::ApprovalProxy for HostStub {
+        async fn request_approval(&self, _ask: crate::approval::ApprovalAsk) -> bool {
+            self.approve
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_proxy_grant_lets_gated_tool_proceed() {
+        // A subagent worker installs an ApprovalProxy for its run. A forced-ask
+        // rule with NO event sink would otherwise fail closed; with the host
+        // proxy granting, the executor treats the context as approved and the
+        // tool proceeds inline (no suspend, no synthetic pause).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approved.txt");
+        let path_str = path.to_str().unwrap().to_string();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_ask_rules([format!("Write({}/**)", dir.path().to_str().unwrap())]);
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+
+        let call = make_tool_call("Write", json!({"file_path": path_str, "content": "ok"}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-worker"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+        };
+
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(HostStub { approve: true });
+        let result = crate::approval::with_approval_proxy(
+            Some(proxy),
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "host grant should let the write through: {result:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn approval_proxy_deny_fails_gated_tool_closed() {
+        // With the host proxy denying, the gated tool fails closed and the side
+        // effect never happens.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("denied.txt");
+        let path_str = path.to_str().unwrap().to_string();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_ask_rules([format!("Write({}/**)", dir.path().to_str().unwrap())]);
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+
+        let call = make_tool_call("Write", json!({"file_path": path_str, "content": "nope"}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-worker"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+        };
+
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(HostStub { approve: false });
+        let result = crate::approval::with_approval_proxy(
+            Some(proxy),
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref m)) if m.contains("denied by host")),
+            "host deny should fail the tool closed: {result:?}"
+        );
+        assert!(fs::metadata(&path).await.is_err());
     }
 
     #[tokio::test]

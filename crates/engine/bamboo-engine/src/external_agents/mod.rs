@@ -6,7 +6,10 @@ pub mod mapping;
 pub mod runtime;
 
 pub use a2a_adapter::A2AExternalChildRunner;
-pub use actor_adapter::ActorChildRunner;
+pub use actor_adapter::{
+    child_approval_reviewer, set_child_approval_reviewer, set_escalation_host_bridge,
+    set_nested_spawn_handler, ActorChildRunner, ChildApprovalReviewer, NestedSpawnHandler,
+};
 pub use config::{
     parse_external_agents, parse_subagent_routing, resolve_runtime_metadata, ExternalAgentProfile,
     ExternalAgentProtocol, SubagentRouting,
