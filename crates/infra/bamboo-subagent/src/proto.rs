@@ -98,7 +98,7 @@ pub enum TerminalStatus {
 
 impl ParentFrame {
     pub fn to_text(&self) -> String {
-        serde_json::to_string(self).expect("ParentFrame serializes")
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
     pub fn from_text(s: &str) -> serde_json::Result<Self> {
         serde_json::from_str(s)
@@ -107,7 +107,7 @@ impl ParentFrame {
 
 impl ChildFrame {
     pub fn to_text(&self) -> String {
-        serde_json::to_string(self).expect("ChildFrame serializes")
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
     pub fn from_text(s: &str) -> serde_json::Result<Self> {
         serde_json::from_str(s)
