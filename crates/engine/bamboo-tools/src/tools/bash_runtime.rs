@@ -23,6 +23,10 @@ const COMPLETED_SESSION_TTL_SECS: u64 = 300;
 pub struct ShellSession {
     pub id: String,
     pub command: String,
+    /// Bamboo session id that owns this background shell, if any. Set from the
+    /// dispatch context (issue #84, phase 2a) so the registry can be queried
+    /// per-session. `None` means the shell is untagged (e.g. spawned from tests).
+    pub session_id: Option<String>,
     pub environment: CommandEnvironmentDiagnostics,
     child: Arc<Mutex<Child>>,
     output: Arc<Mutex<Vec<String>>>,
@@ -128,6 +132,7 @@ pub async fn spawn_background(
     command: &str,
     cwd: Option<&Path>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    session_id: Option<String>,
 ) -> Result<Arc<ShellSession>, String> {
     let shell = preferred_bash_shell();
     trace_windows_command(
@@ -163,15 +168,16 @@ pub async fn spawn_background(
         .take()
         .ok_or_else(|| "Failed to capture shell stderr".to_string())?;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let shell_id = uuid::Uuid::new_v4().to_string();
     let output = Arc::new(Mutex::new(Vec::new()));
     let base_index = Arc::new(Mutex::new(0usize));
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(Mutex::new(None));
 
     let session = Arc::new(ShellSession {
-        id: session_id.clone(),
+        id: shell_id.clone(),
         command: command.to_string(),
+        session_id,
         environment: prepared_env.diagnostics.clone(),
         child: Arc::new(Mutex::new(child)),
         output: output.clone(),
@@ -198,9 +204,9 @@ pub async fn spawn_background(
 
     {
         let child = session.child.clone();
-        let session_id_for_gc = session_id.clone();
+        let session_id_for_gc = shell_id.clone();
         // Owned copies for the completion signal (issue #84, phase 1).
-        let bash_id_for_event = session_id.clone();
+        let bash_id_for_event = shell_id.clone();
         let command_for_event = command.to_string();
         tokio::spawn(async move {
             // Determine the terminal status/exit_code, then break out to emit
@@ -269,7 +275,7 @@ pub async fn spawn_background(
         });
     }
 
-    sessions().insert(session_id, session.clone());
+    sessions().insert(shell_id, session.clone());
     Ok(session)
 }
 
@@ -279,4 +285,29 @@ pub fn get_shell(id: &str) -> Option<Arc<ShellSession>> {
 
 pub fn remove_shell(id: &str) -> Option<Arc<ShellSession>> {
     sessions().remove(id).map(|(_, value)| value)
+}
+
+/// Returns the ids of background shells owned by `session_id` that are still
+/// running (issue #84, phase 2a). Mirrors the sync `get_shell`/`remove_shell`
+/// helpers over the global registry — not async because the registry is a sync
+/// `DashMap` and `status()` is a sync read. A shell is included only when its
+/// stored `session_id` equals `Some(session_id)` and `status()` is `"running"`,
+/// so completed shells and shells belonging to another session (or none) are
+/// excluded.
+///
+/// The result is a point-in-time snapshot: a returned shell may finish between
+/// this call and the caller acting on its id, so callers must re-check liveness
+/// (e.g. via `get_shell(id).status()`) before treating an id as still running.
+pub fn running_shells_for_session(session_id: &str) -> Vec<String> {
+    sessions()
+        .iter()
+        .filter(|entry| {
+            entry
+                .session_id
+                .as_deref()
+                .is_some_and(|sid| sid == session_id)
+                && entry.status() == "running"
+        })
+        .map(|entry| entry.id.clone())
+        .collect()
 }
