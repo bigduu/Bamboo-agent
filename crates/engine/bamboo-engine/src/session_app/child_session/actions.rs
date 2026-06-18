@@ -73,6 +73,22 @@ pub async fn create_child_action(
             .bypass_permissions = true;
     }
 
+    // #73: children inherit "no interactive human approver" too — if the run has
+    // no human to answer approvals (headless / scheduled / deployed), neither do
+    // its sub-agents, so their gated actions must be model-reviewed locally
+    // rather than escalated to a human who will never answer (300s fail-deny).
+    if input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.no_human_approver)
+    {
+        child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .no_human_approver = true;
+    }
+
     child.workspace = Some(input.workspace.clone());
     bamboo_agent_core::workspace_state::set_workspace(
         &child.id,

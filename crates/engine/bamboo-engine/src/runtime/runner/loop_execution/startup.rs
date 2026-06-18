@@ -139,6 +139,14 @@ pub(super) async fn initialize_loop_state(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|prev| prev.bypass_permissions);
+    // #73: "no interactive human approver" (headless / scheduled / deployed) is
+    // likewise a sticky per-session flag; carry it forward so every run — and the
+    // sub-agents it spawns (which inherit it) — route gated actions to the
+    // off-loop model-reviewer instead of escalating to an absent human.
+    runtime_state.no_human_approver = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|prev| prev.no_human_approver);
     runtime_state.llm.model_name = Some(model_name.clone());
     runtime_state.llm.provider_name = config.provider_name.clone();
     runtime_state.llm.fast_model_name = auxiliary_models.fast_model_name.clone();

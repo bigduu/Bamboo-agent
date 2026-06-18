@@ -117,6 +117,16 @@ pub struct Capabilities {
     /// an LLM reasonableness check instead of a blind pass.
     #[serde(default)]
     pub bypass: bool,
+    /// Whether this run has NO interactive human approver (headless `-p`,
+    /// scheduled jobs, deployed broker-agents — propagated from the unattended
+    /// root). #73: when true, the worker's per-run `ApprovalProxy` decides a
+    /// gated action with the OFF-LOOP model-reviewer LOCALLY instead of
+    /// escalating to a human who will never answer (which would 300s-deny). When
+    /// false (an interactive session) the approval escalates to the human as
+    /// usual. Independent of `bypass` (an interactive bypass run still has a
+    /// human; a headless default-mode run does not).
+    #[serde(default)]
+    pub no_human_approver: bool,
 }
 
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
@@ -365,6 +375,7 @@ mod tests {
             nested_spawn: false,
             max_spawn_depth: None,
             bypass: false,
+            no_human_approver: false,
         };
         let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
         assert_eq!(

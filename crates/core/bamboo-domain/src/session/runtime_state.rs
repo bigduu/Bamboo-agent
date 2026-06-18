@@ -277,6 +277,14 @@ pub struct AgentRuntimeState {
     /// sessions are unaffected; persisted in `runtime.json`.
     #[serde(default)]
     pub bypass_permissions: bool,
+    /// When `true`, this run has NO interactive human approver — a headless
+    /// `-p` run, a scheduled job, or a deployed broker-agent. #73: child
+    /// sub-agents inherit it (alongside `bypass_permissions`), and a sub-agent's
+    /// gated action is then decided by the off-loop model-reviewer locally
+    /// instead of escalating to a human who will never answer. Interactive
+    /// sessions leave it `false` so approvals reach the human as usual.
+    #[serde(default)]
+    pub no_human_approver: bool,
 }
 
 impl AgentRuntimeState {
@@ -296,6 +304,7 @@ impl AgentRuntimeState {
             checkpoints: Vec::new(),
             plan_mode: None,
             bypass_permissions: false,
+            no_human_approver: false,
         }
     }
 }
@@ -317,6 +326,7 @@ impl Default for AgentRuntimeState {
             checkpoints: Vec::new(),
             plan_mode: None,
             bypass_permissions: false,
+            no_human_approver: false,
         }
     }
 }

@@ -133,6 +133,13 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
         spec.capabilities.skills_dir = Some(skills_dir.to_string_lossy().into_owned());
     }
 
+    // #73: a deployed broker-agent is definitionally unattended — no interactive
+    // human to answer approvals. Mark it so that IF gating is ever enabled for
+    // it, its (and its sub-agents') gated actions are model-reviewed locally
+    // rather than hard-denied (host=None, reviewer=None). A no-op today since the
+    // broker-agent doesn't set `enforce_permissions`.
+    spec.capabilities.no_human_approver = true;
+
     Ok(spec)
 }
 
