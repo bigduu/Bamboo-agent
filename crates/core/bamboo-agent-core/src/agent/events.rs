@@ -366,15 +366,22 @@ pub enum AgentEvent {
     /// command exits, so clients can react to (and, in later phases, resume
     /// around) long-running commands. Phase 1 (issue #84): completion signal
     /// only — this does not change the default foreground behavior.
+    ///
+    /// Delivery scope: a *live* signal. It rides the per-session
+    /// `/events/{id}` stream and the in-memory late-subscriber replay cache
+    /// (`is_critical_event`), but is intentionally **not** a durable change in
+    /// Phase 1 — it is not written to the account change journal. Treat it as
+    /// ephemeral: a reconnecting client should not rely on seeing a past
+    /// `BashCompleted` via the journaled history.
     BashCompleted {
         /// Background shell session identifier (same value returned as `bash_id`).
         bash_id: String,
         /// The command string that was executed.
         command: String,
-        /// Process exit code, when available.
+        /// Process exit code, when available (`None` for signal/killed termination).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
-        /// One of: "completed" | "killed" | "error"
+        /// One of: "completed" | "killed" | "error".
         status: String,
     },
 
@@ -656,7 +663,6 @@ impl AgentEvent {
                 | AgentEvent::PlanFileUpdated { .. }
                 | AgentEvent::SubAgentStarted { .. }
                 | AgentEvent::SubAgentCompleted { .. }
-                | AgentEvent::BashCompleted { .. }
                 | AgentEvent::NeedClarification { .. }
                 | AgentEvent::ToolApprovalRequested { .. }
                 | AgentEvent::ExecutionStarted { .. }

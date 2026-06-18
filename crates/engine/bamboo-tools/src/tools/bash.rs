@@ -435,6 +435,7 @@ impl Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_agent_core::tools::ToolExecutionSessionFlags;
     use bamboo_agent_core::AgentEvent;
     use bamboo_infrastructure::process::{
         clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
@@ -684,6 +685,189 @@ mod tests {
             } => {
                 assert_eq!(bash_id, expected_id);
                 assert_eq!(command, "true");
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(status, "completed");
+            }
+            other => panic!("expected BashCompleted, got {other:?}"),
+        }
+    }
+
+    /// A failing background command still reports `status="completed"` with its
+    /// non-zero exit code — a non-zero exit is a normal completion, not a kill.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_background_emits_completion_event_for_failing_command() {
+        prime_test_command_environment();
+        let (tx, mut rx) = mpsc::channel(8);
+        let shell = super::bash_runtime::spawn_background("false", None, Some(tx))
+            .await
+            .expect("background shell should spawn");
+        let expected_id = shell.id.clone();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for BashCompleted event")
+            .expect("event channel closed before BashCompleted");
+
+        match event {
+            AgentEvent::BashCompleted {
+                bash_id,
+                exit_code,
+                status,
+                ..
+            } => {
+                assert_eq!(bash_id, expected_id);
+                assert_eq!(exit_code, Some(1));
+                assert_eq!(status, "completed");
+            }
+            other => panic!("expected BashCompleted, got {other:?}"),
+        }
+    }
+
+    /// A killed background command must report `status="killed"` with
+    /// `exit_code=None` (no numeric code for signal termination on Unix).
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_background_emits_killed_when_shell_is_killed() {
+        prime_test_command_environment();
+        let (tx, mut rx) = mpsc::channel(8);
+        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx))
+            .await
+            .expect("background shell should spawn");
+        let expected_id = shell.id.clone();
+
+        shell.kill().await.expect("shell should be killable");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for BashCompleted event")
+            .expect("event channel closed before BashCompleted");
+
+        match event {
+            AgentEvent::BashCompleted {
+                bash_id,
+                exit_code,
+                status,
+                ..
+            } => {
+                assert_eq!(bash_id, expected_id);
+                assert_eq!(exit_code, None);
+                assert_eq!(status, "killed");
+            }
+            other => panic!("expected BashCompleted, got {other:?}"),
+        }
+    }
+
+    /// With no event sender, the poll task must skip the emit entirely and still
+    /// flip the shell to "completed" (issue #84, phase 1).
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_background_without_sender_still_completes() {
+        prime_test_command_environment();
+        let shell = super::bash_runtime::spawn_background("true", None, None)
+            .await
+            .expect("background shell should spawn");
+
+        let started = Instant::now();
+        loop {
+            if shell.status() == "completed" {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                panic!("shell never reached completed without a sender");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A saturated event channel must not hang or panic the poll task: the
+    /// completion send hits the 500ms bounded-timeout path, logs a `warn!`, and
+    /// the shell still completes. The signal is dropped (observable), not lost
+    /// silently. The channel is kept full past the timeout window so the send is
+    /// guaranteed to time out rather than succeed when a slot is freed.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_background_drops_completion_when_channel_saturated() {
+        prime_test_command_environment();
+        // Capacity-1 channel pre-filled so the single slot is occupied.
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(1);
+        tx.try_send(AgentEvent::Token {
+            content: "occupy".into(),
+        })
+        .expect("prefill channel slot");
+
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx))
+            .await
+            .expect("background shell should spawn");
+
+        // Wait past the 500ms bounded-send window so the dropped BashCompleted
+        // has been observed and the poll task has moved on.
+        sleep(Duration::from_millis(650)).await;
+
+        // The only event ever delivered is the pre-filled token; BashCompleted
+        // was dropped (saturated channel) and never enqueued.
+        let only = rx
+            .recv()
+            .await
+            .expect("prefilled token should still be present");
+        assert!(
+            matches!(only, AgentEvent::Token { .. }),
+            "expected only the pre-filled token, got {only:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "no BashCompleted should be delivered after a saturation drop"
+        );
+        assert_eq!(
+            shell.status(),
+            "completed",
+            "shell must still reach completed after a dropped signal"
+        );
+    }
+
+    /// Drives the real tool dispatch path: `BashTool::execute_with_context`
+    /// with `run_in_background=true` and a context built via `for_dispatch`
+    /// carrying an `event_tx`, so the signal flows through `ctx.cloned_sender()`
+    /// (the production wiring), not just `spawn_background` directly.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_tool_background_dispatch_emits_completion_event() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = ToolExecutionContext::for_dispatch(
+            "session_84",
+            "call_84",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags::default(),
+        );
+
+        let result = tool
+            .execute_with_context(json!({ "command": "true", "run_in_background": true }), ctx)
+            .await
+            .expect("background dispatch should succeed");
+        assert!(result.success);
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        let bash_id = payload["bash_id"].as_str().unwrap().to_string();
+        assert_eq!(payload["status"], "running");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for BashCompleted event")
+            .expect("event channel closed before BashCompleted");
+
+        match event {
+            AgentEvent::BashCompleted {
+                bash_id: id,
+                exit_code,
+                status,
+                ..
+            } => {
+                assert_eq!(id, bash_id);
                 assert_eq!(exit_code, Some(0));
                 assert_eq!(status, "completed");
             }

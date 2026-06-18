@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
 const MAX_OUTPUT_LINES: usize = 20_000;
@@ -202,7 +202,6 @@ pub async fn spawn_background(
         // Owned copies for the completion signal (issue #84, phase 1).
         let bash_id_for_event = session_id.clone();
         let command_for_event = command.to_string();
-        let event_tx = event_tx;
         tokio::spawn(async move {
             // Determine the terminal status/exit_code, then break out to emit
             // the completion signal below.
@@ -216,7 +215,17 @@ pub async fn spawn_background(
                         let code = status.code();
                         *exit_code.lock().await = code;
                         running.store(false, Ordering::Relaxed);
-                        break ("completed", code);
+                        // A signal/kill/timeout termination yields no numeric
+                        // exit code on Unix — surface that as "killed" rather
+                        // than masking it behind "completed" (issue #84).
+                        break (
+                            if code.is_none() {
+                                "killed"
+                            } else {
+                                "completed"
+                            },
+                            code,
+                        );
                     }
                     Ok(None) => {
                         sleep(Duration::from_millis(100)).await;
@@ -229,16 +238,30 @@ pub async fn spawn_background(
             };
 
             // Phase 1 (issue #84): emit a completion signal so clients can react
-            // to a long-running background command finishing. Non-blocking by
-            // design — a full channel or absent sender must never stall the GC
-            // task, so send errors are intentionally ignored.
+            // to a long-running background command finishing. This is the ONLY
+            // chance to deliver the signal — the poll task emits exactly once,
+            // then sleeps the GC TTL and removes the shell. A non-blocking
+            // `try_send` would silently drop it under a saturated event channel,
+            // so we bound the await instead: wait up to 500ms for room (the emit
+            // runs before the GC sleep, so a short wait never stalls collection),
+            // and fall back to a visible `warn!` if the channel stays full or is
+            // closed. A dropped signal is therefore rare AND observable.
             if let Some(tx) = &event_tx {
-                let _ = tx.try_send(AgentEvent::BashCompleted {
-                    bash_id: bash_id_for_event.clone(),
-                    command: command_for_event.clone(),
+                let event = AgentEvent::BashCompleted {
+                    bash_id: bash_id_for_event,
+                    command: command_for_event,
                     exit_code: exit_code_value,
                     status: status_str.to_string(),
-                });
+                };
+                if timeout(Duration::from_millis(500), tx.send(event))
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        bash_id = %session_id_for_gc,
+                        "BashCompleted signal dropped (event channel saturated or closed after 500ms)"
+                    );
+                }
             }
 
             sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
