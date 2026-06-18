@@ -320,7 +320,7 @@ impl ActorChildRunner {
         tools.sort();
         let caps = &spec.capabilities;
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}\u{1}nha={}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
@@ -334,6 +334,10 @@ impl ActorChildRunner {
             // silently model-review instead of asking the human (and vice-versa,
             // reintroducing the 300s-deny). Split the bucket on it.
             caps.no_human_approver,
+            // #71: the read-only Bash checker is baked once at build() from this
+            // flag, so a guardian-reviewer worker must NOT be reused for an
+            // ordinary child (which expects unrestricted Bash), and vice-versa.
+            caps.guardian_read_only,
         )
     }
 
@@ -485,6 +489,17 @@ impl ActorChildRunner {
             .agent_runtime_state
             .as_ref()
             .is_some_and(|s| s.no_human_approver);
+        // #71: mark a READ-ONLY Guardian reviewer so the worker installs the
+        // read-only Bash allowlist checker. The reviewer is spawned by
+        // `spawn_guardian_review` with `subagent_type == "guardian"` (the SAME
+        // marker the completion coordinator branches on to parse the verdict) AND
+        // the `guardian_read_only_disabled_tools` denylist. Keyed off that role
+        // marker (already read above to set `identity.role`), so it rides the same
+        // session-metadata path the denylist/subagent_type use — no new wire seam.
+        // Without this the worker keeps an UNRESTRICTED Bash, so the reviewer could
+        // still `rm -rf` / `git push` / `curl | sh`, defeating "read-only".
+        spec.capabilities.guardian_read_only =
+            session.metadata.get("subagent_type").map(String::as_str) == Some("guardian");
         spec
     }
 }
@@ -975,6 +990,16 @@ mod tests {
             base_fp,
             ActorChildRunner::fingerprint(&nha),
             "no_human_approver must split"
+        );
+
+        // #71: the read-only Bash checker is baked once at build() from this flag,
+        // so a guardian reviewer worker must not be reused for an ordinary child.
+        let mut gro = spec_with("explorer", "p", "m", Some("/ws"), None);
+        gro.capabilities.guardian_read_only = true;
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&gro),
+            "guardian_read_only must split"
         );
     }
 

@@ -41,9 +41,10 @@ pub mod tool_permissions;
 // Re-export commonly used types
 pub use approval_store::{with_cached_approval, ApprovalDecision, ApprovalStore};
 pub use checker::{
-    is_safe_edit_command, AllowAllPermissionChecker, ConfigPermissionChecker,
-    DenyDangerousPermissionChecker, LoggingPermissionChecker, ModeAwarePermissionChecker,
-    PermissionChecker, PermissionCheckerExt, PermissionContext, PermissionError, PermissionResult,
+    is_read_only_command, is_safe_edit_command, AllowAllPermissionChecker, ConfigPermissionChecker,
+    DenyDangerousPermissionChecker, GuardianReadOnlyChecker, LoggingPermissionChecker,
+    ModeAwarePermissionChecker, PermissionChecker, PermissionCheckerExt, PermissionContext,
+    PermissionError, PermissionResult,
 };
 pub use config::{
     PermissionConfig, PermissionMode, PermissionRule, PermissionType, RiskLevel,
