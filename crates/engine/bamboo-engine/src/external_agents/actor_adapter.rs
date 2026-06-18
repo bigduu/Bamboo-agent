@@ -680,6 +680,11 @@ async fn drive(
                             // it can't hang the child forever.
                             let (tool_name, permission, resource) =
                                 approval_request_fields(&body);
+                            // Register the pending request BEFORE surfacing it so
+                            // the external handler's `deliver_approval_checked` can
+                            // correlate an out-of-band POST against a genuine
+                            // human-loop request (and consume it one-shot).
+                            super::live::register_pending_approval(child_session_id, &id);
                             let _ = event_tx
                                 .send(AgentEvent::ChildApprovalRequested {
                                     child_session_id: child_session_id.to_string(),
@@ -692,9 +697,13 @@ async fn drive(
                             let child = child_session_id.to_string();
                             tokio::spawn(async move {
                                 tokio::time::sleep(CHILD_APPROVAL_TIMEOUT).await;
-                                // No-op if already answered (worker ignores an
-                                // unknown/duplicate id) or the child is gone.
-                                super::live::deliver_approval(&child, &id, false);
+                                // Deny only if still pending: a one-shot consume so
+                                // we don't double-deliver if the human already
+                                // answered (the POST took it), and so a late POST
+                                // after this fires finds nothing pending.
+                                if super::live::take_pending_approval(&child, &id) {
+                                    super::live::deliver_approval(&child, &id, false);
+                                }
                             });
                         }
                     }
