@@ -27,6 +27,7 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
             parent_id: Some("p1".into()),
             project_key: None,
             role: "smoke".into(),
+            depth: 0,
         },
         ExecutorSpec::Echo,
         fabric.to_string_lossy().into_owned(),
@@ -66,6 +67,7 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
                 }
             }
             ChildFrame::SubagentRequest { .. } => {}
+            ChildFrame::ApprovalRequest { .. } => {}
             ChildFrame::Terminal { status, result, .. } => {
                 terminal = Some((status, result));
                 break;
