@@ -66,7 +66,8 @@ where
                     id: MsgId::new(),
                     from: me.clone(),
                     kind: InboxKind::Reply,
-                    body: serde_json::to_value(ReplyBody { answer }).expect("ReplyBody serializes"),
+                    body: serde_json::to_value(ReplyBody { answer })
+                        .unwrap_or_else(|_| serde_json::json!({})),
                     created_at: Utc::now(),
                     correlation_id: Some(id.clone()),
                 };

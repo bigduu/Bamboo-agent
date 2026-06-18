@@ -41,7 +41,7 @@ pub enum BrokerFrame {
 
 impl ClientFrame {
     pub fn to_text(&self) -> String {
-        serde_json::to_string(self).expect("ClientFrame serializes")
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
     pub fn from_text(s: &str) -> serde_json::Result<Self> {
         serde_json::from_str(s)
@@ -50,7 +50,7 @@ impl ClientFrame {
 
 impl BrokerFrame {
     pub fn to_text(&self) -> String {
-        serde_json::to_string(self).expect("BrokerFrame serializes")
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
     pub fn from_text(s: &str) -> serde_json::Result<Self> {
         serde_json::from_str(s)
