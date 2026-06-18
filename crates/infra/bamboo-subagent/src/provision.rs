@@ -125,6 +125,19 @@ pub struct Capabilities {
     /// human; a headless default-mode run does not).
     #[serde(default)]
     pub no_human_approver: bool,
+    /// Whether this worker is a READ-ONLY Guardian reviewer. #71: a guardian
+    /// reviewer keeps `Bash` (its mutating tools are stripped by
+    /// `guardian_read_only_disabled_tools`) so it can fetch the diff and run
+    /// tests — but an unrestricted `Bash` would let it `rm -rf`, `git push`, or
+    /// `curl | sh`, making the read-only guarantee nominal. When `true`, the
+    /// worker installs a `GuardianReadOnlyChecker` that DENIES any `Bash`/
+    /// `execute_command` whose command is not on the read-only allowlist
+    /// (`is_read_only_command`) and runs read-only commands without gating.
+    /// Default `false` preserves the unrestricted-Bash behavior for ordinary
+    /// sub-agents. Set by the host's `build_spec` from the reviewer's session
+    /// marker. Mirrors `no_human_approver` above.
+    #[serde(default)]
+    pub guardian_read_only: bool,
 }
 
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
@@ -374,6 +387,7 @@ mod tests {
             max_spawn_depth: None,
             bypass: false,
             no_human_approver: false,
+            guardian_read_only: false,
         };
         let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
         assert_eq!(

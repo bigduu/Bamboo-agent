@@ -254,9 +254,22 @@ impl BambooRuntimeExecutor {
                 // runs, so only forced-ask actions reach review there.
                 let perm_config = bamboo_tools::permission::PermissionConfig::new();
                 perm_config.set_confirm_threshold(bamboo_tools::permission::RiskLevel::High);
-                let checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
+                let mut checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
                     bamboo_tools::permission::ConfigPermissionChecker::new(Arc::new(perm_config)),
                 );
+                // #71: a READ-ONLY Guardian reviewer keeps `Bash` so it can fetch
+                // the diff and run tests, but its shell must NOT be able to mutate /
+                // push / exfiltrate. Wrap the checker so any `Bash`/`execute_command`
+                // whose command is not on the read-only allowlist is DENIED (fail
+                // closed — the reviewer has no human approver), while read-only
+                // commands (`cargo test`, `git diff | head`, `rg …`) run WITHOUT a
+                // gate. Other mutating tools are already stripped by the reviewer's
+                // denylist, so they never reach here.
+                if spec.capabilities.guardian_read_only {
+                    checker = Arc::new(bamboo_tools::permission::GuardianReadOnlyChecker::new(
+                        checker,
+                    ));
+                }
                 Arc::new(
                     bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
                         config.clone(),
