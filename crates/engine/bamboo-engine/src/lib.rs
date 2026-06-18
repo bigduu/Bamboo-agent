@@ -37,7 +37,10 @@ pub use runtime::agent::AgentBuilder;
 // `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
 // so it cannot be constructed outside the engine. Execution funnels solely through
 // `AgentRuntime::execute`.
-pub use runtime::config::{AuxiliaryModelConfig, ImageFallbackConfig, ImageFallbackMode};
+pub use runtime::config::{
+    ApprovalDelegate, AuxiliaryModelConfig, ChildApprovalOutcome, ChildApprovalRequest,
+    GuardianConfig, GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
+};
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::hooks::HookRunner;
 pub use runtime::managers::{

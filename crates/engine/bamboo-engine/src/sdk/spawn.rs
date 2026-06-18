@@ -268,8 +268,20 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             };
 
         let timeout_error = timeout_reason.read().await.clone();
+        // Phase 2: a child that suspended awaiting the PARENT's approval of a
+        // gated tool is NOT done — publish a NON-terminal "suspended" status so
+        // the parent's completion coordinator does not resume the parent
+        // prematurely. The child is resumed once the human decides, then runs to
+        // a real terminal completion that re-enters this path.
+        let suspended_for_parent_approval = session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(|reason| reason == "awaiting_parent_approval")
+            .unwrap_or(false);
         let (status, error) = if let Some(reason) = timeout_error {
             ("timeout".to_string(), Some(reason))
+        } else if suspended_for_parent_approval && result.is_ok() {
+            ("suspended".to_string(), None)
         } else {
             match &result {
                 Ok(_) => ("completed".to_string(), None),

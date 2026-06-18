@@ -24,6 +24,7 @@ async fn spawn_discover_run_stream_terminal() {
             parent_id: Some("p1".into()),
             project_key: None,
             role: "demo".into(),
+            depth: 0,
         },
         ExecutorSpec::Echo,
         fabric.to_string_lossy().into_owned(),
@@ -55,6 +56,7 @@ async fn spawn_discover_run_stream_terminal() {
         match frame {
             ChildFrame::Event { event } => events.push(event),
             ChildFrame::SubagentRequest { .. } => {}
+            ChildFrame::ApprovalRequest { .. } => {}
             ChildFrame::Terminal { status, result, .. } => {
                 terminal = Some((status, result));
                 break;
@@ -90,6 +92,7 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
             parent_id: Some("p1".into()),
             project_key: None,
             role: "demo".into(),
+            depth: 0,
         },
         ExecutorSpec::Echo,
         fabric.to_string_lossy().into_owned(),

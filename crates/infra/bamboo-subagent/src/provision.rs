@@ -88,6 +88,35 @@ pub struct Capabilities {
     /// exclusive with `mcp` direct-sync — proxy covers all MCP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_proxy: Option<McpProxyConfig>,
+    /// When `true`, the worker builds its tool executor WITH a permission
+    /// checker, so gated tools hit `ConfirmationRequired` and delegate the
+    /// decision to the host via the per-run `ApprovalProxy` (Phase 2:
+    /// child → parent approval). Default `false` preserves the legacy behavior
+    /// (the worker runs all tools unchecked). Only meaningful when the run has a
+    /// host bridge to proxy to — real actor runs always do.
+    #[serde(default)]
+    pub enforce_permissions: bool,
+    /// When `true`, the worker advertises the `SubAgent` tool (a proxy) to its
+    /// LLM and forwards its calls to the host over the actor protocol, so a
+    /// nested worker can spawn grandchildren (Phase 6: nested execution).
+    /// Default `false` — the worker has no `SubAgent` tool (legacy behavior).
+    /// Only meaningful when the host wires a `NestedSpawnHandler` to fulfil the
+    /// request (real actor runs do).
+    #[serde(default)]
+    pub nested_spawn: bool,
+    /// Max nesting depth a self-orchestrating worker may spawn to (Phase 6:
+    /// direct nested execution). A worker (or the root) refuses to spawn a child
+    /// when its own `spawn_depth >= max_spawn_depth`. `None` ⇒ the default cap
+    /// (4) applies. Carried down so every level enforces the same bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spawn_depth: Option<u32>,
+    /// Whether this actor runs in "bypass permissions" mode (propagated from the
+    /// parent at spawn). Phase 6: when true, a self-orchestrating worker installs
+    /// an OFF-LOOP model-reviewer so its CHILDREN's forced-ask (dangerous) gated
+    /// actions — which still fire `ConfirmationRequired` even under bypass — get
+    /// an LLM reasonableness check instead of a blind pass.
+    #[serde(default)]
+    pub bypass: bool,
 }
 
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
@@ -127,6 +156,13 @@ pub struct ChildIdentity {
     /// Role/profile id, e.g. "researcher". Also published in the discovery record.
     #[serde(default)]
     pub role: String,
+    /// Nesting depth of THIS actor in the spawn tree (root orchestrator = 0, its
+    /// direct worker = 1, …). The worker stamps this onto its run session's
+    /// `spawn_depth` so in-process children accumulate depth correctly ACROSS the
+    /// actor process boundary (each worker otherwise starts at a fresh root).
+    /// Used to enforce the max-depth cap (Phase 6: direct nested execution).
+    #[serde(default)]
+    pub depth: u32,
 }
 
 /// Which engine runs the task. The worker's factory maps each variant to a `ChildExecutor`;
@@ -240,6 +276,7 @@ mod tests {
                 parent_id: Some("p1".into()),
                 project_key: Some("proj".into()),
                 role: "researcher".into(),
+                depth: 0,
             },
             ExecutorSpec::Echo,
             "/tmp/fabric".into(),
@@ -324,6 +361,10 @@ mod tests {
             mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),
             skills_dir: Some("/home/u/.bamboo/skills".into()),
             mcp_proxy: None,
+            enforce_permissions: false,
+            nested_spawn: false,
+            max_spawn_depth: None,
+            bypass: false,
         };
         let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
         assert_eq!(
@@ -341,6 +382,17 @@ mod tests {
         });
         let parsed = ProvisionSpec::from_json(&minimal.to_string()).unwrap();
         assert_eq!(parsed.capabilities, Capabilities::default());
+    }
+
+    #[test]
+    fn enforce_permissions_defaults_false_and_round_trips() {
+        // Absent in JSON ⇒ false (backward compatible with older orchestrators).
+        assert!(!Capabilities::default().enforce_permissions);
+        // Round-trips when opted in.
+        let mut s = spec();
+        s.capabilities.enforce_permissions = true;
+        let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
+        assert!(parsed.capabilities.enforce_permissions);
     }
 
     #[test]

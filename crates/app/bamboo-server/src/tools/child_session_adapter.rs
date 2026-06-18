@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -97,6 +97,38 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    /// Construct an adapter. Public so a self-orchestrating WORKER (Phase 6:
+    /// direct nested execution) can build its OWN child-session machinery
+    /// against its own store/scheduler — the struct fields are `pub(crate)`, so
+    /// out-of-crate callers (the worker binary) go through this constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_store: Arc<SessionStoreV2>,
+        storage: Arc<dyn Storage>,
+        persistence: Arc<LockedSessionStore>,
+        scheduler: Arc<SpawnScheduler>,
+        sessions_cache: bamboo_engine::SessionCache,
+        agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+        session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+        subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+        config: Arc<RwLock<Config>>,
+    ) -> Self {
+        Self {
+            session_store,
+            storage,
+            persistence,
+            scheduler,
+            sessions_cache,
+            agent_runners,
+            session_event_senders,
+            subagent_model_resolver,
+            config,
+            // Fresh per-adapter wait-coalescing map (the type is private to this
+            // crate, so out-of-crate callers can't supply it).
+            parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        }
+    }
+
     /// Resolve the provider+model ref for a given subagent_type using the configured resolver.
     pub async fn resolve_subagent_model(
         &self,
@@ -241,13 +273,7 @@ impl ChildSessionAdapter {
         let mut wait = runtime_state
             .waiting_for_children
             .take()
-            .unwrap_or_else(|| WaitingForChildrenState {
-                child_session_ids: Vec::new(),
-                wait_for: policy,
-                registered_at: now,
-                timeout_at: Some(now + ChronoDuration::hours(6)),
-                registered_by_tool_call_id: None,
-            });
+            .unwrap_or_else(|| WaitingForChildrenState::for_children(Vec::new(), policy, now));
         // An explicit wait re-asserts the policy on any pre-existing wait state.
         wait.wait_for = policy;
         for (child_session_id, tool_call_id) in batch {
@@ -318,6 +344,222 @@ impl SubagentResolutionPort for ChildSessionAdapter {
         subagent_type: &str,
     ) -> std::collections::HashMap<String, String> {
         ChildSessionAdapter::resolve_runtime_metadata(self, subagent_type).await
+    }
+}
+
+/// Lets a [`ChildSessionAdapter`] act as the engine's guardian-review spawner.
+///
+/// `Arc<ChildSessionAdapter>` therefore doubles as `Arc<dyn GuardianSpawner>`
+/// (wired onto `AppState`), so the terminal gate spawns the read-only reviewer
+/// through the same child-session machinery the `SubAgent` tool uses — no second
+/// spawn path. The reviewer is a real sub-agent: it fetches the diff and runs
+/// tests itself via its (read-only) toolset.
+#[async_trait]
+impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
+    async fn spawn_guardian_review(
+        &self,
+        parent_session: &Session,
+        review_prompt: String,
+        model: String,
+        disabled_tools: Option<std::collections::BTreeSet<String>>,
+    ) -> Result<String, String> {
+        let input = bamboo_engine::session_app::child_session::CreateChildInput {
+            parent_session: parent_session.clone(),
+            child_id: format!("guardian-{}", uuid::Uuid::new_v4()),
+            title: "Guardian review".to_string(),
+            responsibility: "Adversarially verify the parent agent's completed work."
+                .to_string(),
+            assignment_prompt: review_prompt,
+            // The coordinator branches on this subagent_type to recognize a
+            // guardian completion and parse its verdict.
+            subagent_type: "guardian".to_string(),
+            workspace: parent_session.workspace_path_meta().unwrap_or_default(),
+            model_override: Some(model),
+            model_ref_override: None,
+            runtime_metadata: HashMap::new(),
+            auto_run: true,
+            reasoning_effort: None,
+            lifecycle: None,
+            resident_name: None,
+            resident_context: None,
+            disabled_tools,
+            context_fork: None,
+        };
+        bamboo_engine::session_app::child_session::create_child_action(self, input)
+            .await
+            .map(|result| result.child_session_id)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl ChildSessionAdapter {
+    /// Host-side nested `wait` (Phase 6: nested execution). The worker's
+    /// `SubAgent`-proxy forwards `wait` to the host (it does NOT suspend its own
+    /// engine), so this polls the requesting child's grandchildren to terminal
+    /// (bounded by a timeout), then returns their final results. The worker's
+    /// `wait` tool call blocks on the WS round-trip while this runs — no
+    /// worker-side suspend / multi-level resume needed. The grandchildren run on
+    /// independent scheduler tasks, so they progress while we poll.
+    async fn nested_wait(
+        &self,
+        child_session_id: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // Optional explicit subset; empty ⇒ wait on every active grandchild.
+        let explicit: Vec<String> = request
+            .get("child_session_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(600);
+        loop {
+            let active = self.active_child_ids(child_session_id).await;
+            let still_active: Vec<String> = if explicit.is_empty() {
+                active
+            } else {
+                active.into_iter().filter(|id| explicit.contains(id)).collect()
+            };
+            if still_active.is_empty() {
+                break;
+            }
+            if started.elapsed() >= timeout {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "result": format!("nested wait timed out; still active: {still_active:?}"),
+                    "display_preference": null,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // Collect final results from the (now-terminal) grandchildren.
+        let statuses = self
+            .storage
+            .list_child_run_statuses(child_session_id)
+            .await
+            .unwrap_or_default();
+        let mut children = Vec::new();
+        for (id, status) in statuses {
+            if !explicit.is_empty() && !explicit.contains(&id) {
+                continue;
+            }
+            let result = match self.storage.load_session(&id).await {
+                Ok(Some(session)) => session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.role, bamboo_agent_core::Role::Assistant))
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            children.push(serde_json::json!({
+                "child_session_id": id,
+                "status": status,
+                "result": result,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "success": true,
+            "result": { "children": children },
+            "display_preference": "Collapsible",
+        }))
+    }
+}
+
+/// Lets a [`ChildSessionAdapter`] fulfil a nested worker's `SubAgent` spawn
+/// request on the host (Phase 6: nested execution). A worker can't spawn
+/// directly (separate process); its `SubAgent`-proxy tool forwards the call over
+/// the actor protocol, the host `drive()` routes it here, and we run the real
+/// spawn through the SAME child-session machinery — parenting a grandchild under
+/// the requesting child. `create` is fire-and-forget (auto_run enqueues it in
+/// the background); `wait` polls those grandchildren to completion (see
+/// [`ChildSessionAdapter::nested_wait`]).
+#[async_trait]
+impl bamboo_engine::external_agents::NestedSpawnHandler for ChildSessionAdapter {
+    async fn spawn_nested(
+        &self,
+        child_session_id: &str,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let action = request.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        if action == "wait" {
+            return self.nested_wait(child_session_id, &request).await;
+        }
+        if action != "create" {
+            return Ok(serde_json::json!({
+                "success": false,
+                "result": format!(
+                    "nested SubAgent action '{action}' is not supported yet (create/wait)"
+                ),
+                "display_preference": null,
+            }));
+        }
+
+        // The requesting child is the grandchild's parent.
+        let parent = self
+            .storage
+            .load_session(child_session_id)
+            .await
+            .map_err(|e| format!("load requesting child {child_session_id}: {e}"))?
+            .ok_or_else(|| format!("requesting child {child_session_id} not found"))?;
+
+        let str_field =
+            |k: &str| request.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let prompt = str_field("prompt").unwrap_or_default();
+        if prompt.trim().is_empty() {
+            return Err("nested SubAgent create requires a 'prompt'".to_string());
+        }
+        let workspace = str_field("workspace")
+            .or_else(|| parent.workspace_path_meta())
+            .unwrap_or_default();
+
+        let input = bamboo_engine::session_app::child_session::CreateChildInput {
+            parent_session: parent,
+            child_id: format!("nested-{}", uuid::Uuid::new_v4()),
+            title: str_field("title")
+                .or_else(|| str_field("description"))
+                .unwrap_or_else(|| "Sub-agent".to_string()),
+            responsibility: str_field("responsibility").unwrap_or_default(),
+            assignment_prompt: prompt,
+            subagent_type: str_field("subagent_type").unwrap_or_else(|| "worker".to_string()),
+            workspace,
+            model_override: str_field("model"),
+            model_ref_override: None,
+            runtime_metadata: HashMap::new(),
+            auto_run: true,
+            reasoning_effort: None,
+            lifecycle: None,
+            resident_name: None,
+            resident_context: None,
+            disabled_tools: None,
+            context_fork: request
+                .get("fork_last_messages")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .filter(|n| *n > 0),
+        };
+
+        let result = bamboo_engine::session_app::child_session::create_child_action(self, input)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "result": {
+                "child_session_id": result.child_session_id,
+                "status": "created",
+                "message": "Grandchild created and enqueued; it runs in the background. Use action=wait to await it once nested wait is supported."
+            },
+            "display_preference": "Collapsible",
+        }))
     }
 }
 
@@ -459,10 +701,17 @@ impl ChildSessionPort for ChildSessionAdapter {
             ));
         }
 
-        // Sub-agents are full agents with the full toolset: no per-role tool
-        // trimming. (The unrelated global `config.disabled_tools` path feeds
-        // `SpawnJob.disabled_tools` elsewhere; it is never computed here.)
-        let disabled_tools = None;
+        // Per-child tool denylist: persisted onto the child session by
+        // `create_child_action` (JSON in metadata). Most sub-agents are full
+        // agents and carry none; a read-only Guardian reviewer carries a
+        // denylist here so the worker trims its toolset. `SpawnJob` wants a
+        // `Vec<String>`, so collect the set.
+        let disabled_tools = child
+            .metadata
+            .get("disabled_tools")
+            .and_then(|raw| serde_json::from_str::<std::collections::BTreeSet<String>>(raw).ok())
+            .filter(|set| !set.is_empty())
+            .map(|set| set.into_iter().collect::<Vec<String>>());
 
         // NOTE: enqueue only *runs* the child in the background. Registering the
         // parent's wait (which suspends the parent) is now an explicit, separate

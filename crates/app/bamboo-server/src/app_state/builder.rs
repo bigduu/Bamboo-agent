@@ -385,6 +385,36 @@ impl AppState {
             persistence.clone(),
         );
 
+        // Dedicated child-session adapter backing the guardian review spawner.
+        // The guardian path passes an explicit model (no subagent_type routing)
+        // and registers its parent wait at the terminal gate (not via the
+        // adapter's coalescing slots), so a lightweight adapter with no resolver
+        // and a fresh wait-slot map suffices. `Arc<ChildSessionAdapter>` doubles
+        // as `Arc<dyn GuardianSpawner>`.
+        let child_adapter = Arc::new(crate::tools::ChildSessionAdapter {
+            session_store: session_store.clone(),
+            storage: storage.clone(),
+            persistence: persistence.clone(),
+            scheduler: spawn_scheduler.clone(),
+            sessions_cache: sessions.clone(),
+            agent_runners: agent_runners.clone(),
+            session_event_senders: session_event_senders.clone(),
+            subagent_model_resolver: None,
+            config: config.clone(),
+            parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        });
+        let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
+        // Phase 6: install the process-global nested-spawn handler (the same
+        // adapter, as a NestedSpawnHandler) now that it exists — resolving the
+        // runner→scheduler→adapter construction-order cycle. The actor host's
+        // `drive()` reads it to fulfil a worker's nested `SubAgent` create.
+        bamboo_engine::external_agents::set_nested_spawn_handler(child_adapter.clone());
+        // Wire the spawner into the completion coordinator too, so a resumed run
+        // can re-spawn a guardian to re-review a fix after a reject verdict.
+        child_completion_coordinator
+            .set_guardian_spawner(guardian_spawner.clone())
+            .await;
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -397,6 +427,7 @@ impl AppState {
             persistence,
             spawn_scheduler,
             child_completion_coordinator,
+            guardian_spawner,
             schedule_store,
             schedule_manager,
             tool_factory,

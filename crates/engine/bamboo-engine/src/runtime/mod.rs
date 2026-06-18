@@ -1,12 +1,14 @@
 //! Agent execution runtime: loop, stream handling, task evaluation.
 
 pub mod agent;
+pub mod approval_delegation_state;
 pub mod complexity_classifier;
 pub mod config;
 pub mod context;
 pub mod execution;
 pub mod goal_state;
 pub mod gold_evaluation;
+pub mod guardian_state;
 pub mod hooks;
 pub mod managers;
 pub mod model_roster;
@@ -20,7 +22,10 @@ pub mod task_evaluation;
 pub use agent::{Agent, AgentBuilder};
 pub use bamboo_domain::RuntimeSessionPersistence;
 pub use complexity_classifier::{ComplexityClassifier, TaskComplexity};
-pub use config::{GoldConfig, ImageFallbackConfig, ImageFallbackMode};
+pub use config::{
+    ApprovalDelegate, ChildApprovalOutcome, ChildApprovalRequest, GoldConfig, GuardianConfig,
+    GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
+};
 // `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
 // so it is unconstructible outside the engine. Internal call sites reach it via
 // `crate::runtime::config::AgentLoopConfig`. External code drives the loop only

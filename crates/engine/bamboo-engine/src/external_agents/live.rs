@@ -54,6 +54,29 @@ pub fn deliver_message(child_id: &str, text: &str) -> bool {
     }
 }
 
+/// Deliver a host/human approval decision to a live child's pending gated-tool
+/// request (Phase 2: child → parent approval delegation). Sends
+/// `ParentFrame::ApprovalReply{id, approved}` over the child's live WS
+/// connection; `drive()` forwards it to the worker, whose pending map resolves
+/// the `host.approval_call` the child's gated tool is blocked on (approve ⇒ the
+/// tool proceeds, deny ⇒ it fails closed). This is the decision-DOWN half of the
+/// human-in-the-loop route: a parent-side responder (e.g. a `/respond`-style
+/// handler) calls this with the `request_id` it surfaced to the human. Returns
+/// `false` when the child is not live (no connection to answer on — the caller
+/// should treat that as a denied/expired request).
+pub fn deliver_approval(child_id: &str, request_id: &str, approved: bool) -> bool {
+    let guard = map().lock().unwrap();
+    match guard.get(child_id) {
+        Some(tx) => tx
+            .send(ParentFrame::ApprovalReply {
+                id: request_id.to_string(),
+                approved,
+            })
+            .is_ok(),
+        None => false,
+    }
+}
+
 /// Whether a child currently has a live actor connection.
 pub fn is_live(child_id: &str) -> bool {
     map().lock().unwrap().contains_key(child_id)
@@ -85,5 +108,22 @@ mod tests {
         let _guard = register("c-dead", tx);
         drop(rx);
         assert!(!deliver_message("c-dead", "hi"));
+    }
+
+    #[test]
+    fn deliver_approval_routes_reply_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let guard = register("c-appr", tx);
+        assert!(deliver_approval("c-appr", "req-7", true));
+        match rx.try_recv() {
+            Ok(ParentFrame::ApprovalReply { id, approved }) => {
+                assert_eq!(id, "req-7");
+                assert!(approved);
+            }
+            other => panic!("expected approval reply, got {other:?}"),
+        }
+        drop(guard);
+        // Not-live child ⇒ false (no connection to answer on).
+        assert!(!deliver_approval("c-appr", "req-8", false));
     }
 }

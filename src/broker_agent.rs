@@ -82,6 +82,7 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
                 .role
                 .clone()
                 .unwrap_or_else(|| "general-purpose".into()),
+            depth: 0,
         },
         ExecutorSpec::BambooRuntime,
         std::env::temp_dir()

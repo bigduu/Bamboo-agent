@@ -499,6 +499,24 @@ pub enum AgentEvent {
         parameters: serde_json::Value,
     },
 
+    /// A child sub-agent (out-of-process worker) hit a gated tool and proxied
+    /// the approval decision to this parent over the actor protocol (Phase 2).
+    /// The parent surfaces it to the human; the decision is routed back to the
+    /// waiting child via
+    /// `external_agents::live::deliver_approval(child_session_id, request_id, approved)`.
+    ChildApprovalRequested {
+        /// The child session whose gated tool is blocked awaiting approval.
+        child_session_id: String,
+        /// Correlates the eventual approve/deny reply back to the blocked tool.
+        request_id: String,
+        /// Name of the gated tool the child wants to run.
+        tool_name: String,
+        /// Human-readable description of the permission requested.
+        permission: String,
+        /// The concrete resource the action targets.
+        resource: String,
+    },
+
     /// Agent execution completed successfully.
     Complete {
         /// Final token usage statistics

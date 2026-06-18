@@ -6,12 +6,13 @@ use serde_json::json;
 
 use super::helpers::{
     compute_status_guidance, format_child_assignment, map_child_entry, metadata_text,
-    normalize_non_empty_optional, normalize_required_text, replace_or_append_last_user_message,
-    truncate_after_index, truncate_after_last_user,
+    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
+    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
 };
 use super::DELEGATION_NOTE;
 use super::{
-    ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult, QueuedInjectedMessage,
+    ChildSessionEntry, ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult,
+    QueuedInjectedMessage,
 };
 
 pub async fn create_child_action(
@@ -156,10 +157,32 @@ pub async fn create_child_action(
         &input.subagent_type,
         &input.assignment_prompt,
     );
+    // Phase 3: optionally fork a slice of the parent's recent context into the
+    // child's task brief (model-controllable via the SubAgent tool's
+    // `fork_last_messages`). `None`/0 keeps the child on a clean fresh context.
+    let assignment = match input
+        .context_fork
+        .and_then(|n| render_forked_parent_context(&input.parent_session, n))
+    {
+        Some(forked) => format!("{forked}\n\n{assignment}"),
+        None => assignment,
+    };
     child.add_message(Message::user(assignment));
 
     if let Some(parent_task_list) = input.parent_session.task_list.clone() {
         child.set_task_list(parent_task_list);
+    }
+
+    // Persist any per-child tool denylist so the spawn path (enqueue_child_run
+    // → SpawnJob.disabled_tools) can trim the child's toolset (e.g. a read-only
+    // Guardian reviewer). Most children carry none and keep the full toolset.
+    if let Some(ref disabled) = input.disabled_tools {
+        if !disabled.is_empty() {
+            child.metadata.insert(
+                "disabled_tools".to_string(),
+                serde_json::to_string(disabled).unwrap_or_default(),
+            );
+        }
     }
 
     let model = child.model.clone();
@@ -185,6 +208,104 @@ pub async fn list_children_action(
         "children": children.iter().map(map_child_entry).collect::<Vec<_>>(),
         "count": children.len(),
     })
+}
+
+/// A node in the materialized parent→child session graph (Phase 6: persistent
+/// multi-level nesting graph). `children` are the transitive descendants.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SessionTreeNode {
+    pub session_id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_status: Option<String>,
+    pub depth: u32,
+    pub children: Vec<SessionTreeNode>,
+}
+
+/// Assemble the transitive parent→child tree rooted at `root_id` from a
+/// pre-fetched adjacency map (pure — unit-testable without a port). Bounded by
+/// `max_depth`; a first-visit guard breaks cycles (a re-encountered session
+/// becomes a leaf rather than recursing forever).
+pub fn assemble_session_tree(
+    root_id: &str,
+    root_title: &str,
+    adjacency: &std::collections::HashMap<String, Vec<ChildSessionEntry>>,
+    max_depth: u32,
+) -> SessionTreeNode {
+    fn build(
+        id: &str,
+        title: &str,
+        status: Option<String>,
+        depth: u32,
+        max_depth: u32,
+        adjacency: &std::collections::HashMap<String, Vec<ChildSessionEntry>>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> SessionTreeNode {
+        let first_visit = visited.insert(id.to_string());
+        let mut children = Vec::new();
+        if first_visit && depth < max_depth {
+            if let Some(kids) = adjacency.get(id) {
+                for kid in kids {
+                    children.push(build(
+                        &kid.child_session_id,
+                        &kid.title,
+                        kid.last_run_status.clone(),
+                        depth + 1,
+                        max_depth,
+                        adjacency,
+                        visited,
+                    ));
+                }
+            }
+        }
+        SessionTreeNode {
+            session_id: id.to_string(),
+            title: title.to_string(),
+            last_run_status: status,
+            depth,
+            children,
+        }
+    }
+    let mut visited = std::collections::HashSet::new();
+    build(root_id, root_title, None, 0, max_depth, adjacency, &mut visited)
+}
+
+/// Materialize the full transitive parent→child session graph rooted at
+/// `root_id` from the persisted session index (Phase 6). BFS-fetches each
+/// level's children via [`ChildSessionPort::list_children`] (a first-visit guard
+/// + a hard node cap protect against cycles / runaway trees), then assembles the
+/// tree. The graph is derived from durable index state, so it survives restarts.
+pub async fn build_session_tree_action(
+    port: &dyn ChildSessionPort,
+    root_id: &str,
+    max_depth: u32,
+) -> SessionTreeNode {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    const NODE_CAP: usize = 5000;
+
+    let root_title = port
+        .load_root_session(root_id)
+        .await
+        .map(|s| s.title)
+        .unwrap_or_default();
+
+    let mut adjacency: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+    queue.push_back((root_id.to_string(), 0));
+
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= max_depth || adjacency.len() >= NODE_CAP || !visited.insert(id.clone()) {
+            continue;
+        }
+        let kids = port.list_children(&id).await;
+        for kid in &kids {
+            queue.push_back((kid.child_session_id.clone(), depth + 1));
+        }
+        adjacency.insert(id, kids);
+    }
+
+    assemble_session_tree(root_id, &root_title, &adjacency, max_depth)
 }
 
 pub async fn get_child_action(
@@ -529,4 +650,73 @@ pub async fn delete_child_action(
         "deleted": true,
         "cancelled_running_child": result.cancelled_running_child,
     }))
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::super::ChildSessionEntry;
+    use super::assemble_session_tree;
+    use std::collections::HashMap;
+
+    fn entry(id: &str, title: &str) -> ChildSessionEntry {
+        ChildSessionEntry {
+            child_session_id: id.to_string(),
+            title: title.to_string(),
+            pinned: false,
+            message_count: 0,
+            updated_at: String::new(),
+            last_run_status: Some("completed".to_string()),
+            last_run_error: None,
+        }
+    }
+
+    #[test]
+    fn assembles_multi_level_tree() {
+        let mut adj: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+        adj.insert(
+            "root".into(),
+            vec![entry("c1", "child 1"), entry("c2", "child 2")],
+        );
+        adj.insert("c1".into(), vec![entry("g1", "grandchild")]);
+
+        let tree = assemble_session_tree("root", "Root", &adj, 8);
+        assert_eq!(tree.session_id, "root");
+        assert_eq!(tree.depth, 0);
+        assert_eq!(tree.children.len(), 2);
+        let c1 = tree.children.iter().find(|n| n.session_id == "c1").unwrap();
+        assert_eq!(c1.depth, 1);
+        assert_eq!(c1.children.len(), 1);
+        assert_eq!(c1.children[0].session_id, "g1");
+        assert_eq!(c1.children[0].depth, 2);
+        let c2 = tree.children.iter().find(|n| n.session_id == "c2").unwrap();
+        assert!(c2.children.is_empty());
+    }
+
+    #[test]
+    fn depth_cap_stops_descent() {
+        let mut adj: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+        adj.insert("root".into(), vec![entry("c1", "c1")]);
+        adj.insert("c1".into(), vec![entry("g1", "g1")]);
+        let tree = assemble_session_tree("root", "Root", &adj, 1);
+        assert_eq!(tree.children.len(), 1);
+        assert!(
+            tree.children[0].children.is_empty(),
+            "depth cap stops expansion at depth 1"
+        );
+    }
+
+    #[test]
+    fn cycle_is_broken_by_first_visit_guard() {
+        let mut adj: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+        adj.insert("a".into(), vec![entry("b", "b")]);
+        adj.insert("b".into(), vec![entry("a", "a")]); // cycle a → b → a
+        let tree = assemble_session_tree("a", "A", &adj, 100);
+        assert_eq!(tree.children.len(), 1);
+        let b = &tree.children[0];
+        assert_eq!(b.session_id, "b");
+        assert_eq!(b.children.len(), 1);
+        let a2 = &b.children[0];
+        assert_eq!(a2.session_id, "a");
+        assert!(a2.children.is_empty(), "cycle must terminate as a leaf");
+    }
 }

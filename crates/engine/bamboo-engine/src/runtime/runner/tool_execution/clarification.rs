@@ -289,6 +289,34 @@ pub(super) async fn maybe_handle_user_question_tool(
             .await;
     }
 
+    // Child→parent approval delegation (Phase 2): a non-bypassed CHILD cannot
+    // answer its own permission prompt (no human is attached to a child session).
+    // When a delegate is wired and this is a permission approval, route the
+    // request UP to the parent (which surfaces it to the human + persists the
+    // mapping) and suspend the child distinctly — do NOT set a human-answerable
+    // pending question on the child, which would strand it.
+    if try_delegate_child_approval(session, tool_call, &result.result, config)
+        .await
+        .is_some()
+    {
+        // ANY delegated outcome routes the decision to the parent and suspends
+        // the child here — never a child-side pending question (which a child has
+        // no human to answer, so it would strand). Auto-approve/auto-deny
+        // fast-paths are resolved on the resume side, not by falling through to
+        // the legacy clarification pause.
+        tracing::info!(
+            "[{}] child gated tool `{}` delegated to parent for approval; suspending child",
+            session_id,
+            tool_call.function.name
+        );
+        session.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_parent_approval".to_string(),
+        );
+        persist_session_after_question(config, session, session_id).await;
+        return true;
+    }
+
     emit_need_clarification_event(
         event_tx,
         &question_payload,
@@ -313,6 +341,71 @@ pub(super) async fn maybe_handle_user_question_tool(
     persist_session_after_question(config, session, session_id).await;
 
     true
+}
+
+/// If a paused tool call is a permission approval AND the executing session is a
+/// CHILD with an approval delegate wired, route the request up to the parent.
+/// Returns the delegate outcome when delegation was attempted, or `None` to let
+/// the caller fall back to the legacy on-session pending-question pause (the
+/// session is not a child, no delegate is wired, this is not a permission
+/// approval, or the delegate failed).
+async fn try_delegate_child_approval(
+    session: &Session,
+    tool_call: &ToolCall,
+    raw_result: &str,
+    config: &AgentLoopConfig,
+) -> Option<crate::runtime::config::ChildApprovalOutcome> {
+    let delegate = config.approval_delegate.as_ref()?;
+    let parent_session_id = session.parent_session_id.clone()?;
+
+    let payload: serde_json::Value = serde_json::from_str(raw_result).ok()?;
+    if payload.get("status").and_then(|v| v.as_str()) != Some("awaiting_permission_approval") {
+        // A non-permission user question (e.g. ExitPlanMode / conclusion) — not
+        // an approval to delegate.
+        return None;
+    }
+    let permission_type = payload
+        .get("permission_type")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_default();
+    let resource = payload
+        .get("resource")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let question = payload
+        .get("question")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Permission required")
+        .to_string();
+
+    let request = crate::runtime::config::ChildApprovalRequest {
+        child_session_id: session.id.clone(),
+        parent_session_id,
+        child_tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.function.name.clone(),
+        permission_type,
+        resource,
+        question,
+        approval_payload: payload,
+    };
+
+    match delegate.delegate_child_approval(request).await {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            tracing::warn!(
+                "[{}] child approval delegation failed: {}; falling back to local pause",
+                session.id,
+                error
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

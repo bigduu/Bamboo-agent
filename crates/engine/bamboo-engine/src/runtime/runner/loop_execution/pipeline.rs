@@ -19,6 +19,10 @@ use crate::runtime::runner::loop_execution::startup::{
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session;
 use crate::runtime::stream::handler::StreamHandlingOutput;
+use crate::runtime::guardian_state::{
+    ensure_guardian_state, guardian_read_only_disabled_tools, write_guardian_config,
+    write_guardian_state, GuardianPhase, GUARDIAN_REVIEW_RUBRIC,
+};
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
@@ -87,6 +91,59 @@ fn is_terminal_child_status(status: &str) -> bool {
     )
 }
 
+/// Runner primitive: durably suspend `session` to wait on a known set of child
+/// sessions, returning the canonical "stop the turn, do not send complete"
+/// outcome.
+///
+/// Centralizes the suspend transaction so every runner-initiated terminal gate
+/// (the orphaned-children safety net, the guardian review gate, ...) registers
+/// the wait identically: build the durable [`WaitingForChildrenState`], mirror
+/// it into the session via [`state_bridge::write_runtime_state`], stamp the
+/// `runtime.suspend_reason` metadata — always `"waiting_for_children"`, the
+/// discriminant the suspend-finalization keys on — bump `updated_at`, and
+/// persist so the completion coordinator can resume this parent and the suspend
+/// finalization merges (rather than clobbers) the durable wait.
+///
+/// The caller owns child *discovery*; `child_session_ids` is assumed already
+/// sorted/deduped where order matters.
+async fn suspend_to_wait_for_children(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    child_session_ids: Vec<String>,
+    wait_for: ChildWaitPolicy,
+) -> TurnOutcome {
+    let now = Utc::now();
+    let count = child_session_ids.len();
+    runtime_state.waiting_for_children = Some(WaitingForChildrenState::for_children(
+        child_session_ids,
+        wait_for,
+        now,
+    ));
+    state_bridge::write_runtime_state(session, runtime_state);
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "waiting_for_children".to_string(),
+    );
+    session.updated_at = now;
+
+    if let Some(persistence) = persistence {
+        if let Err(error) = persistence.save_runtime_session(session).await {
+            tracing::warn!(
+                "[{}] suspend-to-wait failed to persist parent wait on {} child(ren): {}",
+                session.id,
+                count,
+                error
+            );
+        }
+    }
+
+    TurnOutcome {
+        should_break: true,
+        sent_complete: false,
+    }
+}
+
 /// End-of-turn safety net for the spawn/wait model.
 ///
 /// `SubAgent.create` runs children in the background without suspending, and the
@@ -123,42 +180,180 @@ async fn maybe_suspend_for_orphaned_children(
     active.sort();
     active.dedup();
 
-    let now = Utc::now();
-    let count = active.len();
-    runtime_state.waiting_for_children = Some(WaitingForChildrenState {
-        child_session_ids: active,
-        wait_for: ChildWaitPolicy::All,
-        registered_at: now,
-        timeout_at: Some(now + chrono::Duration::hours(6)),
-        registered_by_tool_call_id: None,
-    });
-    state_bridge::write_runtime_state(session, runtime_state);
-    session.metadata.insert(
-        "runtime.suspend_reason".to_string(),
-        "waiting_for_children".to_string(),
-    );
-    session.updated_at = now;
-
-    // Persist so the completion coordinator can resume this parent, and so the
-    // suspend finalization merges (rather than clobbers) the durable wait.
-    if let Some(persistence) = config.persistence.as_ref() {
-        if let Err(error) = persistence.save_runtime_session(session).await {
-            tracing::warn!(
-                "[{}] safety-net auto-wait failed to persist parent wait: {}",
-                session.id,
-                error
-            );
-        }
-    }
     tracing::info!(
         "[{}] end-of-turn safety net: suspending to wait for {} orphaned child session(s) the model did not explicitly wait on",
         session.id,
-        count,
+        active.len(),
     );
-    Some(TurnOutcome {
-        should_break: true,
-        sent_complete: false,
-    })
+    Some(
+        suspend_to_wait_for_children(
+            session,
+            runtime_state,
+            config.persistence.as_ref(),
+            active,
+            ChildWaitPolicy::All,
+        )
+        .await,
+    )
+}
+
+/// Build the guardian reviewer's task brief: the static rubric plus the active
+/// task's completion criteria and the session goal, when present.
+fn build_guardian_review_prompt(
+    task_context: &Option<TaskLoopContext>,
+    config: &AgentLoopConfig,
+) -> String {
+    let mut prompt = String::from(GUARDIAN_REVIEW_RUBRIC);
+
+    let criteria: Vec<String> = task_context
+        .as_ref()
+        .and_then(|ctx| {
+            ctx.items
+                .iter()
+                .find(|item| Some(&item.id) == ctx.active_item_id.as_ref())
+        })
+        .map(|item| item.completion_criteria.clone())
+        .unwrap_or_default();
+    if !criteria.is_empty() {
+        prompt.push_str("\n\n## Completion criteria (verify EACH against real evidence)\n");
+        for (idx, criterion) in criteria.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", idx + 1, criterion));
+        }
+    }
+
+    let goal = config.active_goal();
+    if let Some(goal) = goal {
+        prompt.push_str("\n\n## Session goal\n");
+        prompt.push_str(goal);
+        prompt.push('\n');
+    }
+
+    if criteria.is_empty() && goal.is_none() {
+        prompt.push_str(
+            "\n\n(No explicit completion criteria or goal were provided; review the diff for correctness, completeness, and obvious bugs.)\n",
+        );
+    }
+    prompt
+}
+
+/// Terminal gate (peer to [`maybe_suspend_for_orphaned_children`]): before a run
+/// completes, spawn a read-only adversarial reviewer child and suspend on its
+/// verdict. Returns `Some` suspend outcome when it engages a review, or `None`
+/// to let the run complete — guardian inactive, the verdict already accepted the
+/// work, the review budget is spent, or a spawn failure that must not strand the
+/// run.
+///
+/// Driven by [`GuardianState`]: `None` → spawn the first review; `Pending` →
+/// never double-spawn (a review is in flight, the resume path re-enters with a
+/// verdict); `Reviewed` + approve → complete; `Reviewed` + reject → re-review the
+/// fix until [`GuardianState::budget_exhausted`]. The budget is the hard bound on
+/// the review→fix→review loop, so it always terminates.
+async fn maybe_spawn_guardian_review(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    task_context: &Option<TaskLoopContext>,
+    runtime_state: &mut AgentRuntimeState,
+    iteration: u32,
+) -> Option<TurnOutcome> {
+    // Already suspended waiting on a child (orphan gate / explicit wait won).
+    if runtime_state.waiting_for_children.is_some() {
+        return None;
+    }
+    if !config.guardian_active() {
+        return None;
+    }
+    let spawner = config.guardian_spawner.as_ref()?;
+    let max_reviews = config.guardian_max_reviews();
+
+    let mut guardian_state = ensure_guardian_state(session);
+    match guardian_state.phase {
+        // A review is in flight (we suspended for it); never double-spawn.
+        GuardianPhase::Pending => return None,
+        GuardianPhase::Reviewed => {
+            if guardian_state.last_approved() {
+                // Work accepted — allow completion.
+                return None;
+            }
+            if guardian_state.budget_exhausted(max_reviews) {
+                tracing::warn!(
+                    "[{}] guardian: review budget ({}) exhausted with unresolved findings; allowing completion",
+                    session.id,
+                    max_reviews
+                );
+                return None;
+            }
+            // Rejected and budget remains → re-review the fix below.
+        }
+        GuardianPhase::None => {
+            if guardian_state.budget_exhausted(max_reviews) {
+                return None;
+            }
+            // First review → spawn below.
+        }
+    }
+
+    // Persist the guardian config so the resumed run (driven by the completion
+    // coordinator, which has no original request) re-injects it and keeps the
+    // review → fix → re-review loop active across the suspend/resume boundary.
+    if let Some(guardian_config) = config.guardian_config.as_ref() {
+        write_guardian_config(session, guardian_config);
+    }
+
+    let review_prompt = build_guardian_review_prompt(task_context, config);
+    let Some(model) = config
+        .guardian_model()
+        .map(str::to_string)
+        .or_else(|| config.model_name.clone())
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+    else {
+        // No reviewer model resolves — skip the review rather than spawning a
+        // child with an empty model id, which would error out and burn the
+        // review budget on a reviewer that never actually runs.
+        tracing::warn!(
+            "[{}] guardian: no reviewer model resolved; skipping review at this terminal",
+            session.id
+        );
+        return None;
+    };
+    let disabled_tools = Some(guardian_read_only_disabled_tools());
+
+    match spawner
+        .spawn_guardian_review(session, review_prompt, model, disabled_tools)
+        .await
+    {
+        Ok(child_id) => {
+            guardian_state.record_spawn(&child_id);
+            guardian_state.last_reviewed_at_round = iteration;
+            let pass = guardian_state.review_count;
+            write_guardian_state(session, guardian_state);
+            tracing::info!(
+                "[{}] guardian: spawned read-only review child {} (pass {}/{}); suspending until verdict",
+                session.id,
+                child_id,
+                pass,
+                max_reviews
+            );
+            Some(
+                suspend_to_wait_for_children(
+                    session,
+                    runtime_state,
+                    config.persistence.as_ref(),
+                    vec![child_id],
+                    ChildWaitPolicy::All,
+                )
+                .await,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[{}] guardian: failed to spawn review child: {}; allowing completion",
+                session.id,
+                error
+            );
+            None
+        }
+    }
 }
 
 // ---- Metrics helpers (from round_error.rs) ----
@@ -946,6 +1141,22 @@ pub(super) async fn run_pipeline(
                     turn_outcome = Some(suspend);
                     break;
                 }
+                // Adversarial guardian review: before completing, spawn a
+                // read-only reviewer child to verify the work and suspend until
+                // its verdict returns. Inert unless a guardian config + spawner
+                // are wired (`config.guardian_active()`).
+                if let Some(review) = maybe_spawn_guardian_review(
+                    session,
+                    config,
+                    &state.task_context,
+                    &mut state.runtime_state,
+                    turn_counter + 1,
+                )
+                .await
+                {
+                    turn_outcome = Some(review);
+                    break;
+                }
                 let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                     .then_some(stream_output.reasoning_content);
                 let eval_model = state
@@ -1085,6 +1296,19 @@ pub(super) async fn run_pipeline(
                     hook_point: Some("AfterToolExecution".to_string()),
                 });
             }
+            Some("awaiting_parent_approval") => {
+                // Phase 2: a CHILD suspended while its gated tool awaits the
+                // PARENT's approval. Resumable — the parent's decision sets the
+                // re-execute marker and resumes this child via the same path as
+                // `awaiting_clarification`.
+                state.runtime_state.status = AgentStatusState::Suspended;
+                state.runtime_state.suspension = Some(SuspensionState {
+                    reason: "awaiting_parent_approval".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: Some("AfterToolExecution".to_string()),
+                });
+            }
             Some("waiting_for_children") => {
                 state.runtime_state.status = AgentStatusState::Suspended;
                 state.runtime_state.suspension = Some(SuspensionState {
@@ -1121,7 +1345,18 @@ pub(super) async fn run_pipeline(
                                 .as_ref()
                                 .and_then(|metadata| metadata.get("runtime_kind"))
                                 .and_then(|value| value.as_str())
-                                .is_some_and(|kind| kind == "child_completion_resume");
+                                // Preserve BOTH the generic child-completion resume
+                                // and the guardian review resume: a fast guardian
+                                // child can append its verdict message before this
+                                // suspended runner's final (message-overwriting)
+                                // save lands, and the verdict/findings must not be
+                                // dropped.
+                                .is_some_and(|kind| {
+                                    matches!(
+                                        kind,
+                                        "child_completion_resume" | "guardian_review_resume"
+                                    )
+                                });
                             if hidden_runtime_resume && !existing_ids.contains(message.id.as_str())
                             {
                                 session.messages.push(message);
@@ -1253,11 +1488,15 @@ mod tests {
     use super::super::startup::OverflowRecoveryState;
     use super::{
         is_overflow_recoverable, is_terminal_child_status, map_turn_error_status,
-        maybe_suspend_for_orphaned_children, should_retry_turn_error,
+        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children, should_retry_turn_error,
     };
-    use crate::runtime::config::AgentLoopConfig;
+    use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
         ensure_goal_state, read_goal_state, write_goal_state, GoalDeclaredStatus, GoalRuntimeStatus,
+    };
+    use crate::runtime::guardian_state::{
+        ensure_guardian_state, read_guardian_state, write_guardian_state, GuardianPhase,
+        GuardianVerdict,
     };
     use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
@@ -1272,6 +1511,159 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    /// A guardian spawner stub that returns a canned child id without touching
+    /// any real spawn machinery — lets the gate's state machine be unit-tested.
+    struct MockGuardianSpawner {
+        child_id: String,
+    }
+    #[async_trait::async_trait]
+    impl GuardianSpawner for MockGuardianSpawner {
+        async fn spawn_guardian_review(
+            &self,
+            _parent_session: &Session,
+            _review_prompt: String,
+            _model: String,
+            _disabled_tools: Option<std::collections::BTreeSet<String>>,
+        ) -> Result<String, String> {
+            Ok(self.child_id.clone())
+        }
+    }
+
+    /// An `AgentLoopConfig` with the guardian gate enabled and a mock spawner.
+    fn guardian_enabled_config(max_reviews: u32) -> AgentLoopConfig {
+        let spawner: Arc<dyn GuardianSpawner> = Arc::new(MockGuardianSpawner {
+            child_id: "guardian-child".to_string(),
+        });
+        AgentLoopConfig {
+            guardian_config: Some(GuardianConfig {
+                enabled: true,
+                model_name: Some("guardian-test-model".to_string()),
+                max_reviews,
+            }),
+            guardian_spawner: Some(spawner),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_gate_spawns_and_suspends_on_first_terminal() {
+        let mut session = Session::new("s1", "model");
+        let config = guardian_enabled_config(2);
+        let mut runtime_state = AgentRuntimeState::new("s1".to_string());
+
+        let outcome =
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1)
+                .await
+                .expect("guardian should engage a review and suspend");
+
+        assert!(outcome.should_break && !outcome.sent_complete);
+        assert!(runtime_state.waiting_for_children.is_some());
+        let guardian_state = read_guardian_state(&session).expect("guardian state persisted");
+        assert_eq!(guardian_state.phase, GuardianPhase::Pending);
+        assert_eq!(
+            guardian_state.guardian_child_id.as_deref(),
+            Some("guardian-child")
+        );
+        assert_eq!(guardian_state.review_count, 1);
+    }
+
+    #[tokio::test]
+    async fn guardian_gate_inert_without_config() {
+        let mut session = Session::new("s1", "model");
+        let config = AgentLoopConfig::default(); // no guardian config / spawner
+        let mut runtime_state = AgentRuntimeState::new("s1".to_string());
+        assert!(
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1)
+                .await
+                .is_none()
+        );
+        assert!(runtime_state.waiting_for_children.is_none());
+    }
+
+    #[tokio::test]
+    async fn guardian_gate_skips_when_no_model_resolves() {
+        // Guardian enabled + spawner wired, but no reviewer model anywhere
+        // (guardian_config.model_name None AND AgentLoopConfig.model_name None).
+        let spawner: Arc<dyn GuardianSpawner> = Arc::new(MockGuardianSpawner {
+            child_id: "guardian-child".to_string(),
+        });
+        let config = AgentLoopConfig {
+            guardian_config: Some(GuardianConfig {
+                enabled: true,
+                model_name: None,
+                max_reviews: 2,
+            }),
+            guardian_spawner: Some(spawner),
+            ..Default::default()
+        };
+        let mut session = Session::new("s1", "model");
+        let mut runtime_state = AgentRuntimeState::new("s1".to_string());
+        // Skip the review (no spawn, no suspend) rather than spawning a reviewer
+        // with an empty model id; the budget is NOT charged.
+        assert!(
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1)
+                .await
+                .is_none()
+        );
+        assert!(runtime_state.waiting_for_children.is_none());
+        assert!(
+            read_guardian_state(&session).is_none(),
+            "no guardian review budget should be charged when skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn guardian_gate_completes_after_approval() {
+        let mut session = Session::new("s1", "model");
+        let mut guardian_state = ensure_guardian_state(&session);
+        guardian_state.record_spawn("guardian-child");
+        guardian_state.record_verdict(GuardianVerdict::approved(), 1);
+        write_guardian_state(&mut session, guardian_state);
+
+        let config = guardian_enabled_config(2);
+        let mut runtime_state = AgentRuntimeState::new("s1".to_string());
+        // Reviewed + approved → allow completion (no suspend, no re-spawn).
+        assert!(
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 2)
+                .await
+                .is_none()
+        );
+        assert!(runtime_state.waiting_for_children.is_none());
+    }
+
+    #[tokio::test]
+    async fn guardian_gate_re_reviews_after_reject_then_completes_on_budget() {
+        let mut session = Session::new("s1", "model");
+        // One review already done and rejected; budget 2 → a re-review is allowed.
+        let mut guardian_state = ensure_guardian_state(&session);
+        guardian_state.record_spawn("guardian-child");
+        guardian_state.record_verdict(GuardianVerdict::rejected(vec!["bug".to_string()]), 1);
+        write_guardian_state(&mut session, guardian_state);
+
+        let config = guardian_enabled_config(2);
+        let mut runtime_state = AgentRuntimeState::new("s1".to_string());
+        let outcome =
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 2)
+                .await
+                .expect("rejected within budget → re-review (suspend)");
+        assert!(outcome.should_break && !outcome.sent_complete);
+        let after = read_guardian_state(&session).expect("state persisted");
+        assert_eq!(after.review_count, 2, "second review spawned");
+        assert_eq!(after.phase, GuardianPhase::Pending);
+
+        // The second review also rejects, exhausting the budget → completion.
+        let mut exhausted = ensure_guardian_state(&session);
+        exhausted.record_verdict(GuardianVerdict::rejected(vec!["still".to_string()]), 3);
+        write_guardian_state(&mut session, exhausted);
+        let mut runtime_state2 = AgentRuntimeState::new("s1".to_string());
+        assert!(
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state2, 4)
+                .await
+                .is_none(),
+            "budget exhausted → allow completion despite unresolved findings"
+        );
+    }
 
     /// Minimal provider for terminal-gate tests. Never actually invoked when Gold
     /// is disabled (the gate short-circuits before any LLM call).

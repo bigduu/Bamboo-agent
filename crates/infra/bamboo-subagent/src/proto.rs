@@ -52,6 +52,15 @@ pub enum ParentFrame {
         id: String,
         body: serde_json::Value,
     },
+    /// Reply to a [`ChildFrame::ApprovalRequest`] — the host's human/policy
+    /// decision on a gated tool the worker proxied back (Phase 2 child→parent
+    /// approval delegation). `id` correlates to the request. When
+    /// `approved == true` the worker records the grant locally and proceeds;
+    /// `false` denies the tool. Mirrors the `SubagentReply` proxy pattern.
+    ApprovalReply {
+        id: String,
+        approved: bool,
+    },
 }
 
 /// Child → parent event/terminal frames.
@@ -65,6 +74,16 @@ pub enum ChildFrame {
     /// to this worker's host session). The host answers with
     /// [`ParentFrame::SubagentReply`] carrying the same `id`.
     SubagentRequest {
+        id: String,
+        body: serde_json::Value,
+    },
+    /// The worker hit a tool needing human approval (Phase 2 child→parent
+    /// approval delegation). Proxied to the host — which surfaces it to the
+    /// human via the parent session's pending-question / notification path —
+    /// mirroring [`ChildFrame::SubagentRequest`]. The host answers with
+    /// [`ParentFrame::ApprovalReply`] carrying the same `id`. `body` carries
+    /// `{tool_name, permission_type, resource, question}`.
+    ApprovalRequest {
         id: String,
         body: serde_json::Value,
     },
@@ -165,6 +184,23 @@ mod tests {
             body: serde_json::json!({"success":true}),
         };
         assert_eq!(ParentFrame::from_text(&reply.to_text()).unwrap(), reply);
+
+        // Phase 2 approval request/reply round-trip over the per-child WS.
+        let areq = ChildFrame::ApprovalRequest {
+            id: "a1".into(),
+            body: serde_json::json!({
+                "tool_name": "Write",
+                "permission_type": "WriteFile",
+                "resource": "/tmp/x",
+                "question": "approve?",
+            }),
+        };
+        assert_eq!(ChildFrame::from_text(&areq.to_text()).unwrap(), areq);
+        let areply = ParentFrame::ApprovalReply {
+            id: "a1".into(),
+            approved: true,
+        };
+        assert_eq!(ParentFrame::from_text(&areply.to_text()).unwrap(), areply);
     }
 
     #[test]

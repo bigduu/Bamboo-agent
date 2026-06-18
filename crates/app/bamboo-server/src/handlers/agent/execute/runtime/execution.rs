@@ -169,6 +169,11 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         mpsc_tx: args.mpsc_tx,
         image_fallback: args.image_fallback,
         gold_config: args.gold_config,
+        // The guardian reviewer spawner is always available; the terminal gate
+        // stays inert until `guardian_config` is enabled. (TODO: surface a
+        // guardian config on the request, mirroring `gold_config`.)
+        guardian_config: None,
+        guardian_spawner: Some(args.state.guardian_spawner.clone()),
         app_data_dir: args.app_data_dir,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
