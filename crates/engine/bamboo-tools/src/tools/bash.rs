@@ -398,9 +398,14 @@ impl Tool for BashTool {
         let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
         let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
         if parsed.run_in_background.unwrap_or(false) {
-            let shell = bash_runtime::spawn_background(command, Some(&cwd), ctx.cloned_sender())
-                .await
-                .map_err(ToolError::Execution)?;
+            let shell = bash_runtime::spawn_background(
+                command,
+                Some(&cwd),
+                ctx.cloned_sender(),
+                ctx.session_id.map(str::to_string),
+            )
+            .await
+            .map_err(ToolError::Execution)?;
 
             if let Some(requested_timeout) = parsed.timeout {
                 let kill_after_ms = Self::effective_timeout_ms(Some(requested_timeout));
@@ -666,7 +671,7 @@ mod tests {
     async fn bash_background_emits_completion_event_with_exit_code() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx))
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -699,7 +704,7 @@ mod tests {
     async fn bash_background_emits_completion_event_for_failing_command() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("false", None, Some(tx))
+        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -731,7 +736,7 @@ mod tests {
     async fn bash_background_emits_killed_when_shell_is_killed() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx))
+        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -764,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn bash_background_without_sender_still_completes() {
         prime_test_command_environment();
-        let shell = super::bash_runtime::spawn_background("true", None, None)
+        let shell = super::bash_runtime::spawn_background("true", None, None, None)
             .await
             .expect("background shell should spawn");
 
@@ -796,7 +801,7 @@ mod tests {
         })
         .expect("prefill channel slot");
 
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx))
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None)
             .await
             .expect("background shell should spawn");
 
@@ -926,5 +931,80 @@ mod tests {
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("directory"))
         );
+    }
+
+    /// `running_shells_for_session` reports only the running shells tagged with the
+    /// requested session, excluding completed shells and shells owned by another
+    /// session (or none). (issue #84, phase 2a.)
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn running_shells_for_session_filters_by_session_and_status() {
+        prime_test_command_environment();
+
+        // Two long-running shells owned by sess-A.
+        let a1 = super::bash_runtime::spawn_background(
+            "sleep 30",
+            None,
+            None,
+            Some("sess-A".to_string()),
+        )
+        .await
+        .expect("spawn a1");
+        let a2 = super::bash_runtime::spawn_background(
+            "sleep 30",
+            None,
+            None,
+            Some("sess-A".to_string()),
+        )
+        .await
+        .expect("spawn a2");
+        // One long-running shell owned by sess-B.
+        let b = super::bash_runtime::spawn_background(
+            "sleep 30",
+            None,
+            None,
+            Some("sess-B".to_string()),
+        )
+        .await
+        .expect("spawn b");
+        // An untagged (None) long-running shell.
+        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None)
+            .await
+            .expect("spawn untagged");
+        // A sess-A shell that completes immediately — must be excluded once done.
+        let done =
+            super::bash_runtime::spawn_background("true", None, None, Some("sess-A".to_string()))
+                .await
+                .expect("spawn done");
+
+        // Wait for the fast shell to reach "completed" so we exercise the status filter.
+        let started = Instant::now();
+        loop {
+            if done.status() == "completed" {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                panic!("sess-A fast shell never completed");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        // sess-A should report exactly the two long-running shells, order-independent.
+        let mut running = super::bash_runtime::running_shells_for_session("sess-A");
+        running.sort();
+        let mut expected = vec![a1.id.clone(), a2.id.clone()];
+        expected.sort();
+        assert_eq!(running, expected);
+
+        // sess-B should report exactly its own single running shell.
+        assert_eq!(
+            super::bash_runtime::running_shells_for_session("sess-B"),
+            vec![b.id.clone()]
+        );
+
+        // Cleanup: kill the still-running shells so the GC isn't left holding them.
+        for shell in [a1, a2, b, untagged] {
+            let _ = shell.kill().await;
+        }
     }
 }
