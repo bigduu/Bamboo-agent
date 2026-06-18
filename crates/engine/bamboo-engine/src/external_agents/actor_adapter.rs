@@ -298,9 +298,16 @@ impl ActorChildRunner {
     }
 
     /// Reuse fingerprint: two children are interchangeable on one warm worker iff
-    /// they share role, provider, model, workspace, and disabled-tool set (those
-    /// are baked into the worker at provision time; everything else — assignment,
-    /// history — is shipped per-run in the `RunSpec`).
+    /// they share role, provider, model, workspace, disabled-tool set, AND every
+    /// capability the worker BAKES at provision time (`BambooRuntimeExecutor`
+    /// stamps these once and reuses them across runs): nesting depth, nested-spawn
+    /// stack, bypass mode, permission enforcement, and the depth cap. Omitting any
+    /// of these lets the pool hand a run a worker baked for a DIFFERENT posture —
+    /// e.g. a depth-1 worker (with its own spawn stack) reused for a depth-4
+    /// child would re-stamp `spawn_depth=1` and pass the depth-cap check, breaking
+    /// the recursion bound; or a bypass worker reused for a non-bypass child. So
+    /// these MUST split the pool bucket. Everything else (assignment, history) is
+    /// shipped per-run in the `RunSpec` and does not affect the fingerprint.
     fn fingerprint(spec: &ProvisionSpec) -> String {
         let role = spec.identity.role.as_str();
         let (provider, model) = spec
@@ -311,9 +318,15 @@ impl ActorChildRunner {
         let workspace = spec.workspace.as_deref().unwrap_or("");
         let mut tools = spec.disabled_tools.clone().unwrap_or_default();
         tools.sort();
+        let caps = &spec.capabilities;
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}",
-            tools.join(",")
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}",
+            tools.join(","),
+            spec.identity.depth,
+            caps.nested_spawn,
+            caps.bypass,
+            caps.enforce_permissions,
+            caps.max_spawn_depth.unwrap_or(0),
         )
     }
 
@@ -881,6 +894,40 @@ mod tests {
                 Some(vec!["Bash"])
             ))
         );
+    }
+
+    #[test]
+    fn fingerprint_splits_on_baked_capabilities() {
+        // Every capability baked once at provision time must split the pool
+        // bucket, else a worker baked for one posture gets reused for another
+        // (e.g. a depth-1 worker re-stamping spawn_depth onto a depth-4 child,
+        // breaking the depth cap; or a bypass worker reused for a non-bypass one).
+        let base_fp =
+            ActorChildRunner::fingerprint(&spec_with("explorer", "p", "m", Some("/ws"), None));
+
+        let mut depth = spec_with("explorer", "p", "m", Some("/ws"), None);
+        depth.identity.depth = 2;
+        assert_ne!(base_fp, ActorChildRunner::fingerprint(&depth), "depth must split");
+
+        let mut nested = spec_with("explorer", "p", "m", Some("/ws"), None);
+        nested.capabilities.nested_spawn = true;
+        assert_ne!(base_fp, ActorChildRunner::fingerprint(&nested), "nested_spawn must split");
+
+        let mut bypass = spec_with("explorer", "p", "m", Some("/ws"), None);
+        bypass.capabilities.bypass = true;
+        assert_ne!(base_fp, ActorChildRunner::fingerprint(&bypass), "bypass must split");
+
+        let mut enforce = spec_with("explorer", "p", "m", Some("/ws"), None);
+        enforce.capabilities.enforce_permissions = true;
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&enforce),
+            "enforce_permissions must split"
+        );
+
+        let mut cap = spec_with("explorer", "p", "m", Some("/ws"), None);
+        cap.capabilities.max_spawn_depth = Some(8);
+        assert_ne!(base_fp, ActorChildRunner::fingerprint(&cap), "max_spawn_depth must split");
     }
 
     struct StaticDecider(bool);
