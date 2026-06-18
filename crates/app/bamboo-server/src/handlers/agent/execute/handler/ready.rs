@@ -34,6 +34,9 @@ pub(super) struct ReadyExecution {
     pub model_source: &'static str,
     pub reasoning_source: &'static str,
     pub is_child_session: bool,
+    /// The `no_human_approver` posture from THIS execute request. #74: re-derived
+    /// per user-initiated execute and written over the session's persisted flag.
+    pub no_human_approver: bool,
 }
 
 /// Reserve the runner, persist, and spawn the agent loop for a ready session.
@@ -48,6 +51,13 @@ pub(super) async fn handle_execute_ready(
     disabled_skill_ids_vec: Vec<String>,
 ) -> HttpResponse {
     let mut session = ready.session;
+
+    // #74: re-derive the "no interactive human approver" posture per
+    // user-initiated execute, OVERWRITING the session's persisted flag (see
+    // `apply_no_human_approver`). Done before the `merge_save_runtime` persist
+    // below so the corrected posture is what's stored and handed to the spawn.
+    apply_no_human_approver(&mut session, ready.no_human_approver);
+
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
     let (cancel_token, run_id) =
@@ -174,4 +184,101 @@ pub(super) async fn handle_execute_ready(
     });
 
     started_response(session_id, sync_info, run_id)
+}
+
+/// #74: re-derive the "no interactive human approver" posture for a
+/// user-initiated execute, OVERWRITING the session's persisted flag with
+/// `no_human_approver` from THIS request.
+///
+/// Why an overwrite (not a sticky carry-forward): a session first run
+/// headlessly/scheduled persists `true`; if it is later reopened INTERACTIVELY,
+/// the UI omits the field (→ `false`), so this resets the session to the
+/// human-present posture. Otherwise its sub-agents (which inherit the flag)
+/// would silently model-review approvals that a now-present human should answer.
+///
+/// Safe w.r.t. suspend/resume: a within-run resume (answering a pending
+/// question, the waiting_for_children resume, gold auto-answer) does NOT
+/// re-enter the execute handler — it goes through `resume_session_execution`,
+/// which reloads the persisted `runtime_state` and never touches an
+/// `ExecuteRequest`. So this overwrite only fires on a fresh user execute; the
+/// startup carry-forward then preserves the posture across the run's segments.
+fn apply_no_human_approver(session: &mut bamboo_agent_core::Session, no_human_approver: bool) {
+    session
+        .agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+        .no_human_approver = no_human_approver;
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::apply_no_human_approver;
+    use bamboo_agent_core::Session;
+    use bamboo_domain::AgentRuntimeState;
+
+    #[test]
+    fn interactive_execute_resets_persisted_no_human_approver_to_false() {
+        // Cross-mode resume (#74): a session first run headlessly persists
+        // `no_human_approver = true`. Reopening it INTERACTIVELY (the UI omits
+        // the field, so the request carries `false`) must OVERWRITE the stale
+        // `true` back to `false` so approvals reach the now-present human.
+        let mut session = Session::new("sess-cross-mode", "test-model");
+        let mut prev = AgentRuntimeState::new("run-prev");
+        prev.no_human_approver = true;
+        session.agent_runtime_state = Some(prev);
+
+        apply_no_human_approver(&mut session, false);
+
+        assert!(
+            !session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .no_human_approver,
+            "interactive execute (false) must reset a persisted true"
+        );
+    }
+
+    #[test]
+    fn headless_execute_yields_no_human_approver_true() {
+        // Headless `-p` sends `no_human_approver = true` on the request; the
+        // overwrite must set it on a session with no prior runtime state.
+        let mut session = Session::new("sess-headless", "test-model");
+        assert!(session.agent_runtime_state.is_none());
+
+        apply_no_human_approver(&mut session, true);
+
+        assert!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .no_human_approver,
+            "headless execute (true) must set the posture"
+        );
+    }
+
+    #[test]
+    fn execute_overwrites_regardless_of_prior_value() {
+        // The overwrite is unconditional (not OR-sticky): an interactive run
+        // (false) over a persisted false stays false, and a true-over-true stays
+        // true — the request value is authoritative each execute.
+        for (prev_flag, req_flag) in [(false, false), (true, true), (false, true), (true, false)] {
+            let mut session = Session::new("sess", "test-model");
+            let mut prev = AgentRuntimeState::new("run-prev");
+            prev.no_human_approver = prev_flag;
+            session.agent_runtime_state = Some(prev);
+
+            apply_no_human_approver(&mut session, req_flag);
+
+            assert_eq!(
+                session
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .no_human_approver,
+                req_flag,
+                "request value must be authoritative (prev={prev_flag}, req={req_flag})"
+            );
+        }
+    }
 }

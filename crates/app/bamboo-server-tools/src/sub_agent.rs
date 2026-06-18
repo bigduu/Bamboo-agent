@@ -596,6 +596,35 @@ impl Tool for SubAgentTool {
                                 .await
                                 .map_err(tool_error_from_child_session)?;
                         }
+                        // #74: re-seed the reused resident's posture from the LIVE
+                        // parent. The resident-reuse path bypasses
+                        // `create_child_action` (which seeds `bypass_permissions` /
+                        // `no_human_approver` on the child's first run), so without
+                        // this a resident created under one posture keeps a stale
+                        // flag when reused under another (e.g. parent flipped from
+                        // headless to interactive, or toggled bypass). Mirror BOTH
+                        // flags so the reused resident matches the current parent.
+                        {
+                            let mut child = self
+                                .sessions
+                                .load_child_for_parent(&parent.id, &existing_id)
+                                .await
+                                .map_err(tool_error_from_child_session)?;
+                            let (parent_bypass, parent_no_human) = parent
+                                .agent_runtime_state
+                                .as_ref()
+                                .map(|s| (s.bypass_permissions, s.no_human_approver))
+                                .unwrap_or((false, false));
+                            let rs = child
+                                .agent_runtime_state
+                                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+                            rs.bypass_permissions = parent_bypass;
+                            rs.no_human_approver = parent_no_human;
+                            self.sessions
+                                .save_child_session(&mut child)
+                                .await
+                                .map_err(tool_error_from_child_session)?;
+                        }
                         // Reuse: reset => update (truncate + new task) then rerun;
                         // accumulate => send the task as a new message (auto-runs).
                         if resident_context == "accumulate" {
