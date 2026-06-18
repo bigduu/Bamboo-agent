@@ -48,6 +48,14 @@ pub trait ExternalChildRunner: Send + Sync {
         event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> crate::runtime::runner::Result<()>;
+
+    /// Bind this runner's per-run escalation host bridge (#68). A nested worker's
+    /// `run()` installs its OWN host bridge here so the runner can hand it to each
+    /// grandchild's `drive()` AT SPAWN time (captured into the drive task, not read
+    /// later), letting the grandchild re-proxy a non-bypass approval request UP to
+    /// its parent run for its whole lifetime — even when it outlives the run that
+    /// spawned it. Default no-op for runners that don't escalate (e.g. A2A).
+    fn set_escalation_bridge(&self, _bridge: Option<bamboo_subagent::executor::HostBridge>) {}
 }
 
 #[derive(Clone)]

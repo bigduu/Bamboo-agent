@@ -82,6 +82,17 @@ pub struct ActorChildRunner {
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
     approval_decider: Option<Arc<dyn ChildApprovalDecider>>,
+    /// Per-run escalation host bridge for non-bypass child-approval routing (#68;
+    /// Phase 6, Part B). The owning worker's `run()` installs its OWN host bridge
+    /// here via `set_escalation_bridge`; `execute_external_child` CAPTURES it at
+    /// grandchild-spawn time and hands the owned value to `drive()`, which uses it
+    /// to RE-PROXY a child's approval request UP to the parent run — chaining up
+    /// every level until a bypass level (model-review) or the top orchestrator
+    /// (human) decides, then relaying the reply back down. Was a process-global
+    /// slot; now per-runner so a fire-and-forget grandchild that OUTLIVES the run
+    /// that spawned it keeps that run's bridge for its whole lifetime instead of
+    /// reading a stale/overwritten global at approval time (→ fail-closed deny).
+    escalation_bridge: Arc<std::sync::Mutex<Option<bamboo_subagent::executor::HostBridge>>>,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -162,30 +173,6 @@ pub fn child_approval_reviewer() -> Option<Arc<dyn ChildApprovalReviewer>> {
     child_approval_reviewer_slot().get().cloned()
 }
 
-/// Per-run escalation bridge for non-bypass child-approval routing (Phase 6,
-/// Part B). A WORKER's `run()` installs its OWN host bridge here; its `drive()`
-/// (driving grandchildren) uses it to RE-PROXY a child's approval request UP to
-/// its own parent — chaining the request up every level until a bypass level
-/// (model-review) or the top orchestrator (human) decides, then relaying the
-/// reply back down. The top server never installs one ⇒ its drive() falls to the
-/// human-loop. Set per-run (a worker serves runs sequentially, so one active
-/// bridge); a stale bridge from a finished run errors on call ⇒ fail-closed.
-fn escalation_bridge_slot(
-) -> &'static std::sync::Mutex<Option<bamboo_subagent::executor::HostBridge>> {
-    static SLOT: std::sync::Mutex<Option<bamboo_subagent::executor::HostBridge>> =
-        std::sync::Mutex::new(None);
-    &SLOT
-}
-
-/// Install (or clear with `None`) the process escalation host bridge.
-pub fn set_escalation_host_bridge(bridge: Option<bamboo_subagent::executor::HostBridge>) {
-    *escalation_bridge_slot().lock().unwrap() = bridge;
-}
-
-fn escalation_host_bridge() -> Option<bamboo_subagent::executor::HostBridge> {
-    escalation_bridge_slot().lock().unwrap().clone()
-}
-
 impl ActorChildRunner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -211,6 +198,7 @@ impl ActorChildRunner {
             pool: Arc::new(Mutex::new(HashMap::new())),
             max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
             approval_decider: None,
+            escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -436,6 +424,10 @@ impl ExternalChildRunner for ActorChildRunner {
             && session.metadata.get("external.agent_id") == Some(&self.agent_id)
     }
 
+    fn set_escalation_bridge(&self, bridge: Option<bamboo_subagent::executor::HostBridge>) {
+        *self.escalation_bridge.lock().unwrap() = bridge;
+    }
+
     async fn execute_external_child(
         &self,
         session: &mut Session,
@@ -443,6 +435,15 @@ impl ExternalChildRunner for ActorChildRunner {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> crate::runtime::runner::Result<()> {
+        // #68 CORRECTNESS CRUX: capture the per-run escalation bridge HERE, at the
+        // moment this grandchild is spawned — while the parent run's bridge is
+        // still in our slot — into an owned local handed to `drive()` for this
+        // grandchild's whole lifetime. A fire-and-forget grandchild that OUTLIVES
+        // the run that spawned it must NOT re-read `self.escalation_bridge` at
+        // approval time: by then `run()` may have cleared/overwritten it (a worker
+        // serves runs sequentially), and re-proxying through a closed bridge
+        // fail-closed denies. Capturing at spawn pins the right bridge per run.
+        let escalation = self.escalation_bridge.lock().unwrap().clone();
         let assignment = extract_assignment(session);
         let mut spec = self.build_spec(session, job);
         // Make every actor a warm, reusable worker so the pool can recycle it for
@@ -525,6 +526,7 @@ impl ExternalChildRunner for ActorChildRunner {
             &mut client,
             &job.child_session_id,
             self.approval_decider.as_ref(),
+            escalation,
             &event_tx,
             &cancel_token,
             &mut live_rx,
@@ -565,10 +567,18 @@ impl ExternalChildRunner for ActorChildRunner {
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
 /// `live_rx` carries in-band frames (steering messages) from the live registry.
+///
+/// `escalation_bridge` (#68) is the per-run escalation host bridge CAPTURED BY
+/// VALUE at spawn time in `execute_external_child` (NOT read live here): when a
+/// non-bypass child re-proxies an approval request, this owned bridge routes it
+/// UP to the parent run. Owning it for the call's lifetime is what lets a
+/// fire-and-forget grandchild that outlives its spawning run still escalate to
+/// the correct (then-current) parent bridge rather than a stale/overwritten one.
 async fn drive(
     client: &mut ChildClient,
     child_session_id: &str,
     approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
+    escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
     live_rx: &mut mpsc::UnboundedReceiver<ParentFrame>,
@@ -635,7 +645,7 @@ async fn drive(
                                     "failed to answer approval_request; connection failing"
                                 );
                             }
-                        } else if let Some(host) = escalation_host_bridge() {
+                        } else if let Some(host) = escalation_bridge.clone() {
                             // Non-bypass WORKER: ESCALATE up our own actor link
                             // (re-proxy) so the request chains to our parent — and
                             // up every level until a bypass level (model-review) or

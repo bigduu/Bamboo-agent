@@ -7,8 +7,7 @@ pub mod runtime;
 
 pub use a2a_adapter::A2AExternalChildRunner;
 pub use actor_adapter::{
-    child_approval_reviewer, set_child_approval_reviewer, set_escalation_host_bridge,
-    ActorChildRunner, ChildApprovalReviewer,
+    child_approval_reviewer, set_child_approval_reviewer, ActorChildRunner, ChildApprovalReviewer,
 };
 pub use config::{
     parse_external_agents, parse_subagent_routing, resolve_runtime_metadata, ExternalAgentProfile,
