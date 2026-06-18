@@ -242,6 +242,15 @@ async fn run_schedule_job(
     );
     let session_id = session.id.clone();
 
+    // #73: a scheduled run has no interactive human approver — mark the root so
+    // its sub-agents (which inherit the flag) decide gated actions with the
+    // off-loop model-reviewer locally instead of escalating to an absent human,
+    // which would 300s-deny.
+    session
+        .agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+        .no_human_approver = true;
+
     // Persist session and index entry.
     ctx.persistence
         .merge_save_runtime(&mut session)

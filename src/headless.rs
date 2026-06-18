@@ -179,6 +179,15 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             .map_err(|e| format!("load session: {e}"))?
             .ok_or_else(|| "session vanished".to_string())?;
         session.add_message(Message::user(args.prompt.clone()));
+        // #73: a headless `-p` run has no interactive approver. Mark the root
+        // session so its sub-agents (which inherit the flag) decide gated actions
+        // with the off-loop model-reviewer locally instead of escalating to an
+        // absent human — which would otherwise 300s-deny. Sticky; carried forward
+        // each run by startup.
+        session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .no_human_approver = true;
         state
             .storage
             .save_session(&session)

@@ -470,6 +470,14 @@ impl ActorChildRunner {
             .agent_runtime_state
             .as_ref()
             .is_some_and(|s| s.bypass_permissions);
+        // #73: propagate "no interactive human approver" (headless / scheduled /
+        // deployed root, inherited by the child session). When set, the worker's
+        // per-run approval proxy model-reviews a gated action locally instead of
+        // escalating to a human who will never answer (which would 300s-deny).
+        spec.capabilities.no_human_approver = session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|s| s.no_human_approver);
         spec
     }
 }

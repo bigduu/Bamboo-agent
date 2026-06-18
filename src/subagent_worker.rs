@@ -146,6 +146,12 @@ pub struct BambooRuntimeExecutor {
     /// AND it propagates to grandchildren (whose forced-ask actions then get the
     /// installed model-reviewer). Phase 6, Part B.
     bypass: bool,
+    /// #73: the off-loop model-reviewer to decide this run's OWN gated actions
+    /// locally when the run has no interactive human approver (headless /
+    /// scheduled / deployed). `Some` ⇒ the per-run `HostApprovalProxy` calls it
+    /// instead of forwarding the approval to a host whose human-loop would
+    /// 300s-deny it. `None` (interactive) ⇒ forward to the host as usual.
+    no_human_review: Option<Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer>>,
 }
 
 impl BambooRuntimeExecutor {
@@ -430,23 +436,36 @@ impl BambooRuntimeExecutor {
                 None
             };
 
-        // Phase 6, Part B: a BYPASSED self-orchestrating worker installs an
-        // off-loop model-reviewer so its children's forced-ask (dangerous)
-        // actions — which still fire even under bypass — get an LLM
-        // reasonableness check instead of a blind pass. Process-global, read by
-        // this worker's `drive()` when a child sends an ApprovalRequest.
+        // The off-loop model-reviewer (provider + model). Built once and shared:
+        // installed process-global for a BYPASSED nested parent (read by this
+        // worker's `drive()` when a CHILD forwards an ApprovalRequest), and held
+        // per-run for the no-human case below.
+        let reviewer: Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer> =
+            Arc::new(ModelApprovalReviewer {
+                provider: provider_for_review,
+                model: spec
+                    .model
+                    .as_ref()
+                    .map(|m| m.model.clone())
+                    .unwrap_or_default(),
+            });
+
+        // Phase 6, Part B: a BYPASSED self-orchestrating worker installs the
+        // off-loop reviewer so its children's forced-ask (dangerous) actions —
+        // which still fire even under bypass — get an LLM reasonableness check
+        // instead of a blind pass.
         if spec.capabilities.bypass && spec.capabilities.nested_spawn {
-            bamboo_engine::external_agents::set_child_approval_reviewer(Arc::new(
-                ModelApprovalReviewer {
-                    provider: provider_for_review,
-                    model: spec
-                        .model
-                        .as_ref()
-                        .map(|m| m.model.clone())
-                        .unwrap_or_default(),
-                },
-            ));
+            bamboo_engine::external_agents::set_child_approval_reviewer(reviewer.clone());
         }
+
+        // #73: when this run has NO interactive human approver, the per-run
+        // approval proxy decides a gated action with the SAME model-reviewer
+        // LOCALLY (see `HostApprovalProxy`) instead of forwarding to a host whose
+        // human-loop would 300s-deny it. `None` for interactive runs → forward.
+        let no_human_review = spec
+            .capabilities
+            .no_human_approver
+            .then(|| reviewer.clone());
 
         Ok(Self {
             agent,
@@ -461,6 +480,7 @@ impl BambooRuntimeExecutor {
             run_tools,
             spawn_depth: spec.identity.depth,
             bypass: spec.capabilities.bypass,
+            no_human_review,
         })
     }
 }
@@ -470,8 +490,16 @@ impl BambooRuntimeExecutor {
 /// a `ConfirmationRequired`, the executor calls this; we forward the ask to the
 /// parent via [`HostBridge::approval_call`] and block inline for the decision.
 /// Any transport failure resolves to `false` (fail closed).
+///
+/// #73: if `reviewer` is `Some` (the run has no interactive human approver), the
+/// decision is made LOCALLY by the off-loop model-reviewer instead of forwarding
+/// — escalating to an absent human would otherwise 300s-deny it. Interactive
+/// runs leave it `None` and forward to the host as usual.
 struct HostApprovalProxy {
-    host: HostBridge,
+    /// `None` for a deployed worker with no parent host (e.g. broker-agent); in
+    /// that case `reviewer` MUST be set, else the action fails closed.
+    host: Option<HostBridge>,
+    reviewer: Option<Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer>>,
 }
 
 #[async_trait]
@@ -482,7 +510,15 @@ impl bamboo_tools::ApprovalProxy for HostApprovalProxy {
             "permission": ask.permission,
             "resource": ask.resource,
         });
-        match self.host.approval_call(body).await {
+        // No human to ask → decide locally with the model-reviewer.
+        if let Some(reviewer) = &self.reviewer {
+            return reviewer.review("", &body).await;
+        }
+        let Some(host) = &self.host else {
+            tracing::warn!("approval proxy: no host and no reviewer; denying (fail closed)");
+            return false;
+        };
+        match host.approval_call(body).await {
             Ok(reply) => reply
                 .get("approved")
                 .and_then(|v| v.as_bool())
@@ -695,10 +731,17 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // ApprovalProxy so this run's gated tools delegate the decision to the
         // parent over the WS protocol instead of failing closed in this headless
         // worker. Captured here BEFORE `events` moves into the forward task.
+        let host = events.host().cloned();
         let approval_proxy: Option<Arc<dyn bamboo_tools::ApprovalProxy>> =
-            events.host().cloned().map(|host| {
-                Arc::new(HostApprovalProxy { host }) as Arc<dyn bamboo_tools::ApprovalProxy>
-            });
+            if host.is_some() || self.no_human_review.is_some() {
+                Some(Arc::new(HostApprovalProxy {
+                    host,
+                    // #73: when this run has no human approver, decide locally.
+                    reviewer: self.no_human_review.clone(),
+                }) as Arc<dyn bamboo_tools::ApprovalProxy>)
+            } else {
+                None
+            };
         // Phase 6, Part B: install our host bridge as the process escalation
         // bridge so this worker's `drive()` can re-proxy a (non-bypass) child's
         // approval request UP to our own parent — chaining it to the top human.
@@ -832,6 +875,41 @@ fn build_isolated_config(
 mod tests {
     use super::*;
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
+
+    #[tokio::test]
+    async fn proxy_decides_locally_when_no_human_approver() {
+        use bamboo_tools::ApprovalProxy as _;
+
+        struct FixedReviewer(bool);
+        #[async_trait]
+        impl bamboo_engine::external_agents::ChildApprovalReviewer for FixedReviewer {
+            async fn review(&self, _id: &str, _req: &serde_json::Value) -> bool {
+                self.0
+            }
+        }
+        let ask = bamboo_tools::ApprovalAsk {
+            tool_name: "Bash".into(),
+            permission: "execute".into(),
+            resource: "rm -rf /tmp/x".into(),
+        };
+        // reviewer present (no_human_approver) → decided LOCALLY, host untouched.
+        let approve = HostApprovalProxy {
+            host: None,
+            reviewer: Some(Arc::new(FixedReviewer(true))),
+        };
+        assert!(approve.request_approval(ask.clone()).await);
+        let deny = HostApprovalProxy {
+            host: None,
+            reviewer: Some(Arc::new(FixedReviewer(false))),
+        };
+        assert!(!deny.request_approval(ask.clone()).await);
+        // no host AND no reviewer → fail closed.
+        let neither = HostApprovalProxy {
+            host: None,
+            reviewer: None,
+        };
+        assert!(!neither.request_approval(ask).await);
+    }
 
     #[test]
     fn sanitize_review_field_neutralizes_injection() {
