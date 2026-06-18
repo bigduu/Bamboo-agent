@@ -557,15 +557,20 @@ fn sanitize_review_field(value: &str) -> String {
 /// `CANNOT APPROVE`, `DO NOT APPROVE` — which the old `contains("APPROVE")`
 /// accepted as approvals.
 fn parse_review_verdict(content: &str) -> bool {
-    let upper = content.to_uppercase();
-    let denied = upper.contains("DENY")
-        || upper.contains("DISAPPROVE")
-        || upper.contains("NOT APPROVE")
-        || upper.contains("CANNOT APPROVE")
-        || upper.contains("CAN'T APPROVE")
-        || upper.contains("CAN NOT APPROVE")
-        || upper.contains("DON'T APPROVE");
-    !denied && upper.contains("APPROVE")
+    let t = content.trim().to_uppercase();
+    // An explicit deny anywhere wins — handles "APPROVE… on reflection DENY" and
+    // "DISAPPROVE".
+    if t.contains("DENY") || t.contains("DISAPPROVE") {
+        return false;
+    }
+    // Otherwise approve ONLY when the reply LEADS with APPROVE — the instructed
+    // one-word form (optionally followed by reasoning). This fails closed on
+    // every prose refusal that merely CONTAINS the substring "APPROVE" — "I won't
+    // approve", "Never approve", "I do not approve", "I cannot approve", "NOT
+    // APPROVE" — which the old `contains("APPROVE")` (and a deny-list patch of it)
+    // wrongly accepted. A non-leading "Yes, I approve" also fails closed: safer to
+    // deny an unusually-phrased approval than to approve a refusal.
+    t.starts_with("APPROVE")
 }
 
 /// LLM-judge reviewer for a BYPASSED parent worker's children (Phase 6, Part B).
@@ -975,6 +980,11 @@ mod tests {
         assert!(!parse_review_verdict("I do not approve this action"));
         assert!(!parse_review_verdict("I cannot approve — too risky"));
         assert!(!parse_review_verdict("NOT APPROVE"));
+        // Prose refusals that merely CONTAIN "approve" must fail closed — only a
+        // reply that LEADS with APPROVE is an approval.
+        assert!(!parse_review_verdict("I won't approve that"));
+        assert!(!parse_review_verdict("Never approve a destructive command"));
+        assert!(!parse_review_verdict("Yes, I approve")); // non-leading ⇒ fail closed
     }
 
     fn spec_with(provider: &str, key: &str, model: Option<(&str, &str)>) -> ProvisionSpec {
