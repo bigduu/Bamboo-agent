@@ -3,7 +3,9 @@
 //! Provides both heuristic and accurate BPE-based token counting.
 //! `TiktokenTokenCounter` uses OpenAI's o200k_base encoding (bundled at compile
 //! time) for accurate counts. `HeuristicTokenCounter` remains available as a
-//! lightweight fallback.
+//! lightweight fallback and is also used automatically if the bundled BPE
+//! vocabulary ever fails to load, so a failed load degrades gracefully rather
+//! than panicking.
 
 use std::sync::OnceLock;
 
@@ -12,10 +14,32 @@ use tiktoken_rs::o200k_base;
 use tiktoken_rs::CoreBPE;
 
 /// Cached BPE encoder — initialized once, reused across all count_text calls.
-static O200K_ENCODER: OnceLock<CoreBPE> = OnceLock::new();
+///
+/// Holds `None` if the bundled o200k_base vocabulary failed to load (e.g. a
+/// corrupt or unlinkable build). When `None`, `TiktokenTokenCounter` falls back
+/// to `HeuristicTokenCounter` instead of panicking. The failure is logged once
+/// at initialization time so the degradation is observable.
+static O200K_ENCODER: OnceLock<Option<CoreBPE>> = OnceLock::new();
 
-fn o200k_encoder() -> &'static CoreBPE {
-    O200K_ENCODER.get_or_init(|| o200k_base().unwrap())
+/// Returns the cached o200k_base encoder, or `None` if it failed to load.
+///
+/// The first call loads (or attempts to load) the bundled vocabulary exactly
+/// once; a load failure is logged a single time and cached as `None`, so the
+/// hot path never panics and never re-attempts the failing load.
+fn o200k_encoder() -> Option<&'static CoreBPE> {
+    O200K_ENCODER
+        .get_or_init(|| match o200k_base() {
+            Ok(encoder) => Some(encoder),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load bundled o200k_base tokenizer; \
+                     falling back to heuristic token counting"
+                );
+                None
+            }
+        })
+        .as_ref()
 }
 
 /// Trait for token counting implementations.
@@ -189,8 +213,13 @@ impl TokenCounter for TiktokenTokenCounter {
         if text.is_empty() {
             return 0;
         }
-        let tokens = o200k_encoder().encode_with_special_tokens(text);
-        tokens.len() as u32
+        match o200k_encoder() {
+            // Accurate BPE count.
+            Some(encoder) => encoder.encode_with_special_tokens(text).len() as u32,
+            // Encoder unavailable — degrade to the char-based heuristic instead
+            // of panicking. Reuses the existing HeuristicTokenCounter.
+            None => HeuristicTokenCounter::default().count_text(text),
+        }
     }
 }
 
@@ -365,5 +394,18 @@ mod tests {
 
         // Both should produce reasonable counts
         assert!(h_tokens > 0 && t_tokens > 0);
+    }
+
+    #[test]
+    fn bundled_o200k_encoder_loads_successfully() {
+        // Regression guard: if the bundled o200k_base vocabulary ever fails to
+        // load (a build/link regression in tiktoken-rs), TiktokenTokenCounter
+        // would silently fall back to heuristic counting. Assert the bundled
+        // encoder actually loads so such a regression is caught here.
+        assert!(
+            o200k_base().is_ok(),
+            "bundled o200k_base tokenizer failed to load; \
+             suspected tiktoken-rs build/link regression"
+        );
     }
 }
