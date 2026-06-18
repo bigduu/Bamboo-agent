@@ -96,12 +96,10 @@ pub struct Capabilities {
     /// host bridge to proxy to — real actor runs always do.
     #[serde(default)]
     pub enforce_permissions: bool,
-    /// When `true`, the worker advertises the `SubAgent` tool (a proxy) to its
-    /// LLM and forwards its calls to the host over the actor protocol, so a
-    /// nested worker can spawn grandchildren (Phase 6: nested execution).
-    /// Default `false` — the worker has no `SubAgent` tool (legacy behavior).
-    /// Only meaningful when the host wires a `NestedSpawnHandler` to fulfil the
-    /// request (real actor runs do).
+    /// When `true`, the worker builds its OWN external-child runner + scheduler
+    /// + adapter and runs the REAL `SubAgent` tool directly, so a nested worker
+    /// can spawn grandchildren in-process (Phase 6: direct nested execution).
+    /// Default `false` — the worker has no `SubAgent` tool (a leaf sub-agent).
     #[serde(default)]
     pub nested_spawn: bool,
     /// Max nesting depth a self-orchestrating worker may spawn to (Phase 6:

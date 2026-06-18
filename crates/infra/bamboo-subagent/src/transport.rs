@@ -23,7 +23,7 @@ use crate::proto::{ChildFrame, ParentFrame, RunSpec};
 
 /// Pending host-callback replies, keyed by request id, shared between the
 /// per-run pump (which inserts) and the connection read loop (which resolves
-/// them on [`ParentFrame::SubagentReply`]).
+/// them on [`ParentFrame::ApprovalReply`]).
 type PendingReplies = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -148,8 +148,8 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(
     let (out_tx, out_rx) = mpsc::unbounded_channel::<ChildFrame>();
     let writer = tokio::spawn(writer_task(ws_tx, out_rx));
 
-    // Host-callback replies for SubAgent calls the active run proxies back to
-    // the host over this WS (nested sub-agents). Shared with each run's pump.
+    // Host-callback replies for gated-tool approvals the active run proxies back
+    // to the host over this WS. Shared with each run's pump.
     let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
 
     let mut active_cancel: Option<CancellationToken> = None;
@@ -157,15 +157,10 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(
     while let Some(msg) = ws_rx.next().await {
         match msg? {
             Message::Text(t) => match ParentFrame::from_text(t.as_str()) {
-                Ok(ParentFrame::SubagentReply { id, body }) => {
-                    if let Some(reply) = pending.lock().expect("pending lock").remove(&id) {
-                        let _ = reply.send(body);
-                    }
-                }
                 // Phase 2: the host's decision on a proxied gated-tool approval.
-                // Routed through the same `pending` correlation map as
-                // `SubagentReply` (body = {"approved": bool}); a worker that
-                // proxied an `ApprovalRequest` awaits its oneshot here.
+                // Routed through the `pending` correlation map (body =
+                // {"approved": bool}); a worker that proxied an `ApprovalRequest`
+                // awaits its oneshot here.
                 Ok(ParentFrame::ApprovalReply { id, approved }) => {
                     if let Some(reply) = pending.lock().expect("pending lock").remove(&id) {
                         let _ = reply.send(serde_json::json!({ "approved": approved }));
@@ -255,9 +250,10 @@ fn start_run<E: ChildExecutor + ?Sized>(
         }
     });
 
-    // Host-callback pump: each SubAgent call the executor proxies back becomes a
-    // `SubagentRequest` on the wire; its reply (a `SubagentReply` resolved in
-    // `handle_conn`) is delivered to the awaiting oneshot via `pending`.
+    // Host-callback pump: each gated-tool approval the executor proxies back
+    // becomes an `ApprovalRequest` on the wire; its reply (an `ApprovalReply`
+    // resolved in `handle_conn`) is delivered to the awaiting oneshot via
+    // `pending`.
     let (bridge, mut req_rx) = HostBridge::channel();
     let sink = sink.with_host_bridge(bridge);
     let out_req = out_tx.clone();
@@ -271,7 +267,6 @@ fn start_run<E: ChildExecutor + ?Sized>(
                 .expect("pending lock")
                 .insert(id.clone(), req.reply);
             let frame = match req.kind {
-                HostRequestKind::Subagent => ChildFrame::SubagentRequest { id, body: req.body },
                 HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },
             };
             if out_req.send(frame).is_err() {
@@ -361,7 +356,6 @@ mod tests {
         while let Some(frame) = client.next_frame().await.unwrap() {
             match frame {
                 ChildFrame::Event { event } => events.push(event),
-                ChildFrame::SubagentRequest { .. } => {}
                 ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::Terminal { status, result, .. } => {
                     terminal = Some((status, result));
@@ -643,7 +637,6 @@ mod tests {
                         tokens.push(t.to_string());
                     }
                 }
-                ChildFrame::SubagentRequest { .. } => {}
                 ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::Terminal {
                     status, result: r, ..

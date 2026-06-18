@@ -404,11 +404,6 @@ impl AppState {
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
-        // Phase 6: install the process-global nested-spawn handler (the same
-        // adapter, as a NestedSpawnHandler) now that it exists — resolving the
-        // runner→scheduler→adapter construction-order cycle. The actor host's
-        // `drive()` reads it to fulfil a worker's nested `SubAgent` create.
-        bamboo_engine::external_agents::set_nested_spawn_handler(child_adapter.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
         child_completion_coordinator

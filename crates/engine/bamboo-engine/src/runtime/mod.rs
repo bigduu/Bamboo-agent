@@ -1,7 +1,6 @@
 //! Agent execution runtime: loop, stream handling, task evaluation.
 
 pub mod agent;
-pub mod approval_delegation_state;
 pub mod complexity_classifier;
 pub mod config;
 pub mod context;

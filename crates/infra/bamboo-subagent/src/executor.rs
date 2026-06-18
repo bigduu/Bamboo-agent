@@ -13,15 +13,12 @@ use crate::proto::{RunSpec, TerminalStatus};
 /// Which kind of host callback a [`HostRequest`] is — selects the wire frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostRequestKind {
-    /// Proxy a `SubAgent` tool call to the host (→ `ChildFrame::SubagentRequest`).
-    Subagent,
     /// Proxy a gated-tool approval to the host (→ `ChildFrame::ApprovalRequest`).
     Approval,
 }
 
-/// A single host-callback request: an executor proxies a `SubAgent` tool call
-/// (or a gated-tool approval) back to the host over the run's WS and awaits the
-/// reply.
+/// A single host-callback request: an executor proxies a gated-tool approval
+/// back to the host over the run's WS and awaits the reply.
 pub struct HostRequest {
     pub kind: HostRequestKind,
     pub body: serde_json::Value,
@@ -29,7 +26,7 @@ pub struct HostRequest {
 }
 
 /// Host-callback bridge handed to an executor (via [`EventSink`]) so a nested
-/// sub-agent can create/wait on its OWN sub-agents on the host — over the same
+/// sub-agent can proxy a gated-tool approval to the host — over the same
 /// per-child WebSocket, no broker needed. Absent for tests/[`EchoExecutor`].
 #[derive(Clone)]
 pub struct HostBridge {
@@ -42,17 +39,10 @@ impl HostBridge {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         (HostBridge { req_tx }, req_rx)
     }
-    /// Proxy one SubAgent tool call to the host and await its reply JSON.
-    pub async fn subagent_call(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        self.call(HostRequestKind::Subagent, body).await
-    }
 
     /// Proxy one gated-tool approval to the host and await the decision JSON
     /// (`{"approved": bool}`). The worker's permission flow blocks on this so the
-    /// human decides on the parent; mirrors [`Self::subagent_call`] (Phase 2).
+    /// human decides on the parent (Phase 2).
     pub async fn approval_call(
         &self,
         body: serde_json::Value,
@@ -305,16 +295,5 @@ mod tests {
         let _ = req.reply.send(serde_json::json!({"approved": true}));
         let reply = caller.await.unwrap().expect("decision");
         assert_eq!(reply["approved"], true);
-    }
-
-    #[tokio::test]
-    async fn subagent_call_sends_subagent_kind() {
-        let (bridge, mut req_rx) = HostBridge::channel();
-        let caller =
-            tokio::spawn(async move { bridge.subagent_call(serde_json::json!({"a": 1})).await });
-        let req = req_rx.recv().await.expect("a host request");
-        assert_eq!(req.kind, HostRequestKind::Subagent);
-        let _ = req.reply.send(serde_json::json!({"ok": true}));
-        let _ = caller.await.unwrap();
     }
 }

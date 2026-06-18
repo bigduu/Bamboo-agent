@@ -55,7 +55,6 @@ async fn spawn_discover_run_stream_terminal() {
     while let Some(frame) = client.next_frame().await.unwrap() {
         match frame {
             ChildFrame::Event { event } => events.push(event),
-            ChildFrame::SubagentRequest { .. } => {}
             ChildFrame::ApprovalRequest { .. } => {}
             ChildFrame::Terminal { status, result, .. } => {
                 terminal = Some((status, result));
