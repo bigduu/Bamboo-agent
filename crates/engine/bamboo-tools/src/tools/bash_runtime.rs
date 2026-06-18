@@ -1,3 +1,4 @@
+use bamboo_agent_core::AgentEvent;
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
     preferred_bash_shell, trace_windows_command, CommandEnvironmentDiagnostics,
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::warn;
@@ -125,6 +127,7 @@ async fn pump_stream_lines<T>(
 pub async fn spawn_background(
     command: &str,
     cwd: Option<&Path>,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> Result<Arc<ShellSession>, String> {
     let shell = preferred_bash_shell();
     trace_windows_command(
@@ -196,27 +199,48 @@ pub async fn spawn_background(
     {
         let child = session.child.clone();
         let session_id_for_gc = session_id.clone();
+        // Owned copies for the completion signal (issue #84, phase 1).
+        let bash_id_for_event = session_id.clone();
+        let command_for_event = command.to_string();
+        let event_tx = event_tx;
         tokio::spawn(async move {
-            loop {
+            // Determine the terminal status/exit_code, then break out to emit
+            // the completion signal below.
+            let (status_str, exit_code_value) = loop {
                 let poll = {
                     let mut guard = child.lock().await;
                     guard.try_wait()
                 };
                 match poll {
                     Ok(Some(status)) => {
-                        *exit_code.lock().await = status.code();
+                        let code = status.code();
+                        *exit_code.lock().await = code;
                         running.store(false, Ordering::Relaxed);
-                        break;
+                        break ("completed", code);
                     }
                     Ok(None) => {
                         sleep(Duration::from_millis(100)).await;
                     }
                     Err(_) => {
                         running.store(false, Ordering::Relaxed);
-                        break;
+                        break ("error", None);
                     }
                 }
+            };
+
+            // Phase 1 (issue #84): emit a completion signal so clients can react
+            // to a long-running background command finishing. Non-blocking by
+            // design — a full channel or absent sender must never stall the GC
+            // task, so send errors are intentionally ignored.
+            if let Some(tx) = &event_tx {
+                let _ = tx.try_send(AgentEvent::BashCompleted {
+                    bash_id: bash_id_for_event.clone(),
+                    command: command_for_event.clone(),
+                    exit_code: exit_code_value,
+                    status: status_str.to_string(),
+                });
             }
+
             sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
             let _ = remove_shell(&session_id_for_gc);
         });

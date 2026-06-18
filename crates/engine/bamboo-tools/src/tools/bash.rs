@@ -398,7 +398,7 @@ impl Tool for BashTool {
         let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
         let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
         if parsed.run_in_background.unwrap_or(false) {
-            let shell = bash_runtime::spawn_background(command, Some(&cwd))
+            let shell = bash_runtime::spawn_background(command, Some(&cwd), ctx.cloned_sender())
                 .await
                 .map_err(ToolError::Execution)?;
 
@@ -655,6 +655,39 @@ mod tests {
                 panic!("background shell did not stop after timeout");
             }
             sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A short background command must emit a `BashCompleted` signal carrying the
+    /// session's `bash_id` and an exit code of `Some(0)` (issue #84, phase 1).
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_background_emits_completion_event_with_exit_code() {
+        prime_test_command_environment();
+        let (tx, mut rx) = mpsc::channel(8);
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx))
+            .await
+            .expect("background shell should spawn");
+        let expected_id = shell.id.clone();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for BashCompleted event")
+            .expect("event channel closed before BashCompleted");
+
+        match event {
+            AgentEvent::BashCompleted {
+                bash_id,
+                command,
+                exit_code,
+                status,
+            } => {
+                assert_eq!(bash_id, expected_id);
+                assert_eq!(command, "true");
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(status, "completed");
+            }
+            other => panic!("expected BashCompleted, got {other:?}"),
         }
     }
 

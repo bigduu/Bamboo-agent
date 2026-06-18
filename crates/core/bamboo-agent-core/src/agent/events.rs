@@ -360,6 +360,24 @@ pub enum AgentEvent {
         error: Option<String>,
     },
 
+    /// Background Bash shell finished (completed/killed/error).
+    ///
+    /// Emitted by the background shell runtime when a `run_in_background`
+    /// command exits, so clients can react to (and, in later phases, resume
+    /// around) long-running commands. Phase 1 (issue #84): completion signal
+    /// only — this does not change the default foreground behavior.
+    BashCompleted {
+        /// Background shell session identifier (same value returned as `bash_id`).
+        bash_id: String,
+        /// The command string that was executed.
+        command: String,
+        /// Process exit code, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// One of: "completed" | "killed" | "error"
+        status: String,
+    },
+
     /// Plan mode was entered.
     PlanModeEntered {
         /// Session identifier
@@ -638,6 +656,7 @@ impl AgentEvent {
                 | AgentEvent::PlanFileUpdated { .. }
                 | AgentEvent::SubAgentStarted { .. }
                 | AgentEvent::SubAgentCompleted { .. }
+                | AgentEvent::BashCompleted { .. }
                 | AgentEvent::NeedClarification { .. }
                 | AgentEvent::ToolApprovalRequested { .. }
                 | AgentEvent::ExecutionStarted { .. }
