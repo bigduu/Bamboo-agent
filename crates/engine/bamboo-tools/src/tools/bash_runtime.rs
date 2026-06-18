@@ -1,3 +1,4 @@
+use bamboo_agent_core::AgentEvent;
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
     preferred_bash_shell, trace_windows_command, CommandEnvironmentDiagnostics,
@@ -10,8 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
 const MAX_OUTPUT_LINES: usize = 20_000;
@@ -125,6 +127,7 @@ async fn pump_stream_lines<T>(
 pub async fn spawn_background(
     command: &str,
     cwd: Option<&Path>,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> Result<Arc<ShellSession>, String> {
     let shell = preferred_bash_shell();
     trace_windows_command(
@@ -196,27 +199,71 @@ pub async fn spawn_background(
     {
         let child = session.child.clone();
         let session_id_for_gc = session_id.clone();
+        // Owned copies for the completion signal (issue #84, phase 1).
+        let bash_id_for_event = session_id.clone();
+        let command_for_event = command.to_string();
         tokio::spawn(async move {
-            loop {
+            // Determine the terminal status/exit_code, then break out to emit
+            // the completion signal below.
+            let (status_str, exit_code_value) = loop {
                 let poll = {
                     let mut guard = child.lock().await;
                     guard.try_wait()
                 };
                 match poll {
                     Ok(Some(status)) => {
-                        *exit_code.lock().await = status.code();
+                        let code = status.code();
+                        *exit_code.lock().await = code;
                         running.store(false, Ordering::Relaxed);
-                        break;
+                        // A signal/kill/timeout termination yields no numeric
+                        // exit code on Unix — surface that as "killed" rather
+                        // than masking it behind "completed" (issue #84).
+                        break (
+                            if code.is_none() {
+                                "killed"
+                            } else {
+                                "completed"
+                            },
+                            code,
+                        );
                     }
                     Ok(None) => {
                         sleep(Duration::from_millis(100)).await;
                     }
                     Err(_) => {
                         running.store(false, Ordering::Relaxed);
-                        break;
+                        break ("error", None);
                     }
                 }
+            };
+
+            // Phase 1 (issue #84): emit a completion signal so clients can react
+            // to a long-running background command finishing. This is the ONLY
+            // chance to deliver the signal — the poll task emits exactly once,
+            // then sleeps the GC TTL and removes the shell. A non-blocking
+            // `try_send` would silently drop it under a saturated event channel,
+            // so we bound the await instead: wait up to 500ms for room (the emit
+            // runs before the GC sleep, so a short wait never stalls collection),
+            // and fall back to a visible `warn!` if the channel stays full or is
+            // closed. A dropped signal is therefore rare AND observable.
+            if let Some(tx) = &event_tx {
+                let event = AgentEvent::BashCompleted {
+                    bash_id: bash_id_for_event,
+                    command: command_for_event,
+                    exit_code: exit_code_value,
+                    status: status_str.to_string(),
+                };
+                if timeout(Duration::from_millis(500), tx.send(event))
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        bash_id = %session_id_for_gc,
+                        "BashCompleted signal dropped (event channel saturated or closed after 500ms)"
+                    );
+                }
             }
+
             sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
             let _ = remove_shell(&session_id_for_gc);
         });

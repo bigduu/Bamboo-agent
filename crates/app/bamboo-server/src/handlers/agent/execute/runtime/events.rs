@@ -17,6 +17,7 @@ fn is_critical_event(event: &AgentEvent) -> bool {
             | AgentEvent::TaskListCompleted { .. }
             | AgentEvent::SubAgentStarted { .. }
             | AgentEvent::SubAgentCompleted { .. }
+            | AgentEvent::BashCompleted { .. }
             | AgentEvent::SessionTitleUpdated { .. }
             | AgentEvent::SessionPinnedUpdated { .. }
             | AgentEvent::PlanModeEntered { .. }
