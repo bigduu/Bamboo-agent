@@ -3,6 +3,8 @@
 //! We centralize proxy handling here so all code paths (server handlers,
 //! provider factory, auth flows) consistently respect `Config` proxy settings.
 
+use std::time::Duration;
+
 use crate::provider::LLMError;
 use bamboo_config::Config;
 use reqwest::{Client, NoProxy, Proxy};
@@ -34,7 +36,15 @@ pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
 }
 
 pub fn build_http_client(config: &Config) -> Result<Client, LLMError> {
-    let mut builder = Client::builder();
+    // `connect_timeout` bounds only TCP/TLS connection establishment. That is
+    // safe for streaming: it never kills an in-flight streaming response. We
+    // deliberately do NOT set an overall `.timeout()` here — this client is
+    // shared between streaming and non-streaming calls, and an overall timeout
+    // would abort legitimately long streaming responses (thinking models can
+    // stream for minutes). Mid-stream stalls — where the connection stays open
+    // but no chunks arrive — are instead bounded by the inter-chunk idle
+    // timeout in `consume_llm_stream_internal` (issue #28).
+    let mut builder = Client::builder().connect_timeout(Duration::from_secs(30));
     if let Some(proxy) = build_proxy(config)? {
         builder = builder.proxy(proxy);
     }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -29,16 +31,30 @@ pub(super) async fn consume_llm_stream_internal(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     session_id: &str,
+    // Inter-chunk idle deadline: the maximum gap allowed between two
+    // consecutive stream chunks. The sleep is created fresh every loop
+    // iteration, so this is a true *inter-chunk* deadline that resets on
+    // every received chunk — NOT an overall stream cap. A legitimately long
+    // stream that keeps producing chunks is never killed; only a stall with
+    // no chunk for `idle_timeout` trips it (issue #28).
+    idle_timeout: Duration,
 ) -> Result<StreamHandlingOutput, AgentError> {
     let mut state = StreamAccumulationState::new();
 
     loop {
-        // Select on cancellation *and* the next chunk so a stalled or
-        // non-terminating provider stream is interruptible the instant the
-        // token is cancelled — `stream.next().await` alone blocks forever and
-        // the previous between-chunks `is_cancelled()` poll never ran. `biased`
-        // checks cancellation first so a ready-but-cancelled chunk is dropped,
-        // preserving the prior "return Cancelled without handling" semantics.
+        // Select on cancellation, the next chunk, *and* an inter-chunk idle
+        // deadline so a stalled provider connection is bounded.
+        //
+        // `biased` checks branches top-to-bottom: cancellation first (so a
+        // ready-but-cancelled chunk is dropped), then the pending chunk, then
+        // the idle timer. The idle `sleep` is created fresh every iteration, so
+        // it is a true *inter-chunk* deadline that resets on every received
+        // chunk — NOT an overall stream cap. A legitimately long stream that
+        // keeps producing chunks is never killed; only a stall with no chunk
+        // for `idle_timeout` trips it. Without this branch,
+        // `stream.next().await` blocks forever when the provider's connection
+        // hangs mid-stream (issue #28). Listing `stream.next()` ahead of the
+        // timer means a ready chunk always wins over the timer.
         let chunk_result = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
@@ -46,6 +62,17 @@ pub(super) async fn consume_llm_stream_internal(
                 Some(chunk_result) => chunk_result,
                 None => break,
             },
+            _ = tokio::time::sleep(idle_timeout) => {
+                tracing::warn!(
+                    "[{}] LLM stream timed out: no chunk received within {:?}; \
+                     aborting stalled stream",
+                    session_id,
+                    idle_timeout,
+                );
+                return Err(AgentError::StreamTimeout(format!(
+                    "the model stopped responding (no data received for over {idle_timeout:?})"
+                )));
+            }
         };
 
         handle_chunk_result(chunk_result, &mut state, event_tx, session_id).await?;
