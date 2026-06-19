@@ -942,6 +942,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            can_async_resume: false,
         };
         let result = executor.execute_with_context(&call, ctx).await;
 
@@ -969,6 +970,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            can_async_resume: false,
         };
         let result = executor.execute_with_context(&call, ctx).await;
 
@@ -1013,6 +1015,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(HostStub { approve: true });
@@ -1048,6 +1051,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(HostStub { approve: false });
@@ -1121,6 +1125,7 @@ mod tests {
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    can_async_resume: false,
                 },
             )
             .await

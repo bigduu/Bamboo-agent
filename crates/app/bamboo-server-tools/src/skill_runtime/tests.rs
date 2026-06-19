@@ -124,6 +124,7 @@ Use this demo skill."#,
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     };
 
     let error = tool
@@ -187,6 +188,7 @@ Use this demo skill."#,
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     };
 
     let _ = tool
@@ -256,6 +258,7 @@ Use this demo skill."#,
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     };
     let read_ctx = ToolExecutionContext {
         session_id: Some(session_id),
@@ -263,6 +266,7 @@ Use this demo skill."#,
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     };
 
     let _ = load_tool

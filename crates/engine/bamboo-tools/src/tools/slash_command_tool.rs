@@ -147,6 +147,7 @@ mod tests {
                     event_tx: None,
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    can_async_resume: false,
                 },
             )
             .await

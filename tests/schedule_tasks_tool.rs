@@ -96,6 +96,7 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     }
 }
 

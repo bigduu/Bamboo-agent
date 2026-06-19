@@ -9,7 +9,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant};
@@ -25,21 +24,6 @@ const MAX_CAPTURE_BYTES: usize = 512 * 1024;
 /// milliseconds are promoted to background instead of continuing to block.
 /// Deliberately generous so virtually all interactive commands stay synchronous.
 const PROMOTE_TO_BACKGROUND_AFTER_MS: u64 = 10_000;
-
-/// Test override for the promotion threshold (issue #84, phase 2d). When > 0,
-/// tests use this value instead of `PROMOTE_TO_BACKGROUND_AFTER_MS` so promotion
-/// can be exercised without waiting 10 seconds. Always 0 in production builds.
-static PROMOTE_AFTER_MS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
-
-/// The effective auto-sync promotion threshold, honoring the test override.
-fn promote_to_background_after_ms() -> u64 {
-    let val = PROMOTE_AFTER_MS_OVERRIDE.load(Ordering::Relaxed);
-    if val > 0 {
-        val
-    } else {
-        PROMOTE_TO_BACKGROUND_AFTER_MS
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct BashArgs {
@@ -92,6 +76,22 @@ impl BashTool {
             }
         }
         *truncated = true;
+    }
+
+    /// Append a line to a promotion-seed buffer, draining the oldest entries
+    /// when over the same budget the background registry enforces
+    /// (`bash_runtime::MAX_OUTPUT_LINES`). Keeps a chatty command from ballooning
+    /// memory during the ~10s promotion window (issue #84, phase 2d) — the
+    /// `stdout_buf`/`stderr_buf` capture is byte-capped, but the seed Vecs feed
+    /// the background buffer and must not grow unbounded. Mirrors `push_line`'s
+    /// drain-oldest semantics.
+    fn push_capped_seed_line(buf: &mut Vec<String>, line: String) {
+        buf.push(line);
+        let cap = bash_runtime::MAX_OUTPUT_LINES;
+        if buf.len() > cap {
+            let overflow = buf.len() - cap;
+            buf.drain(0..overflow);
+        }
     }
 
     fn python_diagnostics_json(
@@ -310,7 +310,7 @@ impl BashTool {
                             let line = decode_process_line_lossy(&mut stdout_line_bytes);
                             Self::append_capped(&mut stdout_buf, &line, &mut stdout_truncated);
                             if promote_after_ms.is_some() {
-                                stdout_lines.push(line.clone());
+                                Self::push_capped_seed_line(&mut stdout_lines, line.clone());
                             }
                             ctx.emit_tool_token(format!("{}\n", line)).await;
                         }
@@ -326,7 +326,7 @@ impl BashTool {
                             let line = decode_process_line_lossy(&mut stderr_line_bytes);
                             Self::append_capped(&mut stderr_buf, &line, &mut stderr_truncated);
                             if promote_after_ms.is_some() {
-                                stderr_lines.push(line.clone());
+                                Self::push_capped_seed_line(&mut stderr_lines, line.clone());
                             }
                             ctx.emit_tool_token(format!("{}\n", line)).await;
                         }
@@ -391,13 +391,13 @@ impl BashTool {
             if !stdout_line_bytes.is_empty() {
                 let partial = decode_process_line_lossy(&mut stdout_line_bytes);
                 if !partial.is_empty() {
-                    stdout_lines.push(partial);
+                    Self::push_capped_seed_line(&mut stdout_lines, partial);
                 }
             }
             if !stderr_line_bytes.is_empty() {
                 let partial = decode_process_line_lossy(&mut stderr_line_bytes);
                 if !partial.is_empty() {
-                    stderr_lines.push(partial);
+                    Self::push_capped_seed_line(&mut stderr_lines, partial);
                 }
             }
 
@@ -579,15 +579,18 @@ impl Tool for BashTool {
             None => {
                 // Auto-sync promotion (issue #84, phase 2d). Runs foreground but
                 // promotes to background if still running after the promotion
-                // threshold (~10s). Fast commands finish synchronously.
-                self.run_streaming_command(
-                    command,
-                    timeout_ms,
-                    Some(promote_to_background_after_ms()),
-                    &cwd,
-                    ctx,
-                )
-                .await
+                // threshold (~10s). Fast commands finish synchronously. Promotion
+                // is ONLY enabled when the executing loop can actually suspend
+                // for and self-resume a backgrounded shell (`can_async_resume`):
+                // on hook-less paths (schedule / external-child loops) it stays
+                // purely synchronous so a long command's output is never orphaned.
+                let promote_after_ms = if ctx.can_async_resume {
+                    Some(PROMOTE_TO_BACKGROUND_AFTER_MS)
+                } else {
+                    None
+                };
+                self.run_streaming_command(command, timeout_ms, promote_after_ms, &cwd, ctx)
+                    .await
             }
         }
     }
@@ -678,6 +681,7 @@ mod tests {
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    can_async_resume: false,
                 },
             )
             .await
@@ -1004,6 +1008,7 @@ mod tests {
             &tx,
             &[],
             ToolExecutionSessionFlags::default(),
+            true,
         );
 
         let result = tool
@@ -1060,6 +1065,7 @@ mod tests {
                     event_tx: None,
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    can_async_resume: false,
                 },
             )
             .await
@@ -1182,6 +1188,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         let result = tool
@@ -1219,12 +1226,16 @@ mod tests {
             &tx,
             &[],
             ToolExecutionSessionFlags::default(),
+            // `can_async_resume` is irrelevant here — this test drives
+            // promotion directly via run_streaming_command(Some(200)).
+            true,
         );
         let cwd = super::workspace_state::workspace_or_process_cwd(Some(session_id));
 
         // Call run_streaming_command directly with a 200ms promotion threshold
-        // so we don't touch the process-global PROMOTE_AFTER_MS_OVERRIDE (which
-        // would race with other auto-path tests running in parallel).
+        // so this test exercises promotion deterministically without depending
+        // on the production 10s default or the None dispatch arm's
+        // `can_async_resume` gating.
         let result = tool
             .run_streaming_command("sleep 10", 60000, Some(200), &cwd, ctx)
             .await
@@ -1291,6 +1302,39 @@ mod tests {
         );
         assert_eq!(payload["timed_out"], true);
         assert!(!result.success, "timed-out result must not be successful");
+    }
+
+    // (e) Auto path (run_in_background OMITTED) with can_async_resume == false
+    // also does NOT promote — it runs purely synchronously, exactly like (c),
+    // even though promotion is now the default. This is the hook-less-path guard
+    // (issue #84, phase 2d): a loop that can't suspend+resume a background shell
+    // (schedule path, agent-core loop) must never orphan one via auto-promotion.
+    // `execute()` builds `ToolExecutionContext::none`, whose can_async_resume is
+    // false, so the None dispatch arm passes promote_after_ms = None.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn auto_path_does_not_promote_when_not_resume_capable() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+
+        let result = tool
+            .execute(json!({
+                "command": "sleep 10",
+                "timeout": 50
+            }))
+            .await
+            .expect("non-resume-capable auto path should produce a result");
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert!(
+            payload.get("bash_id").is_none(),
+            "auto path must not promote when can_async_resume is false"
+        );
+        assert_eq!(payload["timed_out"], true);
+        assert!(
+            !result.success,
+            "a timed-out command must not report success"
+        );
     }
 
     // (d) adopt_running_child preserves already-captured output: seed lines

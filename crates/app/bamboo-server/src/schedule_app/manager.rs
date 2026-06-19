@@ -433,11 +433,16 @@ async fn run_schedule_job(
         guardian_config: None,
         guardian_spawner: None,
         // No bash self-resume hook on the schedule path: the end-of-turn bash
-        // suspend gate is therefore inert here (it requires a wired hook). This
-        // is graceful degradation — a scheduled run that leaves a
-        // `run_in_background` shell running simply completes; the shell keeps
-        // running detached and stays readable via BashOutput. No strand can
-        // occur because the gate refuses to suspend without the hook.
+        // suspend gate is therefore inert here (it requires a wired hook).
+        // Because the loop can't resume a backgrounded shell, the Bash tool's
+        // auto path detects this (can_async_resume == false, derived from
+        // hook+persistence) and stays purely synchronous — a long command on
+        // the default path blocks to its timeout rather than promoting to an
+        // orphaned background shell whose output this loop could never await
+        // (issue #84, phase 2d). An explicitly backgrounded shell
+        // (`run_in_background: true`) still runs detached and stays readable via
+        // BashOutput; no strand can occur because the gate refuses to suspend
+        // without the hook.
         bash_resume_hook: None,
         app_data_dir: ctx.app_data_dir.clone(),
         runners: ctx.agent_runners.clone(),

@@ -62,6 +62,16 @@ pub struct ToolExecutionContext<'a> {
     /// tool permission checks are skipped. Sourced per-session from the
     /// session's runtime state (`runtime.json`), not the global checker.
     pub bypass_permissions: bool,
+    /// When `true`, the executing agent loop can suspend the current turn for a
+    /// backgrounded shell and self-resume once it finishes (i.e. a
+    /// `bash_resume_hook` AND persistence are wired). The Bash tool uses this to
+    /// decide whether its auto path (`run_in_background` omitted) may promote a
+    /// long command to background: when `false`, the auto path stays purely
+    /// synchronous so the command's output is never orphaned on a loop that
+    /// can't resume it (issue #84, phase 2d). Derived from the loop config at
+    /// the dispatch site — NOT session-derived — so it is a direct
+    /// `for_dispatch` parameter rather than a `ToolExecutionSessionFlags` field.
+    pub can_async_resume: bool,
 }
 
 impl<'a> ToolExecutionContext<'a> {
@@ -72,6 +82,7 @@ impl<'a> ToolExecutionContext<'a> {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         }
     }
 
@@ -86,6 +97,11 @@ impl<'a> ToolExecutionContext<'a> {
         event_tx: &'a mpsc::Sender<AgentEvent>,
         available_tool_schemas: &'a [ToolSchema],
         flags: ToolExecutionSessionFlags,
+        // Whether the executing loop can suspend for and self-resume a
+        // backgrounded bash shell (`bash_resume_hook` + persistence wired).
+        // When `false`, the Bash auto path stays synchronous (issue #84,
+        // phase 2d). NOT session-derived — set by the dispatch site.
+        can_async_resume: bool,
     ) -> Self {
         Self {
             session_id: Some(session_id),
@@ -93,6 +109,7 @@ impl<'a> ToolExecutionContext<'a> {
             event_tx: Some(event_tx),
             available_tool_schemas: Some(available_tool_schemas),
             bypass_permissions: flags.bypass_permissions,
+            can_async_resume,
         }
     }
 
@@ -164,9 +181,11 @@ mod session_flags_tests {
             ToolExecutionSessionFlags {
                 bypass_permissions: true,
             },
+            true,
         );
         assert_eq!(ctx.session_id, Some("s1"));
         assert!(ctx.bypass_permissions);
+        assert!(ctx.can_async_resume);
     }
 }
 
@@ -188,6 +207,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         tokio::time::timeout(
@@ -215,6 +235,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -244,6 +265,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         // Test with various non-Token events
@@ -284,6 +306,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         ctx.emit_tool_token("convenient output").await;
@@ -335,6 +358,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         let cloned = ctx.cloned_sender();
@@ -359,6 +383,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         for i in 0..5 {
@@ -388,6 +413,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         // Can clone (Copy implies Clone)
@@ -416,6 +442,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -441,6 +468,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -470,6 +498,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -495,6 +524,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         let content = String::from("owned string");
@@ -518,6 +548,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            can_async_resume: false,
         };
 
         ctx.emit_tool_token("string slice").await;

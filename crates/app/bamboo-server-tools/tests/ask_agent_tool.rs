@@ -46,6 +46,7 @@ async fn ask_agent_tool_queries_a_broker_agent() {
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     };
     let result = tool
         .execute_with_context(
@@ -75,6 +76,7 @@ async fn ask_agent_tool_rejects_unknown_mode() {
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        can_async_resume: false,
     };
     let err = tool
         .execute_with_context(

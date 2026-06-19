@@ -379,6 +379,11 @@ pub async fn execute_sub_actions(
             event_tx,
             available_tools.as_slice(),
             ToolExecutionSessionFlags::from_session(session),
+            // bamboo-agent-core's own loop has no engine suspend/resume
+            // machinery (that lives in bamboo-engine's pipeline), so it can
+            // never safely auto-promote a Bash command — keep it synchronous
+            // (issue #84, phase 2d).
+            false,
         );
 
         match execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx)

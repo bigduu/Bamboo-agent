@@ -17,7 +17,10 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
-const MAX_OUTPUT_LINES: usize = 20_000;
+/// Per-stream line cap for a background shell's captured output, AND for the
+/// foreground promotion-seed buffers (`bash.rs`). Shared so a chatty command
+/// can't balloon memory before it promotes (issue #84, phase 2d).
+pub(crate) const MAX_OUTPUT_LINES: usize = 20_000;
 const COMPLETED_SESSION_TTL_SECS: u64 = 300;
 
 #[derive(Debug)]
