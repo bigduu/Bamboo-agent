@@ -1,4 +1,6 @@
-use futures::stream;
+use std::time::Duration;
+
+use futures::{stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
@@ -8,6 +10,7 @@ use bamboo_agent_core::{AgentError, AgentEvent};
 use bamboo_llm::provider::LLMError;
 use bamboo_llm::{LLMChunk, LLMStream};
 
+use super::consume::consume_llm_stream_internal;
 use super::{consume_llm_stream, consume_llm_stream_silent};
 
 fn build_stream(items: Vec<bamboo_llm::provider::Result<LLMChunk>>) -> LLMStream {
@@ -143,4 +146,95 @@ async fn consume_llm_stream_interrupts_blocked_next_on_mid_stream_cancel() {
     .expect("must not hang: mid-stream cancellation should interrupt the blocked next()");
 
     assert!(matches!(result, Err(AgentError::Cancelled)));
+}
+
+#[tokio::test]
+async fn consume_llm_stream_times_out_when_stream_stalls_after_first_chunk() {
+    // Issue #28: a stream that yields one chunk, then never yields again and
+    // never closes, models a provider connection that stalls mid-stream. The
+    // inter-chunk idle deadline must trip and return a StreamTimeout error
+    // instead of hanging forever.
+    let stream: LLMStream = Box::pin(
+        stream::once(async { Ok::<_, LLMError>(LLMChunk::Token("first".to_string())) })
+            .chain(stream::pending()),
+    );
+
+    let idle_timeout = Duration::from_millis(80);
+    let started = std::time::Instant::now();
+
+    let result = tokio::time::timeout(
+        // Generous outer bound; the idle timeout must trip well before this.
+        Duration::from_secs(2),
+        consume_llm_stream_internal(
+            stream,
+            None,
+            &CancellationToken::new(),
+            "session-timeout",
+            idle_timeout,
+        ),
+    )
+    .await
+    .expect("idle timeout must interrupt the stalled stream, not hang");
+
+    let elapsed = started.elapsed();
+    match result {
+        Err(AgentError::StreamTimeout(_)) => {}
+        Err(other) => panic!("expected AgentError::StreamTimeout, got Err({other:?})"),
+        Ok(_) => panic!("expected AgentError::StreamTimeout, got Ok(_)"),
+    }
+
+    // The first chunk arrives immediately, so the idle timer effectively starts
+    // after it. The timeout should fire ~80ms later. A mild lower bound guards
+    // against an "instant timeout" regression; the upper bound guards against
+    // the timeout being ignored.
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "timeout fired too early ({elapsed:?}): the first chunk should reset the idle timer"
+    );
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "timeout fired too late ({elapsed:?}): the stalled stream was not interrupted in time"
+    );
+}
+
+#[tokio::test]
+async fn consume_llm_stream_idle_timeout_does_not_affect_healthy_stream() {
+    // Issue #28: each chunk arrives well within the idle window (25ms << 80ms),
+    // but the *total* stream duration (~150ms) far exceeds the idle timeout.
+    // Because the deadline resets on every received chunk, a legitimately long
+    // stream that keeps producing data must complete normally — the idle
+    // timeout only fires on a true stall (no chunk at all).
+    let idle_timeout = Duration::from_millis(80);
+    let per_chunk_delay = Duration::from_millis(25);
+    let chunk_count: u32 = 6;
+
+    let stream: LLMStream = Box::pin(stream::unfold(0u32, move |i| async move {
+        if i >= chunk_count {
+            return None;
+        }
+        tokio::time::sleep(per_chunk_delay).await;
+        Some((
+            Ok::<_, LLMError>(LLMChunk::Token(format!("chunk-{i}"))),
+            i + 1,
+        ))
+    }));
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        consume_llm_stream_internal(
+            stream,
+            None,
+            &CancellationToken::new(),
+            "session-healthy",
+            idle_timeout,
+        ),
+    )
+    .await
+    .expect("healthy stream must complete without timing out")
+    .expect("stream should succeed");
+
+    assert_eq!(output.content, "chunk-0chunk-1chunk-2chunk-3chunk-4chunk-5");
+    // `token_count` is the total character count of the stream, not the chunk
+    // count: 6 chunks × 7 chars ("chunk-N") = 42.
+    assert_eq!(output.token_count, output.content.chars().count());
 }
