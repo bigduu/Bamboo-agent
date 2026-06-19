@@ -76,21 +76,42 @@ impl GeminiProvider {
         self
     }
 
-    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> HeaderMap {
+    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         // Authenticate via header rather than a `?key=` URL query parameter so
         // the API key never leaks into HTTP/proxy/debug logs (issue #12).
-        if let Ok(value) = HeaderValue::from_str(&self.api_key) {
-            headers.insert("x-goog-api-key", value);
-        }
+        // A malformed/non-ASCII key surfaces as `LLMError::Auth` instead of
+        // being silently dropped (which would send an unauthenticated request
+        // and produce a confusing 401) — mirrors the Anthropic sibling.
+        headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_str(&self.api_key)
+                .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
+        );
+        // `x-goog-api-key` is intentionally overridable: `request_overrides`
+        // (applied next) may replace it for per-endpoint/operator auth overrides.
         request_overrides::apply_overrides_to_header_map(
             &mut headers,
             self.request_overrides.as_ref(),
             endpoint,
             model,
         );
-        headers
+        Ok(headers)
+    }
+
+    /// Build the `streamGenerateContent` URL for `model`. Auth travels via the
+    /// `x-goog-api-key` header (see [`GeminiProvider::build_headers`]), so the
+    /// API key never appears in this URL.
+    fn stream_url(&self, model: &str) -> String {
+        format!("{}/models/{}:streamGenerateContent", self.base_url, model)
+    }
+
+    /// Build the `list_models` URL. Auth travels via the `x-goog-api-key`
+    /// header (see [`GeminiProvider::build_headers`]), so the API key never
+    /// appears in this URL.
+    fn list_models_url(&self) -> String {
+        format!("{}/models", self.base_url.trim_end_matches('/'))
     }
 
     fn thinking_budget_for_effort(effort: ReasoningEffort) -> Option<u32> {
@@ -165,7 +186,7 @@ impl LLMProvider for GeminiProvider {
             reasoning_effort.and_then(Self::thinking_budget_for_effort);
 
         // Auth is supplied via the x-goog-api-key header (see build_headers).
-        let url = format!("{}/models/{}:streamGenerateContent", self.base_url, model);
+        let url = self.stream_url(model);
 
         let build_request = |effort: Option<ReasoningEffort>| -> Result<GeminiRequest> {
             // Convert messages using the new protocol system
@@ -232,7 +253,7 @@ impl LLMProvider for GeminiProvider {
         let headers = self.build_headers(
             request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
             Some(model),
-        );
+        )?;
         let mut response = self
             .client
             .post(&url)
@@ -281,7 +302,7 @@ impl LLMProvider for GeminiProvider {
                 let fallback_headers = self.build_headers(
                     request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
                     Some(model),
-                );
+                )?;
                 response = self
                     .client
                     .post(&url)
@@ -364,8 +385,8 @@ impl LLMProvider for GeminiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None);
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.list_models_url();
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
     }
 }
@@ -406,18 +427,24 @@ mod tests {
 
         // The API key must NOT appear in the URL; auth is sent via the
         // x-goog-api-key header (see test_build_headers_sends_api_key).
-        let constructed_url = format!(
-            "{}/models/{}:streamGenerateContent",
-            provider.base_url, "gemini-custom"
-        );
-
+        // These assertions exercise the SAME helpers the production request
+        // paths use (`stream_url` / `list_models_url`), so a regression that
+        // reintroduces `?key=` in real code fails here.
+        let stream_url = provider.stream_url("gemini-custom");
         assert_eq!(
-            constructed_url,
+            stream_url,
             "https://test.api.com/v1beta/models/gemini-custom:streamGenerateContent"
         );
         assert!(
-            !constructed_url.contains("key="),
-            "API key must not be embedded in the URL"
+            !stream_url.contains("key="),
+            "API key must not be embedded in the stream URL"
+        );
+
+        let models_url = provider.list_models_url();
+        assert_eq!(models_url, "https://test.api.com/v1beta/models");
+        assert!(
+            !models_url.contains("key="),
+            "API key must not be embedded in the list_models URL"
         );
     }
 
@@ -427,8 +454,9 @@ mod tests {
     fn test_build_headers_sends_api_key() {
         let provider = GeminiProvider::new("my_api_key_123");
 
-        let stream_headers =
-            provider.build_headers(request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT, None);
+        let stream_headers = provider
+            .build_headers(request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT, None)
+            .expect("valid key should build headers");
         assert_eq!(
             stream_headers
                 .get("x-goog-api-key")
@@ -438,7 +466,9 @@ mod tests {
             "my_api_key_123"
         );
 
-        let models_headers = provider.build_headers(request_overrides::ENDPOINT_MODELS, None);
+        let models_headers = provider
+            .build_headers(request_overrides::ENDPOINT_MODELS, None)
+            .expect("valid key should build headers");
         assert_eq!(
             models_headers
                 .get("x-goog-api-key")
@@ -446,6 +476,20 @@ mod tests {
                 .to_str()
                 .expect("valid header value"),
             "my_api_key_123"
+        );
+    }
+
+    /// A malformed/non-ASCII key (e.g. one carrying a trailing newline) must
+    /// surface as `LLMError::Auth` instead of being silently dropped to an
+    /// unauthenticated request (which would otherwise produce a confusing 401).
+    #[test]
+    fn test_build_headers_rejects_invalid_api_key() {
+        let provider = GeminiProvider::new("bad\nkey");
+        let result =
+            provider.build_headers(request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT, None);
+        assert!(
+            matches!(result, Err(LLMError::Auth(_))),
+            "expected LLMError::Auth for invalid key"
         );
     }
 
