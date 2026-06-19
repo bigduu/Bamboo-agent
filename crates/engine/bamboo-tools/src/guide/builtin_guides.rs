@@ -6,9 +6,10 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 22] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
     "conclusion_with_options",
     "Bash",
+    "BashInput",
     "BashOutput",
     "Edit",
     "EnterPlanMode",
@@ -184,6 +185,25 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 json!({"command":"cargo test","timeout":120000}),
                 "Use for build/test/CLI operations.",
             )],
+        )),
+        "BashInput" => Some(guide(
+            "BashInput",
+            ToolCategory::CommandExecution,
+            "Send input to the stdin of an interactive background shell (spawned with Bash interactive=true) to answer a prompt, or close stdin (eof:true) to let a stdin-consumer finish.",
+            "Do not use without a bash_id from an interactive Bash shell; the shell must have been spawned with interactive=true (piped stdin), otherwise this returns an error. The input is written as UTF-8 bytes; eof:true sends end-of-input so a consumer that reads until EOF (cat/sort/REPL) terminates instead of hanging.",
+            &["Bash", "BashOutput"],
+            vec![
+                example(
+                    "Answer a prompt",
+                    json!({"bash_id":"<bash_id-from-Bash-interactive>","input":"y"}),
+                    "Use when a background command is waiting for input (e.g. a confirmation prompt).",
+                ),
+                example(
+                    "Send EOF so a consumer finishes",
+                    json!({"bash_id":"<bash_id>","input":"data","eof":true}),
+                    "Close stdin after writing so a command that reads until EOF terminates instead of running until killed.",
+                ),
+            ],
         )),
         "BashOutput" => Some(guide(
             "BashOutput",

@@ -111,6 +111,14 @@ pub fn check_permissions(
                 Ok(None)
             }
         }
+        "BashInput" => {
+            let bash_id = required_string_arg(args, "bash_id")?;
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::TerminalSession,
+                bash_id,
+                format!("Write to interactive shell stdin: {}", bash_id),
+            )]))
+        }
         "BashOutput" => {
             let bash_id = required_string_arg(args, "bash_id")?;
             Ok(Some(vec![PermissionContext::new(
@@ -306,6 +314,18 @@ mod tests {
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::TerminalSession);
         assert_eq!(contexts[0].resource, "abc-123");
+    }
+
+    #[test]
+    fn check_permissions_bash_input_classified_as_terminal_session() {
+        let args = json!({"bash_id": "abc-123", "input": "y"});
+        let contexts = check_permissions("BashInput", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::TerminalSession);
+        assert_eq!(contexts[0].resource, "abc-123");
+        assert!(contexts[0]
+            .operation_description
+            .contains("Write to interactive shell stdin"));
     }
 
     #[test]
