@@ -18,7 +18,8 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 
 use crate::runtime::config::{
-    AuxiliaryModelConfig, GoldConfig, GuardianConfig, GuardianSpawner, ImageFallbackConfig,
+    AuxiliaryModelConfig, BashResumeHook, GoldConfig, GuardianConfig, GuardianSpawner,
+    ImageFallbackConfig,
 };
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
@@ -140,6 +141,8 @@ pub struct SessionExecutionArgs {
     /// Late-bound guardian reviewer spawner (server-provided; the runner cannot
     /// construct a child directly).
     pub guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
+    /// Late-bound bash self-resume hook (issue #84 Phase 2b).
+    pub bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     pub app_data_dir: Option<std::path::PathBuf>,
 
     // Post-execution resources.
@@ -174,6 +177,7 @@ struct ExecuteRequestParams {
     gold_config: Option<GoldConfig>,
     guardian_config: Option<GuardianConfig>,
     guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
+    bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -203,6 +207,7 @@ fn build_execute_request(
         gold_config,
         guardian_config,
         guardian_spawner,
+        bash_resume_hook,
         app_data_dir,
     } = params;
 
@@ -210,7 +215,8 @@ fn build_execute_request(
         .model_roster(model_roster)
         .gold_config(gold_config)
         .guardian_config(guardian_config)
-        .guardian_spawner(guardian_spawner);
+        .guardian_spawner(guardian_spawner)
+        .bash_resume_hook(bash_resume_hook);
 
     if let Some(tools) = tools {
         builder = builder.tools(tools);
@@ -280,6 +286,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 gold_config,
                 guardian_config,
                 guardian_spawner,
+                bash_resume_hook,
                 app_data_dir,
                 runners,
                 sessions_cache,
@@ -342,6 +349,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                     gold_config,
                     guardian_config,
                     guardian_spawner,
+                    bash_resume_hook,
                     app_data_dir,
                 },
             );

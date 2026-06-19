@@ -251,12 +251,15 @@ async fn suspend_to_wait_for_bash(
 /// `run_in_background` shells land in the session-aware registry, so the default
 /// foreground path never trips this.
 ///
-/// Returns `Some` suspend outcome (with the durable wait persisted) when it
-/// engages, or `None` to let the run proceed. No-ops when no background shells
-/// are still running or a bash wait is already registered. This is an
-/// independent check from [`maybe_suspend_for_orphaned_children`]; the call site
-/// runs the children gate first, so a session already suspending for children
-/// never reaches this in the same pass.
+/// Returns `Some` suspend outcome (with the durable wait persisted AND a
+/// self-resume hook arranged) when it engages, or `None` to let the run
+/// proceed. No-ops when no background shells are still running, a bash wait is
+/// already registered, or durable backing + a resume hook are unavailable
+/// (should-fix 1 — mirrors children's durability guard so a session never
+/// strands itself without a resume path). This is an independent check from
+/// [`maybe_suspend_for_orphaned_children`]; the call site runs the children gate
+/// first, so a session already suspending for children never reaches this in the
+/// same pass.
 async fn maybe_suspend_for_outstanding_bash(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -266,6 +269,14 @@ async fn maybe_suspend_for_outstanding_bash(
         return None;
     }
 
+    // Should-fix 1: a suspend without durable backing or a resume hook would
+    // strand the session forever — the self-resume task reloads from
+    // persistence, and without a wired hook no resume can ever fire.
+    if config.persistence.is_none() {
+        return None;
+    }
+    let hook = config.bash_resume_hook.as_ref()?;
+
     let mut bash_ids = bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id);
     if bash_ids.is_empty() {
         return None;
@@ -273,20 +284,43 @@ async fn maybe_suspend_for_outstanding_bash(
     bash_ids.sort();
     bash_ids.dedup();
 
+    // Blocker 1: close the snapshot→commit TOCTOU. A shell captured above may
+    // finish before we commit the suspend; if ALL did, do not strand the
+    // session — let the turn complete normally. The self-resume poll task
+    // (arranged below) handles shells that complete AFTER the commit.
+    if bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id).is_empty() {
+        tracing::info!(
+            "[{}] end-of-turn bash gate: all {} shell(s) finished during the snapshot window; not suspending",
+            session.id,
+            bash_ids.len(),
+        );
+        return None;
+    }
+
     tracing::info!(
         "[{}] end-of-turn safety net: suspending to wait for {} background bash shell(s) still running",
         session.id,
         bash_ids.len(),
     );
-    Some(
-        suspend_to_wait_for_bash(
-            session,
-            runtime_state,
-            config.persistence.as_ref(),
-            bash_ids,
-        )
-        .await,
+
+    // Clone ids for the self-resume hook before moving them into the suspend.
+    let hook_ids = bash_ids.clone();
+    let outcome = suspend_to_wait_for_bash(
+        session,
+        runtime_state,
+        config.persistence.as_ref(),
+        bash_ids,
     )
+    .await;
+
+    // Blocker 2: arrange the self-resume safety net so the session is ALWAYS
+    // eventually resumed once the captured shells finish. The hook polls the
+    // live registry — not the one-shot BashCompleted event — so it is immune to
+    // the lost-wakeup: even if a shell completes during the persist above, the
+    // poll task's first check will see it as not-running and resume.
+    hook.arrange_bash_self_resume(session.id.clone(), hook_ids);
+
+    Some(outcome)
 }
 
 /// Build the guardian reviewer's task brief: the static rubric plus the active
@@ -1495,7 +1529,14 @@ pub(super) async fn run_pipeline(
                 if let Some(storage) = config.storage.as_ref() {
                     if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
                         if let Some(runtime_state) = persisted.agent_runtime_state {
-                            state.runtime_state.waiting_for_bash = runtime_state.waiting_for_bash;
+                            // Nit 1: only merge when the persisted record actually
+                            // carries a bash wait — a failed earlier persist can
+                            // leave a stale `None`, and overwriting the in-memory
+                            // `Some` with it would silently drop the wait.
+                            if runtime_state.waiting_for_bash.is_some() {
+                                state.runtime_state.waiting_for_bash =
+                                    runtime_state.waiting_for_bash;
+                            }
                         }
 
                         let existing_ids: std::collections::HashSet<String> = session
@@ -1510,7 +1551,9 @@ pub(super) async fn run_pipeline(
                                 .as_ref()
                                 .and_then(|metadata| metadata.get("runtime_kind"))
                                 .and_then(|value| value.as_str())
-                                .is_some_and(|kind| matches!(kind, "bash_completion_resume"));
+                                .is_some_and(|kind| {
+                                    kind == crate::runtime::config::BASH_COMPLETION_RESUME_KIND
+                                });
                             if hidden_runtime_resume && !existing_ids.contains(message.id.as_str())
                             {
                                 session.messages.push(message);
@@ -2961,6 +3004,159 @@ mod tests {
                 .await
                 .is_none(),
             "must not re-suspend when a bash wait is already registered"
+        );
+    }
+
+    // ── Bash self-resume liveness tests (issue #84 Phase 2b) ──────────────
+
+    struct StubBashPersistence;
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for StubBashPersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingBashResumeHook {
+        calls: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
+    }
+    impl crate::runtime::config::BashResumeHook for RecordingBashResumeHook {
+        fn arrange_bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
+            self.calls
+                .lock()
+                .expect("hook mutex")
+                .push((session_id, bash_ids));
+        }
+    }
+
+    struct NoopBashResumeHook;
+    impl crate::runtime::config::BashResumeHook for NoopBashResumeHook {
+        fn arrange_bash_self_resume(&self, _: String, _: Vec<String>) {}
+    }
+
+    #[tokio::test]
+    async fn bash_gate_arranges_self_resume_hook_on_suspend() {
+        // Liveness proof (Blocker 2): when the gate suspends for outstanding
+        // background bash, it MUST arrange a self-resume hook so the session
+        // is always eventually resumed — no suspend-forever.
+        let session_id = "s-bash-liveness";
+        let mut config = AgentLoopConfig::default();
+        config.persistence = Some(Arc::new(StubBashPersistence));
+        let hook = RecordingBashResumeHook {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        config.bash_resume_hook = Some(Arc::new(hook.clone()));
+
+        let shell = bamboo_tools::tools::bash_runtime::spawn_background(
+            "sleep 5",
+            None,
+            None,
+            Some(session_id.to_string()),
+        )
+        .await
+        .expect("spawn");
+
+        let mut session = Session::new(session_id, "model");
+        let mut runtime_state = AgentRuntimeState::new(session_id);
+        let outcome =
+            maybe_suspend_for_outstanding_bash(&mut session, &config, &mut runtime_state).await;
+        let _ = shell.kill().await; // clean up first
+
+        assert!(
+            outcome.is_some(),
+            "gate should suspend with a running shell"
+        );
+        assert!(
+            runtime_state.waiting_for_bash.is_some(),
+            "durable wait registered"
+        );
+        let calls = hook.calls.lock().expect("hook calls");
+        assert_eq!(calls.len(), 1, "hook called exactly once");
+        assert_eq!(calls[0].0, session_id);
+        assert!(!calls[0].1.is_empty(), "hook received bash ids");
+    }
+
+    #[tokio::test]
+    async fn bash_gate_no_suspend_when_all_shells_finished() {
+        // Blocker 1: if all captured shells finish before the gate commits, the
+        // gate returns None — no suspend-forever on a lost-wakeup.
+        let session_id = "s-bash-toctou";
+        let mut config = AgentLoopConfig::default();
+        config.persistence = Some(Arc::new(StubBashPersistence));
+        config.bash_resume_hook = Some(Arc::new(NoopBashResumeHook));
+
+        let shell = bamboo_tools::tools::bash_runtime::spawn_background(
+            "true",
+            None,
+            None,
+            Some(session_id.to_string()),
+        )
+        .await
+        .expect("spawn");
+
+        // Wait for the shell to finish (bounded so the test never hangs).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if shell.status() != "running" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("test shell did not finish in 5s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut session = Session::new(session_id, "model");
+        let mut runtime_state = AgentRuntimeState::new(session_id);
+        let outcome =
+            maybe_suspend_for_outstanding_bash(&mut session, &config, &mut runtime_state).await;
+
+        assert!(
+            outcome.is_none(),
+            "must not suspend when no shells are running"
+        );
+        assert!(
+            runtime_state.waiting_for_bash.is_none(),
+            "no bash wait registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_suspend_reason_matches_suspended_discriminant() {
+        // Should-fix 2: the suspend_reason literal set by the write site
+        // (suspend_to_wait_for_bash) MUST resolve to Suspended status in the
+        // discriminant match — a future typo in either side is caught here.
+        let mut session = Session::new("s-discriminant", "model");
+        let mut runtime_state = AgentRuntimeState::new("s-discriminant");
+        suspend_to_wait_for_bash(
+            &mut session,
+            &mut runtime_state,
+            None,
+            vec!["bg-1".to_string()],
+        )
+        .await;
+
+        let reason = session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str);
+        assert_eq!(reason, Some("waiting_for_bash"));
+
+        // Mirrors the discriminant arms in run_pipeline. If the write site's
+        // literal were changed, the assert_eq! above catches it. If a match arm
+        // were renamed, this matches! fails — the reason would fall through to
+        // the inert `_ => {}` and the session would wrongly complete.
+        let produces_suspended = matches!(
+            reason,
+            Some("awaiting_clarification")
+                | Some("awaiting_parent_approval")
+                | Some("waiting_for_children")
+                | Some("waiting_for_bash")
+        );
+        assert!(
+            produces_suspended,
+            "waiting_for_bash must be Suspended-producing"
         );
     }
 }

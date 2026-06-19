@@ -12,7 +12,7 @@ use crate::execution::{
     create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
     ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
 };
-use crate::runtime::config::GuardianSpawner;
+use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
     GuardianVerdict,
@@ -742,10 +742,108 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             gold_config,
             guardian_config,
             guardian_spawner,
+            bash_resume_hook: {
+                let hook: Arc<dyn BashResumeHook> = Arc::new(self.clone());
+                Some(hook)
+            },
             app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
             on_complete: None,
+        });
+    }
+}
+
+/// Hidden resume message for a bash-completion self-resume (issue #84 Phase 2b).
+/// Mirrors [`runtime_resume_message`]'s hidden/compressible shape so the resume
+/// port's `has_pending_user_message` gate is satisfied.
+fn bash_completion_resume_message(bash_ids: &[String]) -> Message {
+    let body = format!(
+        "Runtime notification: all background Bash shell(s) ({}) have completed. \
+         Review their output with BashOutput and resume the task from where you left off.",
+        bash_ids.join(", ")
+    );
+    let mut message = Message::user(body);
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY: BASH_COMPLETION_RESUME_KIND,
+    }));
+    message.never_compress = false;
+    message
+}
+
+/// Bash self-resume support (issue #84 Phase 2b).
+impl ChildCompletionCoordinator {
+    /// Poll the live background-shell registry until all captured shells are no
+    /// longer running, then clear the bash wait and resume the session. This is
+    /// the liveness guarantee: **polling** the registry — not the one-shot
+    /// `BashCompleted` event — so even if a shell completed between the suspend
+    /// snapshot and this task's first poll, or before any event subscriber
+    /// existed, the registry reports it as not-running and the session resumes.
+    async fn bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
+        let poll_interval = Duration::from_millis(200);
+        // Hard ceiling: the wait lease (6 h) + the registry GC TTL (5 min) +
+        // margin. After this the shells are gone from the registry regardless,
+        // so force-resume to avoid stranding the session on a GC edge case.
+        let max_poll = Duration::from_secs(6 * 3600 + 600);
+        let deadline = tokio::time::Instant::now() + max_poll;
+
+        loop {
+            let still_running =
+                bamboo_tools::tools::bash_runtime::running_shells_for_session(&session_id);
+            if still_running.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "bash self-resume poll exceeded the wait ceiling; forcing resume"
+                );
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Shells are done (or the deadline expired). Clear the wait and resume
+        // — but only if the session is still suspended waiting for bash.
+        let Some(mut session) = self.load_session(&session_id).await else {
+            tracing::warn!(%session_id, "bash self-resume: session not found; nothing to resume");
+            return;
+        };
+
+        let mut runtime_state = read_runtime_state(&session);
+        if runtime_state.waiting_for_bash.is_none() {
+            // Already resumed (user message, or a prior poll task raced and
+            // resumed first). Nothing to do.
+            tracing::info!(%session_id, "bash self-resume: wait already cleared, skipping");
+            return;
+        }
+
+        runtime_state.waiting_for_bash = None;
+        runtime_state.status = AgentStatusState::Idle;
+        runtime_state.suspension = None;
+        write_runtime_state(&mut session, &runtime_state);
+        session.metadata.remove("runtime.suspend_reason");
+
+        session.add_message(bash_completion_resume_message(&bash_ids));
+        session.updated_at = Utc::now();
+        self.save_and_cache(&mut session).await;
+
+        tracing::info!(
+            session_id = %session_id,
+            shell_count = bash_ids.len(),
+            "bash self-resume: all background shells complete, resuming session"
+        );
+
+        self.resume_parent(session_id).await;
+    }
+}
+
+impl BashResumeHook for ChildCompletionCoordinator {
+    fn arrange_bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
+        let coordinator = Arc::new(self.clone());
+        tokio::spawn(async move {
+            coordinator.bash_self_resume(session_id, bash_ids).await;
         });
     }
 }

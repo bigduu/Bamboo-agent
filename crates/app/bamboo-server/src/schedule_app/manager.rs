@@ -432,6 +432,7 @@ async fn run_schedule_job(
         // Guardian review is not wired into the schedule path for now.
         guardian_config: None,
         guardian_spawner: None,
+        bash_resume_hook: None,
         app_data_dir: ctx.app_data_dir.clone(),
         runners: ctx.agent_runners.clone(),
         sessions_cache: ctx.sessions_cache.clone(),

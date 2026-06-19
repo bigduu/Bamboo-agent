@@ -410,6 +410,12 @@ impl AppState {
             .set_guardian_spawner(guardian_spawner.clone())
             .await;
 
+        // The completion coordinator doubles as the bash self-resume hook
+        // (issue #84 Phase 2b): it polls the live shell registry and resumes a
+        // session once all its background bash shells finish.
+        let bash_resume_hook: Arc<dyn bamboo_engine::BashResumeHook> =
+            child_completion_coordinator.clone();
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -423,6 +429,7 @@ impl AppState {
             spawn_scheduler,
             child_completion_coordinator,
             guardian_spawner,
+            bash_resume_hook,
             schedule_store,
             schedule_manager,
             tool_factory,

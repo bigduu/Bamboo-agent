@@ -217,6 +217,12 @@ pub struct AppState {
     /// Backed by a dedicated [`crate::tools::ChildSessionAdapter`].
     pub guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner>,
 
+    /// Bash self-resume hook (issue #84 Phase 2b). Backed by the same
+    /// [`ChildCompletionCoordinator`] that handles child-completion resumes —
+    /// it polls the live shell registry and resumes a session once all its
+    /// background bash shells finish.
+    pub bash_resume_hook: Arc<dyn bamboo_engine::BashResumeHook>,
+
     /// Schedule store (timed tasks).
     pub schedule_store: Arc<ScheduleStore>,
 
