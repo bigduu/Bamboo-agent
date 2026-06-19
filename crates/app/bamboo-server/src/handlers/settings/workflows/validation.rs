@@ -1,5 +1,5 @@
 /// Validates workflow names for security (prevents path traversal, etc.).
-pub(super) fn is_safe_workflow_name(name: &str) -> bool {
+pub(crate) fn is_safe_workflow_name(name: &str) -> bool {
     // Check basic constraints.
     if name.is_empty() || name.len() > 255 {
         return false;
