@@ -239,6 +239,23 @@ fn openai_compat_error_to_llm_error(error: &Value) -> LLMError {
     LLMError::Api(message)
 }
 
+/// Whether a top-level SSE `"error"` field actually represents an error.
+///
+/// Several OpenAI-compatible gateways (LiteLLM, OneAPI/New-API, some Azure
+/// proxies) emit `{"error": null}` (or `""`/`{}`) as a *no-error* marker on an
+/// otherwise-normal chunk. `serde_json`'s `get("error")` returns `Some(Null)`
+/// for an explicit null, so without this guard such a benign marker would abort
+/// a valid stream (issue #26). Only a non-null, non-empty value is a real error.
+fn sse_error_is_present(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        _ => true,
+    }
+}
+
 /// Parse an SSE `data:` payload in strict mode (OpenAI behavior).
 ///
 /// - `"[DONE]"` -> `LLMChunk::Done`
@@ -257,7 +274,7 @@ pub fn parse_openai_compat_sse_data_strict(data: &str) -> Result<LLMChunk> {
     // silently swallow the provider's error) before deserializing the stream
     // chunk type. See issue #26.
     let value: Value = serde_json::from_str(data)?;
-    if let Some(error) = value.get("error") {
+    if let Some(error) = value.get("error").filter(|e| sse_error_is_present(e)) {
         return Err(openai_compat_error_to_llm_error(error));
     }
     let chunk: OpenAICompatStreamChunk = serde_json::from_value(value)?;
@@ -281,7 +298,7 @@ pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
             // Surface mid-stream API errors even in lenient mode; only
             // structurally-unexpected (or unparseable) payloads degrade to an
             // empty token.
-            if let Some(error) = value.get("error") {
+            if let Some(error) = value.get("error").filter(|e| sse_error_is_present(e)) {
                 return Err(openai_compat_error_to_llm_error(error));
             }
             match serde_json::from_value::<OpenAICompatStreamChunk>(value) {
@@ -682,6 +699,43 @@ mod tests {
         match chunk {
             LLMChunk::Token(token) => assert_eq!(token, "Hello"),
             other => panic!("expected LLMChunk::Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_or_empty_error_field_does_not_abort() {
+        // Several OpenAI-compatible gateways emit `{"error": null}` (or empty
+        // string/object/array) as a *no-error* marker. `serde_json::get` returns
+        // Some(Null) for an explicit null, so these must NOT be treated as errors
+        // (issue #26): they must continue the stream, not abort it.
+        for data in [
+            r#"{"error":null}"#,
+            r#"{"error":""}"#,
+            r#"{"error":{}}"#,
+            r#"{"error":[]}"#,
+            r#"{"error":null,"choices":[{"delta":{"content":"Hi"}}]}"#,
+        ] {
+            // strict: must not return Err(LLMError::Api)
+            let strict = super::parse_openai_compat_sse_data_strict(data);
+            assert!(
+                !matches!(strict, Err(crate::provider::LLMError::Api(_))),
+                "strict wrongly aborted on benign error marker: {data} -> {strict:?}"
+            );
+            // lenient: contract is "never abort"
+            let lenient = super::parse_openai_compat_sse_data_lenient(data);
+            assert!(
+                !matches!(lenient, Err(crate::provider::LLMError::Api(_))),
+                "lenient wrongly aborted on benign error marker: {data} -> {lenient:?}"
+            );
+        }
+        // And the content alongside a null error still surfaces.
+        match super::parse_openai_compat_sse_data_strict(
+            r#"{"error":null,"choices":[{"delta":{"content":"Hi"}}]}"#,
+        )
+        .unwrap()
+        {
+            LLMChunk::Token(token) => assert_eq!(token, "Hi"),
+            other => panic!("expected Token(\"Hi\"), got {other:?}"),
         }
     }
 
