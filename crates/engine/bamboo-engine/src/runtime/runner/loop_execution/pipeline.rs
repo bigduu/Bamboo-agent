@@ -1015,6 +1015,13 @@ pub(super) async fn run_pipeline(
 ) -> super::super::Result<bool> {
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
+    // One-shot sentinel for the max_rounds summary turn (see the guard at the
+    // bottom of the loop). Cleared per-run. We also drop any stale
+    // `runtime.completion_reason` carried over from a previous run on this
+    // session, so a normal completion is never misread as exhaustion (mirrors
+    // how `runtime.suspend_reason` is cleared on resume).
+    let mut max_rounds_summary_used = false;
+    session.metadata.remove("runtime.completion_reason");
 
     loop {
         refresh_auxiliary_models_for_round(state, config);
@@ -1621,8 +1628,56 @@ pub(super) async fn run_pipeline(
 
         turn_counter += 1;
 
-        // --- Guard against max_rounds ---
+        // --- Guard against max_rounds (issue #29) ---
+        //
+        // Hitting the round budget must be DISTINGUISHABLE from a normal
+        // completion, not silent. On exhaustion we:
+        //   1. stamp `runtime.completion_reason` = "max_rounds_reached"
+        //      (mirroring the `runtime.suspend_reason` convention) so the
+        //      finalize/Complete path — and the UI reading session metadata —
+        //      can tell exhaustion apart from real success;
+        //   2. log a tracing::warn!;
+        //   3. inject a VISIBLE user-facing notification explaining the stop.
+        //
+        // We also grant the model EXACTLY ONE final turn to summarize. The
+        // local `max_rounds_summary_used` sentinel makes this strictly
+        // one-shot: the first guard hit injects the summary prompt and continues
+        // for a single extra round; the next time this guard fires we break
+        // unconditionally — regardless of what that turn did (including ignoring
+        // the instruction and emitting more tool calls). It can therefore never
+        // recurse or extend the loop indefinitely.
         if turn_counter >= config.max_rounds as u32 {
+            if !max_rounds_summary_used {
+                tracing::warn!(
+                    "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
+                    state.session_id,
+                    config.max_rounds
+                );
+                session.metadata.insert(
+                    "runtime.completion_reason".to_string(),
+                    "max_rounds_reached".to_string(),
+                );
+                // Single visible user turn that both notifies the user WHY the
+                // run stopped and prompts the model to summarize. It MUST be one
+                // message: two consecutive user messages would violate strict
+                // role alternation (Anthropic 400s on it), breaking the summary
+                // turn and the next resume. One user turn keeps alternation valid
+                // (a preceding Tool message is merged into it by the serializer).
+                session.add_message(Message::user(format!(
+                    "Reached the maximum of {0} rounds; the task was stopped before \
+                     completion. Stop working now and summarize your progress so far \
+                     and what remains.",
+                    config.max_rounds
+                )));
+                max_rounds_summary_used = true;
+                continue;
+            }
+
+            tracing::warn!(
+                "[{}] Reached max rounds ({}) — stopping the run before completion.",
+                state.session_id,
+                config.max_rounds
+            );
             break;
         }
     }
@@ -2357,6 +2412,170 @@ mod tests {
             }
         }
         assert_eq!(completes, 1, "exactly one terminal Complete");
+    }
+
+    /// Always emits a tool call so the loop can never self-terminate — forces the
+    /// worst case through the full round budget, including the summary turn.
+    struct MaxRoundsProvider {
+        main_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for MaxRoundsProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+            _: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let n = self
+                .main_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: format!("tool-{n}"),
+                tool_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "noop".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    /// Executes any tool call successfully so tool rounds keep progressing.
+    struct AlwaysOkExecutor;
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for AlwaysOkExecutor {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> std::result::Result<
+            bamboo_agent_core::tools::ToolResult,
+            bamboo_agent_core::tools::ToolError,
+        > {
+            Ok(bamboo_agent_core::tools::ToolResult {
+                success: true,
+                result: "ok".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #29: hitting `max_rounds` must be DISTINGUISHABLE, not silent.
+    ///
+    /// Drives the worst case — a model that keeps emitting tool calls so the loop
+    /// can never self-terminate — through a small budget, then asserts:
+    ///   (a) the session is stamped `runtime.completion_reason` =
+    ///       "max_rounds_reached";
+    ///   (b) a visible notification message is appended;
+    ///   (c) the model gets EXACTLY ONE summary turn (`max_rounds + 1` total
+    ///       model turns) before the loop stops hard — no infinite loop.
+    #[tokio::test]
+    async fn max_rounds_exhaustion_is_distinguishable_and_runs_one_summary_turn() {
+        use crate::runtime::config::PromptMemoryFlags;
+        use std::sync::atomic::Ordering;
+
+        const MAX_ROUNDS: usize = 3;
+        let mut session = Session::new("session-max-rounds", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(MaxRoundsProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            max_rounds: MAX_ROUNDS,
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+            },
+            model_name: Some("model".to_string()),
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-max-rounds");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let sent_complete =
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+                .await
+                .expect("pipeline runs to completion");
+
+        // (a) Distinguishable: session carries the exhaustion reason.
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.completion_reason")
+                .map(String::as_str),
+            Some("max_rounds_reached"),
+            "exhaustion must be stamped in session metadata"
+        );
+        // (b) Visible notification is present.
+        assert!(
+            session.messages.iter().any(|m| m.content.contains(
+                "Reached the maximum of 3 rounds; the task was stopped before completion."
+            )),
+            "a visible max_rounds notification message must be appended"
+        );
+        // (b2) The injected summary turn must NOT create consecutive user
+        // messages — that would 400 on strict-alternation providers (Anthropic)
+        // and break the very summary turn this feature relies on (#29 review).
+        assert!(
+            !session
+                .messages
+                .windows(2)
+                .any(|w| w[0].role == bamboo_domain::Role::User
+                    && w[1].role == bamboo_domain::Role::User),
+            "max_rounds injection must not produce consecutive user messages"
+        );
+        // (c) Exactly one summary turn, then stops hard (no infinite loop).
+        let main_calls = provider.main_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            main_calls,
+            MAX_ROUNDS + 1,
+            "exactly one extra summary turn after {MAX_ROUNDS} normal rounds (got {main_calls})"
+        );
+        // Worst case: the summary turn itself emitted tool calls, so the loop
+        // broke via the guard (sent_complete false; finalize emits a zero-token
+        // Complete — the exact pre-fix symptom, now made distinguishable above).
+        assert!(
+            !sent_complete,
+            "worst-case summary turn (tool calls) leaves sent_complete false"
+        );
+        drop(tx);
+        let mut completes = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Complete { .. }) {
+                completes += 1;
+            }
+        }
+        assert_eq!(
+            completes, 0,
+            "no Complete emitted during this worst-case run"
+        );
     }
 
     #[derive(Default)]
