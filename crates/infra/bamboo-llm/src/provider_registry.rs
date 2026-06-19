@@ -91,18 +91,15 @@ impl ProviderRegistry {
     ) -> Result<(), LLMError> {
         let (providers, metadata, default_provider) =
             Self::build_registry_state(config, app_data_dir).await?;
-        *self
-            .providers
-            .write()
-            .expect("provider registry write lock poisoned") = providers;
-        *self
-            .metadata
-            .write()
-            .expect("provider registry metadata write lock poisoned") = metadata;
+        // Recover from a poisoned lock rather than panicking the whole process: a
+        // poisoned guard's inner data is still usable, and panicking here would be a
+        // permanent DoS on the critical path for every LLM call.
+        *self.providers.write().unwrap_or_else(|e| e.into_inner()) = providers;
+        *self.metadata.write().unwrap_or_else(|e| e.into_inner()) = metadata;
         *self
             .default_provider
             .write()
-            .expect("provider registry default write lock poisoned") = default_provider;
+            .unwrap_or_else(|e| e.into_inner()) = default_provider;
         Ok(())
     }
 
@@ -282,7 +279,7 @@ impl ProviderRegistry {
     pub fn get(&self, name: &str) -> Option<Arc<dyn LLMProvider>> {
         self.providers
             .read()
-            .expect("provider registry read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned()
     }
@@ -290,7 +287,7 @@ impl ProviderRegistry {
     pub fn get_metadata(&self, name: &str) -> Option<ProviderMetadata> {
         self.metadata
             .read()
-            .expect("provider registry metadata read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned()
     }
@@ -298,7 +295,7 @@ impl ProviderRegistry {
     pub fn provider_metadata(&self) -> Vec<ProviderMetadata> {
         self.metadata
             .read()
-            .expect("provider registry metadata read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
             .collect()
@@ -314,7 +311,7 @@ impl ProviderRegistry {
     pub fn default_provider_name(&self) -> String {
         self.default_provider
             .read()
-            .expect("provider registry default read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -322,7 +319,7 @@ impl ProviderRegistry {
     pub fn provider_names(&self) -> Vec<String> {
         self.providers
             .read()
-            .expect("provider registry read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .keys()
             .cloned()
             .collect()
@@ -332,7 +329,7 @@ impl ProviderRegistry {
     pub fn len(&self) -> usize {
         self.providers
             .read()
-            .expect("provider registry read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .len()
     }
 
@@ -340,7 +337,7 @@ impl ProviderRegistry {
     pub fn is_empty(&self) -> bool {
         self.providers
             .read()
-            .expect("provider registry read lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_empty()
     }
 
@@ -348,11 +345,11 @@ impl ProviderRegistry {
     pub fn insert(&self, key: String, provider: Arc<dyn LLMProvider>) {
         self.providers
             .write()
-            .expect("provider registry write lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), provider);
         self.metadata
             .write()
-            .expect("provider registry metadata write lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(
                 key.clone(),
                 ProviderMetadata {
@@ -367,11 +364,11 @@ impl ProviderRegistry {
     pub fn remove(&self, key: &str) -> Option<Arc<dyn LLMProvider>> {
         self.metadata
             .write()
-            .expect("provider registry metadata write lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(key);
         self.providers
             .write()
-            .expect("provider registry write lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(key)
     }
 
@@ -380,7 +377,7 @@ impl ProviderRegistry {
         *self
             .default_provider
             .write()
-            .expect("provider registry default write lock poisoned") = key;
+            .unwrap_or_else(|e| e.into_inner()) = key;
     }
 }
 
@@ -636,5 +633,55 @@ mod tests {
         );
         assert_eq!(openai.model.as_deref(), Some("gpt-4o"));
         assert_eq!(config.provider, "openai");
+    }
+
+    /// A poisoned lock must not brick the registry: every subsequent operation
+    /// recovers the (still-usable) inner data instead of panicking the process.
+    #[test]
+    fn poisoned_lock_does_not_panic_subsequent_reads() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let registry = ProviderRegistry::new(HashMap::new(), "default".to_string());
+
+        // Poison the `providers` RwLock by panicking while holding a write guard.
+        // The guard is dropped during unwinding, which is exactly what marks the
+        // lock as poisoned.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = registry.providers.write().unwrap();
+            panic!("intentional poison for test");
+        }));
+        assert!(poisoned.is_err(), "setup panic should have been caught");
+
+        // Despite poisoning, all of these must succeed instead of propagating a
+        // PoisonError panic — that is the regression this test guards against.
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
+        assert!(registry.get("missing").is_none());
+        assert!(registry.provider_names().is_empty());
+
+        // Writes must recover too: a subsequent insert still lands.
+        use bamboo_domain::Message;
+        use bamboo_domain::ToolSchema;
+        struct NoopProvider;
+        #[async_trait::async_trait]
+        impl LLMProvider for NoopProvider {
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSchema],
+                _max_output_tokens: Option<u32>,
+                _model: &str,
+            ) -> crate::provider::Result<crate::provider::LLMStream> {
+                Err(LLMError::Api("noop".to_string()))
+            }
+        }
+        registry.insert("after-poison".to_string(), Arc::new(NoopProvider));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("after-poison").is_some());
+        assert_eq!(
+            registry.provider_metadata().len(),
+            1,
+            "metadata RwLock should also recover independently"
+        );
     }
 }

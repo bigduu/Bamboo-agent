@@ -69,7 +69,7 @@ impl Registry {
         };
         self.table
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(r.child_id.clone(), reg.clone());
         self.persist_entry(&reg, now).await
     }
@@ -82,7 +82,7 @@ impl Registry {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let reg = {
-            let mut table = self.table.lock().unwrap();
+            let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
             let Some(reg) = table.get_mut(child_id) else {
                 return Ok(()); // unknown child -> ignore
             };
@@ -102,7 +102,11 @@ impl Registry {
         final_status: ChildStatus,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let reg = self.table.lock().unwrap().remove(child_id);
+        let reg = self
+            .table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(child_id);
         if let Some(mut reg) = reg {
             reg.status = final_status;
             self.persist_entry(&reg, now).await?;
@@ -112,20 +116,30 @@ impl Registry {
 
     /// Snapshot of currently-registered children (for `GET /internal/subagents`).
     pub fn list(&self) -> Vec<Registration> {
-        let mut v: Vec<_> = self.table.lock().unwrap().values().cloned().collect();
+        let mut v: Vec<_> = self
+            .table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         v.sort_by(|a, b| a.child_id.cmp(&b.child_id));
         v
     }
 
     pub fn get(&self, child_id: &str) -> Option<Registration> {
-        self.table.lock().unwrap().get(child_id).cloned()
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(child_id)
+            .cloned()
     }
 
     /// Child ids whose last heartbeat is older than `ttl` (candidates for reaping).
     pub fn stale(&self, ttl: Duration, now: DateTime<Utc>) -> Vec<String> {
         self.table
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|r| now - r.last_heartbeat > ttl)
             .map(|r| r.child_id.clone())
