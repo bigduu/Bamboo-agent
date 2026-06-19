@@ -1613,6 +1613,154 @@ mod anthropic_request_building {
     }
 
     #[test]
+    fn messages_to_anthropic_json_skips_stray_system_on_production_path() {
+        // Regression for issue #22, but exercising the REAL production path.
+        // `messages_to_anthropic_json` is the function `build_anthropic_request`
+        // actually calls; unlike the synthetic `filter_map` consumer in
+        // `stray_system_message_is_skipped_not_panicked`, this runs the
+        // provider's own System-routing arm (→ top-level `system` field) AND
+        // the let-else skip + out_ids population, so it catches regressions in
+        // how the two are wired together.
+        let system = Message::system("You are a robot.");
+        let user = Message::user("Hello");
+        let assistant = Message::assistant("Hi there!", None);
+
+        // Capture the originating ids so we can assert out_ids tracks them
+        // exactly — the System message's id must NOT appear in out_ids.
+        let user_id = user.id.clone();
+        let assistant_id = assistant.id.clone();
+
+        let messages = [system, user, assistant];
+        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+
+        // (a) The System message is routed into the top-level `system` field.
+        let system_value =
+            system_val.expect("the System message must populate the top-level `system` field");
+        let system_arr = system_value
+            .as_array()
+            .expect("`system` should be an array of text blocks");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0]["type"], "text");
+        assert_eq!(system_arr[0]["text"], "You are a robot.");
+
+        // (b) The `messages` array omits the System message entirely — no null
+        // entry, order preserved, User then Assistant.
+        assert_eq!(
+            out.len(),
+            2,
+            "system message must be skipped, leaving user + assistant"
+        );
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"][0]["type"], "text");
+        assert_eq!(out[0]["content"][0]["text"], "Hello");
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "a skipped system message must be omitted, not emitted as null"
+        );
+
+        // (c) out_ids mirrors the surviving messages 1:1 — the System message's
+        // id is absent, the User/Assistant ids are present in order.
+        assert_eq!(out_ids.len(), 2);
+        assert_eq!(out_ids[0], user_id);
+        assert_eq!(out_ids[1], assistant_id);
+
+        // (d) KEY INVARIANT: the parallel id vector stays in lockstep with the
+        // messages array, so cache-breakpoint placement by id never desyncs.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_multiple_stray_system_messages() {
+        // Every stray System message is routed to the top-level `system` field;
+        // none survives into the `messages` array, no matter how many appear.
+        let messages = [
+            Message::system("Rule one."),
+            Message::system("Rule two."),
+            Message::user("Hello"),
+            Message::assistant("Hi!", None),
+        ];
+        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+
+        // Both system messages are joined into the system field.
+        let system_value =
+            system_val.expect("system messages must populate the top-level `system` field");
+        let system_arr = system_value
+            .as_array()
+            .expect("`system` should be an array of text blocks");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0]["text"], "Rule one.\n\nRule two.");
+
+        // Only User + Assistant survive in the messages array.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "skipped system messages must be omitted, not emitted as null"
+        );
+
+        // Parity invariant holds with multiple skipped messages.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_system_between_tool_use_and_result() {
+        // A stray System message wedged between an assistant tool_use and its
+        // tool_result must be routed to `system` and NOT break the pairing:
+        // tool_use and tool_result stay adjacent in the messages array.
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"rust"}"#.to_string(),
+            },
+        };
+        let messages = [
+            Message::assistant("", Some(vec![tool_call])),
+            Message::system("mid-conversation system"),
+            Message::tool_result("call_1", "found it"),
+        ];
+        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+
+        // The wedged System message is routed to the system field, not dropped.
+        assert!(
+            system_val.is_some(),
+            "the mid-conversation System message must populate the `system` field"
+        );
+
+        // Two messages survive, adjacent and paired: assistant tool_use then
+        // user tool_result referencing the same tool_use_id.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"][0]["type"], "tool_use");
+        assert_eq!(out[0]["content"][0]["id"], "call_1");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][0]["type"], "tool_result");
+        assert_eq!(out[1]["content"][0]["tool_use_id"], "call_1");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "skipped system message must be omitted, not emitted as null"
+        );
+
+        // Parity invariant holds even with the interleaved System message.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
     fn messages_keep_only_the_most_recent_tool_image() {
         let img = |d: &str| bamboo_domain::ToolResultImage {
             mime_type: "image/jpeg".to_string(),
