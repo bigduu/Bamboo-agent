@@ -38,6 +38,7 @@ pub use provider_instances::{
 };
 pub use redaction::{redact_config_for_api, redact_providers_for_api};
 pub use setup::{get_setup_status, mark_setup_complete, mark_setup_incomplete};
+pub(crate) use workflows::is_safe_workflow_name;
 pub use workflows::{
     delete_workflow, get_workflow, list_workflows, save_workflow, SaveWorkflowRequest,
 };

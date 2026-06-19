@@ -2,6 +2,7 @@ use actix_web::{web, HttpResponse};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
+use crate::handlers::settings::is_safe_workflow_name;
 
 use super::sources::{list_mcp_tools_as_commands, list_workflows_as_commands, skill_to_command};
 use super::types::CommandListResponse;
@@ -48,6 +49,10 @@ pub async fn get_command(
 
     match command_type.as_str() {
         "workflow" => {
+            if !is_safe_workflow_name(&id) {
+                return Err(AppError::BadRequest("Invalid workflow name".to_string()));
+            }
+
             let workflows_dir = app_state.app_data_dir.join("workflows");
             let filename = format!("{id}.md");
             let filepath = workflows_dir.join(&filename);
