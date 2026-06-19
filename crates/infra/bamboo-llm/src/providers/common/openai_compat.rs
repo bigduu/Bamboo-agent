@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::provider::Result;
+use crate::provider::{LLMError, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
 
@@ -219,30 +219,76 @@ pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
     LLMChunk::Token(String::new())
 }
 
+/// Surface a mid-stream OpenAI-compatible `"error"` event as an [`LLMError::Api`].
+///
+/// OpenAI-compatible providers (OpenAI, GitHub Copilot, Bodhi) deliver
+/// rate-limit / server / content-filter errors as ordinary SSE `data:` JSON
+/// carrying a top-level `"error"` field, e.g.
+/// `{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}`.
+/// If the error object has a human-readable `"message"` string we surface it
+/// directly; otherwise we fall back to the JSON form of the whole error
+/// object so no detail is lost. Mirrors the error-event handling already used
+/// by the Gemini (`gemini/stream.rs`) and Anthropic (`anthropic/mod.rs`)
+/// parsers.
+fn openai_compat_error_to_llm_error(error: &Value) -> LLMError {
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    LLMError::Api(message)
+}
+
 /// Parse an SSE `data:` payload in strict mode (OpenAI behavior).
 ///
 /// - `"[DONE]"` -> `LLMChunk::Done`
+/// - A JSON object with a top-level `"error"` field -> `Err(LLMError::Api(..))`
+///   (rate limits, server errors, content-filter triggers, etc. — these arrive
+///   as regular `data:` JSON and would otherwise be swallowed as an empty
+///   token). See issue #26.
 /// - Invalid JSON -> error
 pub fn parse_openai_compat_sse_data_strict(data: &str) -> Result<LLMChunk> {
     if data.trim() == "[DONE]" {
         return Ok(LLMChunk::Done);
     }
 
-    let chunk: OpenAICompatStreamChunk = serde_json::from_str(data)?;
+    // Parse into a generic JSON value first so we can detect mid-stream error
+    // events (which otherwise deserialize as a chunk with empty `choices` and
+    // silently swallow the provider's error) before deserializing the stream
+    // chunk type. See issue #26.
+    let value: Value = serde_json::from_str(data)?;
+    if let Some(error) = value.get("error") {
+        return Err(openai_compat_error_to_llm_error(error));
+    }
+    let chunk: OpenAICompatStreamChunk = serde_json::from_value(value)?;
     Ok(parse_openai_compat_chunk(chunk))
 }
 
 /// Parse an SSE `data:` payload in lenient mode (Copilot behavior).
 ///
 /// - `"[DONE]"` -> `LLMChunk::Done`
-/// - Invalid JSON -> `LLMChunk::Token(\"\")`
+/// - A JSON object with a top-level `"error"` field -> `Err(LLMError::Api(..))`
+///   (surfaced even in lenient mode so provider errors are never silently
+///   swallowed as empty tokens). See issue #26.
+/// - Invalid JSON -> `LLMChunk::Token("")`
 pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
     if data.trim() == "[DONE]" {
         return Ok(LLMChunk::Done);
     }
 
-    match serde_json::from_str::<OpenAICompatStreamChunk>(data) {
-        Ok(chunk) => Ok(parse_openai_compat_chunk(chunk)),
+    match serde_json::from_str::<Value>(data) {
+        Ok(value) => {
+            // Surface mid-stream API errors even in lenient mode; only
+            // structurally-unexpected (or unparseable) payloads degrade to an
+            // empty token.
+            if let Some(error) = value.get("error") {
+                return Err(openai_compat_error_to_llm_error(error));
+            }
+            match serde_json::from_value::<OpenAICompatStreamChunk>(value) {
+                Ok(chunk) => Ok(parse_openai_compat_chunk(chunk)),
+                Err(_) => Ok(LLMChunk::Token(String::new())),
+            }
+        }
         Err(_) => Ok(LLMChunk::Token(String::new())),
     }
 }
@@ -548,6 +594,91 @@ mod tests {
     fn parse_openai_compat_sse_data_lenient_valid_json_works() {
         let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"Hello"}}]}"#;
         let chunk = super::parse_openai_compat_sse_data_lenient(data).unwrap();
+        match chunk {
+            LLMChunk::Token(token) => assert_eq!(token, "Hello"),
+            other => panic!("expected LLMChunk::Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_strict_error_event_yields_api_error() {
+        // Issue #26: a mid-stream error event arrives as ordinary `data:` JSON
+        // with a top-level "error" field and must NOT be swallowed as an empty
+        // token.
+        let data = r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
+
+        let result = super::parse_openai_compat_sse_data_strict(data);
+        assert!(result.is_err(), "expected an error for an error event");
+        match result.unwrap_err() {
+            crate::provider::LLMError::Api(msg) => {
+                assert!(
+                    msg.contains("rate limit exceeded"),
+                    "error message should surface the provider message, got: {msg}"
+                );
+            }
+            other => panic!("expected LLMError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_lenient_error_event_yields_api_error() {
+        // Even lenient mode (Copilot) must surface mid-stream API errors
+        // instead of silently swallowing them as empty tokens. See issue #26.
+        let data = r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
+
+        let result = super::parse_openai_compat_sse_data_lenient(data);
+        assert!(result.is_err(), "expected an error for an error event");
+        match result.unwrap_err() {
+            crate::provider::LLMError::Api(msg) => {
+                assert!(
+                    msg.contains("rate limit exceeded"),
+                    "error message should surface the provider message, got: {msg}"
+                );
+            }
+            other => panic!("expected LLMError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_strict_error_event_without_message_falls_back_to_object() {
+        // No "message" field -> fall back to stringifying the whole error object.
+        let data = r#"{"error":{"type":"server_error","code":503}}"#;
+
+        let result = super::parse_openai_compat_sse_data_strict(data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            crate::provider::LLMError::Api(msg) => {
+                assert!(
+                    msg.contains("server_error"),
+                    "fallback should carry the error object, got: {msg}"
+                );
+            }
+            other => panic!("expected LLMError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_strict_string_error_surfaces_value() {
+        // Some providers send "error" as a plain string rather than an object.
+        let data = r#"{"error":"quota exceeded"}"#;
+
+        let result = super::parse_openai_compat_sse_data_strict(data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            crate::provider::LLMError::Api(msg) => {
+                assert!(msg.contains("quota exceeded"), "got: {msg}");
+            }
+            other => panic!("expected LLMError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_strict_normal_chunk_unchanged_after_error_check() {
+        // Happy path regression: a normal content delta still yields a Token,
+        // unaffected by the new error-field check.
+        let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"Hello"}}]}"#;
+
+        let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
         match chunk {
             LLMChunk::Token(token) => assert_eq!(token, "Hello"),
             other => panic!("expected LLMChunk::Token, got {other:?}"),
