@@ -1657,14 +1657,16 @@ pub(super) async fn run_pipeline(
                     "runtime.completion_reason".to_string(),
                     "max_rounds_reached".to_string(),
                 );
-                // Visible notification so the user can see WHY the run stopped.
+                // Single visible user turn that both notifies the user WHY the
+                // run stopped and prompts the model to summarize. It MUST be one
+                // message: two consecutive user messages would violate strict
+                // role alternation (Anthropic 400s on it), breaking the summary
+                // turn and the next resume. One user turn keeps alternation valid
+                // (a preceding Tool message is merged into it by the serializer).
                 session.add_message(Message::user(format!(
-                    "Reached the maximum of {} rounds; the task was stopped before completion.",
-                    config.max_rounds
-                )));
-                // Prompt the model to summarize; this one extra turn is terminal.
-                session.add_message(Message::user(format!(
-                    "Maximum rounds ({}) reached. Stop working and summarize your progress and what remains.",
+                    "Reached the maximum of {0} rounds; the task was stopped before \
+                     completion. Stop working now and summarize your progress so far \
+                     and what remains.",
                     config.max_rounds
                 )));
                 max_rounds_summary_used = true;
@@ -2537,6 +2539,17 @@ mod tests {
                 "Reached the maximum of 3 rounds; the task was stopped before completion."
             )),
             "a visible max_rounds notification message must be appended"
+        );
+        // (b2) The injected summary turn must NOT create consecutive user
+        // messages — that would 400 on strict-alternation providers (Anthropic)
+        // and break the very summary turn this feature relies on (#29 review).
+        assert!(
+            !session
+                .messages
+                .windows(2)
+                .any(|w| w[0].role == bamboo_domain::Role::User
+                    && w[1].role == bamboo_domain::Role::User),
+            "max_rounds injection must not produce consecutive user messages"
         );
         // (c) Exactly one summary turn, then stops hard (no infinite loop).
         let main_calls = provider.main_calls.load(Ordering::SeqCst);
