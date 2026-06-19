@@ -183,6 +183,41 @@ impl WaitingForChildrenState {
     }
 }
 
+/// Durable wait state for event-driven background-Bash orchestration (issue #84).
+///
+/// The agent loop opt-in is implicit: a background shell only lands in the
+/// session-aware registry (and therefore in `bash_runtime::running_shells_for_session`)
+/// when the agent launched it with `run_in_background: true`. Foreground Bash
+/// calls are awaited inline and never appear here, so this state never engages
+/// for the default foreground path. The wait policy is fixed — "all tracked bash
+/// ids must finish" — so, unlike children, no policy enum is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WaitingForBashState {
+    /// Background shell ids this session is currently waiting on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bash_ids: Vec<String>,
+    /// When this wait state was registered.
+    pub registered_at: DateTime<Utc>,
+    /// Optional wait lease. Expiry does not kill shells; the bash coordinator
+    /// (Phase 2c) owns liveness/timeout decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_at: Option<DateTime<Utc>>,
+}
+
+impl WaitingForBashState {
+    /// Construct a wait over `bash_ids` with the default 6-hour wait lease
+    /// (`timeout_at = now + 6h`), mirroring [`WaitingForChildrenState::for_children`]
+    /// so every runner-initiated bash suspend (the end-of-turn safety net) builds
+    /// the record identically.
+    pub fn for_bash(bash_ids: Vec<String>, now: DateTime<Utc>) -> Self {
+        Self {
+            bash_ids,
+            registered_at: now,
+            timeout_at: Some(now + chrono::Duration::hours(6)),
+        }
+    }
+}
+
 /// Suspension reason and context for resumable runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SuspensionState {
@@ -268,6 +303,8 @@ pub struct AgentRuntimeState {
     pub children: ChildSessionRuntimeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for_children: Option<WaitingForChildrenState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_bash: Option<WaitingForBashState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<HookCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +338,7 @@ impl AgentRuntimeState {
             llm: LlmRuntimeState::default(),
             children: ChildSessionRuntimeState::default(),
             waiting_for_children: None,
+            waiting_for_bash: None,
             checkpoints: Vec::new(),
             plan_mode: None,
             bypass_permissions: false,
@@ -323,6 +361,7 @@ impl Default for AgentRuntimeState {
             llm: LlmRuntimeState::default(),
             children: ChildSessionRuntimeState::default(),
             waiting_for_children: None,
+            waiting_for_bash: None,
             checkpoints: Vec::new(),
             plan_mode: None,
             bypass_permissions: false,
@@ -480,6 +519,57 @@ mod tests {
         assert_eq!(wait.child_session_ids.len(), 2);
         assert_eq!(wait.wait_for, ChildWaitPolicy::All);
         assert_eq!(wait.registered_by_tool_call_id.as_deref(), Some("tool-1"));
+    }
+
+    #[test]
+    fn waiting_for_bash_state_round_trip() {
+        let wait = WaitingForBashState {
+            bash_ids: vec!["shell-1".to_string(), "shell-2".to_string()],
+            registered_at: Utc::now(),
+            timeout_at: Some(Utc::now()),
+        };
+        let serialized = serde_json::to_string(&wait).expect("serialize");
+        let restored: WaitingForBashState = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(wait, restored);
+        assert_eq!(restored.bash_ids.len(), 2);
+    }
+
+    #[test]
+    fn agent_runtime_state_with_waiting_for_bash_round_trip() {
+        let mut state = AgentRuntimeState::new("run-bash");
+        state.waiting_for_bash = Some(WaitingForBashState {
+            bash_ids: vec!["bg-1".to_string(), "bg-2".to_string()],
+            registered_at: Utc::now(),
+            timeout_at: None,
+        });
+
+        let serialized = serde_json::to_string(&state).expect("serialize");
+        let deserialized: AgentRuntimeState =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(state, deserialized);
+
+        let wait = deserialized
+            .waiting_for_bash
+            .expect("bash wait state should round-trip");
+        assert_eq!(wait.bash_ids, vec!["bg-1".to_string(), "bg-2".to_string()]);
+    }
+
+    #[test]
+    fn waiting_for_bash_absent_by_default_and_not_serialized() {
+        // A fresh state has no bash wait, and it must not be serialized when absent.
+        let state = AgentRuntimeState::new("run-empty");
+        assert!(state.waiting_for_bash.is_none());
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("waiting_for_bash"),
+            "absent bash wait must be skipped in serialization: {json}"
+        );
+
+        // Old JSON without the field still deserializes to None.
+        let old = r#"{"version":1,"run_id":"old","status":"idle"}"#;
+        let restored: AgentRuntimeState = serde_json::from_str(old).unwrap();
+        assert!(restored.waiting_for_bash.is_none());
     }
 
     #[test]

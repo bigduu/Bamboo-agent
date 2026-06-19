@@ -174,6 +174,7 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         // guardian config on the request, mirroring `gold_config`.)
         guardian_config: None,
         guardian_spawner: Some(args.state.guardian_spawner.clone()),
+        bash_resume_hook: Some(args.state.bash_resume_hook.clone()),
         app_data_dir: args.app_data_dir,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),

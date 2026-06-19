@@ -23,8 +23,8 @@ use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
 
 use crate::runtime::config::{
-    AgentLoopConfig, AuxiliaryModelConfig, GoldConfig, GuardianConfig, GuardianSpawner,
-    ImageFallbackConfig, PromptMemoryFlags,
+    AgentLoopConfig, AuxiliaryModelConfig, BashResumeHook, GoldConfig, GuardianConfig,
+    GuardianSpawner, ImageFallbackConfig, PromptMemoryFlags,
 };
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
@@ -294,6 +294,9 @@ pub struct ExecuteRequest {
     /// Late-bound spawner for the guardian reviewer child (wired by the server;
     /// the runner cannot construct a child directly).
     pub guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
+    /// Late-bound hook that arranges a self-resume after a background-bash
+    /// suspend (issue #84 Phase 2b). Wired by the server.
+    pub bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
 }
@@ -342,6 +345,7 @@ pub struct ExecuteRequestBuilder {
     gold_config: Option<GoldConfig>,
     guardian_config: Option<GuardianConfig>,
     guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
+    bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -378,6 +382,7 @@ impl ExecuteRequestBuilder {
             gold_config: None,
             guardian_config: None,
             guardian_spawner: None,
+            bash_resume_hook: None,
             app_data_dir: None,
         }
     }
@@ -536,6 +541,13 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the late-bound bash self-resume hook (crate-visible; wired by the
+    /// server so a session suspended on background bash is always resumed).
+    pub(crate) fn bash_resume_hook(mut self, v: Option<Arc<dyn BashResumeHook>>) -> Self {
+        self.bash_resume_hook = v;
+        self
+    }
+
     /// Set the Bamboo application data directory.
     pub fn app_data_dir(mut self, v: std::path::PathBuf) -> Self {
         self.app_data_dir = Some(v);
@@ -578,6 +590,7 @@ impl ExecuteRequestBuilder {
             gold_config: self.gold_config,
             guardian_config: self.guardian_config,
             guardian_spawner: self.guardian_spawner,
+            bash_resume_hook: self.bash_resume_hook,
             app_data_dir: self.app_data_dir,
         }
     }
@@ -629,6 +642,7 @@ impl AgentRuntime {
             gold_config,
             guardian_config,
             guardian_spawner,
+            bash_resume_hook,
             app_data_dir,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
@@ -710,6 +724,7 @@ impl AgentRuntime {
             gold_config,
             guardian_config,
             guardian_spawner,
+            bash_resume_hook,
             // Capture the tool executor's server-level guidance (connected MCP
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.

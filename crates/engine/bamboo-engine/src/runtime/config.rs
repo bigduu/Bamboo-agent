@@ -177,6 +177,32 @@ pub trait GuardianSpawner: Send + Sync {
     ) -> Result<String, String>;
 }
 
+/// Hidden resume-message `runtime_kind` metadata value for a bash-completion
+/// self-resume (issue #84 Phase 2b). Shared by the producer (the self-resume
+/// task that appends the resume message) and the consumer (the suspend-
+/// finalization discriminant arm that preserves it), so a typo in one cannot
+/// desync from the other and silently drop the resume trigger.
+pub const BASH_COMPLETION_RESUME_KIND: &str = "bash_completion_resume";
+
+/// Late-bound hook that arranges a self-resume for a session suspended waiting
+/// on background Bash shells (issue #84 Phase 2b). Injected per-request on
+/// [`AgentLoopConfig`] exactly like [`GuardianSpawner`]; the implementation
+/// lives in the session-app layer (on the completion coordinator) where the
+/// resume port ([`crate::session_app::resume::ResumeExecutionPort`]) is
+/// reachable.
+///
+/// The hook spawns a detached task that **polls the live background-shell
+/// registry** until every captured shell is no longer running, then clears the
+/// wait and resumes the session. Polling — not the one-shot `BashCompleted`
+/// event — is the liveness guarantee: even if a shell completes between the
+/// suspend snapshot and the hook's first poll, or before any event subscriber
+/// exists, the registry will report it as not-running and the session resumes.
+pub trait BashResumeHook: Send + Sync {
+    /// Arrange a detached self-resume for `session_id`, which has just been
+    /// durably suspended waiting on the background shells in `bash_ids`.
+    fn arrange_bash_self_resume(&self, session_id: String, bash_ids: Vec<String>);
+}
+
 /// A child sub-agent's request to have a gated tool approved by its parent.
 ///
 /// A non-bypassed child cannot answer its own permission prompt (no human is
@@ -392,6 +418,12 @@ pub struct AgentLoopConfig {
     /// leaves the guardian gate inert even when `guardian_config.enabled` is set,
     /// since the runner cannot create a child without it. Wired by the server.
     pub(crate) guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
+    /// Late-bound hook that arranges a self-resume for a session suspended
+    /// waiting on background Bash shells (issue #84 Phase 2b). `None` (the
+    /// default) leaves the bash suspend gate inert: the gate refuses to suspend
+    /// without a wired hook, so a session can never strand itself without a
+    /// resume path. Wired by the server (the completion coordinator impl).
+    pub(crate) bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     /// Late-bound delegate that routes a child's gated-tool approval request up
     /// to its parent (Phase 2). `None` (the default) leaves child gating on its
     /// legacy path. Wired by the server.
@@ -471,6 +503,7 @@ impl Default for AgentLoopConfig {
             gold_config: None,
             guardian_config: None,
             guardian_spawner: None,
+            bash_resume_hook: None,
             approval_delegate: None,
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,
