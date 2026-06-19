@@ -677,7 +677,13 @@ fn messages_to_anthropic_json(
             Role::System => system_parts.push(m.content.as_str()),
             Role::User | Role::Assistant | Role::Tool => {
                 let keep_image = Some(idx) == last_image_tool_idx;
-                let msg_json = message_to_anthropic_json(m, keep_image);
+                // `message_to_anthropic_json` returns `None` only for a stray
+                // System message; skip it (rather than emit a null/empty entry)
+                // so a malformed conversation never pollutes the `messages`
+                // array nor crashes the call (issue #22).
+                let Some(msg_json) = message_to_anthropic_json(m, keep_image) else {
+                    continue;
+                };
                 // Merge consecutive Tool messages into the preceding user
                 // message so that all tool_results for a single assistant
                 // tool_use turn live in the *same* user message, as required
@@ -740,13 +746,31 @@ fn message_has_image(message: &Message) -> bool {
 /// `keep_image`: when false, a tool result's images are dropped (replaced by a
 /// short note) so only the most recent screenshot is sent — see
 /// `messages_to_anthropic_json`.
-fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Value {
+///
+/// Returns `None` for a stray `System` message (which should have been routed
+/// into the top-level `system` field by the caller). Skipping it — rather than
+/// panicking — keeps a malformed/legacy conversation from crashing the process
+/// during an LLM call (issue #22). Callers consume this with `filter_map` /
+/// `let-else` so a skipped message is omitted entirely, never turned into a
+/// `null`/empty entry in the `messages` array.
+fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Option<Value> {
     match message.role {
-        Role::System => unreachable!("system messages should be extracted into top-level `system`"),
-        Role::User => json!({
+        // A System message belongs in the top-level `system` field, not the
+        // `messages` array; the caller (`messages_to_anthropic_json`) routes it
+        // there. But a malformed/legacy session loaded from storage, or a future
+        // bug in system extraction, could surface one here — so log and skip it
+        // instead of bringing down the whole process mid-call (issue #22).
+        Role::System => {
+            tracing::warn!(
+                "Anthropic conversion received a System message in the conversation array; \
+                 skipping it (system messages belong in the top-level `system` field)"
+            );
+            None
+        }
+        Role::User => Some(json!({
             "role": "user",
             "content": user_content_to_anthropic_blocks(message),
-        }),
+        })),
         Role::Assistant => {
             let mut blocks: Vec<Value> = Vec::new();
 
@@ -778,17 +802,17 @@ fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Value {
                 }
             }
 
-            json!({
+            Some(json!({
                 "role": "assistant",
                 "content": blocks,
-            })
+            }))
         }
         Role::Tool => {
             let Some(tool_use_id) = message.tool_call_id.as_deref() else {
                 tracing::warn!(
                     "Anthropic conversion received tool message without tool_call_id; emitting plain text block"
                 );
-                return json!({
+                return Some(json!({
                     "role": "user",
                     "content": [
                         {
@@ -796,7 +820,7 @@ fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Value {
                             "text": message.content,
                         }
                     ],
-                });
+                }));
             };
 
             // Tool results that carry images (e.g. an MCP `screenshot`) embed the
@@ -836,7 +860,7 @@ fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Value {
                 json!(message.content)
             };
 
-            json!({
+            Some(json!({
                 "role": "user",
                 "content": [
                     {
@@ -845,7 +869,7 @@ fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Value {
                         "content": tool_result_content,
                     }
                 ],
-            })
+            }))
         }
     }
 }
@@ -1491,7 +1515,8 @@ mod anthropic_request_building {
                 data: "AAAA".to_string(),
             }],
         );
-        let v = super::message_to_anthropic_json(&msg, true);
+        let v =
+            super::message_to_anthropic_json(&msg, true).expect("tool message should serialize");
         let block = &v["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "toolu_1");
@@ -1514,7 +1539,8 @@ mod anthropic_request_building {
     fn tool_result_without_image_stays_plain_string() {
         // Regression: text-only tool results keep the cheap string form.
         let msg = Message::tool_result("toolu_2", "plain text");
-        let v = super::message_to_anthropic_json(&msg, true);
+        let v =
+            super::message_to_anthropic_json(&msg, true).expect("tool message should serialize");
         assert_eq!(v["content"][0]["type"], "tool_result");
         assert_eq!(v["content"][0]["content"], "plain text");
     }
@@ -1532,11 +1558,206 @@ mod anthropic_request_building {
                 data: "OLD".to_string(),
             }],
         );
-        let v = super::message_to_anthropic_json(&msg, false);
+        let v =
+            super::message_to_anthropic_json(&msg, false).expect("tool message should serialize");
         let content = &v["content"][0]["content"];
         // No image block — content is a plain string with the omission note.
         assert!(content.is_string(), "dropped image should leave a string");
         assert!(content.as_str().unwrap().contains("omitted"));
+    }
+
+    #[test]
+    fn stray_system_message_is_skipped_not_panicked() {
+        // Regression for issue #22: a System message reaching the per-message
+        // serializer (a malformed/legacy session loaded from storage, or a future
+        // bug in system extraction) must NOT panic the process. It is logged and
+        // dropped (None), and the surrounding User/Assistant messages survive
+        // intact in the resulting Anthropic `messages` array.
+        use serde_json::Value;
+
+        // (a) Direct: a System message serializes to None instead of panicking.
+        let system_msg = Message::system("You are a robot.");
+        assert!(
+            super::message_to_anthropic_json(&system_msg, true).is_none(),
+            "a System message must serialize to None (skipped), not panic"
+        );
+
+        // (b) In context: the conversation array is consumed the way an
+        // Option-returning serializer should be — None entries are filtered out
+        // (filter_map), the rest survive. Reaching these assertions also proves
+        // the System message did NOT panic.
+        let conversation = [
+            Message::system("You are a robot."),
+            Message::user("Hello"),
+            Message::assistant("Hi there!", None),
+        ];
+        let serialized: Vec<Value> = conversation
+            .iter()
+            .filter_map(|m| super::message_to_anthropic_json(m, true))
+            .collect();
+
+        // The System message is omitted; User + Assistant survive, in order.
+        assert_eq!(
+            serialized.len(),
+            2,
+            "system message must be skipped, leaving user + assistant"
+        );
+        assert_eq!(serialized[0]["role"], "user");
+        assert_eq!(serialized[0]["content"][0]["text"], "Hello");
+        assert_eq!(serialized[1]["role"], "assistant");
+        // No null/placeholder entry sneaks in for the skipped system message.
+        assert!(
+            serialized.iter().all(|m| !m.is_null()),
+            "a skipped system message must be omitted, not emitted as null"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_stray_system_on_production_path() {
+        // Regression for issue #22, but exercising the REAL production path.
+        // `messages_to_anthropic_json` is the function `build_anthropic_request`
+        // actually calls; unlike the synthetic `filter_map` consumer in
+        // `stray_system_message_is_skipped_not_panicked`, this runs the
+        // provider's own System-routing arm (→ top-level `system` field) AND
+        // the let-else skip + out_ids population, so it catches regressions in
+        // how the two are wired together.
+        let system = Message::system("You are a robot.");
+        let user = Message::user("Hello");
+        let assistant = Message::assistant("Hi there!", None);
+
+        // Capture the originating ids so we can assert out_ids tracks them
+        // exactly — the System message's id must NOT appear in out_ids.
+        let user_id = user.id.clone();
+        let assistant_id = assistant.id.clone();
+
+        let messages = [system, user, assistant];
+        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+
+        // (a) The System message is routed into the top-level `system` field.
+        let system_value =
+            system_val.expect("the System message must populate the top-level `system` field");
+        let system_arr = system_value
+            .as_array()
+            .expect("`system` should be an array of text blocks");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0]["type"], "text");
+        assert_eq!(system_arr[0]["text"], "You are a robot.");
+
+        // (b) The `messages` array omits the System message entirely — no null
+        // entry, order preserved, User then Assistant.
+        assert_eq!(
+            out.len(),
+            2,
+            "system message must be skipped, leaving user + assistant"
+        );
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"][0]["type"], "text");
+        assert_eq!(out[0]["content"][0]["text"], "Hello");
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "a skipped system message must be omitted, not emitted as null"
+        );
+
+        // (c) out_ids mirrors the surviving messages 1:1 — the System message's
+        // id is absent, the User/Assistant ids are present in order.
+        assert_eq!(out_ids.len(), 2);
+        assert_eq!(out_ids[0], user_id);
+        assert_eq!(out_ids[1], assistant_id);
+
+        // (d) KEY INVARIANT: the parallel id vector stays in lockstep with the
+        // messages array, so cache-breakpoint placement by id never desyncs.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_multiple_stray_system_messages() {
+        // Every stray System message is routed to the top-level `system` field;
+        // none survives into the `messages` array, no matter how many appear.
+        let messages = [
+            Message::system("Rule one."),
+            Message::system("Rule two."),
+            Message::user("Hello"),
+            Message::assistant("Hi!", None),
+        ];
+        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+
+        // Both system messages are joined into the system field.
+        let system_value =
+            system_val.expect("system messages must populate the top-level `system` field");
+        let system_arr = system_value
+            .as_array()
+            .expect("`system` should be an array of text blocks");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0]["text"], "Rule one.\n\nRule two.");
+
+        // Only User + Assistant survive in the messages array.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "skipped system messages must be omitted, not emitted as null"
+        );
+
+        // Parity invariant holds with multiple skipped messages.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_system_between_tool_use_and_result() {
+        // A stray System message wedged between an assistant tool_use and its
+        // tool_result must be routed to `system` and NOT break the pairing:
+        // tool_use and tool_result stay adjacent in the messages array.
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"rust"}"#.to_string(),
+            },
+        };
+        let messages = [
+            Message::assistant("", Some(vec![tool_call])),
+            Message::system("mid-conversation system"),
+            Message::tool_result("call_1", "found it"),
+        ];
+        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+
+        // The wedged System message is routed to the system field, not dropped.
+        assert!(
+            system_val.is_some(),
+            "the mid-conversation System message must populate the `system` field"
+        );
+
+        // Two messages survive, adjacent and paired: assistant tool_use then
+        // user tool_result referencing the same tool_use_id.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"][0]["type"], "tool_use");
+        assert_eq!(out[0]["content"][0]["id"], "call_1");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][0]["type"], "tool_result");
+        assert_eq!(out[1]["content"][0]["tool_use_id"], "call_1");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "skipped system message must be omitted, not emitted as null"
+        );
+
+        // Parity invariant holds even with the interleaved System message.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
     }
 
     #[test]
