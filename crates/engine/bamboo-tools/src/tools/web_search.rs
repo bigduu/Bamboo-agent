@@ -35,6 +35,13 @@ fn search_cache() -> &'static RwLock<HashMap<String, CachedSearch>> {
     SEARCH_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+// Static, compile-time-constant patterns: compile each exactly once and reuse.
+// `expect` is safe here because the patterns are hardcoded and verified valid.
+static LINK_RE: OnceLock<Regex> = OnceLock::new();
+static TAG_RE: OnceLock<Regex> = OnceLock::new();
+static SNIPPET_RE: OnceLock<Regex> = OnceLock::new();
+static HREF_RE: OnceLock<Regex> = OnceLock::new();
+
 pub struct WebSearchTool;
 
 impl WebSearchTool {
@@ -245,21 +252,20 @@ impl Tool for WebSearchTool {
             .map(|value| value.to_ascii_lowercase())
             .collect();
 
-        let link_re = Regex::new(r#"<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
-            .map_err(|e| {
-            ToolError::Execution(format!("Failed to compile link regex: {}", e))
-        })?;
-        let tag_re = Regex::new(r"(?is)<[^>]+>")
-            .map_err(|e| ToolError::Execution(format!("Failed to compile tag regex: {}", e)))?;
-        let snippet_re =
+        let link_re = LINK_RE.get_or_init(|| {
+            Regex::new(r#"<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
+                .expect("valid static regex")
+        });
+        let tag_re =
+            TAG_RE.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid static regex"));
+        let snippet_re = SNIPPET_RE.get_or_init(|| {
             Regex::new(r#"<a[^>]*class="result__snippet"[^>]*href="[^"]*"[^>]*>(.*?)</a>"#)
-                .map_err(|e| {
-                    ToolError::Execution(format!("Failed to compile snippet regex: {}", e))
-                })?;
+                .expect("valid static regex")
+        });
 
         // Build a map of snippet content by href (to match with result links)
-        let href_re = Regex::new(r#"href="([^"]+)""#)
-            .map_err(|e| ToolError::Execution(format!("Failed to compile href regex: {}", e)))?;
+        let href_re =
+            HREF_RE.get_or_init(|| Regex::new(r#"href="([^"]+)""#).expect("valid static regex"));
         let mut snippets: HashMap<String, String> = HashMap::new();
         for cap in snippet_re.captures_iter(&html) {
             if let Some(href_cap) = cap.get(0) {
