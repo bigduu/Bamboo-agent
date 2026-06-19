@@ -79,6 +79,11 @@ impl GeminiProvider {
     fn build_headers(&self, endpoint: &str, model: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // Authenticate via header rather than a `?key=` URL query parameter so
+        // the API key never leaks into HTTP/proxy/debug logs (issue #12).
+        if let Ok(value) = HeaderValue::from_str(&self.api_key) {
+            headers.insert("x-goog-api-key", value);
+        }
         request_overrides::apply_overrides_to_header_map(
             &mut headers,
             self.request_overrides.as_ref(),
@@ -159,11 +164,8 @@ impl LLMProvider for GeminiProvider {
         let mut applied_thinking_budget =
             reasoning_effort.and_then(Self::thinking_budget_for_effort);
 
-        // Build URL with query param authentication
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?key={}",
-            self.base_url, model, self.api_key
-        );
+        // Auth is supplied via the x-goog-api-key header (see build_headers).
+        let url = format!("{}/models/{}:streamGenerateContent", self.base_url, model);
 
         let build_request = |effort: Option<ReasoningEffort>| -> Result<GeminiRequest> {
             // Convert messages using the new protocol system
@@ -363,11 +365,7 @@ impl LLMProvider for GeminiProvider {
 
     async fn list_models(&self) -> Result<Vec<String>> {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None);
-        let url = format!(
-            "{}/models?key={}",
-            self.base_url.trim_end_matches('/'),
-            self.api_key
-        );
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
     }
 }
@@ -406,14 +404,49 @@ mod tests {
         let provider =
             GeminiProvider::new("my_api_key_123").with_base_url("https://test.api.com/v1beta");
 
-        // This verifies URL construction logic
-        let expected_url = "https://test.api.com/v1beta/models/gemini-custom:streamGenerateContent?key=my_api_key_123";
+        // The API key must NOT appear in the URL; auth is sent via the
+        // x-goog-api-key header (see test_build_headers_sends_api_key).
         let constructed_url = format!(
-            "{}/models/{}:streamGenerateContent?key={}",
-            provider.base_url, "gemini-custom", provider.api_key
+            "{}/models/{}:streamGenerateContent",
+            provider.base_url, "gemini-custom"
         );
 
-        assert_eq!(constructed_url, expected_url);
+        assert_eq!(
+            constructed_url,
+            "https://test.api.com/v1beta/models/gemini-custom:streamGenerateContent"
+        );
+        assert!(
+            !constructed_url.contains("key="),
+            "API key must not be embedded in the URL"
+        );
+    }
+
+    /// Header-based auth: the API key travels in `x-goog-api-key`, never in the
+    /// URL query string (issue #12).
+    #[test]
+    fn test_build_headers_sends_api_key() {
+        let provider = GeminiProvider::new("my_api_key_123");
+
+        let stream_headers =
+            provider.build_headers(request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT, None);
+        assert_eq!(
+            stream_headers
+                .get("x-goog-api-key")
+                .expect("x-goog-api-key header should be set on streamGenerateContent requests")
+                .to_str()
+                .expect("valid header value"),
+            "my_api_key_123"
+        );
+
+        let models_headers = provider.build_headers(request_overrides::ENDPOINT_MODELS, None);
+        assert_eq!(
+            models_headers
+                .get("x-goog-api-key")
+                .expect("x-goog-api-key header should be set on list_models requests")
+                .to_str()
+                .expect("valid header value"),
+            "my_api_key_123"
+        );
     }
 
     // ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========
