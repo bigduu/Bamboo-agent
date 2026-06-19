@@ -19,6 +19,12 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_CAPTURE_BYTES: usize = 512 * 1024;
 
+/// Auto-sync promotion threshold (issue #84, phase 2d). Commands started via the
+/// auto path (`run_in_background` omitted) that are still running after this many
+/// milliseconds are promoted to background instead of continuing to block.
+/// Deliberately generous so virtually all interactive commands stay synchronous.
+const PROMOTE_TO_BACKGROUND_AFTER_MS: u64 = 10_000;
+
 #[derive(Debug, Deserialize)]
 struct BashArgs {
     command: String,
@@ -70,6 +76,22 @@ impl BashTool {
             }
         }
         *truncated = true;
+    }
+
+    /// Append a line to a promotion-seed buffer, draining the oldest entries
+    /// when over the same budget the background registry enforces
+    /// (`bash_runtime::MAX_OUTPUT_LINES`). Keeps a chatty command from ballooning
+    /// memory during the ~10s promotion window (issue #84, phase 2d) — the
+    /// `stdout_buf`/`stderr_buf` capture is byte-capped, but the seed Vecs feed
+    /// the background buffer and must not grow unbounded. Mirrors `push_line`'s
+    /// drain-oldest semantics.
+    fn push_capped_seed_line(buf: &mut Vec<String>, line: String) {
+        buf.push(line);
+        let cap = bash_runtime::MAX_OUTPUT_LINES;
+        if buf.len() > cap {
+            let overflow = buf.len() - cap;
+            buf.drain(0..overflow);
+        }
     }
 
     fn python_diagnostics_json(
@@ -189,10 +211,23 @@ impl BashTool {
         build_command_environment(&overrides).await
     }
 
-    async fn run_foreground(
+    /// Run a command with streaming output (issue #84, phase 2d).
+    ///
+    /// When `promote_after_ms` is `None`, this is pure synchronous foreground:
+    /// blocks until the command completes or the timeout fires — byte-identical
+    /// to the pre-2d `run_foreground` (same streaming, capture, exit code, result).
+    ///
+    /// When `promote_after_ms` is `Some(ms)`, the command starts foreground but
+    /// is auto-promoted to background if still running after `ms` milliseconds.
+    /// Fast commands that finish before the promotion deadline never reach the
+    /// promotion branch, so their behavior is unchanged. Only the promotion
+    /// deadline (not the timeout) triggers the hand-off: a timeout with
+    /// `ms >= timeout_ms` kills the child exactly as before.
+    async fn run_streaming_command(
         &self,
         command: &str,
         timeout_ms: u64,
+        promote_after_ms: Option<u64>,
         cwd: &Path,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
@@ -241,20 +276,32 @@ impl BashTool {
 
         let mut stdout_buf = String::new();
         let mut stderr_buf = String::new();
+        // Individual decoded lines collected for promotion seeding. Only
+        // populated when promotion is enabled — a cheap Vec::push per line that
+        // is never touched on the pure-foreground path.
+        let mut stdout_lines: Vec<String> = Vec::new();
+        let mut stderr_lines: Vec<String> = Vec::new();
         let mut stdout_truncated = false;
         let mut stderr_truncated = false;
         let mut stdout_done = false;
         let mut stderr_done = false;
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let mut timed_out = false;
+
+        // Effective deadline: when promotion is enabled, the earlier of the
+        // promotion threshold and the timeout; otherwise just the timeout.
+        let timeout_deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let effective_deadline = match promote_after_ms {
+            Some(promote_ms) => {
+                (Instant::now() + Duration::from_millis(promote_ms)).min(timeout_deadline)
+            }
+            None => timeout_deadline,
+        };
 
         while !(stdout_done && stderr_done) {
-            if Instant::now() >= deadline {
-                timed_out = true;
+            if Instant::now() >= effective_deadline {
                 break;
             }
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = effective_deadline.saturating_duration_since(Instant::now());
             tokio::select! {
                 line = stdout_reader.read_until(b'\n', &mut stdout_line_bytes), if !stdout_done => {
                     match line {
@@ -262,6 +309,9 @@ impl BashTool {
                         Ok(_) => {
                             let line = decode_process_line_lossy(&mut stdout_line_bytes);
                             Self::append_capped(&mut stdout_buf, &line, &mut stdout_truncated);
+                            if promote_after_ms.is_some() {
+                                Self::push_capped_seed_line(&mut stdout_lines, line.clone());
+                            }
                             ctx.emit_tool_token(format!("{}\n", line)).await;
                         }
                         Err(e) => {
@@ -275,6 +325,9 @@ impl BashTool {
                         Ok(_) => {
                             let line = decode_process_line_lossy(&mut stderr_line_bytes);
                             Self::append_capped(&mut stderr_buf, &line, &mut stderr_truncated);
+                            if promote_after_ms.is_some() {
+                                Self::push_capped_seed_line(&mut stderr_lines, line.clone());
+                            }
                             ctx.emit_tool_token(format!("{}\n", line)).await;
                         }
                         Err(e) => {
@@ -283,39 +336,114 @@ impl BashTool {
                     }
                 }
                 _ = tokio::time::sleep(remaining) => {
-                    timed_out = true;
                     break;
                 }
             }
         }
 
-        let status = if timed_out {
-            let _ = child.kill().await;
-            None
-        } else {
-            Some(
-                child
-                    .wait()
-                    .await
-                    .map_err(|e| ToolError::Execution(format!("Failed waiting command: {}", e)))?,
+        let streams_closed = stdout_done && stderr_done;
+
+        // A promotion fires only when promotion is enabled AND the promotion
+        // threshold is strictly less than the timeout. When promotion is
+        // disabled or timeout <= promote, the deadline firing is a timeout.
+        let promotion_fired =
+            !streams_closed && promote_after_ms.is_some() && promote_after_ms.unwrap() < timeout_ms;
+
+        if streams_closed {
+            // Command completed normally — identical to the pre-2d foreground path.
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| ToolError::Execution(format!("Failed waiting command: {}", e)))?;
+            let exit_code = status.code();
+            let success = exit_code.unwrap_or(-1) == 0;
+            let cwd_display = bamboo_config::paths::path_to_display_string(cwd);
+            let environment = Self::environment_json(&prepared_env.diagnostics, !success);
+
+            return Ok(ToolResult {
+                success,
+                result: json!({
+                    "command": command,
+                    "cwd": cwd_display,
+                    "stdout": stdout_buf,
+                    "stderr": stderr_buf,
+                    "exit_code": exit_code,
+                    "timed_out": false,
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
+                    "environment": environment,
+                })
+                .to_string(),
+                display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
+            });
+        }
+
+        if promotion_fired {
+            // Promotion deadline fired while the child is still running —
+            // hand off the live child to the background registry. Do NOT kill:
+            // pump tasks continue draining and the completion poll emits
+            // BashCompleted when the child exits (issue #84, phase 2d).
+            //
+            // Flush any partial line bytes left by a cancelled `read_until` —
+            // they represent real bytes consumed from the pipe that must not be
+            // lost across the hand-off.
+            if !stdout_line_bytes.is_empty() {
+                let partial = decode_process_line_lossy(&mut stdout_line_bytes);
+                if !partial.is_empty() {
+                    Self::push_capped_seed_line(&mut stdout_lines, partial);
+                }
+            }
+            if !stderr_line_bytes.is_empty() {
+                let partial = decode_process_line_lossy(&mut stderr_line_bytes);
+                if !partial.is_empty() {
+                    Self::push_capped_seed_line(&mut stderr_lines, partial);
+                }
+            }
+
+            let session = bash_runtime::adopt_running_child(
+                child,
+                stdout_reader,
+                stderr_reader,
+                stdout_lines,
+                stderr_lines,
+                command,
+                ctx.session_id.map(str::to_string),
+                prepared_env.diagnostics.clone(),
+                ctx.cloned_sender(),
             )
-        };
+            .await
+            .map_err(ToolError::Execution)?;
 
-        let exit_code = status.and_then(|s| s.code());
-        let success = !timed_out && exit_code.unwrap_or(-1) == 0;
+            return Ok(ToolResult {
+                success: true,
+                result: json!({
+                    "bash_id": session.id,
+                    "command": session.command,
+                    "status": "running",
+                    "cwd": bamboo_config::paths::path_to_display_string(cwd),
+                    "environment": Self::environment_json(&session.environment, false),
+                })
+                .to_string(),
+                display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
+            });
+        }
+
+        // Timeout fired (promotion disabled or timeout <= promote threshold).
+        let _ = child.kill().await;
         let cwd_display = bamboo_config::paths::path_to_display_string(cwd);
-
-        let environment = Self::environment_json(&prepared_env.diagnostics, !success);
+        let environment = Self::environment_json(&prepared_env.diagnostics, true);
 
         Ok(ToolResult {
-            success,
+            success: false,
             result: json!({
                 "command": command,
                 "cwd": cwd_display,
                 "stdout": stdout_buf,
                 "stderr": stderr_buf,
-                "exit_code": exit_code,
-                "timed_out": timed_out,
+                "exit_code": serde_json::Value::Null,
+                "timed_out": true,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
                 "environment": environment,
@@ -340,7 +468,14 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute shell commands with streaming output (supports background mode). Default timeout is 120000ms (max 600000ms); captured stdout/stderr are each capped at 512KB."
+        "Execute shell commands with streaming output (supports background mode). \
+         By default (run_in_background omitted), commands run synchronously but are \
+         auto-promoted to background if they run longer than ~10s — fast commands \
+         behave exactly as foreground. Set run_in_background to false to force \
+         synchronous (block until timeout), or true to force immediate background. \
+         Backgrounded commands are observed via BashOutput and the loop waits for \
+         them at turn end. Default timeout is 120000ms (max 600000ms); captured \
+         stdout/stderr are each capped at 512KB."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -361,7 +496,7 @@ impl Tool for BashTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Set to true to run this command in the background"
+                    "description": "Controls execution mode. Omit (default) for auto: runs synchronously but auto-backgrounds if the command runs longer than ~10s. Set to false to force synchronous (block until timeout). Set to true to force immediate background (observe via BashOutput; the loop waits at turn end)."
                 },
                 "workdir": {
                     "type": "string",
@@ -397,43 +532,67 @@ impl Tool for BashTool {
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
         let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
         let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
-        if parsed.run_in_background.unwrap_or(false) {
-            let shell = bash_runtime::spawn_background(
-                command,
-                Some(&cwd),
-                ctx.cloned_sender(),
-                ctx.session_id.map(str::to_string),
-            )
-            .await
-            .map_err(ToolError::Execution)?;
+        match parsed.run_in_background {
+            Some(true) => {
+                // Force background — spawn immediately (issue #84, phase 1).
+                let shell = bash_runtime::spawn_background(
+                    command,
+                    Some(&cwd),
+                    ctx.cloned_sender(),
+                    ctx.session_id.map(str::to_string),
+                )
+                .await
+                .map_err(ToolError::Execution)?;
 
-            if let Some(requested_timeout) = parsed.timeout {
-                let kill_after_ms = Self::effective_timeout_ms(Some(requested_timeout));
-                let shell_clone = shell.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(kill_after_ms)).await;
-                    if shell_clone.status() == "running" {
-                        let _ = shell_clone.kill().await;
-                    }
-                });
-            }
+                if let Some(requested_timeout) = parsed.timeout {
+                    let kill_after_ms = Self::effective_timeout_ms(Some(requested_timeout));
+                    let shell_clone = shell.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(kill_after_ms)).await;
+                        if shell_clone.status() == "running" {
+                            let _ = shell_clone.kill().await;
+                        }
+                    });
+                }
 
-            return Ok(ToolResult {
-                success: true,
-                result: json!({
-                    "bash_id": shell.id,
-                    "command": shell.command,
-                    "status": "running",
-                    "cwd": bamboo_config::paths::path_to_display_string(&cwd),
-                    "environment": Self::environment_json(&shell.environment, false),
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "bash_id": shell.id,
+                        "command": shell.command,
+                        "status": "running",
+                        "cwd": bamboo_config::paths::path_to_display_string(&cwd),
+                        "environment": Self::environment_json(&shell.environment, false),
+                    })
+                    .to_string(),
+                    display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
-                .to_string(),
-                display_preference: Some("Collapsible".to_string()),
-                images: Vec::new(),
-            });
+            }
+            Some(false) => {
+                // Force synchronous — pure foreground, no promotion (issue #84,
+                // phase 2d). Blocks until the command completes or times out,
+                // exactly like the pre-2d behavior.
+                self.run_streaming_command(command, timeout_ms, None, &cwd, ctx)
+                    .await
+            }
+            None => {
+                // Auto-sync promotion (issue #84, phase 2d). Runs foreground but
+                // promotes to background if still running after the promotion
+                // threshold (~10s). Fast commands finish synchronously. Promotion
+                // is ONLY enabled when the executing loop can actually suspend
+                // for and self-resume a backgrounded shell (`can_async_resume`):
+                // on hook-less paths (schedule / external-child loops) it stays
+                // purely synchronous so a long command's output is never orphaned.
+                let promote_after_ms = if ctx.can_async_resume {
+                    Some(PROMOTE_TO_BACKGROUND_AFTER_MS)
+                } else {
+                    None
+                };
+                self.run_streaming_command(command, timeout_ms, promote_after_ms, &cwd, ctx)
+                    .await
+            }
         }
-
-        self.run_foreground(command, timeout_ms, &cwd, ctx).await
     }
 }
 
@@ -522,6 +681,7 @@ mod tests {
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    can_async_resume: false,
                 },
             )
             .await
@@ -848,6 +1008,7 @@ mod tests {
             &tx,
             &[],
             ToolExecutionSessionFlags::default(),
+            true,
         );
 
         let result = tool
@@ -904,6 +1065,7 @@ mod tests {
                     event_tx: None,
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    can_async_resume: false,
                 },
             )
             .await
@@ -1008,5 +1170,220 @@ mod tests {
             let _ = shell.kill().await;
         }
         let _ = super::bash_runtime::remove_shell(&done.id);
+    }
+
+    // ── Auto-sync promotion tests (issue #84, phase 2d) ──────────────────
+
+    // (a) A fast command via the auto (None) path returns a synchronous result
+    // with stdout + exit_code and no bash_id — identical to the old foreground.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn auto_path_fast_command_returns_synchronous_result() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+        let (tx, _rx) = mpsc::channel(32);
+        let ctx = ToolExecutionContext {
+            session_id: Some("session_auto_fast"),
+            tool_call_id: "call_auto_fast",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+        };
+
+        let result = tool
+            .execute_with_context(json!({ "command": "echo auto-fast-output" }), ctx)
+            .await
+            .expect("auto fast command should succeed");
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert!(
+            payload.get("bash_id").is_none(),
+            "fast auto command must not return a bash_id"
+        );
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["timed_out"], false);
+        assert!(payload["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("auto-fast-output"));
+    }
+
+    // (b) Promotion: with a low test threshold, a long command (sleep) on the
+    // auto path returns a background {bash_id, running} result, the adopted
+    // shell appears in running_shells_for_session, and later emits
+    // BashCompleted with the right id.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn auto_path_promotes_long_command_to_background() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+        let session_id = "session_auto_promote";
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = ToolExecutionContext::for_dispatch(
+            session_id,
+            "call_auto_promote",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags::default(),
+            // `can_async_resume` is irrelevant here — this test drives
+            // promotion directly via run_streaming_command(Some(200)).
+            true,
+        );
+        let cwd = super::workspace_state::workspace_or_process_cwd(Some(session_id));
+
+        // Call run_streaming_command directly with a 200ms promotion threshold
+        // so this test exercises promotion deterministically without depending
+        // on the production 10s default or the None dispatch arm's
+        // `can_async_resume` gating.
+        let result = tool
+            .run_streaming_command("sleep 10", 60000, Some(200), &cwd, ctx)
+            .await
+            .expect("auto promote should succeed");
+
+        assert!(result.success);
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        let bash_id = payload["bash_id"]
+            .as_str()
+            .expect("promoted result must have bash_id")
+            .to_string();
+        assert_eq!(payload["status"], "running");
+
+        let running = super::bash_runtime::running_shells_for_session(session_id);
+        assert!(
+            running.contains(&bash_id),
+            "adopted shell {bash_id} must appear in running_shells, got {running:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("timed out waiting for BashCompleted")
+            .expect("event channel closed before BashCompleted");
+        match event {
+            AgentEvent::BashCompleted {
+                bash_id: id,
+                exit_code,
+                status,
+                ..
+            } => {
+                assert_eq!(id, bash_id);
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(status, "completed");
+            }
+            other => panic!("expected BashCompleted, got {other:?}"),
+        }
+
+        if let Some(shell) = super::bash_runtime::get_shell(&bash_id) {
+            let _ = shell.kill().await;
+        }
+    }
+
+    // (c) run_in_background:Some(false) does NOT promote — blocks/times out
+    // like the pre-2d foreground path.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn force_sync_does_not_promote_and_times_out() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+
+        let result = tool
+            .execute(json!({
+                "command": "sleep 10",
+                "run_in_background": false,
+                "timeout": 50
+            }))
+            .await
+            .expect("force-sync should produce a timed-out result");
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert!(
+            payload.get("bash_id").is_none(),
+            "force-sync must never promote"
+        );
+        assert_eq!(payload["timed_out"], true);
+        assert!(!result.success, "timed-out result must not be successful");
+    }
+
+    // (e) Auto path (run_in_background OMITTED) with can_async_resume == false
+    // also does NOT promote — it runs purely synchronously, exactly like (c),
+    // even though promotion is now the default. This is the hook-less-path guard
+    // (issue #84, phase 2d): a loop that can't suspend+resume a background shell
+    // (schedule path, agent-core loop) must never orphan one via auto-promotion.
+    // `execute()` builds `ToolExecutionContext::none`, whose can_async_resume is
+    // false, so the None dispatch arm passes promote_after_ms = None.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn auto_path_does_not_promote_when_not_resume_capable() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+
+        let result = tool
+            .execute(json!({
+                "command": "sleep 10",
+                "timeout": 50
+            }))
+            .await
+            .expect("non-resume-capable auto path should produce a result");
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert!(
+            payload.get("bash_id").is_none(),
+            "auto path must not promote when can_async_resume is false"
+        );
+        assert_eq!(payload["timed_out"], true);
+        assert!(
+            !result.success,
+            "a timed-out command must not report success"
+        );
+    }
+
+    // (d) adopt_running_child preserves already-captured output: seed lines
+    // appear in subsequent read_output_since calls.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn adopt_running_child_preserves_seeded_output() {
+        prime_test_command_environment();
+        let shell = bamboo_infrastructure::process::preferred_bash_shell();
+        let mut cmd = tokio::process::Command::new(&shell.program);
+        bamboo_infrastructure::process::hide_window_for_tokio_command(&mut cmd);
+        cmd.arg(shell.arg)
+            .arg("echo seeded-line-1; echo seeded-line-2; sleep 5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn child");
+        let stdout_reader = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let stderr_reader = tokio::io::BufReader::new(child.stderr.take().unwrap());
+
+        // Let the echo output land in the pipe buffer before adoption.
+        sleep(Duration::from_millis(200)).await;
+
+        let session = super::bash_runtime::adopt_running_child(
+            child,
+            stdout_reader,
+            stderr_reader,
+            vec!["seeded-line-1".to_string(), "seeded-line-2".to_string()],
+            vec![],
+            "echo seeded-line-1; echo seeded-line-2; sleep 5",
+            Some("session_seed_test".to_string()),
+            test_environment_diagnostics(),
+            None,
+        )
+        .await
+        .expect("adopt should succeed");
+
+        let (lines, _cursor, _dropped) = session.read_output_since(0, None).await;
+        assert!(
+            lines.iter().any(|l| l.contains("seeded-line-1")),
+            "seeded line 1 must be present, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("seeded-line-2")),
+            "seeded line 2 must be present, got {lines:?}"
+        );
+
+        let _ = session.kill().await;
+        let _ = super::bash_runtime::remove_shell(&session.id);
     }
 }

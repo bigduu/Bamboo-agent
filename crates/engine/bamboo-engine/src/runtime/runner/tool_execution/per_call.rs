@@ -148,6 +148,12 @@ pub(super) async fn execute_tool_call_only(
         ctx.event_tx,
         available_tool_schemas.as_slice(),
         ctx.session_flags,
+        // Only let the Bash auto path promote to background when this loop can
+        // actually suspend for and self-resume the shell — i.e. a
+        // `bash_resume_hook` AND persistence are both wired (issue #84, phase
+        // 2d). On hook-less paths (e.g. the schedule loop) this is false, so the
+        // auto path stays synchronous and never orphans a promoted shell.
+        ctx.config.bash_resume_hook.is_some() && ctx.config.persistence.is_some(),
     );
 
     let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context(

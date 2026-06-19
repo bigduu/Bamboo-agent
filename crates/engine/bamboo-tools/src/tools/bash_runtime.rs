@@ -9,14 +9,18 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
-const MAX_OUTPUT_LINES: usize = 20_000;
+/// Per-stream line cap for a background shell's captured output, AND for the
+/// foreground promotion-seed buffers (`bash.rs`). Shared so a chatty command
+/// can't balloon memory before it promotes (issue #84, phase 2d).
+pub(crate) const MAX_OUTPUT_LINES: usize = 20_000;
 const COMPLETED_SESSION_TTL_SECS: u64 = 300;
 
 #[derive(Debug)]
@@ -202,78 +206,170 @@ pub async fn spawn_background(
         });
     }
 
-    {
-        let child = session.child.clone();
-        let session_id_for_gc = shell_id.clone();
-        // Owned copies for the completion signal (issue #84, phase 1).
-        let bash_id_for_event = shell_id.clone();
-        let command_for_event = command.to_string();
-        tokio::spawn(async move {
-            // Determine the terminal status/exit_code, then break out to emit
-            // the completion signal below.
-            let (status_str, exit_code_value) = loop {
-                let poll = {
-                    let mut guard = child.lock().await;
-                    guard.try_wait()
-                };
-                match poll {
-                    Ok(Some(status)) => {
-                        let code = status.code();
-                        *exit_code.lock().await = code;
-                        running.store(false, Ordering::Relaxed);
-                        // A signal/kill/timeout termination yields no numeric
-                        // exit code on Unix — surface that as "killed" rather
-                        // than masking it behind "completed" (issue #84).
-                        break (
-                            if code.is_none() {
-                                "killed"
-                            } else {
-                                "completed"
-                            },
-                            code,
-                        );
-                    }
-                    Ok(None) => {
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                    Err(_) => {
-                        running.store(false, Ordering::Relaxed);
-                        break ("error", None);
-                    }
-                }
-            };
+    spawn_completion_poll(
+        session.child.clone(),
+        shell_id.clone(),
+        command.to_string(),
+        running,
+        exit_code,
+        event_tx,
+    );
 
-            // Phase 1 (issue #84): emit a completion signal so clients can react
-            // to a long-running background command finishing. This is the ONLY
-            // chance to deliver the signal — the poll task emits exactly once,
-            // then sleeps the GC TTL and removes the shell. A non-blocking
-            // `try_send` would silently drop it under a saturated event channel,
-            // so we bound the await instead: wait up to 500ms for room (the emit
-            // runs before the GC sleep, so a short wait never stalls collection),
-            // and fall back to a visible `warn!` if the channel stays full or is
-            // closed. A dropped signal is therefore rare AND observable.
-            if let Some(tx) = &event_tx {
-                let event = AgentEvent::BashCompleted {
-                    bash_id: bash_id_for_event,
-                    command: command_for_event,
-                    exit_code: exit_code_value,
-                    status: status_str.to_string(),
-                };
-                if timeout(Duration::from_millis(500), tx.send(event))
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        bash_id = %session_id_for_gc,
-                        "BashCompleted signal dropped (event channel saturated or closed after 500ms)"
+    sessions().insert(shell_id, session.clone());
+    Ok(session)
+}
+
+/// Shared completion-poll task. Polls the child until it exits, then sets the
+/// exit code/running flags, emits a `BashCompleted` event (when a sender is
+/// wired), and GCs the shell from the registry after the TTL. Used by both
+/// [`spawn_background`] and [`adopt_running_child`] so the poll/emit logic is
+/// never duplicated (issue #84, phase 2d).
+fn spawn_completion_poll(
+    child: Arc<Mutex<Child>>,
+    shell_id: String,
+    command: String,
+    running: Arc<AtomicBool>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+) {
+    let session_id_for_gc = shell_id.clone();
+    let bash_id_for_event = shell_id;
+    let command_for_event = command;
+    tokio::spawn(async move {
+        let (status_str, exit_code_value) = loop {
+            let poll = {
+                let mut guard = child.lock().await;
+                guard.try_wait()
+            };
+            match poll {
+                Ok(Some(status)) => {
+                    let code = status.code();
+                    *exit_code.lock().await = code;
+                    running.store(false, Ordering::Relaxed);
+                    break (
+                        if code.is_none() {
+                            "killed"
+                        } else {
+                            "completed"
+                        },
+                        code,
                     );
                 }
+                Ok(None) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    running.store(false, Ordering::Relaxed);
+                    break ("error", None);
+                }
             }
+        };
 
-            sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
-            let _ = remove_shell(&session_id_for_gc);
+        // Phase 1 (issue #84): emit a completion signal so clients can react
+        // to a long-running background command finishing. This is the ONLY
+        // chance to deliver the signal — the poll task emits exactly once,
+        // then sleeps the GC TTL and removes the shell. A non-blocking
+        // `try_send` would silently drop it under a saturated event channel,
+        // so we bound the await instead (500ms) and fall back to a visible
+        // `warn!` if the channel stays full or closed.
+        if let Some(tx) = &event_tx {
+            let event = AgentEvent::BashCompleted {
+                bash_id: bash_id_for_event,
+                command: command_for_event,
+                exit_code: exit_code_value,
+                status: status_str.to_string(),
+            };
+            if timeout(Duration::from_millis(500), tx.send(event))
+                .await
+                .is_err()
+            {
+                warn!(
+                    bash_id = %session_id_for_gc,
+                    "BashCompleted signal dropped (event channel saturated or closed after 500ms)"
+                );
+            }
+        }
+
+        sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
+        let _ = remove_shell(&session_id_for_gc);
+    });
+}
+
+/// Adopt a child process that was spawned and partially drained by the
+/// foreground streaming loop (auto-sync promotion, issue #84 phase 2d).
+///
+/// Builds a [`ShellSession`] seeded with the already-captured output lines so
+/// they survive the hand-off and appear in subsequent `read_output_since`
+/// calls, then spawns the same pump + completion-poll tasks as
+/// [`spawn_background`] to keep draining the handed-over readers and eventually
+/// emit `BashCompleted`. The poll/emit logic is shared via
+/// [`spawn_completion_poll`] — it is never duplicated between the two entry
+/// points.
+#[allow(clippy::too_many_arguments)]
+pub async fn adopt_running_child(
+    child: Child,
+    stdout_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    stderr_reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    seeded_stdout_lines: Vec<String>,
+    seeded_stderr_lines: Vec<String>,
+    command: &str,
+    session_id: Option<String>,
+    environment: CommandEnvironmentDiagnostics,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+) -> Result<Arc<ShellSession>, String> {
+    let shell_id = uuid::Uuid::new_v4().to_string();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let base_index = Arc::new(Mutex::new(0usize));
+    let running = Arc::new(AtomicBool::new(true));
+    let exit_code = Arc::new(Mutex::new(None));
+
+    // Seed the output buffer with already-captured lines so they are not lost
+    // across the foreground→background hand-off. Lines captured by the
+    // foreground phase are pushed here; the pump tasks below will append any
+    // subsequent output produced after promotion.
+    for line in seeded_stdout_lines.iter().chain(seeded_stderr_lines.iter()) {
+        push_line(&output, &base_index, line.clone()).await;
+    }
+
+    let session = Arc::new(ShellSession {
+        id: shell_id.clone(),
+        command: command.to_string(),
+        session_id,
+        environment,
+        child: Arc::new(Mutex::new(child)),
+        output: output.clone(),
+        base_index: base_index.clone(),
+        running: running.clone(),
+        exit_code: exit_code.clone(),
+    });
+
+    // Spawn pump tasks to continue draining the handed-over readers. The
+    // readers may still hold buffered data from the foreground phase — wrapping
+    // them in a new BufReader (as pump_stream_lines does) reads through that
+    // buffer first, so no data is lost or double-counted.
+    {
+        let output = output.clone();
+        let base_index = base_index.clone();
+        tokio::spawn(async move {
+            pump_stream_lines("stdout", stdout_reader, output, base_index).await;
         });
     }
+    {
+        let output = output.clone();
+        let base_index = base_index.clone();
+        tokio::spawn(async move {
+            pump_stream_lines("stderr", stderr_reader, output, base_index).await;
+        });
+    }
+
+    spawn_completion_poll(
+        session.child.clone(),
+        shell_id.clone(),
+        command.to_string(),
+        running,
+        exit_code,
+        event_tx,
+    );
 
     sessions().insert(shell_id, session.clone());
     Ok(session)

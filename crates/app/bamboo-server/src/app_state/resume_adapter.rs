@@ -213,6 +213,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         event_tx: Some(&mpsc_tx),
                         available_tool_schemas: None,
                         bypass_permissions: false,
+                        can_async_resume: false,
                     };
                     executor.execute_with_context(&tool_call, ctx).await
                 };
