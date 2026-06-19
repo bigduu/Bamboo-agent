@@ -99,6 +99,7 @@ fn default_builtin_executor() -> &'static BuiltinToolExecutor {
 pub enum BuiltinTool {
     ConclusionWithOptions,
     Bash,
+    BashInput,
     BashOutput,
     Edit,
     EnterPlanMode,
@@ -123,9 +124,10 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 22] = [
+    pub const ALL: [BuiltinTool; 23] = [
         BuiltinTool::ConclusionWithOptions,
         BuiltinTool::Bash,
+        BuiltinTool::BashInput,
         BuiltinTool::BashOutput,
         BuiltinTool::Edit,
         BuiltinTool::EnterPlanMode,
@@ -153,6 +155,7 @@ impl BuiltinTool {
         match self {
             BuiltinTool::ConclusionWithOptions => "conclusion_with_options",
             BuiltinTool::Bash => "Bash",
+            BuiltinTool::BashInput => "BashInput",
             BuiltinTool::BashOutput => "BashOutput",
             BuiltinTool::Edit => "Edit",
             BuiltinTool::EnterPlanMode => "EnterPlanMode",

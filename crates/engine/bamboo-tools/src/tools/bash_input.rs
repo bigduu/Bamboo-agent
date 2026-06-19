@@ -11,6 +11,11 @@ struct BashInputArgs {
     input: String,
     #[serde(default = "default_append_newline")]
     append_newline: bool,
+    /// When true, send EOF (close stdin) after writing `input`. Lets a
+    /// consumer that reads stdin until EOF (`cat`, `sort`, a REPL) finish
+    /// instead of running until killed.
+    #[serde(default)]
+    eof: bool,
 }
 
 fn default_append_newline() -> bool {
@@ -42,7 +47,10 @@ impl Tool for BashInputTool {
          The shell must have been spawned with Bash(interactive=true), which \
          gives it a piped stdin; non-interactive shells have no stdin pipe and \
          this tool returns an error. By default a trailing newline is appended \
-         so the input is delivered as a complete line."
+         so the input is delivered as a complete line. Set eof to true to send \
+         end-of-input (close stdin) after writing; a consumer that reads stdin \
+         until EOF (e.g. cat, sort, a REPL) can then terminate normally. The \
+         input is written as its UTF-8 bytes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -59,7 +67,11 @@ impl Tool for BashInputTool {
                 },
                 "append_newline": {
                     "type": "boolean",
-                    "description": "Append a trailing newline to the input (default true). Set to false to send raw bytes without a line terminator."
+                    "description": "Append a trailing newline to the input (default true). Set to false to send the input as UTF-8 bytes without a line terminator."
+                },
+                "eof": {
+                    "type": "boolean",
+                    "description": "After writing `input`, close the shell's stdin (send EOF) so a consumer that reads until end-of-file (e.g. cat, sort, a REPL) can finish. Default false. When eof is true, an empty `input` is allowed (sends EOF only)."
                 }
             },
             "required": ["bash_id", "input"],
@@ -71,9 +83,13 @@ impl Tool for BashInputTool {
         let parsed: BashInputArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid BashInput args: {}", e)))?;
 
-        if parsed.input.is_empty() && !parsed.append_newline {
+        // Empty input is only meaningful when sending EOF (close_stdin) —
+        // otherwise a write of zero bytes with no newline is a no-op and almost
+        // certainly a caller mistake.
+        if parsed.input.is_empty() && !parsed.append_newline && !parsed.eof {
             return Err(ToolError::InvalidArguments(
-                "'input' must not be empty when append_newline is false".to_string(),
+                "'input' must not be empty unless eof is true (or append_newline is true)"
+                    .to_string(),
             ));
         }
 
@@ -81,21 +97,40 @@ impl Tool for BashInputTool {
             ToolError::Execution(format!("Background shell '{}' not found", parsed.bash_id))
         })?;
 
-        shell
-            .write_stdin(&parsed.input, parsed.append_newline)
-            .await
-            .map_err(ToolError::Execution)?;
+        // Write any provided input first. When `input` is empty and no newline
+        // is requested there is nothing to write — skip straight to the optional
+        // EOF so an "eof only" call is a clean close rather than a zero-byte
+        // write.
+        let mut bytes_written = 0usize;
+        if !parsed.input.is_empty() || parsed.append_newline {
+            shell
+                .write_stdin(&parsed.input, parsed.append_newline)
+                .await
+                .map_err(ToolError::Execution)?;
+            bytes_written = if parsed.append_newline {
+                parsed.input.len() + 1
+            } else {
+                parsed.input.len()
+            };
+        }
+
+        // Optionally close stdin (send EOF) so a consumer that reads until
+        // end-of-file can terminate normally. Done after the write so the bytes
+        // are flushed before the pipe is closed.
+        let stdin_closed = if parsed.eof {
+            shell.close_stdin().await;
+            true
+        } else {
+            false
+        };
 
         Ok(ToolResult {
             success: true,
             result: json!({
                 "bash_id": shell.id,
                 "status": shell.status(),
-                "bytes_written": if parsed.append_newline {
-                    parsed.input.len() + 1
-                } else {
-                    parsed.input.len()
-                },
+                "bytes_written": bytes_written,
+                "stdin_closed": stdin_closed,
             })
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
@@ -326,26 +361,28 @@ mod tests {
         let _ = bash_runtime::remove_shell(&shell.id);
     }
 
-    // append_newline=false sends raw bytes without a trailing newline.
+    // append_newline=false sends the input as UTF-8 bytes without a trailing
+    // newline. (It is NOT arbitrary binary — `input` is a JSON String, so it is
+    // validated UTF-8.)
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
-    async fn bash_input_append_newline_false_sends_raw_bytes() {
+    async fn bash_input_append_newline_false_sends_utf8_bytes() {
         prime_test_command_environment();
         let shell = bash_runtime::spawn_background("cat", None, None, None, true)
             .await
             .expect("spawn interactive shell");
 
         let tool = BashInputTool::new();
-        // Send "raw-payload" with no newline; cat won't produce a line until it
+        // Send "utf8-payload" with no newline; cat won't produce a line until it
         // gets one, so send a second write WITH newline to flush it.
         let result = tool
             .execute(json!({
                 "bash_id": shell.id,
-                "input": "raw-payload",
+                "input": "utf8-payload",
                 "append_newline": false
             }))
             .await
-            .expect("raw write should succeed");
+            .expect("utf-8 write should succeed");
         assert!(result.success);
 
         // Now send a newline so cat emits the buffered line.
@@ -356,7 +393,7 @@ mod tests {
         .await
         .expect("newline write should succeed");
 
-        wait_for_output_contains(&shell, "raw-payload", 5).await;
+        wait_for_output_contains(&shell, "utf8-payload", 5).await;
 
         let _ = shell.kill().await;
         let _ = bash_runtime::remove_shell(&shell.id);
@@ -374,6 +411,85 @@ mod tests {
             }))
             .await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    // eof:true writes any input then closes stdin, so an interactive `cat`
+    // (which echoes stdin until EOF) reaches end-of-file and terminates — its
+    // status flips to "completed" and the echoed input is captured.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_input_eof_closes_stdin_and_lets_consumer_terminate() {
+        prime_test_command_environment();
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+            .await
+            .expect("spawn interactive shell");
+
+        let tool = BashInputTool::new();
+        let result = tool
+            .execute(json!({
+                "bash_id": shell.id,
+                "input": "line-one",
+                "eof": true,
+            }))
+            .await
+            .expect("eof write should succeed");
+        assert!(result.success);
+        // We reported the line write and the close.
+        assert!(
+            result.result.contains("\"stdin_closed\":true"),
+            "result should report stdin closed: {}",
+            result.result
+        );
+
+        // `cat` reads until EOF; closing stdin lets it finish instead of hanging.
+        wait_for_output_contains(&shell, "line-one", 5).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if shell.status() == "completed" {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("interactive cat must terminate on EOF, not hang");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        let _ = bash_runtime::remove_shell(&shell.id);
+    }
+
+    // eof:true with empty input is accepted (sends EOF only, no payload).
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_input_eof_allows_empty_input() {
+        prime_test_command_environment();
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+            .await
+            .expect("spawn interactive shell");
+
+        let tool = BashInputTool::new();
+        let result = tool
+            .execute(json!({
+                "bash_id": shell.id,
+                "input": "",
+                "eof": true,
+            }))
+            .await
+            .expect("eof-only write should succeed");
+        assert!(result.success);
+
+        // With stdin closed, `cat` reaches EOF and exits — it must not hang.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if shell.status() == "completed" {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("interactive cat must terminate on EOF, not hang");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        let _ = bash_runtime::remove_shell(&shell.id);
     }
 
     // The default append_newline is true (serde default function).

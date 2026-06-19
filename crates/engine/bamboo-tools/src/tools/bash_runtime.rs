@@ -23,6 +23,10 @@ use tracing::warn;
 /// can't balloon memory before it promotes (issue #84, phase 2d).
 pub(crate) const MAX_OUTPUT_LINES: usize = 20_000;
 const COMPLETED_SESSION_TTL_SECS: u64 = 300;
+/// Upper bound on a single `write_stdin` so a wedged consumer (full pipe
+/// buffer, child not draining) cannot pin the stdin mutex — and thus block any
+/// queued writer — indefinitely. A timeout surfaces a clear error instead.
+const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct ShellSession {
@@ -116,15 +120,43 @@ impl ShellSession {
         if append_newline {
             bytes.push(b'\n');
         }
-        stdin
-            .write_all(&bytes)
+        // Bound the write+flush so a consumer that has stopped reading (full
+        // pipe buffer) cannot hold the stdin mutex — and thus block any queued
+        // writer — forever. A timeout surfaces a clear error instead of a hang.
+        timeout(STDIN_WRITE_TIMEOUT, stdin.write_all(&bytes))
             .await
+            .map_err(|_| {
+                format!(
+                    "Timed out after {}s writing to stdin of shell '{}' (consumer not draining)",
+                    STDIN_WRITE_TIMEOUT.as_secs(),
+                    self.id
+                )
+            })?
             .map_err(|e| format!("Failed to write to stdin of shell '{}': {}", self.id, e))?;
-        stdin
-            .flush()
+        timeout(STDIN_WRITE_TIMEOUT, stdin.flush())
             .await
+            .map_err(|_| {
+                format!(
+                    "Timed out after {}s flushing stdin of shell '{}'",
+                    STDIN_WRITE_TIMEOUT.as_secs(),
+                    self.id
+                )
+            })?
             .map_err(|e| format!("Failed to flush stdin of shell '{}': {}", self.id, e))?;
         Ok(())
+    }
+
+    /// Close the retained stdin pipe (issue #89), sending end-of-file to the
+    /// child. Dropping the `ChildStdin` handle closes the pipe's write end, so
+    /// a consumer that reads stdin until EOF (e.g. `cat`, `sort`, a REPL) can
+    /// terminate normally instead of running until killed.
+    ///
+    /// Idempotent: a no-op on a non-interactive shell (stdin was already
+    /// `None`) or one whose stdin was already closed. Returns `true` when a
+    /// handle was actually taken (i.e. this was an interactive shell whose
+    /// stdin was still open), `false` otherwise, so callers can distinguish.
+    pub async fn close_stdin(&self) -> bool {
+        self.stdin.lock().await.take().is_some()
     }
 }
 
