@@ -5,9 +5,17 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use std::net::IpAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const MAX_RESPONSE_BYTES: usize = 1_000_000;
+
+// Static, compile-time-constant patterns: compile each exactly once and reuse.
+// `expect` is safe here because the patterns are hardcoded and verified valid.
+static SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
+static STYLE_RE: OnceLock<Regex> = OnceLock::new();
+static TAG_RE: OnceLock<Regex> = OnceLock::new();
+static WHITESPACE_RE: OnceLock<Regex> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct WebFetchArgs {
@@ -23,15 +31,16 @@ impl WebFetchTool {
     }
 
     fn strip_html(input: &str) -> Result<String, ToolError> {
-        let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>")
-            .map_err(|e| ToolError::Execution(format!("Failed to compile script regex: {}", e)))?;
-        let style_re = Regex::new(r"(?is)<style[^>]*>.*?</style>")
-            .map_err(|e| ToolError::Execution(format!("Failed to compile style regex: {}", e)))?;
-        let tag_re = Regex::new(r"(?is)<[^>]+>")
-            .map_err(|e| ToolError::Execution(format!("Failed to compile tag regex: {}", e)))?;
-        let whitespace_re = Regex::new(r"[ \t\n\r]+").map_err(|e| {
-            ToolError::Execution(format!("Failed to compile whitespace regex: {}", e))
-        })?;
+        let script_re = SCRIPT_RE.get_or_init(|| {
+            Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("valid static regex")
+        });
+        let style_re = STYLE_RE.get_or_init(|| {
+            Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("valid static regex")
+        });
+        let tag_re =
+            TAG_RE.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid static regex"));
+        let whitespace_re =
+            WHITESPACE_RE.get_or_init(|| Regex::new(r"[ \t\n\r]+").expect("valid static regex"));
 
         let without_scripts = script_re.replace_all(input, " ");
         let without_styles = style_re.replace_all(&without_scripts, " ");
@@ -223,6 +232,20 @@ impl Tool for WebFetchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_html_strips_scripts_styles_tags_and_collapses_whitespace() {
+        // Scripts and styles are dropped, tags are stripped, and runs of
+        // whitespace are collapsed to a single space, then trimmed.
+        let html = "<html><head><style>body{color:red}</style></head><body>\
+<script>alert(1)</script><h1>Title</h1><p>Hello   world</p></body></html>";
+        assert_eq!(WebFetchTool::strip_html(html).unwrap(), "Title Hello world");
+
+        // A second call exercises the already-initialized (cached) static regexes
+        // and must produce identical semantics.
+        let html2 = "<div>  <b>A</b>  <i>B</i>  </div>";
+        assert_eq!(WebFetchTool::strip_html(html2).unwrap(), "A B");
+    }
 
     #[test]
     fn disallowed_host_rejects_local_and_private_targets() {
