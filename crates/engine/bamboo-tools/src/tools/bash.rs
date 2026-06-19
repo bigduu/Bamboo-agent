@@ -35,6 +35,8 @@ struct BashArgs {
     #[serde(default)]
     run_in_background: Option<bool>,
     #[serde(default)]
+    interactive: Option<bool>,
+    #[serde(default)]
     workdir: Option<String>,
 }
 
@@ -473,9 +475,12 @@ impl Tool for BashTool {
          auto-promoted to background if they run longer than ~10s — fast commands \
          behave exactly as foreground. Set run_in_background to false to force \
          synchronous (block until timeout), or true to force immediate background. \
-         Backgrounded commands are observed via BashOutput and the loop waits for \
-         them at turn end. Default timeout is 120000ms (max 600000ms); captured \
-         stdout/stderr are each capped at 512KB."
+         Set interactive to true to spawn in the background with a piped stdin so \
+         input can be fed over time via BashInput (interactive implies background; \
+         use it only to answer an interactive prompt). Backgrounded commands are \
+         observed via BashOutput and the loop waits for them at turn end. Default \
+         timeout is 120000ms (max 600000ms); captured stdout/stderr are each \
+         capped at 512KB."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -497,6 +502,10 @@ impl Tool for BashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Controls execution mode. Omit (default) for auto: runs synchronously but auto-backgrounds if the command runs longer than ~10s. Set to false to force synchronous (block until timeout). Set to true to force immediate background (observe via BashOutput; the loop waits at turn end)."
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "description": "Opt-in: spawn the command in the BACKGROUND with a piped stdin so input can be fed over time via BashInput (interactive:true implies run_in_background — returns a bash_id immediately). When omitted/false the command's stdin is closed (Stdio::null), so a command that reads stdin gets immediate EOF — the default behavior is unchanged. Use this only to answer an interactive prompt in a long-running background shell."
                 },
                 "workdir": {
                     "type": "string",
@@ -532,6 +541,50 @@ impl Tool for BashTool {
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
         let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
         let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
+
+        if parsed.interactive == Some(true) {
+            // Interactive (issue #89): spawn in the background with a piped
+            // stdin so the shell can be fed input over time via BashInput.
+            // interactive:true implies run_in_background — return a bash_id
+            // immediately. The non-interactive paths below keep Stdio::null(),
+            // so default EOF-on-read is byte-for-byte unchanged.
+            let shell = bash_runtime::spawn_background(
+                command,
+                Some(&cwd),
+                ctx.cloned_sender(),
+                ctx.session_id.map(str::to_string),
+                true,
+            )
+            .await
+            .map_err(ToolError::Execution)?;
+
+            if let Some(requested_timeout) = parsed.timeout {
+                let kill_after_ms = Self::effective_timeout_ms(Some(requested_timeout));
+                let shell_clone = shell.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(kill_after_ms)).await;
+                    if shell_clone.status() == "running" {
+                        let _ = shell_clone.kill().await;
+                    }
+                });
+            }
+
+            return Ok(ToolResult {
+                success: true,
+                result: json!({
+                    "bash_id": shell.id,
+                    "command": shell.command,
+                    "status": "running",
+                    "interactive": true,
+                    "cwd": bamboo_config::paths::path_to_display_string(&cwd),
+                    "environment": Self::environment_json(&shell.environment, false),
+                })
+                .to_string(),
+                display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
+            });
+        }
+
         match parsed.run_in_background {
             Some(true) => {
                 // Force background — spawn immediately (issue #84, phase 1).
@@ -540,6 +593,7 @@ impl Tool for BashTool {
                     Some(&cwd),
                     ctx.cloned_sender(),
                     ctx.session_id.map(str::to_string),
+                    false,
                 )
                 .await
                 .map_err(ToolError::Execution)?;
@@ -831,7 +885,7 @@ mod tests {
     async fn bash_background_emits_completion_event_with_exit_code() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None)
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -864,7 +918,7 @@ mod tests {
     async fn bash_background_emits_completion_event_for_failing_command() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None)
+        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None, false)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -896,7 +950,7 @@ mod tests {
     async fn bash_background_emits_killed_when_shell_is_killed() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None)
+        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -929,7 +983,7 @@ mod tests {
     #[tokio::test]
     async fn bash_background_without_sender_still_completes() {
         prime_test_command_environment();
-        let shell = super::bash_runtime::spawn_background("true", None, None, None)
+        let shell = super::bash_runtime::spawn_background("true", None, None, None, false)
             .await
             .expect("background shell should spawn");
 
@@ -961,7 +1015,7 @@ mod tests {
         })
         .expect("prefill channel slot");
 
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None)
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false)
             .await
             .expect("background shell should spawn");
 
@@ -1109,6 +1163,7 @@ mod tests {
             None,
             None,
             Some("sess-A".to_string()),
+            false,
         )
         .await
         .expect("spawn a1");
@@ -1117,6 +1172,7 @@ mod tests {
             None,
             None,
             Some("sess-A".to_string()),
+            false,
         )
         .await
         .expect("spawn a2");
@@ -1126,18 +1182,24 @@ mod tests {
             None,
             None,
             Some("sess-B".to_string()),
+            false,
         )
         .await
         .expect("spawn b");
         // An untagged (None) long-running shell.
-        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None)
+        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None, false)
             .await
             .expect("spawn untagged");
         // A sess-A shell that completes immediately — must be excluded once done.
-        let done =
-            super::bash_runtime::spawn_background("true", None, None, Some("sess-A".to_string()))
-                .await
-                .expect("spawn done");
+        let done = super::bash_runtime::spawn_background(
+            "true",
+            None,
+            None,
+            Some("sess-A".to_string()),
+            false,
+        )
+        .await
+        .expect("spawn done");
 
         // Wait for the fast shell to reach "completed" so we exercise the status filter.
         let started = Instant::now();

@@ -10,8 +10,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
@@ -33,6 +34,12 @@ pub struct ShellSession {
     pub session_id: Option<String>,
     pub environment: CommandEnvironmentDiagnostics,
     child: Arc<Mutex<Child>>,
+    /// Retained stdin handle for an interactive shell (issue #89). `Some` only
+    /// when the shell was spawned with `interactive: true` (a piped stdin);
+    /// `None` for every non-interactive shell so the default EOF-on-read
+    /// behavior is byte-for-byte unchanged. Guarded by a Mutex so `write_stdin`
+    /// can borrow it without racing the completion poll.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     output: Arc<Mutex<Vec<String>>>,
     base_index: Arc<Mutex<usize>>,
     running: Arc<AtomicBool>,
@@ -87,6 +94,38 @@ impl ShellSession {
         self.running.store(false, Ordering::Relaxed);
         Ok(())
     }
+
+    /// Write `data` to the shell's retained stdin pipe (issue #89). When
+    /// `append_newline` is true a trailing `\n` is appended so the input is
+    /// delivered as a complete line (e.g. to satisfy a line-oriented prompt).
+    ///
+    /// Returns a clear error — never panics — when the shell was NOT spawned
+    /// interactive (no stdin pipe to write to) or when the write/flush fails
+    /// (the process has exited and the pipe is closed). Callers must not treat
+    /// either case as fatal: a non-interactive shell simply has no stdin, and an
+    /// exited shell's pipe is gone.
+    pub async fn write_stdin(&self, data: &str, append_newline: bool) -> Result<(), String> {
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or_else(|| {
+            format!(
+                "Shell '{}' has no interactive stdin pipe; spawn it via Bash with interactive=true",
+                self.id
+            )
+        })?;
+        let mut bytes = data.as_bytes().to_vec();
+        if append_newline {
+            bytes.push(b'\n');
+        }
+        stdin
+            .write_all(&bytes)
+            .await
+            .map_err(|e| format!("Failed to write to stdin of shell '{}': {}", self.id, e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush stdin of shell '{}': {}", self.id, e))?;
+        Ok(())
+    }
 }
 
 fn sessions() -> &'static DashMap<String, Arc<ShellSession>> {
@@ -137,6 +176,7 @@ pub async fn spawn_background(
     cwd: Option<&Path>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
     session_id: Option<String>,
+    interactive: bool,
 ) -> Result<Arc<ShellSession>, String> {
     let shell = preferred_bash_shell();
     trace_windows_command(
@@ -152,10 +192,17 @@ pub async fn spawn_background(
         cmd.current_dir(cwd);
     }
     prepared_env.apply_to_tokio_command(&mut cmd);
-    cmd.arg(shell.arg)
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+    cmd.arg(shell.arg).arg(command);
+    // Interactive (issue #89): a piped stdin lets callers feed input over time
+    // via `write_stdin`/BashInput. Non-interactive keeps `Stdio::null()` so a
+    // command that reads stdin gets immediate EOF — the default behavior is
+    // byte-for-byte unchanged for every existing path.
+    if interactive {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
@@ -171,6 +218,13 @@ pub async fn spawn_background(
         .stderr
         .take()
         .ok_or_else(|| "Failed to capture shell stderr".to_string())?;
+    // Only take (and store) the stdin handle when spawned interactive; a
+    // non-interactive child never has a stdin pipe to take.
+    let stdin_handle = if interactive {
+        child.stdin.take()
+    } else {
+        None
+    };
 
     let shell_id = uuid::Uuid::new_v4().to_string();
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -184,6 +238,7 @@ pub async fn spawn_background(
         session_id,
         environment: prepared_env.diagnostics.clone(),
         child: Arc::new(Mutex::new(child)),
+        stdin: Arc::new(Mutex::new(stdin_handle)),
         output: output.clone(),
         base_index: base_index.clone(),
         running: running.clone(),
@@ -337,6 +392,9 @@ pub async fn adopt_running_child(
         session_id,
         environment,
         child: Arc::new(Mutex::new(child)),
+        // The foreground streamer always spawns with Stdio::null() (bash.rs), so
+        // a promoted shell has no stdin pipe — None preserves EOF-on-read.
+        stdin: Arc::new(Mutex::new(None)),
         output: output.clone(),
         base_index: base_index.clone(),
         running: running.clone(),

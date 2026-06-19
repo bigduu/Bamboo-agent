@@ -3053,6 +3053,7 @@ mod tests {
             None,
             None,
             Some(session_id.to_string()),
+            false,
         )
         .await
         .expect("spawn");
@@ -3091,6 +3092,7 @@ mod tests {
             None,
             None,
             Some(session_id.to_string()),
+            false,
         )
         .await
         .expect("spawn");
