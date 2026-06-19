@@ -345,7 +345,14 @@ impl ChildCompletionCoordinator {
         )
     }
 
-    async fn resume_parent(&self, parent_session_id: String) {
+    /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers
+    /// can distinguish a successful spawn (`Started`) from a gate-blocked
+    /// attempt (`Completed`). The bash self-resume poll task uses this to
+    /// detect the finalize-clobber case — its appended resume message was
+    /// reverted by the suspending runner's final `merge_save_runtime`, so the
+    /// resume port's `has_pending_user_message` gate fails and nothing spawns —
+    /// and retry the clear→append→resume (see [`Self::bash_self_resume`]).
+    async fn resume_parent(&self, parent_session_id: String) -> ResumeOutcome {
         for attempt in 0..=5u8 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
@@ -353,7 +360,7 @@ impl ChildCompletionCoordinator {
 
             let Some(session) = self.load_session(&parent_session_id).await else {
                 tracing::warn!(%parent_session_id, "cannot resume parent after child completion: session not found");
-                return;
+                return ResumeOutcome::NotFound;
             };
             let config_snapshot = self.config.read().await.clone();
             let resume_config = self.build_resume_config(&session, &config_snapshot);
@@ -366,8 +373,12 @@ impl ChildCompletionCoordinator {
             );
 
             if !matches!(outcome, ResumeOutcome::AlreadyRunning { .. }) {
-                return;
+                return outcome;
             }
+        }
+        // Exhausted the AlreadyRunning retry budget; surface the final state.
+        ResumeOutcome::AlreadyRunning {
+            run_id: String::new(),
         }
     }
 
@@ -757,12 +768,27 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
 /// Hidden resume message for a bash-completion self-resume (issue #84 Phase 2b).
 /// Mirrors [`runtime_resume_message`]'s hidden/compressible shape so the resume
 /// port's `has_pending_user_message` gate is satisfied.
-fn bash_completion_resume_message(bash_ids: &[String]) -> Message {
-    let body = format!(
-        "Runtime notification: all background Bash shell(s) ({}) have completed. \
-         Review their output with BashOutput and resume the task from where you left off.",
-        bash_ids.join(", ")
-    );
+///
+/// `timed_out` selects the wording: the normal path (all shells finished)
+/// announces completion; the deadline path (the 6h+10m wait ceiling was hit with
+/// shells STILL running) must NOT claim the shells completed — it says they may
+/// still be running so the model verifies with BashOutput instead of assuming
+/// success on a false premise.
+fn bash_completion_resume_message(bash_ids: &[String], timed_out: bool) -> Message {
+    let body = if timed_out {
+        format!(
+            "Runtime notification: the background-Bash wait ceiling was reached while one or more \
+             shell(s) ({}) may still be running. The session is being resumed so it is not \
+             stranded; verify their actual status with BashOutput before assuming completion.",
+            bash_ids.join(", ")
+        )
+    } else {
+        format!(
+            "Runtime notification: all background Bash shell(s) ({}) have completed. \
+             Review their output with BashOutput and resume the task from where you left off.",
+            bash_ids.join(", ")
+        )
+    };
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({
         RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
@@ -770,6 +796,27 @@ fn bash_completion_resume_message(bash_ids: &[String]) -> Message {
     }));
     message.never_compress = false;
     message
+}
+
+/// Decide whether the bash self-resume should retry its clear→append→resume
+/// sequence after a resume attempt returned `outcome`, given that the persisted
+/// bash wait is (`true`) / is not (`false`) still set on reload.
+///
+/// Retry **only** when the resume did NOT spawn (`Completed` — no pending user
+/// message, i.e. our resume message was dropped — or `AlreadyRunning`) AND the
+/// persisted bash wait is still set: the signature of the finalize-clobber, where
+/// the suspending runner's one-shot final `merge_save_runtime` lands after our
+/// save and reverts `waiting_for_bash=Some` while dropping our resume message, so
+/// `has_pending_user_message` fails and nothing spawns. `Started` (resume fired)
+/// and `NotFound` (session gone) never retry. Pure helper so the clobber
+/// detection is unit-testable in isolation from async I/O.
+fn bash_resume_should_retry(outcome: &ResumeOutcome, persisted_waiting_for_bash: bool) -> bool {
+    match outcome {
+        ResumeOutcome::Started { .. } | ResumeOutcome::NotFound => false,
+        ResumeOutcome::Completed | ResumeOutcome::AlreadyRunning { .. } => {
+            persisted_waiting_for_bash
+        }
+    }
 }
 
 /// Bash self-resume support (issue #84 Phase 2b).
@@ -780,6 +827,17 @@ impl ChildCompletionCoordinator {
     /// `BashCompleted` event — so even if a shell completed between the suspend
     /// snapshot and this task's first poll, or before any event subscriber
     /// existed, the registry reports it as not-running and the session resumes.
+    ///
+    /// The clear→append→resume is a **bounded retry loop** that closes the
+    /// finalize-clobber strand. The suspending runner's `finalize_task_context`
+    /// runs a full `save_runtime_session` (same `merge_save_runtime`, which
+    /// overwrites the whole `messages` array) AFTER this task is spawned; if it
+    /// lands after ours it reverts `waiting_for_bash=Some` and drops our resume
+    /// message, so `has_pending_user_message` fails and `resume_parent` returns
+    /// `Completed` without spawning. We detect that (persisted wait still set
+    /// after a non-`Started` outcome) and re-clear/re-append/re-resume. It
+    /// converges because the runner's finalize persist is one-shot: once landed,
+    /// our retry's save is the last writer, the message sticks, and resume fires.
     async fn bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
         let poll_interval = Duration::from_millis(200);
         // Hard ceiling: the wait lease (6 h) + the registry GC TTL (5 min) +
@@ -788,6 +846,7 @@ impl ChildCompletionCoordinator {
         let max_poll = Duration::from_secs(6 * 3600 + 600);
         let deadline = tokio::time::Instant::now() + max_poll;
 
+        let mut timed_out = false;
         loop {
             let still_running =
                 bamboo_tools::tools::bash_runtime::running_shells_for_session(&session_id);
@@ -795,6 +854,7 @@ impl ChildCompletionCoordinator {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
                 tracing::warn!(
                     session_id = %session_id,
                     "bash self-resume poll exceeded the wait ceiling; forcing resume"
@@ -804,38 +864,97 @@ impl ChildCompletionCoordinator {
             tokio::time::sleep(poll_interval).await;
         }
 
-        // Shells are done (or the deadline expired). Clear the wait and resume
-        // — but only if the session is still suspended waiting for bash.
-        let Some(mut session) = self.load_session(&session_id).await else {
-            tracing::warn!(%session_id, "bash self-resume: session not found; nothing to resume");
-            return;
-        };
+        // Clobber-retry loop (see the function doc). Bounded: the runner's
+        // finalize persist is one-shot, so once it has landed our retry's save
+        // is the last writer, the resume message sticks, and the resume fires.
+        const MAX_RESUME_ATTEMPTS: u8 = 5;
+        for attempt in 0..MAX_RESUME_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(poll_interval).await;
+            }
 
-        let mut runtime_state = read_runtime_state(&session);
-        if runtime_state.waiting_for_bash.is_none() {
-            // Already resumed (user message, or a prior poll task raced and
-            // resumed first). Nothing to do.
-            tracing::info!(%session_id, "bash self-resume: wait already cleared, skipping");
-            return;
+            let Some(mut session) = self.load_session(&session_id).await else {
+                tracing::warn!(%session_id, "bash self-resume: session not found; nothing to resume");
+                return;
+            };
+
+            let mut runtime_state = read_runtime_state(&session);
+            if runtime_state.waiting_for_bash.is_none() {
+                // Double-resume guard: the wait was already cleared by another
+                // path (a user-driven resume, or a racing duplicate poll task),
+                // or our own prior clear survived a clobber-retry. Do not append
+                // a duplicate message or request a redundant resume.
+                tracing::info!(
+                    %session_id, attempt,
+                    "bash self-resume: persisted bash wait already cleared; nothing to resume"
+                );
+                return;
+            }
+
+            runtime_state.waiting_for_bash = None;
+            runtime_state.status = AgentStatusState::Idle;
+            runtime_state.suspension = None;
+            write_runtime_state(&mut session, &runtime_state);
+            session.metadata.remove("runtime.suspend_reason");
+            session.add_message(bash_completion_resume_message(&bash_ids, timed_out));
+            session.updated_at = Utc::now();
+            self.save_and_cache(&mut session).await;
+            tracing::info!(
+                session_id = %session_id,
+                shell_count = bash_ids.len(),
+                timed_out, attempt,
+                "bash self-resume: cleared bash wait and appended resume message"
+            );
+
+            let outcome = self.resume_parent(session_id.clone()).await;
+            match outcome {
+                ResumeOutcome::Started { .. } => {
+                    tracing::info!(%session_id, attempt, "bash self-resume: resume fired");
+                    return;
+                }
+                ResumeOutcome::NotFound => {
+                    tracing::warn!(%session_id, "bash self-resume: session vanished during resume");
+                    return;
+                }
+                _ => {
+                    // Completed (no pending user message ⇒ our resume message was
+                    // dropped by the runner's finalize persist) or AlreadyRunning.
+                    // Decide via the persisted bash wait: still set ⇒
+                    // finalize-clobber ⇒ retry; cleared ⇒ the session is being
+                    // handled (by us or a concurrent resume) ⇒ stop.
+                    let clobbered = match self.load_session(&session_id).await {
+                        Some(reloaded) => read_runtime_state(&reloaded).waiting_for_bash.is_some(),
+                        None => {
+                            tracing::warn!(
+                                %session_id,
+                                "bash self-resume: session vanished after resume"
+                            );
+                            return;
+                        }
+                    };
+                    if bash_resume_should_retry(&outcome, clobbered) {
+                        tracing::warn!(
+                            %session_id, attempt,
+                            outcome = outcome.as_str(),
+                            "bash self-resume: persisted wait still set after resume (finalize-clobber); retrying"
+                        );
+                        continue;
+                    }
+                    tracing::info!(
+                        %session_id, attempt,
+                        outcome = outcome.as_str(),
+                        "bash self-resume: wait cleared and resume handled; stopping"
+                    );
+                    return;
+                }
+            }
         }
 
-        runtime_state.waiting_for_bash = None;
-        runtime_state.status = AgentStatusState::Idle;
-        runtime_state.suspension = None;
-        write_runtime_state(&mut session, &runtime_state);
-        session.metadata.remove("runtime.suspend_reason");
-
-        session.add_message(bash_completion_resume_message(&bash_ids));
-        session.updated_at = Utc::now();
-        self.save_and_cache(&mut session).await;
-
-        tracing::info!(
-            session_id = %session_id,
-            shell_count = bash_ids.len(),
-            "bash self-resume: all background shells complete, resuming session"
+        tracing::warn!(
+            %session_id,
+            attempts = MAX_RESUME_ATTEMPTS,
+            "bash self-resume: exhausted clobber-retry budget without confirming resume; giving up"
         );
-
-        self.resume_parent(session_id).await;
     }
 }
 
@@ -1068,5 +1187,106 @@ mod tests {
 
             assert_eq!(snapshot.provider, "cached-provider");
         });
+    }
+
+    // ── Bash self-resume (issue #84 Phase 2b): deadline message + clobber-retry ──
+
+    #[test]
+    fn bash_completion_resume_message_normal_announces_completion() {
+        let ids = vec!["bg-1".to_string(), "bg-2".to_string()];
+        let message = bash_completion_resume_message(&ids, false);
+        // Normal path: the shells genuinely finished.
+        assert!(
+            message.content.contains("have completed"),
+            "normal resume message must announce completion: {}",
+            message.content
+        );
+        // Hidden + compressible so the resume gate sees it but the UI hides it.
+        let metadata = message.metadata.expect("metadata present");
+        assert_eq!(
+            metadata
+                .get(RUNTIME_RESUME_MESSAGE_HIDDEN_KEY)
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "resume message must be hidden from the UI"
+        );
+        assert_eq!(
+            metadata
+                .get(RUNTIME_RESUME_MESSAGE_KIND_KEY)
+                .and_then(|v| v.as_str()),
+            Some(BASH_COMPLETION_RESUME_KIND),
+            "resume message must carry the bash-completion kind discriminant"
+        );
+    }
+
+    #[test]
+    fn bash_completion_resume_message_deadline_does_not_claim_completion() {
+        // The 6h+10m deadline force-breaks with shells STILL running. The message
+        // must NOT say "have completed" — that would let the model assume success
+        // on a false premise. It must direct the model to verify with BashOutput.
+        let ids = vec!["bg-long".to_string()];
+        let message = bash_completion_resume_message(&ids, true);
+        assert!(
+            !message.content.contains("have completed"),
+            "deadline resume message must NOT claim the shells completed: {}",
+            message.content
+        );
+        assert!(
+            message.content.contains("may still be running"),
+            "deadline resume message must warn shells may still be running: {}",
+            message.content
+        );
+        assert!(
+            message.content.contains("BashOutput"),
+            "deadline resume message must direct verification via BashOutput: {}",
+            message.content
+        );
+        // Same hidden/kind shape so the resume gate is satisfied identically.
+        let metadata = message.metadata.expect("metadata present");
+        assert_eq!(
+            metadata
+                .get(RUNTIME_RESUME_MESSAGE_KIND_KEY)
+                .and_then(|v| v.as_str()),
+            Some(BASH_COMPLETION_RESUME_KIND)
+        );
+    }
+
+    #[test]
+    fn bash_resume_should_retry_matrix() {
+        // The finalize-clobber retry predicate (issue #84 Phase 2b). Retry only
+        // when the resume did NOT spawn (Completed / AlreadyRunning) AND the
+        // persisted bash wait is still set on reload — the clobber signature.
+
+        // Started: the resume fired — never retry, regardless of persisted state.
+        assert!(!bash_resume_should_retry(
+            &ResumeOutcome::Started { run_id: "r".into() },
+            true
+        ));
+        assert!(!bash_resume_should_retry(
+            &ResumeOutcome::Started { run_id: "r".into() },
+            false
+        ));
+
+        // NotFound: session gone — never retry.
+        assert!(!bash_resume_should_retry(&ResumeOutcome::NotFound, true));
+        assert!(!bash_resume_should_retry(&ResumeOutcome::NotFound, false));
+
+        // Completed + persisted wait still set ⇒ finalize-clobber ⇒ retry.
+        assert!(bash_resume_should_retry(&ResumeOutcome::Completed, true));
+        // Completed + persisted wait cleared ⇒ handled (our message stuck, or a
+        // concurrent resume finished) ⇒ stop.
+        assert!(!bash_resume_should_retry(&ResumeOutcome::Completed, false));
+
+        // AlreadyRunning + persisted wait still set ⇒ clobbered while a runner is
+        // (stale-)active ⇒ retry to re-establish the resume message.
+        assert!(bash_resume_should_retry(
+            &ResumeOutcome::AlreadyRunning { run_id: "r".into() },
+            true
+        ));
+        // AlreadyRunning + wait cleared ⇒ a runner owns the session ⇒ stop.
+        assert!(!bash_resume_should_retry(
+            &ResumeOutcome::AlreadyRunning { run_id: "r".into() },
+            false
+        ));
     }
 }

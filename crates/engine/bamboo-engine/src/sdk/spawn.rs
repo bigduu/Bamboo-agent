@@ -254,6 +254,15 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // dispatch to the composite child runner. The built-in local actor
         // handles the default case; expert `externalAgents` profiles handle
         // roles pinned to other agents. `should_handle` selects the right one.
+        //
+        // The child's `AgentLoopConfig` is assembled by the external runner, not
+        // here, and does not currently wire `bash_resume_hook`. The end-of-turn
+        // bash suspend gate is therefore inert for children — graceful
+        // degradation: a child that leaves a `run_in_background` shell running
+        // simply completes; the shell keeps running detached and stays readable
+        // via BashOutput. No strand can occur because the gate refuses to
+        // suspend without the hook. (The parent-resume path re-wires the hook,
+        // so a RESUMED run is covered; only the initial child run is not.)
         let result: crate::runtime::runner::Result<()> =
             if external_runner.should_handle(&session).await {
                 external_runner

@@ -432,6 +432,12 @@ async fn run_schedule_job(
         // Guardian review is not wired into the schedule path for now.
         guardian_config: None,
         guardian_spawner: None,
+        // No bash self-resume hook on the schedule path: the end-of-turn bash
+        // suspend gate is therefore inert here (it requires a wired hook). This
+        // is graceful degradation — a scheduled run that leaves a
+        // `run_in_background` shell running simply completes; the shell keeps
+        // running detached and stays readable via BashOutput. No strand can
+        // occur because the gate refuses to suspend without the hook.
         bash_resume_hook: None,
         app_data_dir: ctx.app_data_dir.clone(),
         runners: ctx.agent_runners.clone(),
