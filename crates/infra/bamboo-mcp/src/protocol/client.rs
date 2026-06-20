@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
 use crate::error::{McpError, Result};
 use crate::protocol::models::*;
@@ -15,7 +15,28 @@ pub trait McpTransport: Send + Sync {
     async fn connect(&mut self) -> Result<()>;
     async fn disconnect(&mut self) -> Result<()>;
     async fn send(&self, message: String) -> Result<()>;
+
+    /// Returns the inbound message channel receiver for efficient, non-polling
+    /// consumption.
+    ///
+    /// The receiver yields `Some(message)` for each inbound message and `None`
+    /// when the transport disconnects or its background reader task ends (EOF /
+    /// stream error). A consumer that awaits `receiver.recv()` parks with zero
+    /// wakeups while idle — no polling, no sleep, no per-iteration lock.
+    ///
+    /// Should be called once right after [`connect`](Self::connect). Returns
+    /// `None` when the transport is not connected or the receiver was already
+    /// taken. Once taken, [`receive`](Self::receive) is no longer usable.
+    async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>>;
+
+    /// Polls for a single inbound message with a short internal timeout.
+    ///
+    /// This is the legacy receive path retained for backward compatibility and
+    /// unit tests. Production callers should prefer
+    /// [`take_message_receiver`](Self::take_message_receiver) to avoid
+    /// busy-waiting.
     async fn receive(&self) -> Result<Option<String>>;
+
     fn is_connected(&self) -> bool;
 }
 
@@ -50,15 +71,27 @@ impl McpProtocolClient {
     pub async fn connect(&mut self) -> Result<()> {
         let mut transport = self.transport.write().await;
         transport.connect().await?;
+
+        // Take the inbound message receiver once — the handler will own it and
+        // consume messages directly from the channel without touching the
+        // transport (no per-iteration RwLock, no polling, no sleep).
+        let receiver = transport.take_message_receiver().await;
         drop(transport);
 
-        // Start message handler
-        self.start_message_handler();
+        if let Some(receiver) = receiver {
+            self.start_message_handler(receiver);
+        } else {
+            warn!(
+                "Transport did not provide a message receiver; \
+                 message handler will not be started"
+            );
+        }
 
         Ok(())
     }
 
     pub async fn disconnect(&mut self) -> Result<()> {
+        // Abort the handler first so it stops consuming from the channel.
         if let Some(handler) = self.message_handler.take() {
             handler.abort();
         }
@@ -67,39 +100,31 @@ impl McpProtocolClient {
         transport.disconnect().await
     }
 
-    fn start_message_handler(&mut self) {
-        let transport = self.transport.clone();
+    /// Spawns the message handler task that consumes inbound messages directly
+    /// from the channel receiver.
+    ///
+    /// The task parks efficiently on `receiver.recv().await` — zero wakeups
+    /// while idle, no transport lock acquisition, no sleep. It exits cleanly
+    /// when the channel closes (transport disconnected / background reader
+    /// ended) or is aborted during [`disconnect`](Self::disconnect).
+    fn start_message_handler(&mut self, mut receiver: mpsc::Receiver<String>) {
         let pending_requests = self.pending_requests.clone();
         let notification_tx = self.notification_tx.clone();
 
         let handler = tokio::spawn(async move {
-            loop {
-                let transport = transport.read().await;
-                if !transport.is_connected() {
-                    break;
-                }
-
-                match transport.receive().await {
-                    Ok(Some(message)) => {
-                        // Raw inbound wire messages can be extremely noisy and may contain secrets.
-                        trace!("Received message (bytes={})", message.len());
-                        if let Err(e) =
-                            Self::handle_message(&message, &pending_requests, &notification_tx)
-                                .await
-                        {
-                            warn!("Failed to handle message: {}", e);
-                        }
-                    }
-                    Ok(None) => {
-                        // No message available, continue
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                    Err(e) => {
-                        error!("Transport error: {}", e);
-                        break;
-                    }
+            // Await the next message from the channel. When the channel closes
+            // (all senders dropped — transport disconnected, EOF, or shutdown),
+            // `recv()` returns `None` and the loop exits gracefully.
+            while let Some(message) = receiver.recv().await {
+                // Raw inbound wire messages can be extremely noisy and may contain secrets.
+                trace!("Received message (bytes={})", message.len());
+                if let Err(e) =
+                    Self::handle_message(&message, &pending_requests, &notification_tx).await
+                {
+                    warn!("Failed to handle message: {}", e);
                 }
             }
+            trace!("MCP message handler exited (channel closed)");
         });
 
         self.message_handler = Some(handler);
@@ -296,29 +321,46 @@ impl McpProtocolClient {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use tokio::sync::Mutex as TokioMutex;
 
-    // Mock transport for testing
+    // Mock transport for testing — backed by an mpsc channel so that
+    // `take_message_receiver` hands the client a real receiver.
     struct MockTransport {
         connected: bool,
         messages_sent: Arc<RwLock<Vec<String>>>,
-        messages_to_receive: Arc<RwLock<Vec<String>>>,
+        message_rx: TokioMutex<Option<mpsc::Receiver<String>>>,
+        // Holding the sender keeps the channel open (idle handler parks, no EOF).
+        _message_tx: Option<mpsc::Sender<String>>,
     }
 
     impl MockTransport {
         fn new() -> Self {
+            let (tx, rx) = mpsc::channel(100);
             Self {
                 connected: false,
                 messages_sent: Arc::new(RwLock::new(Vec::new())),
-                messages_to_receive: Arc::new(RwLock::new(Vec::new())),
+                message_rx: TokioMutex::new(Some(rx)),
+                _message_tx: Some(tx),
             }
         }
 
         fn with_response(message: String) -> Self {
-            let messages = Arc::new(RwLock::new(vec![message]));
+            Self::with_messages(vec![message])
+        }
+
+        /// Pre-loads `messages` into the channel then drops the sender,
+        /// simulating a server that sends N messages and closes (EOF).
+        fn with_messages(messages: Vec<String>) -> Self {
+            let (tx, rx) = mpsc::channel(100);
+            for msg in &messages {
+                let _ = tx.try_send(msg.clone());
+            }
+            drop(tx);
             Self {
                 connected: false,
                 messages_sent: Arc::new(RwLock::new(Vec::new())),
-                messages_to_receive: messages,
+                message_rx: TokioMutex::new(Some(rx)),
+                _message_tx: None,
             }
         }
     }
@@ -341,12 +383,23 @@ mod tests {
             Ok(())
         }
 
+        async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
+            self.message_rx.lock().await.take()
+        }
+
         async fn receive(&self) -> Result<Option<String>> {
-            let mut messages = self.messages_to_receive.write().await;
-            if messages.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(messages.remove(0)))
+            let mut guard = self.message_rx.lock().await;
+            match guard.as_mut() {
+                None => Err(McpError::Disconnected),
+                Some(rx) => {
+                    match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv())
+                        .await
+                    {
+                        Ok(Some(msg)) => Ok(Some(msg)),
+                        Ok(None) => Err(McpError::Disconnected),
+                        Err(_) => Ok(None),
+                    }
+                }
             }
         }
 
@@ -462,5 +515,51 @@ mod tests {
         let result = rx2.blocking_recv().unwrap().unwrap();
         assert_eq!(result.id, 1);
         assert!(result.result.is_some());
+    }
+
+    /// Verifies that the channel-based handler delivers N messages in order
+    /// and exits cleanly when the channel closes (simulated EOF).
+    #[tokio::test]
+    async fn test_handler_delivers_messages_in_order_and_exits_on_eof() {
+        let n = 10;
+        let messages: Vec<String> = (0..n)
+            .map(|i| {
+                serde_json::to_string(&JsonRpcNotification {
+                    jsonrpc: "2.0".to_string(),
+                    method: format!("test/event/{i}"),
+                    params: None,
+                })
+                .unwrap()
+            })
+            .collect();
+
+        let transport = Box::new(MockTransport::with_messages(messages));
+        let mut client = McpProtocolClient::new(transport);
+        client.connect().await.unwrap();
+
+        // Give the handler time to process all messages.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Drain received notifications.
+        let mut received: Vec<String> = Vec::new();
+        while let Some(notif) = client.try_receive_notification().await {
+            received.push(notif.method);
+        }
+        assert_eq!(received.len(), n, "all notifications should be delivered");
+        for (i, method) in received.iter().enumerate() {
+            assert_eq!(method, &format!("test/event/{i}"), "order preserved");
+        }
+
+        // After all messages consumed + sender dropped (EOF), the handler
+        // should have exited cleanly.
+        if let Some(handler) = &client.message_handler {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            assert!(
+                handler.is_finished(),
+                "handler should have exited after channel closed (EOF)"
+            );
+        }
+
+        let _ = client.disconnect().await;
     }
 }

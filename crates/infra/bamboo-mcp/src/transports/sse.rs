@@ -68,8 +68,13 @@ pub struct SseTransport {
     client: Client,
     post_client: Arc<dyn PostClient>,
     connected: Arc<AtomicBool>,
-    message_tx: mpsc::Sender<String>,
-    message_rx: Mutex<mpsc::Receiver<String>>,
+    // Pre-connect keepalive sender — keeps the initial channel open so legacy
+    // `receive()` times out instead of seeing EOF before connect() runs.
+    // connect() drops this; afterwards the SSE background task is the sole
+    // sender, so when it ends (stream error / abort) the channel closes and
+    // the client message handler wakes with zero idle wakeups.
+    keepalive_tx: Option<mpsc::Sender<String>>,
+    message_rx: Mutex<Option<mpsc::Receiver<String>>>,
     sse_handle: Option<tokio::task::JoinHandle<()>>,
     endpoint_url: Arc<Mutex<Option<String>>>,
     endpoint_notify: Arc<Notify>,
@@ -81,7 +86,7 @@ impl SseTransport {
     }
 
     pub fn new_with_client(config: SseConfig, client: Client) -> Self {
-        let (message_tx, message_rx) = mpsc::channel(100);
+        let (keepalive_tx, message_rx) = mpsc::channel(100);
         let post_client: Arc<dyn PostClient> = Arc::new(ReqwestPostClient {
             client: client.clone(),
         });
@@ -90,8 +95,8 @@ impl SseTransport {
             client,
             post_client,
             connected: Arc::new(AtomicBool::new(false)),
-            message_tx,
-            message_rx: Mutex::new(message_rx),
+            keepalive_tx: Some(keepalive_tx),
+            message_rx: Mutex::new(Some(message_rx)),
             sse_handle: None,
             endpoint_url: Arc::new(Mutex::new(None)),
             endpoint_notify: Arc::new(Notify::new()),
@@ -212,8 +217,12 @@ impl McpTransport for SseTransport {
                 .and_then(|v| v.to_str().ok())
         );
 
+        // Drop the pre-connect keepalive sender — the SSE task becomes the sole
+        // sender so the channel closes when the stream ends.
+        self.keepalive_tx = None;
+
         // Start SSE event handler
-        let message_tx = self.message_tx.clone();
+        let (message_tx, message_rx) = mpsc::channel(100);
         let url = self.config.url.clone();
         let endpoint_url = self.endpoint_url.clone();
         let endpoint_notify = self.endpoint_notify.clone();
@@ -267,6 +276,7 @@ impl McpTransport for SseTransport {
 
         self.sse_handle = Some(handle);
         self.connected.store(true, Ordering::SeqCst);
+        self.message_rx = Mutex::new(Some(message_rx));
 
         info!("MCP SSE transport connected");
         Ok(())
@@ -370,26 +380,31 @@ impl McpTransport for SseTransport {
         Ok(())
     }
 
+    async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
+        self.message_rx.lock().await.take()
+    }
+
     async fn receive(&self) -> Result<Option<String>> {
         if !self.is_connected() {
             return Err(McpError::Disconnected);
         }
 
-        let mut rx = self.message_rx.lock().await;
-        match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(message)) => {
-                // Don't log raw message bodies at debug/info: they may contain tool args/secrets.
-                trace!("Received SSE message (bytes={})", message.len());
-                Ok(Some(message))
-            }
-            Ok(None) => {
-                // Channel closed
-                warn!("SSE message channel closed");
-                Err(McpError::Disconnected)
-            }
-            Err(_) => {
-                // Timeout, no message available
-                Ok(None)
+        let mut guard = self.message_rx.lock().await;
+        match guard.as_mut() {
+            None => Err(McpError::Disconnected),
+            Some(rx) => {
+                match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await
+                {
+                    Ok(Some(message)) => {
+                        trace!("Received SSE message (bytes={})", message.len());
+                        Ok(Some(message))
+                    }
+                    Ok(None) => {
+                        warn!("SSE message channel closed");
+                        Err(McpError::Disconnected)
+                    }
+                    Err(_) => Ok(None),
+                }
             }
         }
     }
