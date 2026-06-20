@@ -53,8 +53,10 @@ impl ToolCallRuntime {
 
     /// Determine if a tool supports parallel execution.
     pub fn supports_parallel(executor: &Arc<dyn ToolExecutor>, call: &ToolCall) -> bool {
-        executor.call_mutability(call) == ToolMutability::ReadOnly
-            && executor.call_concurrency_safe(call)
+        // Compute mutability + concurrency-safety together so the executor parses
+        // the call's arguments once instead of once per classification (issue #17).
+        let (mutability, concurrency_safe) = executor.call_parallel_classification(call);
+        mutability == ToolMutability::ReadOnly && concurrency_safe
     }
 
     /// Execute a single tool call with appropriate concurrency control.

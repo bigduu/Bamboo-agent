@@ -430,6 +430,26 @@ impl ToolExecutor for BuiltinToolExecutor {
             .map(|tool| tool.call_concurrency_safe(&args))
             .unwrap_or_else(|| self.tool_concurrency_safe(&canonical))
     }
+
+    fn call_parallel_classification(&self, call: &ToolCall) -> (crate::ToolMutability, bool) {
+        // `call_mutability` and `call_concurrency_safe` each independently resolve
+        // the canonical tool name and parse the call's arguments. Computing both
+        // together here lets us do that work a single time, while returning the
+        // exact same `(mutability, concurrency_safe)` pair the two methods
+        // produce. Equivalent to calling both, but with one (not two) arg parses.
+        let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
+        let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
+        match self.registry.get(&canonical) {
+            Some(tool) => (
+                tool.call_mutability(&args),
+                tool.call_concurrency_safe(&args),
+            ),
+            None => (
+                self.tool_mutability(&canonical),
+                self.tool_concurrency_safe(&canonical),
+            ),
+        }
+    }
 }
 
 /// Builder for constructing a BuiltinToolExecutor with custom tool configurations
@@ -731,6 +751,68 @@ mod tests {
             crate::ToolMutability::Mutating
         );
         assert!(!executor.call_concurrency_safe(&set_call));
+    }
+
+    #[test]
+    fn call_parallel_classification_matches_individual_methods() {
+        // Regression guard for the issue #17 perf refactor: the combined
+        // `call_parallel_classification` (which parses args once) must return the
+        // exact same (mutability, concurrency_safe) pair as calling
+        // `call_mutability` and `call_concurrency_safe` separately (which each
+        // parse args). Covers a read-only tool, mutating tools, and an
+        // args-aware tool (Workspace get vs set) so every branch of the
+        // single-parse override is exercised.
+        let executor = BuiltinToolExecutor::new();
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("Read", json!({})),
+            ("Grep", json!({"pattern": "x"})),
+            (
+                "Write",
+                json!({"file_path": "/tmp/par_cls.txt", "content": "y"}),
+            ),
+            ("Bash", json!({"command": "echo hi"})),
+            ("Workspace", json!({})),
+            ("Workspace", json!({"path": "/tmp"})),
+        ];
+
+        for (name, args) in cases {
+            let call = make_tool_call(name, args.clone());
+            let expected_mutability = executor.call_mutability(&call);
+            let expected_concurrency = executor.call_concurrency_safe(&call);
+            let (mutability, concurrency) = executor.call_parallel_classification(&call);
+            assert_eq!(
+                mutability, expected_mutability,
+                "mutability mismatch for {name} ({args})"
+            );
+            assert_eq!(
+                concurrency, expected_concurrency,
+                "concurrency mismatch for {name} ({args})"
+            );
+        }
+    }
+
+    #[test]
+    fn list_tools_snapshot_is_stable_across_calls() {
+        // The per-round schema cache (issue #17 Part A) assumes the executor's
+        // `list_tools()` is stable within a round: a snapshot taken once must
+        // equal a fresh call. Guards that invariant so caching the set for the
+        // duration of a round can't serve a stale or filtered view.
+        let executor = BuiltinToolExecutor::new();
+        let first: Vec<String> = executor
+            .list_tools()
+            .into_iter()
+            .map(|s| s.function.name)
+            .collect();
+        let second: Vec<String> = executor
+            .list_tools()
+            .into_iter()
+            .map(|s| s.function.name)
+            .collect();
+        assert!(!first.is_empty(), "builtin executor should expose tools");
+        assert_eq!(
+            first, second,
+            "list_tools() must be deterministic per round"
+        );
     }
 
     #[tokio::test]
