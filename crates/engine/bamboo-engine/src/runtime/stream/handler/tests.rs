@@ -238,3 +238,47 @@ async fn consume_llm_stream_idle_timeout_does_not_affect_healthy_stream() {
     // count: 6 chunks × 7 chars ("chunk-N") = 42.
     assert_eq!(output.token_count, output.content.chars().count());
 }
+
+#[tokio::test]
+async fn consume_llm_stream_continues_when_subscriber_disconnects() {
+    // Issue #23: when the subscriber drops its receiver, every token send
+    // fails. Previously this was `let _ = event_tx.send(...).await;`, so the
+    // failure was invisible (no log). The send must not panic and — because
+    // accumulation happens *before* the forward — the stream must still
+    // complete and return its full content. The failure path now emits a warn
+    // instead of silently swallowing; the await (backpressure) semantics are
+    // preserved (no try_send / timeout drop is introduced).
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("think".to_string())),
+        Ok(LLMChunk::Token("hello".to_string())),
+        Ok(LLMChunk::Token("world".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+
+    // Create the channel and immediately drop the receiver, modelling a
+    // subscriber that disconnected before streaming began. A capacity of 1 is
+    // deliberate: it forces every send straight onto the disconnected path.
+    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(1);
+    drop(event_rx);
+
+    // Must not panic, hang, or error despite every event send failing.
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        consume_llm_stream(
+            stream,
+            &event_tx,
+            &CancellationToken::new(),
+            "session-disconnect",
+        ),
+    )
+    .await
+    .expect("stream must complete when the subscriber is disconnected, not hang")
+    .expect("stream should succeed even though event sends fail");
+
+    // Content is accumulated into `state` before the forward attempt, so it is
+    // fully preserved regardless of the event channel state. This is the key
+    // behavioral guarantee: a dropped subscriber must never corrupt the run.
+    assert_eq!(output.reasoning_content, "think");
+    assert_eq!(output.content, "helloworld");
+    assert_eq!(output.token_count, 10);
+}
