@@ -833,6 +833,7 @@ async fn handle_no_tool_calls(
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tool_calls_path(
     frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
     stream_output: StreamHandlingOutput,
@@ -841,6 +842,7 @@ async fn handle_tool_calls_path(
     auxiliary_models: &crate::runtime::config::AuxiliaryModelConfig,
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
+    cancel_token: &CancellationToken,
 ) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -861,21 +863,38 @@ async fn handle_tool_calls_path(
     let tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
 
-    let tool_execution = crate::runtime::runner::tool_execution::execute_round_tool_calls(
-        &stream_output.tool_calls,
-        frame,
-        session,
-        task_context,
-        compression_model
-            .as_deref()
-            .or(auxiliary_models.background_model_name.as_deref()),
-        auxiliary_models
-            .summarization_model_provider
-            .as_ref()
-            .or(auxiliary_models.background_model_provider.as_ref()),
-        &tool_schemas,
-    )
-    .await?;
+    // Tool execution can block for a long time (up to parallel_batch_timeout_secs,
+    // default 300s, and per_tool_timeout_secs for single tools). The loop only
+    // polls cancellation BETWEEN rounds, so without this select! a cancel issued
+    // *during* tool execution (e.g. a 120s foreground Bash command) would run to
+    // completion and the agent would appear unresponsive to cancel for up to
+    // minutes.
+    //
+    // We mirror the LLM stream's biased-cancel pattern (see
+    // `stream/handler/consume.rs`): `biased` checks cancellation first so a
+    // ready-but-cancelled batch is dropped. On cancel the in-flight tool futures
+    // are dropped (true cancellation — foreground Bash is kill_on_drop, so its
+    // child is reaped). The per-batch/per-tool `tokio::time::timeout` *inside*
+    // `execute_round_tool_calls` is left untouched — cancel is strictly an
+    // additional early-exit, the timeout is preserved. (issue #30)
+    let tool_execution = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+        result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
+            &stream_output.tool_calls,
+            frame,
+            session,
+            task_context,
+            compression_model
+                .as_deref()
+                .or(auxiliary_models.background_model_name.as_deref()),
+            auxiliary_models
+                .summarization_model_provider
+                .as_ref()
+                .or(auxiliary_models.background_model_provider.as_ref()),
+            &tool_schemas,
+        ) => result?,
+    };
 
     // Track round state for metrics
     let mut awaiting_clarification = false;
@@ -1352,6 +1371,7 @@ pub(super) async fn run_pipeline(
                 &state.auxiliary_models,
                 &state.model_name,
                 &mut state.task_context,
+                cancel_token,
             )
             .await
             {
@@ -3378,6 +3398,250 @@ mod tests {
         assert!(
             produces_suspended,
             "waiting_for_bash must be Suspended-producing"
+        );
+    }
+
+    // ── Cancel-during-tool-execution (issue #30) ─────────────────────────
+    //
+    // The loop previously only checked cancellation BETWEEN rounds, so a cancel
+    // issued *during* a long-running tool (up to parallel_batch_timeout_secs =
+    // 300s, or per_tool_timeout_secs for a single tool like a 120s Bash command)
+    // was ignored until the tool finished — the agent looked unresponsive to
+    // cancel for up to minutes. The fix wraps the tool-execution await in
+    // `handle_tool_calls_path` with a biased `select!` on the cancel token
+    // (mirroring `stream/handler/consume.rs`). On cancel the in-flight tool
+    // futures are dropped; the `Cancelled` error reuses the loop's existing
+    // cancel classification (`map_turn_error_status`), so no new flow is added.
+
+    use super::handle_tool_calls_path;
+    use crate::runtime::runner::round_frame::RoundFrame;
+    use crate::runtime::runner::tool_execution::execute_round_tool_calls;
+    use crate::runtime::stream::handler::StreamHandlingOutput;
+    use crate::runtime::task_context::TaskLoopContext;
+    use bamboo_agent_core::tools::{
+        FunctionCall, FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Tool-executor probe. When `block` is set it sleeps far longer than any
+    /// test will wait, so cancel must race a genuinely in-flight future (not the
+    /// pre-execution setup). It flips `started` the instant execution begins so
+    /// the test can fire cancel against real, in-progress execution.
+    struct CancelProbeToolExecutor {
+        block: bool,
+        started: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CancelProbeToolExecutor {
+        async fn execute(
+            &self,
+            _call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            self.started.store(true, Ordering::SeqCst);
+            if self.block {
+                // Block far longer than the test will wait. When the biased
+                // select! in handle_tool_calls_path drops this future on cancel,
+                // the sleep is cancelled cooperatively.
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            }
+            Ok(ToolResult {
+                success: true,
+                result: "tool-result-123".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "Read".to_string(),
+                    description: "read tool".to_string(),
+                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                },
+            }]
+        }
+    }
+
+    fn single_read_call() -> ToolCall {
+        ToolCall {
+            id: "call-read".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Read".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    fn stream_output_with_tool_call(call: ToolCall) -> StreamHandlingOutput {
+        StreamHandlingOutput {
+            response_id: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            token_count: 0,
+            tool_calls: vec![call],
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            input_tokens: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_execution_cancel_returns_promptly() {
+        // A long-running tool must NOT pin the loop after cancel. The probe
+        // sleeps 120s; if cancel isn't honored *during* tool execution this test
+        // would block until that sleep (or the batch timeout) — the outer
+        // tokio::time::timeout turns that into a fast failure instead of a hang.
+        let started = Arc::new(AtomicBool::new(false));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(CancelProbeToolExecutor {
+            block: true,
+            started: started.clone(),
+        });
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(128);
+        let llm: Arc<dyn LLMProvider> = Arc::new(StubProvider);
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("s-cancel", "model");
+        let frame = RoundFrame {
+            session_id: "s-cancel",
+            round_id: "r1",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let auxiliary_models = crate::runtime::config::AuxiliaryModelConfig::default();
+        let mut task_context: Option<TaskLoopContext> = None;
+        let cancel_token = CancellationToken::new();
+
+        // Driver: wait until the tool has ACTUALLY started executing, then cancel
+        // — guaranteeing cancel races a live in-flight tool, not pre-exec setup.
+        let driver_started = started.clone();
+        let driver_token = cancel_token.clone();
+        let driver = tokio::spawn(async move {
+            for _ in 0..500 {
+                if driver_started.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert!(
+                driver_started.load(Ordering::SeqCst),
+                "tool never started executing"
+            );
+            driver_token.cancel();
+        });
+
+        let t0 = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            // Bounded well below the 120s tool sleep so a regression fails fast.
+            Duration::from_secs(5),
+            handle_tool_calls_path(
+                &frame,
+                stream_output_with_tool_call(single_read_call()),
+                MetricsTokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+                &mut session,
+                &auxiliary_models,
+                "model",
+                &mut task_context,
+                &cancel_token,
+            ),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        let _ = driver.await;
+
+        let inner = result.expect(
+            "handle_tool_calls_path did not return within 5s — cancel not honored during tool execution",
+        );
+        assert!(
+            matches!(inner, Err(AgentError::Cancelled)),
+            "expected Err(AgentError::Cancelled), got {:?}",
+            inner.as_ref().err()
+        );
+        // Cancel must be PROMPT — well under the 120s tool sleep and the 300s
+        // batch timeout. `elapsed` is dominated by polling for the tool to start
+        // (2ms cadence); cancel propagation itself is sub-millisecond.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel was not prompt (tool would otherwise block for ~120s): {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_tool_batch_completes_unchanged() {
+        // No cancel: the batch must complete normally and record the tool result
+        // — byte-identical healthy behavior. Tested at the `execute_round_tool_calls`
+        // level (the exact future the select! wraps): its non-cancel arm is
+        // literally `result = execute_round_tool_calls(...) => result?`, identical
+        // to the previous `.await?`, so a clean healthy completion here proves the
+        // wrapper does not perturb the non-cancelled path.
+        let tools: Arc<dyn ToolExecutor> = Arc::new(CancelProbeToolExecutor {
+            block: false,
+            started: Arc::new(AtomicBool::new(false)),
+        });
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(128);
+        let llm: Arc<dyn LLMProvider> = Arc::new(StubProvider);
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("s-normal", "model");
+        let frame = RoundFrame {
+            session_id: "s-normal",
+            round_id: "r1",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let tool_schemas = tools.list_tools();
+        let mut task_context: Option<TaskLoopContext> = None;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_round_tool_calls(
+                std::slice::from_ref(&single_read_call()),
+                &frame,
+                &mut session,
+                &mut task_context,
+                // No compression model -> mid-turn compression short-circuits, so
+                // the healthy path is exercised without any auxiliary LLM call.
+                None,
+                None,
+                &tool_schemas,
+            ),
+        )
+        .await
+        .expect("normal tool batch did not complete within 10s");
+
+        let round_result = result.expect("normal batch should return Ok");
+        assert!(!round_result.awaiting_clarification);
+        assert!(!round_result.waiting_for_children);
+        // The tool result must have been recorded as a tool message.
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.role == bamboo_agent_core::Role::Tool
+                    && m.content.contains("tool-result-123")),
+            "expected a tool-result message, got {} message(s)",
+            session.messages.len()
         );
     }
 }
