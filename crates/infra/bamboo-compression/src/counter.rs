@@ -165,6 +165,127 @@ impl TiktokenTokenCounter {
     pub fn new(metadata_overhead: u32) -> Self {
         Self { metadata_overhead }
     }
+
+    /// Truncate `text` to at most `max_tokens` tokens, keeping the START.
+    ///
+    /// Encodes the text **once** and decodes the first `max_tokens` tokens back
+    /// to a string — O(N) (one encode + one decode), versus the O(N²)
+    /// char-by-char re-tokenization the previous `find_prefix_within_tokens`
+    /// performed (which called `count_text(&text[..i])` on every char index).
+    ///
+    /// # Semantics
+    /// - `max_tokens == 0` → empty string (exactly 0 tokens; never exceeds budget).
+    /// - Text already within `max_tokens` → returned unchanged (fast path).
+    /// - Otherwise the result is an exact prefix of `text` (its START preserved),
+    ///   is valid UTF-8, and re-counts to ≤ `max_tokens`.
+    ///
+    /// If the o200k encoder is unavailable (the issue #25 fallback path), this
+    /// degrades to a conservative char-based cut instead of panicking.
+    pub fn truncate_to_token_prefix(&self, text: &str, max_tokens: u32) -> String {
+        if max_tokens == 0 {
+            return String::new();
+        }
+        let Some(encoder) = o200k_encoder() else {
+            return heuristic_char_prefix(text, max_tokens);
+        };
+        // One encode — same encoder `count_text` uses, so the fast-path length
+        // check is consistent with `count_text(text)`.
+        let tokens = encoder.encode_with_special_tokens(text);
+        if (tokens.len() as u32) <= max_tokens {
+            return text.to_string();
+        }
+        let end = max_tokens as usize;
+        match encoder.decode_bytes(&tokens[..end]) {
+            // `decode_bytes` yields exactly the bytes of `text` spanned by the
+            // first `end` tokens — a byte-prefix of `text`. A token boundary can
+            // fall inside a multi-byte UTF-8 char, so trim any partial trailing
+            // char: the result stays a valid-UTF-8 exact prefix of `text`.
+            Ok(bytes) => valid_utf8_prefix(bytes),
+            Err(_) => heuristic_char_prefix(text, max_tokens),
+        }
+    }
+
+    /// Truncate `text` to at most `max_tokens` tokens, keeping the END.
+    ///
+    /// Symmetric to [`truncate_to_token_prefix`](Self::truncate_to_token_prefix):
+    /// encodes once and decodes the **last** `max_tokens` tokens. Same budget /
+    /// fast-path / fallback semantics; the result is a valid-UTF-8 exact suffix
+    /// of `text` (its END preserved) that re-counts to ≤ `max_tokens`.
+    pub fn truncate_to_token_suffix(&self, text: &str, max_tokens: u32) -> String {
+        if max_tokens == 0 {
+            return String::new();
+        }
+        let Some(encoder) = o200k_encoder() else {
+            return heuristic_char_suffix(text, max_tokens);
+        };
+        let tokens = encoder.encode_with_special_tokens(text);
+        if (tokens.len() as u32) <= max_tokens {
+            return text.to_string();
+        }
+        let start = tokens.len() - (max_tokens as usize);
+        match encoder.decode_bytes(&tokens[start..]) {
+            // The last `max_tokens` tokens span a byte-suffix of `text`; a
+            // boundary may split a *leading* multi-byte char, so drop any partial
+            // leading bytes to keep the result valid UTF-8 (still an exact suffix
+            // of `text`).
+            Ok(bytes) => valid_utf8_suffix(bytes),
+            Err(_) => heuristic_char_suffix(text, max_tokens),
+        }
+    }
+}
+
+// ── Encode-once truncation helpers ───────────────────────────────────────────
+//
+// These are used only by `TiktokenTokenCounter::truncate_to_token_{prefix,suffix}`.
+
+/// Conservative char-based prefix used solely when the BPE encoder is
+/// unavailable (the issue #25 fallback). Sized so the `HeuristicTokenCounter`
+/// estimate (chars/4 · 1.1) stays within budget.
+fn heuristic_char_prefix(text: &str, max_tokens: u32) -> String {
+    text.chars()
+        .take(heuristic_char_budget(max_tokens))
+        .collect()
+}
+
+/// Conservative char-based suffix — symmetric to [`heuristic_char_prefix`].
+fn heuristic_char_suffix(text: &str, max_tokens: u32) -> String {
+    let max_chars = heuristic_char_budget(max_tokens);
+    let skip = text.chars().count().saturating_sub(max_chars);
+    text.chars().skip(skip).collect()
+}
+
+/// Number of chars whose heuristic token estimate (ceil(chars/4 · 1.1)) is
+/// ≤ `max_tokens`: solves ceil(c/4 · 1.1) ≤ max_tokens ⟺ c ≤ max_tokens·4/1.1.
+fn heuristic_char_budget(max_tokens: u32) -> usize {
+    ((max_tokens as f64) * 4.0 / 1.1).floor() as usize
+}
+
+/// Turn a byte-prefix of some valid UTF-8 text into a valid UTF-8 string,
+/// trimming a partial trailing multi-byte char if the token boundary landed
+/// mid-character. The result is still an exact prefix of the original text.
+fn valid_utf8_prefix(bytes: Vec<u8>) -> String {
+    let valid_up_to = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    // bytes[..valid_up_to] is valid UTF-8 → lossy is a zero-copy borrow.
+    String::from_utf8_lossy(&bytes[..valid_up_to]).into_owned()
+}
+
+/// Turn a byte-suffix of some valid UTF-8 text into a valid UTF-8 string,
+/// dropping leading bytes that belong to a partial multi-byte char. Because the
+/// input is a contiguous suffix of valid UTF-8 text, the only possible
+/// invalidity is a leading partial char (≤ 3 bytes), so this advances at most a
+/// couple of times — O(N) overall.
+fn valid_utf8_suffix(bytes: Vec<u8>) -> String {
+    let mut start = 0;
+    while start < bytes.len() {
+        if let Ok(_) = std::str::from_utf8(&bytes[start..]) {
+            return String::from_utf8_lossy(&bytes[start..]).into_owned();
+        }
+        start += 1;
+    }
+    String::new()
 }
 
 impl Default for TiktokenTokenCounter {
@@ -406,6 +527,108 @@ mod tests {
             o200k_base().is_ok(),
             "bundled o200k_base tokenizer failed to load; \
              suspected tiktoken-rs build/link regression"
+        );
+    }
+
+    // ── Encode-once truncation (issue #24: O(N²) → O(N)) ──
+
+    #[test]
+    fn truncate_prefix_keeps_start_and_stays_within_budget() {
+        let counter = TiktokenTokenCounter::default();
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(50);
+        // Sanity: text is well over the budget.
+        assert!(counter.count_text(&text) > 30);
+
+        let max_tokens = 30u32;
+        let prefix = counter.truncate_to_token_prefix(&text, max_tokens);
+
+        // (c) keep the START: prefix must be an exact prefix of `text`.
+        assert!(
+            text.starts_with(&prefix),
+            "prefix must be the START of text"
+        );
+        assert!(
+            !prefix.is_empty(),
+            "prefix should not be empty under budget"
+        );
+        // (a) never exceed max_tokens.
+        let count = counter.count_text(&prefix);
+        assert!(
+            count <= max_tokens,
+            "prefix token count {count} exceeds budget {max_tokens}"
+        );
+    }
+
+    #[test]
+    fn truncate_suffix_keeps_end_and_stays_within_budget() {
+        let counter = TiktokenTokenCounter::default();
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(50);
+        assert!(counter.count_text(&text) > 30);
+
+        let max_tokens = 30u32;
+        let suffix = counter.truncate_to_token_suffix(&text, max_tokens);
+
+        // (c) keep the END: suffix must be an exact suffix of `text`.
+        assert!(text.ends_with(&suffix), "suffix must be the END of text");
+        assert!(
+            !suffix.is_empty(),
+            "suffix should not be empty under budget"
+        );
+        // (a) never exceed max_tokens.
+        let count = counter.count_text(&suffix);
+        assert!(
+            count <= max_tokens,
+            "suffix token count {count} exceeds budget {max_tokens}"
+        );
+    }
+
+    #[test]
+    fn truncate_returns_text_unchanged_when_within_budget() {
+        let counter = TiktokenTokenCounter::default();
+        let text = "Hello, world!"; // a handful of tokens
+        assert!(counter.count_text(text) <= 1000);
+
+        assert_eq!(counter.truncate_to_token_prefix(text, 1000), text);
+        assert_eq!(counter.truncate_to_token_suffix(text, 1000), text);
+    }
+
+    #[test]
+    fn truncate_max_tokens_zero_returns_empty() {
+        let counter = TiktokenTokenCounter::default();
+        // (a) with budget 0 the only value that never exceeds it is empty.
+        assert_eq!(counter.truncate_to_token_prefix("Hello, world!", 0), "");
+        assert_eq!(counter.truncate_to_token_suffix("Hello, world!", 0), "");
+    }
+
+    #[test]
+    fn truncate_prefix_suffix_large_input_is_valid_and_within_budget() {
+        // Correctness + perf sanity on a ~100KB input mixing ASCII, CJK, digits
+        // and newlines — exercises multi-byte token-boundary alignment.
+        let counter = TiktokenTokenCounter::default();
+        let unit = "The quick brown fox 你好世界 jumps 1234567890 over.\n";
+        let text = unit.repeat(2_500);
+        assert!(text.len() > 100_000, "precondition: large input");
+        assert!(counter.count_text(&text) > 500);
+
+        let max_tokens = 500u32;
+
+        let prefix = counter.truncate_to_token_prefix(&text, max_tokens);
+        assert!(
+            text.starts_with(&prefix),
+            "prefix must be the START of text"
+        );
+        let pcount = counter.count_text(&prefix);
+        assert!(
+            pcount <= max_tokens,
+            "prefix token count {pcount} exceeds budget {max_tokens}"
+        );
+
+        let suffix = counter.truncate_to_token_suffix(&text, max_tokens);
+        assert!(text.ends_with(&suffix), "suffix must be the END of text");
+        let scount = counter.count_text(&suffix);
+        assert!(
+            scount <= max_tokens,
+            "suffix token count {scount} exceeds budget {max_tokens}"
         );
     }
 }
