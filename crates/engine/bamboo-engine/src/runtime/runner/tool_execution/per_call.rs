@@ -49,10 +49,12 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     /// every single tool call. Passed straight into the dispatch context's
     /// `available_tool_schemas`. Scoped to the round — never global/static — so
     /// one session's tool set can't leak into another. ASSUMPTION: the
-    /// executor's tool set is stable for the duration of a round; the agent
-    /// loop never registers/unregisters tools mid-round, and this field
-    /// currently has no readers, so a per-round snapshot can't diverge
-    /// observably from the prior per-call `list_tools()`.
+    /// executor's tool set is stable for the duration of a round (the agent loop
+    /// only registers hooks mid-round, never tools), so the snapshot equals what
+    /// a fresh `list_tools()` would return on every call. It is consumed only by
+    /// `for_dispatch`, which threads it into the dispatch context's
+    /// `available_tool_schemas` — a metadata field no builtin tool currently
+    /// inspects — so even a hypothetical divergence would be unobservable today.
     pub available_tool_schemas: &'a [ToolSchema],
 }
 
