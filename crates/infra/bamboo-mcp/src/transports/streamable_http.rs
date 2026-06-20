@@ -26,8 +26,10 @@ pub struct StreamableHttpTransport {
     client: Client,
     session_id: Arc<Mutex<Option<String>>>,
     connected: Arc<AtomicBool>,
-    message_tx: mpsc::Sender<String>,
-    message_rx: Mutex<mpsc::Receiver<String>>,
+    // Dropped in disconnect() so the channel closes and the client handler
+    // wakes without polling.
+    message_tx: Option<mpsc::Sender<String>>,
+    message_rx: Mutex<Option<mpsc::Receiver<String>>>,
     get_sse_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -43,8 +45,8 @@ impl StreamableHttpTransport {
             client,
             session_id: Arc::new(Mutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
-            message_tx,
-            message_rx: Mutex::new(message_rx),
+            message_tx: Some(message_tx),
+            message_rx: Mutex::new(Some(message_rx)),
             get_sse_handle: Mutex::new(None),
         }
     }
@@ -154,7 +156,9 @@ impl StreamableHttpTransport {
         if content_type.contains("text/event-stream") {
             // SSE response — parse events and forward each to channel.
             trace!("MCP StreamableHTTP POST response is SSE stream");
-            let tx = self.message_tx.clone();
+            let Some(tx) = self.message_tx.clone() else {
+                return Ok(()); // disconnected
+            };
             let url = self.config.url.clone();
             let connected = self.connected.clone();
 
@@ -193,8 +197,10 @@ impl StreamableHttpTransport {
                     "MCP StreamableHTTP POST response is JSON (bytes={})",
                     body.len()
                 );
-                if self.message_tx.send(body).await.is_err() {
-                    warn!("MCP StreamableHTTP: message channel closed");
+                if let Some(tx) = self.message_tx.as_ref() {
+                    if tx.send(body).await.is_err() {
+                        warn!("MCP StreamableHTTP: message channel closed");
+                    }
                 }
             }
         }
@@ -263,7 +269,9 @@ impl StreamableHttpTransport {
 
         debug!("MCP StreamableHTTP GET SSE stream opened");
 
-        let tx = self.message_tx.clone();
+        let Some(tx) = self.message_tx.clone() else {
+            return; // disconnected
+        };
         let connected = self.connected.clone();
 
         let handle = tokio::spawn(async move {
@@ -318,6 +326,10 @@ impl McpTransport for StreamableHttpTransport {
         debug!("Disconnecting MCP StreamableHTTP transport");
 
         self.connected.store(false, Ordering::SeqCst);
+
+        // Drop the struct's message sender so the channel closes, waking the
+        // client handler (if any) without polling.
+        self.message_tx = None;
 
         // Cancel the GET SSE stream background task.
         {
@@ -382,25 +394,35 @@ impl McpTransport for StreamableHttpTransport {
         Ok(())
     }
 
+    async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
+        self.message_rx.lock().await.take()
+    }
+
     async fn receive(&self) -> Result<Option<String>> {
         if !self.is_connected() {
             return Err(McpError::Disconnected);
         }
 
-        let mut rx = self.message_rx.lock().await;
-        match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(message)) => {
-                trace!(
-                    "MCP StreamableHTTP received message (bytes={})",
-                    message.len()
-                );
-                Ok(Some(message))
+        let mut guard = self.message_rx.lock().await;
+        match guard.as_mut() {
+            None => Err(McpError::Disconnected),
+            Some(rx) => {
+                match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await
+                {
+                    Ok(Some(message)) => {
+                        trace!(
+                            "MCP StreamableHTTP received message (bytes={})",
+                            message.len()
+                        );
+                        Ok(Some(message))
+                    }
+                    Ok(None) => {
+                        warn!("MCP StreamableHTTP message channel closed");
+                        Err(McpError::Disconnected)
+                    }
+                    Err(_) => Ok(None),
+                }
             }
-            Ok(None) => {
-                warn!("MCP StreamableHTTP message channel closed");
-                Err(McpError::Disconnected)
-            }
-            Err(_) => Ok(None), // Timeout, no message available
         }
     }
 
