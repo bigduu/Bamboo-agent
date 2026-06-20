@@ -346,20 +346,26 @@ impl LLMProvider for GeminiProvider {
         tracing::debug!("Gemini stream started successfully");
 
         // Parse SSE stream with Gemini-specific parser
+        // Parse SSE stream with Gemini-specific parser. Uses the multi-chunk
+        // adapter: a single Gemini event can yield several chunks (a final
+        // `usageMetadata` carries both a cache hit and output/thinking usage),
+        // and `streamGenerateContent?alt=sse` sends no [DONE], so emitting all
+        // chunks from the one event — rather than deferring — guarantees usage
+        // is delivered even when the connection closes immediately afterwards.
         let mut state = GeminiStreamState::default();
         let model_for_log = model.to_string();
         let requested_reasoning_for_log = applied_reasoning_effort;
         let request_thinking_budget_for_log = applied_thinking_budget;
         let mut logged_summary = false;
 
-        let stream = crate::providers::common::sse::llm_stream_from_sse(
+        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
             move |event, data| {
-                let chunk = parse_gemini_sse_event(&mut state, event, data)?;
+                let chunks = parse_gemini_sse_event(&mut state, event, data)?;
 
-                if matches!(chunk, Some(LLMChunk::Done))
-                    && !logged_summary
+                if !logged_summary
                     && (requested_reasoning_for_log.is_some() || state.observed_thinking_signal)
+                    && chunks.iter().any(|c| matches!(c, LLMChunk::Done))
                 {
                     tracing::info!(
                         "Gemini reasoning summary: model='{}' requested_effort={} request_thinking_budget={} observed_thinking_signal={} thinking_parts_count={} thinking_text_chars={}",
@@ -377,7 +383,7 @@ impl LLMProvider for GeminiProvider {
                     logged_summary = true;
                 }
 
-                Ok(chunk)
+                Ok(chunks)
             },
         );
 

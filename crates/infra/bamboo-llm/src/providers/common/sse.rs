@@ -1,6 +1,7 @@
 //! Shared SSE -> [`LLMStream`] adapter.
 
 use eventsource_stream::Eventsource;
+use futures::stream;
 use futures::StreamExt;
 use reqwest::Response;
 
@@ -20,9 +21,34 @@ fn to_stream_error(err: LLMError) -> LLMError {
 /// - return `Ok(Some(chunk))` to emit a chunk
 /// - return `Ok(None)` to skip an event
 /// - return `Err(_)` to emit a stream error (mapped to `LLMError::Stream`)
+///
+/// This is the common case where each SSE event yields at most one chunk.
+/// Providers whose events can carry several chunks (e.g. Gemini's final
+/// `usageMetadata` folds a cache hit and output/thinking usage into one event)
+/// should use [`llm_stream_from_sse_multi`] instead.
 pub fn llm_stream_from_sse<H>(response: Response, mut handler: H) -> LLMStream
 where
     H: FnMut(&str, &str) -> Result<Option<LLMChunk>> + Send + 'static,
+{
+    llm_stream_from_sse_multi(response, move |event, data| {
+        Ok(handler(event, data)?.into_iter().collect())
+    })
+}
+
+/// Like [`llm_stream_from_sse`], but the handler may emit **zero or more**
+/// chunks per SSE event; they are flattened into the stream in order.
+///
+/// This is required for providers where a single SSE event must surface
+/// multiple logical chunks. The motivating case is Gemini: a final
+/// `usageMetadata` event carries both a prompt-cache hit AND output/thinking
+/// token usage, and `streamGenerateContent?alt=sse` sends no `[DONE]`
+/// sentinel — so a chunk deferred to "the next event" would be silently lost
+/// when the connection closes. Returning every chunk from the one event (via
+/// `Vec`) and flattening here delivers both with no buffering and no reliance
+/// on a trailing event (issue #27).
+pub fn llm_stream_from_sse_multi<H>(response: Response, mut handler: H) -> LLMStream
+where
+    H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
 {
     let stream = response
         .bytes_stream()
@@ -31,12 +57,11 @@ where
             let event = event.map_err(|e| LLMError::Stream(e.to_string()))?;
             handler(event.event.as_str(), event.data.as_str()).map_err(to_stream_error)
         })
-        .filter_map(|result| async move {
-            match result {
-                Ok(Some(chunk)) => Some(Ok(chunk)),
-                Ok(None) => None,
-                Err(err) => Some(Err(err)),
-            }
+        .flat_map(|result| {
+            stream::iter(match result {
+                Ok(chunks) => chunks.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(err) => vec![Err(err)],
+            })
         });
 
     Box::pin(stream)
