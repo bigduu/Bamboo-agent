@@ -31,6 +31,15 @@ pub struct GeminiStreamState {
     /// Gemini reports `usageMetadata` cumulatively; emitting once (on the final,
     /// content-free chunk) keeps the downstream accumulator from over-counting.
     cache_usage_emitted: bool,
+    /// Whether an [`LLMChunk::UsageSummary`] has already been emitted for this
+    /// stream. Like cache usage, emitted once from the final `usageMetadata`.
+    usage_summary_emitted: bool,
+    /// A usage chunk (e.g. [`LLMChunk::UsageSummary`]) deferred from an earlier
+    /// content-free chunk, awaiting the next parse call. Gemini folds cache and
+    /// output/thinking usage into a single final `usageMetadata`, but a parse
+    /// call yields at most one [`LLMChunk`]; the secondary chunk is buffered
+    /// here and drained at the top of the next call.
+    pending_usage: Option<LLMChunk>,
 }
 
 impl GeminiStreamState {
@@ -54,6 +63,54 @@ fn take_gemini_cache_usage(state: &mut GeminiStreamState, value: &Value) -> Opti
         .and_then(crate::cache::cache_usage_from_gemini_usage)?;
     state.cache_usage_emitted = true;
     Some(chunk)
+}
+
+/// Emit an [`LLMChunk::UsageSummary`] once, from a Gemini chunk's
+/// `usageMetadata`: `candidatesTokenCount` maps to `output_tokens` and
+/// `thoughtsTokenCount` maps to `thinking_tokens`. `thoughtsTokenCount` is
+/// absent for non-thinking models (or when no thinking occurred), so it
+/// defaults to `0`. Returns `None` when no output token count is reported.
+///
+/// This is the Gemini analogue of the usage emission Anthropic
+/// (`message_delta` `usage`) and OpenAI Responses (`response.completed`
+/// `usage`) already perform, so downstream cost accounting / budget
+/// enforcement works for Gemini too (issue #27).
+fn take_gemini_usage_summary(state: &mut GeminiStreamState, value: &Value) -> Option<LLMChunk> {
+    if state.usage_summary_emitted {
+        return None;
+    }
+    let usage = value.get("usageMetadata")?;
+    let output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64)?;
+    let thinking_tokens = usage
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    state.usage_summary_emitted = true;
+    Some(LLMChunk::UsageSummary {
+        output_tokens,
+        thinking_tokens,
+    })
+}
+
+/// Emit the final usage from a content-free Gemini chunk's `usageMetadata`:
+/// the existing [`LLMChunk::CacheUsage`] (cache hit) plus the new
+/// [`LLMChunk::UsageSummary`] (output/thinking). Gemini folds both into a
+/// single final `usageMetadata`, but a parse call returns at most one chunk, so
+/// when both are present the cache chunk is emitted first (unchanged path) and
+/// the usage summary is buffered in [`GeminiStreamState::pending_usage`] for
+/// the next parse call. Either may be `None`; returns `None` only when neither
+/// is reported.
+fn take_gemini_final_usage(state: &mut GeminiStreamState, value: &Value) -> Option<LLMChunk> {
+    let cache = take_gemini_cache_usage(state, value);
+    let summary = take_gemini_usage_summary(state, value);
+    match (cache, summary) {
+        (Some(cache), Some(summary)) => {
+            state.pending_usage = Some(summary);
+            Some(cache)
+        }
+        (Some(chunk), None) | (None, Some(chunk)) => Some(chunk),
+        (None, None) => None,
+    }
 }
 
 /// Parse a single Gemini SSE event into an optional [`LLMChunk`].
@@ -81,6 +138,14 @@ pub fn parse_gemini_sse_event(
     _event_type: &str,
     data: &str,
 ) -> Result<Option<LLMChunk>> {
+    // Drain any usage chunk deferred from a previous content-free chunk (see
+    // `take_gemini_final_usage`) before handling the current event, so a final
+    // `usageMetadata` that carries both cache and output/thinking usage still
+    // surfaces both chunks.
+    if let Some(pending) = state.pending_usage.take() {
+        return Ok(Some(pending));
+    }
+
     // Trim whitespace
     let data = data.trim();
 
@@ -116,7 +181,7 @@ pub fn parse_gemini_sse_event(
         })?;
 
     if candidates.is_empty() {
-        return Ok(take_gemini_cache_usage(state, &value));
+        return Ok(take_gemini_final_usage(state, &value));
     }
 
     // Get the first candidate (Gemini typically returns one)
@@ -132,7 +197,7 @@ pub fn parse_gemini_sse_event(
     // Extract content
     let content = match candidate.get("content") {
         Some(c) => c,
-        None => return Ok(take_gemini_cache_usage(state, &value)),
+        None => return Ok(take_gemini_final_usage(state, &value)),
     };
 
     // Extract parts array
@@ -142,7 +207,7 @@ pub fn parse_gemini_sse_event(
     };
 
     if parts.is_empty() {
-        return Ok(take_gemini_cache_usage(state, &value));
+        return Ok(take_gemini_final_usage(state, &value));
     }
 
     // Process the first part (Gemini typically sends one part per chunk)
@@ -248,6 +313,111 @@ mod tests {
         }
         assert!(state.observed_thinking_signal);
         assert_eq!(state.thinking_parts_count, 1);
+    }
+
+    #[test]
+    fn parse_usage_metadata_emits_usage_summary() {
+        // Final content-free chunk: Gemini reports cumulative usage here.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":42,"thoughtsTokenCount":7,"totalTokenCount":59}}"#;
+
+        let chunk = parse_gemini_sse_event(&mut state, "", data)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::UsageSummary {
+                output_tokens,
+                thinking_tokens,
+            } => {
+                assert_eq!(output_tokens, 42);
+                assert_eq!(thinking_tokens, 7);
+            }
+            other => panic!("expected LLMChunk::UsageSummary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_usage_metadata_without_thinking_defaults_to_zero() {
+        // Non-thinking models omit thoughtsTokenCount entirely.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":42,"totalTokenCount":52}}"#;
+
+        let chunk = parse_gemini_sse_event(&mut state, "", data)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::UsageSummary {
+                output_tokens,
+                thinking_tokens,
+            } => {
+                assert_eq!(output_tokens, 42);
+                assert_eq!(thinking_tokens, 0);
+            }
+            other => panic!("expected LLMChunk::UsageSummary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_usage_metadata_emitted_once() {
+        // Gemini may echo usageMetadata on more than one chunk; only the first
+        // must produce a UsageSummary (the downstream accumulator would otherwise
+        // double-count output/thinking tokens).
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":42,"thoughtsTokenCount":7,"totalTokenCount":59}}"#;
+
+        let first = parse_gemini_sse_event(&mut state, "", data).unwrap();
+        assert!(
+            matches!(first, Some(LLMChunk::UsageSummary { .. })),
+            "expected UsageSummary on first usageMetadata chunk, got {:?}",
+            first
+        );
+
+        // A second, identical cumulative usageMetadata chunk must not re-emit.
+        let second = parse_gemini_sse_event(&mut state, "", data).unwrap();
+        assert!(
+            second.is_none(),
+            "UsageSummary must be emitted only once; got {:?}",
+            second
+        );
+    }
+
+    #[test]
+    fn parse_usage_metadata_preserves_cache_usage() {
+        // A final chunk can carry BOTH a prompt-cache hit and output/thinking
+        // usage. Cache reporting (issue #12) must survive the new usage
+        // emission: CacheUsage is emitted first, the UsageSummary is buffered
+        // and drained on the next parse call.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":1000,"candidatesTokenCount":42,"thoughtsTokenCount":7,"cachedContentTokenCount":555,"totalTokenCount":1042}}"#;
+
+        let cache = parse_gemini_sse_event(&mut state, "", data)
+            .unwrap()
+            .expect("cache chunk");
+        match cache {
+            LLMChunk::CacheUsage {
+                cache_read_input_tokens,
+                ..
+            } => assert_eq!(cache_read_input_tokens, 555),
+            other => panic!("expected LLMChunk::CacheUsage first, got {:?}", other),
+        }
+
+        // The UsageSummary was buffered; it surfaces on the next parse call
+        // (here, the trailing [DONE] event).
+        let summary = parse_gemini_sse_event(&mut state, "", "[DONE]")
+            .unwrap()
+            .expect("buffered usage summary");
+        match summary {
+            LLMChunk::UsageSummary {
+                output_tokens,
+                thinking_tokens,
+            } => {
+                assert_eq!(output_tokens, 42);
+                assert_eq!(thinking_tokens, 7);
+            }
+            other => panic!("expected buffered LLMChunk::UsageSummary, got {:?}", other),
+        }
     }
 
     #[test]
