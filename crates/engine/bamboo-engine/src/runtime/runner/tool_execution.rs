@@ -118,6 +118,9 @@ async fn execute_and_apply_single_tool_call(
     session: &mut Session,
     tools: &Arc<dyn ToolExecutor>,
     config: &AgentLoopConfig,
+    // Pre-built per-round snapshot of the executor's full tool-schema list —
+    // avoids re-cloning every schema on each tool call.
+    available_tool_schemas: &[ToolSchema],
     task_context: &mut Option<TaskLoopContext>,
     state: &mut RoundExecutionState,
     policy_guard: &mut policy::ToolPolicyGuard,
@@ -209,6 +212,7 @@ async fn execute_and_apply_single_tool_call(
                     config,
                     session_flags:
                         bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session),
+                    available_tool_schemas,
                 })
                 .await
             }
@@ -381,6 +385,20 @@ pub(crate) async fn execute_round_tool_calls(
     let config = frame.config;
     let llm = frame.llm;
 
+    // Build the executor's full tool-schema list ONCE for this round instead of
+    // on every individual tool call (the per-call path previously called
+    // `tools.list_tools()`, which clones all ~25 schemas — each carrying a JSON
+    // parameters block — per invocation). The slice is threaded into the dispatch
+    // context via `ToolExecutionOnlyContext::available_tool_schemas`. It is a
+    // local, so it is scoped to this round/session and can never leak one
+    // session's tool set into another. NOTE: this is the executor's full set and
+    // is DISTINCT from the `tool_schemas` parameter (the per-session *filtered*
+    // prompt set) — they must not be conflated. The agent loop never
+    // registers/unregisters tools mid-round, so the snapshot stays valid for the
+    // whole round.
+    let available_tool_schemas: Vec<ToolSchema> = tools.list_tools();
+    let available_tool_schemas = available_tool_schemas.as_slice();
+
     let mut state = RoundExecutionState::default();
     let mut policy_guard = policy::ToolPolicyGuard::new(
         config.max_tool_calls_per_round,
@@ -424,6 +442,7 @@ pub(crate) async fn execute_round_tool_calls(
                         session,
                         tools,
                         config,
+                        available_tool_schemas,
                         task_context,
                         &mut state,
                         &mut policy_guard,
@@ -462,6 +481,7 @@ pub(crate) async fn execute_round_tool_calls(
                     session,
                     tools,
                     config,
+                    available_tool_schemas,
                     task_context,
                     &mut state,
                     &mut policy_guard,
@@ -521,6 +541,7 @@ pub(crate) async fn execute_round_tool_calls(
                                 tools,
                                 config,
                                 session_flags,
+                                available_tool_schemas,
                             }),
                         )
                         .await
@@ -665,6 +686,7 @@ pub(crate) async fn execute_round_tool_calls(
             session,
             tools,
             config,
+            available_tool_schemas,
             task_context,
             &mut state,
             &mut policy_guard,
@@ -964,6 +986,7 @@ mod tests {
             &mut session,
             &tools,
             &config,
+            tools.list_tools().as_slice(),
             &mut None,
             &mut state,
             &mut policy_guard,
@@ -1020,6 +1043,7 @@ mod tests {
             &mut session,
             &tools,
             &config,
+            tools.list_tools().as_slice(),
             &mut None,
             &mut state,
             &mut policy_guard,
@@ -1070,6 +1094,7 @@ mod tests {
             &mut session,
             &tools,
             &config,
+            tools.list_tools().as_slice(),
             &mut None,
             &mut state,
             &mut policy_guard,
@@ -1121,6 +1146,7 @@ mod tests {
             &mut session,
             &tools,
             &config,
+            tools.list_tools().as_slice(),
             &mut None,
             &mut state,
             &mut policy_guard,

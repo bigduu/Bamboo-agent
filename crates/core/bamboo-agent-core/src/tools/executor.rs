@@ -129,6 +129,26 @@ pub trait ToolExecutor: Send + Sync {
     fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
         self.tool_concurrency_safe(call.function.name.trim())
     }
+
+    /// Classify a tool call's mutability AND concurrency-safety together,
+    /// returning `(mutability, concurrency_safe)`.
+    ///
+    /// The default delegates to [`call_mutability`](Self::call_mutability) and
+    /// [`call_concurrency_safe`](Self::call_concurrency_safe) — i.e. the exact
+    /// prior behavior, so every executor that doesn't override this is
+    /// unchanged. Concrete executors that parse the call's arguments inside BOTH
+    /// of those methods (e.g. `BuiltinToolExecutor`) override this to parse the
+    /// arguments a single time while returning the identical pair. The combined
+    /// result lets callers that need both (parallel scheduling) avoid a
+    /// redundant argument parse per tool call.
+    fn call_parallel_classification(
+        &self,
+        call: &ToolCall,
+    ) -> (crate::tools::ToolMutability, bool) {
+        let mutability = self.call_mutability(call);
+        let concurrency_safe = self.call_concurrency_safe(call);
+        (mutability, concurrency_safe)
+    }
 }
 
 /// Executes a tool call with composition support

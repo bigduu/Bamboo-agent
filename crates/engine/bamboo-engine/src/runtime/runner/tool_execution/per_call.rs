@@ -6,7 +6,7 @@ use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
     parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags,
-    ToolExecutor, ToolResult,
+    ToolExecutor, ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_metrics::MetricsCollector;
@@ -44,6 +44,18 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     /// and threaded through so this (parallel-safe) path can apply them without
     /// borrowing the session.
     pub session_flags: ToolExecutionSessionFlags,
+    /// Snapshot of every tool schema the executor exposes for THIS round, built
+    /// once per round (in `execute_round_tool_calls`) rather than re-cloned on
+    /// every single tool call. Passed straight into the dispatch context's
+    /// `available_tool_schemas`. Scoped to the round — never global/static — so
+    /// one session's tool set can't leak into another. ASSUMPTION: the
+    /// executor's tool set is stable for the duration of a round (the agent loop
+    /// only registers hooks mid-round, never tools), so the snapshot equals what
+    /// a fresh `list_tools()` would return on every call. It is consumed only by
+    /// `for_dispatch`, which threads it into the dispatch context's
+    /// `available_tool_schemas` — a metadata field no builtin tool currently
+    /// inspects — so even a hypothetical divergence would be unobservable today.
+    pub available_tool_schemas: &'a [ToolSchema],
 }
 
 pub(super) struct ToolExecutionApplyContext<'a> {
@@ -138,15 +150,16 @@ pub(super) async fn execute_tool_call_only(
     }
 
     let tool_timer = std::time::Instant::now();
-    let available_tool_schemas = ctx.tools.list_tools();
     // THIS is the live server tool-dispatch path (engine runtime). Build via
     // `for_dispatch` so per-session flags stay in sync with the other loop
-    // (bamboo-agent-core's `result_handler.rs`).
+    // (bamboo-agent-core's `result_handler.rs`). The schema slice is the
+    // per-round snapshot threaded in via `ctx.available_tool_schemas` (built
+    // once in `execute_round_tool_calls`) instead of re-cloning every call.
     let tool_ctx = ToolExecutionContext::for_dispatch(
         ctx.session_id,
         &ctx.tool_call.id,
         ctx.event_tx,
-        available_tool_schemas.as_slice(),
+        ctx.available_tool_schemas,
         ctx.session_flags,
         // Only let the Bash auto path promote to background when this loop can
         // actually suspend for and self-resume the shell — i.e. a
