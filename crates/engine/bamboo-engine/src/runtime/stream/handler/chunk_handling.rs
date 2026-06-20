@@ -24,16 +24,43 @@ pub(super) async fn handle_chunk_result(
         Ok(LLMChunk::Token(token)) => {
             state.append_token(&token);
             if let Some(event_tx) = event_tx {
-                let _ = event_tx.send(AgentEvent::Token { content: token }).await;
+                // `send().await` applies proper backpressure: it only yields
+                // (waiting for capacity) while a subscriber is present, and
+                // returns `Err` solely when the receiver has been dropped
+                // (subscriber disconnected). A `try_send` or a bounded-timeout
+                // send would *drop* the token under load — exactly the silent
+                // loss this guards against — so the await is preserved. The
+                // failure path (receiver gone) used to be swallowed by
+                // `let _ =`; it now logs once per token only *after* the
+                // subscriber is already gone (issue #23).
+                if event_tx
+                    .send(AgentEvent::Token { content: token })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "[{}] event channel closed; dropping streamed token \
+                         (subscriber disconnected)",
+                        session_id,
+                    );
+                }
             }
             Ok(())
         }
         Ok(LLMChunk::ReasoningToken(token)) => {
             state.append_reasoning_token(&token);
             if let Some(event_tx) = event_tx {
-                let _ = event_tx
+                if event_tx
                     .send(AgentEvent::ReasoningToken { content: token })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "[{}] event channel closed; dropping streamed reasoning token \
+                         (subscriber disconnected)",
+                        session_id,
+                    );
+                }
             }
             Ok(())
         }
