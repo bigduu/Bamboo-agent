@@ -352,9 +352,13 @@ impl BodhiProvider {
         }
 
         let mut state = GeminiStreamState::default();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            parse_gemini_sse_event(&mut state, event, data)
-        });
+        // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
+        // cache hit and output/thinking usage in one event, and the stream sends
+        // no [DONE], so both must be emitted from that single event (issue #27).
+        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| parse_gemini_sse_event(&mut state, event, data),
+        );
 
         Ok(stream)
     }
