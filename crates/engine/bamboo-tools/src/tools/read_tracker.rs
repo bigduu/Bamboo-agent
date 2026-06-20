@@ -30,15 +30,16 @@ fn tracker() -> &'static DashMap<String, Arc<Mutex<SessionReads>>> {
     TRACKER.get_or_init(DashMap::new)
 }
 
-fn normalize_path(path: &str) -> String {
-    std::fs::canonicalize(path)
+async fn normalize_path(path: &str) -> String {
+    tokio::fs::canonicalize(path)
+        .await
         .ok()
         .and_then(|value| value.to_str().map(|s| s.to_string()))
         .unwrap_or_else(|| path.to_string())
 }
 
-fn snapshot_for_path(path: &str) -> Option<FileSnapshot> {
-    let metadata = std::fs::metadata(path).ok()?;
+async fn snapshot_for_path(path: &str) -> Option<FileSnapshot> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
     let modified_ns = metadata
         .modified()
         .ok()
@@ -74,8 +75,8 @@ async fn cleanup_if_needed() {
 }
 
 pub async fn mark_read(session_id: &str, path: &str) {
-    let normalized = normalize_path(path);
-    let snapshot = snapshot_for_path(path);
+    let normalized = normalize_path(path).await;
+    let snapshot = snapshot_for_path(path).await;
     let entry = tracker()
         .entry(session_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(SessionReads::default())))
@@ -102,7 +103,7 @@ pub async fn mark_read(session_id: &str, path: &str) {
 }
 
 pub async fn has_read(session_id: &str, path: &str) -> bool {
-    let normalized = normalize_path(path);
+    let normalized = normalize_path(path).await;
     let Some(entry) = tracker().get(session_id).map(|value| value.clone()) else {
         return false;
     };
@@ -113,7 +114,7 @@ pub async fn has_read(session_id: &str, path: &str) -> bool {
 }
 
 pub async fn read_state(session_id: &str, path: &str) -> ReadState {
-    let normalized = normalize_path(path);
+    let normalized = normalize_path(path).await;
     let Some(entry) = tracker().get(session_id).map(|value| value.clone()) else {
         return ReadState::Unread;
     };
@@ -124,7 +125,7 @@ pub async fn read_state(session_id: &str, path: &str) -> ReadState {
         return ReadState::Unread;
     };
 
-    let Some(current) = snapshot_for_path(path) else {
+    let Some(current) = snapshot_for_path(path).await else {
         return ReadState::Stale;
     };
 
@@ -168,5 +169,24 @@ mod tests {
         mark_read(&session, &path_str).await;
         assert!(has_read(&session, &path_str).await);
         assert_eq!(read_state(&session, &path_str).await, ReadState::Stale);
+    }
+
+    #[tokio::test]
+    async fn normalize_path_canonicalizes_real_file_and_falls_back_for_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("real.txt");
+        tokio::fs::write(&file_path, "hello").await.unwrap();
+
+        // A real path is canonicalized to the resolved absolute form.
+        let raw = file_path.to_string_lossy().to_string();
+        let normalized = normalize_path(&raw).await;
+        let canonical = tokio::fs::canonicalize(&file_path).await.unwrap();
+        assert_eq!(normalized, canonical.to_string_lossy().to_string());
+
+        // A non-existent path cannot be canonicalized and falls back to the
+        // input string unchanged (preserves the prior std::fs behavior).
+        let missing = dir.path().join("does_not_exist.txt");
+        let missing_str = missing.to_string_lossy().to_string();
+        assert_eq!(normalize_path(&missing_str).await, missing_str);
     }
 }
