@@ -568,36 +568,30 @@ fn truncate_to_token_budget(
     )
 }
 
+/// Keep the START of `text`, capped at `max_tokens` tokens.
+///
+/// Delegates to [`TiktokenTokenCounter::truncate_to_token_prefix`], which
+/// encodes the text **once** and decodes the first `max_tokens` tokens back to a
+/// string — O(N) — instead of the O(N²) char-by-char re-tokenization this used
+/// to perform (`count_text(&text[..i])` on every char index). See issue #24.
 fn find_prefix_within_tokens(
     text: &str,
     max_tokens: u32,
     counter: &bamboo_compression::TiktokenTokenCounter,
 ) -> String {
-    use bamboo_compression::TokenCounter;
-    let mut end = text.len();
-    for (i, _) in text.char_indices() {
-        if counter.count_text(&text[..i]) > max_tokens {
-            end = i;
-            break;
-        }
-    }
-    text[..end].to_string()
+    counter.truncate_to_token_prefix(text, max_tokens)
 }
 
+/// Keep the END of `text`, capped at `max_tokens` tokens.
+///
+/// Delegates to [`TiktokenTokenCounter::truncate_to_token_suffix`] (O(N),
+/// encode-once). See [`find_prefix_within_tokens`] and issue #24.
 fn find_suffix_within_tokens(
     text: &str,
     max_tokens: u32,
     counter: &bamboo_compression::TiktokenTokenCounter,
 ) -> String {
-    use bamboo_compression::TokenCounter;
-    let mut start = 0;
-    for (i, _) in text.char_indices().rev() {
-        if counter.count_text(&text[i..]) > max_tokens {
-            break;
-        }
-        start = i;
-    }
-    text[start..].to_string()
+    counter.truncate_to_token_suffix(text, max_tokens)
 }
 
 /// Dispatch to the appropriate scenario compressor.
