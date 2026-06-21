@@ -251,6 +251,11 @@ pub struct AppState {
     /// allowing graceful shutdown of long-running operations.
     pub cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
 
+    /// Cancels the supervised MCP proxy service (issue #47) on shutdown so the
+    /// reconnect/backoff supervisor stops cleanly instead of looping forever
+    /// after an intended stop. Unused when no broker is configured.
+    pub mcp_proxy_shutdown: CancellationToken,
+
     /// Skill manager for prompt-based skill execution
     ///
     /// Manages the skill registry and handles skill lookup,

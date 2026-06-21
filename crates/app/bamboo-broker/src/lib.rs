@@ -38,7 +38,10 @@ pub use crate::deploy::{
     AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
 };
 pub use crate::error::{BrokerError, BrokerResult};
-pub use crate::mcp::{serve_mcp_proxy, McpProxyExecutor, McpReply, McpRequest, ProxiedResult};
+pub use crate::mcp::{
+    serve_mcp_proxy, serve_mcp_proxy_supervised, McpProxyExecutor, McpReply, McpRequest,
+    ProxiedResult,
+};
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
 pub use crate::server::BrokerServer;

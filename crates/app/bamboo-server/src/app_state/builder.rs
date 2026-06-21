@@ -255,9 +255,13 @@ impl AppState {
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
 
-        // When a broker is configured, run the MCP proxy service: deployed
-        // workers forward their (host-bound) MCP tool calls here, and we execute
-        // them against this orchestrator's real MCP servers (single MCP host).
+        // When a broker is configured, run the MCP proxy service under a
+        // supervisor (issue #47): deployed workers forward their (host-bound)
+        // MCP tool calls here, and we execute them against this orchestrator's
+        // real MCP servers (single MCP host). The supervisor restarts the proxy
+        // with bounded backoff after a transient WebSocket drop instead of
+        // permanently disabling proxied tools for the worker's lifetime.
+        let mcp_proxy_shutdown = tokio_util::sync::CancellationToken::new();
         if let Some(broker) = config_snapshot.subagents.broker.clone() {
             if !broker.endpoint.trim().is_empty() {
                 let backend: std::sync::Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
@@ -265,17 +269,20 @@ impl AppState {
                         mcp_manager.clone(),
                         mcp_manager.tool_index(),
                     ));
+                let shutdown = mcp_proxy_shutdown.clone();
                 tokio::spawn(async move {
                     let me = bamboo_broker::AgentRef {
                         session_id: bamboo_broker::ORCHESTRATOR_ID.to_string(),
                         role: Some("orchestrator".into()),
                     };
-                    if let Err(e) =
-                        bamboo_broker::serve_mcp_proxy(&broker.endpoint, me, &broker.token, backend)
-                            .await
-                    {
-                        tracing::warn!("MCP proxy service ended: {e}");
-                    }
+                    bamboo_broker::serve_mcp_proxy_supervised(
+                        &broker.endpoint,
+                        me,
+                        &broker.token,
+                        backend,
+                        shutdown,
+                    )
+                    .await;
                 });
             }
         }
@@ -436,6 +443,7 @@ impl AppState {
             permission_checker,
             notification_service,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            mcp_proxy_shutdown,
             skill_manager,
             mcp_manager,
             metrics_service,

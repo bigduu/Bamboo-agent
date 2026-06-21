@@ -82,6 +82,9 @@ impl AppState {
     #[allow(dead_code)]
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down MCP servers...");
+        // Stop the supervised MCP proxy service (issue #47) so its reconnect
+        // supervisor exits cleanly instead of looping after an intended stop.
+        self.mcp_proxy_shutdown.cancel();
         self.mcp_manager.shutdown_all().await;
         tracing::info!("MCP servers shut down complete");
     }
