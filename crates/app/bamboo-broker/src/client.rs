@@ -3,6 +3,8 @@
 //! `delivered` receipt stream — so one connection can both deliver and
 //! subscribe (the parent does both: deliver an Ask, subscribe for the Reply).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bamboo_subagent::{AgentRef, InboxMessage, MsgId};
@@ -30,7 +32,15 @@ pub struct BrokerClient {
     sink: WsSink,
     messages: mpsc::UnboundedReceiver<InboxMessage>,
     delivered: mpsc::UnboundedReceiver<MsgId>,
-    _reader: tokio::task::JoinHandle<()>,
+    /// Cleared by [`reader_supervisor`] the instant the background reader exits
+    /// (clean close / panic / cancellation), so callers can tell "no messages
+    /// right now" (`next_message() -> None` but still alive) apart from "the
+    /// connection died". See [`BrokerClient::reader_alive`].
+    reader_alive: Arc<AtomicBool>,
+    /// Supervisor that awaits the reader's `JoinHandle` and logs its outcome;
+    /// ends on its own the moment the reader resolves (clean disconnect → no
+    /// leaked task). Replaces the old ignored `_reader` handle.
+    _supervisor: tokio::task::JoinHandle<()>,
 }
 
 impl BrokerClient {
@@ -69,6 +79,8 @@ impl BrokerClient {
 
         let (msg_tx, messages) = mpsc::unbounded_channel();
         let (del_tx, delivered) = mpsc::unbounded_channel();
+        // The demux loop is unchanged: it pushes `Message`/`Delivered` frames
+        // into the channels and ends when the stream closes or errors.
         let reader = tokio::spawn(async move {
             while let Some(frame) = source.next().await {
                 match frame {
@@ -87,11 +99,21 @@ impl BrokerClient {
             }
         });
 
+        // Supervise the reader so its termination is *observable* instead of
+        // silently dropped (issue #52): log every exit kind and flip a shared
+        // flag callers can poll. The supervisor owns the reader handle and ends
+        // the instant the reader resolves — a clean disconnect leaves no leaked
+        // task. Holding this must not change the reader's behavior, so the
+        // reader body above is left exactly as it was.
+        let reader_alive = Arc::new(AtomicBool::new(true));
+        let supervisor = tokio::spawn(reader_supervisor(reader, reader_alive.clone()));
+
         Ok(Self {
             sink,
             messages,
             delivered,
-            _reader: reader,
+            reader_alive,
+            _supervisor: supervisor,
         })
     }
 
@@ -138,8 +160,29 @@ impl BrokerClient {
     }
 
     /// Next pushed message, or `None` once the connection closes.
+    ///
+    /// A `None` here used to be ambiguous — "no messages right now" vs. "the
+    /// reader task died". It still returns `None` in both cases (callers already
+    /// handle that), but now it emits a `warn` when the reader is known to have
+    /// exited, and [`BrokerClient::reader_alive`] lets a caller tell the two
+    /// apart. Happy path (a message arrives) is unchanged.
     pub async fn next_message(&mut self) -> Option<InboxMessage> {
-        self.messages.recv().await
+        let msg = self.messages.recv().await;
+        if msg.is_none() && !self.reader_alive.load(Ordering::SeqCst) {
+            tracing::warn!(
+                "broker next_message() returned None: reader task exited (connection closed)"
+            );
+        }
+        msg
+    }
+
+    /// `true` while the background reader task is still running. Flips to
+    /// `false` the moment the reader exits — clean close, panic, or
+    /// cancellation — with the cause logged by [`reader_supervisor`]. Use this
+    /// after a `next_message() -> None` to distinguish "the connection died"
+    /// from "the broker is just idle".
+    pub fn reader_alive(&self) -> bool {
+        self.reader_alive.load(Ordering::SeqCst)
     }
 
     /// Acknowledge a processed message so the broker deletes it.
@@ -153,6 +196,49 @@ impl BrokerClient {
             .await
             .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
     }
+}
+
+/// Await the reader task and make its exit observable (issue #52).
+///
+/// - clean end (the demux loop returned / stream closed): `warn!`
+/// - panic (`JoinError::is_panic`): `error!` with the panic message
+/// - other `JoinError` (cancelled / aborted): `error!`
+///
+/// In every case the shared `reader_alive` flag is cleared so callers can tell
+/// "the connection died" from "no messages right now". This owns the reader
+/// handle, so it resolves — and the supervisor task ends — exactly when the
+/// reader does: a clean disconnect leaves no leaked task.
+async fn reader_supervisor(reader: tokio::task::JoinHandle<()>, reader_alive: Arc<AtomicBool>) {
+    let outcome = reader.await;
+    // Clear first, log second: a caller racing on `next_message() -> None` is
+    // guaranteed to see `reader_alive == false` by the time it checks, no matter
+    // how the reader exited.
+    reader_alive.store(false, Ordering::SeqCst);
+    match outcome {
+        Ok(()) => {
+            tracing::warn!("broker reader task ended; connection closed");
+        }
+        Err(err) if err.is_panic() => {
+            tracing::error!(
+                "broker reader task panicked: {}",
+                panic_payload_message(err.into_panic())
+            );
+        }
+        Err(err) => {
+            tracing::error!("broker reader task ended unexpectedly (cancelled/aborted): {err}");
+        }
+    }
+}
+
+/// Best-effort stringification of a panic payload (`&'static str`, `String`, or
+/// a fallback) for logging — a panic while *reporting* a reader panic would be
+/// the worst possible outcome, so this must never itself panic.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 #[cfg(test)]
@@ -244,6 +330,74 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "deliver() should fail fast, but took {:?}",
             started.elapsed(),
+        );
+    }
+
+    /// Issue #52: a broker that completes the handshake then closes the
+    /// connection, so the client's reader loop exits on its own (clean close).
+    async fn broker_that_closes_after_handshake() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = accept_async(stream).await.expect("ws upgrade");
+            let (mut sink, mut source) = ws.split();
+            // First text frame is the client's `Hello`; answer with `Welcome`.
+            if let Some(Ok(Message::Text(_))) = source.next().await {
+                let _ = sink
+                    .send(Message::Text(BrokerFrame::Welcome.to_text()))
+                    .await;
+            }
+            // Close cleanly so the client reader's `Ok(Close)` / stream-end arm
+            // fires and the demux loop returns on its own.
+            let _ = sink.send(Message::Close(None)).await;
+            // Drain anything the client still sends until its side closes too.
+            while let Some(Ok(_)) = source.next().await {}
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Issue #52: when the connection closes (reader loop returns), the death
+    /// must be *observable* to a caller instead of a silent
+    /// `next_message() -> None`. The supervisor flips `reader_alive`, so after
+    /// the close:
+    ///   - `next_message()` returns `None`, and
+    ///   - `reader_alive()` is `false`.
+    /// (Logging is exercised by the same supervisor path; we assert the
+    /// caller-facing surface here.)
+    #[tokio::test]
+    async fn reader_death_is_surfaced_when_connection_closes() {
+        let endpoint = broker_that_closes_after_handshake().await;
+        let mut client = BrokerClient::connect(&endpoint, test_agent("parent"), "ignored")
+            .await
+            .expect("handshake completes");
+
+        // The reader is alive right after a successful handshake.
+        assert!(
+            client.reader_alive(),
+            "reader should be alive immediately after connect"
+        );
+
+        // Server closed → reader loop returns → `messages` channel drains to None.
+        let msg = tokio::time::timeout(Duration::from_secs(2), client.next_message())
+            .await
+            .expect("next_message() resolved instead of hanging");
+        assert!(msg.is_none(), "no message expected after the close");
+
+        // The supervisor flips the flag once the reader resolves; give the
+        // runtime a (short, bounded) moment to schedule that.
+        let flagged_dead = tokio::time::timeout(Duration::from_secs(2), async {
+            while client.reader_alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            flagged_dead,
+            "reader should be marked dead once the connection closed"
         );
     }
 }
