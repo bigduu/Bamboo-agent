@@ -668,6 +668,9 @@ impl AgentRuntime {
         let loop_config = AgentLoopConfig {
             max_rounds: 200,
             system_prompt,
+            // Snapshot the legacy model_limits from the live in-memory config so
+            // resolve_token_budget never falls back to a disk-reading Config::new(). #38.
+            legacy_model_limits: config.extra.get("model_limits").cloned(),
             disabled_skill_ids: disabled_skill_ids.unwrap_or_else(|| config.disabled_skill_ids()),
             selected_skill_ids,
             selected_skill_mode,

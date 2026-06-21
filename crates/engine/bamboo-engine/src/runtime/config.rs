@@ -387,6 +387,12 @@ pub struct AgentLoopConfig {
     pub(crate) disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
     pub(crate) token_budget: Option<TokenBudget>,
+    /// Legacy `config.json` `model_limits` value, snapshotted from the live
+    /// in-memory Config when this loop config is built. Consulted only by
+    /// `resolve_token_budget` as a last-resort fallback when `model_limits.json`
+    /// fails to load — so the engine never does a fresh disk-reading
+    /// `Config::new()` (which would also clobber the global env-var cache). #38.
+    pub(crate) legacy_model_limits: Option<serde_json::Value>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
     ///
     /// This is intended for text-only provider paths where image parts must be degraded
@@ -480,6 +486,7 @@ impl Default for AgentLoopConfig {
             app_data_dir: None,
             disabled_tools: BTreeSet::new(),
             token_budget: None,
+            legacy_model_limits: None,
             image_fallback: None,
             prompt_memory_flags: PromptMemoryFlags::default(),
             max_tool_calls_per_round: 80,
