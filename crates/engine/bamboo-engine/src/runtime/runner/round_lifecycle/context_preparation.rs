@@ -28,6 +28,11 @@ mod transforms;
 
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
 
+/// Session-metadata key holding the last emitted context-pressure level, so
+/// `ContextPressureNotification` is deduplicated across rounds on a per-level-
+/// transition basis (mirrors the prefix-drift `session.metadata` key style).
+const LAST_PRESSURE_LEVEL_KEY: &str = "context_pressure_last_level";
+
 pub(super) struct PreparedRoundContext {
     pub prepared_context: PreparedContext,
     pub budget: TokenBudget,
@@ -50,10 +55,8 @@ async fn emit_context_compression_status(
 }
 
 fn emit_context_pressure_notification(
-    session: &Session,
-    _budget: &TokenBudget,
+    session: &mut Session,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
-    last_emitted_level: &mut Option<String>,
 ) {
     let Some(tx) = event_tx else { return };
     let Some(usage) = session.token_usage.as_ref() else {
@@ -69,6 +72,7 @@ fn emit_context_pressure_notification(
     }
 
     let pct = (usage.total_tokens as f64 / denominator as f64) * 100.0;
+    // `usage`'s immutable borrow ends here; the metadata mutations below need it.
 
     let (level, message) = if pct >= 90.0 {
         (
@@ -87,13 +91,26 @@ fn emit_context_pressure_notification(
             ),
         )
     } else {
+        // Pressure dropped below the warning threshold: clear the stored level so
+        // that re-entering pressure later re-notifies. Dedup is per level
+        // transition, not once-forever.
+        session.metadata.remove(LAST_PRESSURE_LEVEL_KEY);
         return;
     };
 
-    if last_emitted_level.as_deref() == Some(level) {
+    // Dedup across rounds via session.metadata: skip if the current level matches
+    // the last one we emitted for this session.
+    if session
+        .metadata
+        .get(LAST_PRESSURE_LEVEL_KEY)
+        .map(String::as_str)
+        == Some(level)
+    {
         return;
     }
-    *last_emitted_level = Some(level.to_string());
+    session
+        .metadata
+        .insert(LAST_PRESSURE_LEVEL_KEY.to_string(), level.to_string());
 
     let _ = tx.try_send(AgentEvent::ContextPressureNotification {
         percent: pct,
@@ -562,8 +579,9 @@ pub(super) async fn prepare_round_context(
     transforms::apply_message_transforms(config, &mut prepared_context, llm, session_id).await?;
     logging::log_context_truncation(session_id, &prepared_context);
 
-    let mut _pressure_level = None;
-    emit_context_pressure_notification(session, &budget, event_tx, &mut _pressure_level);
+    // Dedup state for pressure notifications lives in session.metadata so it
+    // persists across rounds (see LAST_PRESSURE_LEVEL_KEY).
+    emit_context_pressure_notification(session, event_tx);
 
     Ok(PreparedRoundContext {
         prepared_context,

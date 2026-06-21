@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use super::{maybe_apply_host_context_compression, prepare_round_context};
+use super::{
+    emit_context_pressure_notification, maybe_apply_host_context_compression,
+    prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
+};
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{
@@ -1682,5 +1685,117 @@ async fn tokens_saved_is_computed_from_compressed_messages() {
     assert!(
         tokens_saved > 0,
         "tokens_saved should be > 0, got {tokens_saved}"
+    );
+}
+
+/// Build a `TokenBudgetUsage` at `total_tokens`/`max_context_tokens`, so pressure
+/// is `total / max * 100` percent. `max_context_tokens` doubles as `budget_limit`.
+fn pressure_usage(total_tokens: u32, max_context_tokens: u32) -> TokenBudgetUsage {
+    TokenBudgetUsage {
+        system_tokens: 0,
+        summary_tokens: 0,
+        window_tokens: 0,
+        total_tokens,
+        max_context_tokens,
+        budget_limit: max_context_tokens,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    }
+}
+
+/// Count emitted `ContextPressureNotification` events still buffered on a
+/// channel. `emit_context_pressure_notification` uses `try_send`, so draining via
+/// `try_recv` needs no async runtime.
+fn drain_pressure_notifications(event_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<String> {
+    std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextPressureNotification { level, .. } => Some(level),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn context_pressure_notification_fires_at_most_once_per_level_across_rounds() {
+    // Acceptance test for issue #36: with pressure held at a fixed level, the
+    // notification must fire exactly once — not once per round. Dedup state now
+    // persists in session.metadata instead of a per-round throwaway local.
+    let mut session = Session::new("session-pressure-dedup", "test-model");
+    // 80% usage -> "warning" level (>= 70%).
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+
+    // Drive 10 rounds at the same pressure level.
+    for _ in 0..10 {
+        emit_context_pressure_notification(&mut session, Some(&event_tx));
+    }
+    drop(event_tx);
+
+    let levels = drain_pressure_notifications(&mut event_rx);
+    assert_eq!(
+        levels,
+        vec!["warning".to_string()],
+        "expected exactly one notification across 10 rounds at the same level"
+    );
+    // Dedup state persists across rounds in metadata.
+    assert_eq!(
+        session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
+        Some(&"warning".to_string())
+    );
+}
+
+#[test]
+fn context_pressure_notification_refires_only_on_level_transition() {
+    // Per-level-transition semantics: a level re-fires only after pressure drops
+    // below the threshold and comes back (reset), or escalates to a new level.
+    let mut session = Session::new("session-pressure-transition", "test-model");
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+
+    // Round 1: 80% warning -> emits.
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    emit_context_pressure_notification(&mut session, Some(&event_tx));
+
+    // Round 2: still 80% warning -> deduped, no re-fire.
+    emit_context_pressure_notification(&mut session, Some(&event_tx));
+
+    // Round 3: drops to 50% (below threshold) -> clears stored level, no fire.
+    session.token_usage = Some(pressure_usage(50_000, 100_000));
+    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    assert!(
+        session.metadata.get(LAST_PRESSURE_LEVEL_KEY).is_none(),
+        "stored level should be cleared once pressure drops below threshold"
+    );
+
+    // Round 4: back to 80% warning -> re-fires (reset transition).
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    emit_context_pressure_notification(&mut session, Some(&event_tx));
+
+    // Round 5: escalates to 95% critical -> level transition, fires again.
+    session.token_usage = Some(pressure_usage(95_000, 100_000));
+    emit_context_pressure_notification(&mut session, Some(&event_tx));
+
+    // Round 6: still 95% critical -> deduped, no re-fire.
+    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    drop(event_tx);
+
+    let levels = drain_pressure_notifications(&mut event_rx);
+    // warning (r1) + warning (r4, after reset) + critical (r5) == 3 fires.
+    assert_eq!(
+        levels,
+        vec![
+            "warning".to_string(),
+            "warning".to_string(),
+            "critical".to_string()
+        ],
+        "expected fires only on level transitions, not every round"
+    );
+    assert_eq!(
+        session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
+        Some(&"critical".to_string())
     );
 }
