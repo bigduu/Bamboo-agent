@@ -3,6 +3,7 @@
 //! This module provides a flexible permission system for controlling access to
 //! potentially dangerous operations like file writes, command execution, and HTTP requests.
 
+use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
@@ -588,8 +589,15 @@ fn match_pattern_internal(pattern: &str, resource: &str) -> bool {
 pub struct PermissionConfig {
     /// Persistent whitelist rules (loaded from/saved to config file)
     whitelist: DashMap<String, PermissionRule>,
-    /// Session-granted permissions that expire after a timeout
-    session_grants: DashMap<PermissionType, Vec<SessionGrant>>,
+    /// Session-granted permissions that expire after a timeout.
+    ///
+    /// Keyed by `PermissionType`, then by the grant's resource-pattern string.
+    /// Using a `HashMap` (rather than a `Vec`) makes dedup and re-grant O(1) and
+    /// bounds growth: re-granting the same pattern replaces/refreshes the existing
+    /// entry instead of appending a duplicate. The per-pattern lookup cannot be
+    /// used to resolve a *match*, however, because matching is glob-based — see
+    /// [`PermissionConfig::is_session_granted`].
+    session_grants: DashMap<PermissionType, HashMap<String, SessionGrant>>,
     /// Default session grant duration (default: 30 minutes)
     session_grant_duration: Duration,
     /// Whether permission checks are enabled
@@ -768,36 +776,45 @@ impl PermissionConfig {
         self.whitelist.clear();
     }
 
-    /// Grant a permission for the current session
+    /// Grant a permission for the current session.
+    ///
+    /// Grants are keyed by their resource pattern, so re-granting the **same**
+    /// pattern replaces the existing entry (refreshing its expiry) instead of
+    /// appending a duplicate — this bounds the per-permission grant set to one
+    /// entry per distinct pattern. Expired grants are also opportunistically
+    /// pruned on every call, so the set does not grow without an explicit
+    /// [`PermissionConfig::cleanup_expired_grants`] call.
     pub fn grant_session_permission(
         &self,
         perm_type: PermissionType,
         resource_pattern: impl Into<String>,
     ) {
         let grant = SessionGrant::new(resource_pattern, self.session_grant_duration);
+        let pattern = grant.resource_pattern.clone();
 
-        self.session_grants
-            .entry(perm_type)
-            .and_modify(|grants| {
-                grants.push(grant.clone());
-            })
-            .or_insert_with(|| vec![grant]);
+        let mut grants = self.session_grants.entry(perm_type).or_default();
+
+        // Opportunistic auto-cleanup: drop expired grants on every insert.
+        grants.retain(|_, g| !g.is_expired());
+
+        // Dedup: re-granting the same pattern replaces/refreshes the entry.
+        grants.insert(pattern, grant);
     }
 
-    /// Check if a permission is granted for the current session
+    /// Check if a permission is granted for the current session.
+    ///
+    /// Grant matching is **glob-based** (a single resource such as `/tmp/x.rs`
+    /// can match several patterns, e.g. `/tmp/*` and `*.rs`), so the match
+    /// cannot be resolved by a single O(1) hash lookup of the resource — each
+    /// pattern must be evaluated against it. The set scanned here is, however,
+    /// deduped and (via [`PermissionConfig::grant_session_permission`]) cleaned
+    /// of expired entries, so it never grows without bound. Expired grants are
+    /// still skipped defensively here in case the set hasn't been pruned yet.
     pub fn is_session_granted(&self, perm_type: PermissionType, resource: &str) -> bool {
         if let Some(grants) = self.session_grants.get(&perm_type) {
-            // Clean up expired grants and check for matches
-            let has_match = grants.iter().any(|grant| {
-                if grant.is_expired() {
-                    return false;
-                }
-                grant.matches(perm_type, resource)
-            });
-
-            if has_match {
-                return true;
-            }
+            return grants
+                .values()
+                .any(|grant| !grant.is_expired() && grant.matches(perm_type, resource));
         }
         false
     }
@@ -807,10 +824,14 @@ impl PermissionConfig {
         self.session_grants.clear();
     }
 
-    /// Clean up expired session grants
+    /// Clean up expired session grants.
+    ///
+    /// Note that expired grants are *also* removed opportunistically by
+    /// [`PermissionConfig::grant_session_permission`]; this explicit call is
+    /// still available for callers that want to prune without granting.
     pub fn cleanup_expired_grants(&self) {
         for mut entry in self.session_grants.iter_mut() {
-            entry.value_mut().retain(|grant| !grant.is_expired());
+            entry.value_mut().retain(|_, g| !g.is_expired());
         }
     }
 
@@ -1194,6 +1215,150 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         assert!(!grant.matches(PermissionType::WriteFile, "/tmp/test.txt"));
+    }
+
+    #[test]
+    fn test_session_grant_dedup_same_pattern_replaces() {
+        // (a) Re-granting the same pattern must NOT append a duplicate — it
+        // replaces/refreshes the existing entry, so the grant set is bounded.
+        let config = PermissionConfig::new();
+
+        config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
+        config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
+        config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
+
+        let count = config
+            .session_grants
+            .get(&PermissionType::WriteFile)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "re-granting the same pattern must dedup to a single entry"
+        );
+
+        // A distinct pattern under the same perm_type is a separate entry.
+        config.grant_session_permission(PermissionType::WriteFile, "/home/*");
+        let count = config
+            .session_grants
+            .get(&PermissionType::WriteFile)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(count, 2, "two distinct patterns must yield two entries");
+    }
+
+    #[test]
+    fn test_session_grant_expired_auto_removed_on_grant() {
+        // (b) An expired grant is removed (not merely skipped) by a subsequent
+        // grant — opportunistic auto-cleanup inside grant_session_permission.
+        let config = PermissionConfig::new();
+
+        // Inject an already-expired grant directly (grant_session_permission
+        // always uses the 30-min default, so we plant a 0-duration one here).
+        {
+            let mut grants = config
+                .session_grants
+                .entry(PermissionType::WriteFile)
+                .or_default();
+            grants.insert(
+                "/var/*".to_string(),
+                SessionGrant::new("/var/*", Duration::from_secs(0)),
+            );
+        }
+        // Ensure the 0-duration grant has actually expired.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let before = config
+            .session_grants
+            .get(&PermissionType::WriteFile)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(before, 1, "precondition: expired grant is present");
+
+        // Granting a new (distinct) pattern must prune the expired one.
+        config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
+
+        let grants = config
+            .session_grants
+            .get(&PermissionType::WriteFile)
+            .expect("WriteFile grants bucket must exist");
+        assert_eq!(grants.len(), 1, "expired grant must be auto-removed");
+        assert!(grants.contains_key("/tmp/*"), "new grant must remain");
+        assert!(!grants.contains_key("/var/*"), "expired grant must be gone");
+    }
+
+    #[test]
+    fn test_session_grant_expired_removed_by_explicit_cleanup() {
+        // (b, cont.) The explicit cleanup_expired_grants() still removes
+        // expired entries too (behavior preserved from the old Vec impl).
+        let config = PermissionConfig::new();
+        {
+            let mut grants = config
+                .session_grants
+                .entry(PermissionType::ExecuteCommand)
+                .or_default();
+            grants.insert(
+                "npm".to_string(),
+                SessionGrant::new("npm", Duration::from_secs(0)),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(config
+            .session_grants
+            .get(&PermissionType::ExecuteCommand)
+            .map(|m| m.contains_key("npm"))
+            .unwrap_or(false));
+
+        config.cleanup_expired_grants();
+
+        let grants = config
+            .session_grants
+            .get(&PermissionType::ExecuteCommand)
+            .expect("bucket must still exist after cleanup");
+        assert!(grants.is_empty(), "expired grant must be removed");
+    }
+
+    #[test]
+    fn test_is_session_granted_allow_deny_expired() {
+        // (c) is_session_granted returns the correct allow/deny for matching,
+        // non-matching, and expired patterns.
+        let config = PermissionConfig::new();
+        config.grant_session_permission(PermissionType::HttpRequest, "api.example.com");
+
+        // Matching pattern → granted.
+        assert!(config.is_session_granted(PermissionType::HttpRequest, "api.example.com"));
+        // Non-matching resource → not granted.
+        assert!(!config.is_session_granted(PermissionType::HttpRequest, "other.example.com"));
+        // Different perm_type → not granted.
+        assert!(!config.is_session_granted(PermissionType::ExecuteCommand, "api.example.com"));
+
+        // Expired grant → not granted (deny).
+        {
+            let mut grants = config
+                .session_grants
+                .entry(PermissionType::TerminalSession)
+                .or_default();
+            grants.insert(
+                "session_1".to_string(),
+                SessionGrant::new("session_1", Duration::from_secs(0)),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!config.is_session_granted(PermissionType::TerminalSession, "session_1"));
+    }
+
+    #[test]
+    fn test_is_session_granted_glob_match() {
+        // (d) Matching is glob-based: a wildcard pattern matches a concrete
+        // resource that is NOT identical to the pattern string. This is exactly
+        // why the match itself cannot be a single O(1) hashed lookup.
+        let config = PermissionConfig::new();
+        config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
+
+        // /tmp/foo.rs matches the /tmp/* glob even though it isn't the key.
+        assert!(config.is_session_granted(PermissionType::WriteFile, "/tmp/foo.rs"));
+        // A path outside the glob does not.
+        assert!(!config.is_session_granted(PermissionType::WriteFile, "/var/foo.rs"));
     }
 
     #[test]
