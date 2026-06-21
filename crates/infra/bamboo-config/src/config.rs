@@ -1110,7 +1110,15 @@ fn expand_user_path(value: &str) -> PathBuf {
 
 impl Default for Config {
     fn default() -> Self {
-        Self::new()
+        // In-memory defaults ONLY. `default()` must not touch the filesystem or
+        // environment: it was delegating to `new()` → `from_data_dir(None)`,
+        // which read config.json from disk, applied BAMBOO_* env overrides, and
+        // published to the global env-var cache. That made every `..Default::
+        // default()` struct-update and every test silently disk-dependent and
+        // let non-server callers clobber the server's in-memory config cache.
+        // `create_default()` is the pure in-memory constructor; disk loading is
+        // the explicit job of `new()` / `from_data_dir()`. #38.
+        Self::create_default()
     }
 }
 
@@ -2828,13 +2836,11 @@ mod tests {
 
     #[test]
     fn default_config_has_empty_env_vars() {
-        // `Config::default()` loads from the real on-disk data dir, which makes this
-        // assertion depend on the developer's `~/.bamboo/config.json`. Isolate to an
-        // empty temp data dir (no config.json) so we exercise the in-memory default.
-        let _lock = env_lock_acquire();
-        let temp_home = TempHome::new();
-        let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        assert!(config.env_vars.is_empty());
+        // `Config::default()` is a pure in-memory constructor (no disk read, no
+        // env overrides), so this is independent of the developer's
+        // `~/.bamboo/config.json` — no temp-dir isolation needed. Directly
+        // asserts the #38 invariant that default() does not touch the filesystem.
+        assert!(Config::default().env_vars.is_empty());
     }
 
     #[test]
