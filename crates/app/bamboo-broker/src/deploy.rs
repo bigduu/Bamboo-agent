@@ -291,7 +291,17 @@ impl SshDeployer {
         } else {
             broker_port(&d.broker_endpoint)
         };
-        let mut a = vec!["-tt".to_string()];
+        let mut a = vec![
+            "-tt".to_string(),
+            // Trust-on-first-use: accept a NEW host key on first connect but
+            // REJECT a known host whose key has changed — closes the silent
+            // key-change MITM hole without breaking first deploys. The broker
+            // token + ProvisionSpec provider creds ride this connection, so host
+            // verification must not silently fall back to the user's SSH config
+            // (often `accept-new` or `no`).
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
         if let Some(p) = port {
             a.push("-R".to_string());
             a.push(format!("{p}:127.0.0.1:{p}"));
@@ -393,11 +403,20 @@ mod tests {
         let s = SshDeployer::new("gpu-host");
         let a = s.argv(&dep()); // dep() broker_endpoint = ws://broker:9600
         assert_eq!(a[0], "-tt");
+        // Host-key checking: trust-on-first-use (accept new host keys, reject a
+        // changed key on a known host) — must always be in the constructed argv.
+        assert!(a.windows(2).any(|w| w
+            == [
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string()
+            ]));
         // reverse tunnel: remote loopback :9600 -> host-side broker :9600
-        assert_eq!(a[1], "-R");
-        assert_eq!(a[2], "9600:127.0.0.1:9600");
-        assert_eq!(a[3], "gpu-host");
-        let remote = &a[4];
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["-R".to_string(), "9600:127.0.0.1:9600".to_string()]));
+        assert!(a.contains(&"gpu-host".to_string()));
+        // the single remote-command argument is always last.
+        let remote = a.last().unwrap();
         assert!(remote.starts_with("BAMBOO_BROKER_TOKEN='tok'"));
         assert!(remote.contains("broker-agent"));
         // the worker connects to the tunnel mouth on the remote loopback,
@@ -413,7 +432,13 @@ mod tests {
         let s = SshDeployer::new("localhost");
         let a = s.argv(&dep());
         assert_eq!(a[0], "-tt");
-        assert_eq!(a[1], "localhost");
+        // Host-key checking still enforced on same-host deploys.
+        assert!(a.windows(2).any(|w| w
+            == [
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string()
+            ]));
+        assert!(a.contains(&"localhost".to_string()));
         assert!(!a.iter().any(|x| x == "-R"));
         let remote = a.last().unwrap();
         assert!(remote.contains("ws://broker:9600"));
