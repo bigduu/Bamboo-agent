@@ -287,3 +287,121 @@ impl Tool for DeployAgentTool {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn empty_registry() -> DeployedRegistry {
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn tool_with(registry: DeployedRegistry) -> DeployAgentTool {
+        // bamboo_bin is never spawned in these tests (we don't drive deploy()).
+        DeployAgentTool::new("ws://localhost:0", "test-token", "/bin/true", registry)
+    }
+
+    /// A trivial long-running child so the kill/wait path is genuinely exercised.
+    fn spawn_sleeper(id: &str, cleanup: Option<Vec<String>>) -> DeployedAgent {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        DeployedAgent::from_parts(id, child, cleanup)
+    }
+
+    /// True while `pid` is a live process (POSIX `kill -0`).
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn parse(result: ToolResult) -> serde_json::Value {
+        serde_json::from_str(&result.result).expect("tool result is JSON")
+    }
+
+    #[tokio::test]
+    async fn deploy_list_stop_lifecycle_kills_process() {
+        let registry = empty_registry();
+        let tool = tool_with(registry.clone());
+
+        // (1) register a worker (the registry effect of a successful deploy); list shows it.
+        let agent = spawn_sleeper("w1", None);
+        let pid = agent.pid().expect("child has a pid");
+        registry.lock().await.insert(
+            "w1".to_string(),
+            Deployed {
+                env: "local".into(),
+                handle: agent,
+            },
+        );
+        assert!(
+            pid_alive(pid),
+            "registered worker process should be running"
+        );
+
+        let listed = parse(tool.list().await.unwrap());
+        let agents = listed["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["id"], "w1");
+        assert_eq!(agents[0]["env"], "local");
+
+        // (2) stop: removes the entry AND kills the process (shutdown awaits the child).
+        let stopped = parse(tool.stop("w1".to_string()).await.unwrap());
+        assert_eq!(stopped["id"], "w1");
+        assert_eq!(stopped["status"], "stopped");
+        assert!(!pid_alive(pid), "stopped worker process must be killed");
+
+        // (3) list after stop is empty.
+        let listed = parse(tool.list().await.unwrap());
+        assert!(listed["agents"].as_array().unwrap().is_empty());
+
+        // (4) double-stop (already removed) is a no-op, not a crash.
+        let again = parse(tool.stop("w1".to_string()).await.unwrap());
+        assert_eq!(again["status"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn stop_unknown_id_is_not_found_not_a_crash() {
+        let tool = tool_with(empty_registry());
+        let r = parse(tool.stop("never-deployed".to_string()).await.unwrap());
+        assert_eq!(r["status"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn deployed_agent_shutdown_kills_and_runs_cleanup() {
+        // A unique marker the cleanup command will `touch` — proves cleanup ran.
+        let marker = std::env::temp_dir().join(format!(
+            "bamboo_deploy_cleanup_{}_{:?}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let agent = spawn_sleeper(
+            "cleanup-worker",
+            Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch {}", marker.display()),
+            ]),
+        );
+        let pid = agent.pid().expect("child has a pid");
+
+        agent.shutdown().await;
+
+        assert!(!pid_alive(pid), "shutdown must kill the process");
+        assert!(
+            marker.exists(),
+            "shutdown must run the cleanup command (docker rm -f path)"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+}
