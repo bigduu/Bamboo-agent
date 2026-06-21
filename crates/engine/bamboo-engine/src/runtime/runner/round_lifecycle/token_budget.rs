@@ -47,34 +47,12 @@ pub(super) async fn resolve_token_budget(
     };
 
     if !loaded_from_file {
-        let unified_model_limits = match tokio::task::spawn_blocking(|| {
-            let config = bamboo_llm::Config::new();
-            load_model_limits_from_unified_config(config.extra.get("model_limits"))
-        })
-        .await
-        {
-            Ok(Ok(limits)) => limits,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    "Failed to parse legacy model limits from config.json key 'model_limits': {}.",
-                    error
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "Failed to load legacy model limits from config.json: {}.",
-                    error
-                );
-                None
-            }
-        };
-
-        if let Some(limits) = unified_model_limits {
-            for limit in limits {
-                registry.add_limit(limit);
-            }
-        }
+        // Legacy fallback: parse the config.json `model_limits` key. The value is
+        // snapshotted from the live in-memory config at loop-config build time
+        // (config.legacy_model_limits) — NOT re-read from disk via Config::new(),
+        // which would diverge from the server's live config and clobber the global
+        // env-var cache (#38). Pure JSON parse, so no spawn_blocking needed.
+        apply_legacy_model_limits(&mut registry, config.legacy_model_limits.as_ref());
     }
 
     let matched_limit = registry.get(model_name);
@@ -106,6 +84,29 @@ pub(super) async fn resolve_token_budget(
         bamboo_compression::BudgetStrategy::default(),
         model_limit.get_safety_margin(),
     )
+}
+
+/// Apply the legacy `config.json` `model_limits` value (snapshotted from the
+/// live in-memory config) to `registry`. Pure: parses the JSON and adds each
+/// limit; a parse error is logged and ignored (the registry keeps its defaults).
+fn apply_legacy_model_limits(
+    registry: &mut ModelLimitsRegistry,
+    legacy_model_limits: Option<&serde_json::Value>,
+) {
+    match load_model_limits_from_unified_config(legacy_model_limits) {
+        Ok(Some(limits)) => {
+            for limit in limits {
+                registry.add_limit(limit);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "Failed to parse legacy model limits from config.json key 'model_limits': {}.",
+                error
+            );
+        }
+    }
 }
 
 async fn resolve_provider_runtime_limit(
@@ -157,6 +158,33 @@ mod tests {
     use bamboo_agent_core::{tools::ToolSchema, Message};
     use bamboo_llm::provider::{LLMError, ProviderModelInfo, Result};
     use bamboo_llm::types::LLMChunk;
+
+    #[test]
+    fn apply_legacy_model_limits_adds_parsed_limits_to_registry() {
+        // A legacy config.json `model_limits` value, as snapshotted into
+        // AgentLoopConfig.legacy_model_limits from the live in-memory config.
+        let legacy = serde_json::json!([
+            { "model_pattern": "legacy-model", "max_context_tokens": 12345 }
+        ]);
+        let mut registry = ModelLimitsRegistry::new();
+        apply_legacy_model_limits(&mut registry, Some(&legacy));
+        let got = registry
+            .get("legacy-model")
+            .expect("legacy model limit was applied to the registry");
+        assert_eq!(got.max_context_tokens, 12345);
+    }
+
+    #[test]
+    fn apply_legacy_model_limits_is_noop_for_none_or_malformed() {
+        let mut registry = ModelLimitsRegistry::new();
+        // No legacy value -> nothing added.
+        apply_legacy_model_limits(&mut registry, None);
+        assert!(registry.get("legacy-model").is_none());
+        // Malformed value -> logged + ignored, not a panic, nothing added.
+        let bad = serde_json::json!({ "not": "an array" });
+        apply_legacy_model_limits(&mut registry, Some(&bad));
+        assert!(registry.get("legacy-model").is_none());
+    }
 
     #[derive(Default)]
     struct MetadataProvider {
