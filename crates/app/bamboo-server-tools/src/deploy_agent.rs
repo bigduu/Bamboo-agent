@@ -315,6 +315,9 @@ mod tests {
     fn pid_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
+            // `kill -0` on a reaped pid prints "No such process" to stderr; that
+            // stderr is the expected signal, not test noise — silence it.
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
