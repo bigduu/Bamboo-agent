@@ -210,9 +210,12 @@ impl BrokerClient {
 /// reader does: a clean disconnect leaves no leaked task.
 async fn reader_supervisor(reader: tokio::task::JoinHandle<()>, reader_alive: Arc<AtomicBool>) {
     let outcome = reader.await;
-    // Clear first, log second: a caller racing on `next_message() -> None` is
-    // guaranteed to see `reader_alive == false` by the time it checks, no matter
-    // how the reader exited.
+    // Best-effort, eventually-consistent death signal: this store races the
+    // reader dropping `msg_tx` (which is what makes `next_message()` return
+    // `None`), so a caller can observe `None` a beat *before* this flips the
+    // flag. That only means a possibly-missed warn on the very first post-death
+    // `None`; it is not a correctness guarantee and callers must not rely on
+    // `reader_alive` being false the instant `next_message()` returns `None`.
     reader_alive.store(false, Ordering::SeqCst);
     match outcome {
         Ok(()) => {
