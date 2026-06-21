@@ -107,13 +107,6 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
-        // the dependency arrow pointing down (agent-core no longer imports the
-        // infrastructure config crate); the server owns config and provides it here.
-        bamboo_agent_core::workspace_state::set_default_workspace_provider(|| {
-            bamboo_llm::Config::from_data_dir(Some(bamboo_config::paths::bamboo_dir()))
-                .get_default_work_area_path()
-        });
-
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
@@ -122,6 +115,32 @@ impl AppState {
         let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
 
         let config = Arc::new(RwLock::new(config));
+
+        // Wire the configured-default-workspace resolver into agent-core. This keeps
+        // the dependency arrow pointing down (agent-core owns only the slot; the
+        // server fills it). The closure reads the server's LIVE in-memory config —
+        // not a fresh disk-reading Config::new(), which would diverge from the live
+        // config and clobber the global env-var cache (#38). `try_read` never blocks
+        // (the resolver is called from sync code, so a blocking read could deadlock);
+        // on the rare write-lock contention it returns the last successfully-resolved
+        // path so a session never transiently falls back to the process cwd.
+        {
+            let config_for_workspace = config.clone();
+            let last_known: Arc<std::sync::Mutex<Option<PathBuf>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            bamboo_agent_core::workspace_state::set_default_workspace_provider(Box::new(
+                move || match config_for_workspace.try_read() {
+                    Ok(cfg) => {
+                        let path = cfg.get_default_work_area_path();
+                        if let Ok(mut cache) = last_known.lock() {
+                            *cache = path.clone();
+                        }
+                        path
+                    }
+                    Err(_) => last_known.lock().ok().and_then(|c| c.clone()),
+                },
+            ));
+        }
 
         let permission_checker = load_permission_checker(&bamboo_home_dir).await;
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(

@@ -40,7 +40,10 @@ pub fn get_workspace(session_id: &str) -> Option<PathBuf> {
 /// config crate. Instead, the composition root (the server bootstrap) registers
 /// a provider here via [`set_default_workspace_provider`]; until then this
 /// resolves to `None` and callers fall back to the process working directory.
-type DefaultWorkspaceProvider = fn() -> Option<PathBuf>;
+/// A boxed closure (not a bare `fn`) so the composition root can capture state —
+/// e.g. a handle to the server's live in-memory config — instead of being forced
+/// to re-read config from disk on every call. #38.
+type DefaultWorkspaceProvider = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 static DEFAULT_WORKSPACE_PROVIDER: OnceLock<DefaultWorkspaceProvider> = OnceLock::new();
 
 /// Register the provider that resolves the configured default workspace.
