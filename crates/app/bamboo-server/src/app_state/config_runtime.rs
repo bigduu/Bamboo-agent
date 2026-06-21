@@ -102,8 +102,15 @@ impl AppState {
     /// }
     /// ```
     pub async fn reload_config(&self) -> Config {
-        let new_config = Config::from_data_dir(Some(self.app_data_dir.clone()));
+        // Read from disk INSIDE the write lock. If the disk read happened before
+        // acquiring the lock, a concurrent update_config() could persist new
+        // state in that gap and then be clobbered here by the stale disk copy
+        // (in-memory-only mutations silently lost). Holding the lock across the
+        // read+swap serializes reload with update_config's in-memory mutation.
+        // Config::from_data_dir is a sync read (no await), so this doesn't hold
+        // the lock across an await point. #41.
         let mut config = self.config.write().await;
+        let new_config = Config::from_data_dir(Some(self.app_data_dir.clone()));
         *config = new_config.clone();
         new_config
     }
