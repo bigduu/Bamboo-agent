@@ -49,6 +49,22 @@ pub struct DeployedAgent {
 }
 
 impl DeployedAgent {
+    /// Build from an already-spawned child process and an optional cleanup
+    /// command. Used by the deployers below; also lets integration tests
+    /// exercise the registry/shutdown lifecycle with a trivial child instead of
+    /// a real docker/ssh deployment.
+    pub fn from_parts(
+        id: impl Into<String>,
+        child: tokio::process::Child,
+        cleanup: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            child,
+            cleanup,
+        }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }
@@ -122,11 +138,7 @@ impl Deployer for LocalProcessDeployer {
             .env("BAMBOO_BROKER_TOKEN", &d.token)
             .kill_on_drop(true);
         let child = cmd.spawn().map_err(spawn_err)?;
-        Ok(DeployedAgent {
-            id: d.id.clone(),
-            child,
-            cleanup: None,
-        })
+        Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
     }
 }
 
@@ -243,16 +255,16 @@ impl Deployer for DockerDeployer {
         let mut cmd = Command::new(&self.docker_bin);
         cmd.args(self.argv(d, &container)).kill_on_drop(true);
         let child = cmd.spawn().map_err(spawn_err)?;
-        Ok(DeployedAgent {
-            id: d.id.clone(),
+        Ok(DeployedAgent::from_parts(
+            d.id.clone(),
             child,
-            cleanup: Some(vec![
+            Some(vec![
                 self.docker_bin.clone(),
                 "rm".into(),
                 "-f".into(),
                 container,
             ]),
-        })
+        ))
     }
 }
 
@@ -330,11 +342,7 @@ impl Deployer for SshDeployer {
         let mut cmd = Command::new(&self.ssh_bin);
         cmd.args(self.argv(d)).kill_on_drop(true);
         let child = cmd.spawn().map_err(spawn_err)?;
-        Ok(DeployedAgent {
-            id: d.id.clone(),
-            child,
-            cleanup: None,
-        })
+        Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
     }
 }
 
