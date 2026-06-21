@@ -146,3 +146,99 @@ async fn bad_token_is_rejected() {
         "wrong token must be rejected with an auth error"
     );
 }
+
+/// Start a broker on an explicit mailbox-root (so a restart reuses the same
+/// persisted state). Returns the ws endpoint + the server task handle (abort it
+/// to simulate a crash).
+async fn start_broker_on(root: &std::path::Path) -> (String, tokio::task::JoinHandle<()>) {
+    let core = Arc::new(BrokerCore::new(root));
+    let server = Arc::new(BrokerServer::new(core, TOKEN));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+    (format!("ws://{addr}"), handle)
+}
+
+/// End-to-end at-least-once durability across a broker crash+restart: deliver
+/// three asks, ack one, kill the broker, restart it on the SAME mailbox root,
+/// reconnect — the two UNACKED asks are redelivered and the acked one is not.
+#[tokio::test]
+async fn unacked_messages_redelivered_after_broker_crash_and_restart() {
+    // One mailbox root that survives the broker "crash" + restart.
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // --- broker #1 ---
+    let (endpoint1, server1) = start_broker_on(dir.path()).await;
+
+    let mut worker = BrokerClient::connect(&endpoint1, agent("worker"), TOKEN)
+        .await
+        .expect("worker connects");
+    worker.subscribe().await.expect("worker subscribes");
+
+    let mut boss = BrokerClient::connect(&endpoint1, agent("boss"), TOKEN)
+        .await
+        .expect("boss connects");
+
+    let m1 = ask("boss");
+    let m2 = ask("boss");
+    let m3 = ask("boss");
+    for m in [&m1, &m2, &m3] {
+        boss.deliver("worker", m.clone())
+            .await
+            .expect("deliver ask");
+    }
+
+    // Worker receives all three but ACKs only m1; m2 and m3 stay in-flight.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let got = recv(&mut worker).await;
+        seen.insert(got.id.clone());
+        if got.id == m1.id {
+            worker.ack(got.id.clone()).await.expect("worker acks m1");
+        }
+    }
+    assert_eq!(seen.len(), 3, "worker received all three deliveries");
+
+    // --- crash: kill broker #1 and drop the live connections ---
+    server1.abort();
+    let _ = server1.await; // wait for the task to actually stop
+    drop(worker);
+    drop(boss);
+
+    // --- broker #2 on the SAME root ---
+    let (endpoint2, server2) = start_broker_on(dir.path()).await;
+
+    let mut worker2 = BrokerClient::connect(&endpoint2, agent("worker"), TOKEN)
+        .await
+        .expect("worker reconnects");
+    worker2.subscribe().await.expect("worker re-subscribes");
+
+    // The two UNACKED asks (m2, m3) are redelivered; the acked m1 is not.
+    let mut redelivered = std::collections::HashSet::new();
+    for _ in 0..2 {
+        redelivered.insert(recv(&mut worker2).await.id);
+    }
+    assert!(
+        redelivered.contains(&m2.id),
+        "unacked m2 must be redelivered"
+    );
+    assert!(
+        redelivered.contains(&m3.id),
+        "unacked m3 must be redelivered"
+    );
+    assert!(
+        !redelivered.contains(&m1.id),
+        "acked m1 must NOT be redelivered (ack is durable)"
+    );
+
+    // Nothing further is delivered (the acked message stays acked).
+    let extra = tokio::time::timeout(Duration::from_millis(500), worker2.next_message()).await;
+    assert!(
+        extra.is_err(),
+        "no extra redelivery after the two unacked asks"
+    );
+
+    server2.abort();
+}
