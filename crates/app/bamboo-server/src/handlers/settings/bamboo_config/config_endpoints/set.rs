@@ -45,7 +45,13 @@ pub async fn set_bamboo_config(
         )
         .await?;
 
-    write_model_limits_file(&app_state.app_data_dir, model_limits_patch.as_ref()).await?;
+    // Persist model_limits.json under the config write lock so two concurrent
+    // set_bamboo_config calls can't race / clobber each other's writes (the
+    // write itself is now atomic too — see common::write_model_limits_file). #42.
+    {
+        let _config_guard = app_state.config.write().await;
+        write_model_limits_file(&app_state.app_data_dir, model_limits_patch.as_ref()).await?;
+    }
 
     if effects.reload_provider == config_manager::ReloadMode::BestEffort {
         if let Err(error) = app_state.reload_provider().await {
