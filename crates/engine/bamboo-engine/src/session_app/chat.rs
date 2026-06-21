@@ -202,8 +202,17 @@ pub fn resolve_workspace_path(
         .map(ToString::to_string)
         .or_else(|| session.workspace_path_meta())
         .or_else(|| {
-            bamboo_llm::Config::from_data_dir(data_dir.map(Path::to_path_buf))
-                .get_default_work_area_path()
+            // Prefer the server's LIVE in-memory config via the registered
+            // workspace provider — no disk read, no global env-cache clobber
+            // (#38). Only when no provider is registered (non-server contexts:
+            // SDK / CLI / unit tests) fall back to the legacy disk read of
+            // data_dir. In the server the provider is always wired at startup,
+            // so the divergent from_data_dir read never runs there.
+            bamboo_agent_core::workspace_state::get_configured_default_workspace()
+                .or_else(|| {
+                    bamboo_llm::Config::from_data_dir(data_dir.map(Path::to_path_buf))
+                        .get_default_work_area_path()
+                })
                 .map(|path| path_to_display_string(&path))
         })
 }
