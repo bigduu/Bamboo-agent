@@ -166,8 +166,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    /// Build a clean test config that doesn't load from the user's filesystem.
-    /// This avoids env-var and file-system bleed that pollutes `Config::default()`.
+    /// Build a test config with explicit empty providers/instances. (Since #38,
+    /// `Config::default()` is in-memory only — no filesystem/env bleed — so the
+    /// remaining fields come from clean defaults.)
     fn clean_test_config() -> Config {
         Config {
             providers: crate::config::ProviderConfigs::default(),
