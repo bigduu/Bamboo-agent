@@ -301,6 +301,24 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 }
 
 /// Configuration for the agent loop.
+///
+/// # One-config-per-run invariant (#44)
+///
+/// These values are SNAPSHOTTED once, from the live `Config` under a brief read
+/// lock, at the start of `AgentRuntime::execute()`. The entire multi-round run —
+/// which can last minutes — then uses this frozen snapshot. Changing config
+/// (model names, provider, `disabled_tools`/`disabled_skills`, memory flags,
+/// token budget, …) while a run is in flight does NOT affect that run; the new
+/// values are picked up on the NEXT execution (i.e. the next user turn / session
+/// restart), not the next round of the current run.
+///
+/// This is intentional: a run sees a stable configuration, so its behavior can't
+/// shift underneath it mid-execution. The deliberate exceptions are the
+/// late-bound, per-request trait objects that resolve LIVE each time they're
+/// used rather than being snapshotted — `auxiliary_model_resolver` (auxiliary
+/// model selection) and `guardian_spawner` (the reviewer child). If a frozen
+/// field ever needs to become live-per-round, follow that resolver pattern
+/// rather than widening the snapshot.
 #[non_exhaustive]
 pub struct AgentLoopConfig {
     pub(crate) max_rounds: usize,
