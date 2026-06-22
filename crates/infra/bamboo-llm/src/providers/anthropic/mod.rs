@@ -546,7 +546,7 @@ pub fn build_anthropic_request_with_cache_blocks(
         let mut breakpoint_indices: Vec<usize> = message_ids
             .iter()
             .enumerate()
-            .filter_map(|(idx, id)| plan.is_breakpoint(id).then_some(idx))
+            .filter_map(|(idx, ids)| ids.iter().any(|id| plan.is_breakpoint(id)).then_some(idx))
             .collect();
         // Keep only the breakpoints closest to the end of the conversation.
         if breakpoint_indices.len() > budget {
@@ -657,10 +657,13 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 fn messages_to_anthropic_json(
     messages: &[Message],
     system_blocks: &[PromptBlock],
-) -> (Option<Value>, Vec<Value>, Vec<String>) {
+) -> (Option<Value>, Vec<Value>, Vec<Vec<String>>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
-    let mut out_ids: Vec<String> = Vec::new();
+    // One entry per OUTPUT message: the source message id(s) folded into it. A
+    // single output message can carry several ids after same-role coalescing
+    // (#101); a cache breakpoint on ANY of them lands on that message.
+    let mut out_ids: Vec<Vec<String>> = Vec::new();
 
     // Keep only the MOST RECENT tool-result image (e.g. screenshot); older ones
     // are dropped from the request to control context size, since a conversation
@@ -684,37 +687,55 @@ fn messages_to_anthropic_json(
                 let Some(msg_json) = message_to_anthropic_json(m, keep_image) else {
                     continue;
                 };
-                // Merge consecutive Tool messages into the preceding user
-                // message so that all tool_results for a single assistant
-                // tool_use turn live in the *same* user message, as required
-                // by the Anthropic API. The merged-into message keeps its
-                // original id, so a breakpoint placed on that turn still maps.
-                if matches!(m.role, Role::Tool) {
-                    if let Some(last) = out.last_mut() {
-                        let last_role = last.get("role").and_then(|r| r.as_str());
-                        if last_role == Some("user") {
-                            if let Some(last_content) =
-                                last.get_mut("content").and_then(|c| c.as_array_mut())
-                            {
-                                let last_is_tool_result_message = !last_content.is_empty()
-                                    && last_content.iter().all(|block| {
+                // Coalesce consecutive SAME-ROLE messages into one. Anthropic
+                // requires strict user/assistant alternation and 400s on two
+                // consecutive same-role turns, so concatenating their content
+                // blocks keeps alternation valid no matter what upstream produced
+                // (defense-in-depth, #101). This also subsumes the original
+                // tool_result merge (#29/#22): a `Tool` message serializes to a
+                // `user` message, so consecutive tool_results — and a tool_result
+                // following any user turn — fold into that same user message, with
+                // every tool_result for one assistant tool_use turn in one message
+                // as the API requires. The merged-into message keeps its original
+                // id, so a cache breakpoint on that turn still maps (its id stays in
+                // `out_ids`; the merged-in message's id is intentionally dropped).
+                if let Some(last) = out.last_mut() {
+                    let same_role = last.get("role").and_then(|r| r.as_str())
+                        == msg_json.get("role").and_then(|r| r.as_str());
+                    if same_role {
+                        if let (Some(last_content), Some(new_content)) = (
+                            last.get_mut("content").and_then(|c| c.as_array_mut()),
+                            msg_json.get("content").and_then(|c| c.as_array()),
+                        ) {
+                            // Drop any `thinking` block from the appended content:
+                            // Anthropic requires `thinking` to be the FIRST block of
+                            // an assistant turn, so a merged-in turn's thinking would
+                            // land in an illegal interior position. (Two consecutive
+                            // assistant turns don't occur in a well-formed
+                            // conversation, but coalescing must not itself produce an
+                            // invalid block order. User merges carry no thinking
+                            // blocks, so this is a no-op there.) #101.
+                            last_content.extend(
+                                new_content
+                                    .iter()
+                                    .filter(|block| {
                                         block.get("type").and_then(|t| t.as_str())
-                                            == Some("tool_result")
-                                    });
-                                if last_is_tool_result_message {
-                                    if let Some(new_content) =
-                                        msg_json.get("content").and_then(|c| c.as_array())
-                                    {
-                                        last_content.extend(new_content.iter().cloned());
-                                        continue;
-                                    }
-                                }
+                                            != Some("thinking")
+                                    })
+                                    .cloned(),
+                            );
+                            // Record the merged-in id on the SAME output message so a
+                            // cache breakpoint targeting it still lands here — its
+                            // content now lives at the end of this message. #101.
+                            if let Some(last_ids) = out_ids.last_mut() {
+                                last_ids.push(m.id.clone());
                             }
+                            continue;
                         }
                     }
                 }
                 out.push(msg_json);
-                out_ids.push(m.id.clone());
+                out_ids.push(vec![m.id.clone()]);
             }
         }
     }
@@ -1660,10 +1681,12 @@ mod anthropic_request_building {
         );
 
         // (c) out_ids mirrors the surviving messages 1:1 — the System message's
-        // id is absent, the User/Assistant ids are present in order.
+        // id is absent, the User/Assistant ids are present in order. Each output
+        // message carries its source id(s); here no same-role coalescing occurs so
+        // each slot holds exactly one id.
         assert_eq!(out_ids.len(), 2);
-        assert_eq!(out_ids[0], user_id);
-        assert_eq!(out_ids[1], assistant_id);
+        assert_eq!(out_ids[0], vec![user_id]);
+        assert_eq!(out_ids[1], vec![assistant_id]);
 
         // (d) KEY INVARIANT: the parallel id vector stays in lockstep with the
         // messages array, so cache-breakpoint placement by id never desyncs.
@@ -1960,15 +1983,21 @@ mod anthropic_request_building {
         );
 
         let msgs = out["messages"].as_array().unwrap();
-        // Only the message whose id is in the plan gets a cache breakpoint.
-        assert!(msgs[0]["content"].as_array().unwrap()[0]
-            .get("cache_control")
-            .is_none());
-        assert_eq!(
-            msgs[1]["content"].as_array().unwrap()[0]["cache_control"]["type"],
-            "ephemeral"
+        // "Hi" and the flagged "Old context here" are consecutive user turns, so
+        // they coalesce into ONE user message (#101). The flagged id was folded in,
+        // so its breakpoint lands on that merged message's LAST block (the flagged
+        // content), not on a separate message.
+        assert_eq!(msgs.len(), 2, "the two consecutive user turns coalesced");
+        let merged_user = msgs[0]["content"].as_array().unwrap();
+        assert!(
+            merged_user[0].get("cache_control").is_none(),
+            "the leading 'Hi' block is not the breakpoint"
         );
-        assert!(msgs[2]["content"].as_array().unwrap()[0]
+        assert_eq!(
+            merged_user[1]["cache_control"]["type"], "ephemeral",
+            "the breakpoint lands on the flagged content (the last block)"
+        );
+        assert!(msgs[1]["content"].as_array().unwrap()[0]
             .get("cache_control")
             .is_none());
     }
@@ -2133,7 +2162,14 @@ mod anthropic_request_building {
         let mut messages = vec![Message::system("Stable prompt")];
         let mut flagged_ids = Vec::new();
         for i in 0..6 {
-            let m = Message::user(format!("turn {i}"));
+            // Alternate roles so the 6 flagged turns stay DISTINCT output messages
+            // (consecutive same-role turns would coalesce, #101); the point here is
+            // breakpoint CLAMPING, which needs more candidate messages than budget.
+            let m = if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("turn {i}"), None)
+            };
             flagged_ids.push(m.id.clone());
             messages.push(m);
         }
@@ -2260,7 +2296,14 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn tool_result_does_not_merge_into_regular_user_message() {
+    fn tool_result_coalesces_with_adjacent_user_turn_for_alternation() {
+        // A `Tool` message serializes to a `user` message, so a tool_result
+        // adjacent to another user turn coalesces into ONE user message — Anthropic
+        // requires strict user/assistant alternation and 400s on consecutive
+        // same-role turns (#101). (This particular input is degenerate — a
+        // tool_result with no preceding tool_use — but coalescing is still the
+        // alternation-valid outcome, and the realistic [tool_use, tool_result,
+        // user] case is what this prevents 400-ing.)
         let messages = vec![
             Message::user("normal user text"),
             Message::tool_result("call_1", "OK"),
@@ -2272,15 +2315,95 @@ mod anthropic_request_building {
         let built_messages = out["messages"].as_array().expect("messages array");
         assert_eq!(
             built_messages.len(),
-            2,
-            "tool_result should stay in its own user message instead of merging into a regular user text message"
+            1,
+            "consecutive user-role turns coalesce into one message"
         );
         assert_eq!(built_messages[0]["role"], "user");
-        assert_eq!(built_messages[0]["content"][0]["type"], "text");
         assert_eq!(built_messages[0]["content"][0]["text"], "normal user text");
-        assert_eq!(built_messages[1]["role"], "user");
-        assert_eq!(built_messages[1]["content"][0]["type"], "tool_result");
-        assert_eq!(built_messages[1]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(built_messages[0]["content"][1]["type"], "tool_result");
+        assert_eq!(built_messages[0]["content"][1]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn consecutive_same_role_turns_coalesce_into_strict_alternation() {
+        // The acceptance case (#101): [user, user, assistant, assistant] must
+        // become a strictly alternating [user, assistant] with content concatenated
+        // in order, so Anthropic never 400s on consecutive same-role turns.
+        let messages = vec![
+            Message::user("u1"),
+            Message::user("u2"),
+            Message::assistant("a1", None),
+            Message::assistant("a2", None),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let built = out["messages"].as_array().expect("messages array");
+
+        assert_eq!(
+            built.len(),
+            2,
+            "two same-role pairs collapse to two messages"
+        );
+        assert_eq!(built[0]["role"], "user");
+        assert_eq!(built[0]["content"][0]["text"], "u1");
+        assert_eq!(built[0]["content"][1]["text"], "u2");
+        assert_eq!(built[1]["role"], "assistant");
+        assert_eq!(built[1]["content"][0]["text"], "a1");
+        assert_eq!(built[1]["content"][1]["text"], "a2");
+
+        // Strict alternation invariant: no two adjacent messages share a role.
+        for pair in built.windows(2) {
+            assert_ne!(
+                pair[0]["role"], pair[1]["role"],
+                "adjacent messages must alternate role"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_coalesce_drops_interior_thinking_block() {
+        // Two consecutive assistant turns, each carrying reasoning. After
+        // coalescing, the merged turn must keep only ONE leading `thinking` block —
+        // Anthropic rejects a `thinking` block in any non-first position, so the
+        // merged-in turn's thinking is dropped. (#101 invariant: coalescing never
+        // produces an illegal block order, even for the assistant role.)
+        let messages = vec![
+            Message::assistant_with_reasoning("a1", None, Some("reason one".into())),
+            Message::assistant_with_reasoning("a2", None, Some("reason two".into())),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let built = out["messages"].as_array().expect("messages array");
+        assert_eq!(built.len(), 1, "the two assistant turns coalesced");
+
+        let content = built[0]["content"].as_array().unwrap();
+        let thinking_positions: Vec<usize> = content
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            thinking_positions,
+            vec![0],
+            "exactly one thinking block, in the first position"
+        );
+
+        let texts: Vec<&str> = content
+            .iter()
+            .filter_map(|b| {
+                (b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .then(|| b.get("text").and_then(|t| t.as_str()))
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["a1", "a2"],
+            "both turns' text survives the merge"
+        );
     }
 
     #[test]
@@ -2299,21 +2422,23 @@ mod anthropic_request_building {
 
         assert_eq!(out["system"][0]["text"], "stable system");
         let built_messages = out["messages"].as_array().expect("messages array");
-        assert_eq!(built_messages.len(), 5);
+        // Order is preserved, but consecutive same-role turns coalesce (#101):
+        // the two leading user turns merge; the tool_result (a user message) and the
+        // trailing user turn merge. Result: user / assistant / user, strictly
+        // alternating, with content blocks in original order.
+        assert_eq!(built_messages.len(), 3);
         assert_eq!(built_messages[0]["role"], "user");
         assert_eq!(
             built_messages[0]["content"][0]["text"],
             "dynamic context block"
         );
-        assert_eq!(built_messages[1]["role"], "user");
-        assert_eq!(built_messages[1]["content"][0]["text"], "conversation turn");
-        assert_eq!(built_messages[2]["role"], "assistant");
-        assert_eq!(built_messages[2]["content"][0]["text"], "calling tool");
-        assert_eq!(built_messages[3]["role"], "user");
-        assert_eq!(built_messages[3]["content"][0]["type"], "tool_result");
-        assert_eq!(built_messages[3]["content"][0]["tool_use_id"], "call_1");
-        assert_eq!(built_messages[4]["role"], "user");
-        assert_eq!(built_messages[4]["content"][0]["text"], "latest user turn");
+        assert_eq!(built_messages[0]["content"][1]["text"], "conversation turn");
+        assert_eq!(built_messages[1]["role"], "assistant");
+        assert_eq!(built_messages[1]["content"][0]["text"], "calling tool");
+        assert_eq!(built_messages[2]["role"], "user");
+        assert_eq!(built_messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(built_messages[2]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(built_messages[2]["content"][1]["text"], "latest user turn");
     }
 
     #[test]
