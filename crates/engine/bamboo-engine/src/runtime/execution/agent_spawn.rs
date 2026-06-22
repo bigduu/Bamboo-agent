@@ -128,6 +128,11 @@ pub struct SessionExecutionArgs {
     pub reasoning_effort_source: String,
     pub auxiliary_model_resolver:
         Option<Arc<dyn Fn() -> crate::runtime::config::AuxiliaryModelConfig + Send + Sync>>,
+    /// Optional per-round live resolver for the disabled tool/skill sets (#136).
+    /// When `None` the per-run snapshot is used (sub-agent spawns pass `None`, so
+    /// short-lived children keep the spawn-time snapshot — by design).
+    pub disabled_filter_resolver:
+        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
     pub disabled_tools: Option<BTreeSet<String>>,
     pub disabled_skill_ids: Option<BTreeSet<String>>,
     pub selected_skill_ids: Option<Vec<String>>,
@@ -169,6 +174,8 @@ struct ExecuteRequestParams {
     model_roster: ModelRoster,
     reasoning_effort: Option<ReasoningEffort>,
     auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    disabled_filter_resolver:
+        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
     disabled_tools: Option<BTreeSet<String>>,
     disabled_skill_ids: Option<BTreeSet<String>>,
     selected_skill_ids: Option<Vec<String>>,
@@ -199,6 +206,7 @@ fn build_execute_request(
         model_roster,
         reasoning_effort,
         auxiliary_model_resolver,
+        disabled_filter_resolver,
         disabled_tools,
         disabled_skill_ids,
         selected_skill_ids,
@@ -226,6 +234,9 @@ fn build_execute_request(
     }
     if let Some(reasoning_effort) = reasoning_effort {
         builder = builder.reasoning_effort(reasoning_effort);
+    }
+    if let Some(disabled_filter_resolver) = disabled_filter_resolver {
+        builder = builder.disabled_filter_resolver(disabled_filter_resolver);
     }
     if let Some(auxiliary_model_resolver) = auxiliary_model_resolver {
         builder = builder.auxiliary_model_resolver(auxiliary_model_resolver);
@@ -276,6 +287,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 reasoning_effort,
                 reasoning_effort_source,
                 auxiliary_model_resolver,
+                disabled_filter_resolver,
                 disabled_tools,
                 disabled_skill_ids,
                 selected_skill_ids,
@@ -341,6 +353,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                     model_roster,
                     reasoning_effort,
                     auxiliary_model_resolver,
+                    disabled_filter_resolver,
                     disabled_tools,
                     disabled_skill_ids,
                     selected_skill_ids,

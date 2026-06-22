@@ -743,6 +743,9 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             reasoning_effort,
             reasoning_effort_source,
             auxiliary_model_resolver: Some(auxiliary_model_resolver),
+            // Resumed child runs keep the spawn-time disabled snapshot (#136 lives
+            // on the long-running main agent path; children are short-lived).
+            disabled_filter_resolver: None,
             disabled_tools: Some(config.disabled_tools),
             disabled_skill_ids: Some(config.disabled_skill_ids),
             selected_skill_ids: None,
