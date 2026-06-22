@@ -41,7 +41,7 @@ pub use crate::deploy::{
 pub use crate::error::{BrokerError, BrokerResult};
 pub use crate::mcp::{
     serve_mcp_proxy, serve_mcp_proxy_supervised, McpProxyExecutor, McpReply, McpRequest,
-    ProxiedResult,
+    ProxiedResult, RoleToolAllowlist,
 };
 pub use crate::mux::MultiplexedClient;
 pub use crate::proto::{BrokerFrame, ClientFrame};

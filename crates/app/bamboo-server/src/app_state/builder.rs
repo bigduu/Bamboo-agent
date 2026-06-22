@@ -294,11 +294,19 @@ impl AppState {
                         session_id: bamboo_broker::ORCHESTRATOR_ID.to_string(),
                         role: Some("orchestrator".into()),
                     };
+                    // No per-role tool allowlist is configured here yet, so the
+                    // proxy is unrestricted (every role sees/can call all
+                    // host-bound tools) — identical to the pre-#54 behavior.
+                    // Wiring a config-driven allowlist in is a follow-up; the
+                    // filtering mechanism (RoleToolAllowlist) is now in place.
+                    let allowlist =
+                        std::sync::Arc::new(bamboo_broker::RoleToolAllowlist::unrestricted());
                     bamboo_broker::serve_mcp_proxy_supervised(
                         &broker.endpoint,
                         me,
                         &broker.token,
                         backend,
+                        allowlist,
                         shutdown,
                     )
                     .await;
