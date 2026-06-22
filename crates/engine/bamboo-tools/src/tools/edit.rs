@@ -836,6 +836,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await;
@@ -851,6 +852,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await
@@ -870,6 +872,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await
@@ -1224,6 +1227,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await
@@ -1244,6 +1248,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await

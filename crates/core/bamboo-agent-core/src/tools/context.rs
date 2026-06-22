@@ -7,6 +7,8 @@
 
 use tokio::sync::mpsc;
 
+use serde_json::Value;
+
 use crate::tools::ToolSchema;
 use crate::{AgentEvent, Session};
 
@@ -72,6 +74,16 @@ pub struct ToolExecutionContext<'a> {
     /// the dispatch site — NOT session-derived — so it is a direct
     /// `for_dispatch` parameter rather than a `ToolExecutionSessionFlags` field.
     pub can_async_resume: bool,
+    /// The tool call's `function.arguments` JSON string, already parsed once by
+    /// the dispatching agent loop (which also parses it to populate the
+    /// `ToolStart` event). When `Some`, downstream executors should reuse this
+    /// instead of calling `parse_tool_args_best_effort` on the raw string a
+    /// second time — the value here is the *exact* output of that same parser on
+    /// the same input, so reuse is behavior-preserving (issue #106, deferred B1
+    /// from #17). When `None` (e.g. `none()` contexts, tests, or executors that
+    /// synthesize a child call), executors parse the raw string themselves,
+    /// preserving the original single-parse-per-consumer behavior.
+    pub pre_parsed_args: Option<&'a Value>,
 }
 
 impl<'a> ToolExecutionContext<'a> {
@@ -83,6 +95,7 @@ impl<'a> ToolExecutionContext<'a> {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         }
     }
 
@@ -102,6 +115,14 @@ impl<'a> ToolExecutionContext<'a> {
         // When `false`, the Bash auto path stays synchronous (issue #84,
         // phase 2d). NOT session-derived — set by the dispatch site.
         can_async_resume: bool,
+        // The call's arguments, already parsed once at the dispatch site (to
+        // populate the `ToolStart` event). Threaded down so the executor reuses
+        // it instead of re-parsing the raw JSON string (issue #106). Only pass
+        // `Some` when the value was produced by `parse_tool_args_best_effort`
+        // (the executor's own parser) so reuse is byte-for-byte equivalent; a
+        // dispatch site that parses with a different/stricter parser must pass
+        // `None` so the executor re-parses leniently and behavior is preserved.
+        pre_parsed_args: Option<&'a Value>,
     ) -> Self {
         Self {
             session_id: Some(session_id),
@@ -110,6 +131,7 @@ impl<'a> ToolExecutionContext<'a> {
             available_tool_schemas: Some(available_tool_schemas),
             bypass_permissions: flags.bypass_permissions,
             can_async_resume,
+            pre_parsed_args,
         }
     }
 
@@ -182,10 +204,28 @@ mod session_flags_tests {
                 bypass_permissions: true,
             },
             true,
+            None,
         );
         assert_eq!(ctx.session_id, Some("s1"));
         assert!(ctx.bypass_permissions);
         assert!(ctx.can_async_resume);
+        assert!(ctx.pre_parsed_args.is_none());
+    }
+
+    #[test]
+    fn for_dispatch_threads_pre_parsed_args() {
+        let (tx, _rx) = mpsc::channel(1);
+        let parsed = serde_json::json!({"v": "x"});
+        let ctx = ToolExecutionContext::for_dispatch(
+            "s1",
+            "call-1",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags::default(),
+            false,
+            Some(&parsed),
+        );
+        assert_eq!(ctx.pre_parsed_args, Some(&parsed));
     }
 }
 
@@ -208,6 +248,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         tokio::time::timeout(
@@ -236,6 +277,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -266,6 +308,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         // Test with various non-Token events
@@ -307,6 +350,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         ctx.emit_tool_token("convenient output").await;
@@ -359,6 +403,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         let cloned = ctx.cloned_sender();
@@ -384,6 +429,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         for i in 0..5 {
@@ -414,6 +460,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         // Can clone (Copy implies Clone)
@@ -443,6 +490,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -469,6 +517,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -499,6 +548,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -525,6 +575,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         let content = String::from("owned string");
@@ -549,6 +600,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         ctx.emit_tool_token("string slice").await;

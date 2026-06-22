@@ -127,7 +127,7 @@ pub(super) async fn execute_tool_call_only(
         AgentEvent::ToolStart {
             tool_call_id: ctx.tool_call.id.clone(),
             tool_name: ctx.tool_call.function.name.clone(),
-            arguments: args,
+            arguments: args.clone(),
         },
     )
     .await;
@@ -167,6 +167,11 @@ pub(super) async fn execute_tool_call_only(
         // 2d). On hook-less paths (e.g. the schedule loop) this is false, so the
         // auto path stays synchronous and never orphans a promoted shell.
         ctx.config.bash_resume_hook.is_some() && ctx.config.persistence.is_some(),
+        // Reuse the args parsed above (for the `ToolStart` event) instead of
+        // re-parsing the raw JSON string downstream in the executor (issue #106).
+        // `args` came from `parse_tool_args_best_effort`, the same parser the
+        // executor would call, so reuse is byte-for-byte equivalent.
+        Some(&args),
     );
 
     let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context(

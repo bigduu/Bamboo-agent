@@ -736,6 +736,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await
@@ -1063,6 +1064,7 @@ mod tests {
             &[],
             ToolExecutionSessionFlags::default(),
             true,
+            None,
         );
 
         let result = tool
@@ -1120,6 +1122,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await
@@ -1251,6 +1254,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         let result = tool
@@ -1291,6 +1295,7 @@ mod tests {
             // `can_async_resume` is irrelevant here — this test drives
             // promotion directly via run_streaming_command(Some(200)).
             true,
+            None,
         );
         let cwd = super::workspace_state::workspace_or_process_cwd(Some(session_id));
 

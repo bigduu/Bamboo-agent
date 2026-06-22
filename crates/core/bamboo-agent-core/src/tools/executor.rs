@@ -205,17 +205,26 @@ pub async fn execute_tool_call_with_context(
     ctx: ToolExecutionContext<'_>,
 ) -> Result<ToolResult> {
     if let Some(executor) = composition_executor {
-        let args_raw = tool_call.function.arguments.trim();
-        let (args, parse_warning) = parse_tool_args_best_effort(&tool_call.function.arguments);
-        if let Some(warning) = parse_warning {
-            tracing::warn!(
-                "Composition executor tool args fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
-                tool_call.id,
-                tool_call.function.name,
-                args_raw.len(),
-                warning
-            );
-        }
+        // Reuse the args the dispatching loop already parsed (threaded via the
+        // context) instead of re-parsing the raw string here (issue #106). When
+        // absent, parse exactly as before — including the fallback warning.
+        let args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            let args_raw = tool_call.function.arguments.trim();
+            let (parsed, parse_warning) =
+                parse_tool_args_best_effort(&tool_call.function.arguments);
+            if let Some(warning) = parse_warning {
+                tracing::warn!(
+                    "Composition executor tool args fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
+                    tool_call.id,
+                    tool_call.function.name,
+                    args_raw.len(),
+                    warning
+                );
+            }
+            parsed
+        };
         let expr = ToolExpr::call(tool_call.function.name.clone(), args);
         let mut exec_ctx = ExecutionContext::new();
 
