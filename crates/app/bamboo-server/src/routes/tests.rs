@@ -245,3 +245,21 @@ async fn local_request_bypasses_access_middleware() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[actix_web::test]
+async fn dev_reset_route_registered_when_dev_endpoints_enabled() {
+    // Under `cargo test` (a debug build) dev endpoints are enabled, so the route is
+    // wired and matches (non-404). In a release build with no
+    // BAMBOO_ENABLE_DEV_ENDPOINTS it is absent — the production gate is covered by
+    // `routes::agent`'s `dev_endpoints_env_gate_*` unit test.
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/dev/reset")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dev/reset must be registered when dev endpoints are enabled"
+    );
+}
