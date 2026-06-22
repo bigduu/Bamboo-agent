@@ -79,7 +79,9 @@ pub async fn get_workflow(
 ) -> Result<HttpResponse, AppError> {
     let name = workflow_name.into_inner();
     if !is_safe_workflow_name(&name) {
-        return Err(AppError::NotFound("Workflow".to_string()));
+        // An invalid (malformed) name is a 400, matching every other workflow
+        // handler — not a 404, which would imply a valid-but-absent workflow. #97.
+        return Err(AppError::BadRequest("Invalid workflow name".to_string()));
     }
 
     let dir = app_state.app_data_dir.join("workflows");
