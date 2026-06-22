@@ -44,14 +44,69 @@ fn pick_option(options: &[String], needle: &str) -> String {
         .unwrap_or_else(|| needle.to_string())
 }
 
+/// What to do with a parked pending question in headless mode, decided BEFORE
+/// touching stdin so a non-interactive run can never block on un-answerable input.
+enum HeadlessPromptAction {
+    /// stdin is a terminal — prompt the operator interactively.
+    Prompt,
+    /// stdin is NOT a terminal — resolve deterministically without reading stdin.
+    /// `response` is the answer to submit (the `deny` option, fail-closed);
+    /// `message` explains the auto-decision to the operator/log.
+    Resolve { response: String, message: String },
+}
+
+/// Decide how to handle a pending question given whether stdin is a terminal.
+///
+/// This is the testable seam for issue #80: a background / CI / piped `bamboo -p`
+/// inherits an open, non-TTY stdin that never reaches EOF, so the old
+/// unconditional `read_line` blocked forever. When `is_terminal` is false we
+/// resolve the question deterministically and FAIL CLOSED — we deny the gate
+/// rather than auto-approve (denying is the safe default; auto-approving would be
+/// a security regression) — and never read stdin. When `is_terminal` is true we
+/// fall through to the existing interactive prompt.
+fn resolve_headless_permission(
+    is_terminal: bool,
+    pending: &bamboo_agent_core::PendingQuestion,
+) -> HeadlessPromptAction {
+    if is_terminal {
+        return HeadlessPromptAction::Prompt;
+    }
+    // Fail closed: pick the question's own `deny` option (e.g. permission gates use
+    // ["Approve", "Deny"]) so the respond validator's exact-match accepts it.
+    HeadlessPromptAction::Resolve {
+        response: pick_option(&pending.options, "deny"),
+        message: format!(
+            "no interactive approver (stdin is not a TTY): auto-denying \"{}\". \
+             Pass --permission-mode bypass|accept-edits|dont-ask to run non-interactively.",
+            pending.question.trim()
+        ),
+    }
+}
+
 /// Prompt the operator on the terminal for a parked pending question (typically a
 /// permission gate, since headless has no UI approver) and map the answer to a
 /// response string the engine's respond flow understands: `y`/`yes` → `approve`,
 /// `n`/`no`/empty → `deny`, a number selects a listed option, anything else is
-/// sent verbatim. Returns `None` on EOF (e.g. stdin is not a TTY).
+/// sent verbatim.
+///
+/// When stdin is NOT a terminal (background, pipe, CI), we do NOT block on a stdin
+/// read — issue #80: such stdin can stay open without ever reaching EOF, so a
+/// `read_line` would hang forever. Instead we resolve the gate deterministically,
+/// FAIL CLOSED (deny), and return that answer. Returns `None` on EOF when stdin
+/// IS a terminal (operator closed the input).
 async fn prompt_pending_response(pending: &bamboo_agent_core::PendingQuestion) -> Option<String> {
+    use std::io::IsTerminal as _;
     use std::io::Write as _;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Decide up front, before touching stdin, so a non-TTY run can't wedge.
+    match resolve_headless_permission(std::io::stdin().is_terminal(), pending) {
+        HeadlessPromptAction::Resolve { response, message } => {
+            eprintln!("\n⏸  {message}");
+            return Some(response);
+        }
+        HeadlessPromptAction::Prompt => {}
+    }
 
     eprintln!("\n⏸  {}", pending.question.trim());
     if !pending.options.is_empty() {
@@ -480,5 +535,68 @@ fn print_server_event(value: &serde_json::Value, streamed_tokens: &mut bool) {
         }
         "error" => eprintln!("\n✘ {}", value["message"].as_str().unwrap_or("")),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::PendingQuestion;
+
+    fn permission_gate() -> PendingQuestion {
+        PendingQuestion {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "Bash".to_string(),
+            question: "The Bash tool needs approval to run `cargo check`".to_string(),
+            options: vec!["Approve".to_string(), "Deny".to_string()],
+            allow_custom: false,
+            source: Default::default(),
+        }
+    }
+
+    /// Issue #80: when stdin is NOT a terminal, the headless prompt must resolve
+    /// the gate deterministically WITHOUT reading stdin (no hang), and FAIL CLOSED
+    /// (deny) rather than auto-approve.
+    #[test]
+    fn non_tty_fails_closed_to_deny() {
+        let pending = permission_gate();
+        match resolve_headless_permission(false, &pending) {
+            HeadlessPromptAction::Resolve { response, message } => {
+                // Resolves to the gate's own `deny` option — never `approve`.
+                assert_eq!(response, "Deny");
+                assert_ne!(response, "Approve");
+                // The message must point the operator at the escape hatch.
+                assert!(message.contains("--permission-mode"));
+                assert!(message.to_ascii_lowercase().contains("deny"));
+            }
+            HeadlessPromptAction::Prompt => {
+                panic!("non-TTY must resolve deterministically, not prompt on stdin");
+            }
+        }
+    }
+
+    /// When stdin IS a terminal, keep the existing interactive prompt path.
+    #[test]
+    fn tty_prompts_interactively() {
+        let pending = permission_gate();
+        assert!(matches!(
+            resolve_headless_permission(true, &pending),
+            HeadlessPromptAction::Prompt
+        ));
+    }
+
+    /// Fail-closed deny works even for a gate with non-standard option labels:
+    /// `pick_option` matches the `deny`-containing option case-insensitively, and
+    /// falls back to a literal "deny" if none is present (still not "approve").
+    #[test]
+    fn non_tty_deny_handles_varied_options() {
+        let mut pending = permission_gate();
+        pending.options = vec!["Allow it".to_string(), "Deny this".to_string()];
+        match resolve_headless_permission(false, &pending) {
+            HeadlessPromptAction::Resolve { response, .. } => {
+                assert_eq!(response, "Deny this");
+            }
+            HeadlessPromptAction::Prompt => panic!("expected deterministic resolve"),
+        }
     }
 }
