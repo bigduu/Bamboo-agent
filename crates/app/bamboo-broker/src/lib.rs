@@ -21,6 +21,7 @@ pub mod client;
 pub mod core;
 pub mod deploy;
 pub mod mcp;
+pub mod mux;
 pub mod proto;
 pub mod serve;
 pub mod server;
@@ -42,6 +43,7 @@ pub use crate::mcp::{
     serve_mcp_proxy, serve_mcp_proxy_supervised, McpProxyExecutor, McpReply, McpRequest,
     ProxiedResult,
 };
+pub use crate::mux::MultiplexedClient;
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
 pub use crate::server::BrokerServer;
