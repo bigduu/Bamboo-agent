@@ -1188,18 +1188,24 @@ impl Config {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 Self::parse_and_hydrate(&content).unwrap_or_else(|e| {
                     // Don't silently discard the user's config on corruption.
-                    // Quarantine the unparseable file (so it isn't lost or
-                    // overwritten by the next save) and try the last-known-good
-                    // config.json.bak before falling back to defaults. #37.
+                    // Quarantine the unparseable file, then recover the MOST recent
+                    // intent in order: (1) SALVAGE the still-valid fields from the
+                    // corrupt file (a single bad field shouldn't drop everything),
+                    // (2) the last-known-good config.json.bak, (3) defaults.
+                    // #37 / #135.
                     tracing::warn!(
-                        "Failed to parse config.json ({}); quarantining it and trying config.json.bak",
+                        "Failed to parse config.json ({}); quarantining it and attempting recovery",
                         e
                     );
                     quarantine_corrupt_config(&config_path);
-                    Self::load_backup(&data_dir).unwrap_or_else(|| {
-                        tracing::warn!("No usable config.json.bak; using defaults");
-                        Self::create_default()
-                    })
+                    Self::salvage_partial(&content, &data_dir)
+                        .or_else(|| Self::load_backup(&data_dir))
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "Could not salvage and no usable config.json.bak; using defaults"
+                            );
+                            Self::create_default()
+                        })
                 })
             } else {
                 Self::create_default()
@@ -1324,6 +1330,91 @@ impl Config {
                 None
             }
         }
+    }
+
+    /// Largest corrupt-object key count we'll attempt to salvage. The overlay loop
+    /// is O(keys) full-Config deserializes over a growing object (the `extra`
+    /// catch-all absorbs unknown keys), i.e. O(n²) on a pathological file; cap it
+    /// so a junk-key-flooded config.json can't stall a load. A real config has a
+    /// few dozen top-level keys, so this only ever trips on garbage.
+    const SALVAGE_MAX_KEYS: usize = 512;
+
+    /// Best-effort PARTIAL salvage of a corrupt `config.json` (#135): parse it as a
+    /// generic JSON object and overlay each top-level field onto the richest
+    /// known-good baseline — the last-known-good `config.json.bak` if present, else
+    /// a fresh default — keeping only the fields that still yield a valid [`Config`].
+    /// A single bad field (wrong type, malformed section, …) then keeps the
+    /// baseline's value instead of discarding ALL the user's other settings.
+    ///
+    /// Overlaying onto `.bak` (rather than defaults) means the result is the
+    /// best-of-both: the backup's complete recent-good state PLUS the corrupt
+    /// file's still-valid newer edits on top — so salvage is never worse than the
+    /// plain `.bak` fallback, removing the "sparse salvage defeats a rich backup"
+    /// hazard. Tried BEFORE the bare `.bak` fallback.
+    ///
+    /// Returns the hydrated salvaged config, or `None` when the corrupt file isn't
+    /// even a JSON object (nothing field-wise to salvage) so the caller falls
+    /// through to `.bak` / defaults.
+    ///
+    /// NOTE: the per-field overlay guarantees a VALID `Config`, not a *maximal* or
+    /// attribution-perfect one. Deterministic alphabetical key order (serde_json is
+    /// BTreeMap-backed, no `preserve_order`) means a rename/alias pair like
+    /// `mcp`/`mcpServers` can drop the second-seen even if it'd be valid alone — the
+    /// outcome is still a valid config, just not necessarily the richest possible.
+    fn salvage_partial(content: &str, data_dir: &std::path::Path) -> Option<Self> {
+        // Must at least be a JSON object; otherwise there's nothing field-wise to
+        // salvage (a truncated/garbage file just falls through to .bak/defaults).
+        let corrupt: serde_json::Value = serde_json::from_str(content).ok()?;
+        let corrupt_obj = corrupt.as_object()?;
+        if corrupt_obj.len() > Self::SALVAGE_MAX_KEYS {
+            tracing::warn!(
+                "config.json has {} top-level keys (> {}); skipping salvage to avoid an O(n^2) load",
+                corrupt_obj.len(),
+                Self::SALVAGE_MAX_KEYS
+            );
+            return None;
+        }
+
+        // Overlay onto the richest known-good baseline: the last-known-good backup
+        // if it parses, else a fresh default. This makes salvage >= the plain .bak
+        // fallback in every case.
+        let mut base = Self::load_backup(data_dir)
+            .and_then(|backup| serde_json::to_value(backup).ok())
+            .or_else(|| serde_json::to_value(Self::create_default()).ok())?;
+        let base_obj = base.as_object_mut()?;
+
+        let mut salvaged: Vec<String> = Vec::new();
+        for (key, value) in corrupt_obj {
+            let previous = base_obj.insert(key.clone(), value.clone());
+            // Keep the field iff the WHOLE config still deserializes with it
+            // overlaid — base is valid before each step, so a failure isolates THIS
+            // field as the corrupt one (and inter-field constraints are respected).
+            if serde_json::from_value::<Self>(serde_json::Value::Object(base_obj.clone())).is_ok() {
+                salvaged.push(key.clone());
+            } else {
+                match previous {
+                    Some(prev) => {
+                        base_obj.insert(key.clone(), prev);
+                    }
+                    None => {
+                        base_obj.remove(key);
+                    }
+                }
+            }
+        }
+
+        tracing::warn!(
+            "Salvaged {} field(s) from corrupt config.json ({}); corrupt fields kept the \
+             last-known-good/default value",
+            salvaged.len(),
+            salvaged.join(", ")
+        );
+
+        // Re-serialize the rebuilt (all-valid) object and run it back through the
+        // normal parse+hydrate path so secret-decryption / normalization match a
+        // clean load exactly.
+        let rebuilt = serde_json::to_string(&base).ok()?;
+        Self::parse_and_hydrate(&rebuilt).ok()
     }
 
     /// Get the effective default model for the currently active provider.
@@ -2229,6 +2320,104 @@ mod tests {
         assert!(
             dir_has_quarantine_file(&temp.path),
             "corrupt config.json is quarantined even when there's no backup"
+        );
+    }
+
+    #[test]
+    fn salvage_recovers_valid_fields_from_partially_corrupt_config() {
+        let temp = TempHome::new();
+        // A valid JSON OBJECT, but `env_vars` is the wrong type (string, not array)
+        // so STRICT parse fails. There is NO config.json.bak, so recovery must come
+        // from field-level salvage: `http_proxy` is valid and must survive; the bad
+        // `env_vars` resets to its default.
+        temp.set_config_json(
+            r#"{"http_proxy":"http://salvaged","env_vars":"this-should-be-an-array"}"#,
+        );
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.http_proxy, "http://salvaged",
+            "the valid field was salvaged from a partially-corrupt config (no .bak existed)"
+        );
+        assert!(
+            config.env_vars.is_empty(),
+            "the corrupt field reset to its default instead of failing the whole load"
+        );
+        assert!(
+            dir_has_quarantine_file(&temp.path),
+            "the corrupt config.json was still quarantined for inspection"
+        );
+    }
+
+    #[test]
+    fn salvage_preferred_over_backup_for_most_recent_intent() {
+        let temp = TempHome::new();
+        // An OLDER last-known-good backup...
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({ "http_proxy": "http://old-from-backup" }).to_string(),
+        )
+        .unwrap();
+        // ...and a NEWER config that is corrupt but field-salvageable.
+        temp.set_config_json(
+            r#"{"http_proxy":"http://new-salvaged","env_vars":"this-should-be-an-array"}"#,
+        );
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.http_proxy, "http://new-salvaged",
+            "salvage (recent partial) is tried BEFORE the .bak fallback (older complete)"
+        );
+    }
+
+    #[test]
+    fn salvage_merges_backup_baseline_with_corrupt_files_newer_valid_edits() {
+        let temp = TempHome::new();
+        // Backup carries TWO good values.
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({
+                "http_proxy": "http://old-from-backup",
+                "https_proxy": "https://kept-from-backup",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The corrupt file updates http_proxy (newer), leaves https_proxy untouched,
+        // and has one wrong-type field.
+        temp.set_config_json(
+            r#"{"http_proxy":"http://newer-edit","env_vars":"this-should-be-an-array"}"#,
+        );
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        // Best of both: the corrupt file's newer valid edit wins where it set one...
+        assert_eq!(
+            config.http_proxy, "http://newer-edit",
+            "the corrupt file's newer valid edit is applied"
+        );
+        // ...and the backup's value survives for fields the corrupt file didn't fix.
+        assert_eq!(
+            config.https_proxy, "https://kept-from-backup",
+            "the backup baseline is preserved for fields not in (or invalid in) the corrupt file"
+        );
+    }
+
+    #[test]
+    fn unparseable_non_object_config_skips_salvage_and_uses_backup() {
+        let temp = TempHome::new();
+        // Not even a JSON object -> nothing field-wise to salvage -> must fall
+        // through to the .bak (the pre-#135 behavior is preserved).
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({ "http_proxy": "http://from-backup" }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(temp.path.join("config.json"), "{ not valid json ").unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.http_proxy, "http://from-backup",
+            "garbage (non-object) config skips salvage and recovers from .bak"
         );
     }
 
