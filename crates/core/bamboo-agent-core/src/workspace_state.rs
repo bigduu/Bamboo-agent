@@ -61,6 +61,16 @@ pub fn get_configured_default_workspace() -> Option<PathBuf> {
         .and_then(|provider| provider())
 }
 
+/// Whether a default-workspace provider has been registered — i.e. we're running
+/// in a context (the server) that owns the live config and wired the provider at
+/// startup. When true the provider is authoritative: callers must NOT fall back
+/// to a disk read even if it resolves to `None`, since that would re-introduce a
+/// divergent disk read of config (#38 / #131). When false (SDK / CLI / unit
+/// tests) callers may use their own config source.
+pub fn has_default_workspace_provider() -> bool {
+    DEFAULT_WORKSPACE_PROVIDER.get().is_some()
+}
+
 pub fn ensure_session_workspace(session_id: &str, preferred: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(workspace) = preferred {
         set_workspace(session_id, workspace.clone());
