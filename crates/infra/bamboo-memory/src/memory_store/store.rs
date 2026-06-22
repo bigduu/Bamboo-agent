@@ -108,7 +108,18 @@ impl MemoryStore {
     /// Return the process-global write lock guarding the given scope's on-disk
     /// state. Callers acquire it for the full duration of a read-modify-write +
     /// `refresh_scope_artifacts` critical section so concurrent writers to the same
-    /// scope are serialized (no lost updates, no half-written index set).
+    /// scope are serialized — the scope index/artifacts can never be left
+    /// half-written or inconsistent (the #32 corruption).
+    ///
+    /// NOTE: the five resolve-then-lock methods (archive/split/consolidate/
+    /// contradict/merge) read the target document BEFORE acquiring the lock, so two
+    /// concurrent edits to the SAME memory id can still lose one update (the second
+    /// writes back its pre-lock snapshot). Index consistency is unaffected; a
+    /// re-read-under-lock would close that same-doc window — tracked as a follow-up.
+    ///
+    /// The registry holds one `Arc<Mutex<()>>` per distinct scope root forever
+    /// (never evicted), which is negligible: a scope root is global / sessions /
+    /// per-project, so the set is tiny and bounded in practice.
     ///
     /// Each mutating public method acquires AT MOST this one lock and never holds
     /// it while calling another lock-acquiring public method, so there is no lock
