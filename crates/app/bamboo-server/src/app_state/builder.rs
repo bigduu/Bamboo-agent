@@ -445,6 +445,7 @@ impl AppState {
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
+            config_io_lock: Arc::new(tokio::sync::Mutex::new(())),
             provider: provider_lock,
             provider_handle,
             sessions,

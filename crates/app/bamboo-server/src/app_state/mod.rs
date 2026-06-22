@@ -165,6 +165,14 @@ pub struct AppState {
     /// Can be reloaded from disk at runtime using `reload_config()`.
     pub config: Arc<RwLock<Config>>,
 
+    /// Serializes a config WRITE's whole [in-memory mutation + disk persist] with
+    /// a `reload_config`'s [disk read + in-memory swap], so a reload can never
+    /// observe an in-flight-but-not-yet-persisted update and clobber it with the
+    /// stale disk copy (the residual of #41). It is NOT the `config` RwLock —
+    /// using a separate mutex keeps config READERS (the hot agent-loop path)
+    /// unblocked during a write's disk I/O. #126.
+    pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
+
     /// Hot-reloadable LLM provider with direct access
     ///
     /// This eliminates the proxy pattern where we created an AgentAppState
