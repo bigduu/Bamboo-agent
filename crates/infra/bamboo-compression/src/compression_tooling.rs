@@ -1,5 +1,5 @@
 use crate::counter::{TiktokenTokenCounter, TokenCounter};
-use crate::limits::create_budget_for_model;
+use crate::limits::{create_budget_for_model, ModelLimitsRegistry};
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePhase;
 use bamboo_domain::{
@@ -120,9 +120,19 @@ pub fn estimate_context_compression_exposure(
     model_name: &str,
     configured_budget: Option<&TokenBudget>,
 ) -> ContextCompressionExposure {
-    let budget = configured_budget
-        .cloned()
-        .unwrap_or_else(|| create_budget_for_model(model_name, BudgetStrategy::default()));
+    // When a budget was already resolved upstream (the production path — see
+    // `resolve_token_budget`, which now also caches it on `session.token_budget`,
+    // issue #20 bug 1), use it directly. Only when none is available do we fall
+    // back to a model-derived budget. No `model_limits.json` registry is in
+    // scope synchronously here, so this fallback resolves to the global default
+    // rather than silently fabricating an empty override registry (#20 bug 2).
+    let budget = configured_budget.cloned().unwrap_or_else(|| {
+        create_budget_for_model(
+            model_name,
+            BudgetStrategy::default(),
+            &ModelLimitsRegistry::new(),
+        )
+    });
     let counter = TiktokenTokenCounter::default();
     let active_messages = active_messages_for_budget(session);
     let active_message_tokens = counter.count_messages(&active_messages);

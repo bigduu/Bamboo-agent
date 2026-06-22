@@ -57,7 +57,8 @@ pub struct ModelLimit {
     pub model_pattern: String,
     /// Maximum context window size in tokens
     pub max_context_tokens: u32,
-    /// Maximum output tokens (defaults to min(4096, max_context / 4))
+    /// Maximum output tokens (defaults to min(max_context / 4,
+    /// DEFAULT_MAX_OUTPUT_TOKENS) when unset — see [`Self::get_max_output_tokens`])
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     /// Safety margin for token counting (defaults to 1000)
@@ -77,9 +78,16 @@ impl ModelLimit {
     }
 
     /// Get max output tokens with default calculation.
+    ///
+    /// When unset, derive from the context window (`max_context_tokens / 4`)
+    /// capped at the global [`DEFAULT_MAX_OUTPUT_TOKENS`]. The cap tracks the
+    /// global default rather than a hard-coded `4096`, so a user override like
+    /// `ModelLimit::new("gpt-4o", 128_000)` (no explicit `max_output_tokens`)
+    /// resolves to `min(32_000, 128_000) = 32_000` instead of collapsing to
+    /// `4096` — see issue #20, bug 4.
     pub fn get_max_output_tokens(&self) -> u32 {
         self.max_output_tokens
-            .unwrap_or_else(|| (self.max_context_tokens / 4).min(4096))
+            .unwrap_or_else(|| (self.max_context_tokens / 4).min(DEFAULT_MAX_OUTPUT_TOKENS))
     }
 
     /// Get safety margin, scaling proportionally with context window.
@@ -163,21 +171,27 @@ impl ModelLimitsRegistry {
     /// # Matching Strategy
     /// 1. Exact match (highest priority)
     /// 2. Model contains pattern (e.g., "gpt-4o-mini" contains "gpt-4o")
-    /// 3. Pattern contains model (e.g., "gpt-4" contains "gpt")
     ///
     /// For partial matches, the longest (most specific) pattern wins.
+    ///
+    /// Only the `model.contains(pattern)` direction is correct: the configured
+    /// pattern must be a substring of the runtime model id. The reverse
+    /// (`pattern.contains(model)`) was a bug (#20, bug 3) — it let a short model
+    /// id like `"gpt-4o"` match a longer, unrelated pattern like `"gpt-4o-mini"`
+    /// and inherit the wrong limit.
     pub fn get(&self, model: &str) -> Option<ModelLimit> {
         // Exact user override match (highest priority).
         if let Some(limit) = self.user_limits.get(model) {
             return Some(limit.clone());
         }
 
-        // Best partial match among user overrides. Longer (more specific)
-        // patterns win for deterministic selection. There is no built-in table;
-        // a miss returns None and the caller falls back to the global default.
+        // Best partial match among user overrides: the pattern must be a
+        // substring of the model id. Longer (more specific) patterns win for
+        // deterministic selection. There is no built-in table; a miss returns
+        // None and the caller falls back to the global default.
         self.user_limits
             .iter()
-            .filter(|(pattern, _)| model.contains(pattern.as_str()) || pattern.contains(model))
+            .filter(|(pattern, _)| model.contains(pattern.as_str()))
             .max_by_key(|(pattern, _)| pattern.len())
             .map(|(_, limit)| limit.clone())
     }
@@ -259,11 +273,21 @@ pub fn load_model_limits_from_unified_config(
     }
 }
 
-/// Create a token budget for a specific model.
+/// Create a token budget for a specific model, resolving its limit from the
+/// supplied `registry` (with user overrides loaded) and falling back to the
+/// global default when there is no match.
 ///
-/// This is a convenience function that creates a budget with appropriate defaults.
-pub fn create_budget_for_model(model: &str, strategy: crate::BudgetStrategy) -> crate::TokenBudget {
-    let registry = ModelLimitsRegistry::default();
+/// The registry is a required parameter on purpose: a previous version built a
+/// fresh empty `ModelLimitsRegistry::default()` internally, which silently
+/// discarded every user override from `model_limits.json` and always returned
+/// the global default (#20, bug 2). Callers must pass a registry they have
+/// loaded user overrides into (or [`ModelLimitsRegistry::new`] when they
+/// genuinely want the global default).
+pub fn create_budget_for_model(
+    model: &str,
+    strategy: crate::BudgetStrategy,
+    registry: &ModelLimitsRegistry,
+) -> crate::TokenBudget {
     let limit = registry.get_or_default(model);
 
     crate::TokenBudget {
@@ -362,8 +386,41 @@ mod tests {
     #[test]
     fn model_limit_calculates_default_output_tokens() {
         let limit = ModelLimit::new("test", 100_000);
-        // Default is min(max_context / 4, 4096) = min(25000, 4096) = 4096
-        assert_eq!(limit.get_max_output_tokens(), 4096);
+        // Default is min(max_context / 4, DEFAULT_MAX_OUTPUT_TOKENS)
+        //        = min(25_000, 128_000) = 25_000 (no longer capped at 4096, #20 bug 4)
+        assert_eq!(limit.get_max_output_tokens(), 25_000);
+    }
+
+    #[test]
+    fn user_override_without_explicit_output_is_not_capped_at_4096() {
+        // Issue #20 bug 4: a user override created with `ModelLimit::new` leaves
+        // `max_output_tokens = None`. The derived default must scale with the
+        // context window (context / 4) rather than collapsing to 4096.
+        let gpt4o = ModelLimit::new("gpt-4o", 128_000);
+        assert!(gpt4o.max_output_tokens.is_none());
+        assert_eq!(gpt4o.get_max_output_tokens(), 32_000);
+
+        // Very large context windows are still capped at the global default so a
+        // single override can't request an unbounded output budget.
+        let huge = ModelLimit::new("huge", 2_000_000);
+        assert_eq!(huge.get_max_output_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn matching_is_directional_model_contains_pattern_only() {
+        // Issue #20 bug 3: a short model id must NOT match a longer pattern.
+        let mut registry = ModelLimitsRegistry::new();
+        registry.add_limit(ModelLimit::new("gpt-4o-mini", 128_000));
+
+        // "gpt-4o" does not contain "gpt-4o-mini", so it must NOT inherit the
+        // mini override (the old `pattern.contains(model)` direction did).
+        assert!(registry.get("gpt-4o").is_none());
+
+        // The reverse still works: a model id that contains the pattern matches.
+        let mini = registry
+            .get("gpt-4o-mini-2024")
+            .expect("model id contains the pattern");
+        assert_eq!(mini.max_context_tokens, 128_000);
     }
 
     #[test]
@@ -461,10 +518,60 @@ mod tests {
         assert_eq!(unknown.get_max_output_tokens(), 128_000);
     }
 
+    #[tokio::test]
+    async fn persisted_override_drives_runtime_token_budget() {
+        // Full chain (issue #20 acceptance): set a model limit on disk →
+        // load registry → build the runtime TokenBudget → the budget reflects
+        // the user-configured context window, not a stale/default value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        // Note: NO explicit max_output_tokens, exercising the bug-4 default path.
+        tokio::fs::write(
+            &path,
+            r#"[{"model_pattern":"gpt-4o","max_context_tokens":128000}]"#,
+        )
+        .await
+        .expect("seed overrides");
+
+        let mut registry = ModelLimitsRegistry::with_config_path(path);
+        registry.load_user_config().await.expect("load user config");
+
+        // The runtime budget for the configured model matches the user limit...
+        let budget = create_budget_for_model("gpt-4o", crate::BudgetStrategy::default(), &registry);
+        assert_eq!(budget.max_context_tokens, 128_000);
+        // ...and the derived output budget is context/4 (32K), not the old 4096 cap.
+        assert_eq!(budget.max_output_tokens, 32_000);
+
+        // A model that does NOT contain the pattern is unaffected (bug-3 fix):
+        // it resolves to the global default, not the gpt-4o override.
+        let other =
+            create_budget_for_model("claude-sonnet", crate::BudgetStrategy::default(), &registry);
+        assert_eq!(other.max_context_tokens, 1_000_000);
+    }
+
     #[test]
-    fn create_budget_for_model_uses_global_default_for_any_model() {
-        let budget = create_budget_for_model("anything-at-all", crate::BudgetStrategy::default());
+    fn create_budget_for_model_uses_global_default_for_unmatched_model() {
+        // An empty registry yields the global default for any model.
+        let registry = ModelLimitsRegistry::new();
+        let budget = create_budget_for_model(
+            "anything-at-all",
+            crate::BudgetStrategy::default(),
+            &registry,
+        );
         assert_eq!(budget.max_context_tokens, 1_000_000);
         assert_eq!(budget.max_output_tokens, 128_000);
+    }
+
+    #[test]
+    fn create_budget_for_model_honors_registry_user_overrides() {
+        // Issue #20 bug 2: the budget must reflect the user override carried by
+        // the registry, not silently fall back to the global default.
+        let mut registry = ModelLimitsRegistry::new();
+        registry.add_limit(ModelLimit::new("gpt-4o", 128_000));
+
+        let budget = create_budget_for_model("gpt-4o", crate::BudgetStrategy::default(), &registry);
+        assert_eq!(budget.max_context_tokens, 128_000);
+        // And the derived output budget is the un-capped context/4 (bug 4), not 4096.
+        assert_eq!(budget.max_output_tokens, 32_000);
     }
 }
