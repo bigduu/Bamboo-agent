@@ -216,13 +216,16 @@ impl OpenAIProvider {
         );
 
         let headers = self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
-        let response = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        // Retry the initial request on transient failures (issue #18); the
+        // returned body is unread, so SSE streaming below is unaffected.
+        let responses_url = format!("{}/responses", self.base_url);
+        let response = crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
+            self.client
+                .post(&responses_url)
+                .headers(headers.clone())
+                .json(&body)
+        })
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -256,12 +259,13 @@ impl OpenAIProvider {
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
-                let fallback = self
-                    .client
-                    .post(format!("{}/responses", self.base_url))
-                    .headers(fallback_headers)
-                    .json(&fallback_body)
-                    .send()
+                let fallback =
+                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
+                        self.client
+                            .post(&responses_url)
+                            .headers(fallback_headers.clone())
+                            .json(&fallback_body)
+                    })
                     .await?;
 
                 if !fallback.status().is_success() {
@@ -395,13 +399,16 @@ impl LLMProvider for OpenAIProvider {
 
         let headers =
             self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        // Retry the initial request on transient failures (issue #18); the
+        // returned body is unread, so SSE streaming below is unaffected.
+        let chat_url = format!("{}/chat/completions", self.base_url);
+        let response = crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
+            self.client
+                .post(&chat_url)
+                .headers(headers.clone())
+                .json(&body)
+        })
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -433,12 +440,13 @@ impl LLMProvider for OpenAIProvider {
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
-                let fallback = self
-                    .client
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .headers(fallback_headers)
-                    .json(&fallback_body)
-                    .send()
+                let fallback =
+                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
+                        self.client
+                            .post(&chat_url)
+                            .headers(fallback_headers.clone())
+                            .json(&fallback_body)
+                    })
                     .await?;
 
                 if fallback.status().is_success() {

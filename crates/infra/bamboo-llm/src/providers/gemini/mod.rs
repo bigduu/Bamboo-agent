@@ -254,14 +254,16 @@ impl LLMProvider for GeminiProvider {
             request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
             Some(model),
         )?;
-        let mut response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&request_json)
-            .send()
-            .await
-            .map_err(LLMError::Http)?;
+        // Retry the initial request on transient failures (issue #18); the
+        // returned body is unread, so SSE streaming below is unaffected.
+        let mut response = crate::retry::send_with_retry(crate::retry::global(), "Gemini", || {
+            self.client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&request_json)
+        })
+        .await
+        .map_err(LLMError::Http)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -303,14 +305,14 @@ impl LLMProvider for GeminiProvider {
                     request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
                     Some(model),
                 )?;
-                response = self
-                    .client
-                    .post(&url)
-                    .headers(fallback_headers)
-                    .json(&fallback_request_json)
-                    .send()
-                    .await
-                    .map_err(LLMError::Http)?;
+                response = crate::retry::send_with_retry(crate::retry::global(), "Gemini", || {
+                    self.client
+                        .post(&url)
+                        .headers(fallback_headers.clone())
+                        .json(&fallback_request_json)
+                })
+                .await
+                .map_err(LLMError::Http)?;
             } else {
                 if status == 401 || status == 403 {
                     return Err(LLMError::Auth(format!(

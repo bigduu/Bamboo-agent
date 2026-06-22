@@ -13,6 +13,7 @@ pub mod provider_factory;
 pub mod provider_registry;
 pub mod providers;
 pub mod resolved_model;
+pub mod retry;
 pub mod router;
 pub mod types;
 
