@@ -18,6 +18,7 @@
 //! to a later parse call — there is no later call (issue #27).
 
 use crate::provider::{LLMError, Result};
+use crate::providers::common::sse::sse_error_is_present;
 use crate::types::LLMChunk;
 use bamboo_domain::{FunctionCall, ToolCall};
 use serde_json::Value;
@@ -162,8 +163,12 @@ pub fn parse_gemini_sse_event(
         LLMError::Stream(format!("Failed to parse Gemini SSE data: {}: {}", e, data))
     })?;
 
-    // Check for error in the response
-    if let Some(error) = value.get("error") {
+    // Check for a REAL error in the response. Guard against a benign no-error
+    // marker (`{"error": null}` / `""` / `{}`) that some Gemini gateways emit on an
+    // otherwise-normal chunk — `get("error")` returns `Some(Null)` for an explicit
+    // null, which would otherwise abort a valid stream (#99, mirroring #26).
+    let error_field = value.get("error");
+    if let Some(error) = error_field.filter(|e| sse_error_is_present(e)) {
         let error_msg = error
             .get("message")
             .and_then(|m| m.as_str())
@@ -172,12 +177,21 @@ pub fn parse_gemini_sse_event(
     }
 
     // Extract candidates array
-    let candidates = value
-        .get("candidates")
-        .and_then(|c| c.as_array())
-        .ok_or_else(|| {
-            LLMError::Stream(format!("Missing candidates in Gemini response: {}", data))
-        })?;
+    let candidates = match value.get("candidates").and_then(|c| c.as_array()) {
+        Some(candidates) => candidates,
+        // No candidates is normally malformed — EXCEPT a standalone benign no-error
+        // marker (`{"error": null}`), which carries an `error` key but no content;
+        // treat that as a no-op instead of aborting the stream (#99). Route through
+        // take_gemini_final_usage so any `usageMetadata` riding on the marker is
+        // still emitted (empty when none is present).
+        None if error_field.is_some() => return Ok(take_gemini_final_usage(state, &value)),
+        None => {
+            return Err(LLMError::Stream(format!(
+                "Missing candidates in Gemini response: {}",
+                data
+            )))
+        }
+    };
 
     if candidates.is_empty() {
         return Ok(take_gemini_final_usage(state, &value));
@@ -601,6 +615,59 @@ mod tests {
 
         let result = parse_gemini_sse_event(&mut state, "", data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn benign_null_error_marker_does_not_abort_stream() {
+        // Some gateways emit `{"error": null}` (or ""/{}) as a NO-error marker.
+        // It must not surface as an API error or abort the stream (#99).
+        for data in [
+            r#"{"error":null}"#,
+            r#"{"error":""}"#,
+            r#"{"error":{}}"#,
+            r#"{"error":[]}"#,
+        ] {
+            let mut state = GeminiStreamState::default();
+            let result = parse_gemini_sse_event(&mut state, "", data);
+            assert!(
+                result.is_ok(),
+                "benign no-error marker {data:?} must not error, got {result:?}"
+            );
+            assert!(
+                result.unwrap().is_empty(),
+                "benign marker {data:?} yields no chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn null_error_marker_alongside_content_still_parses_content() {
+        // The marker rides on an otherwise-normal chunk: the content is parsed,
+        // the null error is ignored.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"error":null,"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#;
+
+        let chunks = parse_gemini_sse_event(&mut state, "", data).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| matches!(c, LLMChunk::Token(t) if t == "hello")),
+            "content alongside a null error marker is still parsed: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn missing_candidates_without_error_key_still_errors() {
+        // A genuinely malformed chunk (no candidates AND no error key) must still
+        // surface an error — the #99 no-op path is only for benign markers.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"usageMetadata":{"totalTokenCount":5}}"#;
+
+        let result = parse_gemini_sse_event(&mut state, "", data);
+        assert!(
+            result.is_err(),
+            "missing candidates with no error key is malformed, got {result:?}"
+        );
     }
 
     #[test]

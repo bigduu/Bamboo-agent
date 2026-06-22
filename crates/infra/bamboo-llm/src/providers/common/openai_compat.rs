@@ -9,6 +9,7 @@ use bamboo_domain::{Message, Role};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::sse::sse_error_is_present;
 use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::provider::{LLMError, Result};
 use crate::types::LLMChunk;
@@ -237,23 +238,6 @@ fn openai_compat_error_to_llm_error(error: &Value) -> LLMError {
         .map(str::to_string)
         .unwrap_or_else(|| error.to_string());
     LLMError::Api(message)
-}
-
-/// Whether a top-level SSE `"error"` field actually represents an error.
-///
-/// Several OpenAI-compatible gateways (LiteLLM, OneAPI/New-API, some Azure
-/// proxies) emit `{"error": null}` (or `""`/`{}`) as a *no-error* marker on an
-/// otherwise-normal chunk. `serde_json`'s `get("error")` returns `Some(Null)`
-/// for an explicit null, so without this guard such a benign marker would abort
-/// a valid stream (issue #26). Only a non-null, non-empty value is a real error.
-fn sse_error_is_present(error: &Value) -> bool {
-    match error {
-        Value::Null => false,
-        Value::String(s) => !s.trim().is_empty(),
-        Value::Object(map) => !map.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        _ => true,
-    }
 }
 
 /// Parse an SSE `data:` payload in strict mode (OpenAI behavior).
