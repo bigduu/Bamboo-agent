@@ -6,6 +6,7 @@ use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::managers::tool::{ToolManager, ToolRoundResult};
@@ -46,6 +47,7 @@ impl ToolManager for DefaultToolManager {
         config: &AgentLoopConfig,
         task_context: &mut Option<TaskLoopContext>,
         tool_schemas: &[ToolSchema],
+        cancel: &CancellationToken,
     ) -> Result<ToolRoundResult, AgentError> {
         let frame = crate::runtime::runner::round_frame::RoundFrame {
             session_id,
@@ -59,27 +61,122 @@ impl ToolManager for DefaultToolManager {
             tools: &self.tools,
         };
 
-        let result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
-            tool_calls,
-            &frame,
-            session,
-            task_context,
-            config
-                .summarization_model_name
-                .as_deref()
-                .or(config.background_model_name.as_deref()),
-            config
-                .summarization_model_provider
-                .as_ref()
-                .or(config.background_model_provider.as_ref()),
-            tool_schemas,
-        )
-        .await?;
+        // Mirror the live pipeline's #30 biased-cancel wrap so a cancel issued
+        // DURING tool execution (e.g. a long foreground Bash run) is honored on
+        // this adapter path too, not only between rounds. `biased` checks
+        // cancellation first; on cancel the in-flight tool futures are dropped
+        // (true cancellation — foreground Bash is kill_on_drop). The per-tool
+        // `tokio::time::timeout` inside `execute_round_tool_calls` is preserved;
+        // cancel is strictly an additional early-exit. #104.
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+            result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
+                tool_calls,
+                &frame,
+                session,
+                task_context,
+                config
+                    .summarization_model_name
+                    .as_deref()
+                    .or(config.background_model_name.as_deref()),
+                config
+                    .summarization_model_provider
+                    .as_ref()
+                    .or(config.background_model_provider.as_ref()),
+                tool_schemas,
+            ) => result?,
+        };
 
         Ok(ToolRoundResult {
             awaiting_clarification: result.awaiting_clarification,
             should_break: false,
             tool_calls_count: tool_calls.len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::tools::{FunctionCall, ToolError, ToolExecutionContext, ToolResult};
+    use bamboo_agent_core::Message;
+    use bamboo_llm::provider::LLMStream;
+
+    // Stubs that PANIC if invoked — they prove the biased cancel arm returns BEFORE
+    // any LLM or tool work runs.
+    struct PanicProvider;
+    #[async_trait]
+    impl bamboo_llm::LLMProvider for PanicProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("LLM must not be invoked when the run is already cancelled");
+        }
+    }
+
+    struct PanicExecutor;
+    #[async_trait]
+    impl ToolExecutor for PanicExecutor {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            panic!("tools must not run when the run is already cancelled");
+        }
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.execute(call).await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_short_circuits_to_cancelled_when_token_already_fired() {
+        let mgr = DefaultToolManager::new(Arc::new(PanicExecutor), Arc::new(PanicProvider));
+        let (event_tx, _rx) = mpsc::channel(8);
+        let mut session = Session::new("s1", "model");
+        let config = AgentLoopConfig::default();
+        let mut task_context = None;
+        // A non-empty tool call: without the cancel short-circuit, execute_round
+        // would route it to PanicExecutor and the test would panic.
+        let tool_calls = vec![ToolCall {
+            id: "c1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "anything".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }];
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled before the call
+
+        let result = mgr
+            .execute_tool_calls(
+                &tool_calls,
+                &event_tx,
+                None,
+                "s1",
+                "r1",
+                0,
+                &mut session,
+                &config,
+                &mut task_context,
+                &[],
+                &cancel,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "a pre-cancelled token returns Cancelled before touching tools/LLM; got {result:?}"
+        );
     }
 }

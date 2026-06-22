@@ -4,6 +4,8 @@ use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_metrics::MetricsCollector;
 use tokio::sync::mpsc;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 
@@ -22,6 +24,11 @@ pub trait ToolManager: Send + Sync {
     fn resolve_tool_schemas(&self, config: &AgentLoopConfig, session: &Session) -> Vec<ToolSchema>;
 
     /// Execute tool calls for a round.
+    ///
+    /// `cancel` is checked DURING tool execution (not just between rounds): the
+    /// implementation must drop the in-flight tool work and return
+    /// [`AgentError::Cancelled`] if the token fires, mirroring the live pipeline's
+    /// #30 biased-cancel wrap. #104.
     #[allow(clippy::too_many_arguments)]
     async fn execute_tool_calls(
         &self,
@@ -35,5 +42,6 @@ pub trait ToolManager: Send + Sync {
         config: &AgentLoopConfig,
         task_context: &mut Option<TaskLoopContext>,
         tool_schemas: &[ToolSchema],
+        cancel: &CancellationToken,
     ) -> Result<ToolRoundResult, AgentError>;
 }
