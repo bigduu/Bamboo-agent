@@ -91,24 +91,56 @@ pub async fn serve_mcp_proxy(
 ) -> BrokerResult<()> {
     let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
     client.subscribe().await?;
-    while let Some(msg) = client.next_message().await {
-        if msg.kind != InboxKind::McpRequest {
-            let _ = client.ack(msg.id).await;
-            continue;
+
+    // Run each request's (potentially slow) backend call CONCURRENTLY in a spawned
+    // task, and route the finished reply back to this loop — the single client
+    // owner — which delivers + acks it. So N parallel McpRequests overlap their
+    // backend work instead of the old serial `handle(msg).await` per message. The
+    // worker side multiplexes replies by correlation_id, so out-of-order completion
+    // is fine. (Spawns are unbounded but bounded in practice by the LLM's parallel
+    // tool-call batch; a Semaphore cap is a future option if a backend needs one.)
+    // #144.
+    //
+    // KEEP-ALIVE: this original `reply_tx` is intentionally retained in scope for
+    // the whole loop (each spawn clones it). It guarantees `reply_rx.recv()` never
+    // returns `None` while looping, which is what lets the reply arm's
+    // `Some(..) = reply_rx.recv()` always eventually match — do NOT drop it (e.g.
+    // by only cloning into the spawn) or the reply arm goes permanently dead.
+    let (reply_tx, mut reply_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(MsgId, String, McpReply)>();
+    loop {
+        tokio::select! {
+            // Deliver a completed reply + ack its request (cheap; serialized
+            // through the owner, never blocks a backend call).
+            Some((corr, reply_to, reply_body)) = reply_rx.recv() => {
+                let reply = InboxMessage {
+                    id: MsgId::new(),
+                    from: me.clone(),
+                    kind: InboxKind::McpReply,
+                    body: serde_json::to_value(reply_body).unwrap_or_default(),
+                    created_at: Utc::now(),
+                    correlation_id: Some(corr.clone()),
+                };
+                client.deliver(&reply_to, reply).await?;
+                client.ack(corr).await?;
+            }
+            msg = client.next_message() => {
+                let Some(msg) = msg else { break }; // connection closed
+                if msg.kind != InboxKind::McpRequest {
+                    let _ = client.ack(msg.id).await;
+                    continue;
+                }
+                let backend = Arc::clone(&backend);
+                let reply_tx = reply_tx.clone();
+                let corr = msg.id.clone();
+                let reply_to = msg.from.session_id.clone();
+                tokio::spawn(async move {
+                    let reply_body = handle_mcp_request(backend.as_ref(), msg).await;
+                    // Receiver gone == loop exited (connection dropped) -> drop.
+                    let _ = reply_tx.send((corr, reply_to, reply_body));
+                });
+            }
         }
-        let reply_to = msg.from.session_id.clone();
-        let corr = msg.id.clone();
-        let reply_body = handle_mcp_request(backend.as_ref(), msg).await;
-        let reply = InboxMessage {
-            id: MsgId::new(),
-            from: me.clone(),
-            kind: InboxKind::McpReply,
-            body: serde_json::to_value(reply_body).unwrap_or_default(),
-            created_at: Utc::now(),
-            correlation_id: Some(corr.clone()),
-        };
-        client.deliver(&reply_to, reply).await?;
-        client.ack(corr).await?;
     }
     Ok(())
 }
@@ -668,6 +700,107 @@ mod tests {
             let (i, result) = h.await.unwrap();
             assert_eq!(result, format!("ran nova_click args={{\"mark\":{i}}}"));
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_proxy_calls_overlap_at_the_orchestrator() {
+        use std::time::Instant;
+
+        // A host-bound backend where each call takes 200ms. Serial handling of N
+        // calls would take N*200ms; concurrent handling overlaps to ~200ms.
+        struct SlowMcp;
+        #[async_trait]
+        impl ToolExecutor for SlowMcp {
+            async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(ToolResult {
+                    success: true,
+                    result: format!("done {}", call.function.arguments),
+                    display_preference: None,
+                    images: Vec::new(),
+                })
+            }
+            async fn execute_with_context(
+                &self,
+                call: &ToolCall,
+                _ctx: ToolExecutionContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                self.execute(call).await
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                vec![ToolSchema {
+                    schema_type: "function".into(),
+                    function: FunctionSchema {
+                        name: "nova_click".into(),
+                        description: "click a mark".into(),
+                        parameters: json!({ "type": "object" }),
+                    },
+                }]
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(core, TOKEN));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let endpoint = format!("ws://{addr}");
+
+        let ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_mcp_proxy(
+                &ep,
+                AgentRef {
+                    session_id: "orchestrator".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(SlowMcp),
+            )
+            .await;
+        });
+
+        let proxy = Arc::new(
+            McpProxyExecutor::connect(
+                &endpoint,
+                "worker#mcp",
+                TOKEN,
+                "orchestrator",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("proxy connects"),
+        );
+
+        // 4 concurrent 200ms calls: serial would be ~800ms, concurrent ~200ms.
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for i in 0..4u32 {
+            let p = proxy.clone();
+            handles.push(tokio::spawn(async move {
+                let call = ToolCall {
+                    id: format!("c{i}"),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "nova_click".into(),
+                        arguments: format!("{{\"i\":{i}}}"),
+                    },
+                };
+                p.execute(&call).await.expect("returns")
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "4 concurrent 200ms proxy calls must OVERLAP at the orchestrator \
+             (serial would be ~800ms); took {elapsed:?}"
+        );
     }
 
     // --- issue #47: supervised reconnect on both sides ------------------------
