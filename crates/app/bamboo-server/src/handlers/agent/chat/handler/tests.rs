@@ -169,33 +169,12 @@ fn resolve_workspace_path_uses_request_then_metadata() {
     assert_eq!(from_metadata.as_deref(), Some("/tmp/workspace"));
 }
 
-#[test]
-fn resolve_workspace_path_falls_back_to_default_work_area_config() {
-    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-    let workspace = temp_dir.path().join("default-workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace should exist");
-    let original = std::env::var_os("BAMBOO_DATA_DIR");
-    std::env::set_var("BAMBOO_DATA_DIR", temp_dir.path());
-    std::fs::write(
-        temp_dir.path().join("config.json"),
-        serde_json::json!({
-            "default_work_area": { "path": workspace.to_string_lossy() }
-        })
-        .to_string(),
-    )
-    .expect("config should be written");
-
-    let mut session = Session::new("session-1", "model");
-    let resolved = resolve_workspace_path(&mut session, None, Some(temp_dir.path()));
-    let expected = bamboo_config::paths::path_to_display_string(&workspace);
-    assert_eq!(resolved.as_deref(), Some(expected.as_str()));
-
-    if let Some(value) = original {
-        std::env::set_var("BAMBOO_DATA_DIR", value);
-    } else {
-        std::env::remove_var("BAMBOO_DATA_DIR");
-    }
-}
+// NOTE: the default-work-area disk fallback used to be tested here, but it's now
+// gated on NO workspace provider being registered (#38/#131) — and the provider
+// is a process-global first-wins OnceLock that sibling AppState tests populate,
+// so a fallback assertion can't be deterministic in the server test binary. The
+// disk fallback is unit-tested directly + deterministically in bamboo-engine's
+// session_app::chat (default_workspace_from_data_dir_reads_configured_work_area).
 
 #[test]
 fn sync_runtime_workspace_persists_workspace_for_tools() {

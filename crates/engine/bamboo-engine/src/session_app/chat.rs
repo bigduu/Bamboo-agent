@@ -7,7 +7,7 @@ use bamboo_config::paths::path_to_display_string;
 use bamboo_domain::Message;
 use bamboo_skills::selection::normalize_selected_skill_ids;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::errors::ChatError;
 use super::provider_model::{derive_model_ref, persist_legacy_model_provider, persist_model_ref};
@@ -201,20 +201,32 @@ pub fn resolve_workspace_path(
     workspace_path_from_request
         .map(ToString::to_string)
         .or_else(|| session.workspace_path_meta())
-        .or_else(|| {
-            // Prefer the server's LIVE in-memory config via the registered
-            // workspace provider — no disk read, no global env-cache clobber
-            // (#38). Only when no provider is registered (non-server contexts:
-            // SDK / CLI / unit tests) fall back to the legacy disk read of
-            // data_dir. In the server the provider is always wired at startup,
-            // so the divergent from_data_dir read never runs there.
-            bamboo_agent_core::workspace_state::get_configured_default_workspace()
-                .or_else(|| {
-                    bamboo_llm::Config::from_data_dir(data_dir.map(Path::to_path_buf))
-                        .get_default_work_area_path()
-                })
-                .map(|path| path_to_display_string(&path))
-        })
+        .or_else(|| resolve_default_workspace(data_dir))
+}
+
+/// Resolve the configured default workspace (display string), preferring the
+/// server's live in-memory config.
+///
+/// If a workspace provider IS registered (the server, which owns the live
+/// `Arc<RwLock<Config>>`), it is AUTHORITATIVE: we use its result and never disk
+/// read — even when it resolves to `None` (no default work area configured).
+/// That closes the divergent disk read + global env-var-cache clobber for the
+/// whole server runtime (#38 / #131). Only when NO provider is registered
+/// (non-server contexts — SDK / CLI / unit tests) do we fall back to a direct
+/// `from_data_dir` read of `data_dir`.
+fn resolve_default_workspace(data_dir: Option<&Path>) -> Option<String> {
+    let configured = if bamboo_agent_core::workspace_state::has_default_workspace_provider() {
+        bamboo_agent_core::workspace_state::get_configured_default_workspace()
+    } else {
+        default_workspace_from_data_dir(data_dir)
+    };
+    configured.map(|path| path_to_display_string(&path))
+}
+
+/// Legacy non-server fallback: load `{data_dir}/config.json` from disk and read
+/// its default work area. Only used when no workspace provider is registered.
+fn default_workspace_from_data_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
+    bamboo_llm::Config::from_data_dir(data_dir.map(Path::to_path_buf)).get_default_work_area_path()
 }
 
 pub fn resolve_selected_skill_ids(
@@ -448,4 +460,44 @@ fn build_enhanced_system_prompt_with_profile(
     };
 
     (merged_prompt, profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The non-server disk fallback (`default_workspace_from_data_dir`) tested
+    // directly + deterministically — no global workspace-provider involved (the
+    // server-side, provider-gated path can't be unit-tested due to the
+    // first-wins OnceLock). #38 / #131.
+
+    #[test]
+    fn default_workspace_from_data_dir_reads_configured_work_area() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("default-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(
+            temp.path().join("config.json"),
+            serde_json::json!({
+                "default_work_area": { "path": workspace.to_string_lossy() }
+            })
+            .to_string(),
+        )
+        .expect("write config.json");
+
+        let resolved = default_workspace_from_data_dir(Some(temp.path())).expect("resolves");
+        // get_default_work_area_path returns the non-canonical candidate, and temp
+        // dirs live under a symlinked prefix on macOS (/var -> /private/var), so
+        // canonicalize BOTH sides before comparing.
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn default_workspace_from_data_dir_is_none_without_config() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        assert!(default_workspace_from_data_dir(Some(temp.path())).is_none());
+    }
 }
