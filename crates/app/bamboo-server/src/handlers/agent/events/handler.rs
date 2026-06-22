@@ -1,8 +1,24 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use serde::Deserialize;
 
 use super::stream::{live_stream_response, terminal_response};
 use super::terminal::terminal_event_if_ready;
 use crate::app_state::{AgentStatus, AppState};
+
+/// Query parameters for the per-session events (SSE) endpoint.
+#[derive(Debug, Default, Deserialize)]
+pub struct EventsQuery {
+    /// Token-coalescing window in milliseconds (v2-P0).
+    ///
+    /// `0` (the default) preserves the legacy behavior exactly: every event is
+    /// emitted in its own SSE frame immediately, with no buffering. When
+    /// `> 0`, consecutive token-class events (`Token` / `ReasoningToken` /
+    /// `ToolToken` of the same `tool_call_id`) are merged into a single frame,
+    /// bounding added latency to `batch_ms`. Desktop clients pass `0`; mobile
+    /// clients pass e.g. `50`.
+    #[serde(default)]
+    pub batch_ms: u64,
+}
 
 /// Subscribe to real-time agent execution events via Server-Sent Events (SSE).
 ///
@@ -15,9 +31,11 @@ use crate::app_state::{AgentStatus, AppState};
 pub async fn handler(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<EventsQuery>,
     _req: HttpRequest,
 ) -> impl Responder {
     let session_id = path.into_inner();
+    let batch_ms = query.batch_ms;
     tracing::debug!("[{}] Events subscription requested", session_id);
 
     // Validate session exists (index-backed).
@@ -101,5 +119,6 @@ pub async fn handler(
         receiver,
         state.clone(),
         session_id,
+        batch_ms,
     )
 }
