@@ -20,11 +20,58 @@
 //! - **Custom**: Restrictive CORS for specific addresses
 
 use actix_cors::Cors;
+use actix_governor::governor::middleware::NoOpMiddleware;
+use actix_governor::{GovernorConfig, GovernorConfigBuilder, PeerIpKeyExtractor};
 use actix_web::http::header;
 use actix_web::middleware::DefaultHeaders;
 use std::collections::HashSet;
 use tracing::info;
 use tracing::warn;
+
+/// Default sustained per-IP request rate (requests/second) for the production
+/// (network-exposed) server. Overridable via `BAMBOO_RATE_LIMIT_PER_SECOND`.
+const DEFAULT_RATE_LIMIT_PER_SECOND: u64 = 10;
+/// Default per-IP burst allowance. Overridable via `BAMBOO_RATE_LIMIT_BURST`.
+const DEFAULT_RATE_LIMIT_BURST: u32 = 20;
+
+fn rate_limiter_config(
+    per_second: u64,
+    burst: u32,
+) -> GovernorConfig<PeerIpKeyExtractor, NoOpMiddleware> {
+    // One cell replenishes every `1000 / per_second` ms (>=1), allowing `per_second`
+    // sustained req/s with a `burst` bucket. Clamp to >=1 so a bad env value can't
+    // produce a zero period/burst (which finish() would reject).
+    let ms_per_request = (1000 / per_second.max(1)).max(1);
+    GovernorConfigBuilder::default()
+        .milliseconds_per_request(ms_per_request)
+        .burst_size(burst.max(1))
+        .finish()
+        .expect("rate limiter config is valid (non-zero period and burst)")
+}
+
+/// Build the per-IP rate-limiter config applied to the PRODUCTION (network-bound)
+/// server via the `actix-governor` middleware. Throttles each client IP to
+/// `BAMBOO_RATE_LIMIT_PER_SECOND` (default 10) req/s with a `BAMBOO_RATE_LIMIT_BURST`
+/// (default 20) burst, returning 429 Too Many Requests when exceeded. Desktop
+/// (localhost) mode does not apply it. #13.
+///
+/// LIMITATION: keys on the TCP PEER IP. Behind a reverse proxy every client shares
+/// the proxy's IP, so the limit becomes effectively GLOBAL (still a real DoS
+/// backstop, but not per-client). Honoring `X-Forwarded-For` would require an
+/// opt-in trusted-proxy mode (XFF is spoofable when not behind a trusted proxy),
+/// tracked separately. The default (peer IP) is the safe, non-spoofable choice for
+/// the direct-exposure (Docker `0.0.0.0`) threat model #13 targets.
+pub fn build_rate_limiter() -> GovernorConfig<PeerIpKeyExtractor, NoOpMiddleware> {
+    let per_second = std::env::var("BAMBOO_RATE_LIMIT_PER_SECOND")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_PER_SECOND);
+    let burst = std::env::var("BAMBOO_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_BURST);
+    rate_limiter_config(per_second, burst)
+}
 
 // Keep the default CSP reasonably strict while remaining compatible with the Lotus UI runtime.
 // Lotus + Ant Design inject runtime styles, so `style-src 'unsafe-inline'` is required for the
@@ -501,6 +548,58 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limiter_config_clamps_degenerate_values() {
+        // 0 per_second / 0 burst would make finish() reject; the clamps keep it
+        // valid (no panic).
+        let _ = rate_limiter_config(0, 0);
+        let _ = rate_limiter_config(1000, 1);
+    }
+
+    #[actix_web::test]
+    async fn rate_limiter_throttles_with_429_after_burst() {
+        use actix_governor::Governor;
+        use actix_web::http::StatusCode;
+        use actix_web::{test, web, App, HttpResponse};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // burst=2: the first two requests from an IP pass, the rest are throttled.
+        let conf = rate_limiter_config(1, 2);
+        let app = test::init_service(
+            App::new()
+                .wrap(Governor::new(&conf))
+                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 9999);
+        let (mut saw_ok, mut saw_429) = (false, false);
+        for _ in 0..6 {
+            let req = test::TestRequest::get().uri("/").peer_addr(ip).to_request();
+            match test::call_service(&app, req).await.status() {
+                StatusCode::OK => saw_ok = true,
+                StatusCode::TOO_MANY_REQUESTS => saw_429 = true,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert!(saw_ok, "requests within the burst must pass");
+        assert!(saw_429, "requests beyond the burst must be 429'd (#13)");
+
+        // A DIFFERENT client IP has its OWN bucket — proving per-IP keying (a
+        // global bucket would 429 this too); guards against a regression to a
+        // global key extractor.
+        let other_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 8888);
+        let req = test::TestRequest::get()
+            .uri("/")
+            .peer_addr(other_ip)
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::OK,
+            "a different IP gets its own fresh bucket (per-IP, not global)"
+        );
+    }
 
     #[test]
     fn default_csp_keeps_scripts_strict_but_allows_inline_styles() {

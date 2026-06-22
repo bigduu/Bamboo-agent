@@ -26,8 +26,11 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 
 /// Configure all routes for production mode.
 ///
-/// Note: OpenAI-compatible forwarding endpoints are intentionally not rate-limited in this
-/// configuration (local-first deployments).
+/// This registers the same route set as [`configure_routes`]; the actual per-IP
+/// rate limiting is applied as an `actix-governor` middleware (`.wrap(Governor)`)
+/// on the production App in `server::entrypoints` / `server::web_service`, since
+/// rate limiting is App-level middleware, not route configuration. See
+/// [`crate::config::build_rate_limiter`]. (Name kept for back-compat.) #13.
 pub fn configure_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
     cfg.configure(agent_routes)
         .configure(bamboo_v1_routes)
