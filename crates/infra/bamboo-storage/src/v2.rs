@@ -29,7 +29,7 @@ use crate::search_index::{should_index_session, SessionSearchIndex};
 use bamboo_domain::AttachmentReader;
 use bamboo_domain::Storage;
 
-fn other_io_error(message: impl Into<String>) -> io::Error {
+pub(crate) fn other_io_error(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
 
@@ -70,7 +70,10 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     }
 }
 
-fn validate_session_id(session_id: &str) -> io::Result<()> {
+/// Reject a session id that could escape the storage directory (empty, or
+/// containing a path separator or `..`). Shared with [`crate::jsonl`] so every
+/// store applies the same guard. #31.
+pub(crate) fn validate_session_id(session_id: &str) -> io::Result<()> {
     if session_id.is_empty()
         || session_id.contains('/')
         || session_id.contains('\\')
