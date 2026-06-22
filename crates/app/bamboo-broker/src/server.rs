@@ -121,6 +121,9 @@ impl BrokerServer {
                         }
                         // A second Hello is meaningless mid-session; ignore.
                         Ok(Some(ClientFrame::Hello { .. })) => {}
+                        // Out-of-band cancel: routed in a follow-up (#50 PR-2);
+                        // parsed-but-ignored here so the variant lands inertly.
+                        Ok(Some(ClientFrame::Cancel { .. })) => {}
                         Ok(None) => break Ok(()),   // client closed
                         Err(e) => break Err(e),
                     }
