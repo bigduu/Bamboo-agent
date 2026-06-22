@@ -135,21 +135,27 @@ impl BambooServer {
     pub async fn start(self) -> Result<()> {
         bamboo_config::paths::init_bamboo_dir(self.data_dir.clone());
 
+        // v2-P1 (#181): when `server.tls` is set, terminate TLS in-process
+        // (fail-fast on bad/missing certs). When absent, the plaintext paths
+        // below are unchanged.
+        let tls = self.config.server.tls.clone();
         let result = if self.config.server.static_dir.is_some() {
-            server::run_with_bind_and_static(
+            server::run_with_bind_and_static_tls(
                 self.data_dir,
                 self.config.server.port,
                 &self.config.server.bind,
                 self.config.server.static_dir.clone(),
+                tls,
             )
             .await
         } else if self.config.server.bind == "127.0.0.1" {
-            server::run(self.data_dir, self.config.server.port).await
+            server::run_with_tls(self.data_dir, self.config.server.port, tls).await
         } else {
-            server::run_with_bind(
+            server::run_with_bind_tls(
                 self.data_dir,
                 self.config.server.port,
                 &self.config.server.bind,
+                tls,
             )
             .await
         };
