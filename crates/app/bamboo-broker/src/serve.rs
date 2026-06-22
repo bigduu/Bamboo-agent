@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, MsgId, ReplyBody};
 use chrono::Utc;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::BrokerClient;
 use crate::error::BrokerResult;
@@ -38,7 +39,7 @@ pub async fn serve_mailbox<H, Fut>(
     handler: H,
 ) -> BrokerResult<()>
 where
-    H: Fn(InboxMessage) -> Fut + Send + Sync,
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync,
     Fut: Future<Output = Handled> + Send,
 {
     let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
@@ -54,13 +55,41 @@ pub async fn serve_loop<H, Fut>(
     handler: H,
 ) -> BrokerResult<()>
 where
-    H: Fn(InboxMessage) -> Fut + Send + Sync,
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync,
     Fut: Future<Output = Handled> + Send,
 {
     while let Some(msg) = client.next_message().await {
         let id = msg.id.clone();
         let reply_to = msg.from.session_id.clone();
-        match handler(msg).await {
+
+        // Run the handler with a per-run cancel token, while concurrently
+        // watching the out-of-band cancel lane. A Cancel naming THIS run's id
+        // trips the token, which the executor honors mid-LLM-call. Work stays
+        // SERIAL — we don't take the next message until this handler finishes —
+        // so only the control SIGNAL is concurrent and the worker's conversation
+        // context is never touched by two runs at once. #50.
+        let token = CancellationToken::new();
+        let handler_fut = handler(msg, token.clone());
+        tokio::pin!(handler_fut);
+        let mut cancels_open = true;
+        let handled = loop {
+            tokio::select! {
+                biased;
+                cancel = client.next_cancel(), if cancels_open => match cancel {
+                    Some(cid) if cid == id => token.cancel(),
+                    // A cancel for a different (already-finished or not-yet-started)
+                    // run; nothing in flight here matches it.
+                    Some(_) => {}
+                    // Cancel lane closed (reader gone): stop selecting on it so we
+                    // don't spin; the handler still completes (or the dropped
+                    // connection surfaces through it).
+                    None => cancels_open = false,
+                },
+                done = &mut handler_fut => break done,
+            }
+        };
+
+        match handled {
             Handled::Reply(answer) => {
                 let reply = InboxMessage {
                     id: MsgId::new(),
@@ -93,7 +122,7 @@ where
     F: Fn(InboxMessage) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = String> + Send,
 {
-    serve_mailbox(endpoint, me, token, move |msg| {
+    serve_mailbox(endpoint, me, token, move |msg, _cancel| {
         let answer = Arc::clone(&answer);
         async move { Handled::Reply(answer(msg).await) }
     })
@@ -126,10 +155,10 @@ where
 {
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    serve_mailbox(endpoint, me, token, move |msg| {
+    serve_mailbox(endpoint, me, token, move |msg, cancel| {
         let executor = Arc::clone(&executor);
         let context = Arc::clone(&context);
-        async move { handle_with_executor(executor.as_ref(), &context, msg).await }
+        async move { handle_with_executor(executor.as_ref(), &context, msg, cancel).await }
     })
     .await
 }
@@ -140,6 +169,7 @@ async fn handle_with_executor<E>(
     executor: &E,
     context: &tokio::sync::Mutex<Vec<serde_json::Value>>,
     msg: InboxMessage,
+    cancel: CancellationToken,
 ) -> Handled
 where
     E: bamboo_subagent::ChildExecutor,
@@ -175,18 +205,25 @@ where
             },
             sink,
             SteerInbox::disconnected(),
-            tokio_util::sync::CancellationToken::new(),
+            cancel,
         )
         .await;
-    let answer = outcome
-        .result
+    let result = outcome.result;
+    let answer = result
+        .clone()
         .or(outcome.error)
         .unwrap_or_else(|| "(no result)".to_string());
 
+    // Persist into the ongoing context ONLY for a steer/task that actually
+    // produced a result. A cancelled or errored run (`result == None`) must NOT
+    // push a synthetic "(no result)" assistant turn, which would pollute every
+    // later query/steer with a bogus exchange. #50.
     if persist {
-        let mut ctx = context.lock().await;
-        ctx.push(serde_json::json!({ "role": "user", "content": question }));
-        ctx.push(serde_json::json!({ "role": "assistant", "content": answer }));
+        if let Some(result) = result {
+            let mut ctx = context.lock().await;
+            ctx.push(serde_json::json!({ "role": "user", "content": question }));
+            ctx.push(serde_json::json!({ "role": "assistant", "content": result }));
+        }
     }
     Handled::Reply(answer)
 }
@@ -384,6 +421,192 @@ mod tests {
         assert_eq!(
             ask_mode(&mut orch, "agent", "q4", AskMode::Query).await,
             "ctx=4"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_in_flight_run_and_loop_keeps_serving() {
+        use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
+
+        // Parks on its cancel token for a "park" ask; echoes anything else.
+        struct ParkOrEcho;
+        #[async_trait::async_trait]
+        impl ChildExecutor for ParkOrEcho {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                cancel: CancellationToken,
+            ) -> ChildOutcome {
+                if spec.assignment.contains("park") {
+                    cancel.cancelled().await;
+                    ChildOutcome::cancelled()
+                } else {
+                    ChildOutcome::completed(format!("echo: {}", spec.assignment))
+                }
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let worker_ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_ep,
+                AgentRef {
+                    session_id: "worker".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(ParkOrEcho),
+            )
+            .await;
+        });
+
+        let mut orch = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        orch.subscribe().await.unwrap();
+
+        // Probe round-trip first: confirms the worker is subscribed (an out-of-band
+        // cancel is dropped if the target isn't), so the test can't race the
+        // worker's Subscribe registration.
+        let probe = ask("orch", "ping");
+        let probe_id = probe.id.clone();
+        orch.deliver("worker", probe).await.unwrap();
+        let r0 = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+            .await
+            .expect("probe reply")
+            .expect("present");
+        assert_eq!(r0.correlation_id, Some(probe_id));
+
+        // Ask 1 parks the worker's run; a cancel for it aborts the run mid-flight,
+        // and the loop still delivers the (cancelled) reply — i.e. it isn't wedged.
+        let q1 = ask("orch", "please park");
+        let qid1 = q1.id.clone();
+        orch.deliver("worker", q1).await.unwrap();
+        orch.cancel("worker", &qid1).await.unwrap();
+        let reply1 = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+            .await
+            .expect("cancelled run still replies — loop not wedged")
+            .expect("present");
+        assert_eq!(reply1.correlation_id, Some(qid1));
+
+        // Ask 2: the worker is still serving (serial), and a normal ask completes
+        // correctly — proving the cancel didn't break the loop or its context.
+        let q2 = ask("orch", "hello");
+        let qid2 = q2.id.clone();
+        orch.deliver("worker", q2).await.unwrap();
+        let reply2 = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+            .await
+            .expect("loop keeps serving after a cancel")
+            .expect("present");
+        assert_eq!(reply2.correlation_id, Some(qid2));
+        let body: ReplyBody = serde_json::from_value(reply2.body).unwrap();
+        assert_eq!(body.answer, "echo: hello");
+    }
+
+    #[tokio::test]
+    async fn cancelled_steer_does_not_pollute_context() {
+        use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
+
+        // Parks (-> cancelled) on a "park" assignment; otherwise reports how many
+        // prior context messages it was given.
+        struct ParkOrReportCtx;
+        #[async_trait::async_trait]
+        impl ChildExecutor for ParkOrReportCtx {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                cancel: CancellationToken,
+            ) -> ChildOutcome {
+                if spec.assignment.contains("park") {
+                    cancel.cancelled().await;
+                    ChildOutcome::cancelled()
+                } else {
+                    ChildOutcome::completed(format!("ctx={}", spec.messages.len()))
+                }
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let worker_ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_ep,
+                AgentRef {
+                    session_id: "w".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(ParkOrReportCtx),
+            )
+            .await;
+        });
+
+        // `ask_mode` hardcodes `from = "orch2"`, so connect as that to receive replies.
+        let mut orch = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch2".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        orch.subscribe().await.unwrap();
+
+        // Probe (query): context starts empty + confirms subscription.
+        assert_eq!(
+            ask_mode(&mut orch, "w", "ping", AskMode::Query).await,
+            "ctx=0"
+        );
+
+        // A STEER (which DOES persist) that gets cancelled — built manually to
+        // capture its id for the cancel.
+        let steer = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "orch2".into(),
+                role: None,
+            },
+            kind: InboxKind::Ask,
+            body: serde_json::to_value(AskBody {
+                question: "park this steer".into(),
+                mode: AskMode::Steer,
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let sid = steer.id.clone();
+        orch.deliver("w", steer).await.unwrap();
+        orch.cancel("w", &sid).await.unwrap();
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+                .await
+                .expect("cancelled steer replies")
+                .expect("present");
+            if m.correlation_id == Some(sid.clone()) {
+                break;
+            }
+        }
+
+        // The cancelled steer must NOT have persisted a synthetic turn — the next
+        // query still sees an EMPTY context (ctx=0), not ctx=2.
+        assert_eq!(
+            ask_mode(&mut orch, "w", "again", AskMode::Query).await,
+            "ctx=0"
         );
     }
 }
