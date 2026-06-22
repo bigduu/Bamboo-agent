@@ -12,7 +12,7 @@ use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
 
 use super::{
     extract_keywords, parse_rfc3339, DurableMemoryStatus, LexicalIndexItem, MemoryScope,
-    MemoryStore,
+    MemoryStore, TemporalGranularity,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +25,10 @@ pub struct MemoryRecallCandidate {
     pub status: DurableMemoryStatus,
     pub updated_at: String,
     pub summary: String,
+    /// Optional temporal granularity, used as a stable tie-breaker in
+    /// [`sort_recall_candidates`]: among equally-relevant candidates, coarser
+    /// (more cache-stable) memories sort first. `None` is treated as most stable.
+    pub granularity: Option<TemporalGranularity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +229,7 @@ async fn shortlist_scope(
             status: item.status,
             updated_at: item.updated_at.clone(),
             summary: item.summary.clone(),
+            granularity: item.granularity,
         })
         .collect::<Vec<_>>();
 
@@ -305,6 +310,15 @@ fn sort_recall_candidates(candidates: &mut [MemoryRecallCandidate]) {
             .score
             .partial_cmp(&left.score)
             .unwrap_or(Ordering::Equal)
+            // Among equally-relevant candidates, prefer coarser (more prefix-cache
+            // friendly) granularity first so the recalled block is stable across
+            // calls and does not churn the LLM prompt prefix (issue #61). Lower
+            // cache_stability_rank = coarser = earlier.
+            .then_with(|| {
+                TemporalGranularity::cache_stability_rank(left.granularity).cmp(
+                    &TemporalGranularity::cache_stability_rank(right.granularity),
+                )
+            })
             .then_with(|| {
                 let left_dt = parse_rfc3339(&left.updated_at)
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
@@ -548,6 +562,7 @@ mod tests {
             updated_at: updated_at.to_string(),
             created_at: updated_at.to_string(),
             summary: summary.to_string(),
+            granularity: None,
         }
     }
 
@@ -584,6 +599,53 @@ mod tests {
                 Ok(LLMChunk::Done),
             ])))
         }
+    }
+
+    fn candidate(
+        id: &str,
+        score: f64,
+        granularity: Option<TemporalGranularity>,
+    ) -> MemoryRecallCandidate {
+        MemoryRecallCandidate {
+            id: id.to_string(),
+            title: id.to_string(),
+            score,
+            scope: MemoryScope::Project,
+            project_key: Some("proj-1".to_string()),
+            status: DurableMemoryStatus::Active,
+            // Same timestamp for all so granularity is the deciding tie-breaker.
+            updated_at: "2026-04-09T00:00:00Z".to_string(),
+            summary: "summary".to_string(),
+            granularity,
+        }
+    }
+
+    #[test]
+    fn equal_score_candidates_sort_coarse_granularity_first_for_cache_stability() {
+        // All same score + same timestamp → granularity decides ordering. Coarser
+        // (year) is more prefix-cache friendly and must sort ahead of finer (day).
+        let mut candidates = vec![
+            candidate("day", 5.0, Some(TemporalGranularity::Day)),
+            candidate("year", 5.0, Some(TemporalGranularity::Year)),
+            candidate("none", 5.0, None),
+            candidate("month", 5.0, Some(TemporalGranularity::Month)),
+        ];
+        sort_recall_candidates(&mut candidates);
+        let order: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        // None is treated as most stable (rank 0), then year, month, day.
+        assert_eq!(order, vec!["none", "year", "month", "day"]);
+    }
+
+    #[test]
+    fn higher_score_still_wins_over_cache_stable_granularity() {
+        // Granularity is only a tie-breaker: a more relevant (higher score) day-level
+        // memory must still outrank a less relevant year-level one.
+        let mut candidates = vec![
+            candidate("year-low", 1.0, Some(TemporalGranularity::Year)),
+            candidate("day-high", 9.0, Some(TemporalGranularity::Day)),
+        ];
+        sort_recall_candidates(&mut candidates);
+        assert_eq!(candidates[0].id, "day-high");
     }
 
     #[test]
@@ -684,6 +746,7 @@ mod tests {
                 status: DurableMemoryStatus::Active,
                 updated_at: "2026-04-09T00:00:00Z".to_string(),
                 summary: "summary a".to_string(),
+                granularity: None,
             },
             MemoryRecallCandidate {
                 id: "mem-b".to_string(),
@@ -694,6 +757,7 @@ mod tests {
                 status: DurableMemoryStatus::Active,
                 updated_at: "2026-04-09T00:00:00Z".to_string(),
                 summary: "summary b".to_string(),
+                granularity: None,
             },
         ];
 
@@ -718,6 +782,7 @@ mod tests {
                 status: DurableMemoryStatus::Active,
                 updated_at: "2026-04-09T00:00:00Z".to_string(),
                 summary: "summary a".to_string(),
+                granularity: None,
             },
             MemoryRecallCandidate {
                 id: "mem-b".to_string(),
@@ -728,6 +793,7 @@ mod tests {
                 status: DurableMemoryStatus::Active,
                 updated_at: "2026-04-09T00:00:00Z".to_string(),
                 summary: "summary b".to_string(),
+                granularity: None,
             },
             MemoryRecallCandidate {
                 id: "mem-c".to_string(),
@@ -738,6 +804,7 @@ mod tests {
                 status: DurableMemoryStatus::Active,
                 updated_at: "2026-04-09T00:00:00Z".to_string(),
                 summary: "summary c".to_string(),
+                granularity: None,
             },
         ];
 
@@ -765,6 +832,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -779,6 +847,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -814,6 +883,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -849,6 +919,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -863,6 +934,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -916,6 +988,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -930,6 +1003,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1013,6 +1087,7 @@ mod tests {
             status: DurableMemoryStatus::Active,
             updated_at: "2026-05-08T00:00:00Z".to_string(),
             summary: "A test durable memory entry".to_string(),
+            granularity: None,
         }];
         let context = MemoryRecallRerankContext {
             llm: provider.clone(),

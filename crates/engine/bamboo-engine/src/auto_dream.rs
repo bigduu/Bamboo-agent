@@ -296,6 +296,7 @@ async fn extract_and_persist_durable_candidates(
                 session_id,
                 "background-fast-model",
                 false,
+                None,
             )
             .await
             .map_err(|error| {
@@ -1612,6 +1613,7 @@ mod tests {
                 Some("session-refine-recent-memory"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .expect("write recent durable memory");
@@ -1701,6 +1703,7 @@ mod tests {
                 Some("session-rebuild-mode"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .expect("write project durable memory");

@@ -569,6 +569,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -674,6 +675,7 @@ mod tests {
                     Some("s"),
                     "t",
                     false,
+                    None,
                 )
                 .await
                 .unwrap();

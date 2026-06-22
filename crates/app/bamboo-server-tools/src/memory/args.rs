@@ -63,6 +63,10 @@ pub(super) enum MemoryArgs {
         tags: Vec<String>,
         #[serde(default)]
         project_key: Option<String>,
+        /// Optional temporal granularity (day/week/month/quarter/year). Orthogonal
+        /// to `scope`; omitted means the memory carries no temporal dimension.
+        #[serde(default)]
+        granularity: Option<String>,
         #[serde(default)]
         options: Option<WriteOptions>,
     },

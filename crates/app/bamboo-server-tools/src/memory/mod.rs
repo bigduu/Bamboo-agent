@@ -102,6 +102,11 @@ impl Tool for MemoryTool {
                     ]
                 },
                 "scope": {"type": "string", "enum": ["session", "project", "global"]},
+                "granularity": {
+                    "type": "string",
+                    "enum": ["day", "week", "month", "quarter", "year"],
+                    "description": "Optional temporal granularity for `write`, orthogonal to scope: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). Omit if the memory has no time horizon. Coarser granularities are prefix-cache friendly and recalled ahead of finer ones at equal relevance."
+                },
                 "project_key": {"type": "string"},
                 "topic": {"type": "string"},
                 "id": {"type": "string"},
@@ -340,6 +345,7 @@ impl Tool for MemoryTool {
                 content,
                 tags,
                 project_key,
+                granularity,
                 options,
             } => {
                 let scope = Self::parse_scope(Some(&scope))?;
@@ -349,6 +355,7 @@ impl Tool for MemoryTool {
                             .to_string(),
                     ));
                 }
+                let granularity = Self::parse_granularity(granularity.as_deref())?;
                 let project_key = self
                     .resolve_project_key(project_key.as_deref(), Some(session_id))
                     .await;
@@ -366,6 +373,7 @@ impl Tool for MemoryTool {
                         options
                             .and_then(|value| value.allow_merge_if_similar)
                             .unwrap_or(false),
+                        granularity,
                     )
                     .await
                     .map_err(|error| {

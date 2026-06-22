@@ -135,3 +135,26 @@ async fn memory_session_list_topics_includes_count() {
     assert_eq!(value["action"], "session_list_topics");
     assert_eq!(value["count"], 2);
 }
+
+#[test]
+fn parse_granularity_accepts_known_values_case_insensitively() {
+    assert_eq!(
+        MemoryTool::parse_granularity(Some("Week")).unwrap(),
+        Some(bamboo_memory::memory_store::TemporalGranularity::Week)
+    );
+    assert_eq!(
+        MemoryTool::parse_granularity(Some("  YEAR ")).unwrap(),
+        Some(bamboo_memory::memory_store::TemporalGranularity::Year)
+    );
+}
+
+#[test]
+fn parse_granularity_none_or_empty_is_none() {
+    assert_eq!(MemoryTool::parse_granularity(None).unwrap(), None);
+    assert_eq!(MemoryTool::parse_granularity(Some("   ")).unwrap(), None);
+}
+
+#[test]
+fn parse_granularity_rejects_unknown_value() {
+    assert!(MemoryTool::parse_granularity(Some("decade")).is_err());
+}

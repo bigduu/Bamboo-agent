@@ -32,7 +32,7 @@ use super::{
 use super::{
     CreatedBy, DurableMemoryDocument, DurableMemoryFrontmatter, DurableMemoryRelations,
     DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus, DurableMemoryType,
-    MemoryScope, SessionState,
+    MemoryScope, SessionState, TemporalGranularity,
 };
 
 /// Hard structural cap on a durable memory body (characters). Appends that would
@@ -420,6 +420,7 @@ impl MemoryStore {
                 status: doc.frontmatter.status,
                 summary: derive_summary(&doc.body, per_item_max),
                 tags: doc.frontmatter.tags.clone(),
+                granularity: doc.frontmatter.granularity,
                 relevance: (*relevance * 100.0).round() / 100.0,
                 related_ids: if options.include_related {
                     Self::combined_related_ids(doc)
@@ -617,6 +618,7 @@ impl MemoryStore {
         session_id: Option<&str>,
         actor: &str,
         allow_merge_if_similar: bool,
+        granularity: Option<TemporalGranularity>,
     ) -> io::Result<DurableMemoryDocument> {
         let project_key = self.require_project_key(scope, project_key)?;
         let title = validate_memory_title(title)?;
@@ -714,6 +716,7 @@ impl MemoryStore {
             r#type,
             scope,
             project_key: project_key_owned,
+            granularity,
             status: DurableMemoryStatus::Active,
             freshness: Some("high".to_string()),
             confidence: Some("high".to_string()),
@@ -871,6 +874,7 @@ impl MemoryStore {
         let source_id = source.frontmatter.id.clone();
         let source_type = source.frontmatter.r#type;
         let source_confidence = source.frontmatter.confidence.clone();
+        let source_granularity = source.frontmatter.granularity;
         let source_sources = source.frontmatter.sources.clone();
 
         // Pieces were fully validated above; this pass only persists them.
@@ -893,6 +897,7 @@ impl MemoryStore {
                 r#type,
                 scope,
                 project_key: project_key_field,
+                granularity: source_granularity,
                 status: DurableMemoryStatus::Active,
                 freshness: Some("high".to_string()),
                 confidence: source_confidence.clone(),
@@ -1296,12 +1301,21 @@ impl MemoryStore {
                 }
             }
         }
+        // Consolidated memory inherits the coarsest (most cache-stable) granularity
+        // among its sources, so merging never makes a long-lived fact look more
+        // volatile than it was. Sources without a granularity are ignored here.
+        // (Day < Week < Month < Quarter < Year by derived Ord, so `max` is coarsest.)
+        let granularity = sources
+            .iter()
+            .filter_map(|doc| doc.frontmatter.granularity)
+            .max();
         let frontmatter = DurableMemoryFrontmatter {
             id: new_id.clone(),
             title: title.to_string(),
             r#type,
             scope,
             project_key: project_key_field,
+            granularity,
             status: DurableMemoryStatus::Active,
             freshness: Some("high".to_string()),
             confidence: sources[0].frontmatter.confidence.clone(),
@@ -1934,6 +1948,7 @@ impl MemoryStore {
                     updated_at: doc.frontmatter.updated_at.clone(),
                     created_at: doc.frontmatter.created_at.clone(),
                     summary: derive_summary(&doc.body, 240),
+                    granularity: doc.frontmatter.granularity,
                 })
                 .collect(),
         };
@@ -2422,6 +2437,7 @@ mod tests {
                 Some("s1"),
                 "test",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2485,6 +2501,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2501,6 +2518,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2539,6 +2557,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2553,6 +2572,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2593,6 +2613,7 @@ mod tests {
                 Some("s1"),
                 "test",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2644,6 +2665,7 @@ mod tests {
                 Some("s1"),
                 "test",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2688,6 +2710,7 @@ mod tests {
                 Some("s1"),
                 "test",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2705,6 +2728,7 @@ mod tests {
                 Some("s1"),
                 "test",
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2752,6 +2776,7 @@ mod tests {
                     Some("s"),
                     "t",
                     false,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2790,6 +2815,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2804,6 +2830,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2864,6 +2891,7 @@ mod tests {
                 Some("s"),
                 "t",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2920,6 +2948,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2968,6 +2997,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2983,6 +3013,7 @@ mod tests {
                 Some("session-2"),
                 "main-model",
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -3038,6 +3069,7 @@ mod tests {
                         "main-model",
                         // No merging: each write must create its own document.
                         false,
+                        None,
                     )
                     .await
                     .expect("concurrent write succeeds")
@@ -3132,6 +3164,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3146,6 +3179,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3221,6 +3255,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3235,6 +3270,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3249,6 +3285,7 @@ mod tests {
                 Some("session-2"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3348,6 +3385,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3362,6 +3400,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3429,6 +3468,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3534,6 +3574,7 @@ mod tests {
                     Some("session-1"),
                     "main-model",
                     false,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3600,6 +3641,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3614,6 +3656,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3678,6 +3721,7 @@ mod tests {
                 Some("session-1"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3691,6 +3735,78 @@ mod tests {
         assert_eq!(lexical.items[0].id, doc.frontmatter.id);
         assert_eq!(lexical.items[0].title, "User prefers concise answers");
         assert!(lexical.items[0].keywords.iter().any(|k| k == "concise"));
+    }
+
+    #[tokio::test]
+    async fn write_memory_persists_granularity_into_document_and_lexical_index() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let doc = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-temporal"),
+                DurableMemoryType::Project,
+                "Quarterly architecture direction",
+                "This quarter we move memory recall onto a temporal granularity dimension.",
+                &["architecture".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+                Some(TemporalGranularity::Quarter),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.frontmatter.granularity,
+            Some(TemporalGranularity::Quarter)
+        );
+
+        // Re-read from disk: granularity must survive the markdown round-trip.
+        let reread = store
+            .get_memory(&doc.frontmatter.id, Some("proj-temporal"))
+            .await
+            .unwrap()
+            .expect("memory should exist on disk");
+        assert_eq!(
+            reread.frontmatter.granularity,
+            Some(TemporalGranularity::Quarter)
+        );
+
+        // And it must be carried into the lexical index used by recall.
+        let lexical = store
+            .read_lexical_index(MemoryScope::Project, Some("proj-temporal"))
+            .await
+            .unwrap()
+            .expect("lexical index should exist");
+        assert_eq!(lexical.items.len(), 1);
+        assert_eq!(
+            lexical.items[0].granularity,
+            Some(TemporalGranularity::Quarter)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_memory_without_granularity_defaults_to_none() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let doc = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Reference without temporal dimension",
+                "A plain reference note that carries no granularity.",
+                &[],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(doc.frontmatter.granularity, None);
     }
 
     #[tokio::test]
