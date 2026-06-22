@@ -18,7 +18,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::{BrokerFrame, ClientFrame};
 
-type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+pub(crate) type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 /// Upper bound on how long [`BrokerClient::deliver`] waits for the broker's
 /// `Delivered` receipt before giving up. The receipt only means the broker
@@ -204,6 +204,23 @@ impl BrokerClient {
     /// Acknowledge a processed message so the broker deletes it.
     pub async fn ack(&mut self, id: MsgId) -> BrokerResult<()> {
         self.send(ClientFrame::Ack { id }).await
+    }
+
+    /// Consume this (already connected + subscribed) client into a multiplexed
+    /// request/reply driver so concurrent correlated requests on ONE connection
+    /// no longer serialize behind a single exclusive lock. The background reader
+    /// + supervisor keep running (detached) and feed `messages`, which the mux's
+    /// router drains and routes to per-request waiters by `correlation_id`. For a
+    /// replies-only connection (e.g. the MCP proxy) where every inbound message
+    /// is a correlated reply. #56.
+    pub fn into_multiplexed(self, me: AgentRef) -> crate::mux::MultiplexedClient {
+        crate::mux::MultiplexedClient::spawn(
+            self.sink,
+            self.messages,
+            self.delivered,
+            self.reader_alive,
+            me,
+        )
     }
 
     /// Out-of-band, fire-and-forget cancel: ask the broker to signal session
