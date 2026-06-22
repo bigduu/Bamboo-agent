@@ -55,8 +55,10 @@ impl PermissionStorage {
     pub async fn load(&self) -> Result<Option<PermissionConfig>, PermissionStorageError> {
         const KEY: &str = "permissions";
 
-        // Load unified config.json first.
-        let config = Config::from_data_dir(Some(self.config_dir.clone()));
+        // Load unified config.json first. Non-publishing: this is a read-only
+        // access to the `permissions` key and must not clobber the server's live
+        // env-var cache with stale disk data (#40).
+        let config = Config::from_data_dir_without_publish(Some(self.config_dir.clone()));
         if let Some(value) = config.extra.get(KEY).cloned() {
             let serializable: SerializablePermissionConfig = serde_json::from_value(value)
                 .map_err(|e| PermissionStorageError::ParseError {
@@ -148,7 +150,10 @@ impl PermissionStorage {
         }
 
         let serializable = config.to_serializable();
-        let mut root = Config::from_data_dir(Some(self.config_dir.clone()));
+        // Read-modify-write of the unified config's `permissions` key. Non-
+        // publishing: persisting permissions must not republish (clobber) the
+        // server's live env-var cache from disk (#40).
+        let mut root = Config::from_data_dir_without_publish(Some(self.config_dir.clone()));
         root.extra.insert(
             KEY.to_string(),
             serde_json::to_value(&serializable).map_err(|e| {
