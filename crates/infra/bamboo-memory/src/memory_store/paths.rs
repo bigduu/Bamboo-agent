@@ -15,7 +15,6 @@ pub const STATE_DIR: &str = "state";
 pub const INDEXES_DIR: &str = "indexes";
 pub const VIEWS_DIR: &str = "views";
 pub const LOGS_DIR: &str = "logs";
-pub const LOCKS_DIR: &str = "locks";
 pub const TOPICS_DIR: &str = "topics";
 
 #[derive(Debug, Clone)]
@@ -150,10 +149,6 @@ impl MemoryPathResolver {
                 .join(STATE_DIR),
             MemoryScope::Session => self.sessions_root(),
         }
-    }
-
-    pub fn locks_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
-        self.state_dir(scope, project_key).join(LOCKS_DIR)
     }
 
     pub fn legacy_notes_root(&self) -> PathBuf {
