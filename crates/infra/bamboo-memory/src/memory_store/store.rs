@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
+use dashmap::DashMap;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 use bamboo_agent_core::workspace_state;
 
@@ -53,6 +56,27 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
         + content.chars().count()
 }
 
+/// Process-global registry of per-scope write locks.
+///
+/// `MemoryStore` is cheap and constructed fresh at most call sites (one per HTTP
+/// handler, per gardener pass, per auto-dream task), so a lock field on the struct
+/// would NOT serialize concurrent writers — each ephemeral instance would get its
+/// own mutex. The actual concurrency is many `MemoryStore` instances inside the
+/// SAME process (the `bamboo serve` server) racing on the same on-disk scope. A
+/// process-global registry keyed by the scope's unique on-disk root therefore
+/// serializes all of them.
+///
+/// Cross-process concurrency to one data dir is not a supported deployment (bodhi
+/// runs a single `bamboo serve` sidecar), so in-process locking is sufficient and
+/// avoids the complexity / portability cost of OS advisory file locks. The key is
+/// the scope root `PathBuf`, which is globally unique across data dir + scope +
+/// project, so two stores pointed at the same data dir share locks and two pointed
+/// at different dirs (e.g. tests) do not contend.
+fn scope_locks() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
+    static SCOPE_LOCKS: OnceLock<DashMap<PathBuf, Arc<Mutex<()>>>> = OnceLock::new();
+    SCOPE_LOCKS.get_or_init(DashMap::new)
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     resolver: MemoryPathResolver,
@@ -79,6 +103,22 @@ impl MemoryStore {
 
     pub fn resolver(&self) -> &MemoryPathResolver {
         &self.resolver
+    }
+
+    /// Return the process-global write lock guarding the given scope's on-disk
+    /// state. Callers acquire it for the full duration of a read-modify-write +
+    /// `refresh_scope_artifacts` critical section so concurrent writers to the same
+    /// scope are serialized (no lost updates, no half-written index set).
+    ///
+    /// Each mutating public method acquires AT MOST this one lock and never holds
+    /// it while calling another lock-acquiring public method, so there is no lock
+    /// nesting and deadlock is structurally impossible.
+    fn scope_lock(&self, scope: MemoryScope, project_key: Option<&str>) -> Arc<Mutex<()>> {
+        let key = self.resolver.scope_root(scope, project_key);
+        scope_locks()
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub fn derive_project_key_from_workspace(workspace: Option<&Path>) -> Option<String> {
@@ -577,6 +617,11 @@ impl MemoryStore {
             ));
         }
 
+        // Serialize the read-modify-write (find-similar → merge/create → audit →
+        // refresh) against concurrent writers to this scope.
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
+
         self.ensure_scope_dirs(scope, project_key).await?;
         let tags = normalize_tags(tags.iter().map(String::as_str));
 
@@ -731,6 +776,11 @@ impl MemoryStore {
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
+        let lock = self.scope_lock(
+            doc.frontmatter.scope,
+            doc.frontmatter.project_key.as_deref(),
+        );
+        let _guard = lock.lock().await;
         let changed = self
             .set_memory_status(&mut doc, mode, "memory_purge", "main-model")
             .await?;
@@ -805,6 +855,8 @@ impl MemoryStore {
         let scope = source.frontmatter.scope;
         let project_key_owned = source.frontmatter.project_key.clone();
         let project_key = project_key_owned.as_deref();
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
         let source_id = source.frontmatter.id.clone();
         let source_type = source.frontmatter.r#type;
         let source_confidence = source.frontmatter.confidence.clone();
@@ -1208,6 +1260,8 @@ impl MemoryStore {
             ));
         }
         let project_key = project_key_owned.as_deref();
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
         let superseded_ids: Vec<String> = sources
             .iter()
             .map(|doc| doc.frontmatter.id.clone())
@@ -1325,6 +1379,8 @@ impl MemoryStore {
         reason: Option<&str>,
     ) -> io::Result<MemoryPurgeResult> {
         let project_key = self.require_project_key(scope, project_key)?;
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
         let mut docs = self.list_memory_documents(scope, project_key).await?;
         let mut updated_ids = Vec::new();
         for doc in &mut docs {
@@ -1385,6 +1441,11 @@ impl MemoryStore {
         let Some(mut target) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
+        let lock = self.scope_lock(
+            target.frontmatter.scope,
+            target.frontmatter.project_key.as_deref(),
+        );
+        let _guard = lock.lock().await;
 
         let requested_ids: Vec<String> = contradicted_by_ids
             .iter()
@@ -1501,6 +1562,11 @@ impl MemoryStore {
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
+        let lock = self.scope_lock(
+            doc.frontmatter.scope,
+            doc.frontmatter.project_key.as_deref(),
+        );
+        let _guard = lock.lock().await;
 
         let content = content.trim();
         if content.is_empty() {
@@ -1646,6 +1712,8 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<()> {
         let project_key = self.require_project_key(scope, project_key)?;
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
         self.refresh_scope_artifacts(scope, project_key).await
     }
 
@@ -2013,7 +2081,6 @@ impl MemoryStore {
         fs::create_dir_all(self.resolver.views_dir(scope, project_key)).await?;
         fs::create_dir_all(self.resolver.logs_dir(scope, project_key)).await?;
         fs::create_dir_all(self.resolver.state_dir(scope, project_key)).await?;
-        fs::create_dir_all(self.resolver.locks_dir(scope, project_key)).await?;
         Ok(())
     }
 
@@ -2259,6 +2326,8 @@ impl MemoryStore {
         content: &str,
     ) -> io::Result<PathBuf> {
         let project_key = self.require_project_key(scope, project_key)?;
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
         self.ensure_scope_dirs(scope, project_key).await?;
         let path = self
             .resolver
@@ -2925,6 +2994,114 @@ mod tests {
             docs.len(),
             1,
             "heuristically similar writes should merge into one durable memory"
+        );
+    }
+
+    /// Many `MemoryStore` instances pointed at the SAME data dir (the real
+    /// concurrency pattern — one store per handler / gardener pass inside one
+    /// process) write distinct memories to the same scope at once. The per-scope
+    /// lock must serialize the read-modify-write + index refresh so every document
+    /// is persisted and the lexical index — fully rebuilt on each refresh — ends up
+    /// listing all of them. Without the lock, a refresh that reads the doc set
+    /// mid-write would drop entries (lost updates / inconsistent index).
+    #[tokio::test]
+    async fn concurrent_writes_to_same_scope_persist_all_and_keep_index_consistent() {
+        let dir = tempdir().unwrap();
+        const WRITERS: usize = 16;
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            // A fresh store per task on purpose: a per-instance lock would not help
+            // here, only the process-global registry does.
+            let store = MemoryStore::new(dir.path());
+            handles.push(tokio::spawn(async move {
+                store
+                    .write_memory(
+                        MemoryScope::Project,
+                        Some("proj-concurrency"),
+                        DurableMemoryType::Project,
+                        &format!("Concurrent fact number {i}"),
+                        &format!("Distinct atomic content for writer {i}."),
+                        &[format!("writer-{i}")],
+                        Some("session-conc"),
+                        "main-model",
+                        // No merging: each write must create its own document.
+                        false,
+                    )
+                    .await
+                    .expect("concurrent write succeeds")
+                    .frontmatter
+                    .id
+            }));
+        }
+
+        let mut written_ids = HashSet::new();
+        for handle in handles {
+            written_ids.insert(handle.await.expect("writer task joins"));
+        }
+        assert_eq!(
+            written_ids.len(),
+            WRITERS,
+            "every concurrent write allocated a unique id (no collisions)"
+        );
+
+        // All N documents are on disk.
+        let store = MemoryStore::new(dir.path());
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, Some("proj-concurrency"))
+            .await
+            .unwrap();
+        let doc_ids: HashSet<String> = docs.iter().map(|d| d.frontmatter.id.clone()).collect();
+        assert_eq!(doc_ids, written_ids, "all written documents are persisted");
+
+        // The lexical index (rebuilt wholesale on every refresh) lists all N — i.e.
+        // no concurrent refresh observed a partial doc set and clobbered the index.
+        let lexical = store
+            .read_lexical_index(MemoryScope::Project, Some("proj-concurrency"))
+            .await
+            .unwrap()
+            .expect("lexical index exists after writes");
+        let indexed_ids: HashSet<String> =
+            lexical.items.iter().map(|item| item.id.clone()).collect();
+        assert_eq!(
+            indexed_ids, written_ids,
+            "lexical index is consistent with the full document set under concurrency"
+        );
+    }
+
+    /// Directly exercises mutual exclusion: tasks sharing the process-global lock
+    /// for a scope must never overlap inside the guarded section. A shared counter
+    /// incremented on enter / decremented on exit can only ever read 1 while locked
+    /// if the lock truly serializes; any interleave would push it to 2+.
+    #[tokio::test]
+    async fn scope_lock_serializes_critical_sections() {
+        let dir = tempdir().unwrap();
+        let in_section = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let store = MemoryStore::new(dir.path());
+            let in_section = Arc::clone(&in_section);
+            let max_seen = Arc::clone(&max_seen);
+            handles.push(tokio::spawn(async move {
+                let lock = store.scope_lock(MemoryScope::Global, None);
+                let _guard = lock.lock().await;
+                let now = in_section.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                // Yield to give any racing task a chance to observe overlap if the
+                // lock were not actually held across the await point.
+                tokio::task::yield_now().await;
+                in_section.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "at most one task is ever inside a scope-locked critical section"
         );
     }
 
