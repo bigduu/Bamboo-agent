@@ -27,6 +27,16 @@ pub(crate) type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, M
 /// never hang indefinitely if the broker dies after receiving `Deliver`.
 const DELIVER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One demuxed serve event from [`BrokerClient::next_message_or_cancel`]: either
+/// the next inbound message or the next out-of-band cancel. The inner `Option` is
+/// `None` once that lane's channel closes (the reader exited). #45.
+pub enum ServeEvent {
+    /// Next inbound message (`None` once the connection closes).
+    Message(Option<InboxMessage>),
+    /// Next out-of-band cancel correlation id (`None` once the cancel lane closes).
+    Cancel(Option<MsgId>),
+}
+
 /// A connected broker client bound to one session mailbox.
 pub struct BrokerClient {
     sink: WsSink,
@@ -207,6 +217,30 @@ impl BrokerClient {
     /// while the work loop is busy. `None` when the reader has exited. #50.
     pub async fn next_cancel(&mut self) -> Option<MsgId> {
         self.cancels.recv().await
+    }
+
+    /// Await whichever arrives first — the next inbound message or the next
+    /// out-of-band cancel — over a SINGLE `&mut self` borrow. The concurrent
+    /// serve loop races this against its (client-free) completion channel; doing
+    /// the message/cancel demux inside one method keeps the two receiver borrows
+    /// disjoint here instead of leaking two simultaneous `&mut self` borrows into
+    /// the loop's outer `select!` (which the borrow checker rejects), so the loop
+    /// can still call `deliver`/`ack` on the same client between events. #45.
+    pub async fn next_message_or_cancel(&mut self) -> ServeEvent {
+        tokio::select! {
+            biased;
+            // Bias the cancel lane so an abort is observed promptly even under a
+            // steady inbound stream — preserves #50's cancel latency.
+            cancel = self.cancels.recv() => ServeEvent::Cancel(cancel),
+            msg = self.messages.recv() => {
+                if msg.is_none() && !self.reader_alive.load(Ordering::SeqCst) {
+                    tracing::warn!(
+                        "broker next_message() returned None: reader task exited (connection closed)"
+                    );
+                }
+                ServeEvent::Message(msg)
+            }
+        }
     }
 
     /// `true` while the background reader task is still running. Flips to
