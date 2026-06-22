@@ -109,22 +109,14 @@ impl AppState {
         // read+swap serializes reload with update_config's in-memory mutation.
         // Config::from_data_dir is a sync read (no await), so this doesn't hold
         // the lock across an await point. #41.
+        // Hold the config-IO lock across the read+swap so it can't interleave
+        // with a config write's mutate+persist (which would let us read the disk
+        // BEFORE that write persisted, then clobber its in-memory mutation). #126.
+        let _io = self.config_io_lock.lock().await;
         let mut config = self.config.write().await;
         let new_config = Config::from_data_dir(Some(self.app_data_dir.clone()));
         *config = new_config.clone();
         new_config
-    }
-
-    /// Persist the current in-memory config to disk (`{app_data_dir}/config.json`).
-    ///
-    /// This is the single "exit" for configuration writes in the server runtime.
-    pub async fn persist_config(&self) -> anyhow::Result<()> {
-        let config = self.config.read().await.clone();
-        let data_dir = self.app_data_dir.clone();
-        tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
-            .await
-            .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
-        Ok(())
     }
 
     async fn persist_config_snapshot(&self, config: Config) -> anyhow::Result<()> {
@@ -149,16 +141,26 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
+        // Hold the config-IO lock across BOTH the in-memory mutation AND the disk
+        // persist, so a concurrent reload_config can't read the disk in the gap
+        // before we persist and then clobber this mutation with the stale copy
+        // (#126). The lock is dropped before apply_config_effects — slow side
+        // effects (provider reload) don't need to block reloads/other updates.
         let snapshot = {
-            let mut cfg = self.config.write().await;
-            update(&mut cfg)?;
-            cfg.publish_env_vars();
-            cfg.clone()
+            let _io = self.config_io_lock.lock().await;
+            let snapshot = {
+                let mut cfg = self.config.write().await;
+                update(&mut cfg)?;
+                cfg.publish_env_vars();
+                cfg.clone()
+            };
+            self.persist_config_snapshot(snapshot.clone())
+                .await
+                .map_err(|e| {
+                    AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
+                })?;
+            snapshot
         };
-
-        self.persist_config_snapshot(snapshot.clone())
-            .await
-            .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))?;
 
         self.apply_config_effects(snapshot.clone(), effects).await?;
         Ok(snapshot)
@@ -170,15 +172,21 @@ impl AppState {
         new_config: Config,
         effects: ConfigUpdateEffects,
     ) -> Result<Config, AppError> {
+        // Same #126 serialization as update_config: mutate + persist under the
+        // config-IO lock so a reload can't interleave; effects run unlocked.
         {
-            let mut cfg = self.config.write().await;
-            *cfg = new_config.clone();
-            cfg.publish_env_vars();
+            let _io = self.config_io_lock.lock().await;
+            {
+                let mut cfg = self.config.write().await;
+                *cfg = new_config.clone();
+                cfg.publish_env_vars();
+            }
+            self.persist_config_snapshot(new_config.clone())
+                .await
+                .map_err(|e| {
+                    AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
+                })?;
         }
-
-        self.persist_config_snapshot(new_config.clone())
-            .await
-            .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))?;
 
         self.apply_config_effects(new_config.clone(), effects)
             .await?;
