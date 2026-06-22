@@ -1186,21 +1186,21 @@ impl Config {
 
         let mut config = if config_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
-                serde_json::from_str::<Config>(&content)
-                    .map(|mut config| {
-                        config.hydrate_proxy_auth_from_encrypted();
-                        config.hydrate_provider_api_keys_from_encrypted();
-                        config.hydrate_provider_instance_api_keys_from_encrypted();
-                        config.hydrate_mcp_secrets_from_encrypted();
-                        config.hydrate_env_vars_from_encrypted();
-                        config.normalize_tool_settings();
-                        config.normalize_skill_settings();
-                        config
-                    })
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("Failed to parse config.json ({}), using defaults", e);
+                Self::parse_and_hydrate(&content).unwrap_or_else(|e| {
+                    // Don't silently discard the user's config on corruption.
+                    // Quarantine the unparseable file (so it isn't lost or
+                    // overwritten by the next save) and try the last-known-good
+                    // config.json.bak before falling back to defaults. #37.
+                    tracing::warn!(
+                        "Failed to parse config.json ({}); quarantining it and trying config.json.bak",
+                        e
+                    );
+                    quarantine_corrupt_config(&config_path);
+                    Self::load_backup(&data_dir).unwrap_or_else(|| {
+                        tracing::warn!("No usable config.json.bak; using defaults");
                         Self::create_default()
                     })
+                })
             } else {
                 Self::create_default()
             }
@@ -1291,6 +1291,39 @@ impl Config {
     /// value and must not clobber the live env-var cache. #40.
     pub fn from_data_dir_without_publish(data_dir: Option<PathBuf>) -> Self {
         Self::from_data_dir_impl(data_dir, false)
+    }
+
+    /// Deserialize config JSON and run the in-memory hydration + normalization
+    /// chain. Shared by the primary load and the backup-recovery path (#37).
+    fn parse_and_hydrate(content: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str::<Config>(content).map(|mut config| {
+            config.hydrate_proxy_auth_from_encrypted();
+            config.hydrate_provider_api_keys_from_encrypted();
+            config.hydrate_provider_instance_api_keys_from_encrypted();
+            config.hydrate_mcp_secrets_from_encrypted();
+            config.hydrate_env_vars_from_encrypted();
+            config.normalize_tool_settings();
+            config.normalize_skill_settings();
+            config
+        })
+    }
+
+    /// Try to recover from `config.json.bak` (the last-known-good written before
+    /// each save) when the primary `config.json` is corrupt. Returns `None` if
+    /// the backup is missing or also unparseable. #37.
+    fn load_backup(data_dir: &std::path::Path) -> Option<Self> {
+        let backup = data_dir.join("config.json.bak");
+        let content = std::fs::read_to_string(&backup).ok()?;
+        match Self::parse_and_hydrate(&content) {
+            Ok(config) => {
+                tracing::info!("Recovered configuration from config.json.bak");
+                Some(config)
+            }
+            Err(e) => {
+                tracing::warn!("config.json.bak is also unparseable ({}); ignoring it", e);
+                None
+            }
+        }
     }
 
     /// Get the effective default model for the currently active provider.
@@ -1740,10 +1773,43 @@ impl Config {
         to_save.normalize_skill_settings();
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
+
+        // Back up the current on-disk config (last-known-good) before overwriting,
+        // so corruption (a bad/partial write, external edit, disk issue) stays
+        // recoverable via config.json.bak on the next load. Best-effort. Only
+        // refresh the backup from a PARSEABLE config.json — otherwise a save right
+        // after an in-memory recovery (where the on-disk config.json is still the
+        // corrupt original) would clobber the good .bak with garbage. #37.
+        if path.exists()
+            && std::fs::read_to_string(&path)
+                .ok()
+                .is_some_and(|c| Self::parse_and_hydrate(&c).is_ok())
+        {
+            let backup = path.with_extension("json.bak");
+            if let Err(e) = std::fs::copy(&path, &backup) {
+                tracing::warn!("Failed to back up config.json before save: {}", e);
+            }
+        }
+
         write_atomic(&path, content.as_bytes())
             .with_context(|| format!("Failed to write config file: {:?}", path))?;
 
         Ok(())
+    }
+}
+
+/// Copy a corrupt config file aside to `config.json.corrupted.<nanos>` so the
+/// user's (unparseable) configuration is preserved for inspection/recovery
+/// instead of being silently discarded and then overwritten by defaults. #37.
+fn quarantine_corrupt_config(config_path: &std::path::Path) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let quarantine = config_path.with_extension(format!("json.corrupted.{nanos}"));
+    match std::fs::copy(config_path, &quarantine) {
+        Ok(_) => tracing::warn!("Quarantined corrupt config.json to {:?}", quarantine),
+        Err(e) => tracing::error!("Failed to quarantine corrupt config.json: {}", e),
     }
 }
 
@@ -2113,6 +2179,112 @@ mod tests {
                 .map(String::as_str),
             Some("stale-disk"),
             "the publishing loader clobbers the cache (contrast)"
+        );
+    }
+
+    fn dir_has_quarantine_file(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("config.json.corrupted.")
+            })
+    }
+
+    #[test]
+    fn corrupt_config_recovered_from_backup_and_quarantined() {
+        let temp = TempHome::new();
+        // Last-known-good backup with a distinctive value.
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({ "http_proxy": "http://from-backup" }).to_string(),
+        )
+        .unwrap();
+        // Corrupt primary config.json.
+        std::fs::write(temp.path.join("config.json"), "{ not valid json ").unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.http_proxy, "http://from-backup",
+            "recovered from config.json.bak instead of losing all config"
+        );
+        assert!(
+            dir_has_quarantine_file(&temp.path),
+            "corrupt config.json was quarantined (preserved), not discarded"
+        );
+    }
+
+    #[test]
+    fn corrupt_config_without_backup_quarantines_then_defaults() {
+        let temp = TempHome::new();
+        std::fs::write(temp.path.join("config.json"), "}}} broken").unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(
+            config.http_proxy.is_empty(),
+            "no backup -> falls back to defaults"
+        );
+        assert!(
+            dir_has_quarantine_file(&temp.path),
+            "corrupt config.json is quarantined even when there's no backup"
+        );
+    }
+
+    #[test]
+    fn save_backs_up_existing_config() {
+        let temp = TempHome::new();
+        // Existing (old) config on disk.
+        std::fs::write(
+            temp.path.join("config.json"),
+            serde_json::json!({ "http_proxy": "http://old" }).to_string(),
+        )
+        .unwrap();
+
+        let mut config = Config::create_default();
+        config.http_proxy = "http://new".to_string();
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let backup =
+            std::fs::read_to_string(temp.path.join("config.json.bak")).expect("config.json.bak");
+        assert!(
+            backup.contains("http://old"),
+            "config.json.bak holds the PREVIOUS config (last-known-good)"
+        );
+        let current = std::fs::read_to_string(temp.path.join("config.json")).unwrap();
+        assert!(
+            current.contains("http://new"),
+            "config.json holds the new config"
+        );
+    }
+
+    #[test]
+    fn save_does_not_overwrite_good_backup_with_corrupt_config() {
+        let temp = TempHome::new();
+        // A good last-known-good backup...
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({ "http_proxy": "http://good-bak" }).to_string(),
+        )
+        .unwrap();
+        // ...but the on-disk config.json is corrupt (as it would be right after an
+        // in-memory recovery, before any clean save).
+        std::fs::write(temp.path.join("config.json"), "{{ corrupt").unwrap();
+
+        let mut config = Config::create_default();
+        config.http_proxy = "http://new".to_string();
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        // The good .bak must NOT have been clobbered by the corrupt config.json.
+        let backup = std::fs::read_to_string(temp.path.join("config.json.bak")).unwrap();
+        assert!(
+            backup.contains("http://good-bak"),
+            "good last-known-good backup is preserved (not overwritten by corrupt config.json)"
         );
     }
 
