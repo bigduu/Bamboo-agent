@@ -318,12 +318,18 @@ impl AnthropicProvider {
             );
         }
 
-        let mut response = self
-            .client
-            .post(format!("{}/messages", self.base_url))
-            .headers(headers.clone())
-            .json(&body)
-            .send()
+        // Retry the *initial* request establishment on transient failures
+        // (429/5xx, connect/timeout). The closure rebuilds a fresh request each
+        // attempt; the returned response body is unread, so streaming below is
+        // unaffected (issue #18).
+        let messages_url = format!("{}/messages", self.base_url);
+        let mut response =
+            crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                self.client
+                    .post(&messages_url)
+                    .headers(headers.clone())
+                    .json(&body)
+            })
             .await
             .map_err(LLMError::Http)?;
 
@@ -368,12 +374,13 @@ impl AnthropicProvider {
                     max_tokens,
                     request_purpose
                 );
-                response = self
-                    .client
-                    .post(format!("{}/messages", self.base_url))
-                    .headers(headers.clone())
-                    .json(&fallback_body)
-                    .send()
+                response =
+                    crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                        self.client
+                            .post(&messages_url)
+                            .headers(headers.clone())
+                            .json(&fallback_body)
+                    })
                     .await
                     .map_err(LLMError::Http)?;
 

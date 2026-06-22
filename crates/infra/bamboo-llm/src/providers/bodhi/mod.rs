@@ -203,13 +203,12 @@ impl BodhiProvider {
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/chat/completions");
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        // Retry the initial request on transient failures (issue #18); the
+        // returned body is unread, so SSE streaming below is unaffected.
+        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+            self.client.post(&url).headers(headers.clone()).json(&body)
+        })
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -262,13 +261,12 @@ impl BodhiProvider {
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/messages");
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        // Retry the initial request on transient failures (issue #18); the
+        // returned body is unread, so SSE streaming below is unaffected.
+        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+            self.client.post(&url).headers(headers.clone()).json(&body)
+        })
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -334,13 +332,15 @@ impl BodhiProvider {
         let headers = self.build_headers()?;
         let url = self.proxy_url(&format!("v1beta/models/{}:streamGenerateContent", model));
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&request_json)
-            .send()
-            .await?;
+        // Retry the initial request on transient failures (issue #18); the
+        // returned body is unread, so SSE streaming below is unaffected.
+        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+            self.client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&request_json)
+        })
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
