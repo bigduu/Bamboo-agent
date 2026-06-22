@@ -1168,12 +1168,15 @@ impl Config {
         Self::from_data_dir(None)
     }
 
-    /// Load configuration from a specific data directory
+    /// Load configuration from a specific data directory.
     ///
-    /// # Arguments
+    /// Use [`Config::from_data_dir`] (publishes env vars to the global cache, for
+    /// the context that OWNS the cache — the server bootstrap) or
+    /// [`Config::from_data_dir_without_publish`] (for non-owning readers that must
+    /// not clobber the live cache). #40.
     ///
     /// * `data_dir` - Optional data directory path. If None, uses default (`BAMBOO_DATA_DIR` or `${HOME}/.bamboo`)
-    pub fn from_data_dir(data_dir: Option<PathBuf>) -> Self {
+    fn from_data_dir_impl(data_dir: Option<PathBuf>, publish: bool) -> Self {
         // Determine data_dir early (needed to find config file)
         let data_dir = data_dir
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
@@ -1264,10 +1267,30 @@ impl Config {
             memory.project_first_dream = parse_bool_env(&project_first_dream);
         }
 
-        // Publish env vars to the global cache so Bash tools can inject them.
-        config.publish_env_vars();
+        // Publish env vars to the global cache so Bash tools can inject them —
+        // ONLY when the caller owns that cache. Non-owning readers pass
+        // publish=false so they don't clobber the server's live env-var cache.
+        if publish {
+            config.publish_env_vars();
+        }
 
         config
+    }
+
+    /// Load config from disk AND publish its env vars to the process-global cache
+    /// (so Bash tools inject them). For the context that OWNS that cache — the
+    /// server bootstrap. Library / secondary readers that only need to read a
+    /// value must use [`Config::from_data_dir_without_publish`] instead, or they
+    /// will clobber the server's live cache with stale disk data (#38 / #40).
+    pub fn from_data_dir(data_dir: Option<PathBuf>) -> Self {
+        Self::from_data_dir_impl(data_dir, true)
+    }
+
+    /// Load config from disk WITHOUT publishing env vars to the global cache.
+    /// For non-owning readers (e.g. permission storage) that just need a config
+    /// value and must not clobber the live env-var cache. #40.
+    pub fn from_data_dir_without_publish(data_dir: Option<PathBuf>) -> Self {
+        Self::from_data_dir_impl(data_dir, false)
     }
 
     /// Get the effective default model for the currently active provider.
@@ -2028,6 +2051,69 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("https://internal.example"))
         }));
+    }
+
+    #[test]
+    fn from_data_dir_without_publish_does_not_clobber_global_cache() {
+        let _lock = crate::test_support::env_cache_lock_acquire();
+
+        // Seed the global cache with a marker "owned" by the live config.
+        Config {
+            env_vars: vec![EnvVarEntry {
+                name: "BAMBOO_CACHE_OWNER_40".to_string(),
+                value: "live".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .publish_env_vars();
+        assert_eq!(
+            Config::current_env_vars()
+                .get("BAMBOO_CACHE_OWNER_40")
+                .map(String::as_str),
+            Some("live")
+        );
+
+        // A config.json on disk sets the SAME var to a different (stale) value.
+        let temp = TempHome::new();
+        temp.set_config_json(
+            &serde_json::json!({
+                "env_vars": [{ "name": "BAMBOO_CACHE_OWNER_40", "value": "stale-disk" }]
+            })
+            .to_string(),
+        );
+
+        // Non-publishing load reads the disk value into the returned Config but
+        // must NOT touch the global cache.
+        let loaded = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            loaded
+                .env_vars
+                .iter()
+                .find(|e| e.name == "BAMBOO_CACHE_OWNER_40")
+                .map(|e| e.value.as_str()),
+            Some("stale-disk"),
+            "the returned Config holds the disk value"
+        );
+        assert_eq!(
+            Config::current_env_vars()
+                .get("BAMBOO_CACHE_OWNER_40")
+                .map(String::as_str),
+            Some("live"),
+            "but the global cache is UNTOUCHED — no clobber (#40)"
+        );
+
+        // Contrast: the publishing variant DOES clobber the cache.
+        let _ = Config::from_data_dir(Some(temp.path.clone()));
+        assert_eq!(
+            Config::current_env_vars()
+                .get("BAMBOO_CACHE_OWNER_40")
+                .map(String::as_str),
+            Some("stale-disk"),
+            "the publishing loader clobbers the cache (contrast)"
+        );
     }
 
     #[test]
