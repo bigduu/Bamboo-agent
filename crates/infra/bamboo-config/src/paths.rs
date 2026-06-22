@@ -82,6 +82,50 @@ pub fn workflows_dir() -> PathBuf {
     bamboo_dir().join("workflows")
 }
 
+/// Whether `name` is a safe workflow file-name stem: rejects empty / over-long /
+/// untrimmed names, path separators and `..`, null bytes / control characters,
+/// reserved Windows device names, and anything outside the
+/// `[alphanumeric - _ . space]` allowlist. The single strict validator shared by
+/// the HTTP workflow handlers and the Tauri-IPC commands so the surfaces can't
+/// drift (#34 / #97). A workflow file is `{name}.md` under [`workflows_dir`].
+pub fn is_safe_workflow_name(name: &str) -> bool {
+    // Basic constraints.
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+
+    // No leading/trailing whitespace.
+    let trimmed = name.trim();
+    if trimmed != name || trimmed.is_empty() {
+        return false;
+    }
+
+    // Path separators and traversal.
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+
+    // Null bytes and control characters.
+    if name.chars().any(|ch| ch.is_control() || ch == '\0') {
+        return false;
+    }
+
+    // Reserved Windows device names.
+    let upper = name.to_uppercase();
+    let stem = upper.split('.').next().unwrap_or(&upper);
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if reserved.contains(&stem) {
+        return false;
+    }
+
+    // Allowlist: alphanumeric (incl. unicode), dash, underscore, dot, space.
+    name.chars()
+        .all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_' || ch == '.' || ch == ' ')
+}
+
 /// Get anthropic-model-mapping.json path
 pub fn anthropic_model_mapping_path() -> PathBuf {
     bamboo_dir().join("anthropic-model-mapping.json")
@@ -182,6 +226,56 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn is_safe_workflow_name_accepts_allowlisted_names() {
+        for ok in [
+            "my-workflow",
+            "workflow_123",
+            "My Workflow",
+            "test.workflow",
+            "workflow.md",
+            "v1.0",
+            "2024-01-15",
+            "a",
+            "工作流",
+            "ワークフロー",
+            "العربية",
+        ] {
+            assert!(is_safe_workflow_name(ok), "{ok:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn is_safe_workflow_name_rejects_unsafe_names() {
+        for bad in [
+            "",                // empty
+            "workflow/name",   // path separator
+            "/workflow",       // path separator
+            "workflow\\name",  // path separator
+            "..",              // traversal
+            "../workflow",     // traversal
+            "workflow..test",  // traversal substring
+            "workflow (v1)",   // not in allowlist
+            "workflow [test]", // not in allowlist
+            "workflow@2.0",    // not in allowlist
+            "workflow#1",      // not in allowlist
+            "workflow$var",    // not in allowlist
+            "workflow*",       // not in allowlist
+            "workflow+test",   // not in allowlist
+            "🚀-workflow",     // emoji is not alphanumeric
+            " workflow",       // leading whitespace
+            "workflow ",       // trailing whitespace
+            "\tworkflow",      // control char + leading whitespace
+            "work\u{0}flow",   // null byte
+            "CON",             // reserved Windows name
+            "nul.md",          // reserved Windows name (stem)
+        ] {
+            assert!(!is_safe_workflow_name(bad), "{bad:?} should be rejected");
+        }
+        // Over-length is rejected.
+        assert!(!is_safe_workflow_name(&"a".repeat(256)));
+    }
 
     #[test]
     fn test_resolve_bamboo_dir_prefers_env() {
