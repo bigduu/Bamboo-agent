@@ -17,6 +17,11 @@ use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 pub struct WebService {
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the running server's [`AppState`], retained so [`WebService::stop`]
+    /// /[`Drop`] can gracefully stop AppState-owned background tasks (the #47
+    /// MCP-proxy reconnect supervisor) instead of leaking them until process exit.
+    /// #119.
+    app_state: Option<web::Data<AppState>>,
     /// Bamboo home directory containing all application data (config, sessions, skills, etc.)
     bamboo_home_dir: PathBuf,
     port: u16,
@@ -31,6 +36,7 @@ impl WebService {
         Self {
             shutdown_tx: None,
             server_handle: None,
+            app_state: None,
             bamboo_home_dir,
             port: 3456, // Default port
         }
@@ -56,6 +62,8 @@ impl WebService {
                 .await
                 .map_err(|e| format!("Failed to initialize app state: {e}"))?,
         );
+        // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
+        self.app_state = Some(app_state.clone());
         let bind_addr = bind.to_string();
         let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
@@ -125,6 +133,8 @@ impl WebService {
                 .await
                 .map_err(|e| format!("Failed to initialize app state: {e}"))?,
         );
+        // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
+        self.app_state = Some(app_state.clone());
         let bind_addr = bind.to_string();
         let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
@@ -188,6 +198,14 @@ impl WebService {
                 }
             }
 
+            // Gracefully stop AppState-owned background tasks — the #47 MCP-proxy
+            // reconnect supervisor (via its cancellation token) and the MCP servers.
+            // Without this the token was wired but never cancelled, so the
+            // supervisor only died at process exit. #119.
+            if let Some(state) = self.app_state.take() {
+                state.shutdown().await;
+            }
+
             info!("Web service stopped successfully");
         }
 
@@ -210,5 +228,50 @@ impl Drop for WebService {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
+        // Drop can't run the async shutdown(), but cancelling the MCP-proxy
+        // supervisor's token is synchronous — so a WebService dropped without an
+        // explicit stop() still tears down the reconnect loop. (The async MCP
+        // server cleanup is left to process exit on this fallback path.) #119.
+        if let Some(state) = self.app_state.take() {
+            state.mcp_proxy_shutdown.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #119 e2e: WebService::stop() must cancel the AppState-owned MCP-proxy
+    /// reconnect supervisor's token, so it terminates on server stop rather than
+    /// leaking until process exit.
+    #[tokio::test]
+    async fn stop_cancels_mcp_proxy_supervisor_token() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let mut service = WebService::new(home.path().to_path_buf());
+        // Port 0 -> OS-assigned ephemeral port (no conflict).
+        service
+            .start_with_bind(0, "127.0.0.1")
+            .await
+            .expect("web service starts");
+
+        // Capture the supervisor's cancellation token while the service runs.
+        let token = service
+            .app_state
+            .as_ref()
+            .expect("app_state retained after start")
+            .mcp_proxy_shutdown
+            .clone();
+        assert!(
+            !token.is_cancelled(),
+            "supervisor token is live while the service runs"
+        );
+
+        service.stop().await.expect("web service stops");
+
+        assert!(
+            token.is_cancelled(),
+            "stop() must cancel the MCP-proxy supervisor token so it terminates"
+        );
     }
 }

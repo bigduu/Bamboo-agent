@@ -90,6 +90,9 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
             .await
             .map_err(|e| format!("Failed to initialize app state: {e}"))?,
     );
+    // Retained for graceful shutdown after the server stops — the `move` factory
+    // below consumes `app_state`. #119.
+    let app_state_for_shutdown = app_state.clone();
     let workers = resolve_worker_count();
 
     let app_factory = move || {
@@ -152,7 +155,15 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 
     info!("Unified server running on http://127.0.0.1:{port}");
 
-    if let Err(e) = server.await {
+    let result = server.await;
+
+    // The server has stopped (actix handles SIGINT/SIGTERM, returning here on an
+    // intended stop). Gracefully stop AppState-owned background tasks — the #47
+    // MCP-proxy reconnect supervisor + MCP servers — instead of leaking them until
+    // process exit. Runs on both the clean and error exit paths. #119.
+    app_state_for_shutdown.shutdown().await;
+
+    if let Err(e) = result {
         error!("Server error: {}", e);
         return Err(format!("Server error: {e}"));
     }
@@ -213,6 +224,9 @@ pub async fn run_with_bind_and_static(
             .await
             .map_err(|e| format!("Failed to initialize app state: {e}"))?,
     );
+    // Retained for graceful shutdown after the server stops — the `move` factory
+    // below consumes `app_state`. #119.
+    let app_state_for_shutdown = app_state.clone();
     let workers = resolve_worker_count();
 
     let bind_for_cors = bind.to_string();
@@ -281,7 +295,14 @@ pub async fn run_with_bind_and_static(
 
     info!("Unified server running on http://{}:{}", bind, port);
 
-    if let Err(e) = server.await {
+    let result = server.await;
+
+    // Gracefully stop AppState-owned background tasks (the #47 MCP-proxy reconnect
+    // supervisor + MCP servers) once the server stops, instead of leaking them
+    // until process exit. Runs on both the clean and error exit paths. #119.
+    app_state_for_shutdown.shutdown().await;
+
+    if let Err(e) = result {
         error!("Server error: {}", e);
         return Err(format!("Server error: {e}"));
     }
