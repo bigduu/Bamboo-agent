@@ -78,8 +78,8 @@ impl AppState {
     /// and waits for them to terminate cleanly.
     ///
     /// This should be called during application shutdown to ensure
-    /// MCP servers are not left running as orphaned processes.
-    #[allow(dead_code)]
+    /// MCP servers are not left running as orphaned processes. Invoked by
+    /// [`crate::server::web_service::WebService::stop`]. #119.
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down MCP servers...");
         // Stop the supervised MCP proxy service (issue #47) so its reconnect
