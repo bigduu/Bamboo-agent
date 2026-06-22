@@ -4,9 +4,28 @@ use eventsource_stream::Eventsource;
 use futures::stream;
 use futures::StreamExt;
 use reqwest::Response;
+use serde_json::Value;
 
 use crate::provider::{LLMError, LLMStream, Result};
 use crate::types::LLMChunk;
+
+/// True if a top-level SSE `"error"` field represents a REAL error.
+///
+/// Several gateways (LiteLLM, OneAPI/New-API, some Azure proxies, and some Gemini
+/// gateways) emit `{"error": null}` — or `""`/`{}` — as a *no-error* marker on an
+/// otherwise-normal chunk. `serde_json`'s `get("error")` returns `Some(Null)` for
+/// an explicit null, so without this guard such a benign marker would abort a
+/// valid stream (#26 openai-compat, #99 Gemini). Only a non-null, non-empty value
+/// is a real error. Shared by every SSE parser so the guard can't drift.
+pub(crate) fn sse_error_is_present(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        _ => true,
+    }
+}
 
 fn to_stream_error(err: LLMError) -> LLMError {
     match err {
@@ -71,7 +90,27 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use serde_json::json;
     // use http; // TODO: add http crate if needed
+
+    #[test]
+    fn sse_error_is_present_distinguishes_real_errors_from_benign_markers() {
+        // Benign no-error markers some gateways emit -> NOT a real error.
+        assert!(!sse_error_is_present(&Value::Null));
+        assert!(!sse_error_is_present(&json!("")));
+        assert!(!sse_error_is_present(&json!("   ")));
+        assert!(!sse_error_is_present(&json!({})));
+        assert!(!sse_error_is_present(&json!([])));
+
+        // Real errors -> present.
+        assert!(sse_error_is_present(&json!("boom")));
+        assert!(sse_error_is_present(
+            &json!({ "message": "API key invalid" })
+        ));
+        assert!(sse_error_is_present(&json!(["e"])));
+        assert!(sse_error_is_present(&json!(42)));
+        assert!(sse_error_is_present(&json!(true)));
+    }
 
     #[tokio::test]
     async fn llm_stream_from_sse_filters_none_and_passes_event_name_and_data() {
