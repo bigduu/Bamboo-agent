@@ -7,6 +7,7 @@
 //! plumbing; the real agent execution (query vs steer) lives in the handler the
 //! caller supplies.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -39,72 +40,132 @@ pub async fn serve_mailbox<H, Fut>(
     handler: H,
 ) -> BrokerResult<()>
 where
-    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync,
-    Fut: Future<Output = Handled> + Send,
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
 {
     let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
     client.subscribe().await?;
     serve_loop(&mut client, &me, handler).await
 }
 
+/// One finished handler routed back to the single client owner for delivery+ack.
+/// Carries everything the owner needs so the spawned task touches no client state.
+struct Completion {
+    /// Correlation id of the original inbound message (the run's id).
+    id: MsgId,
+    /// `session_id` of the sender, i.e. where a `Reply` is delivered.
+    reply_to: String,
+    /// What the handler decided (reply / bare ack / leave unacked).
+    handled: Handled,
+}
+
 /// The serve loop against an already-connected, already-subscribed client.
 /// Separated so tests can drive it over an in-process client.
+///
+/// Each inbound message's handler runs in its OWN spawned task, so N concurrent
+/// Asks to one worker overlap their (expensive, agent-execution) work instead of
+/// serializing behind a single `handler(msg).await`. The single client owner —
+/// this loop — still does ALL the connection I/O: it routes out-of-band cancels
+/// to the matching in-flight run's token, and delivers+acks each finished
+/// handler's reply as it arrives over the completion channel. So the wire side
+/// stays single-owner (no concurrent `deliver`/`ack`) while the work side is
+/// parallel. The original #50 cancel + persist + ack semantics are preserved per
+/// run: each run still gets its own token (now tracked in a live map so a cancel
+/// can find it after we've moved on to the next message), and ack still happens
+/// only AFTER the reply is delivered. #45.
 pub async fn serve_loop<H, Fut>(
     client: &mut BrokerClient,
     me: &AgentRef,
     handler: H,
 ) -> BrokerResult<()>
 where
-    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync,
-    Fut: Future<Output = Handled> + Send,
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
 {
-    while let Some(msg) = client.next_message().await {
-        let id = msg.id.clone();
-        let reply_to = msg.from.session_id.clone();
+    let handler = Arc::new(handler);
 
-        // Run the handler with a per-run cancel token, while concurrently
-        // watching the out-of-band cancel lane. A Cancel naming THIS run's id
-        // trips the token, which the executor honors mid-LLM-call. Work stays
-        // SERIAL — we don't take the next message until this handler finishes —
-        // so only the control SIGNAL is concurrent and the worker's conversation
-        // context is never touched by two runs at once. #50.
-        let token = CancellationToken::new();
-        let handler_fut = handler(msg, token.clone());
-        tokio::pin!(handler_fut);
-        let mut cancels_open = true;
-        let handled = loop {
-            tokio::select! {
-                biased;
-                cancel = client.next_cancel(), if cancels_open => match cancel {
-                    Some(cid) if cid == id => token.cancel(),
-                    // A cancel for a different (already-finished or not-yet-started)
-                    // run; nothing in flight here matches it.
-                    Some(_) => {}
-                    // Cancel lane closed (reader gone): stop selecting on it so we
-                    // don't spin; the handler still completes (or the dropped
-                    // connection surfaces through it).
-                    None => cancels_open = false,
-                },
-                done = &mut handler_fut => break done,
-            }
-        };
+    // Live cancel tokens for runs still in flight, keyed by the run (message) id.
+    // A cancel naming an id present here trips its token (the executor honors it
+    // mid-LLM-call); a cancel for an unknown id (already finished / never started)
+    // is a no-op, exactly as before. An entry is removed when its run completes.
+    let mut inflight: HashMap<MsgId, CancellationToken> = HashMap::new();
 
-        match handled {
-            Handled::Reply(answer) => {
-                let reply = InboxMessage {
-                    id: MsgId::new(),
-                    from: me.clone(),
-                    kind: InboxKind::Reply,
-                    body: serde_json::to_value(ReplyBody { answer })
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    created_at: Utc::now(),
-                    correlation_id: Some(id.clone()),
-                };
-                client.deliver(&reply_to, reply).await?;
-                client.ack(id).await?;
+    // Finished handlers flow back here to the single owner for delivery+ack.
+    // KEEP-ALIVE: this original `done_tx` stays in scope for the whole loop (each
+    // spawn clones it), so `done_rx.recv()` only returns `None` once the loop is
+    // tearing down — never spuriously while runs are in flight. Mirrors the
+    // `reply_tx` keep-alive in `serve_mcp_proxy`. #144/#45.
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Completion>();
+
+    let mut messages_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            // A. A finished handler: deliver its reply (if any) then ack — the ack
+            //    still strictly follows a delivered reply, as before. Done on the
+            //    owner so there is never a concurrent `deliver`/`ack` on the client.
+            //    Biased first so completions (which let us exit on teardown) and
+            //    their acks don't starve behind a steady inbound stream.
+            Some(done) = done_rx.recv() => {
+                inflight.remove(&done.id);
+                let Completion { id, reply_to, handled } = done;
+                match handled {
+                    Handled::Reply(answer) => {
+                        let reply = InboxMessage {
+                            id: MsgId::new(),
+                            from: me.clone(),
+                            kind: InboxKind::Reply,
+                            body: serde_json::to_value(ReplyBody { answer })
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                            created_at: Utc::now(),
+                            correlation_id: Some(id.clone()),
+                        };
+                        client.deliver(&reply_to, reply).await?;
+                        client.ack(id).await?;
+                    }
+                    Handled::Ack => client.ack(id).await?,
+                    Handled::Leave => {}
+                }
             }
-            Handled::Ack => client.ack(id).await?,
-            Handled::Leave => {}
+            // B. The next inbound message OR out-of-band cancel (demuxed over one
+            //    `&mut client` borrow). A cancel trips the matching in-flight run's
+            //    token (#50); a new message registers a fresh token and spawns the
+            //    handler on its own task — so concurrent Asks overlap their work and
+            //    only the (cheap) wire I/O stays serialized through this owner. #45.
+            event = client.next_message_or_cancel(), if messages_open => match event {
+                crate::client::ServeEvent::Cancel(Some(cid)) => {
+                    if let Some(tok) = inflight.get(&cid) {
+                        tok.cancel();
+                    }
+                }
+                // Cancel lane closed (reader gone). The message lane is fed by the
+                // same reader, so treat it as connection teardown: stop pulling and
+                // drain the in-flight handlers through arm A.
+                crate::client::ServeEvent::Cancel(None) => messages_open = false,
+                crate::client::ServeEvent::Message(Some(msg)) => {
+                    let id = msg.id.clone();
+                    let reply_to = msg.from.session_id.clone();
+                    let token = CancellationToken::new();
+                    inflight.insert(id.clone(), token.clone());
+
+                    let handler = Arc::clone(&handler);
+                    let done_tx = done_tx.clone();
+                    tokio::spawn(async move {
+                        let handled = handler(msg, token).await;
+                        // Receiver gone == owner loop exited (conn dropped) -> drop.
+                        let _ = done_tx.send(Completion { id, reply_to, handled });
+                    });
+                }
+                // Connection closed: stop pulling new messages and let the remaining
+                // in-flight handlers drain through arm A before we exit.
+                crate::client::ServeEvent::Message(None) => messages_open = false,
+            },
+        }
+
+        // Once the message stream is closed, exit as soon as every in-flight run
+        // has drained — replies for them have been delivered+acked above.
+        if !messages_open && inflight.is_empty() {
+            break;
         }
     }
     Ok(())
@@ -511,6 +572,99 @@ mod tests {
         assert_eq!(reply2.correlation_id, Some(qid2));
         let body: ReplyBody = serde_json::from_value(reply2.body).unwrap();
         assert_eq!(body.answer, "echo: hello");
+    }
+
+    #[tokio::test]
+    async fn concurrent_asks_to_one_worker_overlap() {
+        use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
+        use std::time::Instant;
+
+        // An executor where each run takes 200ms. Serial handling of N asks to ONE
+        // worker would take ~N*200ms; concurrent (per-ask spawn) overlaps to ~200ms.
+        struct SlowEcho;
+        #[async_trait::async_trait]
+        impl ChildExecutor for SlowEcho {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> ChildOutcome {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                ChildOutcome::completed(format!("done: {}", spec.assignment))
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let worker_ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_ep,
+                AgentRef {
+                    session_id: "worker".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(SlowEcho),
+            )
+            .await;
+        });
+
+        let mut orch = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        orch.subscribe().await.unwrap();
+
+        // Probe round-trip first so the worker is provably subscribed before we
+        // fire the concurrent batch (else early Asks could queue as durable backlog
+        // and not actually overlap).
+        let probe = ask("orch", "ping");
+        let probe_id = probe.id.clone();
+        orch.deliver("worker", probe).await.unwrap();
+        loop {
+            let r = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+                .await
+                .expect("probe reply")
+                .expect("present");
+            if r.correlation_id == Some(probe_id.clone()) {
+                break;
+            }
+        }
+
+        // Fire N concurrent (Query) Asks to the SAME worker, then await all N
+        // correlated replies. Serial would be ~N*200ms; concurrent ~200ms.
+        const N: usize = 4;
+        let mut want: std::collections::HashSet<MsgId> = std::collections::HashSet::new();
+        let start = Instant::now();
+        for i in 0..N {
+            let q = ask("orch", &format!("q{i}"));
+            want.insert(q.id.clone());
+            orch.deliver("worker", q).await.unwrap();
+        }
+        while !want.is_empty() {
+            let r = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+                .await
+                .expect("a reply arrives")
+                .expect("present");
+            if let Some(cid) = &r.correlation_id {
+                want.remove(cid);
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "{N} concurrent 200ms Asks to ONE worker must OVERLAP \
+             (serial would be ~{}ms); took {elapsed:?}",
+            N * 200
+        );
     }
 
     #[tokio::test]
