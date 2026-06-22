@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::ask::request_over;
 use crate::client::BrokerClient;
 use crate::error::{BrokerError, BrokerResult};
+use crate::mux::MultiplexedClient;
 
 // --- supervised-reconnect tuning (issue #47) ----------------------------------
 
@@ -244,11 +244,16 @@ async fn handle_mcp_request(backend: &dyn ToolExecutor, msg: InboxMessage) -> Mc
 /// Worker-side proxy `ToolExecutor`: advertises the orchestrator's proxiable MCP
 /// tools and forwards calls to them over the broker.
 pub struct McpProxyExecutor {
-    client: Mutex<BrokerClient>,
+    /// The multiplexed driver over the proxy's broker sub-connection. A
+    /// `RwLock<Arc<…>>` so reconnect can SWAP the whole driver while in-flight
+    /// requests keep running on their cloned `Arc` of the old one. A request
+    /// clones the `Arc` and releases the lock BEFORE the round-trip, so parallel
+    /// MCP calls overlap instead of serializing behind one exclusive lock. #56.
+    client: tokio::sync::RwLock<Arc<MultiplexedClient>>,
     /// Serializes reconnect attempts so concurrent callers don't each rebuild
-    /// the client. Held only across the (bounded) reconnect — the `client`
-    /// mutex above is never held across a backoff sleep, so a reconnect can't
-    /// deadlock or stall an unrelated caller's lock acquisition.
+    /// the client. Held only across the (bounded) reconnect — the `client` lock
+    /// above is never held across a backoff sleep, so a reconnect can't deadlock
+    /// or stall an unrelated caller's lock acquisition.
     reconnect_lock: Mutex<()>,
     me: AgentRef,
     endpoint: String,
@@ -279,22 +284,22 @@ impl McpProxyExecutor {
         let orchestrator = orchestrator.into();
         let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
         client.subscribe().await?;
+        let mux = client.into_multiplexed(me.clone());
 
-        let reply = request_over(
-            &mut client,
-            &me,
-            &orchestrator,
-            InboxKind::McpRequest,
-            serde_json::to_value(McpRequest::Manifest).expect("McpRequest serializes"),
-            timeout,
-        )
-        .await?;
+        let reply = mux
+            .request(
+                &orchestrator,
+                InboxKind::McpRequest,
+                serde_json::to_value(McpRequest::Manifest).expect("McpRequest serializes"),
+                timeout,
+            )
+            .await?;
         let reply: McpReply = serde_json::from_value(reply)
             .map_err(|e| BrokerError::Protocol(format!("bad manifest reply: {e}")))?;
         let manifest = reply.manifest.unwrap_or_default();
 
         Ok(Self {
-            client: Mutex::new(client),
+            client: tokio::sync::RwLock::new(Arc::new(mux)),
             reconnect_lock: Mutex::new(()),
             me,
             endpoint: endpoint.to_string(),
@@ -313,10 +318,10 @@ impl McpProxyExecutor {
     /// One request/reply over the current client (under its lock). Does NOT
     /// reconnect — callers decide that from the error + connection state.
     async fn request_once(&self, body: serde_json::Value) -> BrokerResult<serde_json::Value> {
-        let mut client = self.client.lock().await;
-        request_over(
-            &mut client,
-            &self.me,
+        // Clone the Arc and RELEASE the lock before the round-trip, so concurrent
+        // proxy calls overlap instead of serializing behind one exclusive lock.
+        let mux = self.client.read().await.clone();
+        mux.request(
             &self.orchestrator,
             InboxKind::McpRequest,
             body,
@@ -358,8 +363,7 @@ impl McpProxyExecutor {
     /// reader has exited). Used to decide whether a failed request is worth a
     /// reconnect+retry rather than a plain error.
     async fn connection_broken(&self) -> bool {
-        let client = self.client.lock().await;
-        !client.reader_alive()
+        !self.client.read().await.reader_alive()
     }
 
     /// Lazily re-establish the broker sub-connection: re-Hello/Subscribe and
@@ -402,23 +406,26 @@ impl McpProxyExecutor {
         let mut client =
             BrokerClient::connect(&self.endpoint, self.me.clone(), &self.token).await?;
         client.subscribe().await?;
+        let mux = client.into_multiplexed(self.me.clone());
         // Re-fetch the manifest so any tool-surface change during the outage is
         // reflected (the only state the proxy keeps beyond the live connection).
-        let reply = request_over(
-            &mut client,
-            &self.me,
-            &self.orchestrator,
-            InboxKind::McpRequest,
-            serde_json::to_value(McpRequest::Manifest).expect("McpRequest serializes"),
-            self.timeout,
-        )
-        .await?;
+        let reply = mux
+            .request(
+                &self.orchestrator,
+                InboxKind::McpRequest,
+                serde_json::to_value(McpRequest::Manifest).expect("McpRequest serializes"),
+                self.timeout,
+            )
+            .await?;
         let reply: McpReply = serde_json::from_value(reply)
             .map_err(|e| BrokerError::Protocol(format!("bad manifest reply: {e}")))?;
         let manifest = reply.manifest.unwrap_or_default();
         {
-            let mut slot = self.client.lock().await;
-            *slot = client;
+            // Swap in the new driver. The old Arc lives until in-flight requests
+            // on it finish; its router ends when the old (dead) connection's
+            // reader closes `messages`, failing any stragglers. #56.
+            let mut slot = self.client.write().await;
+            *slot = Arc::new(mux);
         }
         if let Ok(mut m) = self.manifest.write() {
             *m = manifest;
@@ -596,6 +603,71 @@ mod tests {
             proxy.execute(&miss).await,
             Err(ToolError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn proxy_handles_concurrent_calls_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(core, TOKEN));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let endpoint = format!("ws://{addr}");
+
+        let ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_mcp_proxy(
+                &ep,
+                AgentRef {
+                    session_id: "orchestrator".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(StubMcp),
+            )
+            .await;
+        });
+
+        let proxy = Arc::new(
+            McpProxyExecutor::connect(
+                &endpoint,
+                "worker#mcp",
+                TOKEN,
+                "orchestrator",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("proxy connects"),
+        );
+
+        // Fire N concurrent proxied calls with DISTINCT args over the multiplexed
+        // connection (no per-call exclusive lock). Each must get its OWN result —
+        // proving concurrent execute() doesn't serialize-deadlock or mis-route
+        // replies. (End-to-end latency is still capped by the serial orchestrator
+        // serve_mcp_proxy — that's the complementary half, tracked separately.) #56.
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let p = proxy.clone();
+            handles.push(tokio::spawn(async move {
+                let call = ToolCall {
+                    id: format!("c{i}"),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "nova_click".into(),
+                        arguments: format!("{{\"mark\":{i}}}"),
+                    },
+                };
+                let r = p.execute(&call).await.expect("proxied call returns");
+                (i, r.result)
+            }));
+        }
+        for h in handles {
+            let (i, result) = h.await.unwrap();
+            assert_eq!(result, format!("ran nova_click args={{\"mark\":{i}}}"));
+        }
     }
 
     // --- issue #47: supervised reconnect on both sides ------------------------
