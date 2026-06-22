@@ -147,6 +147,43 @@ async fn bad_token_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn cancel_reaches_subscribed_worker_via_next_cancel() {
+    let (endpoint, _dir) = start_broker().await;
+
+    let mut worker = BrokerClient::connect(&endpoint, agent("worker"), TOKEN)
+        .await
+        .expect("worker connects");
+    worker.subscribe().await.expect("worker subscribes");
+
+    let mut boss = BrokerClient::connect(&endpoint, agent("boss"), TOKEN)
+        .await
+        .expect("boss connects");
+
+    // Confirm the worker's subscription is live via a normal deliver round-trip
+    // BEFORE the out-of-band cancel (which the broker drops if the target isn't
+    // subscribed) — otherwise the test could race the Subscribe registration.
+    let probe = ask("boss");
+    boss.deliver("worker", probe.clone())
+        .await
+        .expect("deliver probe");
+    assert_eq!(recv(&mut worker).await.id, probe.id);
+
+    // The cancel arrives on the worker's out-of-band lane (next_cancel), NOT the
+    // message lane.
+    let cid = MsgId::new();
+    boss.cancel("worker", &cid).await.expect("send cancel");
+
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), worker.next_cancel())
+        .await
+        .expect("cancel arrives in time")
+        .expect("connection stays open");
+    assert_eq!(
+        cancelled, cid,
+        "worker received the cancel's correlation id"
+    );
+}
+
 /// Start a broker on an explicit mailbox-root (so a restart reuses the same
 /// persisted state). Returns the ws endpoint + the server task handle (abort it
 /// to simulate a crash).

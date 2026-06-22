@@ -32,6 +32,10 @@ pub struct BrokerClient {
     sink: WsSink,
     messages: mpsc::UnboundedReceiver<InboxMessage>,
     delivered: mpsc::UnboundedReceiver<MsgId>,
+    /// Out-of-band cancel signals (the timed-out ask's correlation id), demuxed
+    /// by the background reader independently of `messages` — so a Cancel reaches
+    /// the worker even while its work loop is blocked on an in-flight run. #50.
+    cancels: mpsc::UnboundedReceiver<MsgId>,
     /// Cleared by [`reader_supervisor`] the instant the background reader exits
     /// (clean close / panic / cancellation), so callers can tell "no messages
     /// right now" (`next_message() -> None` but still alive) apart from "the
@@ -79,8 +83,9 @@ impl BrokerClient {
 
         let (msg_tx, messages) = mpsc::unbounded_channel();
         let (del_tx, delivered) = mpsc::unbounded_channel();
-        // The demux loop is unchanged: it pushes `Message`/`Delivered` frames
-        // into the channels and ends when the stream closes or errors.
+        let (cancel_tx, cancels) = mpsc::unbounded_channel();
+        // The demux loop pushes `Message`/`Delivered`/`Cancel` frames into their
+        // respective channels and ends when the stream closes or errors.
         let reader = tokio::spawn(async move {
             while let Some(frame) = source.next().await {
                 match frame {
@@ -90,6 +95,9 @@ impl BrokerClient {
                         }
                         Ok(BrokerFrame::Delivered { id }) => {
                             let _ = del_tx.send(id);
+                        }
+                        Ok(BrokerFrame::Cancel { correlation_id }) => {
+                            let _ = cancel_tx.send(correlation_id);
                         }
                         _ => {}
                     },
@@ -112,6 +120,7 @@ impl BrokerClient {
             sink,
             messages,
             delivered,
+            cancels,
             reader_alive,
             _supervisor: supervisor,
         })
@@ -176,6 +185,13 @@ impl BrokerClient {
         msg
     }
 
+    /// Await the next out-of-band cancel (the correlation id of the run to
+    /// abort), demuxed independently of `next_message` so it can be received
+    /// while the work loop is busy. `None` when the reader has exited. #50.
+    pub async fn next_cancel(&mut self) -> Option<MsgId> {
+        self.cancels.recv().await
+    }
+
     /// `true` while the background reader task is still running. Flips to
     /// `false` the moment the reader exits — clean close, panic, or
     /// cancellation — with the cause logged by [`reader_supervisor`]. Use this
@@ -188,6 +204,18 @@ impl BrokerClient {
     /// Acknowledge a processed message so the broker deletes it.
     pub async fn ack(&mut self, id: MsgId) -> BrokerResult<()> {
         self.send(ClientFrame::Ack { id }).await
+    }
+
+    /// Out-of-band, fire-and-forget cancel: ask the broker to signal session
+    /// `to` to abort the run correlated to `correlation_id`. Returns once the
+    /// frame is sent (no receipt — it's a control signal, deliberately off the
+    /// durable/acked path). #50.
+    pub async fn cancel(&mut self, to: &str, correlation_id: &MsgId) -> BrokerResult<()> {
+        self.send(ClientFrame::Cancel {
+            to: to.into(),
+            correlation_id: correlation_id.clone(),
+        })
+        .await
     }
 
     async fn send(&mut self, frame: ClientFrame) -> BrokerResult<()> {
