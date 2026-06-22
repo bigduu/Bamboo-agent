@@ -9,11 +9,12 @@ use tracing::{error, info};
 
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
 use crate::app_state::AppState;
-use crate::config::{build_cors, build_security_headers};
+use crate::config::{build_cors, build_rate_limiter, build_security_headers};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use crate::services::frontend_package::{
     ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
 };
+use actix_governor::Governor;
 
 fn canonicalize_static_dir(path: &Path) -> Result<PathBuf, String> {
     let canonicalized = path
@@ -229,6 +230,10 @@ pub async fn run_with_bind_and_static(
     let app_state_for_shutdown = app_state.clone();
     let workers = resolve_worker_count();
 
+    // Per-IP rate limiter for the network-exposed production server (#13). Built
+    // once and shared (Clone) across workers; `Governor` is the outermost wrap so
+    // a throttled request is rejected with 429 before any handler work.
+    let rate_limiter = build_rate_limiter();
     let bind_for_cors = bind.to_string();
     let app_factory = move || {
         let mut app = App::new()
@@ -237,9 +242,10 @@ pub async fn run_with_bind_and_static(
             .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024)) // 25MB JSON limit
             .app_data(web::PayloadConfig::new(30 * 1024 * 1024)) // 30MB payload limit
             .app_data(app_state.clone())
+            .wrap(Governor::new(&rate_limiter))
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
-            .configure(configure_routes_with_rate_limiting); // Enable rate limiting
+            .configure(configure_routes_with_rate_limiting);
 
         if let Some(static_path) = &static_dir {
             let index_file = static_path.join("index.html");
