@@ -388,6 +388,63 @@ fn pre_parse_checks(command: &str) -> Option<BashWarning> {
 
 // ---- AST walking ----
 
+/// True if `command` runs MORE than one command at the shell level — joined by a
+/// command list (`&&`, `||`, `;`), a pipeline (`|`), or a statement separator
+/// (newline). AST-based (tree-sitter): it counts the `command` nodes reachable
+/// through structural nodes, so an operator inside a quoted argument (e.g.
+/// `git commit -m "a && b"`) is NOT counted — unlike a naive string scan. It does
+/// NOT descend into command/process substitution (those are caught separately as
+/// warnings). Fails CLOSED (returns `true`) when the command can't be parsed, so an
+/// unverifiable command is never mistaken for a single simple command. NOTE:
+/// `analyze_command` deliberately treats `list`/`pipeline` as benign structural
+/// nodes (it warns on the dangerous *leaves*), so this separate helper is what
+/// gates operator-chaining for auto-approval allowlists without changing
+/// `analyze_command`'s verdicts. #10.
+pub fn is_compound_command(command: &str) -> bool {
+    let tree = match parser().lock() {
+        Ok(mut parser) => parser.parse(command, None),
+        Err(_) => return true, // poisoned lock -> can't verify -> fail closed
+    };
+    match tree {
+        Some(tree) => count_commands(&tree.root_node()) > 1,
+        None => true, // unparseable -> fail closed
+    }
+}
+
+/// Count `command` nodes reachable through structural/compound nodes (a superset
+/// of [`collect_commands_recursive`]'s traversal — it also descends
+/// `negated_command` / `c_style_for_statement` so a chain hidden inside them is
+/// still counted rather than relying on the fail-closed path). Substitutions are
+/// not descended (caught separately as warnings).
+fn count_commands(node: &tree_sitter::Node) -> usize {
+    match node.kind() {
+        "command" => 1,
+        "program"
+        | "list"
+        | "pipeline"
+        | "redirected_statement"
+        | "subshell"
+        | "compound_statement"
+        | "if_statement"
+        | "for_statement"
+        | "c_style_for_statement"
+        | "while_statement"
+        | "until_statement"
+        | "case_statement"
+        | "negated_command"
+        | "function_definition" => {
+            let mut total = 0;
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    total += count_commands(&child);
+                }
+            }
+            total
+        }
+        _ => 0,
+    }
+}
+
 fn walk_node_with_budget(
     node: &tree_sitter::Node,
     source: &str,
