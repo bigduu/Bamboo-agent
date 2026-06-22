@@ -119,6 +119,33 @@ pub(crate) fn make_auxiliary_model_resolver(
     })
 }
 
+/// Build the per-round resolver for the LIVE disabled tool/skill sets (#136).
+/// Returns the CURRENT `(disabled_tools, disabled_skill_ids)` from the live global
+/// config each call, so disabling/re-enabling a tool mid-run takes effect on the
+/// next round. Reuses `read_config_snapshot` (non-blocking `try_read` + cached
+/// fallback — the same hot-path-safe mechanism `make_auxiliary_model_resolver`
+/// uses). NB: returns the live GLOBAL set (not unioned with the request-time
+/// snapshot), because that snapshot IS just the old global set — unioning it would
+/// freeze it as a floor and break re-enable.
+pub(crate) fn make_disabled_filter_resolver(
+    state: &actix_web::web::Data<AppState>,
+) -> Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync> {
+    let config = state.config.clone();
+    let cached_config = Arc::new(StdRwLock::new(
+        config
+            .try_read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default(),
+    ));
+    Arc::new(move || {
+        let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
+        (
+            config_snapshot.disabled_tool_names().into_iter().collect(),
+            config_snapshot.disabled_skill_ids().into_iter().collect(),
+        )
+    })
+}
+
 pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
     let tools_override = Some(tools_for_execution(
         args.state.as_ref(),
@@ -161,6 +188,9 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         reasoning_effort: args.reasoning_effort,
         reasoning_effort_source: args.reasoning_effort_source,
         auxiliary_model_resolver: Some(auxiliary_model_resolver),
+        // Live per-round disabled-set resolver (#136): a tool disabled/re-enabled
+        // mid-run takes effect on the next round of this (long-running) agent loop.
+        disabled_filter_resolver: Some(make_disabled_filter_resolver(&args.state)),
         disabled_tools: Some(args.disabled_tools),
         disabled_skill_ids: Some(args.disabled_skill_ids),
         selected_skill_ids,

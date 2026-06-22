@@ -82,3 +82,78 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
 
     tool_schemas
 }
+
+#[cfg(test)]
+mod live_disabled_tests {
+    use super::*;
+    use bamboo_agent_core::tools::{
+        FunctionSchema, ToolCall, ToolError, ToolExecutionContext, ToolResult,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct TwoTools;
+    #[async_trait::async_trait]
+    impl ToolExecutor for TwoTools {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("not invoked in this test")
+        }
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.execute(call).await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["alpha_tool", "beta_tool"]
+                .into_iter()
+                .map(|name| ToolSchema {
+                    schema_type: "function".into(),
+                    function: FunctionSchema {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: serde_json::json!({ "type": "object" }),
+                    },
+                })
+                .collect()
+        }
+    }
+
+    fn offered(config: &AgentLoopConfig, tools: &TwoTools, session: &Session, name: &str) -> bool {
+        resolve_available_tool_schemas_for_session(config, tools, session)
+            .iter()
+            .any(|s| s.function.name == name)
+    }
+
+    #[test]
+    fn live_disabled_resolver_filters_tools_on_the_next_round() {
+        // A resolver whose disabled set flips mid-run: round 1 nothing disabled,
+        // round 2 "beta_tool" disabled — mirrors a user disabling a tool mid-run.
+        let disabled = Arc::new(AtomicBool::new(false));
+        let d = disabled.clone();
+        let mut config = AgentLoopConfig::default();
+        config.disabled_filter_resolver = Some(Arc::new(move || {
+            let tools = if d.load(Ordering::SeqCst) {
+                BTreeSet::from(["beta_tool".to_string()])
+            } else {
+                BTreeSet::new()
+            };
+            (tools, BTreeSet::new())
+        }));
+        let session = Session::new("s", "m");
+        let tools = TwoTools;
+
+        // Round 1: nothing disabled -> beta_tool is offered.
+        assert!(offered(&config, &tools, &session, "beta_tool"));
+
+        // Disable beta_tool mid-run (NO new execution).
+        disabled.store(true, Ordering::SeqCst);
+
+        // Round 2 (same run): the live disable took effect -> beta_tool gone,
+        // alpha_tool still offered. Re-enable would restore it (list rebuilt fresh).
+        assert!(!offered(&config, &tools, &session, "beta_tool"));
+        assert!(offered(&config, &tools, &session, "alpha_tool"));
+    }
+}

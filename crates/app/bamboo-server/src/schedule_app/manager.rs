@@ -421,6 +421,9 @@ async fn run_schedule_job(
         reasoning_effort: resolved.reasoning_effort,
         reasoning_effort_source: "schedule".to_string(),
         auxiliary_model_resolver: Some(auxiliary_model_resolver),
+        // Scheduled runs use the per-run disabled snapshot (#136 lives on the
+        // interactive agent path; a scheduled task is a discrete run).
+        disabled_filter_resolver: None,
         disabled_tools: None,
         disabled_skill_ids: None,
         selected_skill_ids: None,
