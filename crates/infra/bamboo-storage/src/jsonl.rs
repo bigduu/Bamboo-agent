@@ -74,13 +74,13 @@ impl JsonlStorage {
     }
 
     pub async fn save_session(&self, session: &Session) -> std::io::Result<()> {
-        let path = self.session_path(&session.id);
+        let path = self.session_path(&session.id)?;
         let json = serde_json::to_string(session)?;
         fs::write(path, json).await
     }
 
     pub async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
-        let path = self.session_path(session_id);
+        let path = self.session_path(session_id)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -90,7 +90,7 @@ impl JsonlStorage {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
-        let session_path = self.session_path(session_id);
+        let session_path = self.session_path(session_id)?;
         let mut deleted_any = false;
 
         for path in [session_path] {
@@ -106,8 +106,13 @@ impl JsonlStorage {
         Ok(deleted_any)
     }
 
-    fn session_path(&self, session_id: &str) -> PathBuf {
-        self.base_path.join(format!("{}.json", session_id))
+    /// Resolve the on-disk path for a session, REJECTING any id that could escape
+    /// `base_path` (path-separator or `..`). Without this, a `session_id` like
+    /// `"../../etc/passwd"` would read/write outside the storage directory. Shares
+    /// the same guard as `SessionStoreV2`. #31.
+    fn session_path(&self, session_id: &str) -> std::io::Result<PathBuf> {
+        crate::v2::validate_session_id(session_id)?;
+        Ok(self.base_path.join(format!("{}.json", session_id)))
     }
 }
 
@@ -137,6 +142,38 @@ mod tests {
         let storage = JsonlStorage::new(&temp_dir);
         storage.init().await?;
         Ok((storage, temp_dir))
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal_session_ids() {
+        let (storage, _dir) = create_temp_storage().await.expect("temp storage");
+
+        // Ids that could escape base_path must be rejected on every path. #31.
+        for bad in ["../escape", "../../etc/passwd", "a/b", "a\\b", "..", ""] {
+            assert!(
+                storage.load_session(bad).await.is_err(),
+                "load_session must reject {bad:?}"
+            );
+            assert!(
+                storage.delete_session(bad).await.is_err(),
+                "delete_session must reject {bad:?}"
+            );
+        }
+
+        // save_session validates its session.id too — a crafted id can't write
+        // outside base_path.
+        let evil = Session::new("../../escape", "model");
+        assert!(
+            storage.save_session(&evil).await.is_err(),
+            "save_session must reject a traversal id"
+        );
+
+        // A valid id passes validation: it just doesn't exist yet -> Ok(None),
+        // proving the guard rejects only traversal, not legitimate ids.
+        assert!(matches!(
+            storage.load_session("valid-session-123").await,
+            Ok(None)
+        ));
     }
 
     #[tokio::test]
@@ -187,12 +224,12 @@ mod tests {
 
         storage.save_session(&session).await?;
 
-        assert!(storage.session_path(&session.id).exists());
+        assert!(storage.session_path(&session.id).unwrap().exists());
 
         let deleted = storage.delete_session(&session.id).await?;
 
         assert!(deleted);
-        assert!(!storage.session_path(&session.id).exists());
+        assert!(!storage.session_path(&session.id).unwrap().exists());
 
         fs::remove_dir_all(temp_dir).await?;
         Ok(())
@@ -216,7 +253,7 @@ mod tests {
         fs::create_dir_all(&temp_dir).await?;
         let storage = JsonlStorage::new(&temp_dir);
 
-        let session_path = storage.session_path("test-123");
+        let session_path = storage.session_path("test-123").unwrap();
 
         assert_eq!(session_path.file_name().unwrap(), "test-123.json");
 

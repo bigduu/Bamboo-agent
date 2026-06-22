@@ -151,9 +151,31 @@ fn write_key_file(key: &[u8]) -> Result<()> {
             .map_err(|e| anyhow!("Failed to create key dir {}: {e}", parent.display()))?;
     }
 
-    // Store as hex for easy inspection/backup.
-    std::fs::write(&path, hex::encode(key))
-        .map_err(|e| anyhow!("Failed to write key file {}: {e}", path.display()))?;
+    // Store as hex for easy inspection/backup. This file is the MASTER key for
+    // decrypting all API keys / proxy auth / MCP secrets, so it must NEVER be
+    // world/group readable. On Unix, create it 0600 ATOMICALLY (mode applies at
+    // creation) rather than fs::write + chmod, which would leave a brief umask-perm
+    // (0644) window an attacker could read in. #31.
+    let contents = hex::encode(key);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| anyhow!("Failed to write key file {}: {e}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| anyhow!("Failed to write key file {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, contents)
+            .map_err(|e| anyhow!("Failed to write key file {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -534,5 +556,33 @@ mod tests {
         // Subsequent calls must be stable and load the same key.
         let second = get_encryption_key();
         assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_key = EnvVarGuard::unset(KEY_ENV_VAR);
+        let dir = TempDir::new().expect("tempdir");
+        let _data_dir = EnvPathGuard::set("BAMBOO_DATA_DIR", dir.path());
+
+        // Creating the key writes the master key file.
+        let _ = get_encryption_key();
+        let key_path = crate::paths::bamboo_dir().join(KEY_FILE_NAME);
+        assert!(key_path.exists(), "expected key file to exist");
+
+        // It must be owner-only (0600) — never world/group readable (#31).
+        let mode = std::fs::metadata(&key_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "key file must be 0600, got {:o}",
+            mode & 0o777
+        );
     }
 }
