@@ -5,7 +5,7 @@ use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
 use bamboo_llm::provider::LLMProvider;
 
 pub(super) async fn resolve_token_budget(
-    session: &Session,
+    session: &mut Session,
     config: &AgentLoopConfig,
     model_name: &str,
     llm: &dyn LLMProvider,
@@ -78,12 +78,23 @@ pub(super) async fn resolve_token_budget(
         );
     }
 
-    TokenBudget::with_safety_margin(
+    let resolved = TokenBudget::with_safety_margin(
         model_limit.max_context_tokens,
         model_limit.get_max_output_tokens(),
         bamboo_compression::BudgetStrategy::default(),
         model_limit.get_safety_margin(),
-    )
+    );
+
+    // Cache the resolved budget on the session so every downstream reader of
+    // `session.token_budget` sees the real, model-limit-derived budget instead
+    // of `None` (issue #20 bug 1). Previously this value was only ever returned
+    // to the immediate caller, so `build_context_pressure` (tool-output
+    // truncation), the server context bar, and `estimate_context_compression_exposure`
+    // all fell back to a default/empty-registry budget. The session-override
+    // early-return above makes this a one-time resolution per session.
+    session.token_budget = Some(resolved.clone());
+
+    resolved
 }
 
 /// Apply the legacy `config.json` `model_limits` value (snapshotted from the
@@ -184,6 +195,62 @@ mod tests {
         let bad = serde_json::json!({ "not": "an array" });
         apply_legacy_model_limits(&mut registry, Some(&bad));
         assert!(registry.get("legacy-model").is_none());
+    }
+
+    // Issue #20 bug 1: `resolve_token_budget` must cache the resolved budget on
+    // `session.token_budget`, otherwise every downstream reader
+    // (build_context_pressure, the server context bar,
+    // estimate_context_compression_exposure) sees `None` and silently falls back
+    // to a default/empty-registry budget.
+    #[tokio::test]
+    async fn resolve_token_budget_caches_resolved_budget_on_session() {
+        let mut session = bamboo_agent_core::Session::new("budget-cache", "some-model");
+        assert!(
+            session.token_budget.is_none(),
+            "precondition: a fresh session has no cached budget"
+        );
+
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+
+        let resolved = resolve_token_budget(&mut session, &config, "some-model", &provider).await;
+
+        // The function returns the resolved budget AND caches it on the session,
+        // so the two are identical and `session.token_budget` is no longer None.
+        let cached = session
+            .token_budget
+            .clone()
+            .expect("resolved budget must be cached on the session (#20 bug 1)");
+        assert_eq!(cached.max_context_tokens, resolved.max_context_tokens);
+        assert_eq!(cached.max_output_tokens, resolved.max_output_tokens);
+        assert_eq!(cached.safety_margin, resolved.safety_margin);
+    }
+
+    // A budget already present on the session is the highest-priority source and
+    // must be returned verbatim (never recomputed/overwritten).
+    #[tokio::test]
+    async fn resolve_token_budget_prefers_existing_session_budget() {
+        let mut session = bamboo_agent_core::Session::new("budget-existing", "some-model");
+        let preset = TokenBudget::with_safety_margin(
+            123_456,
+            7_890,
+            bamboo_compression::BudgetStrategy::default(),
+            321,
+        );
+        session.token_budget = Some(preset.clone());
+
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+
+        let resolved = resolve_token_budget(&mut session, &config, "some-model", &provider).await;
+        assert_eq!(resolved.max_context_tokens, 123_456);
+        assert_eq!(resolved.max_output_tokens, 7_890);
+        assert_eq!(resolved.safety_margin, preset.safety_margin);
+        // Still exactly the preset value on the session.
+        assert_eq!(
+            session.token_budget.as_ref().unwrap().max_context_tokens,
+            123_456
+        );
     }
 
     #[derive(Default)]
