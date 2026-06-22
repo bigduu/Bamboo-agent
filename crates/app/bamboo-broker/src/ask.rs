@@ -68,9 +68,15 @@ pub async fn ask_over(
                 ))
             }
             Err(_) => {
+                // We're abandoning this ask — tell the worker to stop the
+                // (expensive) in-flight run instead of letting it burn the whole
+                // LLM call for a result no one will read. Best-effort + out-of-band
+                // (no receipt); a worker that's offline or doesn't understand
+                // Cancel just ignores it. #50.
+                let _ = client.cancel(target, &qid).await;
                 return Err(BrokerError::Transport(format!(
                     "ask to '{target}' timed out after {timeout:?}"
-                )))
+                )));
             }
         }
     }
@@ -109,9 +115,13 @@ pub async fn request_over(
                 ))
             }
             Err(_) => {
+                // Abandoning this request — cancel the worker's in-flight run so
+                // it doesn't burn the whole call for an unread result. Best-effort,
+                // out-of-band. #50.
+                let _ = client.cancel(target, &qid).await;
                 return Err(BrokerError::Transport(format!(
                     "request to '{target}' timed out after {timeout:?}"
-                )))
+                )));
             }
         }
     }
@@ -168,5 +178,112 @@ mod tests {
         .await
         .expect("ask returns an answer");
         assert_eq!(answer, "echo: ping pong");
+    }
+
+    #[tokio::test]
+    async fn ask_timeout_cancels_the_worker_run() {
+        use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(core, "t"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let endpoint = format!("ws://{addr}");
+
+        // A worker that parks on its cancel token forever and records the moment
+        // it is cancelled.
+        let was_cancelled = Arc::new(AtomicBool::new(false));
+        // Completes a non-"park" ask immediately (used to confirm subscription);
+        // parks forever on its cancel token for a "park" ask, recording the cancel.
+        struct ProbeOrPark(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl ChildExecutor for ProbeOrPark {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                cancel: CancellationToken,
+            ) -> ChildOutcome {
+                if spec.assignment.contains("park") {
+                    cancel.cancelled().await;
+                    self.0.store(true, Ordering::SeqCst);
+                    ChildOutcome::cancelled()
+                } else {
+                    ChildOutcome::completed("ready")
+                }
+            }
+        }
+        let ep = endpoint.clone();
+        let flag = was_cancelled.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &ep,
+                AgentRef {
+                    session_id: "w".into(),
+                    role: None,
+                },
+                "t",
+                Arc::new(ProbeOrPark(flag)),
+            )
+            .await;
+        });
+
+        // Probe round-trip FIRST: an out-of-band cancel is dropped if the target
+        // isn't subscribed, so confirm the worker is connected + subscribed before
+        // the timing-sensitive park ask (otherwise a slow worker startup could
+        // race the cancel — the poll loop below can't rescue a dropped cancel).
+        let ready = ask_agent(
+            &endpoint,
+            AgentRef {
+                session_id: "probe".into(),
+                role: None,
+            },
+            "t",
+            "w",
+            "ping",
+            AskMode::Query,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(ready.expect("probe answered"), "ready");
+
+        // Now the park ask against the (confirmed-subscribed) worker times out...
+        let result = ask_agent(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            "t",
+            "w",
+            "park on slow work",
+            AskMode::Query,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(result.is_err(), "ask times out (the worker never replies)");
+
+        // ...and the timeout's out-of-band cancel aborted the worker's in-flight
+        // run (end-to-end: ask_over -> ClientFrame::Cancel -> broker -> worker
+        // next_cancel -> the run's token). #50.
+        let mut observed = false;
+        for _ in 0..100 {
+            if was_cancelled.load(Ordering::SeqCst) {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            observed,
+            "ask_agent timeout cancelled the worker's in-flight run"
+        );
     }
 }
