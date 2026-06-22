@@ -898,6 +898,37 @@ pub struct CleanupResult {
     pub deleted_session_ids: Vec<String>,
 }
 
+/// Atomically write `bytes` to `path`: write a uniquely-named temp file in the
+/// same directory, fsync it to durable storage, then atomically rename over the
+/// target. A crash (OOM, panic, power loss) mid-write can therefore never leave
+/// `path` truncated or half-written — a reader sees either the old content or the
+/// complete new content, never a torn write. The temp is cleaned up on a write
+/// failure. Shared by the persistence layers (vs. a plain `fs::write` overwrite).
+/// #35.
+///
+/// Residuals (tracked in #166): the rename + parent directory are not fsync'd, so
+/// after a power loss the file may revert to the OLD complete content (still never
+/// torn); a crash BETWEEN temp-create and rename leaks an orphan `*.tmp.*` (disk
+/// litter, not corruption — no sweep yet); and [`atomic_rename`] is
+/// remove-then-rename on Windows, where a crash in that window can lose the target.
+pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let tmp = path.with_extension(format!("tmp.{}", Uuid::new_v4()));
+    let write_result = async {
+        let mut file = fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        // fsync so the bytes are durable before the rename publishes them.
+        file.sync_all().await
+    }
+    .await;
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    atomic_rename(&tmp, path).await
+}
+
 async fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
     // Best-effort atomic on Unix. On Windows, rename cannot overwrite.
     match fs::rename(from, to).await {
