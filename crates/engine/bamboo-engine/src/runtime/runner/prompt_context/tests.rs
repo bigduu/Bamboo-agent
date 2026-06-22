@@ -155,6 +155,7 @@ async fn external_memory_includes_project_memory_index_and_omits_global_dream_fa
             Some("session-project-memory"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save project memory");
@@ -210,6 +211,7 @@ async fn external_memory_excludes_other_project_memory_index_content() {
             Some("session-project-a"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save project A memory");
@@ -224,6 +226,7 @@ async fn external_memory_excludes_other_project_memory_index_content() {
             Some("session-project-b"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save project B memory");
@@ -368,6 +371,7 @@ async fn external_memory_renders_relevant_memory_section_for_project_hits() {
             Some("session-recall-project"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save relevant project memory");
@@ -418,6 +422,7 @@ async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
             Some("session-recall-stale"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save stale-eligible project memory");
@@ -515,6 +520,7 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
                 Some("session-recall-topk"),
                 "main-model",
                 false,
+                None,
             )
             .await
             .expect("save project memory");
@@ -563,6 +569,7 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
             Some("session-recall-fallback"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save unrelated project memory");
@@ -577,6 +584,7 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
             Some("session-recall-fallback"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save global fallback memory");
@@ -705,6 +713,7 @@ async fn external_memory_omits_project_index_when_project_prompt_injection_disab
             Some("session-no-project-index"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save project memory");
@@ -770,6 +779,7 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
             Some("session-global-dream-mode"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save relevant project memory");
@@ -848,6 +858,7 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
             Some("session-rerank-recall"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save lexical-first memory");
@@ -862,6 +873,7 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
             Some("session-rerank-recall"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save reranked-first memory");
@@ -943,6 +955,7 @@ async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
             Some("session-rerank-reload"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save lexical-first memory");
@@ -957,6 +970,7 @@ async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
             Some("session-rerank-reload"),
             "main-model",
             false,
+            None,
         )
         .await
         .expect("save reranked-first memory");

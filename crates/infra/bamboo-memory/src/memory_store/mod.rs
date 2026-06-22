@@ -28,7 +28,7 @@ pub use types::{
     DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult, MemoryContradictionResult,
     MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPurgeResult,
     MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemoryScope,
-    MemorySplitPiece, MemorySplitResult, SessionState,
+    MemorySplitPiece, MemorySplitResult, SessionState, TemporalGranularity,
 };
 
 pub const MEMORY_SCHEMA_VERSION: u32 = 1;
@@ -410,6 +410,11 @@ pub struct LexicalIndexItem {
     pub updated_at: String,
     pub created_at: String,
     pub summary: String,
+    /// Optional temporal granularity carried from the source frontmatter so recall
+    /// can rank by cache-stability without re-reading every document. Back-compat:
+    /// older `lexical.json` index files predate this field and deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<TemporalGranularity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -693,5 +698,103 @@ mod tests {
     fn parse_markdown_document_requires_frontmatter() {
         let result = parse_markdown_document("plain body");
         assert!(result.is_err());
+    }
+
+    /// Back-compat: a memory document written before the temporal-granularity
+    /// dimension existed (its frontmatter has no `granularity` key) must still
+    /// parse, with `granularity` defaulting to `None`.
+    #[test]
+    fn legacy_frontmatter_without_granularity_parses_to_none() {
+        let legacy = "---\n\
+id: mem-legacy\n\
+title: Legacy memory\n\
+type: project\n\
+scope: project\n\
+project_key: proj-1\n\
+status: active\n\
+created_at: 2026-01-01T00:00:00Z\n\
+updated_at: 2026-01-01T00:00:00Z\n\
+created_by:\n  kind: session\n\
+updated_by:\n  kind: memory_write\n\
+---\n\
+Legacy body content.\n";
+        let (frontmatter, body) =
+            parse_markdown_document(legacy).expect("legacy document should parse");
+        assert_eq!(frontmatter.id, "mem-legacy");
+        assert_eq!(frontmatter.granularity, None);
+        assert_eq!(body, "Legacy body content.");
+    }
+
+    /// A granularity set on the frontmatter round-trips through render + parse.
+    #[test]
+    fn granularity_round_trips_through_render_and_parse() {
+        let legacy = "---\n\
+id: mem-legacy\n\
+title: Legacy memory\n\
+type: project\n\
+scope: project\n\
+project_key: proj-1\n\
+status: active\n\
+created_at: 2026-01-01T00:00:00Z\n\
+updated_at: 2026-01-01T00:00:00Z\n\
+created_by:\n  kind: session\n\
+updated_by:\n  kind: memory_write\n\
+---\n\
+Body.\n";
+        let (mut frontmatter, body) = parse_markdown_document(legacy).unwrap();
+        frontmatter.granularity = Some(TemporalGranularity::Quarter);
+
+        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
+        assert!(rendered.contains("granularity: quarter"));
+
+        let (reparsed, _) = parse_markdown_document(&rendered).unwrap();
+        assert_eq!(reparsed.granularity, Some(TemporalGranularity::Quarter));
+    }
+
+    /// `None` granularity must not emit a `granularity:` key (skip_serializing_if),
+    /// so existing documents re-rendered after a load keep their on-disk shape.
+    #[test]
+    fn none_granularity_is_omitted_on_render() {
+        let legacy = "---\n\
+id: mem-legacy\n\
+title: Legacy memory\n\
+type: project\n\
+scope: project\n\
+project_key: proj-1\n\
+status: active\n\
+created_at: 2026-01-01T00:00:00Z\n\
+updated_at: 2026-01-01T00:00:00Z\n\
+created_by:\n  kind: session\n\
+updated_by:\n  kind: memory_write\n\
+---\n\
+Body.\n";
+        let (frontmatter, body) = parse_markdown_document(legacy).unwrap();
+        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
+        assert!(!rendered.contains("granularity"));
+    }
+
+    #[test]
+    fn temporal_granularity_parse_is_case_insensitive_and_rejects_unknown() {
+        assert_eq!(
+            TemporalGranularity::parse("Week"),
+            Some(TemporalGranularity::Week)
+        );
+        assert_eq!(
+            TemporalGranularity::parse("  YEAR "),
+            Some(TemporalGranularity::Year)
+        );
+        assert_eq!(TemporalGranularity::parse("decade"), None);
+    }
+
+    #[test]
+    fn cache_stability_rank_orders_coarse_before_fine_and_none_first() {
+        use TemporalGranularity::*;
+        let rank = TemporalGranularity::cache_stability_rank;
+        // None is treated as most stable, then coarsest → finest.
+        assert!(rank(None) < rank(Some(Year)));
+        assert!(rank(Some(Year)) < rank(Some(Quarter)));
+        assert!(rank(Some(Quarter)) < rank(Some(Month)));
+        assert!(rank(Some(Month)) < rank(Some(Week)));
+        assert!(rank(Some(Week)) < rank(Some(Day)));
     }
 }

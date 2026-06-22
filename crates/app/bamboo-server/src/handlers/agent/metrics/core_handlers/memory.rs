@@ -519,6 +519,7 @@ mod tests {
                 Some("session-1"),
                 "tester",
                 false,
+                None,
             )
             .await
             .expect("write global memory");
@@ -533,6 +534,7 @@ mod tests {
                 Some("session-1"),
                 "tester",
                 false,
+                None,
             )
             .await
             .expect("write project memory");
@@ -583,6 +585,7 @@ mod tests {
                     Some("session-1"),
                     "tester",
                     false,
+                    None,
                 )
                 .await
                 .expect("write project memory");
@@ -651,6 +654,7 @@ mod tests {
                 Some("session-metrics-a"),
                 "tester",
                 false,
+                None,
             )
             .await
             .expect("write project memory");
@@ -802,6 +806,7 @@ mod tests {
                 Some("session-1"),
                 "tester",
                 false,
+                None,
             )
             .await
             .expect("write first memory");
@@ -816,6 +821,7 @@ mod tests {
                 Some("session-1"),
                 "tester",
                 false,
+                None,
             )
             .await
             .expect("write second memory");

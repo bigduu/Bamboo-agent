@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 
 use bamboo_agent_core::tools::ToolError;
-use bamboo_memory::memory_store::{DurableMemoryStatus, DurableMemoryType, MemoryScope};
+use bamboo_memory::memory_store::{
+    DurableMemoryStatus, DurableMemoryType, MemoryScope, TemporalGranularity,
+};
 
 use super::args::{FilterTypeSet, QueryFilters};
 use super::MemoryTool;
@@ -23,6 +25,22 @@ impl MemoryTool {
                 "invalid scope '{other}'; expected one of: session, project, global"
             ))),
         }
+    }
+
+    /// Parse an optional temporal granularity. `None`/empty stays `None` (the memory
+    /// simply carries no temporal dimension), preserving back-compat. An unknown
+    /// non-empty value is rejected so typos surface instead of silently dropping.
+    pub(super) fn parse_granularity(
+        granularity: Option<&str>,
+    ) -> Result<Option<TemporalGranularity>, ToolError> {
+        let Some(value) = granularity.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        TemporalGranularity::parse(value).map(Some).ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "invalid granularity '{value}'; expected one of: day, week, month, quarter, year"
+            ))
+        })
     }
 
     pub(super) fn parse_type(value: &str) -> Result<DurableMemoryType, ToolError> {

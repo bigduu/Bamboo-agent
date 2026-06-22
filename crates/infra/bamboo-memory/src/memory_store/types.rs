@@ -21,6 +21,78 @@ impl MemoryScope {
     }
 }
 
+/// Temporal granularity of a memory: an orthogonal dimension to [`MemoryScope`]
+/// that describes the *time horizon* a memory is meant to be valid over.
+///
+/// This is additive and optional — memories written before this dimension existed
+/// (and any caller that does not set it) simply carry `None`, which preserves the
+/// pre-existing behavior exactly. The dimension is intentionally NOT used as a hard
+/// recall filter that flips the recalled subset every hour/day, because the recalled
+/// memories are spliced into the LLM prompt prefix and a churning subset would shred
+/// prompt prefix-cache hit rates. Instead it is a stable *ranking / ordering* signal:
+/// coarser-grained memories (year/quarter) are low-frequency and cache-friendly and
+/// sort earlier (toward the stable prefix); finer-grained memories (day/week) change
+/// more often and sort later (toward the volatile suffix). See issue #61.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalGranularity {
+    /// Finest granularity. Highest churn, fastest to go stale (debugging notes,
+    /// today's working context). Least prefix-cache friendly → ranks last.
+    Day,
+    /// Sprint-level / weekly priorities and progress.
+    Week,
+    /// Monthly decisions and phase summaries.
+    Month,
+    /// Quarter-level direction, large refactor plans.
+    Quarter,
+    /// Coarsest granularity. Lowest churn, longest-lived (long-term goals, system
+    /// evolution). Most prefix-cache friendly → ranks first.
+    Year,
+}
+
+impl TemporalGranularity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Quarter => "quarter",
+            Self::Year => "year",
+        }
+    }
+
+    /// Parse a case-insensitive granularity token. Returns `None` for unknown values
+    /// so callers can decide whether to error or fall back to the default.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "day" => Some(Self::Day),
+            "week" => Some(Self::Week),
+            "month" => Some(Self::Month),
+            "quarter" => Some(Self::Quarter),
+            "year" => Some(Self::Year),
+            _ => None,
+        }
+    }
+
+    /// Cache-stability rank: lower number = coarser = more prefix-cache friendly and
+    /// should be ordered earlier (toward the stable prompt prefix). Higher number =
+    /// finer = higher churn and should be ordered later (toward the volatile suffix).
+    ///
+    /// Memories with no granularity set are treated as the most stable (rank 0) so
+    /// existing/unclassified memories keep their current placement and never get
+    /// demoted below classified ones purely for lacking the new dimension.
+    pub fn cache_stability_rank(granularity: Option<Self>) -> u8 {
+        match granularity {
+            None => 0,
+            Some(Self::Year) => 1,
+            Some(Self::Quarter) => 2,
+            Some(Self::Month) => 3,
+            Some(Self::Week) => 4,
+            Some(Self::Day) => 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum DurableMemoryType {
@@ -111,6 +183,11 @@ pub struct DurableMemoryFrontmatter {
     pub scope: MemoryScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
+    /// Optional temporal granularity (day/week/month/quarter/year). Orthogonal to
+    /// `scope`. Defaults to `None` for back-compat: memory documents written before
+    /// this dimension existed simply omit the field and deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<TemporalGranularity>,
     pub status: DurableMemoryStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
@@ -189,6 +266,8 @@ pub struct MemoryQueryItem {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<TemporalGranularity>,
     pub relevance: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_ids: Vec<String>,
