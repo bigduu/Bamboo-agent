@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use bamboo_subagent::InboxMessage;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, WebSocketStream};
 
-use crate::core::BrokerCore;
+use crate::core::{BrokerCore, PushItem};
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::{BrokerFrame, ClientFrame};
 
@@ -90,7 +89,7 @@ impl BrokerServer {
         send(&mut sink, BrokerFrame::Welcome).await?;
 
         // 2. Serve: client frames in, subscription stream out.
-        let mut sub_rx: Option<mpsc::UnboundedReceiver<InboxMessage>> = None;
+        let mut sub_rx: Option<mpsc::UnboundedReceiver<PushItem>> = None;
         let outcome = loop {
             tokio::select! {
                 biased;
@@ -121,17 +120,25 @@ impl BrokerServer {
                         }
                         // A second Hello is meaningless mid-session; ignore.
                         Ok(Some(ClientFrame::Hello { .. })) => {}
-                        // Out-of-band cancel: routed in a follow-up (#50 PR-2);
-                        // parsed-but-ignored here so the variant lands inertly.
-                        Ok(Some(ClientFrame::Cancel { .. })) => {}
+                        // Out-of-band, fire-and-forget cancel: signal the target's
+                        // live subscriber (if any). No Delivered receipt, no mailbox
+                        // write — pure control signal. #50.
+                        Ok(Some(ClientFrame::Cancel { to, correlation_id })) => {
+                            self.core.cancel(&to, &correlation_id).await;
+                        }
                         Ok(None) => break Ok(()),   // client closed
                         Err(e) => break Err(e),
                     }
                 }
                 pushed = next_pushed(&mut sub_rx) => {
                     match pushed {
-                        Some(m) => {
+                        Some(PushItem::Message(m)) => {
                             if send(&mut sink, BrokerFrame::Message { message: m }).await.is_err() {
+                                break Ok(());
+                            }
+                        }
+                        Some(PushItem::Cancel(correlation_id)) => {
+                            if send(&mut sink, BrokerFrame::Cancel { correlation_id }).await.is_err() {
                                 break Ok(());
                             }
                         }
@@ -148,9 +155,7 @@ impl BrokerServer {
 
 /// Await the next pushed message, or never resolve when not subscribed (so the
 /// `select` arm is inert until a `Subscribe` arrives).
-async fn next_pushed(
-    rx: &mut Option<mpsc::UnboundedReceiver<InboxMessage>>,
-) -> Option<InboxMessage> {
+async fn next_pushed(rx: &mut Option<mpsc::UnboundedReceiver<PushItem>>) -> Option<PushItem> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
