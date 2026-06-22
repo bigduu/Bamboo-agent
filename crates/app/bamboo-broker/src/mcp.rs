@@ -9,6 +9,7 @@
 //! - Orchestrator side: [`serve_mcp_proxy`] answers `McpRequest`s from a backend
 //!   [`ToolExecutor`] (the real `McpServerManager`).
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -78,6 +79,97 @@ pub struct ProxiedResult {
     pub result: String,
 }
 
+// ---- role allowlist (issue #54) ----------------------------------------------
+
+/// Per-role allowlist that scopes which host-bound MCP tools a worker may see
+/// and call through the proxy (principle of least privilege).
+///
+/// The orchestrator's MCP host exposes powerful, host-bound tools (screen
+/// capture, local credentials, …). Without scoping, *every* worker — regardless
+/// of role — gets the orchestrator's entire MCP tool set in both its advertised
+/// manifest and as a callable surface, so a hallucinating worker could invoke a
+/// tool its role has no business touching. This policy lets the deployer restrict
+/// each role to an explicit set of tools.
+///
+/// Resolution for a requesting worker's role (`AgentRef.role`):
+/// - **Role with an explicit allowlist** → only the intersection of that
+///   allowlist with the backend's tools is exposed; a `Call` for a tool not on
+///   the allowlist is rejected (defense in depth — the manifest already hides it,
+///   but a worker could still try to call it directly).
+/// - **Role with no entry, or a request with no role** → all tools are exposed
+///   (backward compatible). An empty/default allowlist therefore restricts
+///   nothing, preserving the behavior of existing unrestricted workers.
+///
+/// The default is **allow-all for unlisted roles** (not deny-by-default) so that
+/// dropping this feature in does not silently strip tools from already-deployed
+/// workers; the issue (#54) asks for restricted roles to be filtered while
+/// default/unrestricted roles keep all tools. Restrictions are therefore opt-in
+/// and explicit per role.
+#[derive(Debug, Clone, Default)]
+pub struct RoleToolAllowlist {
+    /// role → set of tool names that role is allowed to proxy. A role absent from
+    /// this map is unrestricted (sees/can call all backend tools).
+    by_role: HashMap<String, HashSet<String>>,
+}
+
+impl RoleToolAllowlist {
+    /// An empty allowlist: every role is unrestricted (back-compat default).
+    pub fn unrestricted() -> Self {
+        Self::default()
+    }
+
+    /// Build from `(role, allowed_tool_names)` entries. A role mapped to an empty
+    /// set is still "restricted" — it gets *no* tools (an explicit lockout),
+    /// distinct from a role that is simply absent (unrestricted).
+    pub fn from_entries<R, T, I>(entries: I) -> Self
+    where
+        R: Into<String>,
+        T: Into<String>,
+        I: IntoIterator<Item = (R, Vec<T>)>,
+    {
+        let by_role = entries
+            .into_iter()
+            .map(|(role, tools)| (role.into(), tools.into_iter().map(Into::into).collect()))
+            .collect();
+        Self { by_role }
+    }
+
+    /// Add/replace one role's allowlist (builder-style).
+    pub fn with_role(
+        mut self,
+        role: impl Into<String>,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.by_role
+            .insert(role.into(), tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Whether `role` is restricted (has an explicit allowlist entry). A `None`
+    /// role, or a role with no entry, is unrestricted.
+    fn is_restricted(&self, role: Option<&str>) -> bool {
+        role.is_some_and(|r| self.by_role.contains_key(r))
+    }
+
+    /// Whether `role` is allowed to use `tool`. Unrestricted roles allow any tool;
+    /// a restricted role allows only the tools on its set.
+    fn allows(&self, role: Option<&str>, tool: &str) -> bool {
+        match role.and_then(|r| self.by_role.get(r)) {
+            Some(allowed) => allowed.contains(tool),
+            None => true, // unrestricted (no entry / no role)
+        }
+    }
+
+    /// Filter a full tool manifest down to what `role` may see. Unrestricted
+    /// roles get the manifest unchanged; restricted roles get the intersection.
+    fn filter_manifest(&self, role: Option<&str>, mut tools: Vec<ToolSchema>) -> Vec<ToolSchema> {
+        if let Some(allowed) = role.and_then(|r| self.by_role.get(r)) {
+            tools.retain(|t| allowed.contains(&t.function.name));
+        }
+        tools
+    }
+}
+
 // ---- orchestrator side --------------------------------------------------------
 
 /// Run the orchestrator-side MCP proxy: connect as `me`, subscribe, and answer
@@ -88,6 +180,7 @@ pub async fn serve_mcp_proxy(
     me: AgentRef,
     token: &str,
     backend: Arc<dyn ToolExecutor>,
+    allowlist: Arc<RoleToolAllowlist>,
 ) -> BrokerResult<()> {
     let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
     client.subscribe().await?;
@@ -131,11 +224,12 @@ pub async fn serve_mcp_proxy(
                     continue;
                 }
                 let backend = Arc::clone(&backend);
+                let allowlist = Arc::clone(&allowlist);
                 let reply_tx = reply_tx.clone();
                 let corr = msg.id.clone();
                 let reply_to = msg.from.session_id.clone();
                 tokio::spawn(async move {
-                    let reply_body = handle_mcp_request(backend.as_ref(), msg).await;
+                    let reply_body = handle_mcp_request(backend.as_ref(), &allowlist, msg).await;
                     // Receiver gone == loop exited (connection dropped) -> drop.
                     let _ = reply_tx.send((corr, reply_to, reply_body));
                 });
@@ -165,10 +259,19 @@ pub async fn serve_mcp_proxy_supervised(
     me: AgentRef,
     token: &str,
     backend: Arc<dyn ToolExecutor>,
+    allowlist: Arc<RoleToolAllowlist>,
     shutdown: CancellationToken,
 ) {
     supervise_reconnect(
-        || serve_mcp_proxy(endpoint, me.clone(), token, backend.clone()),
+        || {
+            serve_mcp_proxy(
+                endpoint,
+                me.clone(),
+                token,
+                backend.clone(),
+                allowlist.clone(),
+            )
+        },
         shutdown,
         PROXY_RECONNECT_INITIAL_BACKOFF,
         PROXY_RECONNECT_MAX_BACKOFF,
@@ -235,13 +338,46 @@ async fn supervise_reconnect<F, Fut>(
     }
 }
 
-async fn handle_mcp_request(backend: &dyn ToolExecutor, msg: InboxMessage) -> McpReply {
+async fn handle_mcp_request(
+    backend: &dyn ToolExecutor,
+    allowlist: &RoleToolAllowlist,
+    msg: InboxMessage,
+) -> McpReply {
+    // The requesting worker's role scopes which host-bound tools it may proxy
+    // (issue #54). `None`/unlisted roles are unrestricted (back-compat).
+    let role = msg.from.role.as_deref();
     match serde_json::from_value::<McpRequest>(msg.body) {
-        Ok(McpRequest::Manifest) => McpReply {
-            manifest: Some(backend.list_tools()),
-            ..Default::default()
-        },
+        Ok(McpRequest::Manifest) => {
+            let tools = allowlist.filter_manifest(role, backend.list_tools());
+            if allowlist.is_restricted(role) {
+                tracing::debug!(
+                    role = role.unwrap_or("<none>"),
+                    tools = tools.len(),
+                    "mcp proxy: serving role-scoped manifest"
+                );
+            }
+            McpReply {
+                manifest: Some(tools),
+                ..Default::default()
+            }
+        }
         Ok(McpRequest::Call { tool, arguments }) => {
+            // Defense in depth: the manifest already hides disallowed tools, but a
+            // worker could still try to call one directly — reject it here too.
+            if !allowlist.allows(role, &tool) {
+                tracing::warn!(
+                    role = role.unwrap_or("<none>"),
+                    tool = %tool,
+                    "mcp proxy: rejecting tool call not on role allowlist"
+                );
+                return McpReply {
+                    error: Some(format!(
+                        "tool '{tool}' is not allowed for role '{}'",
+                        role.unwrap_or("<none>")
+                    )),
+                    ..Default::default()
+                };
+            }
             let call = ToolCall {
                 id: format!("mcp-{}", MsgId::new().as_str()),
                 tool_type: "function".to_string(),
@@ -568,6 +704,179 @@ mod tests {
         }
     }
 
+    /// A multi-tool host-bound MCP stub: a privileged screen tool + a benign one.
+    struct MultiToolMcp;
+
+    #[async_trait]
+    impl ToolExecutor for MultiToolMcp {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                success: true,
+                result: format!("ran {}", call.function.name),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.execute(call).await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["nova_screenshot", "nova_click", "fetch_url"]
+                .into_iter()
+                .map(|name| ToolSchema {
+                    schema_type: "function".into(),
+                    function: FunctionSchema {
+                        name: name.into(),
+                        description: "t".into(),
+                        parameters: json!({ "type": "object" }),
+                    },
+                })
+                .collect()
+        }
+    }
+
+    /// Build a worker `McpRequest` inbox message with a given role, as the broker
+    /// would deliver it to the orchestrator's `handle_mcp_request`.
+    fn worker_request(role: Option<&str>, req: McpRequest) -> InboxMessage {
+        InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "worker#mcp".into(),
+                role: role.map(Into::into),
+            },
+            kind: InboxKind::McpRequest,
+            body: serde_json::to_value(req).unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        }
+    }
+
+    fn manifest_names(reply: &McpReply) -> Vec<String> {
+        reply
+            .manifest
+            .as_ref()
+            .expect("manifest reply")
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect()
+    }
+
+    /// Issue #54: a role WITH an allowlist sees only its allowed tools in the
+    /// manifest; an unrestricted role (no entry / no role) sees ALL tools.
+    #[tokio::test]
+    async fn manifest_is_filtered_by_role_allowlist() {
+        let backend = MultiToolMcp;
+        // "researcher" may only proxy the benign fetch tool — not the screen tools.
+        let allowlist = RoleToolAllowlist::unrestricted().with_role("researcher", ["fetch_url"]);
+
+        // Restricted role → intersection only.
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(Some("researcher"), McpRequest::Manifest),
+        )
+        .await;
+        assert_eq!(manifest_names(&reply), vec!["fetch_url".to_string()]);
+
+        // A role with no allowlist entry is unrestricted → all tools.
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(Some("operator"), McpRequest::Manifest),
+        )
+        .await;
+        assert_eq!(manifest_names(&reply).len(), 3);
+
+        // No role at all is unrestricted too (back-compat) → all tools.
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(None, McpRequest::Manifest),
+        )
+        .await;
+        assert_eq!(manifest_names(&reply).len(), 3);
+    }
+
+    /// Issue #54: defense in depth — a restricted role's `Call` for a tool not on
+    /// its allowlist is REJECTED (the manifest hides it, but a worker could still
+    /// try to call it directly). An allowed tool still executes.
+    #[tokio::test]
+    async fn call_is_rejected_when_tool_not_on_role_allowlist() {
+        let backend = MultiToolMcp;
+        let allowlist = RoleToolAllowlist::unrestricted().with_role("researcher", ["fetch_url"]);
+
+        // Disallowed tool → error, backend NOT invoked.
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(
+                Some("researcher"),
+                McpRequest::Call {
+                    tool: "nova_screenshot".into(),
+                    arguments: "{}".into(),
+                },
+            ),
+        )
+        .await;
+        assert!(reply.result.is_none());
+        let err = reply.error.expect("a rejection error");
+        assert!(
+            err.contains("nova_screenshot") && err.contains("not allowed"),
+            "{err}"
+        );
+
+        // Allowed tool → executes normally.
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(
+                Some("researcher"),
+                McpRequest::Call {
+                    tool: "fetch_url".into(),
+                    arguments: "{}".into(),
+                },
+            ),
+        )
+        .await;
+        assert!(reply.error.is_none());
+        assert_eq!(reply.result.expect("result").result, "ran fetch_url");
+
+        // Unrestricted role may call any tool.
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(
+                None,
+                McpRequest::Call {
+                    tool: "nova_screenshot".into(),
+                    arguments: "{}".into(),
+                },
+            ),
+        )
+        .await;
+        assert!(reply.error.is_none());
+        assert_eq!(reply.result.expect("result").result, "ran nova_screenshot");
+    }
+
+    /// A role mapped to an EMPTY allowlist is an explicit lockout (no tools),
+    /// distinct from an absent role (unrestricted).
+    #[tokio::test]
+    async fn empty_allowlist_entry_is_explicit_lockout() {
+        let backend = MultiToolMcp;
+        let allowlist = RoleToolAllowlist::from_entries(vec![("sandbox", Vec::<String>::new())]);
+        let reply = handle_mcp_request(
+            &backend,
+            &allowlist,
+            worker_request(Some("sandbox"), McpRequest::Manifest),
+        )
+        .await;
+        assert!(manifest_names(&reply).is_empty());
+    }
+
     #[tokio::test]
     async fn proxy_lists_and_forwards_calls_over_the_broker() {
         let dir = tempfile::tempdir().unwrap();
@@ -591,6 +900,7 @@ mod tests {
                 },
                 TOKEN,
                 Arc::new(StubMcp),
+                Arc::new(RoleToolAllowlist::unrestricted()),
             )
             .await;
         });
@@ -659,6 +969,7 @@ mod tests {
                 },
                 TOKEN,
                 Arc::new(StubMcp),
+                Arc::new(RoleToolAllowlist::unrestricted()),
             )
             .await;
         });
@@ -759,6 +1070,7 @@ mod tests {
                 },
                 TOKEN,
                 Arc::new(SlowMcp),
+                Arc::new(RoleToolAllowlist::unrestricted()),
             )
             .await;
         });
