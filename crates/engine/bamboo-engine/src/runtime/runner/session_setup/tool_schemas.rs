@@ -45,8 +45,13 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     tool_schemas.extend(config.additional_tool_schemas.clone());
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
-    if !config.disabled_tools.is_empty() {
-        tool_schemas.retain(|schema| !config.disabled_tools.contains(&schema.function.name));
+    // Resolve the disabled set LIVE each round (#136): when a resolver is wired
+    // (server path) a tool disabled/re-enabled mid-run takes effect on the next
+    // round, because this list is rebuilt unfiltered every round; with no resolver
+    // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
+    let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
+    if !disabled_tools.is_empty() {
+        tool_schemas.retain(|schema| !disabled_tools.contains(&schema.function.name));
     }
 
     // The `update_goal` self-report tool is only meaningful while the autonomous
