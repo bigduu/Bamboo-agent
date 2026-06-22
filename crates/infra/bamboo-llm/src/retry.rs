@@ -309,6 +309,10 @@ mod tests {
         let resp = run(&fast_config(3), &server).await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one 503 then one success");
+        // The success response's body survives the retry wrapper intact (the
+        // headline streaming-safety guarantee: retry inspects status only, never
+        // consumes the body, and returns the final Response whole).
+        assert_eq!(resp.text().await.unwrap(), "ok");
     }
 
     #[tokio::test]

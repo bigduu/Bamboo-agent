@@ -100,6 +100,12 @@ where
     let mut messages_open = true;
     loop {
         tokio::select! {
+            // `biased`: drain finished handlers (arm A) ahead of pulling new
+            // work/cancels (arm B) so completed replies are delivered+acked and
+            // their in-flight entries cleared promptly, bounding memory under load.
+            // (#144's serve_mcp_proxy is unbiased; here arm B internally biases the
+            // cancel lane, so cancel latency stays prompt — completions are gated by
+            // real agent work, so arm B is always reached between them.)
             biased;
             // A. A finished handler: deliver its reply (if any) then ack — the ack
             //    still strictly follows a delivered reply, as before. Done on the
@@ -205,6 +211,15 @@ where
 /// A `Task` is treated as a steer (it advances the agent's work). Works with the
 /// real `BambooRuntime` executor in production and with `EchoExecutor` (no LLM)
 /// for deterministic tests.
+///
+/// CONCURRENCY (#45): inbound Asks are now handled concurrently (see [`serve_loop`]).
+/// All Asks to this worker share one `context` vector. For `Query` (the common,
+/// non-persisting mode) that is fully safe — pure overlap, no mutation. For two
+/// *concurrent* `Steer`s the per-push critical section is atomic (no corruption),
+/// but their persisted ordering is non-deterministic and a steer started mid-run
+/// sees the pre-push context — i.e. concurrent steers to ONE worker interleave by
+/// design. If strict steer ordering is ever required, hold the context lock across
+/// read→run→push for steers (leaving queries concurrent).
 pub async fn serve_executor<E>(
     endpoint: &str,
     me: AgentRef,
@@ -560,8 +575,8 @@ mod tests {
             .expect("present");
         assert_eq!(reply1.correlation_id, Some(qid1));
 
-        // Ask 2: the worker is still serving (serial), and a normal ask completes
-        // correctly — proving the cancel didn't break the loop or its context.
+        // Ask 2: the worker is still serving, and a normal ask completes correctly
+        // — proving the cancel didn't break the loop or its context.
         let q2 = ask("orch", "hello");
         let qid2 = q2.id.clone();
         orch.deliver("worker", q2).await.unwrap();
