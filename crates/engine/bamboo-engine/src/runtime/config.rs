@@ -463,6 +463,14 @@ pub struct AgentLoopConfig {
     /// for fast/background/planning/search/summarization helpers.
     pub(crate) auxiliary_model_resolver:
         Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    /// Optional per-round resolver for the disabled tool/skill sets so they follow
+    /// LIVE global config instead of staying frozen for the whole run. Returns the
+    /// current `(disabled_tools, disabled_skill_ids)`. When `None`, the snapshotted
+    /// `disabled_tools` / `disabled_skill_ids` fields below are used (#44 behavior).
+    /// Re-resolved each round at the tool-schema filter, so disabling/re-enabling a
+    /// tool mid-run takes effect on the next round. #136.
+    pub(crate) disabled_filter_resolver:
+        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
     /// Server-level usage guidance contributed by the run's tool executor —
     /// chiefly the `instructions` connected MCP servers return from `initialize`.
     /// Captured once at config construction (from `ToolExecutor::tool_guidance`)
@@ -532,12 +540,38 @@ impl Default for AgentLoopConfig {
             approval_delegate: None,
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,
+            disabled_filter_resolver: None,
             mcp_tool_guidance: None,
         }
     }
 }
 
 impl AgentLoopConfig {
+    /// Live `(disabled_tools, disabled_skill_ids)` for the current round: the
+    /// resolver if one is wired (#136 — follows live global config between
+    /// rounds), else the per-run snapshot (#44 frozen behavior). `Cow` avoids
+    /// cloning the snapshot in the common no-resolver path (SDK / tests).
+    pub(crate) fn resolve_disabled_filters(
+        &self,
+    ) -> (
+        std::borrow::Cow<'_, BTreeSet<String>>,
+        std::borrow::Cow<'_, BTreeSet<String>>,
+    ) {
+        match &self.disabled_filter_resolver {
+            Some(resolver) => {
+                let (tools, skills) = resolver();
+                (
+                    std::borrow::Cow::Owned(tools),
+                    std::borrow::Cow::Owned(skills),
+                )
+            }
+            None => (
+                std::borrow::Cow::Borrowed(&self.disabled_tools),
+                std::borrow::Cow::Borrowed(&self.disabled_skill_ids),
+            ),
+        }
+    }
+
     /// The active session goal to surface to the main agent, or `None` when
     /// Gold is disabled or no goal is set. Falls back to the legacy
     /// `evaluation_prompt` for back-compat via [`GoldConfig::effective_goal`].

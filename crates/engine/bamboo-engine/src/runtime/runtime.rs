@@ -281,6 +281,10 @@ pub struct ExecuteRequest {
     /// Optional per-round resolver for auxiliary model settings that should be
     /// re-read from live global config between rounds.
     pub auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    /// Optional per-round live resolver for the disabled tool/skill sets (#136).
+    /// When `None`, the snapshotted `disabled_tools`/`disabled_skill_ids` are used.
+    pub disabled_filter_resolver:
+        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
     /// When `None`, falls back to `Config::disabled_tool_names()`.
     pub disabled_tools: Option<BTreeSet<String>>,
     /// When `None`, falls back to `Config::disabled_skill_ids()`.
@@ -337,6 +341,8 @@ pub struct ExecuteRequestBuilder {
     summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     reasoning_effort: Option<ReasoningEffort>,
     auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    disabled_filter_resolver:
+        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
     disabled_tools: Option<BTreeSet<String>>,
     disabled_skill_ids: Option<BTreeSet<String>>,
     selected_skill_ids: Option<Vec<String>>,
@@ -374,6 +380,7 @@ impl ExecuteRequestBuilder {
             summarization_model_provider: None,
             reasoning_effort: None,
             auxiliary_model_resolver: None,
+            disabled_filter_resolver: None,
             disabled_tools: None,
             disabled_skill_ids: None,
             selected_skill_ids: None,
@@ -486,6 +493,15 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the per-round resolver for the live disabled tool/skill sets (#136).
+    pub fn disabled_filter_resolver(
+        mut self,
+        v: Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>,
+    ) -> Self {
+        self.disabled_filter_resolver = Some(v);
+        self
+    }
+
     /// Set the disabled tool names (merged with config defaults at runtime).
     pub fn disabled_tools(mut self, v: BTreeSet<String>) -> Self {
         self.disabled_tools = Some(v);
@@ -582,6 +598,7 @@ impl ExecuteRequestBuilder {
             model_roster,
             reasoning_effort: self.reasoning_effort,
             auxiliary_model_resolver: self.auxiliary_model_resolver,
+            disabled_filter_resolver: self.disabled_filter_resolver,
             disabled_tools: self.disabled_tools,
             disabled_skill_ids: self.disabled_skill_ids,
             selected_skill_ids: self.selected_skill_ids,
@@ -634,6 +651,7 @@ impl AgentRuntime {
             model_roster,
             reasoning_effort,
             auxiliary_model_resolver,
+            disabled_filter_resolver,
             disabled_tools,
             disabled_skill_ids,
             selected_skill_ids,
@@ -704,6 +722,7 @@ impl AgentRuntime {
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,
+            disabled_filter_resolver,
             disabled_tools: {
                 let mut merged = config.disabled_tool_names();
                 if let Some(dt) = disabled_tools {

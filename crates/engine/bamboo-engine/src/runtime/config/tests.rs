@@ -69,3 +69,48 @@ fn prompt_memory_flags_map_from_memory_config() {
     assert!(flags.relevant_recall_rerank);
     assert!(!flags.project_first_dream);
 }
+
+#[test]
+fn resolve_disabled_filters_uses_snapshot_without_resolver() {
+    // #44 frozen behavior: with no resolver, the snapshotted sets are returned.
+    let mut config = AgentLoopConfig::default();
+    config.disabled_tools = std::collections::BTreeSet::from(["frozen_tool".to_string()]);
+    config.disabled_skill_ids = std::collections::BTreeSet::from(["frozen_skill".to_string()]);
+
+    let (tools, skills) = config.resolve_disabled_filters();
+    assert!(tools.contains("frozen_tool"));
+    assert!(skills.contains("frozen_skill"));
+}
+
+#[test]
+fn resolve_disabled_filters_uses_live_resolver_and_reinvokes() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    // #136: a wired resolver overrides the snapshot AND is re-invoked each call,
+    // so the set can change between rounds.
+    let calls = Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let mut config = AgentLoopConfig::default();
+    config.disabled_tools = std::collections::BTreeSet::from(["ignored_snapshot".to_string()]);
+    config.disabled_filter_resolver = Some(Arc::new(move || {
+        let n = c.fetch_add(1, Ordering::SeqCst);
+        (
+            std::collections::BTreeSet::from([format!("live-{n}")]),
+            std::collections::BTreeSet::new(),
+        )
+    }));
+
+    let (t1, _) = config.resolve_disabled_filters();
+    assert!(t1.contains("live-0"), "resolver result is used");
+    assert!(
+        !t1.contains("ignored_snapshot"),
+        "the resolver overrides the frozen snapshot"
+    );
+
+    let (t2, _) = config.resolve_disabled_filters();
+    assert!(
+        t2.contains("live-1"),
+        "the resolver is re-invoked each call (live between rounds)"
+    );
+}
