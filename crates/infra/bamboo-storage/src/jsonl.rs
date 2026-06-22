@@ -76,7 +76,9 @@ impl JsonlStorage {
     pub async fn save_session(&self, session: &Session) -> std::io::Result<()> {
         let path = self.session_path(&session.id)?;
         let json = serde_json::to_string(session)?;
-        fs::write(path, json).await
+        // Atomic write (temp + fsync + rename) so a crash mid-write can't leave a
+        // truncated/corrupt session file and lose conversation history. #35.
+        crate::v2::atomic_write(&path, json.as_bytes()).await
     }
 
     pub async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
@@ -142,6 +144,28 @@ mod tests {
         let storage = JsonlStorage::new(&temp_dir);
         storage.init().await?;
         Ok((storage, temp_dir))
+    }
+
+    #[tokio::test]
+    async fn save_session_round_trips_and_leaves_no_temp_file() {
+        // #35: save_session uses an atomic temp+rename write. Verify it round-trips
+        // (complete write) and cleans up its temp file.
+        let (storage, dir) = create_temp_storage().await.expect("temp storage");
+        let session = Session::new("atomic-test", "model");
+        storage.save_session(&session).await.expect("save");
+
+        let loaded = storage
+            .load_session("atomic-test")
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.id, "atomic-test");
+
+        let has_temp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!has_temp, "atomic write must not leave a temp file behind");
     }
 
     #[tokio::test]
