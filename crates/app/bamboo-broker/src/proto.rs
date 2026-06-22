@@ -22,6 +22,12 @@ pub enum ClientFrame {
     /// Acknowledge a processed message so the broker deletes it (at-least-once;
     /// an unacked message is re-pushed on the next subscribe).
     Ack { id: MsgId },
+    /// Out-of-band cancel: ask the broker to signal session `to` to abort the
+    /// in-flight run correlated to `correlation_id` (the timed-out ask's id).
+    /// Ephemeral and fire-and-forget — NOT durable, never enters a mailbox, never
+    /// acked. A control signal, deliberately off the at-least-once work path so a
+    /// cancel can never queue behind the very work it cancels. #50.
+    Cancel { to: String, correlation_id: MsgId },
 }
 
 /// Broker → client.
@@ -37,6 +43,9 @@ pub enum BrokerFrame {
     Message { message: InboxMessage },
     /// Receipt that a [`ClientFrame::Deliver`] was durably enqueued.
     Delivered { id: MsgId },
+    /// Out-of-band cancel pushed to a live subscriber: abort the in-flight run
+    /// correlated to `correlation_id`. Ephemeral — never persisted/acked (#50).
+    Cancel { correlation_id: MsgId },
 }
 
 impl ClientFrame {
@@ -97,6 +106,10 @@ mod tests {
             },
             ClientFrame::Subscribe,
             ClientFrame::Ack { id: MsgId::new() },
+            ClientFrame::Cancel {
+                to: "child".into(),
+                correlation_id: MsgId::new(),
+            },
         ];
         for f in frames {
             assert_eq!(ClientFrame::from_text(&f.to_text()).unwrap(), f);
@@ -104,6 +117,15 @@ mod tests {
         // tag stability
         let v: serde_json::Value = serde_json::from_str(&ClientFrame::Subscribe.to_text()).unwrap();
         assert_eq!(v["kind"], "subscribe");
+        let c: serde_json::Value = serde_json::from_str(
+            &ClientFrame::Cancel {
+                to: "child".into(),
+                correlation_id: MsgId::new(),
+            }
+            .to_text(),
+        )
+        .unwrap();
+        assert_eq!(c["kind"], "cancel");
     }
 
     #[test]
@@ -115,6 +137,9 @@ mod tests {
             },
             BrokerFrame::Message { message: ask_msg() },
             BrokerFrame::Delivered { id: MsgId::new() },
+            BrokerFrame::Cancel {
+                correlation_id: MsgId::new(),
+            },
         ];
         for f in frames {
             assert_eq!(BrokerFrame::from_text(&f.to_text()).unwrap(), f);
