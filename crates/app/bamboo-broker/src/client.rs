@@ -146,19 +146,36 @@ impl BrokerClient {
         message: InboxMessage,
         receipt_timeout: Duration,
     ) -> BrokerResult<MsgId> {
+        let expected = message.id.clone();
         self.send(ClientFrame::Deliver {
             to: to.into(),
             message,
         })
         .await?;
-        match tokio::time::timeout(receipt_timeout, self.delivered.recv()).await {
-            Ok(Some(id)) => Ok(id),
-            Ok(None) => Err(BrokerError::Transport(
-                "connection closed before delivery receipt".into(),
-            )),
-            Err(_) => Err(BrokerError::Transport(
-                "timed out waiting for delivery receipt from broker".into(),
-            )),
+        // CORRELATE the receipt to THIS message's id. `delivered` is a shared
+        // receipt stream on a reused connection: a late `Delivered` from a PRIOR
+        // deliver() that timed out (broker stalled but stayed connected) can still
+        // be sitting in the channel, and returning it would hand back a stale,
+        // wrong id. So skip any receipt that isn't ours. Deliver is `&mut self`, so
+        // only one deliver awaits at a time — every non-matching id is therefore a
+        // stale prior receipt, safe to drop. The single timeout bounds the whole
+        // correlation loop (deadline, not per-recv). #114.
+        let deadline = tokio::time::Instant::now() + receipt_timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.delivered.recv()).await {
+                Ok(Some(id)) if id == expected => return Ok(id),
+                Ok(Some(_stale)) => continue,
+                Ok(None) => {
+                    return Err(BrokerError::Transport(
+                        "connection closed before delivery receipt".into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(BrokerError::Transport(
+                        "timed out waiting for delivery receipt from broker".into(),
+                    ))
+                }
+            }
         }
     }
 
@@ -446,6 +463,74 @@ mod tests {
         assert!(
             flagged_dead,
             "reader should be marked dead once the connection closed"
+        );
+    }
+
+    /// A broker that completes the handshake then echoes a `Delivered` receipt for
+    /// each `Deliver`, but only after a small delay — so a `deliver()` with a tiny
+    /// receipt timeout misses its receipt (which then lands, late, in the shared
+    /// `delivered` channel as a stale entry).
+    async fn broker_that_echoes_receipts_after_delay() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = accept_async(stream).await.expect("ws upgrade");
+            let (mut sink, mut source) = ws.split();
+            if let Some(Ok(Message::Text(_))) = source.next().await {
+                let _ = sink
+                    .send(Message::Text(BrokerFrame::Welcome.to_text()))
+                    .await;
+            }
+            while let Some(Ok(Message::Text(txt))) = source.next().await {
+                if let Ok(ClientFrame::Deliver { message, .. }) = ClientFrame::from_text(&txt) {
+                    let id = message.id.clone();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = sink
+                        .send(Message::Text(BrokerFrame::Delivered { id }.to_text()))
+                        .await;
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Regression for issue #114: after a `deliver()` times out, its late
+    /// `Delivered` receipt is left in the shared channel. A SUBSEQUENT `deliver()`
+    /// on the reused client must return ITS OWN id (correlated to its message),
+    /// never the stale prior receipt.
+    #[tokio::test]
+    async fn deliver_skips_a_stale_receipt_from_a_prior_timed_out_deliver() {
+        let endpoint = broker_that_echoes_receipts_after_delay().await;
+        let mut client = BrokerClient::connect(&endpoint, test_agent("parent"), "ignored")
+            .await
+            .expect("connect");
+
+        // deliver(A) times out (10ms < the broker's 50ms echo delay); A's receipt
+        // then lands in the shared channel as a stale entry.
+        let msg_a = test_ask("a");
+        let id_a = msg_a.id.clone();
+        let res_a = client
+            .deliver_with_receipt_timeout("target", msg_a, Duration::from_millis(10))
+            .await;
+        assert!(res_a.is_err(), "deliver(A) times out before its receipt");
+
+        // Let A's late receipt arrive and buffer in the channel.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // deliver(B) must return B's id — correlation skips A's stale receipt.
+        let msg_b = test_ask("b");
+        let id_b = msg_b.id.clone();
+        assert_ne!(id_a, id_b);
+        let res_b = client
+            .deliver_with_receipt_timeout("target", msg_b, Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            res_b.expect("deliver(B) succeeds"),
+            id_b,
+            "deliver(B) returns its own id, not A's stale receipt"
         );
     }
 }
