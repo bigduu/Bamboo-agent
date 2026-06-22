@@ -249,19 +249,33 @@ impl ToolExecutor for BuiltinToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let args_raw = call.function.arguments.trim();
-        let (mut args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
-        if let Some(warning) = parse_warning {
-            tracing::warn!(
-                "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
-                ctx.session_id,
-                call.id,
-                call.function.name,
-                args_raw.len(),
-                preview_for_log(args_raw, 180),
-                warning
-            );
-        }
+        // Reuse the args the dispatching agent loop already parsed (for the
+        // `ToolStart` event) when it threaded them through the context, instead
+        // of re-parsing the raw JSON string here (issue #106, deferred B1 from
+        // #17). The pre-parsed value is the exact output of
+        // `parse_tool_args_best_effort` on the same input, and that loop already
+        // logged any fallback warning at parse time, so skipping the re-parse is
+        // behavior-preserving. When absent (the `execute` entry point, tests, or
+        // a loop that parsed with a different/stricter parser), fall back to
+        // parsing here exactly as before — including the fallback-warning log.
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            let args_raw = call.function.arguments.trim();
+            let (parsed, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+            if let Some(warning) = parse_warning {
+                tracing::warn!(
+                    "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
+                    ctx.session_id,
+                    call.id,
+                    call.function.name,
+                    args_raw.len(),
+                    preview_for_log(args_raw, 180),
+                    warning
+                );
+            }
+            parsed
+        };
 
         let raw_tool_name = normalize_tool_name(&call.function.name);
         if let Some(args_obj) = args.as_object_mut() {
@@ -1026,6 +1040,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
         let result = executor.execute_with_context(&call, ctx).await;
 
@@ -1054,6 +1069,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
         let result = executor.execute_with_context(&call, ctx).await;
 
@@ -1099,6 +1115,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(HostStub { approve: true });
@@ -1135,6 +1152,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            pre_parsed_args: None,
         };
 
         let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(HostStub { approve: false });
@@ -1209,6 +1227,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    pre_parsed_args: None,
                 },
             )
             .await
@@ -1271,5 +1290,122 @@ mod tests {
         let result = executor.execute(&call).await.expect("execute custom tool");
         assert!(result.success);
         assert_eq!(result.result, "custom-spawn-session");
+    }
+
+    // ---- issue #106: parse tool args once on the execute path -------------
+
+    /// A tool that echoes back the `v` field of the args it was invoked with, so
+    /// a test can observe *which* parsed value reached the tool.
+    struct EchoArgsTool;
+
+    #[async_trait]
+    impl Tool for EchoArgsTool {
+        fn name(&self) -> &str {
+            "echo_args"
+        }
+        fn description(&self) -> &str {
+            "echoes the `v` arg"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object","properties":{"v":{"type":"string"}}})
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+            let v = args
+                .get("v")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<none>")
+                .to_string();
+            Ok(ToolResult {
+                success: true,
+                result: v,
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+    }
+
+    fn ctx_with_pre_parsed<'a>(
+        call_id: &'a str,
+        pre_parsed: Option<&'a serde_json::Value>,
+    ) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            session_id: Some("s-106"),
+            tool_call_id: call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            pre_parsed_args: pre_parsed,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_context_reuses_pre_parsed_args_without_reparsing() {
+        // The raw `arguments` string and the threaded `pre_parsed_args` Value
+        // deliberately disagree. If the executor honored the contract (parse
+        // once at the dispatch site, reuse downstream), the tool sees the
+        // pre-parsed value; if it re-parsed the raw string it would see "raw".
+        // This is the load-bearing proof that the second parse was eliminated.
+        let executor = BuiltinToolExecutor::new();
+        executor.register_tool(EchoArgsTool).expect("register echo");
+
+        let call = make_tool_call("echo_args", json!({"v": "raw"}));
+        let pre_parsed = json!({"v": "preparsed"});
+        let ctx = ctx_with_pre_parsed(&call.id, Some(&pre_parsed));
+
+        let result = executor
+            .execute_with_context(&call, ctx)
+            .await
+            .expect("execute echo tool");
+        assert_eq!(
+            result.result, "preparsed",
+            "executor must reuse pre_parsed_args, not re-parse the raw string"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_context_parses_raw_when_no_pre_parsed_args() {
+        // Without a threaded value (the `execute` entry point / tests / a loop
+        // that parsed with a different parser), the executor falls back to
+        // parsing the raw string exactly as before — behavior preserved.
+        let executor = BuiltinToolExecutor::new();
+        executor.register_tool(EchoArgsTool).expect("register echo");
+
+        let call = make_tool_call("echo_args", json!({"v": "raw"}));
+        let ctx = ctx_with_pre_parsed(&call.id, None);
+
+        let result = executor
+            .execute_with_context(&call, ctx)
+            .await
+            .expect("execute echo tool");
+        assert_eq!(
+            result.result, "raw",
+            "without pre_parsed_args the executor parses the raw string as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_context_malformed_args_repair_unchanged_without_pre_parsed() {
+        // Malformed (truncated) JSON must still be auto-repaired by the
+        // fallback parse when no pre-parsed value is threaded — the existing
+        // error/leniency behavior is untouched by the dedup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovered-no-preparsed.txt");
+        let malformed_args = format!(
+            r#"{{"file_path":"{}","content":"recovered content""#,
+            path.display()
+        );
+
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call_with_raw_args("Write", &malformed_args);
+        let ctx = ctx_with_pre_parsed(&call.id, None);
+
+        let result = executor
+            .execute_with_context(&call, ctx)
+            .await
+            .expect("truncated JSON should be auto-repaired");
+        assert!(result.success);
+        let written = fs::read_to_string(&path).await.expect("file written");
+        assert_eq!(written, "recovered content");
     }
 }

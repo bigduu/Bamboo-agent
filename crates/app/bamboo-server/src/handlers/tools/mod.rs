@@ -123,6 +123,7 @@ pub async fn execute_tool(
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),
                 bypass_permissions: false,
                 can_async_resume: false,
+                pre_parsed_args: None,
             },
         )
         .await
