@@ -1314,22 +1314,32 @@ impl Config {
         })
     }
 
-    /// Try to recover from `config.json.bak` (the last-known-good written before
-    /// each save) when the primary `config.json` is corrupt. Returns `None` if
-    /// the backup is missing or also unparseable. #37.
+    /// Try to recover from the rotated `config.json.bak[.N]` generations (each a
+    /// last-known-good written before a save) when the primary `config.json` is
+    /// corrupt. Walks newest -> oldest and returns the first that parses; `None`
+    /// if every generation is missing or also unparseable. #37 / #135.
     fn load_backup(data_dir: &std::path::Path) -> Option<Self> {
-        let backup = data_dir.join("config.json.bak");
-        let content = std::fs::read_to_string(&backup).ok()?;
-        match Self::parse_and_hydrate(&content) {
-            Ok(config) => {
-                tracing::info!("Recovered configuration from config.json.bak");
-                Some(config)
-            }
-            Err(e) => {
-                tracing::warn!("config.json.bak is also unparseable ({}); ignoring it", e);
-                None
+        let config_path = data_dir.join("config.json");
+        for gen in 0..BAK_GENERATIONS {
+            let backup = backup_path_for(&config_path, gen);
+            let Ok(content) = std::fs::read_to_string(&backup) else {
+                continue;
+            };
+            match Self::parse_and_hydrate(&content) {
+                Ok(config) => {
+                    tracing::info!("Recovered configuration from {:?}", backup);
+                    return Some(config);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Backup {:?} is unparseable ({}); trying an older generation",
+                        backup,
+                        e
+                    );
+                }
             }
         }
+        None
     }
 
     /// Largest corrupt-object key count we'll attempt to salvage. The overlay loop
@@ -1876,7 +1886,11 @@ impl Config {
                 .ok()
                 .is_some_and(|c| Self::parse_and_hydrate(&c).is_ok())
         {
-            let backup = path.with_extension("json.bak");
+            // Rotate the older generations down (.bak -> .bak.1 -> .bak.2 …) so a
+            // few last-known-good snapshots survive, then snapshot the current
+            // (parseable) config.json as the freshest .bak. #135.
+            rotate_backups(&path, BAK_GENERATIONS);
+            let backup = backup_path_for(&path, 0);
             if let Err(e) = std::fs::copy(&path, &backup) {
                 tracing::warn!("Failed to back up config.json before save: {}", e);
             }
@@ -1889,6 +1903,10 @@ impl Config {
     }
 }
 
+/// How many `config.json.corrupted.*` quarantine files to keep. Each corrupt load
+/// drops one; without a cap they accumulate unbounded. Newest `N` are retained.
+const QUARANTINE_KEEP: usize = 5;
+
 /// Copy a corrupt config file aside to `config.json.corrupted.<nanos>` so the
 /// user's (unparseable) configuration is preserved for inspection/recovery
 /// instead of being silently discarded and then overwritten by defaults. #37.
@@ -1897,10 +1915,81 @@ fn quarantine_corrupt_config(config_path: &std::path::Path) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let quarantine = config_path.with_extension(format!("json.corrupted.{nanos}"));
+    // Two corrupt loads in the same nanosecond would land on the same name and the
+    // second `copy` would silently overwrite the first. Append a counter on
+    // collision so each quarantine is preserved distinctly. #135.
+    let mut quarantine = config_path.with_extension(format!("json.corrupted.{nanos}"));
+    let mut dedup = 1u32;
+    while quarantine.exists() {
+        quarantine = config_path.with_extension(format!("json.corrupted.{nanos}.{dedup}"));
+        dedup += 1;
+    }
     match std::fs::copy(config_path, &quarantine) {
         Ok(_) => tracing::warn!("Quarantined corrupt config.json to {:?}", quarantine),
         Err(e) => tracing::error!("Failed to quarantine corrupt config.json: {}", e),
+    }
+    prune_quarantine_files(config_path, QUARANTINE_KEEP);
+}
+
+/// Keep only the newest `keep` `config.json.corrupted.*` files next to
+/// `config_path`, deleting older ones so quarantines don't grow unbounded. #135.
+fn prune_quarantine_files(config_path: &std::path::Path, keep: usize) {
+    let Some(dir) = config_path.parent() else {
+        return;
+    };
+    let prefix = "config.json.corrupted.";
+    let mut quarantines: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if quarantines.len() <= keep {
+        return;
+    }
+    // Oldest first (by mtime; missing mtime sorts oldest so it's pruned first).
+    quarantines.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    let remove = quarantines.len() - keep;
+    for stale in quarantines.into_iter().take(remove) {
+        if let Err(e) = std::fs::remove_file(&stale) {
+            tracing::warn!("Failed to prune old quarantine file {:?}: {}", stale, e);
+        }
+    }
+}
+
+/// Number of `config.json.bak[.N]` generations to retain (`.bak` + `N-1` numbered).
+/// More generations = more recovery points if a fresher backup is itself bad. #135.
+const BAK_GENERATIONS: usize = 3;
+
+/// The on-disk path of backup generation `gen` (0 == `config.json.bak`).
+fn backup_path_for(config_path: &std::path::Path, gen: usize) -> std::path::PathBuf {
+    if gen == 0 {
+        config_path.with_extension("json.bak")
+    } else {
+        config_path.with_extension(format!("json.bak.{gen}"))
+    }
+}
+
+/// Shift the backup generations down before a fresh `.bak` is written:
+/// `.bak.(N-2) -> .bak.(N-1)`, …, `.bak -> .bak.1`. The oldest is overwritten by
+/// the shift; the caller then writes the new `.bak`. Walks the highest (oldest)
+/// destination slot first so no rename clobbers a slot a later move still needs to
+/// read. Best-effort. #135.
+fn rotate_backups(config_path: &std::path::Path, generations: usize) {
+    for gen in (1..generations).rev() {
+        let from = backup_path_for(config_path, gen - 1);
+        let to = backup_path_for(config_path, gen);
+        if from.exists() {
+            if let Err(e) = std::fs::rename(&from, &to) {
+                tracing::warn!("Failed to rotate backup {:?} -> {:?}: {}", from, to, e);
+            }
+        }
     }
 }
 
@@ -2418,6 +2507,84 @@ mod tests {
         assert_eq!(
             config.http_proxy, "http://from-backup",
             "garbage (non-object) config skips salvage and recovers from .bak"
+        );
+    }
+
+    #[test]
+    fn quarantine_files_are_capped_to_newest_n() {
+        let temp = TempHome::new();
+        let config_path = temp.path.join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        // Drop more quarantines than the cap; each call sleeps so nanos (the name)
+        // and mtime (the prune sort key) are distinct.
+        for _ in 0..(QUARANTINE_KEEP + 3) {
+            quarantine_corrupt_config(&config_path);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+
+        let count = std::fs::read_dir(&temp.path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.corrupted.")
+            })
+            .count();
+        assert_eq!(
+            count, QUARANTINE_KEEP,
+            "old quarantine files are pruned to the newest {QUARANTINE_KEEP}"
+        );
+    }
+
+    #[test]
+    fn load_recovers_from_older_backup_generation_when_bak_is_also_corrupt() {
+        let temp = TempHome::new();
+        // Primary AND the freshest .bak are corrupt; an older generation is good.
+        std::fs::write(temp.path.join("config.json"), "CORRUPT-NOT-JSON").unwrap();
+        std::fs::write(temp.path.join("config.json.bak"), "ALSO-CORRUPT").unwrap();
+        std::fs::write(
+            temp.path.join("config.json.bak.1"),
+            serde_json::json!({ "http_proxy": "http://from-gen-1" }).to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.http_proxy, "http://from-gen-1",
+            "recovered from .bak.1 when both config.json and .bak are corrupt"
+        );
+    }
+
+    #[test]
+    fn save_rotates_backup_generations() {
+        let temp = TempHome::new();
+        let path = temp.path.join("config.json");
+        // v1 is the existing on-disk config.
+        std::fs::write(
+            &path,
+            serde_json::json!({ "http_proxy": "http://proxy-v1" }).to_string(),
+        )
+        .unwrap();
+
+        let mut cfg = Config::create_default();
+        // Save 1: backs up the existing v1 -> .bak, writes v2.
+        cfg.http_proxy = "http://proxy-v2".to_string();
+        cfg.save_to_dir(temp.path.clone()).unwrap();
+        // Save 2: existing (v2) is parseable -> rotate .bak(v1) -> .bak.1, .bak = v2.
+        cfg.http_proxy = "http://proxy-v3".to_string();
+        cfg.save_to_dir(temp.path.clone()).unwrap();
+
+        let bak = std::fs::read_to_string(temp.path.join("config.json.bak")).unwrap();
+        let bak1 = std::fs::read_to_string(temp.path.join("config.json.bak.1")).unwrap();
+        assert!(
+            bak.contains("proxy-v2"),
+            ".bak holds the previous generation (v2)"
+        );
+        assert!(
+            bak1.contains("proxy-v1"),
+            ".bak.1 holds the older rotated generation (v1)"
         );
     }
 
