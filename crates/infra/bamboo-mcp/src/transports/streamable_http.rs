@@ -31,6 +31,10 @@ pub struct StreamableHttpTransport {
     message_tx: Option<mpsc::Sender<String>>,
     message_rx: Mutex<Option<mpsc::Receiver<String>>>,
     get_sse_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // Per-POST SSE forwarder tasks. Stored so they can be aborted
+    // deterministically in disconnect() (they otherwise exit only on the next
+    // send-Err once the receiver is dropped).
+    post_sse_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl StreamableHttpTransport {
@@ -48,6 +52,7 @@ impl StreamableHttpTransport {
             message_tx: Some(message_tx),
             message_rx: Mutex::new(Some(message_rx)),
             get_sse_handle: Mutex::new(None),
+            post_sse_handles: Mutex::new(Vec::new()),
         }
     }
 
@@ -165,7 +170,7 @@ impl StreamableHttpTransport {
             // We need to consume the response body in a spawned task to avoid
             // blocking the caller. Events from this POST's SSE response are
             // forwarded to the channel so receive() can pick them up.
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut stream = response.bytes_stream().eventsource();
                 while let Some(event) = stream.next().await {
                     match event {
@@ -189,6 +194,13 @@ impl StreamableHttpTransport {
                 }
                 let _ = (url, connected); // suppress unused warnings
             });
+
+            // Track the forwarder so disconnect() can abort it deterministically.
+            // Also prune any already-finished handles so the Vec doesn't grow
+            // unbounded across many POSTs.
+            let mut handles = self.post_sse_handles.lock().await;
+            handles.retain(|h| !h.is_finished());
+            handles.push(handle);
         } else {
             // JSON response — forward the body directly.
             let body = response.text().await?;
@@ -316,6 +328,32 @@ impl McpTransport for StreamableHttpTransport {
         // Streamable HTTP doesn't have a separate "connect" step in the traditional
         // sense. The first request (initialize) will be sent via send(). Here we
         // just mark the transport as ready and optionally open a GET SSE stream.
+        //
+        // Recreate the message channel so a connect()-after-disconnect() works.
+        // disconnect() drops `message_tx` and the receiver is take-once, so
+        // without this a second connect() would leave POST responses silently
+        // dropped (no sender) and the client message handler unstarted (no
+        // receiver to take). This mirrors the stdio/SSE transports, which also
+        // recreate their channel in connect().
+        let (message_tx, message_rx) = mpsc::channel(256);
+        self.message_tx = Some(message_tx);
+        *self.message_rx.lock().await = Some(message_rx);
+
+        // Clear any stale GET-SSE handle so the next send() re-opens the stream
+        // against the fresh channel.
+        {
+            let mut guard = self.get_sse_handle.lock().await;
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        {
+            let mut handles = self.post_sse_handles.lock().await;
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+        }
+
         self.connected.store(true, Ordering::SeqCst);
 
         debug!("MCP StreamableHTTP transport ready");
@@ -335,6 +373,16 @@ impl McpTransport for StreamableHttpTransport {
         {
             let mut guard = self.get_sse_handle.lock().await;
             if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+
+        // Abort all per-POST SSE forwarder tasks for deterministic shutdown.
+        // Dropping `message_tx` above would eventually make them exit on the
+        // next send-Err, but aborting is immediate and leaves no leaked tasks.
+        {
+            let mut handles = self.post_sse_handles.lock().await;
+            for handle in handles.drain(..) {
                 handle.abort();
             }
         }
@@ -428,6 +476,26 @@ impl McpTransport for StreamableHttpTransport {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for StreamableHttpTransport {
+    /// Safety net: if the transport is dropped without an explicit
+    /// `disconnect()`, abort the background forwarder tasks so they don't leak.
+    /// The locks are uncontended at drop time (no other owner), so `try_lock`
+    /// succeeds; if it ever didn't, the tasks still exit once `message_tx` is
+    /// dropped with the struct.
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.get_sse_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut handles) = self.post_sse_handles.try_lock() {
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -566,6 +634,165 @@ mod tests {
 
         let sid = transport.session_id.lock().await;
         assert_eq!(sid.as_deref(), Some("test-session-123"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_after_disconnect_recreates_channel() {
+        // Reconnect must restore a usable channel: after disconnect() the
+        // sender is dropped and the receiver is taken, so a naive transport
+        // would silently drop POST responses and never start the handler.
+        let config = create_test_config();
+        let mut transport = StreamableHttpTransport::new(config);
+
+        transport.connect().await.unwrap();
+        // The client takes the receiver once when starting its message handler.
+        let rx = transport.take_message_receiver().await;
+        assert!(rx.is_some(), "first connect should expose a receiver");
+        drop(rx);
+
+        transport.disconnect().await.unwrap();
+        // After disconnect the sender is gone and the receiver was taken.
+        assert!(transport.message_tx.is_none());
+        assert!(transport.take_message_receiver().await.is_none());
+
+        // Second connect() must recreate both ends.
+        transport.connect().await.unwrap();
+        assert!(
+            transport.message_tx.is_some(),
+            "reconnect should recreate the sender so POST responses are routed"
+        );
+        let rx2 = transport.take_message_receiver().await;
+        assert!(
+            rx2.is_some(),
+            "reconnect should recreate the receiver so the handler starts"
+        );
+
+        // And the recreated channel actually carries a message.
+        let tx = transport.message_tx.clone().unwrap();
+        tx.send("ping".to_string()).await.unwrap();
+        let mut rx2 = rx2.unwrap();
+        assert_eq!(rx2.recv().await.as_deref(), Some("ping"));
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_aborts_post_sse_forwarders() {
+        // A POST-SSE forwarder is a spawned task; disconnect() must abort it
+        // deterministically rather than leaving it to exit on the next
+        // send-Err. We simulate a forwarder with a task that would otherwise
+        // run forever and flips a flag only when it actually exits.
+        use std::sync::atomic::AtomicBool;
+
+        let config = create_test_config();
+        let mut transport = StreamableHttpTransport::new(config);
+        transport.connect().await.unwrap();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let started_clone = started.clone();
+        let handle = tokio::spawn(async move {
+            started_clone.store(true, Ordering::SeqCst);
+            // Run forever unless aborted.
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        });
+        transport.post_sse_handles.lock().await.push(handle);
+
+        // Let the task begin.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(started.load(Ordering::SeqCst), "forwarder task should run");
+
+        transport.disconnect().await.unwrap();
+
+        // After disconnect the handle vec is drained and the task is aborted.
+        assert!(
+            transport.post_sse_handles.lock().await.is_empty(),
+            "disconnect should drain the forwarder handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_aborts_forwarder_handle_is_finished() {
+        // Stronger assertion: capture a clone-free handle, confirm it reports
+        // finished after disconnect aborts it.
+        let config = create_test_config();
+        let mut transport = StreamableHttpTransport::new(config);
+        transport.connect().await.unwrap();
+
+        // Spawn a forever task, hold an abort handle to observe termination.
+        let forever = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        });
+        let abort_handle = forever.abort_handle();
+        transport.post_sse_handles.lock().await.push(forever);
+
+        assert!(!abort_handle.is_finished(), "task should be running");
+
+        transport.disconnect().await.unwrap();
+
+        // Give the runtime a moment to process the abort.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(
+            abort_handle.is_finished(),
+            "disconnect should have aborted the forwarder task"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_aborts_forwarder_handles() {
+        // Dropping the transport without disconnect() must not leak forwarders.
+        let config = create_test_config();
+        let mut transport = StreamableHttpTransport::new(config);
+        transport.connect().await.unwrap();
+
+        let forever = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        });
+        let abort_handle = forever.abort_handle();
+        transport.post_sse_handles.lock().await.push(forever);
+
+        assert!(!abort_handle.is_finished());
+
+        drop(transport);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(
+            abort_handle.is_finished(),
+            "dropping the transport should abort forwarder tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_channel_backpressure_blocks_never_drops() {
+        // Guards the #23 invariant: the bounded channel must apply
+        // backpressure (block the sender) rather than silently drop messages
+        // once full. With capacity 256, the 257th send must not complete until
+        // the receiver drains one.
+        let config = create_test_config();
+        let mut transport = StreamableHttpTransport::new(config);
+        transport.connect().await.unwrap();
+
+        let tx = transport.message_tx.clone().unwrap();
+        // Fill the channel to capacity (256).
+        for i in 0..256 {
+            tx.send(format!("msg-{i}")).await.unwrap();
+        }
+
+        // The next send must block (not drop). try_send should report Full.
+        let pending = tx.try_send("overflow".to_string());
+        assert!(
+            matches!(pending, Err(mpsc::error::TrySendError::Full(_))),
+            "channel at capacity must signal Full (backpressure), never drop"
+        );
+
+        // Drain one and confirm ordering preserved (no drops).
+        let mut rx = transport.take_message_receiver().await.unwrap();
+        assert_eq!(rx.recv().await.as_deref(), Some("msg-0"));
+        // Now there's room: the blocked send can complete.
+        tx.send("overflow".to_string()).await.unwrap();
     }
 
     #[tokio::test]
