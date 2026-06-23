@@ -109,6 +109,38 @@ pub struct AccessControlConfig {
     /// Last update timestamp for auditing / debugging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// v2 (#181): issued per-device tokens. Empty = root-password-only mode
+    /// (back-compat with old instances). Each entry stores only the token hash;
+    /// the plaintext token is returned to the client once at pairing time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceCredential>,
+}
+
+/// A single paired device's credential (v2-P2 per-device token, #181).
+///
+/// The server stores only `token_hash` (never the plaintext token). The hash is
+/// computed with the SAME construction as the access password — `SHA-256(salt ||
+/// token)` — so no new crypto dependency is introduced (`docs/api-v2-transport.md`
+/// §4.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCredential {
+    /// Server-generated stable id: `bamboo_<12 hex>`.
+    pub device_id: String,
+    /// Human-readable label, e.g. "iPhone 15".
+    pub label: String,
+    /// `SHA-256(hex_decode(token_salt) || token)`, hex-encoded.
+    pub token_hash: String,
+    /// Per-device salt (hex-encoded).
+    pub token_salt: String,
+    /// RFC3339 creation timestamp.
+    pub created_at: String,
+    /// RFC3339 last-used timestamp (deferred stamping; see PR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// Whether this device's token has been revoked. A revoked token is rejected
+    /// at the handshake/middleware immediately.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 /// Memory and background summarization configuration.
@@ -2127,6 +2159,64 @@ mod tests {
         assert!(value.as_object().unwrap().contains_key("tls"));
         let back: ServerConfig = serde_json::from_value(value).expect("deserialize");
         assert_eq!(back.tls, server.tls);
+    }
+
+    #[test]
+    fn access_control_without_devices_field_deserializes_back_compat() {
+        // An old config.json `access_control` with no `devices` key must still
+        // deserialize, leaving `devices` empty (root-password-only mode).
+        let access: AccessControlConfig = serde_json::from_value(serde_json::json!({
+            "password_enabled": true,
+            "password_hash": "deadbeef",
+            "password_salt": "01020304",
+        }))
+        .expect("legacy access_control without devices should deserialize");
+
+        assert!(access.devices.is_empty());
+        assert!(access.password_enabled);
+    }
+
+    #[test]
+    fn access_control_omits_devices_when_empty() {
+        // `skip_serializing_if = "Vec::is_empty"` keeps the on-disk shape
+        // identical for instances that never paired a device.
+        let access = AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("deadbeef".to_string()),
+            password_salt: Some("01020304".to_string()),
+            updated_at: None,
+            devices: Vec::new(),
+        };
+        let value = serde_json::to_value(&access).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert!(
+            !obj.contains_key("devices"),
+            "devices must be omitted when empty, got: {value}"
+        );
+    }
+
+    #[test]
+    fn access_control_with_devices_roundtrips() {
+        let device = DeviceCredential {
+            device_id: "bamboo_0123456789ab".to_string(),
+            label: "iPhone 15".to_string(),
+            token_hash: "abcd".to_string(),
+            token_salt: "ef01".to_string(),
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+            last_used_at: None,
+            revoked: false,
+        };
+        let access = AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("deadbeef".to_string()),
+            password_salt: Some("01020304".to_string()),
+            updated_at: None,
+            devices: vec![device.clone()],
+        };
+        let value = serde_json::to_value(&access).expect("serialize");
+        assert!(value.as_object().unwrap().contains_key("devices"));
+        let back: AccessControlConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.devices, vec![device]);
     }
 
     #[test]

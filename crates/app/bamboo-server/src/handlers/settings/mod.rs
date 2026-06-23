@@ -14,8 +14,9 @@ mod redaction;
 mod setup;
 mod workflows;
 
+pub(crate) use access_control::verify_device_token;
 pub use access_control::{
-    enforce_access_password_middleware, get_access_status, update_access_password,
+    enforce_access_password_middleware, get_access_status, pair_device, update_access_password,
     verify_access_password,
 };
 pub use bamboo_config::{
