@@ -305,6 +305,41 @@ pub struct SubagentsConfig {
     /// `steer` mode. Omit to leave the tool off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker: Option<BrokerClientConfig>,
+    /// Remote placements: pin specific sub-agent roles to resident workers
+    /// reached over `wss://` instead of a locally-spawned subprocess
+    /// (remote-actor-plan §3.4 / P1.5, #193). Empty (the default) keeps every
+    /// role on the local path — fully back-compatible: an old config with no
+    /// `remote_placements` key deserializes to an empty vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_placements: Vec<RemoteActorPlacement>,
+}
+
+/// Pins a single sub-agent role to a remote resident worker (remote-actor-plan
+/// §3.4 / P1.5). A child whose `subagent_type` matches `role` is connected over
+/// `wss://` to `endpoint` (Bearer-authenticated) instead of being spawned as a
+/// local subprocess. No role match ⇒ that child stays on the local path.
+///
+/// The bearer token is NEVER stored here in the clear: `token_env` names the
+/// environment variable that holds it (mirroring the A2A `auth_ref` pattern),
+/// read once at runner-build time. A `token_env` that is set-but-unset at build
+/// time fails SAFE — the placement is skipped and the role falls back to Local
+/// rather than connecting unauthenticated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RemoteActorPlacement {
+    /// Sub-agent role this targets (matches the child session's
+    /// `metadata["subagent_type"]`).
+    pub role: String,
+    /// Resident worker endpoint, e.g. `wss://gpu-host:8443` (or `ws://` only on
+    /// a trusted/loopback link).
+    pub endpoint: String,
+    /// Env var holding the bearer token (NOT the raw token — mirrors A2A
+    /// `auth_ref`). `None` ⇒ connect without a bearer (trusted link only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    /// PEM file pinning a self-signed worker cert. `None` ⇒ default webpki roots
+    /// (or plaintext `ws://`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_file: Option<String>,
 }
 
 /// How to reach the central sub-agent message broker (`bamboo broker serve`).
@@ -2109,6 +2144,55 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn subagents_config_without_remote_placements_deserializes_empty() {
+        // An OLD config (predating P1.5) has no `remote_placements` key — it must
+        // still deserialize, with an empty placement list (default = local path).
+        let json = r#"{ "max_concurrent": 4 }"#;
+        let cfg: SubagentsConfig = serde_json::from_str(json).expect("old config deserializes");
+        assert_eq!(cfg.max_concurrent, Some(4));
+        assert!(cfg.remote_placements.is_empty());
+        // And an empty placement list is omitted on re-serialize (skip_if empty).
+        let back = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !back.contains("remote_placements"),
+            "empty vec is skipped: {back}"
+        );
+    }
+
+    #[test]
+    fn remote_actor_placement_round_trips() {
+        let json = r#"{
+            "remote_placements": [
+                {
+                    "role": "explorer",
+                    "endpoint": "wss://gpu-host:8443",
+                    "token_env": "WORKER_TOKEN",
+                    "ca_cert_file": "/etc/bamboo/worker.pem"
+                },
+                { "role": "writer", "endpoint": "ws://127.0.0.1:9001" }
+            ]
+        }"#;
+        let cfg: SubagentsConfig = serde_json::from_str(json).expect("populated config");
+        assert_eq!(cfg.remote_placements.len(), 2);
+        let p0 = &cfg.remote_placements[0];
+        assert_eq!(p0.role, "explorer");
+        assert_eq!(p0.endpoint, "wss://gpu-host:8443");
+        assert_eq!(p0.token_env.as_deref(), Some("WORKER_TOKEN"));
+        assert_eq!(p0.ca_cert_file.as_deref(), Some("/etc/bamboo/worker.pem"));
+        // Optional fields default to None and are skipped on serialize.
+        let p1 = &cfg.remote_placements[1];
+        assert_eq!(p1.role, "writer");
+        assert!(p1.token_env.is_none());
+        assert!(p1.ca_cert_file.is_none());
+
+        let back = serde_json::to_string(&cfg).unwrap();
+        let reparsed: SubagentsConfig = serde_json::from_str(&back).unwrap();
+        assert_eq!(cfg, reparsed, "round-trip is stable");
+        assert!(!back.contains("\"token_env\":null"));
+        assert!(!back.contains("\"ca_cert_file\":null"));
     }
 
     #[test]

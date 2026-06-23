@@ -217,17 +217,59 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };
 
-    Ok(Arc::new(ActorChildRunner::new(
-        super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
-        worker_bin,
-        worker_args,
-        fabric_dir,
-        executor,
-        extract_provider_credentials(config),
-        config.provider.clone(),
-        sub.max_concurrent
-            .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
-    )))
+    Ok(Arc::new(
+        ActorChildRunner::new(
+            super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
+            worker_bin,
+            worker_args,
+            fabric_dir,
+            executor,
+            extract_provider_credentials(config),
+            config.provider.clone(),
+            sub.max_concurrent
+                .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
+        )
+        .with_remote_placements(resolve_remote_placements(&sub.remote_placements)),
+    ))
+}
+
+/// Resolve config `remote_placements` into runner-ready handles (#193), keyed by
+/// role. The bearer is read from `token_env` HERE (mirroring the A2A `auth_ref`
+/// handling at ~runtime.rs:142): if the env var is set use it; if `token_env` is
+/// `Some` but the var is UNSET, log an error and SKIP that placement so a
+/// misconfig fails SAFE to the local path rather than connecting to a remote
+/// worker with no bearer. A placement with no `token_env` connects tokenless
+/// (trusted/loopback link only). Duplicate roles: last one wins.
+fn resolve_remote_placements(
+    placements: &[bamboo_config::RemoteActorPlacement],
+) -> std::collections::HashMap<String, super::actor_adapter::ResolvedRemotePlacement> {
+    let mut out = std::collections::HashMap::new();
+    for p in placements {
+        let token = match p.token_env.as_deref() {
+            Some(env_var) => match std::env::var(env_var) {
+                Ok(token) => Some(token),
+                Err(_) => {
+                    tracing::error!(
+                        "remote placement for role '{}' token_env '{}' is not set; \
+                         skipping (role falls back to local, NOT unauthenticated remote)",
+                        p.role,
+                        env_var
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
+        out.insert(
+            p.role.clone(),
+            super::actor_adapter::ResolvedRemotePlacement {
+                endpoint: p.endpoint.clone(),
+                token,
+                ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+            },
+        );
+    }
+    out
 }
 
 /// Snapshot per-provider credentials from the parent config for actor
