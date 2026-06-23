@@ -388,10 +388,34 @@ fn is_public_access_route(path: &str) -> bool {
             | "/v1/bamboo/access/verify"
             // v2-P2 (#181): a brand-new device has no credential yet, so the
             // pairing endpoint must be reachable unauthenticated. It self-gates
-            // by requiring the owner root password in its body. `/v2/stream`
-            // stays GATED.
+            // by requiring the owner root password in its body.
             | "/v2/pair"
+            // v2-P2 (#189): the WS upgrade opens unauthenticated, but the ws_v2
+            // handler then ENFORCES auth before serving ANY channel — it is
+            // pre-authorized when the upgrade itself carries a credential
+            // (local bypass / verified password cookie / device-token header),
+            // OR it must present a VERIFIED `hello` device token before any
+            // subscribe/stop is honored, and an unauthenticated socket is closed
+            // on a short deadline. Browsers cannot set headers on a WS upgrade,
+            // so this open-upgrade + hello-carrier path is the ONLY way a
+            // browser device-token client can authenticate over WS.
+            // `/v2/pair/code` + `/v2/devices*` STAY gated (not listed here).
+            | "/v2/stream"
     )
+}
+
+/// The single source of truth for the access allow-decision, shared by
+/// `enforce_access_password_middleware` (every gated route) and the ws_v2
+/// handler (`/v2/stream` pre-auth). A request is authorized when no credential
+/// is required (no password + no devices, or a local bypass), OR it carries a
+/// verified password cookie, OR it carries a valid per-device token header.
+///
+/// This MUST stay a pure extraction of the middleware's prior allow expression:
+/// changing it changes the gate for every route at once.
+pub(crate) fn request_is_authorized(req: &HttpRequest, config: &Config) -> bool {
+    !build_access_status(config, req).requires_password
+        || request_has_verified_access_cookie(req, config)
+        || request_has_valid_device_token(req, config)
 }
 
 pub async fn enforce_access_password_middleware<B: MessageBody + 'static>(
@@ -417,16 +441,13 @@ pub async fn enforce_access_password_middleware<B: MessageBody + 'static>(
     };
 
     let config = app_state.config.read().await.clone();
-    let access_status = build_access_status(&config, req.request());
     // Auth is required when a credential mechanism is configured (a root password
     // OR at least one active device) AND the request is not a local bypass. An
     // instance with NO devices + NO password behaves EXACTLY as before — zero
     // regression. When required, accept EITHER a verified password cookie OR a
-    // valid per-device token (#181).
-    if !access_status.requires_password
-        || request_has_verified_access_cookie(req.request(), &config)
-        || request_has_valid_device_token(req.request(), &config)
-    {
+    // valid per-device token (#181). The allow-decision is centralized in
+    // `request_is_authorized` so the ws_v2 handler enforces the SAME rule (#189).
+    if request_is_authorized(req.request(), &config) {
         return next
             .call(req)
             .await
@@ -1218,6 +1239,87 @@ mod tests {
             .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
             .to_http_request();
         assert!(!request_has_valid_device_token(&no_id, &config));
+    }
+
+    // ── v2-P2 shared allow-decision: request_is_authorized (#189) ──────────
+    //
+    // This is the SINGLE source of truth the middleware and the ws_v2 handler
+    // both call. These tests pin its truth table so the open `/v2/stream`
+    // upgrade enforces exactly what the middleware enforces everywhere else.
+
+    #[test]
+    fn request_is_authorized_local_is_always_allowed() {
+        // A local request bypasses regardless of configured credentials.
+        let config = config_with_password();
+        assert!(request_is_authorized(&local_req(), &config));
+    }
+
+    #[test]
+    fn request_is_authorized_remote_with_devices_and_no_creds_is_denied() {
+        // Remote + a credential mechanism configured + no presented credential.
+        let (cred, _t) = issue_device_token("d");
+        let config = Config {
+            access_control: Some(AccessControlConfig {
+                password_enabled: false,
+                password_hash: None,
+                password_salt: None,
+                updated_at: None,
+                devices: vec![cred],
+            }),
+            ..Config::default()
+        };
+        assert!(!request_is_authorized(&remote_req(), &config));
+    }
+
+    #[test]
+    fn request_is_authorized_remote_with_password_and_no_creds_is_denied() {
+        let config = config_with_password();
+        assert!(!request_is_authorized(&remote_req(), &config));
+    }
+
+    #[test]
+    fn request_is_authorized_remote_with_valid_cookie_is_allowed() {
+        let config = config_with_password();
+        let cookie_value =
+            access_verification_cookie_value(&config).expect("password config yields a cookie");
+        let req = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .cookie(Cookie::new(ACCESS_VERIFIED_COOKIE_NAME, cookie_value))
+            .to_http_request();
+        assert!(request_is_authorized(&req, &config));
+    }
+
+    #[test]
+    fn request_is_authorized_remote_with_valid_device_token_header_is_allowed() {
+        let (cred, token) = issue_device_token("d");
+        let device_id = cred.device_id.clone();
+        let mut config = config_with_password();
+        config.access_control.as_mut().unwrap().devices.push(cred);
+
+        let req = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
+            .insert_header((DEVICE_ID_HEADER, device_id))
+            .to_http_request();
+        assert!(request_is_authorized(&req, &config));
+    }
+
+    #[test]
+    fn request_is_authorized_no_password_no_devices_is_open() {
+        // Zero-regression baseline: an instance with neither credential mechanism
+        // never requires auth, so even a remote request is authorized.
+        let config = Config::default();
+        assert!(request_is_authorized(&remote_req(), &config));
+    }
+
+    #[test]
+    fn stream_is_public_but_sibling_routes_are_not() {
+        // #189: the upgrade is whitelisted; the gated siblings are NOT.
+        assert!(is_public_access_route("/v2/stream"));
+        assert!(is_public_access_route("/v2/pair"));
+        assert!(!is_public_access_route("/v2/pair/code"));
+        assert!(!is_public_access_route("/v2/devices"));
+        assert!(!is_public_access_route("/v2/devices/bamboo_x"));
     }
 
     // ── v2-P2 pairing codes + brute-force guard (#181, slice 2) ────────────

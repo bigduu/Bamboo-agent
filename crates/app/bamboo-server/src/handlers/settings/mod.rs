@@ -14,12 +14,14 @@ mod redaction;
 mod setup;
 mod workflows;
 
-pub(crate) use access_control::verify_device_token;
+#[cfg(test)]
+pub(crate) use access_control::issue_device_token;
 pub use access_control::{
     create_pairing_code, enforce_access_password_middleware, get_access_status, list_devices,
     pair_device, revoke_device, rotate_device, update_access_password, verify_access_password,
     PairingCodeEntry, PairingCodeGuard,
 };
+pub(crate) use access_control::{request_is_authorized, verify_device_token};
 pub use bamboo_config::{
     get_bamboo_config, get_bamboo_tools, get_model_limit_defaults, get_proxy_auth_status,
     reset_bamboo_config, set_bamboo_config, set_proxy_auth, validate_bamboo_config_patch,

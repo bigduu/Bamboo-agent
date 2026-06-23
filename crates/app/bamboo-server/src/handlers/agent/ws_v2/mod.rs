@@ -24,12 +24,25 @@
 //! - `execute` / `approve` over control (handler refactors) — clients keep REST.
 //! - msgpack subprotocol (v2-P3) — JSON text frames only.
 //!
-//! ## Auth (v2-P2, #181)
-//! The scope middleware is the PRIMARY gate (it accepts a verified password
-//! cookie or a per-device token on the upgrade request). The `hello` frame adds
-//! identity binding: if it carries `device_id` + `token`, they are verified and
-//! the connection is CLOSED on mismatch; a token-less `hello` (e.g. a local
-//! desktop the middleware already bypassed) keeps the prior accept behavior.
+//! ## Auth (v2-P2, #181 / #189)
+//! `/v2/stream` is on the public route whitelist, so the upgrade OPENS without
+//! a middleware credential — this is the only way a browser device-token client
+//! (which cannot set `Authorization`/`X-Device-Id` headers on a WS upgrade) can
+//! present its token, via the `hello` frame. The handler is therefore the
+//! AUTHORITATIVE gate:
+//!
+//! - `pre_authorized` is computed from the SAME allow-decision the middleware
+//!   uses for every other route (`request_is_authorized`): a local bypass, a
+//!   verified password cookie (cookies ARE sent on the upgrade), or a header
+//!   device token. These connections stay frictionless — exactly as before.
+//! - While NOT authorized, the ONLY frame that does anything is `hello` carrying
+//!   a VALID `device_id` + `token`. A `subscribe`/`unsubscribe`/`stop` received
+//!   before authorization is IGNORED — no forwarder, no cancel, no channel data.
+//! - A token-less `hello` NEVER authorizes a connection that wasn't already
+//!   pre-authorized.
+//! - An unauthenticated socket that never sends a valid `hello` within
+//!   [`AUTH_DEADLINE`] is CLOSED, so it cannot linger.
+//! - The token is NEVER logged.
 
 mod envelope;
 mod forwarders;
@@ -57,6 +70,119 @@ const OUTBOUND_BUFFER: usize = 256;
 /// WS ping interval (~15s), mirroring the v1 SSE `[KEEPALIVE]` cadence.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How long an UNAUTHORIZED connection may stay open before it must present a
+/// valid `hello` device token. A connection that opens the (now public) upgrade
+/// without a header/cookie credential and never authenticates is CLOSED when
+/// this elapses, so an unauthenticated socket can never linger (#189). Once the
+/// connection is authorized this deadline is disarmed.
+const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The verdict for one client frame while a connection is NOT yet authorized.
+///
+/// Pure decision over the parsed frame (no `AppState`), so the auth-gating
+/// contract is unit-testable without a live WS driver: while unauthorized the
+/// ONLY frame that can change anything is a `hello`, and only a `hello` carrying
+/// a credential is even a candidate to authorize.
+#[derive(Debug, PartialEq, Eq)]
+enum UnauthorizedAction {
+    /// A `hello` carrying `device_id` + `token` — verify it; valid → authorize,
+    /// invalid → close.
+    VerifyHello,
+    /// A token-less `hello` while unauthorized — a harmless no-op that does NOT
+    /// grant access (the deadline still governs).
+    TokenlessHelloNoop,
+    /// Any other frame (`subscribe`/`unsubscribe`/`stop`/unknown) while
+    /// unauthorized — IGNORE it (serve no channel data, cancel nothing).
+    Ignore,
+}
+
+impl UnauthorizedAction {
+    /// Classify a parsed frame for an unauthorized connection.
+    fn classify(frame: &ClientFrame) -> Self {
+        match frame {
+            ClientFrame::Hello {
+                device_id: Some(_),
+                token: Some(_),
+            } => UnauthorizedAction::VerifyHello,
+            ClientFrame::Hello { .. } => UnauthorizedAction::TokenlessHelloNoop,
+            _ => UnauthorizedAction::Ignore,
+        }
+    }
+}
+
+/// What the driver should do with a frame after the auth gate ran.
+#[derive(Debug, PartialEq, Eq)]
+enum GateOutcome {
+    /// The frame was fully handled by the gate (the connection is/was
+    /// unauthorized, or it just authorized): keep the socket open, do NOT fall
+    /// through to channel dispatch.
+    Handled,
+    /// An invalid credential was presented: CLOSE the connection.
+    Close,
+    /// The connection is authorized and this frame should proceed to the normal
+    /// channel dispatch (subscribe/unsubscribe/stop/hello-rebind).
+    Dispatch,
+}
+
+/// The AppState-aware auth gate, factored out of `handle_client_text` so it is
+/// unit-testable WITHOUT a live WS `Session`. It owns the entire `!authorized`
+/// decision plus the credential verification, and flips `authorized` to `true`
+/// only on a VERIFIED `hello` device token.
+///
+/// Invariants (the security review hammers these):
+/// - While `!*authorized`, a `subscribe`/`unsubscribe`/`stop` returns
+///   [`GateOutcome::Handled`] (ignored — never `Dispatch`), so no channel is
+///   served and no session cancelled before authorization.
+/// - A token-less `hello` NEVER sets `*authorized` when it was `false`.
+/// - A credentialed `hello` with a VALID token sets `*authorized = true`.
+/// - A credentialed `hello` with an INVALID token returns [`GateOutcome::Close`].
+/// - The token is NEVER logged.
+async fn apply_auth_gate(
+    state: &web::Data<AppState>,
+    frame: &ClientFrame,
+    authorized: &mut bool,
+) -> GateOutcome {
+    if *authorized {
+        return GateOutcome::Dispatch;
+    }
+
+    match UnauthorizedAction::classify(frame) {
+        UnauthorizedAction::VerifyHello => {
+            let ClientFrame::Hello {
+                device_id: Some(device_id),
+                token: Some(token),
+            } = frame
+            else {
+                unreachable!("VerifyHello implies a credentialed Hello");
+            };
+            let config = state.config.read().await.clone();
+            if crate::handlers::settings::verify_device_token(&config, device_id, token) {
+                *authorized = true;
+                // Bind device id for logging. NEVER log the token.
+                tracing::debug!("ws_v2: hello verified for device {device_id}; authorized");
+                GateOutcome::Handled
+            } else {
+                tracing::warn!(
+                    "ws_v2: hello rejected — invalid device credential for {device_id}; closing"
+                );
+                GateOutcome::Close
+            }
+        }
+        UnauthorizedAction::TokenlessHelloNoop => {
+            // A token-less hello does NOT authorize a non-pre-authorized
+            // connection. Keep the socket open; the deadline still governs.
+            tracing::debug!("ws_v2: token-less hello while unauthorized — not granting access");
+            GateOutcome::Handled
+        }
+        UnauthorizedAction::Ignore => {
+            // subscribe/unsubscribe/stop/unknown before auth: serve nothing,
+            // cancel nothing. Tolerate hello-after-subscribe ordering.
+            tracing::debug!("ws_v2: ignoring frame on unauthorized connection");
+            GateOutcome::Handled
+        }
+    }
+}
+
 /// Query parameters for the `GET /v2/stream` upgrade.
 #[derive(Debug, Default, Deserialize)]
 pub struct StreamQuery {
@@ -68,8 +194,13 @@ pub struct StreamQuery {
 
 /// `GET /v2/stream` — upgrade to the unified WS multiplex.
 ///
-/// Behind the same access-password scope middleware as `/api/v1` (registered in
-/// `routes/agent.rs`); `local_bypass` keeps desktop loopback frictionless.
+/// The upgrade itself is PUBLIC (whitelisted in `is_public_access_route`), so a
+/// browser device-token client can open the socket and authenticate via `hello`
+/// (it cannot set headers on a WS upgrade). Auth is enforced in `drive`: a
+/// connection that the middleware WOULD have allowed is `pre_authorized` here
+/// (local bypass / verified password cookie / header device token), via the same
+/// `request_is_authorized` allow-decision the middleware uses; everything else
+/// must present a verified `hello` before any channel is served, on a deadline.
 pub async fn handler(
     state: web::Data<AppState>,
     query: web::Query<StreamQuery>,
@@ -79,9 +210,19 @@ pub async fn handler(
     // Clamp the untrusted `batch_ms` the same way the v1 SSE handler does.
     let batch_ms = query.batch_ms.min(MAX_BATCH_MS);
 
+    // Pre-authorize exactly the connections the middleware would have allowed on
+    // a gated route: local bypass, a verified password cookie (sent on the
+    // upgrade), or a header device token. This preserves every existing client
+    // with ZERO change; a remote browser device-token client is NOT pre-auth and
+    // must send a valid `hello`.
+    let pre_authorized = {
+        let config = state.config.read().await.clone();
+        crate::handlers::settings::request_is_authorized(&req, &config)
+    };
+
     let (response, session, msg_stream) = actix_ws::handle(&req, body)?;
 
-    actix_web::rt::spawn(drive(state, session, msg_stream, batch_ms));
+    actix_web::rt::spawn(drive(state, session, msg_stream, batch_ms, pre_authorized));
 
     Ok(response)
 }
@@ -94,14 +235,32 @@ async fn drive(
     mut session: actix_ws::Session,
     mut msg_stream: actix_ws::MessageStream,
     batch_ms: u64,
+    pre_authorized: bool,
 ) {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
     let mut forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // skip the immediate tick
 
+    // Authorization state (#189). Seeded from the upgrade-time decision so local
+    // / cookie / header clients are authorized immediately; everything else must
+    // present a valid `hello` before any channel is served.
+    let mut authorized = pre_authorized;
+    // The unauthorized-deadline timer. Pinned + biased to fire while `!authorized`
+    // and disarmed once the connection authorizes, so an unauthenticated socket
+    // is closed but an authorized one runs indefinitely.
+    let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
+    tokio::pin!(auth_deadline);
+
     loop {
         tokio::select! {
+            // While unauthorized, close the socket once the deadline elapses. The
+            // `!authorized` guard disarms this arm the moment the connection
+            // authorizes (a never-completing branch is simply never selected).
+            _ = &mut auth_deadline, if !authorized => {
+                tracing::debug!("ws_v2: closing unauthorized connection after auth deadline");
+                break;
+            }
             // Drain forwarder output to the WS. If the write fails the peer is
             // gone — break and tear down.
             Some(text) = out_rx.recv() => {
@@ -123,7 +282,8 @@ async fn drive(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         let keep_open = handle_client_text(
-                            &state, &out_tx, &mut forwarders, &mut session, batch_ms, &text,
+                            &state, &out_tx, &mut forwarders, &mut session,
+                            batch_ms, &text, &mut authorized,
                         )
                         .await;
                         if !keep_open {
@@ -162,8 +322,15 @@ async fn drive(
 /// Parse + dispatch one client text frame. A malformed/unknown frame logs and is
 /// ignored — it never tears down the connection.
 ///
+/// `authorized` is the per-connection auth state (#189). While it is `false` the
+/// ONLY frame that does anything is a `hello` carrying a VALID device token (it
+/// flips `authorized` to `true`); EVERY other frame — including a
+/// `subscribe`/`unsubscribe`/`stop` — is IGNORED, so a remote unauthenticated
+/// connection gets NO channel data and cancels nothing. The driver's deadline
+/// closes a socket that never authorizes.
+///
 /// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
-/// presents an invalid device credential); `true` to keep it open.
+/// presents an INVALID device credential); `true` to keep it open.
 async fn handle_client_text(
     state: &web::Data<AppState>,
     out_tx: &OutboundTx,
@@ -171,6 +338,7 @@ async fn handle_client_text(
     _session: &mut actix_ws::Session,
     batch_ms: u64,
     text: &str,
+    authorized: &mut bool,
 ) -> bool {
     let frame: ClientFrame = match serde_json::from_str(text) {
         Ok(f) => f,
@@ -180,18 +348,26 @@ async fn handle_client_text(
         }
     };
 
+    // Auth gate (#189). Until the connection is authorized, no frame may serve a
+    // channel or cancel a session — the only frame that can change anything is a
+    // `hello` that carries a verifiable device credential.
+    match apply_auth_gate(state, &frame, authorized).await {
+        GateOutcome::Handled => return true,
+        GateOutcome::Close => return false,
+        GateOutcome::Dispatch => {}
+    }
+
+    // Authorized path: full dispatch.
     match frame {
         ClientFrame::Hello { device_id, token } => {
-            // Identity binding (v2-P2, #181). The scope middleware is the primary
-            // gate; here we additionally verify a presented credential and reject
-            // an unverified hello on the public WS path. A token-less hello (e.g.
-            // a local desktop the middleware already bypassed) is accepted.
+            // Already authorized. A credentialed hello re-verifies as identity
+            // binding; an invalid one still closes. A token-less hello on an
+            // already-authorized connection is a harmless no-op.
             match (device_id, token) {
                 (Some(device_id), Some(token)) => {
                     let config = state.config.read().await.clone();
                     if crate::handlers::settings::verify_device_token(&config, &device_id, &token) {
-                        // Bind device id onto the connection for logging. Never
-                        // log the token.
+                        // NEVER log the token.
                         tracing::debug!("ws_v2: hello verified for device {device_id}");
                     } else {
                         tracing::warn!(
@@ -201,9 +377,7 @@ async fn handle_client_text(
                     }
                 }
                 _ => {
-                    // No credential in the hello: keep prior accept behavior
-                    // (the middleware already gated the upgrade).
-                    tracing::debug!("ws_v2: hello accepted without device token");
+                    tracing::debug!("ws_v2: token-less hello on authorized connection (no-op)");
                 }
             }
         }
@@ -302,4 +476,158 @@ async fn subscribe(
 
     forwarders.insert(ch.to_string(), handle);
     tracing::debug!("ws_v2: subscribed {ch} (since={since:?})");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use bamboo_config::{AccessControlConfig, DeviceCredential};
+    use tempfile::tempdir;
+
+    fn hello(device_id: Option<&str>, token: Option<&str>) -> ClientFrame {
+        ClientFrame::Hello {
+            device_id: device_id.map(str::to_string),
+            token: token.map(str::to_string),
+        }
+    }
+
+    // ── Pure classification (no AppState) ─────────────────────────────────────
+
+    #[test]
+    fn classify_unauthorized_frame_actions() {
+        // A credentialed hello is the only authorize candidate.
+        assert_eq!(
+            UnauthorizedAction::classify(&hello(Some("d"), Some("t"))),
+            UnauthorizedAction::VerifyHello
+        );
+        // A token-less hello (any missing field) is a no-op, never an authorizer.
+        assert_eq!(
+            UnauthorizedAction::classify(&hello(None, None)),
+            UnauthorizedAction::TokenlessHelloNoop
+        );
+        assert_eq!(
+            UnauthorizedAction::classify(&hello(Some("d"), None)),
+            UnauthorizedAction::TokenlessHelloNoop
+        );
+        assert_eq!(
+            UnauthorizedAction::classify(&hello(None, Some("t"))),
+            UnauthorizedAction::TokenlessHelloNoop
+        );
+        // Every channel-touching / control frame is IGNORED while unauthorized.
+        assert_eq!(
+            UnauthorizedAction::classify(&ClientFrame::Subscribe {
+                ch: "feed".into(),
+                since: None
+            }),
+            UnauthorizedAction::Ignore
+        );
+        assert_eq!(
+            UnauthorizedAction::classify(&ClientFrame::Unsubscribe { ch: "feed".into() }),
+            UnauthorizedAction::Ignore
+        );
+        assert_eq!(
+            UnauthorizedAction::classify(&ClientFrame::Stop {
+                session_id: "s".into()
+            }),
+            UnauthorizedAction::Ignore
+        );
+        assert_eq!(
+            UnauthorizedAction::classify(&ClientFrame::Unknown),
+            UnauthorizedAction::Ignore
+        );
+    }
+
+    // ── AppState-aware gate (no live Session) ─────────────────────────────────
+
+    async fn app_state_with_device() -> (web::Data<AppState>, DeviceCredential, String) {
+        let dir = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let (cred, token) = crate::handlers::settings::issue_device_token("test-device");
+        {
+            let mut config = state.config.write().await;
+            config.access_control = Some(AccessControlConfig {
+                password_enabled: false,
+                password_hash: None,
+                password_salt: None,
+                updated_at: None,
+                devices: vec![cred.clone()],
+            });
+        }
+        (state, cred, token)
+    }
+
+    #[actix_web::test]
+    async fn subscribe_while_unauthorized_is_ignored_and_stays_unauthorized() {
+        let (state, _cred, _token) = app_state_with_device().await;
+        let mut authorized = false;
+        let frame = ClientFrame::Subscribe {
+            ch: "feed".into(),
+            since: None,
+        };
+        let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
+        // The driver keeps the socket open but does NOT dispatch (no forwarder).
+        assert_eq!(outcome, GateOutcome::Handled);
+        assert!(!authorized, "a subscribe must never authorize a connection");
+    }
+
+    #[actix_web::test]
+    async fn stop_while_unauthorized_is_ignored() {
+        let (state, _cred, _token) = app_state_with_device().await;
+        let mut authorized = false;
+        let frame = ClientFrame::Stop {
+            session_id: "sess".into(),
+        };
+        let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
+        assert_eq!(outcome, GateOutcome::Handled);
+        assert!(!authorized);
+    }
+
+    #[actix_web::test]
+    async fn valid_hello_authorizes() {
+        let (state, cred, token) = app_state_with_device().await;
+        let mut authorized = false;
+        let frame = hello(Some(&cred.device_id), Some(&token));
+        let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
+        assert_eq!(outcome, GateOutcome::Handled);
+        assert!(authorized, "a valid hello must authorize the connection");
+    }
+
+    #[actix_web::test]
+    async fn invalid_hello_closes_and_does_not_authorize() {
+        let (state, cred, _token) = app_state_with_device().await;
+        let mut authorized = false;
+        let frame = hello(Some(&cred.device_id), Some("bd1_wrongwrongwrong"));
+        let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
+        assert_eq!(outcome, GateOutcome::Close);
+        assert!(!authorized, "an invalid hello must never authorize");
+    }
+
+    #[actix_web::test]
+    async fn tokenless_hello_does_not_authorize_unauthorized_connection() {
+        let (state, _cred, _token) = app_state_with_device().await;
+        let mut authorized = false;
+        let frame = hello(None, None);
+        let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
+        assert_eq!(outcome, GateOutcome::Handled);
+        assert!(
+            !authorized,
+            "a token-less hello must NEVER authorize a non-pre-authorized connection"
+        );
+    }
+
+    #[actix_web::test]
+    async fn pre_authorized_connection_dispatches_subscribe() {
+        let (state, _cred, _token) = app_state_with_device().await;
+        // Pre-authorized (local / cookie / header equivalent): the gate passes
+        // every frame straight through to channel dispatch.
+        let mut authorized = true;
+        let frame = ClientFrame::Subscribe {
+            ch: "feed".into(),
+            since: None,
+        };
+        let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
+        assert_eq!(outcome, GateOutcome::Dispatch);
+        assert!(authorized);
+    }
 }
