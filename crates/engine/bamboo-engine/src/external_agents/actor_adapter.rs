@@ -20,7 +20,7 @@ use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use bamboo_subagent::discovery::Fabric;
+use bamboo_subagent::discovery::{Discovery, Fabric};
 use bamboo_subagent::fleet::{spawn_worker, SpawnedChild};
 use bamboo_subagent::proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 use bamboo_subagent::provision::{
@@ -67,6 +67,33 @@ pub struct ResolvedRemotePlacement {
     pub ca_cert_file: Option<PathBuf>,
 }
 
+/// A role routed to a registry-SCHEDULED worker (remote-actor-plan §3.4 / P2b,
+/// #181), resolved at runner-build time from `SubagentsConfig.schedulable_placements`.
+/// Unlike a fixed `ResolvedRemotePlacement` (one endpoint), this names the agent
+/// `registry_url` to query and the logical `pool` (= the registry `role`) whose
+/// LIVE workers are scheduling candidates. The env-named bearer is already READ
+/// into `token` here (the raw token never rides the config) and is used for BOTH
+/// the registry query and the chosen worker's `wss://` connect. `ca_cert_file`
+/// pins a self-signed worker/registry cert (`None` ⇒ default webpki roots).
+#[derive(Debug, Clone)]
+pub struct ResolvedSchedulablePlacement {
+    pub pool: String,
+    pub registry_url: String,
+    pub token: Option<String>,
+    pub ca_cert_file: Option<PathBuf>,
+}
+
+/// How `execute_external_child` should obtain its worker connection, decided
+/// once from `spec.placement`. Splits the divergent acquire/connect + retire
+/// logic three ways while the shared middle (Run dispatch, live registration,
+/// drive, close) stays identical. `Local` is the unchanged pre-#193 path;
+/// `Remote` is the unchanged #194 path; `Schedulable` (#181, P2b) is new.
+enum PlacementKind {
+    Local,
+    Remote,
+    Schedulable,
+}
+
 /// Spawns and drives a child session as an independent actor: a `bamboo-subagent` worker process.
 pub struct ActorChildRunner {
     agent_id: String,
@@ -111,6 +138,19 @@ pub struct ActorChildRunner {
     /// `wss://` connect, no spawn, no pool, no kill) instead of the local
     /// subprocess + warm-pool path. Empty (the default) = all-local behavior.
     remote_placements: HashMap<String, ResolvedRemotePlacement>,
+    /// Roles routed to a REGISTRY-SCHEDULED worker (#181, P2b), keyed by sub-agent
+    /// role. A role present here (AND not already in `remote_placements`, which
+    /// wins) routes through the dedicated SCHEDULABLE branch in
+    /// `execute_external_child`: query the registry for live workers in the pool,
+    /// pick one (round-robin), connect over `wss://` — no spawn, no pool, no kill,
+    /// and NO local-subprocess fallback (no live worker ⇒ a clear error). Empty
+    /// (the default) = all-local behavior.
+    schedulable_placements: HashMap<String, ResolvedSchedulablePlacement>,
+    /// Per-pool round-robin cursor for schedulable scheduling (#181, P2b). Bumped
+    /// once per pick so successive sibling spawns SPREAD across a pool's live
+    /// workers instead of all landing on the first candidate. Best-effort spread,
+    /// not a load balancer — the registry's live set can change between picks.
+    schedule_cursor: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -218,6 +258,8 @@ impl ActorChildRunner {
             approval_decider: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
             remote_placements: HashMap::new(),
+            schedulable_placements: HashMap::new(),
+            schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -238,6 +280,19 @@ impl ActorChildRunner {
         placements: HashMap<String, ResolvedRemotePlacement>,
     ) -> Self {
         self.remote_placements = placements;
+        self
+    }
+
+    /// Route specific sub-agent roles to a registry-SCHEDULED worker (#181, P2b).
+    /// The map is keyed by role (`subagent_type`); a child whose role is present
+    /// (and NOT already pinned by `remote_placements`, which takes precedence) is
+    /// run on a live worker discovered from the registry instead of a local
+    /// subprocess. Default (empty) keeps every role on the local path.
+    pub fn with_schedulable_placements(
+        mut self,
+        placements: HashMap<String, ResolvedSchedulablePlacement>,
+    ) -> Self {
+        self.schedulable_placements = placements;
         self
     }
 
@@ -455,8 +510,98 @@ impl ActorChildRunner {
                 endpoint: placement.endpoint.clone(),
             };
             spec.secrets.worker_auth_token = placement.token.clone();
+        } else if let Some(placement) = self.schedulable_placements.get(spec.identity.role.as_str())
+        {
+            // #181 (P2b): route this role to a registry-SCHEDULED worker — ONLY
+            // when it is NOT already pinned to a fixed remote endpoint (the
+            // `else if` makes remote_placements take precedence for a role in
+            // both). The concrete endpoint is resolved at run time in
+            // `execute_external_child`; here we only flip the placement to
+            // Schedulable{pool} and ride the bearer on the scoped secrets
+            // envelope (used for the registry query AND the worker connect). No
+            // match in either map leaves the default `Placement::Local`, so the
+            // local path is byte-for-byte unchanged for every non-routed role.
+            spec.placement = Placement::Schedulable {
+                pool: placement.pool.clone(),
+            };
+            spec.secrets.worker_auth_token = placement.token.clone();
         }
         spec
+    }
+
+    /// Pick a live worker for a SCHEDULABLE role from the agent registry (#181,
+    /// P2b). Builds a `RegistryFabric` at the resolved `registry_url` (Bearer if a
+    /// token is set), lists live records (the registry already excludes expired
+    /// leases — health == a live lease), filters to those whose `role` == the
+    /// configured `pool`, and picks ONE via per-pool ROUND-ROBIN so successive
+    /// sibling spawns spread across the pool. Returns the chosen [`AgentRecord`].
+    ///
+    /// No live candidate ⇒ an `AgentError` (the caller NEVER falls back to a local
+    /// subprocess; that would silently defeat the placement). A registry-query
+    /// failure is likewise a clear, terminal error — not a spawn.
+    async fn resolve_schedulable_worker(
+        &self,
+        role: &str,
+    ) -> std::result::Result<(AgentRecord, ResolvedSchedulablePlacement), AgentError> {
+        let placement = self
+            .schedulable_placements
+            .get(role)
+            .ok_or_else(|| {
+                AgentError::LLM(format!(
+                    "schedulable placement for role '{role}' vanished before scheduling"
+                ))
+            })?
+            .clone();
+
+        // Query the registry (Bearer if configured). The fabric is cheap and the
+        // resolution is per-run, so building it here keeps the bearer scoped.
+        let fabric = match placement.token.as_deref() {
+            Some(token) => {
+                bamboo_subagent::RegistryFabric::with_token(placement.registry_url.clone(), token)
+            }
+            None => bamboo_subagent::RegistryFabric::new(placement.registry_url.clone()),
+        }
+        .map_err(|e| {
+            AgentError::LLM(format!(
+                "schedulable role '{role}': registry client for '{}' failed: {e}",
+                placement.registry_url
+            ))
+        })?;
+
+        let records = fabric.discover().await.map_err(|e| {
+            AgentError::LLM(format!(
+                "schedulable role '{role}': registry '{}' query failed: {e}",
+                placement.registry_url
+            ))
+        })?;
+
+        // Live candidates = records published under the pool's role. The registry
+        // already dropped expired leases, so presence == health.
+        let mut candidates: Vec<AgentRecord> = records
+            .into_iter()
+            .filter(|r| r.role == placement.pool)
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(AgentError::LLM(format!(
+                "schedulable role '{role}': no live worker in pool '{}' at registry '{}' \
+                 (NOT spawning a local subprocess — a schedulable role has no local fallback)",
+                placement.pool, placement.registry_url
+            )));
+        }
+
+        // Round-robin: advance a per-pool cursor and index into the candidate
+        // list. Deterministic-ish spread without a real load balancer; if the live
+        // set shrank between picks the modulo still lands on a valid index.
+        let idx = {
+            let mut cursors = self.schedule_cursor.lock().unwrap();
+            let cursor = cursors.entry(placement.pool.clone()).or_insert(0);
+            let i = *cursor % candidates.len();
+            *cursor = cursor.wrapping_add(1);
+            i
+        };
+        let chosen = candidates.swap_remove(idx);
+        Ok((chosen, placement))
     }
 }
 
@@ -518,99 +663,148 @@ impl ExternalChildRunner for ActorChildRunner {
             .await
             .map_err(|_| AgentError::LLM("actor concurrency limiter closed".to_string()))?;
 
-        // #193: split LOCAL (spawn + warm-pool) from REMOTE (connect to a resident
-        // worker) ONLY at the two divergent spots — acquire/connect here and the
-        // park/retire at the end. Everything between (Run dispatch, live-actor
-        // registration, drive, the close) is identical for both. `remote` is the
-        // single guard; the local arm below is byte-for-byte the pre-#193 code.
-        let remote = matches!(spec.placement, Placement::Remote { .. });
+        // Split LOCAL (spawn + warm-pool) from the two process-less remote paths
+        // ONLY at the divergent spots — acquire/connect here and the park/retire at
+        // the end. Everything between (Run dispatch, live-actor registration,
+        // drive, the close) is identical for all three. `kind` is the single guard.
+        //   - Local       (#0):  byte-for-byte the pre-#193 reuse-or-spawn path.
+        //   - Remote       (#194): connect to a FIXED resident endpoint, no spawn.
+        //   - Schedulable  (#181): resolve a live worker from the registry, connect.
+        let kind = match spec.placement {
+            Placement::Remote { .. } => PlacementKind::Remote,
+            Placement::Schedulable { .. } => PlacementKind::Schedulable,
+            Placement::Local => PlacementKind::Local,
+        };
+        let remote = !matches!(kind, PlacementKind::Local);
 
-        let (actor, mut client) = if remote {
-            // REMOTE branch: connect to a resident worker. No spawn, no pool
-            // touch, no drain. We do not own the worker, so a connect failure has
-            // NO respawn fallback — it is a clear, terminal error.
-            let placement = self
-                .remote_placements
-                .get(spec.identity.role.as_str())
-                .ok_or_else(|| {
+        let (actor, mut client) = match kind {
+            PlacementKind::Remote => {
+                // REMOTE branch: connect to a resident worker. No spawn, no pool
+                // touch, no drain. We do not own the worker, so a connect failure
+                // has NO respawn fallback — it is a clear, terminal error.
+                let placement = self
+                    .remote_placements
+                    .get(spec.identity.role.as_str())
+                    .ok_or_else(|| {
+                        AgentError::LLM(format!(
+                            "remote placement for role '{}' vanished before connect",
+                            spec.identity.role
+                        ))
+                    })?;
+                let endpoint = placement.endpoint.clone();
+                // Build the TLS trust: a pinned CA pins a self-signed worker cert;
+                // otherwise default webpki roots (or plaintext for `ws://`).
+                let trust_cfg = match placement.ca_cert_file.as_deref() {
+                    Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
+                        AgentError::LLM(format!("remote worker CA cert '{}': {e}", path.display()))
+                    })?),
+                    None => None,
+                };
+                let client = ChildClient::connect_with_auth_tls(
+                    &endpoint,
+                    placement.token.as_deref(),
+                    trust_cfg,
+                )
+                .await
+                .map_err(|e| {
+                    AgentError::LLM(format!("remote actor connect to '{endpoint}' failed: {e}"))
+                })?;
+                // Process-less handle so live-actor registration (in-band steering)
+                // works exactly as for a local worker; `kill()` is a no-op.
+                let record = AgentRecord {
+                    agent_id: job.child_session_id.clone(),
+                    role: spec.identity.role.clone(),
+                    labels: Vec::new(),
+                    endpoint: endpoint.clone(),
+                    pid: 0,
+                    version: String::new(),
+                    started_at: chrono::Utc::now(),
+                    lease_expires_at: chrono::Utc::now(),
+                };
+                let actor = PooledActor {
+                    worker: SpawnedChild::remote(record),
+                    endpoint,
+                    agent_id: job.child_session_id.clone(),
+                };
+                (actor, client)
+            }
+            PlacementKind::Schedulable => {
+                // SCHEDULABLE branch (#181, P2b): resolve a LIVE worker from the
+                // registry (round-robin over the pool's live records), then connect
+                // exactly like Remote. No spawn, no pool, no kill, NO local
+                // fallback — no live worker ⇒ a terminal error (raised inside
+                // resolve_schedulable_worker).
+                let (record, placement) = self
+                    .resolve_schedulable_worker(spec.identity.role.as_str())
+                    .await?;
+                let endpoint = record.endpoint.clone();
+                // Same TLS trust derivation as Remote: pinned CA or default roots.
+                let trust_cfg = match placement.ca_cert_file.as_deref() {
+                    Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
+                        AgentError::LLM(format!(
+                            "scheduled worker CA cert '{}': {e}",
+                            path.display()
+                        ))
+                    })?),
+                    None => None,
+                };
+                let client = ChildClient::connect_with_auth_tls(
+                    &endpoint,
+                    placement.token.as_deref(),
+                    trust_cfg,
+                )
+                .await
+                .map_err(|e| {
                     AgentError::LLM(format!(
-                        "remote placement for role '{}' vanished before connect",
-                        spec.identity.role
+                        "scheduled actor connect to '{endpoint}' (pool '{}') failed: {e}",
+                        placement.pool
                     ))
                 })?;
-            let endpoint = placement.endpoint.clone();
-            // Build the TLS trust: a pinned CA pins a self-signed worker cert;
-            // otherwise default webpki roots (or plaintext for `ws://`).
-            let trust_cfg = match placement.ca_cert_file.as_deref() {
-                Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
-                    AgentError::LLM(format!("remote worker CA cert '{}': {e}", path.display()))
-                })?),
-                None => None,
-            };
-            let client = ChildClient::connect_with_auth_tls(
-                &endpoint,
-                placement.token.as_deref(),
-                trust_cfg,
-            )
-            .await
-            .map_err(|e| {
-                AgentError::LLM(format!("remote actor connect to '{endpoint}' failed: {e}"))
-            })?;
-            // Synthesize a process-less handle so the live-actor registration (for
-            // in-band steering) works exactly as it does for a local worker. The
-            // record carries the child agent_id + the remote endpoint; `pid()` is
-            // None and `kill()` is a no-op — correct for a worker we do not own.
-            let record = AgentRecord {
-                agent_id: job.child_session_id.clone(),
-                role: spec.identity.role.clone(),
-                labels: Vec::new(),
-                endpoint: endpoint.clone(),
-                pid: 0,
-                version: String::new(),
-                started_at: chrono::Utc::now(),
-                lease_expires_at: chrono::Utc::now(),
-            };
-            let actor = PooledActor {
-                worker: SpawnedChild::remote(record),
-                endpoint,
-                agent_id: job.child_session_id.clone(),
-            };
-            (actor, client)
-        } else {
-            // LOCAL branch — the EXACT pre-#193 path: reuse-or-spawn + the
-            // respawn-on-connect-miss fallback. Unchanged in behavior, ordering,
-            // and error text.
-            let mut actor = self.acquire_worker(&pool_key, &spec).await?;
-            let client = match ChildClient::connect(&actor.endpoint).await {
-                Ok(client) => client,
-                Err(e) => {
-                    // The pooled worker may have died between checkout and connect;
-                    // retire it and spawn one fresh, once.
-                    self.retire_worker(actor).await;
-                    let spawned = spawn_worker(
-                        &self.worker_bin,
-                        &self.worker_args,
-                        &spec,
-                        self.spawn_timeout,
-                    )
-                    .await
-                    .map_err(|e2| {
-                        AgentError::LLM(format!("actor respawn after reuse miss ({e}): {e2}"))
-                    })?;
-                    let endpoint = spawned.record.endpoint.clone();
-                    let agent_id = spawned.record.agent_id.clone();
-                    let client = ChildClient::connect(&endpoint)
+                // The chosen registry record IS the AgentRecord — synthesize the
+                // process-less handle straight from it (registry-managed worker).
+                let actor = PooledActor {
+                    worker: SpawnedChild::remote(record),
+                    endpoint,
+                    agent_id: job.child_session_id.clone(),
+                };
+                (actor, client)
+            }
+            PlacementKind::Local => {
+                // LOCAL branch — the EXACT pre-#193 path: reuse-or-spawn + the
+                // respawn-on-connect-miss fallback. Unchanged in behavior, ordering,
+                // and error text.
+                let mut actor = self.acquire_worker(&pool_key, &spec).await?;
+                let client = match ChildClient::connect(&actor.endpoint).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        // The pooled worker may have died between checkout and connect;
+                        // retire it and spawn one fresh, once.
+                        self.retire_worker(actor).await;
+                        let spawned = spawn_worker(
+                            &self.worker_bin,
+                            &self.worker_args,
+                            &spec,
+                            self.spawn_timeout,
+                        )
                         .await
-                        .map_err(|e2| AgentError::LLM(format!("actor connect failed: {e2}")))?;
-                    actor = PooledActor {
-                        worker: spawned,
-                        endpoint,
-                        agent_id,
-                    };
-                    client
-                }
-            };
-            (actor, client)
+                        .map_err(|e2| {
+                            AgentError::LLM(format!("actor respawn after reuse miss ({e}): {e2}"))
+                        })?;
+                        let endpoint = spawned.record.endpoint.clone();
+                        let agent_id = spawned.record.agent_id.clone();
+                        let client = ChildClient::connect(&endpoint)
+                            .await
+                            .map_err(|e2| AgentError::LLM(format!("actor connect failed: {e2}")))?;
+                        actor = PooledActor {
+                            worker: spawned,
+                            endpoint,
+                            agent_id,
+                        };
+                        client
+                    }
+                };
+                (actor, client)
+            }
         };
 
         client
@@ -650,11 +844,13 @@ impl ExternalChildRunner for ActorChildRunner {
         // it on error/cancel (a wedged worker must not be reused).
         let _ = client.close().await;
         if remote {
-            // #193: we do NOT own the remote worker — never park it into the local
-            // pool (its endpoint/agent_id are not ours to recycle) and never kill
-            // it (`SpawnedChild::remote.kill()` is a no-op anyway). Just let the
-            // connection drop above; the resident worker self-manages via its own
-            // idle timeout, ready for the next parent. `actor` is dropped here.
+            // #193 / #181: we do NOT own a remote or scheduled worker — never park
+            // it into the local pool (its endpoint/agent_id are not ours to
+            // recycle) and never kill it (`SpawnedChild::remote.kill()` is a no-op
+            // anyway). Just let the connection drop above; the resident /
+            // registry-managed worker self-manages via its own idle timeout, ready
+            // for the next parent. `actor` is dropped here. (Schedulable shares this
+            // arm — release is a no-op for both registry-managed cases.)
             drop(actor);
         } else {
             match &result {
@@ -1234,6 +1430,275 @@ mod tests {
 
         // Drain a couple of streamed events to confirm the event pipe carried the
         // worker's tokens too (best-effort; the reply assertion above is primary).
+        let mut saw_event = false;
+        while let Ok(Some(_ev)) =
+            tokio::time::timeout(Duration::from_millis(50), event_rx.recv()).await
+        {
+            saw_event = true;
+        }
+        let _ = saw_event;
+
+        srv.abort();
+    }
+
+    // ---- #181 (P2b): schedulable placement routing --------------------------
+
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A bogus-worker_bin runner carrying SCHEDULABLE placements (and optionally
+    /// remote ones, to test precedence). A local spawn here would fail on
+    /// `/bin/false`, so a passing schedulable test proves no subprocess spawned.
+    fn bogus_sched_runner(
+        remote: HashMap<String, ResolvedRemotePlacement>,
+        sched: HashMap<String, ResolvedSchedulablePlacement>,
+    ) -> ActorChildRunner {
+        ActorChildRunner::new(
+            "test-actor".into(),
+            PathBuf::from("/bin/false"),
+            vec![],
+            std::env::temp_dir().join("bamboo-test-fab-181"),
+            ExecutorSpec::Echo,
+            vec![],
+            "anthropic".into(),
+            4,
+        )
+        .with_remote_placements(remote)
+        .with_schedulable_placements(sched)
+    }
+
+    fn sched_placement(
+        pool: &str,
+        registry_url: impl Into<String>,
+    ) -> ResolvedSchedulablePlacement {
+        ResolvedSchedulablePlacement {
+            pool: pool.into(),
+            registry_url: registry_url.into(),
+            token: None,
+            ca_cert_file: None,
+        }
+    }
+
+    fn live_record(agent_id: &str, role: &str, endpoint: &str) -> AgentRecord {
+        AgentRecord {
+            agent_id: agent_id.into(),
+            role: role.into(),
+            labels: Vec::new(),
+            endpoint: endpoint.into(),
+            pid: 0,
+            version: String::new(),
+            started_at: chrono::Utc::now(),
+            lease_expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+        }
+    }
+
+    #[test]
+    fn build_spec_sets_schedulable_placement_for_matching_role() {
+        let mut sched = HashMap::new();
+        sched.insert("explorer".to_string(), {
+            let mut p = sched_placement("gpu-pool", "https://control-plane:9562");
+            p.token = Some("T-sched".into());
+            p
+        });
+        let runner = bogus_sched_runner(HashMap::new(), sched);
+
+        let s = session_of_role("explorer", "do the thing");
+        let spec = runner.build_spec(&s, &job_for("child-1"));
+        match &spec.placement {
+            Placement::Schedulable { pool } => assert_eq!(pool, "gpu-pool"),
+            other => panic!("expected Schedulable, got {other:?}"),
+        }
+        // The bearer rides the scoped secrets envelope (registry + worker connect).
+        assert_eq!(spec.secrets.worker_auth_token.as_deref(), Some("T-sched"));
+    }
+
+    #[test]
+    fn build_spec_remote_wins_when_role_in_both_maps() {
+        // A role present in BOTH remote_placements and schedulable_placements must
+        // resolve to the FIXED remote placement (documented precedence).
+        let mut remote = HashMap::new();
+        remote.insert(
+            "explorer".to_string(),
+            ResolvedRemotePlacement {
+                endpoint: "wss://fixed-host:8443".into(),
+                token: Some("T-remote".into()),
+                ca_cert_file: None,
+            },
+        );
+        let mut sched = HashMap::new();
+        sched.insert(
+            "explorer".to_string(),
+            sched_placement("gpu-pool", "https://control-plane:9562"),
+        );
+        let runner = bogus_sched_runner(remote, sched);
+
+        let s = session_of_role("explorer", "do the thing");
+        let spec = runner.build_spec(&s, &job_for("child-1"));
+        match &spec.placement {
+            Placement::Remote { endpoint } => assert_eq!(endpoint, "wss://fixed-host:8443"),
+            other => panic!("expected Remote (precedence), got {other:?}"),
+        }
+        assert_eq!(spec.secrets.worker_auth_token.as_deref(), Some("T-remote"));
+    }
+
+    #[test]
+    fn build_spec_local_for_unmatched_schedulable_role() {
+        let mut sched = HashMap::new();
+        sched.insert(
+            "explorer".to_string(),
+            sched_placement("gpu-pool", "https://control-plane:9562"),
+        );
+        let runner = bogus_sched_runner(HashMap::new(), sched);
+        let s = session_of_role("writer", "do the thing");
+        let spec = runner.build_spec(&s, &job_for("child-1"));
+        assert_eq!(spec.placement, Placement::Local);
+        assert!(spec.secrets.worker_auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_schedulable_worker_round_robin_spreads_over_candidates() {
+        // Registry returns three live workers in the pool; successive picks must
+        // advance the per-pool cursor and cover all three (round-robin spread).
+        let registry = MockServer::start().await;
+        let recs = vec![
+            live_record("w-0", "gpu-pool", "ws://127.0.0.1:1"),
+            live_record("w-1", "gpu-pool", "ws://127.0.0.1:2"),
+            live_record("w-2", "gpu-pool", "ws://127.0.0.1:3"),
+            // A worker in a DIFFERENT pool must be filtered out.
+            live_record("other", "cpu-pool", "ws://127.0.0.1:9"),
+        ];
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/agents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(recs))
+            .mount(&registry)
+            .await;
+
+        let mut sched = HashMap::new();
+        sched.insert(
+            "explorer".to_string(),
+            sched_placement("gpu-pool", registry.uri()),
+        );
+        let runner = bogus_sched_runner(HashMap::new(), sched);
+
+        // Three picks → cursor 0,1,2 → agent_ids w-0, w-1, w-2 in order.
+        let mut picked = Vec::new();
+        for _ in 0..3 {
+            let (rec, placement) = runner
+                .resolve_schedulable_worker("explorer")
+                .await
+                .expect("a live worker is picked");
+            assert_eq!(placement.pool, "gpu-pool");
+            assert_eq!(rec.role, "gpu-pool", "only pool workers are candidates");
+            picked.push(rec.agent_id);
+        }
+        picked.sort();
+        assert_eq!(
+            picked,
+            vec!["w-0".to_string(), "w-1".to_string(), "w-2".to_string()],
+            "round-robin covered every candidate over three picks"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_schedulable_worker_errors_with_no_live_worker() {
+        // The pool has no live workers (registry returns an empty / off-pool set):
+        // a clear error, and CRUCIALLY no spawn (a schedulable role has no local
+        // fallback).
+        let registry = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/agents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![live_record(
+                "x",
+                "cpu-pool",
+                "ws://127.0.0.1:9",
+            )]))
+            .mount(&registry)
+            .await;
+        let mut sched = HashMap::new();
+        sched.insert(
+            "explorer".to_string(),
+            sched_placement("gpu-pool", registry.uri()),
+        );
+        let runner = bogus_sched_runner(HashMap::new(), sched);
+
+        let err = runner
+            .resolve_schedulable_worker("explorer")
+            .await
+            .expect_err("no live worker in pool must error");
+        let msg = err.to_string();
+        assert!(msg.contains("no live worker"), "clear error: {msg}");
+        assert!(msg.contains("gpu-pool"), "names the pool: {msg}");
+    }
+
+    /// Full schedulable e2e: a resident `WsServer` Echo worker is registered (via a
+    /// wiremock registry) into pool "gpu-pool"; the runner is configured with a
+    /// schedulable placement for role "explorer" → that pool, plus a BOGUS
+    /// worker_bin (`/bin/false`). A passing run proves the SCHEDULABLE path RESOLVES
+    /// the worker from the registry and connects to it WITHOUT ever spawning a local
+    /// subprocess (a spawn would fail on /bin/false), and that an echo result flows
+    /// back.
+    #[tokio::test]
+    async fn execute_external_child_schedules_role_from_registry_without_spawning() {
+        // 1. Stand up the resident Echo worker on loopback (no bearer needed here).
+        let server = bamboo_subagent::transport::WsServer::bind_loopback()
+            .await
+            .expect("bind resident worker");
+        let endpoint = server.ws_endpoint(); // ws://127.0.0.1:<port>
+        let srv = tokio::spawn(async move {
+            let _ = server
+                .serve(Arc::new(bamboo_subagent::executor::EchoExecutor))
+                .await;
+        });
+
+        // 2. Registry: returns the live worker registered into pool "gpu-pool"
+        //    pointing at the real worker endpoint.
+        let registry = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/agents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![live_record(
+                "live-explorer",
+                "gpu-pool",
+                &endpoint,
+            )]))
+            .mount(&registry)
+            .await;
+
+        // 3. Runner: role "explorer" → schedulable on "gpu-pool"; bogus worker_bin.
+        let mut sched = HashMap::new();
+        sched.insert(
+            "explorer".to_string(),
+            sched_placement("gpu-pool", registry.uri()),
+        );
+        let runner = bogus_sched_runner(HashMap::new(), sched);
+
+        // 4. Drive a real run for that role.
+        let mut session = session_of_role("explorer", "hello scheduled");
+        let job = job_for("child-1");
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+        let cancel = CancellationToken::new();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            runner.execute_external_child(&mut session, &job, event_tx, cancel),
+        )
+        .await
+        .expect("run did not hang")
+        .expect("scheduled run succeeded (resolved from registry, did not spawn)");
+
+        // The EchoExecutor's reply is written back — proof a terminal flowed back.
+        let last = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Assistant))
+            .expect("an assistant reply was written back");
+        assert!(
+            last.content.contains("echo:"),
+            "expected echo reply, got {:?}",
+            last.content
+        );
+
+        // Best-effort: confirm streamed events also flowed.
         let mut saw_event = false;
         while let Ok(Some(_ev)) =
             tokio::time::timeout(Duration::from_millis(50), event_rx.recv()).await

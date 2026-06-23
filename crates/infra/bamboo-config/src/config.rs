@@ -312,6 +312,55 @@ pub struct SubagentsConfig {
     /// `remote_placements` key deserializes to an empty vec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_placements: Vec<RemoteActorPlacement>,
+    /// Schedulable placements: route specific sub-agent roles to a LIVE worker
+    /// resolved from the agent registry at run time, instead of a locally-spawned
+    /// subprocess (remote-actor-plan §3.4 / P2b, #181). Unlike `remote_placements`
+    /// (a fixed endpoint), a schedulable placement names a logical `pool` and a
+    /// `registry_url`; the engine queries the registry for live workers in that
+    /// pool and picks one. Empty (the default) keeps every role on the local path
+    /// — fully back-compatible: an old config with no `schedulable_placements` key
+    /// deserializes to an empty vec.
+    ///
+    /// PRECEDENCE: if a role appears in BOTH `remote_placements` and
+    /// `schedulable_placements`, the fixed remote placement wins (it is resolved
+    /// first in `build_spec`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedulable_placements: Vec<SchedulablePlacement>,
+}
+
+/// Routes a single sub-agent role to a registry-scheduled worker (remote-actor-
+/// plan §3.4 / P2b, #181). A child whose `subagent_type` matches `role` is run on
+/// a LIVE worker chosen from the agent registry: the engine builds a
+/// `RegistryFabric` at `registry_url`, lists live workers (the registry already
+/// excludes expired leases), filters to those whose `role` == `pool`, picks one
+/// (round-robin), and connects over `wss://` (Bearer-authenticated). If no live
+/// worker exists the run ERRORS — a schedulable role NEVER falls back to a local
+/// subprocess (that would silently defeat the placement).
+///
+/// The bearer token is NEVER stored here in the clear: `token_env` names the
+/// environment variable that holds it (mirroring `RemoteActorPlacement` /
+/// the A2A `auth_ref` pattern), read once at runner-build time and used for BOTH
+/// the registry query AND the worker connect. A `token_env` that is set-but-unset
+/// at build time fails SAFE — the placement is skipped and the role falls back to
+/// Local rather than querying/connecting unauthenticated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SchedulablePlacement {
+    /// Sub-agent role this targets (matches the child session's
+    /// `metadata["subagent_type"]`).
+    pub role: String,
+    /// Logical pool name — the registry `role` to query for live workers.
+    pub pool: String,
+    /// Base URL of the agent registry, e.g. `https://control-plane:9562`.
+    pub registry_url: String,
+    /// Env var holding the bearer token (NOT the raw token — mirrors A2A
+    /// `auth_ref`). Used for BOTH the registry query and the worker connect.
+    /// `None` ⇒ query/connect without a bearer (trusted link only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    /// PEM file pinning a self-signed worker/registry cert. `None` ⇒ default
+    /// webpki roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_file: Option<String>,
 }
 
 /// Pins a single sub-agent role to a remote resident worker (remote-actor-plan
@@ -2185,6 +2234,57 @@ mod tests {
         // Optional fields default to None and are skipped on serialize.
         let p1 = &cfg.remote_placements[1];
         assert_eq!(p1.role, "writer");
+        assert!(p1.token_env.is_none());
+        assert!(p1.ca_cert_file.is_none());
+
+        let back = serde_json::to_string(&cfg).unwrap();
+        let reparsed: SubagentsConfig = serde_json::from_str(&back).unwrap();
+        assert_eq!(cfg, reparsed, "round-trip is stable");
+        assert!(!back.contains("\"token_env\":null"));
+        assert!(!back.contains("\"ca_cert_file\":null"));
+    }
+
+    #[test]
+    fn subagents_config_without_schedulable_placements_deserializes_empty() {
+        // An OLD config (predating P2b) has no `schedulable_placements` key — it
+        // must still deserialize, with an empty list (default = local path).
+        let json = r#"{ "max_concurrent": 4 }"#;
+        let cfg: SubagentsConfig = serde_json::from_str(json).expect("old config deserializes");
+        assert!(cfg.schedulable_placements.is_empty());
+        // An empty list is omitted on re-serialize (skip_if empty).
+        let back = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !back.contains("schedulable_placements"),
+            "empty vec is skipped: {back}"
+        );
+    }
+
+    #[test]
+    fn schedulable_placement_round_trips() {
+        let json = r#"{
+            "schedulable_placements": [
+                {
+                    "role": "explorer",
+                    "pool": "gpu-pool",
+                    "registry_url": "https://control-plane:9562",
+                    "token_env": "WORKER_TOKEN",
+                    "ca_cert_file": "/etc/bamboo/worker.pem"
+                },
+                { "role": "writer", "pool": "cpu-pool", "registry_url": "http://127.0.0.1:8080" }
+            ]
+        }"#;
+        let cfg: SubagentsConfig = serde_json::from_str(json).expect("populated config");
+        assert_eq!(cfg.schedulable_placements.len(), 2);
+        let p0 = &cfg.schedulable_placements[0];
+        assert_eq!(p0.role, "explorer");
+        assert_eq!(p0.pool, "gpu-pool");
+        assert_eq!(p0.registry_url, "https://control-plane:9562");
+        assert_eq!(p0.token_env.as_deref(), Some("WORKER_TOKEN"));
+        assert_eq!(p0.ca_cert_file.as_deref(), Some("/etc/bamboo/worker.pem"));
+        // Optional fields default to None and are skipped on serialize.
+        let p1 = &cfg.schedulable_placements[1];
+        assert_eq!(p1.role, "writer");
+        assert_eq!(p1.pool, "cpu-pool");
         assert!(p1.token_env.is_none());
         assert!(p1.ca_cert_file.is_none());
 

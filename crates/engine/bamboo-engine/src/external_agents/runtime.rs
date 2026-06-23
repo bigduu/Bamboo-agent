@@ -229,8 +229,64 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
             sub.max_concurrent
                 .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
         )
-        .with_remote_placements(resolve_remote_placements(&sub.remote_placements)),
+        .with_remote_placements(resolve_remote_placements(&sub.remote_placements))
+        .with_schedulable_placements(resolve_schedulable_placements(&sub.schedulable_placements)),
     ))
+}
+
+/// Resolve config `schedulable_placements` into runner-ready handles (#181, P2b),
+/// keyed by role. Mirrors `resolve_remote_placements`: the bearer is read from
+/// `token_env` HERE (the raw token never rides the config) and is used for BOTH
+/// the registry query and the chosen worker's connect. If `token_env` is `Some`
+/// but the env var is UNSET, log an error and SKIP that placement so a misconfig
+/// fails SAFE to the local path rather than querying/connecting with no bearer. A
+/// placement with no `token_env` is tokenless (trusted/loopback link only).
+/// Duplicate roles: last one wins.
+fn resolve_schedulable_placements(
+    placements: &[bamboo_config::SchedulablePlacement],
+) -> std::collections::HashMap<String, super::actor_adapter::ResolvedSchedulablePlacement> {
+    let mut out = std::collections::HashMap::new();
+    for p in placements {
+        let token = match p.token_env.as_deref() {
+            Some(env_var) => match std::env::var(env_var) {
+                Ok(token) => Some(token),
+                Err(_) => {
+                    tracing::error!(
+                        "schedulable placement for role '{}' token_env '{}' is not set; \
+                         skipping (role falls back to local, NOT an unauthenticated registry query)",
+                        p.role,
+                        env_var
+                    );
+                    continue;
+                }
+            },
+            None => {
+                // A tokenless schedulable placement only makes sense on a trusted
+                // link. Warn if it targets what looks like a public registry so an
+                // operator footgun is visible in logs.
+                if registry_url_looks_public(&p.registry_url) {
+                    tracing::warn!(
+                        "schedulable placement for role '{}' has no token_env but targets a \
+                         public-looking registry '{}'; the registry query AND the worker connect \
+                         will carry NO bearer. Set token_env for any non-loopback control plane.",
+                        p.role,
+                        p.registry_url
+                    );
+                }
+                None
+            }
+        };
+        out.insert(
+            p.role.clone(),
+            super::actor_adapter::ResolvedSchedulablePlacement {
+                pool: p.pool.clone(),
+                registry_url: p.registry_url.clone(),
+                token,
+                ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+            },
+        );
+    }
+    out
 }
 
 /// Resolve config `remote_placements` into runner-ready handles (#193), keyed by
@@ -250,6 +306,22 @@ fn endpoint_looks_public(endpoint: &str) -> bool {
     let host = endpoint
         .strip_prefix("ws://")
         .unwrap_or(endpoint)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty())
+}
+
+/// Like `endpoint_looks_public` but for a registry URL (`http://` / `https://`).
+/// `https://` is always public-grade; for `http://` we flag any non-loopback
+/// host. Used to surface a tokenless-schedulable-placement footgun in logs.
+fn registry_url_looks_public(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let host = url
+        .strip_prefix("http://")
+        .unwrap_or(url)
         .split(['/', ':'])
         .next()
         .unwrap_or("");
