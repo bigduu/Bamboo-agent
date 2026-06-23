@@ -162,8 +162,24 @@ fn is_local_request(req: &HttpRequest) -> bool {
     if !host_candidates.is_empty() {
         let host_local = host_candidates.iter().all(|host| is_local_host(host));
         // Local only when the Host says local AND the peer is not known-remote.
-        // A peer of `None` (no socket info — e.g. unit tests, or odd transports)
-        // falls back to the Host signal so loopback/LAN dev still resolves local.
+        //
+        // A peer of `None` falls back to the Host signal (so loopback/LAN dev +
+        // unit tests without socket info still resolve local). This is NOT a
+        // remote-reachable bypass: actix populates `peer_addr()` for every
+        // accepted TCP/TLS socket, so a real internet client always yields
+        // `Some(_)`. `None` occurs only for unit `TestRequest`s and non-`net`
+        // transports (UDS / in-memory) — none of which a remote attacker can
+        // drive — so a spoofed `Host: localhost` from `None` cannot originate
+        // off-box.
+        //
+        // DEPLOYMENT CAVEAT: because we trust the socket peer (not `realip` /
+        // `X-Forwarded-For`), a reverse proxy on the SAME host (proxy→bamboo over
+        // loopback) makes every forwarded request's peer `127.0.0.1`. A normal
+        // proxy forwards the client's real `Host` (a public name → `host_local`
+        // false → still requires auth), but a proxy that rewrites `Host` to a
+        // local value would make all proxied clients local-bypass. The v2 design
+        // is "no proxy — bamboo terminates TLS itself", so this is acceptable;
+        // a trusted-proxy mode (trust `X-Forwarded-For`) would be a separate opt-in.
         return host_local && peer_local != Some(false);
     }
 
