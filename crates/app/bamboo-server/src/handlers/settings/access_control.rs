@@ -144,26 +144,35 @@ fn request_host_candidates(req: &HttpRequest) -> Vec<String> {
 }
 
 fn is_local_request(req: &HttpRequest) -> bool {
+    // The real TCP peer is the source of truth for the local-bypass decision. A
+    // client-controlled `Host` / `X-Forwarded-Host` header MUST NOT upgrade a
+    // known-REMOTE peer to "local" — that was an auth bypass (#199): a request
+    // from the public internet carrying `Host: localhost` would be treated as
+    // local and skip the access password entirely.
+    //
+    // We deliberately trust ONLY the actual socket peer here, NOT
+    // `X-Forwarded-For` / realip (also client-controlled, and there is no
+    // trusted-proxy mode configured — bamboo terminates TLS itself per the v2
+    // design, so the socket peer IS the client).
+    let peer_local: Option<bool> = req
+        .peer_addr()
+        .map(|peer| is_local_host(&peer.ip().to_string()));
+
     let host_candidates = request_host_candidates(req);
     if !host_candidates.is_empty() {
-        return host_candidates.iter().all(|host| is_local_host(host));
+        let host_local = host_candidates.iter().all(|host| is_local_host(host));
+        // Local only when the Host says local AND the peer is not known-remote.
+        // A peer of `None` (no socket info — e.g. unit tests, or odd transports)
+        // falls back to the Host signal so loopback/LAN dev still resolves local.
+        return host_local && peer_local != Some(false);
     }
 
-    if let Some(peer) = req.peer_addr() {
-        return is_local_host(&peer.ip().to_string());
+    // No Host header: decide purely from the real socket peer.
+    if let Some(local) = peer_local {
+        return local;
     }
-
     let conn = req.connection_info();
-    for candidate in [conn.realip_remote_addr(), conn.peer_addr()]
-        .into_iter()
-        .flatten()
-    {
-        if is_local_host(candidate) {
-            return true;
-        }
-    }
-
-    false
+    conn.peer_addr().map(is_local_host).unwrap_or(false)
 }
 
 /// Best-effort client-IP key for per-IP throttling (#190).
@@ -1295,6 +1304,40 @@ mod tests {
             .insert_header((header::HOST, "bamboo.example.com"))
             .to_http_request();
         assert!(!is_local_request(&req));
+    }
+
+    #[test]
+    fn spoofed_local_host_from_remote_peer_is_not_local() {
+        // #199: a request from a PUBLIC peer carrying `Host: localhost` (or any
+        // local-looking Host / X-Forwarded-Host) must NOT be treated as local —
+        // otherwise a remote attacker bypasses the access password entirely.
+        for spoof in ["localhost:9562", "127.0.0.1", "192.168.0.1"] {
+            let req = TestRequest::default()
+                .peer_addr("203.0.113.5:40000".parse().unwrap()) // public peer
+                .insert_header((header::HOST, spoof))
+                .to_http_request();
+            assert!(
+                !is_local_request(&req),
+                "remote peer + spoofed Host '{spoof}' must not be local"
+            );
+            // Same via X-Forwarded-Host.
+            let req2 = TestRequest::default()
+                .peer_addr("203.0.113.5:40000".parse().unwrap())
+                .insert_header(("x-forwarded-host", spoof))
+                .to_http_request();
+            assert!(
+                !is_local_request(&req2),
+                "remote peer + spoofed X-Forwarded-Host '{spoof}' must not be local"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_peer_with_no_host_is_local() {
+        let req = TestRequest::default()
+            .peer_addr("127.0.0.1:5000".parse().unwrap())
+            .to_http_request();
+        assert!(is_local_request(&req));
     }
 
     #[test]
