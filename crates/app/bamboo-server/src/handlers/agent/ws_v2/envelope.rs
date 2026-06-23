@@ -8,6 +8,41 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The wire encoding negotiated for a `/v2/stream` connection (v2-P3, §7.2).
+///
+/// Selected ONCE at the upgrade from the offered `Sec-WebSocket-Protocol`
+/// subprotocols and carried for the connection's lifetime. JSON is the default
+/// (desktop / debuggability); `bamboo.v2.msgpack` switches the SAME envelope
+/// schema to binary MessagePack. The logical schema is byte-for-byte identical —
+/// only the serialization + WS frame type (Text vs Binary) differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Encoding {
+    /// JSON text frames (`bamboo.v2`, the default). Today's behavior, unchanged.
+    Json,
+    /// MessagePack binary frames (`bamboo.v2.msgpack`).
+    Msgpack,
+}
+
+/// The subprotocol token a `bamboo.v2.msgpack` client offers / the server echoes.
+pub(crate) const SUBPROTOCOL_MSGPACK: &str = "bamboo.v2.msgpack";
+/// The subprotocol token for the default JSON encoding.
+pub(crate) const SUBPROTOCOL_JSON: &str = "bamboo.v2";
+
+/// An already-encoded outbound frame, tagged by WS frame type.
+///
+/// The forwarders encode a [`ServerEnvelope`] per the connection's [`Encoding`]
+/// up front and push one of these onto the per-channel queue; the driver writes
+/// `Text` via `session.text` and `Binary` via `session.binary`. This keeps the
+/// final encode out of the driver's hot select loop and makes the encoding
+/// per-connection rather than per-write.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OutFrame {
+    /// A JSON text frame (`Encoding::Json`).
+    Text(String),
+    /// A MessagePack binary frame (`Encoding::Msgpack`).
+    Binary(Vec<u8>),
+}
+
 /// A server→client envelope.
 ///
 /// Serializes as one of two shapes sharing `{ch, seq}`:
@@ -84,6 +119,40 @@ impl ServerEnvelope {
     /// Serialize to a JSON text frame.
     pub(crate) fn to_text(&self) -> Option<String> {
         serde_json::to_string(self).ok()
+    }
+
+    /// Encode to an [`OutFrame`] per the connection's [`Encoding`].
+    ///
+    /// JSON → a text frame (today's behavior, byte-for-byte). Msgpack →
+    /// `rmp_serde::to_vec_named`, which serializes structs as MAPS (named
+    /// fields). This is REQUIRED: `ServerEnvelope` uses `#[serde(flatten)]` over
+    /// an `#[serde(untagged)]` body, and rmp-serde's default `to_vec` writes
+    /// structs as positional ARRAYS, which breaks both flatten and untagged
+    /// resolution. With `to_vec_named` the logical wire schema is identical to
+    /// the JSON form (`{ch, seq, event}` / `{ch, seq, control}`), just msgpack.
+    ///
+    /// A serialization failure yields `None` — the caller skips the frame and
+    /// keeps the forwarder alive (matches the v1 SSE `to_string(...).ok()`
+    /// discipline).
+    pub(crate) fn encode(&self, encoding: Encoding) -> Option<OutFrame> {
+        match encoding {
+            Encoding::Json => self.to_text().map(OutFrame::Text),
+            Encoding::Msgpack => rmp_serde::to_vec_named(self).ok().map(OutFrame::Binary),
+        }
+    }
+}
+
+/// Decode an inbound [`ClientFrame`] per the connection's [`Encoding`].
+///
+/// JSON mode parses a Text frame's UTF-8 with serde_json (today's behavior).
+/// Msgpack mode parses a Binary frame with rmp-serde. Both honor the
+/// `#[serde(other)] Unknown` fallback, so an unrecognized `type` tag decodes to
+/// [`ClientFrame::Unknown`] rather than erroring; a truly malformed body is an
+/// `Err` the driver logs-and-ignores (it never tears down the connection).
+pub(crate) fn decode_client_frame(encoding: Encoding, bytes: &[u8]) -> Result<ClientFrame, String> {
+    match encoding {
+        Encoding::Json => serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+        Encoding::Msgpack => rmp_serde::from_slice(bytes).map_err(|e| e.to_string()),
     }
 }
 
@@ -288,6 +357,153 @@ mod tests {
         // A JSON object missing the `type` tag → also an error (no default tag).
         let r: Result<ClientFrame, _> = serde_json::from_str(r#"{"ch":"feed"}"#);
         assert!(r.is_err());
+    }
+
+    // ── msgpack round-trips (v2-P3, #181) ─────────────────────────────────────
+    //
+    // The CRITICAL gotcha: `ServerEnvelope` has `#[serde(flatten)]` over an
+    // untagged body, and rmp-serde's default `to_vec` writes structs as positional
+    // ARRAYS, which breaks both. These tests pin that `to_vec_named` (structs as
+    // MAPS) round-trips the SAME logical schema as JSON. We decode back to a
+    // `serde_json::Value` (msgpack maps → JSON objects) so the assertions are on
+    // the exact field names/values the JSON form carries.
+
+    #[test]
+    fn server_envelope_event_msgpack_roundtrips_to_same_schema() {
+        let env = ServerEnvelope::event(
+            "agent.sess_abc",
+            42,
+            json!({ "type": "token", "content": "Hello" }),
+        );
+        let frame = env.encode(Encoding::Msgpack).expect("msgpack encode");
+        let OutFrame::Binary(bytes) = frame else {
+            panic!("msgpack encoding must yield a Binary frame");
+        };
+        // Decode the msgpack bytes back to a JSON Value: maps → objects, so the
+        // logical shape must equal the JSON form exactly.
+        let v: Value = rmp_serde::from_slice(&bytes).expect("msgpack decodes to Value");
+        assert_eq!(
+            v,
+            json!({
+                "ch": "agent.sess_abc",
+                "seq": 42,
+                "event": { "type": "token", "content": "Hello" }
+            }),
+            "to_vec_named must preserve flatten + untagged as a {{ch,seq,event}} map"
+        );
+        assert_eq!(v.as_object().unwrap().len(), 3, "no wrapper nesting");
+    }
+
+    #[test]
+    fn server_envelope_control_msgpack_roundtrips_to_same_schema() {
+        let env = ServerEnvelope::control("agent.sess_abc", 43, terminal_control("complete"));
+        let frame = env.encode(Encoding::Msgpack).expect("msgpack encode");
+        let OutFrame::Binary(bytes) = frame else {
+            panic!("msgpack encoding must yield a Binary frame");
+        };
+        let v: Value = rmp_serde::from_slice(&bytes).expect("msgpack decodes to Value");
+        assert_eq!(
+            v,
+            json!({
+                "ch": "agent.sess_abc",
+                "seq": 43,
+                "control": { "type": "terminal", "reason": "complete" }
+            }),
+            "the untagged Control arm must round-trip as {{ch,seq,control}}"
+        );
+    }
+
+    #[test]
+    fn server_envelope_json_encode_is_unchanged_text() {
+        // The JSON encoding path is byte-for-byte the existing `to_text`.
+        let env = ServerEnvelope::event("feed", 7, json!({ "type": "x" }));
+        let frame = env.encode(Encoding::Json).expect("json encode");
+        assert_eq!(frame, OutFrame::Text(env.to_text().unwrap()));
+    }
+
+    #[test]
+    fn client_frame_all_variants_msgpack_roundtrip() {
+        // Each variant encodes (as a tagged map) and decodes back identically.
+        for original in [
+            ClientFrame::Hello {
+                device_id: Some("d1".into()),
+                token: Some("bd1_x".into()),
+            },
+            ClientFrame::Hello {
+                device_id: None,
+                token: None,
+            },
+            ClientFrame::Subscribe {
+                ch: "feed".into(),
+                since: Some(1006),
+            },
+            ClientFrame::Subscribe {
+                ch: "agent.s1".into(),
+                since: None,
+            },
+            ClientFrame::Unsubscribe {
+                ch: "agent.s1".into(),
+            },
+            ClientFrame::Stop {
+                session_id: "s1".into(),
+            },
+        ] {
+            // ClientFrame is Deserialize-only; encode the equivalent JSON Value to
+            // msgpack (the same bytes a client would send) and decode it back.
+            let as_json = match &original {
+                ClientFrame::Hello { device_id, token } => {
+                    json!({ "type": "hello", "device_id": device_id, "token": token })
+                }
+                ClientFrame::Subscribe { ch, since } => {
+                    json!({ "type": "subscribe", "ch": ch, "since": since })
+                }
+                ClientFrame::Unsubscribe { ch } => json!({ "type": "unsubscribe", "ch": ch }),
+                ClientFrame::Stop { session_id } => {
+                    json!({ "type": "stop", "session_id": session_id })
+                }
+                ClientFrame::Unknown => unreachable!(),
+            };
+            let bytes = rmp_serde::to_vec_named(&as_json).expect("encode client frame as msgpack");
+            let decoded = decode_client_frame(Encoding::Msgpack, &bytes).expect("decode");
+            assert_eq!(decoded, original, "msgpack client frame must round-trip");
+        }
+    }
+
+    #[test]
+    fn client_frame_unknown_tag_msgpack_maps_to_unknown_not_error() {
+        // An unrecognized `type` over msgpack must map to Unknown (serde `other`),
+        // NOT an Err that would drop the connection — parity with the JSON path.
+        let bytes =
+            rmp_serde::to_vec_named(&json!({ "type": "execute", "session_id": "s1" })).unwrap();
+        let decoded =
+            decode_client_frame(Encoding::Msgpack, &bytes).expect("unknown tag is not Err");
+        assert_eq!(decoded, ClientFrame::Unknown);
+    }
+
+    #[test]
+    fn client_frame_malformed_msgpack_is_err_not_panic() {
+        // Random bytes that are not a valid msgpack map → Err, which the driver
+        // logs + ignores (no disconnect).
+        let r = decode_client_frame(Encoding::Msgpack, &[0xc1, 0x00, 0xff, 0x10]);
+        assert!(r.is_err());
+        // A valid msgpack value missing the `type` tag → also Err (no default tag),
+        // same as the JSON path.
+        let bytes = rmp_serde::to_vec_named(&json!({ "ch": "feed" })).unwrap();
+        assert!(decode_client_frame(Encoding::Msgpack, &bytes).is_err());
+    }
+
+    #[test]
+    fn decode_client_frame_json_matches_serde_json() {
+        // The JSON decode path is unchanged: same result as direct serde_json.
+        let text = r#"{"type":"subscribe","ch":"feed","since":5}"#;
+        let decoded = decode_client_frame(Encoding::Json, text.as_bytes()).unwrap();
+        assert_eq!(
+            decoded,
+            ClientFrame::Subscribe {
+                ch: "feed".into(),
+                since: Some(5)
+            }
+        );
     }
 
     #[test]

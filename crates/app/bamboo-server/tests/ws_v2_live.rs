@@ -139,6 +139,60 @@ async fn connect_remote(server: &TestServer) -> WsConn {
     framed
 }
 
+/// Open a LOCAL WS connection negotiating the `bamboo.v2.msgpack` subprotocol
+/// (v2-P3, #181). Returns the framed socket AND the subprotocol the server ECHOED
+/// on the upgrade response (per RFC 6455 the server echoes the single selected
+/// subprotocol), so the test can assert the handshake negotiated msgpack.
+async fn connect_local_msgpack(server: &TestServer) -> (WsConn, Option<String>) {
+    let (resp, framed) = awc::Client::new()
+        .ws(&server.base_ws_url)
+        .protocols(["bamboo.v2.msgpack"])
+        .connect()
+        .await
+        .expect("local msgpack ws upgrade");
+    let echoed = resp
+        .headers()
+        .get(awc::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    (framed, echoed)
+}
+
+/// Send a client frame as a BINARY MessagePack frame (the inbound shape a msgpack
+/// client uses): the JSON `value` is re-encoded with `to_vec_named` so the wire
+/// bytes carry the SAME logical schema the server's `decode_client_frame` expects.
+async fn send_msgpack(conn: &mut WsConn, value: Value) {
+    let bytes = rmp_serde::to_vec_named(&value).expect("encode client frame as msgpack");
+    conn.send(ws::Message::Binary(bytes.into()))
+        .await
+        .expect("send msgpack client frame");
+}
+
+/// Receive the next BINARY frame and decode the MessagePack envelope back to a
+/// JSON `Value` (msgpack maps → JSON objects), so assertions read the SAME field
+/// names/values as the JSON path. Skips Ping/Pong. Returns `None` on close.
+async fn next_msgpack_envelope(conn: &mut WsConn) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, conn.next())
+            .await
+            .expect("frame did not arrive before timeout")?;
+        match frame.expect("ws protocol error") {
+            ws::Frame::Binary(bytes) => {
+                return Some(rmp_serde::from_slice(&bytes).expect("envelope is msgpack"));
+            }
+            ws::Frame::Text(bytes) => panic!(
+                "msgpack mode must yield BINARY frames, got text: {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+            ws::Frame::Ping(_) | ws::Frame::Pong(_) => continue,
+            ws::Frame::Close(_) => return None,
+            other => panic!("unexpected ws frame: {other:?}"),
+        }
+    }
+}
+
 /// Send a JSON client frame.
 async fn send_json(conn: &mut WsConn, value: Value) {
     conn.send(ws::Message::Text(value.to_string().into()))
@@ -639,6 +693,107 @@ async fn remote_with_invalid_hello_is_closed() {
 
     // An invalid credential closes the socket (well before the deadline).
     expect_closed(&mut conn).await;
+
+    server.stop().await;
+}
+
+// ── Scenario 5: msgpack subprotocol (v2-P3, #181) ───────────────────────────
+
+/// A local client negotiates `bamboo.v2.msgpack`, the server ECHOES it on the
+/// handshake response, the client subscribes over a BINARY msgpack frame, the
+/// server pushes an `AgentEvent`, and the client decodes the BINARY msgpack
+/// envelope and asserts `ch`/`seq`/`event.content`. This proves the full binary
+/// path end to end (real handshake echo + real binary inbound + real binary
+/// outbound), not just the unit round-trips.
+#[actix_web::test]
+async fn msgpack_subprotocol_subscribe_event_roundtrip() {
+    let server = TestServer::start(|_| {}).await;
+    let sid = "sess_msgpack";
+
+    let mut root = bamboo_agent_core::Session::new(sid, "test-model");
+    register_session(&server.state, &mut root).await;
+
+    let (mut conn, echoed) = connect_local_msgpack(&server).await;
+    // The server MUST echo the selected subprotocol on the upgrade response.
+    assert_eq!(
+        echoed.as_deref(),
+        Some("bamboo.v2.msgpack"),
+        "server must echo the negotiated subprotocol on the handshake"
+    );
+
+    let ch = format!("agent.{sid}");
+    // Subscribe over a BINARY msgpack frame (client→server msgpack works).
+    send_msgpack(&mut conn, json!({"type": "subscribe", "ch": ch})).await;
+
+    // Same bounded-retry handoff as the JSON scenario, but decoding BINARY frames.
+    let received = {
+        let mut got = None;
+        let overall = tokio::time::Instant::now() + RECV_TIMEOUT;
+        while tokio::time::Instant::now() < overall {
+            server
+                .state
+                .get_session_event_sender(sid)
+                .await
+                .send(AgentEvent::Token {
+                    content: "Hello".into(),
+                })
+                .ok();
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(150), next_msgpack_envelope(&mut conn))
+                    .await
+            {
+                got = Some(env);
+                break;
+            }
+        }
+        got.expect("a token envelope must arrive as a BINARY msgpack frame")
+    };
+
+    // The decoded msgpack envelope carries the SAME logical schema as JSON.
+    assert_eq!(received["ch"], ch.as_str());
+    assert!(received["seq"].as_u64().unwrap() >= 1);
+    assert_eq!(received["event"]["type"], "token");
+    assert_eq!(received["event"]["content"], "Hello");
+
+    server.stop().await;
+}
+
+/// A client that offers NO subprotocol still gets the JSON path with NO echoed
+/// subprotocol — the legacy handshake is byte-for-byte unchanged (zero-regression
+/// guard for v2-P3).
+#[actix_web::test]
+async fn no_subprotocol_stays_json_with_no_echo() {
+    let server = TestServer::start(|_| {}).await;
+
+    let (resp, mut conn) = awc::Client::new()
+        .ws(&server.base_ws_url)
+        .connect()
+        .await
+        .expect("local ws upgrade");
+    // No subprotocol offered → none echoed (legacy handshake unchanged).
+    assert!(
+        resp.headers()
+            .get(awc::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .is_none(),
+        "a client offering no subprotocol must get no echo"
+    );
+
+    // And the wire is still JSON TEXT: a feed event arrives as a text envelope.
+    server.state.account_sink.record(
+        None,
+        &AgentEvent::SessionDeleted {
+            session_id: "j".into(),
+        },
+    );
+    send_json(
+        &mut conn,
+        json!({"type": "subscribe", "ch": "feed", "since": 0}),
+    )
+    .await;
+    let env = next_envelope(&mut conn)
+        .await
+        .expect("JSON feed envelope on the default path");
+    assert_eq!(env["ch"], "feed");
 
     server.stop().await;
 }
