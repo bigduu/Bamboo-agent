@@ -47,19 +47,24 @@ use bamboo_engine::events::journal;
 
 use actix_web::web;
 
-use super::envelope::{feed_reset_control, terminal_control, ServerEnvelope};
+use super::envelope::{feed_reset_control, terminal_control, Encoding, OutFrame, ServerEnvelope};
 use crate::app_state::AppState;
 use crate::handlers::agent::events::{has_running_child, Coalescer};
 use crate::handlers::agent::stream::{plan_replay, ReplayPlan};
 
-/// What the driver sends to the WS writer: a fully-built envelope's text frame.
-pub(crate) type OutboundTx = mpsc::Sender<String>;
+/// What the driver sends to the WS writer: an already-encoded frame (a JSON text
+/// frame or a MessagePack binary frame), tagged so the driver picks
+/// `session.text` vs `session.binary` (v2-P3, #181). The forwarder encodes per
+/// the connection's [`Encoding`] up front, keeping the final encode out of the
+/// driver's hot select loop.
+pub(crate) type OutboundTx = mpsc::Sender<OutFrame>;
 
-/// Push a server envelope onto the shared outbound mpsc. Returns `false` if the
-/// driver-side receiver is gone (connection closing), so the forwarder stops.
-async fn send_env(out: &OutboundTx, env: ServerEnvelope) -> bool {
-    match env.to_text() {
-        Some(text) => out.send(text).await.is_ok(),
+/// Encode a server envelope per `encoding` and push it onto the shared outbound
+/// mpsc. Returns `false` if the driver-side receiver is gone (connection
+/// closing), so the forwarder stops.
+async fn send_env(out: &OutboundTx, encoding: Encoding, env: ServerEnvelope) -> bool {
+    match env.encode(encoding) {
+        Some(frame) => out.send(frame).await.is_ok(),
         // A serialization failure is per-event; skip it but keep the forwarder
         // alive (matches the v1 SSE `serde_json::to_string(...).ok()` discipline).
         None => true,
@@ -76,6 +81,7 @@ async fn send_env(out: &OutboundTx, env: ServerEnvelope) -> bool {
 /// replay are buffered in the ring (no gap).
 pub(crate) fn spawn_feed_forwarder(
     out: OutboundTx,
+    encoding: Encoding,
     mut receiver: broadcast::Receiver<Arc<ChangeEvent>>,
     events_dir: PathBuf,
     since: u64,
@@ -96,6 +102,7 @@ pub(crate) fn spawn_feed_forwarder(
             // client resyncs via REST and the live tail serves anything newer.
             if !send_env(
                 &out,
+                encoding,
                 ServerEnvelope::control("feed", 0, feed_reset_control(from)),
             )
             .await
@@ -104,7 +111,7 @@ pub(crate) fn spawn_feed_forwarder(
             }
         }
         for ce in events {
-            if !send_env(&out, feed_envelope(&ce)).await {
+            if !send_env(&out, encoding, feed_envelope(&ce)).await {
                 return;
             }
         }
@@ -116,7 +123,7 @@ pub(crate) fn spawn_feed_forwarder(
                     if ce.seq <= last_replayed {
                         continue; // dedupe the replay/live overlap
                     }
-                    if !send_env(&out, feed_envelope(&ce)).await {
+                    if !send_env(&out, encoding, feed_envelope(&ce)).await {
                         return;
                     }
                     last_replayed = ce.seq;
@@ -129,7 +136,7 @@ pub(crate) fn spawn_feed_forwarder(
                             if ce.seq <= last_replayed {
                                 continue;
                             }
-                            if !send_env(&out, feed_envelope(&ce)).await {
+                            if !send_env(&out, encoding, feed_envelope(&ce)).await {
                                 return;
                             }
                             last_replayed = ce.seq;
@@ -174,6 +181,7 @@ pub(crate) fn spawn_agent_forwarder(
     state: web::Data<AppState>,
     session_id: String,
     out: OutboundTx,
+    encoding: Encoding,
     ch: String,
     mut receiver: broadcast::Receiver<AgentEvent>,
     budget_event_to_replay: Option<AgentEvent>,
@@ -186,12 +194,12 @@ pub(crate) fn spawn_agent_forwarder(
         // Replay cached critical state events first (task list, sub-sessions, …),
         // then the last budget event — mirroring the v1 SSE replay order.
         for event in critical_events_to_replay {
-            if !emit_agent_event(&out, &ch, &seq, event).await {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
                 return;
             }
         }
         if let Some(event) = budget_event_to_replay {
-            if !emit_agent_event(&out, &ch, &seq, event).await {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
                 return;
             }
         }
@@ -214,7 +222,7 @@ pub(crate) fn spawn_agent_forwarder(
                         let is_terminal = is_terminal_event(&event);
                         let is_child_completed =
                             matches!(event, AgentEvent::SubAgentCompleted { .. });
-                        if !emit_agent_event(&out, &ch, &seq, event).await {
+                        if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
                             return;
                         }
                         if is_terminal {
@@ -224,6 +232,7 @@ pub(crate) fn spawn_agent_forwarder(
                             }
                             let _ = send_env(
                                 &out,
+                                encoding,
                                 ServerEnvelope::control(
                                     &ch,
                                     seq.next(),
@@ -241,6 +250,7 @@ pub(crate) fn spawn_agent_forwarder(
                         {
                             let _ = send_env(
                                 &out,
+                                encoding,
                                 ServerEnvelope::control(
                                     &ch,
                                     seq.next(),
@@ -275,7 +285,7 @@ pub(crate) fn spawn_agent_forwarder(
             tokio::select! {
                 _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                     if let Some(pending) = coalescer.take_pending() {
-                        if !emit_agent_event(&out, &ch, &seq, pending).await {
+                        if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
                             return;
                         }
                     }
@@ -292,7 +302,7 @@ pub(crate) fn spawn_agent_forwarder(
                             // new event when non-coalescible). Terminal events are
                             // non-coalescible, so any pending tokens flush first.
                             for out_event in coalescer.push(event) {
-                                if !emit_agent_event(&out, &ch, &seq, out_event).await {
+                                if !emit_agent_event(&out, encoding, &ch, &seq, out_event).await {
                                     return;
                                 }
                             }
@@ -314,6 +324,7 @@ pub(crate) fn spawn_agent_forwarder(
                                 }
                                 let _ = send_env(
                                     &out,
+                                    encoding,
                                     ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
                                 )
                                 .await;
@@ -325,6 +336,7 @@ pub(crate) fn spawn_agent_forwarder(
                             {
                                 let _ = send_env(
                                     &out,
+                                    encoding,
                                     ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
                                 )
                                 .await;
@@ -336,7 +348,7 @@ pub(crate) fn spawn_agent_forwarder(
                             // pending buffer so we never merge tokens across the
                             // gap and fabricate adjacency.
                             if let Some(pending) = coalescer.take_pending() {
-                                if !emit_agent_event(&out, &ch, &seq, pending).await {
+                                if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
                                     return;
                                 }
                                 flush_deadline = None;
@@ -345,7 +357,7 @@ pub(crate) fn spawn_agent_forwarder(
                         Err(broadcast::error::RecvError::Closed) => {
                             // Flush any buffered tokens before closing.
                             if let Some(pending) = coalescer.take_pending() {
-                                let _ = emit_agent_event(&out, &ch, &seq, pending).await;
+                                let _ = emit_agent_event(&out, encoding, &ch, &seq, pending).await;
                             }
                             return;
                         }
@@ -356,14 +368,21 @@ pub(crate) fn spawn_agent_forwarder(
     })
 }
 
-/// Serialize an `AgentEvent` into an `{ch, seq, event}` envelope and push it.
-async fn emit_agent_event(out: &OutboundTx, ch: &str, seq: &AgentSeq, event: AgentEvent) -> bool {
+/// Serialize an `AgentEvent` into an `{ch, seq, event}` envelope and push it,
+/// encoded per `encoding`.
+async fn emit_agent_event(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    event: AgentEvent,
+) -> bool {
     let value = match serde_json::to_value(&event) {
         Ok(v) => v,
         // Skip an unserializable event but keep the forwarder alive (v1 parity).
         Err(_) => return true,
     };
-    send_env(out, ServerEnvelope::event(ch, seq.next(), value)).await
+    send_env(out, encoding, ServerEnvelope::event(ch, seq.next(), value)).await
 }
 
 /// Whether an agent event terminates the run (mirrors the v1 SSE predicate).

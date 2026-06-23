@@ -23,9 +23,15 @@
 //! `JoinHandle` lets `unsubscribe`/teardown abort exactly that forwarder and drop
 //! its queue, leaving no orphaned broadcast reader.
 //!
+//! ## Encoding (v2-P3, #181)
+//! The wire encoding is negotiated ONCE at the upgrade from the offered
+//! `Sec-WebSocket-Protocol`: `bamboo.v2.msgpack` selects binary MessagePack,
+//! anything else (or nothing) stays JSON text (the default — desktop /
+//! debuggability). The SAME envelope schema is carried either way; only the
+//! serialization + WS frame type (Text vs Binary) differs. See `envelope::Encoding`.
+//!
 //! ## DEFERRED (later slices; see PR / §5.3)
 //! - `execute` / `approve` over control (handler refactors) — clients keep REST.
-//! - msgpack subprotocol (v2-P3) — JSON text frames only.
 //!
 //! ## Auth (v2-P2, #181 / #189)
 //! `/v2/stream` is on the public route whitelist, so the upgrade OPENS without
@@ -62,7 +68,10 @@ use tokio_stream::StreamMap;
 
 use serde::Deserialize;
 
-use self::envelope::{Channel, ClientFrame};
+use self::envelope::{
+    decode_client_frame, Channel, ClientFrame, Encoding, OutFrame, SUBPROTOCOL_JSON,
+    SUBPROTOCOL_MSGPACK,
+};
 use self::forwarders::{spawn_agent_forwarder, spawn_feed_forwarder, OutboundTx};
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
@@ -148,7 +157,7 @@ enum GateOutcome {
     Dispatch,
 }
 
-/// The AppState-aware auth gate, factored out of `handle_client_text` so it is
+/// The AppState-aware auth gate, factored out of `handle_client_frame` so it is
 /// unit-testable WITHOUT a live WS `Session`. It owns the entire `!authorized`
 /// decision plus the credential verification, and flips `authorized` to `true`
 /// only on a VERIFIED `hello` device token.
@@ -216,6 +225,42 @@ pub struct StreamQuery {
     pub batch_ms: u64,
 }
 
+/// Negotiate the wire [`Encoding`] from the upgrade's `Sec-WebSocket-Protocol`
+/// header (v2-P3, §5.3 / §7.2). Returns the chosen encoding AND the subprotocol
+/// token the server must ECHO on the upgrade response (per RFC 6455 the server
+/// echoes the single selected subprotocol).
+///
+/// - Offers including `bamboo.v2.msgpack` → `(Msgpack, Some("bamboo.v2.msgpack"))`.
+/// - Offers including only `bamboo.v2` → `(Json, Some("bamboo.v2"))`.
+/// - No (recognized) subprotocol offered → `(Json, None)` — today's behavior is
+///   preserved byte-for-byte for clients that offer nothing.
+///
+/// `bamboo.v2.msgpack` wins if BOTH are offered (the client opted into binary).
+fn negotiate_encoding(req: &HttpRequest) -> (Encoding, Option<&'static str>) {
+    let offered = req
+        .headers()
+        .get(actix_web::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // The header is a comma-separated list of subprotocol tokens.
+    let mut has_msgpack = false;
+    let mut has_json = false;
+    for tok in offered.split(',') {
+        match tok.trim() {
+            SUBPROTOCOL_MSGPACK => has_msgpack = true,
+            SUBPROTOCOL_JSON => has_json = true,
+            _ => {}
+        }
+    }
+    if has_msgpack {
+        (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+    } else if has_json {
+        (Encoding::Json, Some(SUBPROTOCOL_JSON))
+    } else {
+        (Encoding::Json, None)
+    }
+}
+
 /// `GET /v2/stream` — upgrade to the unified WS multiplex.
 ///
 /// The upgrade itself is PUBLIC (whitelisted in `is_public_access_route`), so a
@@ -225,6 +270,10 @@ pub struct StreamQuery {
 /// (local bypass / verified password cookie / header device token), via the same
 /// `request_is_authorized` allow-decision the middleware uses; everything else
 /// must present a verified `hello` before any channel is served, on a deadline.
+///
+/// The wire [`Encoding`] is negotiated from `Sec-WebSocket-Protocol` (v2-P3):
+/// `bamboo.v2.msgpack` → binary MessagePack; otherwise JSON text (default). The
+/// selected subprotocol is ECHOED on the upgrade response per RFC 6455.
 pub async fn handler(
     state: web::Data<AppState>,
     query: web::Query<StreamQuery>,
@@ -233,6 +282,9 @@ pub async fn handler(
 ) -> actix_web::Result<impl Responder> {
     // Clamp the untrusted `batch_ms` the same way the v1 SSE handler does.
     let batch_ms = query.batch_ms.min(MAX_BATCH_MS);
+
+    // Negotiate the wire encoding from the offered subprotocols (v2-P3).
+    let (encoding, selected_subprotocol) = negotiate_encoding(&req);
 
     // Pre-authorize exactly the connections the middleware would have allowed on
     // a gated route: local bypass, a verified password cookie (sent on the
@@ -244,9 +296,26 @@ pub async fn handler(
         crate::handlers::settings::request_is_authorized(&req, &config)
     };
 
-    let (response, session, msg_stream) = actix_ws::handle(&req, body)?;
+    let (mut response, session, msg_stream) = actix_ws::handle(&req, body)?;
 
-    actix_web::rt::spawn(drive(state, session, msg_stream, batch_ms, pre_authorized));
+    // Echo the selected subprotocol on the upgrade RESPONSE (RFC 6455). A client
+    // that offered no recognized subprotocol gets none, keeping the legacy
+    // handshake byte-for-byte unchanged.
+    if let Some(proto) = selected_subprotocol {
+        response.headers_mut().insert(
+            actix_web::http::header::SEC_WEBSOCKET_PROTOCOL,
+            actix_web::http::header::HeaderValue::from_static(proto),
+        );
+    }
+
+    actix_web::rt::spawn(drive(
+        state,
+        session,
+        msg_stream,
+        batch_ms,
+        pre_authorized,
+        encoding,
+    ));
 
     Ok(response)
 }
@@ -260,6 +329,7 @@ async fn drive(
     mut msg_stream: actix_ws::MessageStream,
     batch_ms: u64,
     pre_authorized: bool,
+    encoding: Encoding,
 ) {
     // Per-channel outbound (RFC §10-Q3): every subscribed channel owns its OWN
     // bounded queue. `forwarders` keeps the task handle (for unsubscribe/teardown
@@ -268,7 +338,7 @@ async fn drive(
     // head-of-line another at the socket. The two maps are keyed by the SAME
     // channel id and mutated together (see [`subscribe`] / unsubscribe / teardown).
     let mut forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-    let mut queues: StreamMap<String, ReceiverStream<String>> = StreamMap::new();
+    let mut queues: StreamMap<String, ReceiverStream<OutFrame>> = StreamMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // skip the immediate tick
 
@@ -295,9 +365,17 @@ async fn drive(
             // `StreamMap` randomizes its poll start each call, so no single channel's
             // queue is favored — a bursting channel cannot starve another at the
             // socket. `(channel, frame)` is yielded; only the frame goes on the
-            // wire. If the write fails the peer is gone — break and tear down.
-            Some((_ch, text)) = queues.next() => {
-                if session.text(text).await.is_err() {
+            // wire. The frame is ALREADY encoded per the connection's `Encoding`
+            // (the forwarder did the encode), so the driver only picks the WS frame
+            // type: `session.text` for a JSON `Text`, `session.binary` for a
+            // MessagePack `Binary`. If the write fails the peer is gone — break and
+            // tear down.
+            Some((_ch, frame)) = queues.next() => {
+                let write = match frame {
+                    OutFrame::Text(s) => session.text(s).await,
+                    OutFrame::Binary(b) => session.binary(b).await,
+                };
+                if write.is_err() {
                     break;
                 }
             }
@@ -310,13 +388,28 @@ async fn drive(
                     break;
                 }
             }
-            // Client frames.
+            // Client frames. In JSON mode the client sends TEXT frames; in msgpack
+            // mode it sends BINARY frames. A frame carrying the inbound bytes for the
+            // ACTIVE encoding is decoded + dispatched; a frame of the other kind is
+            // ignored (a Binary frame in JSON mode, a Text frame in msgpack mode),
+            // exactly as a malformed frame is — it never tears down the connection.
             msg = msg_stream.next() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        let keep_open = handle_client_text(
-                            &state, &mut forwarders, &mut queues, &mut session,
-                            batch_ms, &text, &mut authorized,
+                    // The inbound frame type that matches the active encoding.
+                    Some(Ok(Message::Text(text))) if encoding == Encoding::Json => {
+                        let keep_open = handle_client_bytes(
+                            &state, &mut forwarders, &mut queues,
+                            batch_ms, encoding, text.as_bytes(), &mut authorized,
+                        )
+                        .await;
+                        if !keep_open {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) if encoding == Encoding::Msgpack => {
+                        let keep_open = handle_client_bytes(
+                            &state, &mut forwarders, &mut queues,
+                            batch_ms, encoding, &bytes, &mut authorized,
                         )
                         .await;
                         if !keep_open {
@@ -328,9 +421,12 @@ async fn drive(
                             break;
                         }
                     }
-                    // Pong / Binary (no msgpack in P1) / Continuation / Nop: ignore.
-                    Some(Ok(Message::Pong(_)))
+                    // A frame of the WRONG kind for the active encoding (a Binary
+                    // frame in JSON mode / a Text frame in msgpack mode), plus Pong /
+                    // Continuation / Nop: ignore, never disconnect.
+                    Some(Ok(Message::Text(_)))
                     | Some(Ok(Message::Binary(_)))
+                    | Some(Ok(Message::Pong(_)))
                     | Some(Ok(Message::Continuation(_)))
                     | Some(Ok(Message::Nop)) => {}
                     Some(Ok(Message::Close(_))) | None => break,
@@ -354,7 +450,41 @@ async fn drive(
     let _ = session.close(None).await;
 }
 
-/// Parse + dispatch one client text frame. A malformed/unknown frame logs and is
+/// Decode one inbound frame's bytes per the connection's [`Encoding`] (serde_json
+/// for `Json`, rmp-serde for `Msgpack`) and dispatch the resulting [`ClientFrame`].
+/// A malformed body logs and is ignored — it NEVER tears down the connection, in
+/// EITHER encoding (the msgpack decode error is treated exactly like a malformed
+/// JSON text frame).
+///
+/// This is the thin decode step in front of [`handle_client_frame`]; the dispatch
+/// and auth logic is encoding-agnostic (the SAME `ClientFrame` flows through both
+/// paths), so the JSON behavior is byte-for-byte unchanged.
+///
+/// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
+/// presents an INVALID device credential); `true` to keep it open.
+async fn handle_client_bytes(
+    state: &web::Data<AppState>,
+    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    batch_ms: u64,
+    encoding: Encoding,
+    bytes: &[u8],
+    authorized: &mut bool,
+) -> bool {
+    let frame: ClientFrame = match decode_client_frame(encoding, bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("ws_v2: ignoring malformed client frame: {e}");
+            return true;
+        }
+    };
+    handle_client_frame(
+        state, forwarders, queues, batch_ms, encoding, frame, authorized,
+    )
+    .await
+}
+
+/// Dispatch one decoded client frame. A malformed/unknown frame logs and is
 /// ignored — it never tears down the connection.
 ///
 /// `authorized` is the per-connection auth state (#189). While it is `false` the
@@ -366,23 +496,15 @@ async fn drive(
 ///
 /// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
 /// presents an INVALID device credential); `true` to keep it open.
-async fn handle_client_text(
+async fn handle_client_frame(
     state: &web::Data<AppState>,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    queues: &mut StreamMap<String, ReceiverStream<String>>,
-    _session: &mut actix_ws::Session,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
     batch_ms: u64,
-    text: &str,
+    encoding: Encoding,
+    frame: ClientFrame,
     authorized: &mut bool,
 ) -> bool {
-    let frame: ClientFrame = match serde_json::from_str(text) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!("ws_v2: ignoring malformed client frame: {e}");
-            return true;
-        }
-    };
-
     // Auth gate (#189). Until the connection is authorized, no frame may serve a
     // channel or cancel a session — the only frame that can change anything is a
     // `hello` that carries a verifiable device credential.
@@ -417,7 +539,7 @@ async fn handle_client_text(
             }
         }
         ClientFrame::Subscribe { ch, since } => {
-            subscribe(state, forwarders, queues, batch_ms, &ch, since).await;
+            subscribe(state, forwarders, queues, batch_ms, encoding, &ch, since).await;
         }
         ClientFrame::Unsubscribe { ch } => {
             if let Some(handle) = forwarders.remove(&ch) {
@@ -446,8 +568,9 @@ async fn handle_client_text(
 async fn subscribe(
     state: &web::Data<AppState>,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    queues: &mut StreamMap<String, ReceiverStream<String>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
     batch_ms: u64,
+    encoding: Encoding,
     ch: &str,
     since: Option<u64>,
 ) {
@@ -465,7 +588,9 @@ async fn subscribe(
 
     // This channel's OWN bounded outbound queue (RFC §10-Q3). The forwarder owns
     // the sender; the driver drains the receiver via the fair `StreamMap` merge.
-    let (out_tx, out_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
+    // Carries already-encoded [`OutFrame`]s (Text/Binary per the connection's
+    // `Encoding`).
+    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(OUTBOUND_BUFFER);
     let out_tx: OutboundTx = out_tx;
 
     let handle = match channel {
@@ -477,7 +602,14 @@ async fn subscribe(
             let latest_at_start = state.account_sink.latest_seq();
             let events_dir = state.account_sink.events_dir().to_path_buf();
             let since = since.unwrap_or(0);
-            spawn_feed_forwarder(out_tx, receiver, events_dir, since, latest_at_start)
+            spawn_feed_forwarder(
+                out_tx,
+                encoding,
+                receiver,
+                events_dir,
+                since,
+                latest_at_start,
+            )
         }
         Channel::Agent(sid) => {
             // The session must exist; otherwise ignore (parity with the v1
@@ -511,6 +643,7 @@ async fn subscribe(
                 state.clone(),
                 sid.clone(),
                 out_tx,
+                encoding,
                 ch.to_string(),
                 receiver,
                 budget_event_to_replay,
@@ -539,6 +672,48 @@ mod tests {
             device_id: device_id.map(str::to_string),
             token: token.map(str::to_string),
         }
+    }
+
+    // ── Subprotocol negotiation (v2-P3) ───────────────────────────────────────
+
+    fn negotiate_for(header: Option<&str>) -> (Encoding, Option<&'static str>) {
+        let mut req = actix_web::test::TestRequest::default();
+        if let Some(h) = header {
+            req = req.insert_header((actix_web::http::header::SEC_WEBSOCKET_PROTOCOL, h));
+        }
+        negotiate_encoding(&req.to_http_request())
+    }
+
+    #[test]
+    fn negotiate_encoding_branches() {
+        // No header / empty → JSON default, NO echo (unchanged for old clients).
+        assert_eq!(negotiate_for(None), (Encoding::Json, None));
+        assert_eq!(negotiate_for(Some("")), (Encoding::Json, None));
+        // Explicit JSON subprotocol → JSON, echo it.
+        assert_eq!(
+            negotiate_for(Some("bamboo.v2")),
+            (Encoding::Json, Some(SUBPROTOCOL_JSON))
+        );
+        // Msgpack offered → Msgpack, echo it.
+        assert_eq!(
+            negotiate_for(Some("bamboo.v2.msgpack")),
+            (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+        );
+        // Multi-offer: msgpack preferred regardless of order, and whitespace is trimmed.
+        assert_eq!(
+            negotiate_for(Some("bamboo.v2.msgpack, bamboo.v2")),
+            (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+        );
+        assert_eq!(
+            negotiate_for(Some("  bamboo.v2 ,  bamboo.v2.msgpack ")),
+            (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+        );
+        // Unknown-only offer → JSON, and NO bogus echo (echoing a non-offered
+        // subprotocol would violate RFC 6455).
+        assert_eq!(
+            negotiate_for(Some("some.other.proto")),
+            (Encoding::Json, None)
+        );
     }
 
     // ── Pure classification (no AppState) ─────────────────────────────────────

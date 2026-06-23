@@ -62,6 +62,10 @@ tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# v2-P3 (#181): MessagePack codec for the `bamboo.v2.msgpack` subprotocol. We use
+# `to_vec_named` (structs-as-maps) so `ServerEnvelope`'s `#[serde(flatten)]` +
+# untagged body round-trip; the default array-encoding would break them.
+rmp-serde = "1"
 
 # Logging
 tracing = "0.1"
