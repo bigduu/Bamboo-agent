@@ -182,6 +182,8 @@ dependencies = [
  "actix-service",
  "actix-utils",
  "futures-core",
+ "http 0.2.12",
+ "http 1.4.0",
  "impl-more",
  "pin-project-lite",
  "rustls-pki-types",
@@ -675,6 +677,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "awc"
+version = "3.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7dc0207013c5059ddce268fe12045bd12b2e919318ee660c891bfe297a54f1f"
+dependencies = [
+ "actix-codec",
+ "actix-http",
+ "actix-rt",
+ "actix-service",
+ "actix-tls",
+ "actix-utils",
+ "base64",
+ "bytes",
+ "cfg-if",
+ "cookie",
+ "derive_more",
+ "futures-core",
+ "futures-util",
+ "h2 0.3.27",
+ "http 0.2.12",
+ "itoa",
+ "log",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "rand 0.9.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "tokio",
+]
+
+[[package]]
 name = "bamboo-a2a"
 version = "0.0.0"
 dependencies = [
@@ -1139,6 +1175,7 @@ dependencies = [
 name = "bamboo-server"
 version = "0.0.0"
 dependencies = [
+ "actix-codec",
  "actix-cors",
  "actix-files",
  "actix-governor",
@@ -1148,6 +1185,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "awc",
  "bamboo-agent-core",
  "bamboo-broker",
  "bamboo-compression",

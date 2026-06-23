@@ -15,10 +15,13 @@
 //!
 //! ## Design
 //! Each subscribed channel runs its OWN forwarder task with its OWN broadcast
-//! receiver (per-channel lag independence; §10-Q3). Forwarders push fully-built
-//! envelope text frames onto one shared `mpsc` that the driver drains to the WS
-//! `session`. A per-channel `JoinHandle` lets `unsubscribe`/teardown abort
-//! exactly that forwarder, leaving no orphaned broadcast reader.
+//! receiver (per-channel lag independence; §10-Q3) AND its OWN bounded outbound
+//! `mpsc` queue. The driver holds a `StreamMap<channel, ReceiverStream>` and
+//! drains every per-channel queue with a fair (rotating-start) merge, so a burst
+//! on one channel can no longer head-of-line another at the socket (RFC §10-Q3 —
+//! see `forwarders.rs` for the honest fairness guarantee). A per-channel
+//! `JoinHandle` lets `unsubscribe`/teardown abort exactly that forwarder and drop
+//! its queue, leaving no orphaned broadcast reader.
 //!
 //! ## DEFERRED (later slices; see PR / §5.3)
 //! - `execute` / `approve` over control (handler refactors) — clients keep REST.
@@ -54,6 +57,8 @@ use actix_web::{web, HttpRequest, Responder};
 use actix_ws::Message;
 use futures::StreamExt;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamMap;
 
 use serde::Deserialize;
 
@@ -63,9 +68,12 @@ use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
 use crate::handlers::agent::stop::cancel_session;
 
-/// Bound on the shared outbound mpsc. Caps how far ahead the (collectively)
-/// forwarders may run before the WS writer applies backpressure.
-const OUTBOUND_BUFFER: usize = 256;
+/// Bound on EACH per-channel outbound mpsc (RFC §10-Q3). Caps how far ahead one
+/// channel's forwarder may run before the WS writer applies backpressure to that
+/// channel ALONE — a slow socket no longer lets a bursting channel starve the
+/// queue of another, because each channel owns its own bounded buffer and the
+/// driver drains them with a fair merge.
+const OUTBOUND_BUFFER: usize = 64;
 
 /// WS ping interval (~15s), mirroring the v1 SSE `[KEEPALIVE]` cadence.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -76,6 +84,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// this elapses, so an unauthenticated socket can never linger (#189). Once the
 /// connection is authorized this deadline is disarmed.
 const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Env var the live integration test sets to SHORTEN the auth deadline so the
+/// "closed when no hello arrives" path is asserted in milliseconds, not 10s. It
+/// is read once per connection in [`drive`]. Production NEVER sets it, so the
+/// 10s [`AUTH_DEADLINE`] default is unchanged.
+const AUTH_DEADLINE_OVERRIDE_ENV: &str = "BAMBOO_WS_AUTH_DEADLINE_MS";
+
+/// The effective unauthorized deadline: the [`AUTH_DEADLINE`] default unless
+/// [`AUTH_DEADLINE_OVERRIDE_ENV`] is set to a valid millisecond count (test-only).
+fn auth_deadline() -> Duration {
+    std::env::var(AUTH_DEADLINE_OVERRIDE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(AUTH_DEADLINE)
+}
 
 /// The verdict for one client frame while a connection is NOT yet authorized.
 ///
@@ -237,8 +261,14 @@ async fn drive(
     batch_ms: u64,
     pre_authorized: bool,
 ) {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
+    // Per-channel outbound (RFC §10-Q3): every subscribed channel owns its OWN
+    // bounded queue. `forwarders` keeps the task handle (for unsubscribe/teardown
+    // abort) and `queues` keeps the matching receiver in a `StreamMap` the driver
+    // drains with a fair (rotating-start) merge, so a burst on one channel cannot
+    // head-of-line another at the socket. The two maps are keyed by the SAME
+    // channel id and mutated together (see [`subscribe`] / unsubscribe / teardown).
     let mut forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut queues: StreamMap<String, ReceiverStream<String>> = StreamMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // skip the immediate tick
 
@@ -249,7 +279,7 @@ async fn drive(
     // The unauthorized-deadline timer. Pinned + biased to fire while `!authorized`
     // and disarmed once the connection authorizes, so an unauthenticated socket
     // is closed but an authorized one runs indefinitely.
-    let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
+    let auth_deadline = tokio::time::sleep(auth_deadline());
     tokio::pin!(auth_deadline);
 
     loop {
@@ -261,9 +291,12 @@ async fn drive(
                 tracing::debug!("ws_v2: closing unauthorized connection after auth deadline");
                 break;
             }
-            // Drain forwarder output to the WS. If the write fails the peer is
-            // gone — break and tear down.
-            Some(text) = out_rx.recv() => {
+            // Drain the per-channel queues to the WS with a fair merge. The
+            // `StreamMap` rotates its poll start each call, so no single channel's
+            // queue is favored — a bursting channel cannot starve another at the
+            // socket. `(channel, frame)` is yielded; only the frame goes on the
+            // wire. If the write fails the peer is gone — break and tear down.
+            Some((_ch, text)) = queues.next() => {
                 if session.text(text).await.is_err() {
                     break;
                 }
@@ -282,7 +315,7 @@ async fn drive(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         let keep_open = handle_client_text(
-                            &state, &out_tx, &mut forwarders, &mut session,
+                            &state, &mut forwarders, &mut queues, &mut session,
                             batch_ms, &text, &mut authorized,
                         )
                         .await;
@@ -312,10 +345,12 @@ async fn drive(
     }
 
     // Clean teardown: abort every forwarder so no orphaned broadcast reader
-    // survives the connection.
+    // survives the connection, and drop every per-channel queue (clearing the
+    // `StreamMap` drops each receiver).
     for (_ch, handle) in forwarders.drain() {
         handle.abort();
     }
+    queues.clear();
     let _ = session.close(None).await;
 }
 
@@ -333,8 +368,8 @@ async fn drive(
 /// presents an INVALID device credential); `true` to keep it open.
 async fn handle_client_text(
     state: &web::Data<AppState>,
-    out_tx: &OutboundTx,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<String>>,
     _session: &mut actix_ws::Session,
     batch_ms: u64,
     text: &str,
@@ -382,11 +417,15 @@ async fn handle_client_text(
             }
         }
         ClientFrame::Subscribe { ch, since } => {
-            subscribe(state, out_tx, forwarders, batch_ms, &ch, since).await;
+            subscribe(state, forwarders, queues, batch_ms, &ch, since).await;
         }
         ClientFrame::Unsubscribe { ch } => {
             if let Some(handle) = forwarders.remove(&ch) {
                 handle.abort();
+                // Drop this channel's queue too: removing it from the StreamMap
+                // drops the receiver so the (now-aborted) forwarder's sender is
+                // dead and no stale frame can leak onto the socket.
+                queues.remove(&ch);
                 tracing::debug!("ws_v2: unsubscribed {ch}");
             }
         }
@@ -406,8 +445,8 @@ async fn handle_client_text(
 /// a duplicate reader on one channel).
 async fn subscribe(
     state: &web::Data<AppState>,
-    out_tx: &OutboundTx,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<String>>,
     batch_ms: u64,
     ch: &str,
     since: Option<u64>,
@@ -417,10 +456,17 @@ async fn subscribe(
         return;
     };
 
-    // Replace any prior forwarder for this exact channel id.
+    // Replace any prior forwarder for this exact channel id, dropping its queue
+    // (a re-subscribe with a new cursor must not leave the old queue behind).
     if let Some(old) = forwarders.remove(ch) {
         old.abort();
     }
+    queues.remove(ch);
+
+    // This channel's OWN bounded outbound queue (RFC §10-Q3). The forwarder owns
+    // the sender; the driver drains the receiver via the fair `StreamMap` merge.
+    let (out_tx, out_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
+    let out_tx: OutboundTx = out_tx;
 
     let handle = match channel {
         Channel::Feed => {
@@ -431,7 +477,7 @@ async fn subscribe(
             let latest_at_start = state.account_sink.latest_seq();
             let events_dir = state.account_sink.events_dir().to_path_buf();
             let since = since.unwrap_or(0);
-            spawn_feed_forwarder(out_tx.clone(), receiver, events_dir, since, latest_at_start)
+            spawn_feed_forwarder(out_tx, receiver, events_dir, since, latest_at_start)
         }
         Channel::Agent(sid) => {
             // The session must exist; otherwise ignore (parity with the v1
@@ -464,7 +510,7 @@ async fn subscribe(
             spawn_agent_forwarder(
                 state.clone(),
                 sid.clone(),
-                out_tx.clone(),
+                out_tx,
                 ch.to_string(),
                 receiver,
                 budget_event_to_replay,
@@ -475,6 +521,9 @@ async fn subscribe(
     };
 
     forwarders.insert(ch.to_string(), handle);
+    // Register this channel's queue receiver into the fair-merge drain. Keyed by
+    // the SAME channel id as `forwarders`, so unsubscribe/teardown drops both.
+    queues.insert(ch.to_string(), ReceiverStream::new(out_rx));
     tracing::debug!("ws_v2: subscribed {ch} (since={since:?})");
 }
 

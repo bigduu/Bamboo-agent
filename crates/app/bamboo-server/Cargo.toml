@@ -100,6 +100,12 @@ tokio-test = "0.4"
 mockall = "0.13"
 http = "1"
 actix-rt = "2"
+# v2-P1 (#187): live WS integration harness for `GET /v2/stream`. `awc` is
+# actix's own HTTP+WS client, so it composes with the actix-web 4 server already
+# in-tree (one runtime, one ws codec) and drives a real loopback `ws://` upgrade.
+# `actix-codec` names the `Framed` half `awc::ws connect()` returns.
+awc = { version = "3", features = ["rustls-0_23"] }
+actix-codec = "0.5"
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
