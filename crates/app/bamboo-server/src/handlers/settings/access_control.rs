@@ -948,6 +948,12 @@ impl PairingCodeGuard {
 const ROOT_PASSWORD_FAILURE_THRESHOLD: u32 = 5;
 /// How long a key stays locked once the threshold is hit.
 const ROOT_PASSWORD_COOLDOWN: Duration = Duration::from_secs(60);
+/// Cap on tracked IP keys. Per-IP keying means an attacker rotating source IPs
+/// could otherwise grow the map unbounded (slow memory DoS). When a NEW key
+/// would exceed this, we first sweep keys not in an active cooldown (abandoned
+/// partial-failures + elapsed cooldowns), which are inert anyway — so memory is
+/// bounded to roughly the set of IPs actively in a 60s lockout.
+const ROOT_PASSWORD_MAX_KEYS: usize = 10_000;
 
 /// Per-key attempt state for the root-password guard.
 #[derive(Debug, Default, Clone)]
@@ -1012,6 +1018,13 @@ impl RootPasswordGuard {
     /// the threshold is reached.
     pub fn record_failure(&self, key: &str) {
         let now = Instant::now();
+        // Bound memory: before adding a NEW key past the cap, drop every key not
+        // in an active cooldown (those are inert — an elapsed cooldown or an
+        // abandoned sub-threshold failure count contributes nothing to gating).
+        if !self.inner.contains_key(key) && self.inner.len() >= ROOT_PASSWORD_MAX_KEYS {
+            self.inner
+                .retain(|_, st| matches!(st.cooldown_until, Some(until) if now < until));
+        }
         let mut entry = self.inner.entry(key.to_string()).or_default();
         // A still-live cooldown shouldn't be reachable here (the caller checks
         // first), but if it is, leave it; otherwise count the failure.
@@ -1694,6 +1707,33 @@ mod tests {
         // The counter was reset to 0 — one fresh failure does not re-trip.
         guard.record_failure(key);
         assert!(matches!(guard.check(key), RootGuardDecision::Allow));
+    }
+
+    #[test]
+    fn root_guard_evicts_inert_keys_past_the_cap() {
+        let guard = RootPasswordGuard::default();
+        // Fill to the cap with single-failure (inert, no cooldown) keys, plus a
+        // few extra to trip the sweep. The map must NOT grow unbounded.
+        for i in 0..(ROOT_PASSWORD_MAX_KEYS + 50) {
+            guard.record_failure(&format!("10.0.{}.{}", i / 256, i % 256));
+        }
+        assert!(
+            guard.inner.len() <= ROOT_PASSWORD_MAX_KEYS,
+            "inert keys must be swept so the map stays bounded (was {})",
+            guard.inner.len()
+        );
+        // An actively cooling-down key survives a sweep.
+        let hot = "203.0.113.200";
+        for _ in 0..ROOT_PASSWORD_FAILURE_THRESHOLD {
+            guard.record_failure(hot);
+        }
+        for i in 0..(ROOT_PASSWORD_MAX_KEYS + 50) {
+            guard.record_failure(&format!("172.16.{}.{}", i / 256, i % 256));
+        }
+        assert!(
+            matches!(guard.check(hot), RootGuardDecision::Cooldown { .. }),
+            "a key in active cooldown must survive eviction sweeps"
+        );
     }
 
     #[test]
