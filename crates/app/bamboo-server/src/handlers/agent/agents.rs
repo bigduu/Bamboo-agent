@@ -53,7 +53,16 @@ impl AgentRegistry {
 
     /// Upsert a record by `agent_id`. The caller has already stamped
     /// `lease_expires_at`. Returns the stored record.
+    ///
+    /// Also prunes expired rows on the WRITE path so the map stays bounded to
+    /// live leases even if nothing ever calls `list` (lazy-GC-on-read alone
+    /// would let an attacker register many short-lived ids — that nobody
+    /// resolves — and grow memory; registration is the write path, so pruning
+    /// here caps growth at the rate of registrations).
     fn upsert(&self, rec: AgentRecord) -> AgentRecord {
+        let now = Utc::now();
+        self.agents
+            .retain(|id, r| id == &rec.agent_id || r.lease_expires_at > now);
         self.agents.insert(rec.agent_id.clone(), rec.clone());
         rec
     }
@@ -280,5 +289,24 @@ mod tests {
         assert!(after > before, "re-register must extend the lease");
         // still a single row (upsert, not append)
         assert_eq!(reg.list_as_of(now, None).len(), 1);
+    }
+
+    #[test]
+    fn upsert_prunes_expired_rows_on_the_write_path() {
+        let reg = AgentRegistry::new();
+        let now = Utc::now();
+        // Seed an already-expired row directly (bypass the upsert prune).
+        reg.insert_for_test(rec("ghost", "service", now - Duration::seconds(1)));
+        reg.upsert(rec("live", "service", now + Duration::seconds(30)));
+        // A registration (write) of a DIFFERENT id evicts the expired ghost even
+        // though nothing ever called list/resolve — the map stays bounded.
+        reg.upsert(rec("trigger", "service", now + Duration::seconds(30)));
+        assert!(
+            !reg.agents.contains_key("ghost"),
+            "an expired row must be pruned on the write path"
+        );
+        // Live rows (including the one that triggered the prune) are retained.
+        assert!(reg.agents.contains_key("live"));
+        assert!(reg.agents.contains_key("trigger"));
     }
 }
