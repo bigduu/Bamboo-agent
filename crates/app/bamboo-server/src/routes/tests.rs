@@ -297,11 +297,18 @@ async fn v2_stream_route_is_registered_and_reaches_handler() {
     );
 }
 
-/// `/v2/stream` is behind the SAME access-password middleware as `/api/v1`: a
-/// remote (non-loopback) request with a password configured and no verified
-/// cookie is blocked with `401` BEFORE reaching the WS handler.
+/// `/v2/stream` upgrade is NOT middleware-gated (#189): browsers cannot set
+/// auth headers on a WS upgrade, so the upgrade is whitelisted and the ws_v2
+/// handler enforces auth via `hello` instead. A remote, password-protected,
+/// credential-less request therefore REACHES the handler (it is NOT the
+/// middleware's `401`); a non-WebSocket GET then gets the handler's own `400`
+/// (no upgrade headers). The handler still serves NO channel without a verified
+/// hello — that contract is covered by the ws_v2 unit tests (`apply_auth_gate`).
+///
+/// The sibling gated routes (`/v2/pair/code`, `/v2/devices`) STAY behind the
+/// middleware: a remote credential-less request is still `401`.
 #[actix_web::test]
-async fn v2_stream_is_behind_access_middleware() {
+async fn v2_stream_upgrade_is_open_but_siblings_stay_gated() {
     let data_dir = tempdir().unwrap();
     let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
     {
@@ -318,15 +325,47 @@ async fn v2_stream_is_behind_access_middleware() {
     }
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
 
+    // Remote, no cookie/header credential. The upgrade is whitelisted, so the
+    // middleware does NOT reject it: the request reaches the WS handler, and a
+    // non-WebSocket GET surfaces the handler's 400 (not the middleware's 401).
     let req = test::TestRequest::get()
         .uri("/v2/stream")
         .insert_header((header::HOST, "bamboo.example.com"))
         .to_request();
     let resp = test::call_service(&app, req).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/stream upgrade must NOT be middleware-rejected (#189: hello carries auth)"
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-WebSocket GET reaches the handler and is rejected by actix_ws::handle"
+    );
+
+    // The sibling management routes are still gated: a remote credential-less
+    // request is rejected by the middleware with 401.
+    let gated = test::TestRequest::post()
+        .uri("/v2/pair/code")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, gated).await;
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "/v2/stream must be guarded by the access middleware for remote requests"
+        "/v2/pair/code must stay middleware-gated"
+    );
+
+    let gated = test::TestRequest::get()
+        .uri("/v2/devices")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, gated).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/devices must stay middleware-gated"
     );
 }
 
@@ -906,7 +945,7 @@ async fn v2_devices_rotate_swaps_token_and_404s_unknown() {
 }
 
 /// `POST /v2/pair/code` is GATED: a remote unauthenticated caller is 401 by the
-/// middleware (mirrors `v2_stream_is_behind_access_middleware`).
+/// middleware (unlike `/v2/stream`, which is open-upgrade + handler-enforced).
 #[actix_web::test]
 async fn v2_pair_code_requires_auth() {
     let data_dir = tempdir().unwrap();
