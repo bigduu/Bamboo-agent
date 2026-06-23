@@ -33,9 +33,19 @@ bamboo-storage = { path = "../../infra/bamboo-storage" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 
 # Web framework
-actix-web = "4"
+# `rustls-0_23` enables actix-web's TLS bind/listen against rustls 0.23
+# (`bind_rustls_0_23` / `listen_rustls_0_23`) for the v2 self-terminated TLS
+# face (#181). Without it the `*_rustls_0_23` methods do not exist.
+actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-cors = "0.7"
 actix-files = "0.6"
+
+# v2 TLS termination (#181): load PEM cert/key and build a rustls ServerConfig.
+# Pin the `ring` crypto provider explicitly so the builder never relies on a
+# process-default provider (avoids the rustls 0.23 "no process-level
+# CryptoProvider" panic); `ring` is the provider already resolved in the lock.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -5,9 +5,13 @@
 
 mod entrypoints;
 mod listeners;
+mod tls;
 mod web_service;
 
-pub use entrypoints::{run, run_with_bind, run_with_bind_and_static};
+pub use entrypoints::{
+    run, run_with_bind, run_with_bind_and_static, run_with_bind_and_static_tls, run_with_bind_tls,
+    run_with_tls,
+};
 pub use web_service::WebService;
 
 #[cfg(test)]
