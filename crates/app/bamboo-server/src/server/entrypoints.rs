@@ -8,6 +8,7 @@ use actix_web::{
 use tracing::{error, info};
 
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
+use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{build_cors, build_rate_limiter, build_security_headers};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
@@ -15,6 +16,7 @@ use crate::services::frontend_package::{
     ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
 };
 use actix_governor::Governor;
+use bamboo_config::TlsConfig;
 
 fn canonicalize_static_dir(path: &Path) -> Result<PathBuf, String> {
     let canonicalized = path
@@ -82,6 +84,17 @@ fn resolve_runtime_static_dir(
 ///   Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
+    run_with_tls(bamboo_home_dir, port, None).await
+}
+
+/// Like [`run`], but terminates TLS itself when `tls` is `Some` (#181).
+///
+/// Desktop loopback callers pass `None` and get the unchanged plaintext path.
+pub async fn run_with_tls(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    tls: Option<TlsConfig>,
+) -> Result<(), String> {
     info!("Starting unified server in desktop mode...");
 
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, None)?;
@@ -143,18 +156,36 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
         app
     };
 
+    // Fail-fast: when TLS is configured, build the rustls config up front so a
+    // bad/missing cert refuses startup instead of silently falling back to
+    // plaintext. `None` → unchanged plaintext path.
+    let rustls_cfg = match &tls {
+        Some(tls) => Some(build_rustls_config(tls)?),
+        None => None,
+    };
+
     let listeners = build_desktop_listeners(port)?;
 
     let mut http = HttpServer::new(app_factory).workers(workers);
     for (idx, listener) in listeners.into_iter().enumerate() {
-        http = http
-            .listen(listener)
-            .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?;
+        http = match &rustls_cfg {
+            Some(cfg) => http
+                .listen_rustls_0_23(listener, cfg.clone())
+                .map_err(|e| format!("Failed to attach TLS listener #{idx}: {e}"))?,
+            None => http
+                .listen(listener)
+                .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?,
+        };
     }
 
     let server = http.run();
 
-    info!("Unified server running on http://127.0.0.1:{port}");
+    let scheme = if rustls_cfg.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    info!("Unified server running on {scheme}://127.0.0.1:{port}");
 
     let result = server.await;
 
@@ -189,6 +220,16 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
     run_with_bind_and_static(bamboo_home_dir, port, bind, None).await
 }
 
+/// Like [`run_with_bind`], but terminates TLS itself when `tls` is `Some` (#181).
+pub async fn run_with_bind_tls(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    bind: &str,
+    tls: Option<TlsConfig>,
+) -> Result<(), String> {
+    run_with_bind_and_static_tls(bamboo_home_dir, port, bind, None, tls).await
+}
+
 /// Run the unified server with custom bind address and static file serving
 ///
 /// Production mode with frontend serving:
@@ -215,6 +256,18 @@ pub async fn run_with_bind_and_static(
     port: u16,
     bind: &str,
     static_dir: Option<PathBuf>,
+) -> Result<(), String> {
+    run_with_bind_and_static_tls(bamboo_home_dir, port, bind, static_dir, None).await
+}
+
+/// Like [`run_with_bind_and_static`], but terminates TLS itself when `tls` is
+/// `Some` (#181). When `None`, the plaintext `.listen()` path is unchanged.
+pub async fn run_with_bind_and_static_tls(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    bind: &str,
+    static_dir: Option<PathBuf>,
+    tls: Option<TlsConfig>,
 ) -> Result<(), String> {
     info!("Starting unified server on {}:{}...", bind, port);
 
@@ -288,18 +341,36 @@ pub async fn run_with_bind_and_static(
         app
     };
 
+    // Fail-fast: build the rustls config before binding so a bad/missing cert
+    // refuses startup rather than silently downgrading to plaintext. `None` →
+    // unchanged plaintext path (desktop/loopback behavior preserved). #181.
+    let rustls_cfg = match &tls {
+        Some(tls) => Some(build_rustls_config(tls)?),
+        None => None,
+    };
+
     let listeners = build_bind_listeners(bind, port)?;
 
     let mut http = HttpServer::new(app_factory).workers(workers);
     for (idx, listener) in listeners.into_iter().enumerate() {
-        http = http
-            .listen(listener)
-            .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?;
+        http = match &rustls_cfg {
+            Some(cfg) => http
+                .listen_rustls_0_23(listener, cfg.clone())
+                .map_err(|e| format!("Failed to attach TLS listener #{idx}: {e}"))?,
+            None => http
+                .listen(listener)
+                .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?,
+        };
     }
 
     let server = http.run();
 
-    info!("Unified server running on http://{}:{}", bind, port);
+    let scheme = if rustls_cfg.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    info!("Unified server running on {scheme}://{}:{}", bind, port);
 
     let result = server.await;
 

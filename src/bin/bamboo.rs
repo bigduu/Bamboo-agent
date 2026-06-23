@@ -547,19 +547,24 @@ async fn main() {
 
             // Start server using the unified config
             println!("Starting Bamboo server at {}", config.server_addr());
+            // v2-P1 (#181): honor `server.tls` for in-process TLS termination
+            // (fail-fast on bad/missing certs); absent → unchanged plaintext.
+            let tls = config.server.tls.clone();
             let result = if config.server.static_dir.is_some() {
-                bamboo_agent::server::run_with_bind_and_static(
+                bamboo_agent::server::run_with_bind_and_static_tls(
                     bamboo_home_dir,
                     config.server.port,
                     &config.server.bind,
                     config.server.static_dir.clone(),
+                    tls,
                 )
                 .await
             } else {
-                bamboo_agent::server::run_with_bind(
+                bamboo_agent::server::run_with_bind_tls(
                     bamboo_home_dir,
                     config.server.port,
                     &config.server.bind,
+                    tls,
                 )
                 .await
             };

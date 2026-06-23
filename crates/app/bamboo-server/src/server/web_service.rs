@@ -6,10 +6,12 @@ use tokio::sync::oneshot;
 use tracing::{error, info};
 
 use super::listeners::DEFAULT_WORKER_COUNT;
+use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{build_cors, build_rate_limiter, build_security_headers};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use actix_governor::Governor;
+use bamboo_config::TlsConfig;
 
 /// Manageable web service with start/stop lifecycle
 ///
@@ -50,6 +52,18 @@ impl WebService {
 
     /// Start the web service on the specified port and bind address.
     pub async fn start_with_bind(&mut self, port: u16, bind: &str) -> Result<(), String> {
+        self.start_with_bind_tls(port, bind, None).await
+    }
+
+    /// Start the web service, terminating TLS itself when `tls` is `Some` (#181).
+    ///
+    /// `None` keeps the plaintext `.bind()` path unchanged (desktop loopback).
+    pub async fn start_with_bind_tls(
+        &mut self,
+        port: u16,
+        bind: &str,
+        tls: Option<&TlsConfig>,
+    ) -> Result<(), String> {
         info!("Starting web service...");
         if self.server_handle.is_some() {
             return Err("Web service is already running".to_string());
@@ -75,9 +89,18 @@ impl WebService {
                 .wrap(build_cors(&bind_addr, port))
                 .configure(configure_routes) // No rate limiting for WebService
         })
-        .workers(DEFAULT_WORKER_COUNT)
-        .bind(&listen_addr)
-        .map_err(|e| format!("Failed to bind server: {e}"))?
+        .workers(DEFAULT_WORKER_COUNT);
+
+        // Fail-fast: build the rustls config before binding; `None` → unchanged
+        // plaintext `.bind()` path. #181.
+        let server = match tls {
+            Some(tls) => server
+                .bind_rustls_0_23(&listen_addr, build_rustls_config(tls)?)
+                .map_err(|e| format!("Failed to bind TLS server: {e}"))?,
+            None => server
+                .bind(&listen_addr)
+                .map_err(|e| format!("Failed to bind server: {e}"))?,
+        }
         .run();
 
         let server_handle = tokio::spawn(async move {
@@ -96,8 +119,9 @@ impl WebService {
         self.shutdown_tx = Some(shutdown_tx);
         self.server_handle = Some(server_handle);
 
+        let scheme = if tls.is_some() { "https" } else { "http" };
         info!(
-            "Web service started successfully on http://{}:{}",
+            "Web service started successfully on {scheme}://{}:{}",
             bind_for_log, port
         );
         Ok(())
@@ -110,6 +134,19 @@ impl WebService {
         port: u16,
         bind: &str,
         static_dir: PathBuf,
+    ) -> Result<(), String> {
+        self.start_with_bind_and_static_tls(port, bind, static_dir, None)
+            .await
+    }
+
+    /// Like [`WebService::start_with_bind_and_static`], terminating TLS itself
+    /// when `tls` is `Some` (#181). `None` keeps the plaintext path unchanged.
+    pub async fn start_with_bind_and_static_tls(
+        &mut self,
+        port: u16,
+        bind: &str,
+        static_dir: PathBuf,
+        tls: Option<&TlsConfig>,
     ) -> Result<(), String> {
         info!("Starting web service with static frontend...");
         if self.server_handle.is_some() {
@@ -159,9 +196,18 @@ impl WebService {
                         .disable_content_disposition(),
                 )
         })
-        .workers(DEFAULT_WORKER_COUNT)
-        .bind(&listen_addr)
-        .map_err(|e| format!("Failed to bind server: {e}"))?
+        .workers(DEFAULT_WORKER_COUNT);
+
+        // Fail-fast: build the rustls config before binding; `None` → unchanged
+        // plaintext `.bind()` path. #181.
+        let server = match tls {
+            Some(tls) => server
+                .bind_rustls_0_23(&listen_addr, build_rustls_config(tls)?)
+                .map_err(|e| format!("Failed to bind TLS server: {e}"))?,
+            None => server
+                .bind(&listen_addr)
+                .map_err(|e| format!("Failed to bind server: {e}"))?,
+        }
         .run();
 
         let server_handle = tokio::spawn(async move {
@@ -180,8 +226,9 @@ impl WebService {
         self.shutdown_tx = Some(shutdown_tx);
         self.server_handle = Some(server_handle);
 
+        let scheme = if tls.is_some() { "https" } else { "http" };
         info!(
-            "Web service with static frontend started successfully on http://{}:{}",
+            "Web service with static frontend started successfully on {scheme}://{}:{}",
             bind_for_log, port
         );
         Ok(())

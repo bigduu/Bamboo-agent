@@ -1062,6 +1062,16 @@ pub struct ServerConfig {
     #[serde(default = "default_workers")]
     pub workers: usize,
 
+    /// v2 (API v2 transport, #181): optional TLS termination config. When both
+    /// `cert_file` and `key_file` are given, bamboo terminates TLS itself
+    /// (rustls, no reverse proxy) and serves `https://` — intended for the
+    /// public `0.0.0.0` face. When absent, the server keeps the plain `.bind()`
+    /// / `.listen()` path unchanged (desktop loopback stays plaintext). Missing
+    /// or unparseable cert/key files are fail-fast at startup, never a silent
+    /// downgrade to plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+
     /// Preserve unknown keys under `server`.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -1074,9 +1084,23 @@ impl Default for ServerConfig {
             bind: default_bind(),
             static_dir: None,
             workers: default_workers(),
+            tls: None,
             extra: BTreeMap::new(),
         }
     }
+}
+
+/// Manual TLS certificate configuration (current stage; ACME deferred).
+///
+/// Both fields point at PEM files: `cert_file` is the full certificate chain
+/// (leaf → intermediates → root), `key_file` is the matching private key
+/// (PKCS#8 or RSA). See `docs/api-v2-transport.md` §3.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TlsConfig {
+    /// PEM certificate chain (leaf → intermediates → root).
+    pub cert_file: PathBuf,
+    /// PEM private key (PKCS#8 or RSA).
+    pub key_file: PathBuf,
 }
 
 /// Proxy authentication credentials
@@ -2053,6 +2077,56 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn server_config_without_tls_field_deserializes_back_compat() {
+        // An old config.json `server` section with no `tls` key must still
+        // deserialize, leaving `tls` as None (zero behavior change on upgrade).
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "port": 9562,
+            "bind": "127.0.0.1"
+        }))
+        .expect("legacy server config without tls should deserialize");
+
+        assert_eq!(server.tls, None);
+        assert_eq!(server.port, 9562);
+        assert_eq!(server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_config_omits_tls_when_none() {
+        // `skip_serializing_if = "Option::is_none"` keeps the on-disk shape
+        // identical to before for the common (no-TLS) case.
+        let server = ServerConfig::default();
+        let value = serde_json::to_value(&server).expect("server config should serialize");
+        let obj = value
+            .as_object()
+            .expect("server config serializes to object");
+        assert!(
+            !obj.contains_key("tls"),
+            "tls must be omitted when None, got: {value}"
+        );
+    }
+
+    #[test]
+    fn server_config_with_tls_roundtrips() {
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "port": 9562,
+            "bind": "0.0.0.0",
+            "tls": { "cert_file": "/etc/bamboo/cert.pem", "key_file": "/etc/bamboo/key.pem" }
+        }))
+        .expect("server config with tls should deserialize");
+
+        let tls = server.tls.clone().expect("tls should be Some");
+        assert_eq!(tls.cert_file, PathBuf::from("/etc/bamboo/cert.pem"));
+        assert_eq!(tls.key_file, PathBuf::from("/etc/bamboo/key.pem"));
+
+        // Round-trips: tls survives a serialize → deserialize cycle.
+        let value = serde_json::to_value(&server).expect("serialize");
+        assert!(value.as_object().unwrap().contains_key("tls"));
+        let back: ServerConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.tls, server.tls);
     }
 
     #[test]

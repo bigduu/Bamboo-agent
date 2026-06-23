@@ -1,0 +1,213 @@
+//! TLS termination support for the actix-web HTTP face (v2-P1, #181).
+//!
+//! bamboo terminates TLS itself via rustls — no reverse proxy. Certificates are
+//! manual PEM files configured under `server.tls` (see
+//! `docs/api-v2-transport.md` §3). When `server.tls` is absent the server keeps
+//! its existing plaintext `.bind()` / `.listen()` path unchanged; this module is
+//! only consulted when TLS is explicitly configured.
+//!
+//! **Fail-fast invariant:** if `server.tls` is set but the cert/key files are
+//! missing or unparseable, [`build_rustls_config`] returns an `Err` and the
+//! caller must refuse to start. It never silently downgrades to plaintext.
+//!
+//! **Crypto provider:** rustls 0.23 needs an active [`CryptoProvider`]. Rather
+//! than depend on a process-default provider being installed (a common footgun
+//! that panics at handshake time), we build the config against an explicit
+//! `ring` provider via [`ServerConfig::builder_with_provider`]. `ring` is the
+//! provider already resolved in the workspace lockfile.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
+
+use rustls::crypto::ring;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+
+use bamboo_config::TlsConfig;
+
+/// Build a rustls [`ServerConfig`] from manual PEM cert/key files.
+///
+/// Returns a descriptive `Err(String)` (never panics, never falls back to
+/// plaintext) when:
+/// - the cert or key file is missing / unreadable,
+/// - the cert file contains no certificates,
+/// - the key file contains no usable private key (PKCS#8, PKCS#1/RSA, or SEC1),
+/// - rustls rejects the cert/key pair.
+pub(super) fn build_rustls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
+    let cert_path = tls.cert_file.display();
+    let key_path = tls.key_file.display();
+
+    // --- certificate chain ---
+    let cert_file = File::open(&tls.cert_file)
+        .map_err(|e| format!("TLS: failed to open cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("TLS: failed to parse certificates from '{cert_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "TLS: no certificates found in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
+        ));
+    }
+
+    // --- private key (PKCS#8, then PKCS#1/RSA, then SEC1/EC) ---
+    let key = load_private_key(&tls.key_file)
+        .map_err(|e| format!("TLS: failed to load key_file '{key_path}': {e}"))?;
+
+    // Build against an explicit `ring` provider so we never rely on a process
+    // default being installed (avoids the rustls 0.23 no-provider panic).
+    let provider = Arc::new(ring::default_provider());
+    ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS: rustls protocol version setup failed: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| {
+            format!("TLS: rustls rejected the cert/key pair (cert '{cert_path}', key '{key_path}'): {e}")
+        })
+}
+
+/// Load the first usable private key from a PEM file, trying PKCS#8, then
+/// PKCS#1/RSA, then SEC1/EC. Returns a clear error if none is present.
+fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>, String> {
+    // rustls_pemfile::private_key understands all three PEM key kinds and
+    // returns the first one found, so a single pass covers PKCS#8 / RSA / SEC1.
+    let file = File::open(path).map_err(|e| format!("open: {e}"))?;
+    match rustls_pemfile::private_key(&mut BufReader::new(file)) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => {
+            Err("no private key found (expected a PKCS#8, RSA, or SEC1 PEM block)".to_string())
+        }
+        Err(e) => Err(format!("parse: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn tmp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bamboo-tls-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Generate a throwaway self-signed cert + PKCS#8 key via openssl, returning
+    /// `None` (skip) if openssl is unavailable in the test environment.
+    fn gen_self_signed(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let status = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                cert.to_str().unwrap(),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+            ])
+            .status();
+        match status {
+            Ok(s) if s.success() => Some((cert, key)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn build_rustls_config_errors_on_missing_cert_file() {
+        let tls = TlsConfig {
+            cert_file: PathBuf::from("/nonexistent/bamboo-tls/cert.pem"),
+            key_file: PathBuf::from("/nonexistent/bamboo-tls/key.pem"),
+        };
+        let err = build_rustls_config(&tls).expect_err("missing cert must fail");
+        assert!(
+            err.contains("cert_file"),
+            "error should name cert_file: {err}"
+        );
+        assert!(
+            err.contains("/nonexistent/bamboo-tls/cert.pem"),
+            "error should include the path: {err}"
+        );
+    }
+
+    #[test]
+    fn build_rustls_config_errors_on_empty_cert_file() {
+        let dir = tmp_dir();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, "not a pem certificate\n").unwrap();
+        std::fs::write(&key, "not a pem key\n").unwrap();
+        let tls = TlsConfig {
+            cert_file: cert,
+            key_file: key,
+        };
+        let err = build_rustls_config(&tls).expect_err("garbage cert must fail");
+        assert!(
+            err.contains("no certificates found"),
+            "error should explain empty cert: {err}"
+        );
+    }
+
+    #[test]
+    fn build_rustls_config_errors_on_missing_key_in_keyfile() {
+        let dir = tmp_dir();
+        // A valid-looking cert file but a key file with no key block.
+        let Some((cert, _key)) = gen_self_signed(&dir) else {
+            eprintln!("skipping: openssl unavailable");
+            return;
+        };
+        let bad_key = dir.join("bad_key.pem");
+        std::fs::write(
+            &bad_key,
+            "-----BEGIN GARBAGE-----\nzz\n-----END GARBAGE-----\n",
+        )
+        .unwrap();
+        let tls = TlsConfig {
+            cert_file: cert,
+            key_file: bad_key,
+        };
+        let err = build_rustls_config(&tls).expect_err("no key must fail");
+        assert!(
+            err.contains("key_file"),
+            "error should name key_file: {err}"
+        );
+    }
+
+    #[test]
+    fn build_rustls_config_succeeds_on_valid_self_signed_cert() {
+        // Smoke test the full success path (parse + crypto provider + accept the
+        // cert/key pair) when openssl is available to mint a throwaway cert.
+        // Skips gracefully on environments without openssl.
+        let dir = tmp_dir();
+        let Some((cert, key)) = gen_self_signed(&dir) else {
+            eprintln!("skipping build_rustls_config success test: openssl unavailable");
+            return;
+        };
+        let tls = TlsConfig {
+            cert_file: cert,
+            key_file: key,
+        };
+        let cfg = build_rustls_config(&tls).expect("valid self-signed cert should build a config");
+        // A built config implies the ring provider was usable and the pair was accepted.
+        assert!(
+            !cfg.crypto_provider().cipher_suites.is_empty(),
+            "expected a non-empty cipher suite set from the ring provider"
+        );
+    }
+}
