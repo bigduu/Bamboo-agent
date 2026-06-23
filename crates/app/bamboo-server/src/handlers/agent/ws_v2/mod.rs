@@ -17,7 +17,7 @@
 //! Each subscribed channel runs its OWN forwarder task with its OWN broadcast
 //! receiver (per-channel lag independence; §10-Q3) AND its OWN bounded outbound
 //! `mpsc` queue. The driver holds a `StreamMap<channel, ReceiverStream>` and
-//! drains every per-channel queue with a fair (rotating-start) merge, so a burst
+//! drains every per-channel queue with a fair (randomized-start) merge, so a burst
 //! on one channel can no longer head-of-line another at the socket (RFC §10-Q3 —
 //! see `forwarders.rs` for the honest fairness guarantee). A per-channel
 //! `JoinHandle` lets `unsubscribe`/teardown abort exactly that forwarder and drop
@@ -264,7 +264,7 @@ async fn drive(
     // Per-channel outbound (RFC §10-Q3): every subscribed channel owns its OWN
     // bounded queue. `forwarders` keeps the task handle (for unsubscribe/teardown
     // abort) and `queues` keeps the matching receiver in a `StreamMap` the driver
-    // drains with a fair (rotating-start) merge, so a burst on one channel cannot
+    // drains with a fair (randomized-start) merge, so a burst on one channel cannot
     // head-of-line another at the socket. The two maps are keyed by the SAME
     // channel id and mutated together (see [`subscribe`] / unsubscribe / teardown).
     let mut forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -292,7 +292,7 @@ async fn drive(
                 break;
             }
             // Drain the per-channel queues to the WS with a fair merge. The
-            // `StreamMap` rotates its poll start each call, so no single channel's
+            // `StreamMap` randomizes its poll start each call, so no single channel's
             // queue is favored — a bursting channel cannot starve another at the
             // socket. `(channel, frame)` is yielded; only the frame goes on the
             // wire. If the write fails the peer is gone — break and tear down.

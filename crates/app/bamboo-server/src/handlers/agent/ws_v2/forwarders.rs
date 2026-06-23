@@ -20,7 +20,7 @@
 //!
 //! Fairness guarantee (honest): the merge is **fair-ish, not strict
 //! round-robin**. `StreamMap` polls all ready per-channel queues starting from a
-//! rotating index, so over time no channel is systematically starved, and a
+//! randomized index each poll, so over time no channel is systematically starved, and a
 //! flooding channel cannot monopolize the socket while another has frames ready.
 //! It does NOT guarantee exact 1:1 interleaving or any latency bound; it
 //! guarantees starvation-freedom and that per-channel backpressure stays local.
