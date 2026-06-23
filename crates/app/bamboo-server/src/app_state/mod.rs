@@ -330,6 +330,19 @@ pub struct AppState {
     /// Used by [`crate::title_gen`] to dedupe concurrent invocations
     /// (e.g. execute handler firing while a regenerate-title request is running).
     pub title_gen_in_flight: Arc<dashmap::DashSet<String>>,
+
+    /// v2-P2 (#181, slice 2): in-memory one-time pairing codes. A 6-digit numeric
+    /// code (keyed by the code string) maps to an entry holding its expiry. Codes
+    /// are PROCESS-EPHEMERAL — never persisted to `config.json`; a restart drops
+    /// all outstanding codes by design. Keyed by `Instant`-based expiry; expired
+    /// entries are purged opportunistically on insert/lookup.
+    pub pairing_codes: Arc<dashmap::DashMap<String, crate::handlers::settings::PairingCodeEntry>>,
+
+    /// v2-P2 (#181, slice 2): per-process brute-force guard for the public
+    /// code-redemption path (`POST /v2/pair { code }`). A 6-digit code is only
+    /// ~1M space, so a public redeem endpoint is brute-forceable without a guard.
+    /// Tracks recent FAILED code-redemption attempts and a cooldown deadline.
+    pub pairing_code_guard: Arc<crate::handlers::settings::PairingCodeGuard>,
 }
 
 impl AppState {
