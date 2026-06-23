@@ -24,8 +24,17 @@ use serde_json::Value;
 pub(crate) struct ServerEnvelope {
     /// Channel id: `feed` or `agent.{session_id}`.
     pub ch: String,
-    /// Per-channel monotonic sequence number (resume cursor). For `feed` this is
-    /// `ChangeEvent.seq`; for `agent.{sid}` it is a server-maintained counter.
+    /// Per-channel monotonic sequence number.
+    ///
+    /// For `feed` this is `ChangeEvent.seq` — a durable, cross-connection cursor
+    /// the client passes back as `subscribe.since` to resume losslessly.
+    ///
+    /// For `agent.{sid}` it is a server-maintained counter that is **per
+    /// subscription**, not a durable resume cursor: it restarts at 1 on each
+    /// (re)subscribe. Agent resume is replay-cache-only (RFC §10-Q2 — a long
+    /// disconnect re-fetches session detail via REST), so `agent` `since` is not
+    /// honored as a lossless cursor and this counter is for ordering/dedup within
+    /// one subscription only.
     pub seq: u64,
     /// The carried payload: either a journaled/agent `event` or a transport
     /// `control` signal.

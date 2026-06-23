@@ -104,7 +104,10 @@ async fn drive(
                     break;
                 }
             }
-            // Keepalive ping.
+            // Keepalive ping. Liveness is write-driven (a dead peer surfaces as a
+            // failed `ping`/`text` write); we do NOT track Pong arrivals or run a
+            // pong timeout — same one-directional keepalive contract as the v1 SSE
+            // stream.
             _ = ping.tick() => {
                 if session.ping(b"").await.is_err() {
                     break;
@@ -252,6 +255,8 @@ async fn subscribe(
                 .unwrap_or_default();
 
             spawn_agent_forwarder(
+                state.clone(),
+                sid.clone(),
                 out_tx.clone(),
                 ch.to_string(),
                 receiver,

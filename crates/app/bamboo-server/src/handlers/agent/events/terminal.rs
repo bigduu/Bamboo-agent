@@ -128,7 +128,7 @@ pub(super) fn session_prevents_terminal_event(session: Option<&Session>) -> bool
 /// runs. For a flat tree (every child directly under the root) this is identical
 /// to the old direct-child check, because a direct child's `root_session_id`
 /// equals the root's.
-pub(super) async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
+pub(crate) async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
     // The tree root the watched session belongs to (a Root is its own root).
     let watched_root = state
         .session_store

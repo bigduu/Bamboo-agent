@@ -1,10 +1,18 @@
 //! Per-channel forwarder tasks for the v2 WS multiplex.
 //!
 //! Each subscribed channel runs its OWN task with its OWN broadcast receiver,
-//! pushing [`ServerEnvelope`]s onto a single shared `mpsc` that the driver
-//! drains to the WS session. This per-forwarder design gives **per-channel lag
-//! independence** (a slow/lagging channel only overruns its own broadcast ring,
-//! never blocking another channel) — the §10-Q3 backpressure requirement.
+//! pushing [`ServerEnvelope`]s onto a single shared bounded `mpsc` that the
+//! driver drains to the WS session.
+//!
+//! Backpressure (RFC §10-Q3): the per-forwarder design gives **broadcast-ring
+//! independence** — a slow/lagging channel only overruns its own broadcast ring
+//! and is never blocked at the *source* by another channel. The forwarders then
+//! merge into one bounded outbound FIFO, so a sustained burst on one channel can
+//! still queue ahead of another at the *socket* (a head-of-line window bounded
+//! by the FIFO depth); it cannot deadlock (forwarders block on `send().await`
+//! holding no shared lock, and the driver always drains). A fully per-channel
+//! outbound queue with a fair merge is a possible future refinement; the bounded
+//! shared FIFO is the pragmatic first cut.
 //!
 //! The driver keeps a `JoinHandle` per channel so `unsubscribe` (or teardown)
 //! aborts exactly that forwarder, leaving no orphaned broadcast reader.
@@ -20,8 +28,11 @@ use bamboo_agent_core::AgentEvent;
 use bamboo_engine::events::change_feed::ChangeEvent;
 use bamboo_engine::events::journal;
 
+use actix_web::web;
+
 use super::envelope::{feed_reset_control, terminal_control, ServerEnvelope};
-use crate::handlers::agent::events::Coalescer;
+use crate::app_state::AppState;
+use crate::handlers::agent::events::{has_running_child, Coalescer};
 use crate::handlers::agent::stream::{plan_replay, ReplayPlan};
 
 /// What the driver sends to the WS writer: a fully-built envelope's text frame.
@@ -143,6 +154,8 @@ impl AgentSeq {
 /// `ch` is the full channel id (`agent.{sid}`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_agent_forwarder(
+    state: web::Data<AppState>,
+    session_id: String,
     out: OutboundTx,
     ch: String,
     mut receiver: broadcast::Receiver<AgentEvent>,
@@ -168,15 +181,47 @@ pub(crate) fn spawn_agent_forwarder(
 
         if batch_ms == 0 {
             // Fast path: every event emitted immediately, byte-for-byte (desktop
-            // default), with no buffering. Terminal events close the channel.
+            // default), with no buffering.
+            //
+            // Terminal handling mirrors the v1 SSE stream: the parent's own turn
+            // can finish while its child sub-agents are still running. Children
+            // outlive the parent turn and forward their progress/preview onto THIS
+            // session's broadcast, so we must NOT close the channel on the parent
+            // terminal while descendants remain — doing so would silently drop
+            // every later child event. Hold the channel open and emit the
+            // `terminal` control only once no running child is left.
+            let mut awaiting_children = false;
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
                         let is_terminal = is_terminal_event(&event);
+                        let is_child_completed =
+                            matches!(event, AgentEvent::SubAgentCompleted { .. });
                         if !emit_agent_event(&out, &ch, &seq, event).await {
                             return;
                         }
                         if is_terminal {
+                            if has_running_child(&state, &session_id).await {
+                                awaiting_children = true;
+                                continue;
+                            }
+                            let _ = send_env(
+                                &out,
+                                ServerEnvelope::control(
+                                    &ch,
+                                    seq.next(),
+                                    terminal_control("complete"),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                        // A child just finished: if it was the last running child
+                        // after the parent already terminated, close now.
+                        if awaiting_children
+                            && is_child_completed
+                            && !has_running_child(&state, &session_id).await
+                        {
                             let _ = send_env(
                                 &out,
                                 ServerEnvelope::control(
@@ -202,6 +247,9 @@ pub(crate) fn spawn_agent_forwarder(
         let mut coalescer = Coalescer::default();
         let flush_window = Duration::from_millis(batch_ms);
         let mut flush_deadline: Option<tokio::time::Instant> = None;
+        // See the fast-path comment: keep the channel open after the parent
+        // terminal while child sub-agents still run.
+        let mut awaiting_children = false;
 
         loop {
             let sleep_until = flush_deadline
@@ -220,6 +268,8 @@ pub(crate) fn spawn_agent_forwarder(
                     match recv {
                         Ok(event) => {
                             let is_terminal = is_terminal_event(&event);
+                            let is_child_completed =
+                                matches!(event, AgentEvent::SubAgentCompleted { .. });
                             // Feed through the coalescer: it returns the ordered
                             // events to emit now (a flushed pending buffer then the
                             // new event when non-coalescible). Terminal events are
@@ -238,6 +288,24 @@ pub(crate) fn spawn_agent_forwarder(
                                 flush_deadline = None;
                             }
                             if is_terminal {
+                                // Keep the channel open while children run (v1
+                                // parity); the pending buffer was already flushed
+                                // above since a terminal is non-coalescible.
+                                if has_running_child(&state, &session_id).await {
+                                    awaiting_children = true;
+                                    continue;
+                                }
+                                let _ = send_env(
+                                    &out,
+                                    ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
+                                )
+                                .await;
+                                return;
+                            }
+                            if awaiting_children
+                                && is_child_completed
+                                && !has_running_child(&state, &session_id).await
+                            {
                                 let _ = send_env(
                                     &out,
                                     ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
