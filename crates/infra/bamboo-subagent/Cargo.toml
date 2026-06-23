@@ -16,7 +16,10 @@ async-trait = "0.1"
 futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "io-util", "io-std", "rt", "rt-multi-thread", "sync", "macros", "net", "time", "process"] }
 tokio-util = "0.7"
-tokio-tungstenite = "0.24"
+# rustls-tls-webpki-roots gives the CLIENT (`ChildClient`) real wss:// support
+# against standard CA roots, and pulls in the `Connector` API so a parent can
+# also pin a self-signed worker cert via connect_with_auth_tls (remote-actor P1).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # TLS termination for a remotely-reachable worker (remote-actor-plan P1, #181).
 # default-features=false + ["ring","std","tls12"] matches the server's TLS face
 # (#183) so the workspace resolves a single rustls/ring provider.

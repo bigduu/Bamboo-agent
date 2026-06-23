@@ -289,12 +289,30 @@ impl Callback for BearerCallback {
     }
 }
 
-/// Constant-form check that an `Authorization` header is `Bearer <expected>`.
+/// Check that an `Authorization` header is `Bearer <expected>`, comparing the
+/// token in constant time so a network attacker cannot recover it byte-by-byte
+/// via response timing (mirrors `bamboo-server`'s `constant_time_eq` convention
+/// for credential comparison). The `Bearer ` prefix is non-secret, so the
+/// `strip_prefix` short-circuit is fine.
 fn bearer_matches(header: &str, expected: &str) -> bool {
-    header
-        .strip_prefix("Bearer ")
-        .map(|t| t == expected)
-        .unwrap_or(false)
+    match header.strip_prefix("Bearer ") {
+        Some(t) => constant_time_eq(t.as_bytes(), expected.as_bytes()),
+        None => false,
+    }
+}
+
+/// Constant-time byte comparison: returns early only on a length mismatch
+/// (length is not secret), then folds all bytes so the time does not depend on
+/// where a mismatch occurs.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Build a rustls [`rustls::ServerConfig`] from PEM cert/key files against an
@@ -337,6 +355,45 @@ fn build_server_config(cert_file: &Path, key_file: &Path) -> Result<rustls::Serv
         .map_err(|e| {
             format!("rustls rejected cert/key (cert '{cert_path}', key '{key_path}'): {e}")
         })
+}
+
+/// Build a rustls [`rustls::ClientConfig`] that trusts exactly the certificate(s)
+/// in `cert_file` (PEM) as roots — for a parent connecting over `wss://` to a
+/// worker with a self-signed cert under single-direction TLS (remote-actor-plan
+/// §7 Q2: "P1 先单向"). The worker's cert must carry a SAN matching the endpoint
+/// host (e.g. `IP:127.0.0.1`) for rustls to accept it. Uses the explicit `ring`
+/// provider to match the rest of the workspace. For CA-signed worker certs use
+/// [`ChildClient::connect_with_auth`] (default webpki roots) instead.
+pub fn client_config_trusting_cert(cert_file: &Path) -> Result<rustls::ClientConfig, String> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_path = cert_file.display();
+    let cf = File::open(cert_file).map_err(|e| format!("open cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cf))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "no certificates in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
+        ));
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| format!("add trust anchor from '{cert_path}': {e}"))?;
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("protocol versions: {e}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(cfg)
 }
 
 /// Drive an already-upgraded WS connection (generic over the underlying stream
@@ -517,23 +574,50 @@ impl ChildClient {
     }
 
     /// Connect to a worker endpoint, optionally presenting a bearer token on the
-    /// WS upgrade (`Authorization: Bearer <token>`). A `wss://` endpoint flows
-    /// through `MaybeTlsStream` transparently. The token is never logged.
+    /// WS upgrade (`Authorization: Bearer <token>`). The token is never logged.
+    ///
+    /// A `wss://` endpoint is negotiated against the standard webpki CA roots
+    /// (the `rustls-tls-webpki-roots` feature) — i.e. a worker serving a
+    /// CA-signed cert (Let's Encrypt etc.) works with no extra configuration. To
+    /// trust a self-signed worker cert (the typical P1 single-direction-TLS
+    /// case), use [`connect_with_auth_tls`](Self::connect_with_auth_tls) with a
+    /// client config built by [`client_config_trusting_cert`].
     pub async fn connect_with_auth(endpoint: &str, token: Option<&str>) -> TransportResult<Self> {
-        let (ws, _resp) = match token {
-            None => connect_async(endpoint).await?,
-            Some(token) => {
-                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-                let mut request = endpoint.into_client_request().map_err(TransportError::Ws)?;
-                let value = format!("Bearer {token}")
-                    .parse()
-                    .map_err(|e| TransportError::Protocol(format!("bad bearer header: {e}")))?;
-                request.headers_mut().insert(
-                    tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-                    value,
-                );
-                connect_async(request).await?
+        Self::connect_with_auth_tls(endpoint, token, None).await
+    }
+
+    /// Like [`connect_with_auth`](Self::connect_with_auth), but for `wss://` lets
+    /// the caller supply a custom rustls [`rustls::ClientConfig`] (e.g. one that
+    /// pins/trusts a self-signed worker cert). `None` uses the default webpki-root
+    /// trust. The config is ignored for plaintext `ws://`.
+    pub async fn connect_with_auth_tls(
+        endpoint: &str,
+        token: Option<&str>,
+        tls_config: Option<rustls::ClientConfig>,
+    ) -> TransportResult<Self> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = endpoint.into_client_request().map_err(TransportError::Ws)?;
+        if let Some(token) = token {
+            let value = format!("Bearer {token}")
+                .parse()
+                .map_err(|e| TransportError::Protocol(format!("bad bearer header: {e}")))?;
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+                value,
+            );
+        }
+        let (ws, _resp) = match tls_config {
+            Some(cfg) => {
+                let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(cfg));
+                tokio_tungstenite::connect_async_tls_with_config(
+                    request,
+                    None,
+                    false,
+                    Some(connector),
+                )
+                .await?
             }
+            None => connect_async(request).await?,
         };
         let (tx, rx) = ws.split();
         Ok(Self { tx, rx })

@@ -148,6 +148,16 @@ pub async fn serve(args: ActorServeArgs) -> Result<(), String> {
             .await
             .map_err(|e| format!("bind_tls: {e}"))?
     } else if let Some(bind_addr) = args.bind {
+        // A bearer token on a non-loopback PLAINTEXT bind would cross the wire in
+        // the clear, defeating its purpose. Refuse it: tokens require --tls on a
+        // public bind. (A loopback plaintext bind with a token is allowed for
+        // local/testing use.)
+        if args.token.is_some() && !bind_addr.ip().is_loopback() {
+            return Err(format!(
+                "refusing --token on a non-loopback plaintext bind ({bind_addr}): the token would \
+                 be sent in cleartext. Use --tls (with --cert-file/--key-file) for a public bind."
+            ));
+        }
         WsServer::bind_with_token(bind_addr, args.token.clone())
             .await
             .map_err(|e| format!("bind: {e}"))?

@@ -237,6 +237,134 @@ async fn bind_tls_real_handshake_runs_to_terminal() {
     drop(dir); // keep the tempdir alive until here
 }
 
+/// The SHIPPED client over `wss://`: `ChildClient::connect_with_auth_tls` drives
+/// the full TLS terminate -> WS upgrade -> bearer -> Echo -> Terminal round-trip
+/// using a custom rustls client config (here a test no-verify one; production
+/// pins the worker cert via `client_config_trusting_cert`). This proves the
+/// actual product client can speak `wss://` — not just a raw tokio-rustls client.
+#[tokio::test]
+async fn child_client_wss_round_trip() {
+    use std::sync::Arc;
+
+    let Some((cert, key, dir)) = mint_self_signed() else {
+        eprintln!("skipping child_client_wss_round_trip: openssl unavailable");
+        return;
+    };
+
+    let server = WsServer::bind_tls(
+        (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+        &cert,
+        &key,
+        Some(TOKEN.to_string()),
+    )
+    .await
+    .expect("bind_tls");
+    let endpoint = server.ws_endpoint();
+    assert!(endpoint.starts_with("wss://"));
+    let srv = tokio::spawn(async move {
+        let _ = server.serve(Arc::new(EchoExecutor)).await;
+    });
+
+    let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoVerify))
+    .with_no_client_auth();
+
+    let mut client = ChildClient::connect_with_auth_tls(&endpoint, Some(TOKEN), Some(client_cfg))
+        .await
+        .expect("ChildClient must connect over wss:// with the bearer");
+    client
+        .send(ParentFrame::Run(RunSpec {
+            assignment: "wss hello".into(),
+            reasoning_effort: None,
+            messages: Vec::new(),
+        }))
+        .await
+        .unwrap();
+
+    let mut terminal = None;
+    while let Some(frame) = client.next_frame().await.unwrap() {
+        if let ChildFrame::Terminal { status, result, .. } = frame {
+            terminal = Some((status, result));
+            break;
+        }
+    }
+    let (status, result) = terminal.expect("Terminal over wss://");
+    assert_eq!(status, TerminalStatus::Completed);
+    assert_eq!(result.as_deref(), Some("echo: wss hello"));
+
+    let _ = client.close().await;
+    srv.abort();
+    drop(dir);
+}
+
+/// Negative: the bearer gate still applies over `wss://` — a wrong token is
+/// rejected at the upgrade even when TLS itself succeeds.
+#[tokio::test]
+async fn child_client_wss_wrong_token_is_rejected() {
+    use std::sync::Arc;
+
+    let Some((cert, key, dir)) = mint_self_signed() else {
+        eprintln!("skipping child_client_wss_wrong_token: openssl unavailable");
+        return;
+    };
+
+    let server = WsServer::bind_tls(
+        (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+        &cert,
+        &key,
+        Some(TOKEN.to_string()),
+    )
+    .await
+    .expect("bind_tls");
+    let endpoint = server.ws_endpoint();
+    let srv = tokio::spawn(async move {
+        let _ = server.serve(Arc::new(EchoExecutor)).await;
+    });
+
+    let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoVerify))
+    .with_no_client_auth();
+
+    let result =
+        ChildClient::connect_with_auth_tls(&endpoint, Some("WRONG"), Some(client_cfg)).await;
+    assert!(
+        result.is_err(),
+        "a wrong bearer must be rejected at the wss upgrade"
+    );
+
+    srv.abort();
+    drop(dir);
+}
+
+/// The production pinning helper builds a usable client config from a cert PEM.
+#[test]
+fn client_config_trusting_cert_builds_from_pem() {
+    let Some((cert, _key, dir)) = mint_self_signed() else {
+        eprintln!("skipping client_config_trusting_cert_builds_from_pem: openssl unavailable");
+        return;
+    };
+    let cfg = bamboo_subagent::transport::client_config_trusting_cert(&cert);
+    assert!(cfg.is_ok(), "should build a client config from a cert PEM");
+    // A non-existent path is a clear error, not a panic.
+    assert!(
+        bamboo_subagent::transport::client_config_trusting_cert(std::path::Path::new(
+            "/no/such/cert.pem"
+        ))
+        .is_err()
+    );
+    drop(dir);
+}
+
 /// A rustls verifier that accepts any server cert — TEST ONLY (self-signed).
 #[derive(Debug)]
 struct NoVerify;
