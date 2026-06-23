@@ -10,11 +10,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
     let session_id = path.into_inner();
     tracing::info!("[{}] Stop request received", session_id);
 
-    let runner_cancelled = cancel_running_runner(&state, &session_id).await;
-    let legacy_cancelled = cancel_legacy_token(&state, &session_id).await;
-
-    if runner_cancelled || legacy_cancelled {
-        mark_runner_cancelled(&state, &session_id).await;
+    if cancel_session(&state, &session_id).await {
         HttpResponse::Ok().json(StopResponse {
             success: true,
             message: "Agent execution stopped".to_string(),
@@ -25,6 +21,22 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
             success: false,
             message: "No active agent execution found".to_string(),
         })
+    }
+}
+
+/// Cancel a running agent session, returning whether anything was actually
+/// cancelled. Mirrors the v1 `POST /stop/{session_id}` behavior exactly so the
+/// v2 WS `control` channel (`{"type":"stop"}`) can reuse it without duplicating
+/// the runner + legacy-token cancellation discipline.
+pub(crate) async fn cancel_session(state: &web::Data<AppState>, session_id: &str) -> bool {
+    let runner_cancelled = cancel_running_runner(state, session_id).await;
+    let legacy_cancelled = cancel_legacy_token(state, session_id).await;
+
+    if runner_cancelled || legacy_cancelled {
+        mark_runner_cancelled(state, session_id).await;
+        true
+    } else {
+        false
     }
 }
 

@@ -9,7 +9,7 @@ use crate::app_state::{AgentStatus, AppState};
 ///
 /// `batch_ms` is an untrusted query parameter; this caps the buffering window
 /// so a hostile/typo'd value cannot defer flushes out to the heartbeat interval.
-pub(super) const MAX_BATCH_MS: u64 = 1_000;
+pub(crate) const MAX_BATCH_MS: u64 = 1_000;
 
 /// Query parameters for the per-session events (SSE) endpoint.
 #[derive(Debug, Default, Deserialize)]

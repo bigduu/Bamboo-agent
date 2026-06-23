@@ -15,7 +15,7 @@ use super::terminal::has_running_child;
 /// is keyed by `tool_call_id` so that interleaved output from different tool
 /// calls never merges into the same frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CoalesceKey {
+pub(crate) enum CoalesceKey {
     Token,
     ReasoningToken,
     ToolToken(String),
@@ -24,7 +24,7 @@ enum CoalesceKey {
 /// Classifies an event as coalescible (returning its channel key) or not
 /// (`None`). Non-token events must flush any pending buffer and be emitted
 /// immediately, unchanged.
-fn coalesce_key(event: &AgentEvent) -> Option<CoalesceKey> {
+pub(crate) fn coalesce_key(event: &AgentEvent) -> Option<CoalesceKey> {
     match event {
         AgentEvent::Token { .. } => Some(CoalesceKey::Token),
         AgentEvent::ReasoningToken { .. } => Some(CoalesceKey::ReasoningToken),
@@ -43,11 +43,11 @@ fn coalesce_key(event: &AgentEvent) -> Option<CoalesceKey> {
 /// the pending event once its content exceeds the threshold, so a pathological
 /// token stream cannot amplify memory. 64 KiB is far larger than any real token
 /// burst yet small enough to bound the allocation.
-const MAX_PENDING_CONTENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PENDING_CONTENT_BYTES: usize = 64 * 1024;
 
 /// Returns the byte length of a coalescible event's `content`, or 0 for
 /// non-token events (which are never buffered).
-fn pending_content_len(event: &AgentEvent) -> usize {
+pub(crate) fn pending_content_len(event: &AgentEvent) -> usize {
     match event {
         AgentEvent::Token { content }
         | AgentEvent::ReasoningToken { content }
@@ -59,7 +59,7 @@ fn pending_content_len(event: &AgentEvent) -> usize {
 /// Appends `content` from a same-key incoming token event onto the pending
 /// merged event of the same variant. Callers guarantee both events share the
 /// same [`CoalesceKey`], so the variants always match.
-fn merge_token_into(pending: &mut AgentEvent, incoming: AgentEvent) {
+pub(crate) fn merge_token_into(pending: &mut AgentEvent, incoming: AgentEvent) {
     match (pending, incoming) {
         (AgentEvent::Token { content }, AgentEvent::Token { content: more })
         | (AgentEvent::ReasoningToken { content }, AgentEvent::ReasoningToken { content: more })
@@ -82,7 +82,7 @@ fn merge_token_into(pending: &mut AgentEvent, incoming: AgentEvent) {
 /// and emits the returned events, but a `batch_ms == 0` window means the
 /// deadline fires immediately so nothing accumulates — see `live_stream_response`).
 #[derive(Default)]
-struct Coalescer {
+pub(crate) struct Coalescer {
     pending: Option<AgentEvent>,
 }
 
@@ -92,7 +92,7 @@ impl Coalescer {
     /// when the new event is non-coalescible). A coalescible event that merges
     /// into / starts the pending buffer yields an empty list — it stays buffered
     /// until a flush (different kind, deadline, terminal, heartbeat, or close).
-    fn push(&mut self, event: AgentEvent) -> Vec<AgentEvent> {
+    pub(crate) fn push(&mut self, event: AgentEvent) -> Vec<AgentEvent> {
         match coalesce_key(&event) {
             // Non-coalescible: flush pending first, then emit this event.
             None => {
@@ -138,12 +138,12 @@ impl Coalescer {
     /// Removes and returns the pending merged event, if any. Used to flush on a
     /// deadline tick, heartbeat, terminal event, or stream close so buffered
     /// content is never lost.
-    fn take_pending(&mut self) -> Option<AgentEvent> {
+    pub(crate) fn take_pending(&mut self) -> Option<AgentEvent> {
         self.pending.take()
     }
 
     /// Whether a merged event is currently buffered.
-    fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
 }
