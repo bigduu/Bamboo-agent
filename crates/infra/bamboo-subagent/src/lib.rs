@@ -21,6 +21,7 @@ pub mod mailbox;
 pub mod proto;
 pub mod provision;
 pub mod registry;
+pub mod registry_fabric;
 pub mod store;
 pub mod transport;
 
@@ -39,6 +40,7 @@ pub use provision::{
     ProvisionSpec, ScopedCredential, SecretsEnvelope, PROVISION_VERSION,
 };
 pub use registry::{RegisterChild, Registration, Registry};
+pub use registry_fabric::RegistryFabric;
 pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,
     RootEntry, RootFields, SessionLoc, SubagentStore,
