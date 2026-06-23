@@ -30,6 +30,18 @@ use crate::error::AppError;
 use crate::AppState;
 
 /// Default lease lifetime when a registration omits `lease_ttl_secs`.
+///
+/// RENEW CADENCE (worker contract, #202): a registry-published worker (a
+/// `bamboo_subagent::RegistryFabric` heartbeat loop) MUST re-`publish()` well
+/// WITHIN this TTL — each upsert refreshes `lease_expires_at = now + ttl`, and a
+/// record whose lease expires is pruned (lazily on read, eagerly on the next
+/// write) and STOPS being a scheduling candidate. Renew at roughly `TTL/2` to
+/// `TTL/3` (here ~10-15s) so a single slow/late heartbeat — or a transient
+/// network blip on the renew call — does not expire a worker that is actually
+/// alive. This mirrors the file-fabric serve loop's "renew < TTL" discipline.
+/// The Schedulable scheduler now tolerates a stale-but-leased worker by failing
+/// over to the next live candidate, but that is a SECOND line of defense; the
+/// renew cadence is the first.
 const DEFAULT_LEASE_TTL_SECS: i64 = 30;
 /// Upper bound on a requested lease TTL — a worker cannot pin itself live for an
 /// unbounded time; it must keep heartbeating. Caps a misbehaving/forged TTL.
