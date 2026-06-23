@@ -26,7 +26,7 @@ use bamboo_engine::events::journal;
 ///
 /// Pure and deterministic so the resume handoff can be unit-tested without an
 /// HTTP server.
-pub(super) struct ReplayPlan {
+pub(crate) struct ReplayPlan {
     /// If `Some`, the client's cursor predated the retained window; it must
     /// drop local state and full-resync. The contained value is the stale `since`.
     pub reset_from: Option<u64>,
@@ -43,7 +43,7 @@ pub(super) struct ReplayPlan {
 /// * On a cursor below the retained window: returns a reset directive and
 ///   fast-forwards `last_replayed` to `latest_at_start` (the client resyncs via
 ///   REST and the live tail serves anything newer).
-pub(super) fn plan_replay(events_dir: &Path, since: u64, latest_at_start: u64) -> ReplayPlan {
+pub(crate) fn plan_replay(events_dir: &Path, since: u64, latest_at_start: u64) -> ReplayPlan {
     if since > 0 {
         if let Ok(Some(oldest)) = journal::oldest_seq(events_dir) {
             if oldest > since + 1 {

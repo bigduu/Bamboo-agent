@@ -263,3 +263,64 @@ async fn dev_reset_route_registered_when_dev_endpoints_enabled() {
         "dev/reset must be registered when dev endpoints are enabled"
     );
 }
+
+// --- v2-P1 (#181): `GET /v2/stream` unified WS multiplex ------------------
+
+/// The `/v2/stream` route is registered and reaches its handler. A plain GET
+/// (no WebSocket upgrade headers) is NOT a websocket request, so `actix_ws::handle`
+/// rejects it with `400 Bad Request` — which proves the route is wired through
+/// the `/v2` scope (a missing route would be `404`, a blocked one `401/426`).
+#[actix_web::test]
+async fn v2_stream_route_is_registered_and_reaches_handler() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // Loopback peer (default test peer is 127.0.0.1) → `local_bypass`, so the
+    // access middleware lets the request through to the handler.
+    let req = test::TestRequest::get().uri("/v2/stream").to_request();
+    let resp = test::call_service(&app, req).await;
+
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "/v2/stream must be registered"
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-WebSocket GET reaches the handler and is rejected by actix_ws::handle"
+    );
+}
+
+/// `/v2/stream` is behind the SAME access-password middleware as `/api/v1`: a
+/// remote (non-loopback) request with a password configured and no verified
+/// cookie is blocked with `401` BEFORE reaching the WS handler.
+#[actix_web::test]
+async fn v2_stream_is_behind_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/v2/stream")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/stream must be guarded by the access middleware for remote requests"
+    );
+}

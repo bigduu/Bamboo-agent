@@ -22,3 +22,4 @@ pub mod sessions;
 pub mod stop;
 pub mod stream;
 pub mod task;
+pub mod ws_v2;

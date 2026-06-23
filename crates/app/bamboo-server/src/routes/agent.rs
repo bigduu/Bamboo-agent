@@ -261,6 +261,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     }
 
     cfg.service(scope);
+
+    // v2-P1 (#181): the unified WebSocket multiplex. A single `GET /v2/stream`
+    // WS replaces the two v1 SSE streams plus a `stop` control uplink. Behind
+    // the SAME access-password middleware as `/api/v1`, so `local_bypass` keeps
+    // desktop loopback frictionless and public access still requires the
+    // password. The v1 SSE/REST endpoints above stay unchanged (dual-track).
+    let v2_scope = web::scope("/v2")
+        .wrap(actix_web::middleware::from_fn(
+            settings::enforce_access_password_middleware,
+        ))
+        .route("/stream", web::get().to(agent::ws_v2::handler));
+    cfg.service(v2_scope);
 }
 
 /// Whether the dev-only HTTP endpoints (e.g. `POST /api/v1/dev/reset`) should be
