@@ -7,6 +7,7 @@
 //! - `list`:  show live fabric records (who is discoverable right now).
 //! - `call`:  discover a service agent by id or role and send it a task.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -48,6 +49,17 @@ pub struct ActorServeArgs {
     pub workspace: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
     pub echo: bool,
+    /// Address to bind. `None` ⇒ loopback ephemeral port (current behavior).
+    /// Pass `0.0.0.0:PORT` for a remotely-reachable worker
+    /// (remote-actor-plan P1, #181).
+    pub bind: Option<SocketAddr>,
+    /// Terminate TLS (`wss://`). Requires `cert_file` + `key_file`.
+    pub tls: bool,
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    /// Bearer token the worker requires on the WS handshake. `None` ⇒ accept any
+    /// (loopback default).
+    pub token: Option<String>,
 }
 
 pub struct ActorCallArgs {
@@ -122,9 +134,39 @@ pub async fn serve(args: ActorServeArgs) -> Result<(), String> {
         std::sync::Arc::new(BambooRuntimeExecutor::build(&spec).await?)
     };
 
-    let server = WsServer::bind_loopback()
-        .await
-        .map_err(|e| format!("bind: {e}"))?;
+    // Bind: TLS > explicit --bind (+ optional token) > loopback default.
+    // Default (no flags) is byte-for-byte the historical loopback behavior.
+    let server = if args.tls {
+        let (cert, key) = match (&args.cert_file, &args.key_file) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Err("--tls requires both --cert-file and --key-file".to_string()),
+        };
+        let bind_addr = args
+            .bind
+            .unwrap_or_else(|| (std::net::Ipv4Addr::UNSPECIFIED, 8443).into());
+        WsServer::bind_tls(bind_addr, cert, key, args.token.clone())
+            .await
+            .map_err(|e| format!("bind_tls: {e}"))?
+    } else if let Some(bind_addr) = args.bind {
+        // A bearer token on a non-loopback PLAINTEXT bind would cross the wire in
+        // the clear, defeating its purpose. Refuse it: tokens require --tls on a
+        // public bind. (A loopback plaintext bind with a token is allowed for
+        // local/testing use.)
+        if args.token.is_some() && !bind_addr.ip().is_loopback() {
+            return Err(format!(
+                "refusing --token on a non-loopback plaintext bind ({bind_addr}): the token would \
+                 be sent in cleartext. Use --tls (with --cert-file/--key-file) for a public bind."
+            ));
+        }
+        WsServer::bind_with_token(bind_addr, args.token.clone())
+            .await
+            .map_err(|e| format!("bind: {e}"))?
+    } else {
+        // Unchanged loopback default (no TLS, no token).
+        WsServer::bind_loopback()
+            .await
+            .map_err(|e| format!("bind: {e}"))?
+    };
     let endpoint = server.ws_endpoint();
 
     let fab = std::sync::Arc::new(Fabric::at(&spec.fabric_dir));

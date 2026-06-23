@@ -223,6 +223,14 @@ pub struct Limits {
 pub struct SecretsEnvelope {
     #[serde(default)]
     pub provider_credentials: Vec<ScopedCredential>,
+    /// Bearer token a remote resident worker requires on the WS handshake
+    /// (remote-actor-plan §3.4 / P1). The parent puts the worker's expected
+    /// token here and `ConnectLauncher` reads it to authenticate the connect.
+    /// Additive + forward-compatible (older specs deserialize with `None`).
+    /// Never published in a discovery `AgentRecord` — tokens stay in the
+    /// scoped envelope, not in advertised records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -368,6 +376,33 @@ mod tests {
             Placement::Remote {
                 endpoint: "wss://gpu-host:8443".into()
             }
+        );
+    }
+
+    #[test]
+    fn worker_auth_token_defaults_none_and_round_trips() {
+        // Absent in JSON ⇒ None (forward-compatible: older specs have no token).
+        assert!(SecretsEnvelope::default().worker_auth_token.is_none());
+        let minimal = serde_json::json!({
+            "version": 1,
+            "identity": { "child_id": "c" },
+            "executor": { "kind": "echo" },
+            "fabric_dir": "/tmp/f",
+        });
+        let parsed = ProvisionSpec::from_json(&minimal.to_string()).unwrap();
+        assert!(parsed.secrets.worker_auth_token.is_none());
+
+        // Round-trips when set, and is omitted from JSON when None.
+        let mut s = spec();
+        assert!(
+            !s.to_json().unwrap().contains("worker_auth_token"),
+            "None token must be skipped in serialization"
+        );
+        s.secrets.worker_auth_token = Some("T-secret".into());
+        let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(
+            parsed.secrets.worker_auth_token.as_deref(),
+            Some("T-secret")
         );
     }
 

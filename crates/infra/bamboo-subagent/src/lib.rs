@@ -28,7 +28,7 @@ pub use discovery::{Discovery, Fabric, FileFabric};
 pub use error::{Result, StoreError};
 pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink, SteerInbox};
 pub use fleet::{spawn_worker, SpawnedChild};
-pub use launcher::{LocalSubprocessLauncher, WorkerLauncher};
+pub use launcher::{ConnectLauncher, LocalSubprocessLauncher, WorkerLauncher};
 pub use mailbox::{
     AdmittedSet, AgentRef, AskBody, AskMode, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,
     ReplyBody, ADMITTED_SET_CAPACITY,

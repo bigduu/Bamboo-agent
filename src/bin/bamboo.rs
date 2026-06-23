@@ -364,6 +364,29 @@ enum ActorCommands {
         /// Serve the echo executor (no LLM) — for smoke tests.
         #[arg(long)]
         echo: bool,
+
+        /// Address to bind for a remotely-reachable worker, e.g.
+        /// '0.0.0.0:8443'. Omit for the loopback ephemeral-port default
+        /// (remote-actor-plan P1, #181).
+        #[arg(long)]
+        bind: Option<std::net::SocketAddr>,
+
+        /// Terminate TLS ('wss://'). Requires --cert-file and --key-file.
+        #[arg(long)]
+        tls: bool,
+
+        /// PEM certificate chain for --tls.
+        #[arg(long)]
+        cert_file: Option<PathBuf>,
+
+        /// PEM private key for --tls.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Bearer token a connecting parent must present on the WS handshake.
+        /// Omit to accept any client (loopback default).
+        #[arg(long)]
+        token: Option<String>,
     },
 
     /// List actors currently discoverable in the local fabric.
@@ -611,6 +634,11 @@ async fn main() {
                     workspace,
                     data_dir,
                     echo,
+                    bind,
+                    tls,
+                    cert_file,
+                    key_file,
+                    token,
                 } => {
                     bamboo_agent::actor_cli::serve(bamboo_agent::actor_cli::ActorServeArgs {
                         role,
@@ -619,6 +647,11 @@ async fn main() {
                         workspace,
                         data_dir,
                         echo,
+                        bind,
+                        tls,
+                        cert_file,
+                        key_file,
+                        token,
                     })
                     .await
                 }
