@@ -83,6 +83,7 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
             updated_at: None,
+            devices: Vec::new(),
         });
     }
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
@@ -108,6 +109,7 @@ async fn access_bootstrap_endpoints_remain_public() {
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
             updated_at: None,
+            devices: Vec::new(),
         });
     }
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
@@ -140,6 +142,7 @@ async fn verified_cookie_allows_remote_request_through_middleware() {
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
             updated_at: None,
+            devices: Vec::new(),
         });
     }
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
@@ -234,6 +237,7 @@ async fn local_request_bypasses_access_middleware() {
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
             updated_at: None,
+            devices: Vec::new(),
         });
     }
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
@@ -309,6 +313,7 @@ async fn v2_stream_is_behind_access_middleware() {
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
             updated_at: None,
+            devices: Vec::new(),
         });
     }
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
@@ -323,4 +328,176 @@ async fn v2_stream_is_behind_access_middleware() {
         StatusCode::UNAUTHORIZED,
         "/v2/stream must be guarded by the access middleware for remote requests"
     );
+}
+
+// --- v2-P2 (#181): per-device token pairing + enforcement -----------------
+
+/// The hash of password "secret" with salt `01..01` (matches the literals above).
+const SECRET_HASH: &str = "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d";
+const SECRET_SALT: &str = "01010101010101010101010101010101";
+
+fn password_access_control() -> AccessControlConfig {
+    AccessControlConfig {
+        password_enabled: true,
+        password_hash: Some(SECRET_HASH.to_string()),
+        password_salt: Some(SECRET_SALT.to_string()),
+        updated_at: None,
+        devices: Vec::new(),
+    }
+}
+
+/// `POST /v2/pair` with the correct root password issues a device token whose
+/// hash (not the plaintext) is persisted; the token then authenticates a remote
+/// request through the access middleware.
+#[actix_web::test]
+async fn v2_pair_issues_token_that_authenticates_remote_request() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair (public route; self-gates on root password).
+    let pair_req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "secret", "label": "iPhone 15" }))
+        .to_request();
+    let pair_resp = test::call_service(&app, pair_req).await;
+    assert_eq!(pair_resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(pair_resp.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let device_token = payload["device_token"].as_str().unwrap().to_string();
+    assert!(device_token.starts_with("bd1_"));
+    assert!(device_id.starts_with("bamboo_"));
+
+    // The plaintext token is NEVER persisted — only the hash.
+    {
+        let config = app_state.config.read().await;
+        let devices = &config.access_control.as_ref().unwrap().devices;
+        assert_eq!(devices.len(), 1);
+        assert_ne!(devices[0].token_hash, device_token);
+    }
+
+    // The token authenticates a remote request through the middleware.
+    let ok_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id))
+        .to_request();
+    let ok_resp = test::call_service(&app, ok_req).await;
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    // A bogus token is rejected.
+    let bad_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, "Bearer bd1_deadbeef"))
+        .insert_header(("X-Device-Id", "bamboo_000000000000"))
+        .to_request();
+    let bad_resp = test::call_service(&app, bad_req).await;
+    assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `POST /v2/pair` with a wrong root password is rejected with 401.
+#[actix_web::test]
+async fn v2_pair_rejects_wrong_root_password() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "wrong", "label": "x" }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `POST /v2/pair` when no root password is set returns 400 with guidance.
+#[actix_web::test]
+async fn v2_pair_requires_root_password_to_be_set() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "", "label": "x" }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Changing the root password MUST preserve already-paired devices — replacing
+/// the whole `AccessControlConfig` would silently wipe every device token.
+#[actix_web::test]
+async fn password_change_preserves_paired_devices() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair a device.
+    let pair_req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "secret", "label": "iPad" }))
+        .to_request();
+    let pair_resp = test::call_service(&app, pair_req).await;
+    assert_eq!(pair_resp.status(), StatusCode::OK);
+    let device_count_before = app_state
+        .config
+        .read()
+        .await
+        .access_control
+        .as_ref()
+        .unwrap()
+        .devices
+        .len();
+    assert_eq!(device_count_before, 1);
+
+    // Change the root password (local bypass → current_password not required).
+    let change_req = test::TestRequest::post()
+        .uri("/v1/bamboo/access/password")
+        .insert_header((header::HOST, "localhost:9562"))
+        .set_json(serde_json::json!({ "new_password": "newsecret" }))
+        .to_request();
+    let change_resp = test::call_service(&app, change_req).await;
+    assert_eq!(change_resp.status(), StatusCode::OK);
+
+    // The device survives the password change.
+    let config = app_state.config.read().await;
+    let access = config.access_control.as_ref().unwrap();
+    assert_eq!(
+        access.devices.len(),
+        1,
+        "password change must NOT wipe paired devices"
+    );
+    assert_eq!(access.devices[0].label, "iPad");
 }

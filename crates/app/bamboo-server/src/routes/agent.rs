@@ -267,10 +267,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     // the SAME access-password middleware as `/api/v1`, so `local_bypass` keeps
     // desktop loopback frictionless and public access still requires the
     // password. The v1 SSE/REST endpoints above stay unchanged (dual-track).
+    // v2-P2 (#181): `/v2/pair` is on the public whitelist (a new device has no
+    // credential yet) and self-gates via the owner root password in its body.
+    // `/v2/stream` stays GATED by the same middleware.
     let v2_scope = web::scope("/v2")
         .wrap(actix_web::middleware::from_fn(
             settings::enforce_access_password_middleware,
         ))
+        .route("/pair", web::post().to(settings::pair_device))
         .route("/stream", web::get().to(agent::ws_v2::handler));
     cfg.service(v2_scope);
 }

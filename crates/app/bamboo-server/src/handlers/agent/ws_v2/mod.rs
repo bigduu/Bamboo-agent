@@ -22,9 +22,14 @@
 //!
 //! ## DEFERRED (later slices; see PR / §5.3)
 //! - `execute` / `approve` over control (handler refactors) — clients keep REST.
-//! - per-device tokens / `hello` validation / `/v2/pair` (v2-P2) — `hello` is
-//!   accepted and ignored; auth is the scope middleware only.
 //! - msgpack subprotocol (v2-P3) — JSON text frames only.
+//!
+//! ## Auth (v2-P2, #181)
+//! The scope middleware is the PRIMARY gate (it accepts a verified password
+//! cookie or a per-device token on the upgrade request). The `hello` frame adds
+//! identity binding: if it carries `device_id` + `token`, they are verified and
+//! the connection is CLOSED on mismatch; a token-less `hello` (e.g. a local
+//! desktop the middleware already bypassed) keeps the prior accept behavior.
 
 mod envelope;
 mod forwarders;
@@ -117,10 +122,13 @@ async fn drive(
             msg = msg_stream.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_client_text(
+                        let keep_open = handle_client_text(
                             &state, &out_tx, &mut forwarders, &mut session, batch_ms, &text,
                         )
                         .await;
+                        if !keep_open {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Ping(bytes))) => {
                         if session.pong(&bytes).await.is_err() {
@@ -153,6 +161,9 @@ async fn drive(
 
 /// Parse + dispatch one client text frame. A malformed/unknown frame logs and is
 /// ignored — it never tears down the connection.
+///
+/// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
+/// presents an invalid device credential); `true` to keep it open.
 async fn handle_client_text(
     state: &web::Data<AppState>,
     out_tx: &OutboundTx,
@@ -160,20 +171,41 @@ async fn handle_client_text(
     _session: &mut actix_ws::Session,
     batch_ms: u64,
     text: &str,
-) {
+) -> bool {
     let frame: ClientFrame = match serde_json::from_str(text) {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!("ws_v2: ignoring malformed client frame: {e}");
-            return;
+            return true;
         }
     };
 
     match frame {
-        ClientFrame::Hello { .. } => {
-            // v2-P1: auth is the scope middleware only. Accept + ignore (token
-            // validation lands in v2-P2).
-            tracing::debug!("ws_v2: hello frame accepted (P1 no-op)");
+        ClientFrame::Hello { device_id, token } => {
+            // Identity binding (v2-P2, #181). The scope middleware is the primary
+            // gate; here we additionally verify a presented credential and reject
+            // an unverified hello on the public WS path. A token-less hello (e.g.
+            // a local desktop the middleware already bypassed) is accepted.
+            match (device_id, token) {
+                (Some(device_id), Some(token)) => {
+                    let config = state.config.read().await.clone();
+                    if crate::handlers::settings::verify_device_token(&config, &device_id, &token) {
+                        // Bind device id onto the connection for logging. Never
+                        // log the token.
+                        tracing::debug!("ws_v2: hello verified for device {device_id}");
+                    } else {
+                        tracing::warn!(
+                            "ws_v2: hello rejected — invalid device credential for {device_id}; closing"
+                        );
+                        return false;
+                    }
+                }
+                _ => {
+                    // No credential in the hello: keep prior accept behavior
+                    // (the middleware already gated the upgrade).
+                    tracing::debug!("ws_v2: hello accepted without device token");
+                }
+            }
         }
         ClientFrame::Subscribe { ch, since } => {
             subscribe(state, out_tx, forwarders, batch_ms, &ch, since).await;
@@ -192,6 +224,7 @@ async fn handle_client_text(
             tracing::debug!("ws_v2: ignoring unknown client frame type");
         }
     }
+    true
 }
 
 /// Subscribe to a channel, replacing any existing forwarder for the same `ch`
