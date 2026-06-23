@@ -31,6 +31,11 @@ bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
+# remote-actor P2a (#181): the server hosts the `/v1/agents` control-plane
+# registry over `bamboo_subagent::proto::AgentRecord`. The engine already pulls
+# this crate in transitively; a DIRECT dep makes the type reuse explicit (no
+# server-side DTO that could drift from the wire record).
+bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 
 # Web framework
 # `rustls-0_23` enables actix-web's TLS bind/listen against rustls 0.23

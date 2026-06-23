@@ -338,6 +338,15 @@ pub struct AppState {
     /// entries are purged opportunistically on insert/lookup.
     pub pairing_codes: Arc<dashmap::DashMap<String, crate::handlers::settings::PairingCodeEntry>>,
 
+    /// remote-actor P2a (#181): the in-memory `/v1/agents` control-plane registry.
+    /// Cross-host agent discovery — the network counterpart of the local-file
+    /// `bamboo_subagent::FileFabric`. Workers on other machines register/heartbeat
+    /// here; parents resolve/list/withdraw. PROCESS-EPHEMERAL — never persisted; a
+    /// restart drops all registrations (workers re-register on their next
+    /// heartbeat). Lease expiry is enforced lazily on read (see
+    /// [`crate::handlers::agent::agents::AgentRegistry`]).
+    pub agent_registry: Arc<crate::handlers::agent::agents::AgentRegistry>,
+
     /// v2-P2 (#181, slice 2): per-process brute-force guard for the public
     /// code-redemption path (`POST /v2/pair { code }`). A 6-digit code is only
     /// ~1M space, so a public redeem endpoint is brute-forceable without a guard.

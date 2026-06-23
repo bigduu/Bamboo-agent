@@ -22,6 +22,11 @@ pub enum StoreError {
     CorruptIndex { path: PathBuf },
     #[error("not found: {0}")]
     NotFound(String),
+    /// A network/transport failure from the HTTP `Discovery` backend
+    /// ([`crate::registry_fabric::RegistryFabric`]). The message is scrubbed of
+    /// any credential — never format a bearer token into this.
+    #[error("registry network error: {0}")]
+    Network(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

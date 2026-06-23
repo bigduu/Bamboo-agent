@@ -1201,6 +1201,7 @@ dependencies = [
  "bamboo-server-tools",
  "bamboo-skills",
  "bamboo-storage",
+ "bamboo-subagent",
  "bamboo-tools",
  "bytes",
  "chrono",
@@ -1314,6 +1315,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1325,6 +1327,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -26,7 +26,16 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2"
+# remote-actor P2a (#181): the HTTP client behind `RegistryFabric` (the network
+# `Discovery` impl that talks to the server's `/v1/agents` control plane).
+# default-features=false drops reqwest's default native-tls stack; `rustls-tls`
+# keeps this crate on the same rustls/ring posture as the rest of the workspace
+# (no system OpenSSL, no native-tls). `json` is for (de)serializing `AgentRecord`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 tempfile = "3"
+# remote-actor P2a (#181): mock the `/v1/agents` registry so the `RegistryFabric`
+# HTTP round-trip is exercised without standing up the full bamboo-server.
+wiremock = "0.6"
