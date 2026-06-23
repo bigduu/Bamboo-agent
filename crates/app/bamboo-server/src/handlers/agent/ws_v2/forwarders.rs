@@ -1,21 +1,38 @@
 //! Per-channel forwarder tasks for the v2 WS multiplex.
 //!
 //! Each subscribed channel runs its OWN task with its OWN broadcast receiver,
-//! pushing [`ServerEnvelope`]s onto a single shared bounded `mpsc` that the
-//! driver drains to the WS session.
+//! pushing [`ServerEnvelope`]s onto its OWN bounded `mpsc` queue. The driver
+//! holds a `StreamMap<channel, ReceiverStream>` and drains every per-channel
+//! queue with a fair merge (see below) to the WS session.
 //!
-//! Backpressure (RFC §10-Q3): the per-forwarder design gives **broadcast-ring
-//! independence** — a slow/lagging channel only overruns its own broadcast ring
-//! and is never blocked at the *source* by another channel. The forwarders then
-//! merge into one bounded outbound FIFO, so a sustained burst on one channel can
-//! still queue ahead of another at the *socket* (a head-of-line window bounded
-//! by the FIFO depth); it cannot deadlock (forwarders block on `send().await`
-//! holding no shared lock, and the driver always drains). A fully per-channel
-//! outbound queue with a fair merge is a possible future refinement; the bounded
-//! shared FIFO is the pragmatic first cut.
+//! Backpressure (RFC §10-Q3): the design now gives **per-channel independence at
+//! BOTH ends**:
+//!   1. *Source* — each forwarder owns its own broadcast receiver, so a
+//!      slow/lagging channel only overruns its own broadcast ring and is never
+//!      blocked at the source by another channel (the lag recovery is local).
+//!   2. *Socket* — each forwarder owns its own bounded outbound queue
+//!      (`OUTBOUND_BUFFER`), and the driver merges them with `tokio_stream`'s
+//!      `StreamMap`, whose poll order ROTATES its start index every poll. So a
+//!      sustained burst on one channel fills only its OWN queue (its forwarder
+//!      then awaits on `send`, applying backpressure to THAT channel alone) and
+//!      can no longer head-of-line another channel's frames at the socket — the
+//!      shared-FIFO head-of-line point of the first cut is removed.
 //!
-//! The driver keeps a `JoinHandle` per channel so `unsubscribe` (or teardown)
-//! aborts exactly that forwarder, leaving no orphaned broadcast reader.
+//! Fairness guarantee (honest): the merge is **fair-ish, not strict
+//! round-robin**. `StreamMap` polls all ready per-channel queues starting from a
+//! randomized index each poll, so over time no channel is systematically starved, and a
+//! flooding channel cannot monopolize the socket while another has frames ready.
+//! It does NOT guarantee exact 1:1 interleaving or any latency bound; it
+//! guarantees starvation-freedom and that per-channel backpressure stays local.
+//!
+//! Ordering WITHIN a channel is preserved end-to-end: a single forwarder pushes
+//! to a single FIFO `mpsc`, and `StreamMap` drains each inner stream in order; it
+//! only interleaves ACROSS channels.
+//!
+//! The driver keeps a `JoinHandle` per channel AND the matching queue receiver in
+//! the `StreamMap`, both keyed by the channel id, so `unsubscribe` (or teardown)
+//! aborts exactly that forwarder AND drops its queue, leaving no orphaned
+//! broadcast reader and no stale queued frame.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
