@@ -501,3 +501,469 @@ async fn password_change_preserves_paired_devices() {
     );
     assert_eq!(access.devices[0].label, "iPad");
 }
+
+// --- v2-P2 (#181, slice 2): pairing codes + /v2/devices management ---------
+
+use crate::handlers::settings::PairingCodeEntry;
+use std::time::Duration;
+
+/// Inject a code directly into the ephemeral store with the given TTL.
+fn inject_code(app_state: &AppState, code: &str, ttl: Duration) {
+    app_state
+        .pairing_codes
+        .insert(code.to_string(), PairingCodeEntry::new(ttl));
+}
+
+/// Inject an already-expired code (expiry in the past).
+fn inject_expired_code(app_state: &AppState, code: &str) {
+    // Reuse a 0-TTL entry: `expires_at == now` ⇒ already expired by the
+    // `>=` predicate, with no sleep needed.
+    app_state.pairing_codes.insert(
+        code.to_string(),
+        PairingCodeEntry::new(Duration::from_secs(0)),
+    );
+}
+
+/// `POST /v2/pair { code }` → redeem a valid code → token authenticates a remote
+/// request; the code is single-use (a second redeem fails).
+#[actix_web::test]
+async fn v2_pair_code_redeems_once_and_token_authenticates() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "842913", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Redeem the code.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "842913", "label": "iPad" }))
+        .to_request();
+    let resp = test::call_service(&app, redeem).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let device_token = payload["device_token"].as_str().unwrap().to_string();
+    assert!(device_token.starts_with("bd1_"));
+
+    // The token authenticates a remote request through the middleware.
+    let ok_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, ok_req).await.status(),
+        StatusCode::OK
+    );
+
+    // Second redeem of the SAME code fails (one-time consume).
+    let again = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "842913", "label": "iPad2" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, again).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// An expired code is rejected.
+#[actix_web::test]
+async fn v2_pair_code_expired_is_rejected() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    inject_expired_code(&app_state, "111111");
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "111111", "label": "x" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// An unknown code is rejected.
+#[actix_web::test]
+async fn v2_pair_code_unknown_is_rejected() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "999999", "label": "x" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Brute-force guard: after the failure threshold, further code redemptions are
+/// rejected for the cooldown; a correct code outside the cooldown still works.
+#[actix_web::test]
+async fn v2_pair_code_brute_force_guard_trips_then_recovers() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // 10 wrong codes trip the cooldown.
+    for _ in 0..10 {
+        let req = test::TestRequest::post()
+            .uri("/v2/pair")
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "code": "000000", "label": "x" }))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // Even a freshly-injected VALID code is now rejected while in cooldown.
+    inject_code(&app_state, "123456", Duration::from_secs(120));
+    let blocked = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "123456", "label": "x" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, blocked).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "valid code must be blocked during cooldown"
+    );
+
+    // Simulate the cooldown elapsing by clearing the guard, then a valid code
+    // (re-injected — the trip cleared outstanding codes) works again.
+    app_state.pairing_code_guard.record_success();
+    inject_code(&app_state, "654321", Duration::from_secs(120));
+    let ok = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "654321", "label": "after-cooldown" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, ok).await.status(),
+        StatusCode::OK,
+        "a correct code outside the cooldown must work"
+    );
+}
+
+/// `GET /v2/devices` lists devices as a summary DTO that EXCLUDES token_hash and
+/// token_salt (assert the serialized JSON has no such keys/values).
+#[actix_web::test]
+async fn v2_devices_list_excludes_secret_material() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "424242", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair a device so the list is non-empty.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "424242", "label": "Pixel" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, redeem).await.status(),
+        StatusCode::OK
+    );
+
+    // Grab the persisted secrets so we can assert they don't appear in the list.
+    let (hash, salt) = {
+        let config = app_state.config.read().await;
+        let d = &config.access_control.as_ref().unwrap().devices[0];
+        (d.token_hash.clone(), d.token_salt.clone())
+    };
+
+    // GET /v2/devices (local bypass → reaches the gated handler).
+    let list = test::TestRequest::get()
+        .uri("/v2/devices")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let resp = test::call_service(&app, list).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let raw = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        !raw.contains("token_hash"),
+        "DTO must not expose token_hash key"
+    );
+    assert!(
+        !raw.contains("token_salt"),
+        "DTO must not expose token_salt key"
+    );
+    assert!(!raw.contains(&hash), "DTO must not leak the hash value");
+    assert!(!raw.contains(&salt), "DTO must not leak the salt value");
+
+    let arr: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(arr.as_array().unwrap().len(), 1);
+    assert_eq!(arr[0]["label"], "Pixel");
+    assert_eq!(arr[0]["revoked"], false);
+}
+
+/// `DELETE /v2/devices/{id}` revokes (token stops verifying, has_active_devices
+/// flips when it was the last device); an unknown id → 404.
+#[actix_web::test]
+async fn v2_devices_delete_revokes_and_404s_unknown() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "333333", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "333333", "label": "Watch" }))
+        .to_request();
+    let resp = test::call_service(&app, redeem).await;
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let device_token = payload["device_token"].as_str().unwrap().to_string();
+
+    // Token works before revoke.
+    let before = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, before).await.status(),
+        StatusCode::OK
+    );
+
+    // Revoke (local bypass → reaches the gated handler).
+    let del = test::TestRequest::delete()
+        .uri(&format!("/v2/devices/{device_id}"))
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(test::call_service(&app, del).await.status(), StatusCode::OK);
+
+    // The row is kept but marked revoked.
+    {
+        let config = app_state.config.read().await;
+        let access = config.access_control.as_ref().unwrap();
+        assert_eq!(access.devices.len(), 1, "revoke keeps the audit row");
+        assert!(access.devices[0].revoked);
+    }
+
+    // Token no longer authenticates (instant revocation). Since this was the last
+    // active device but a root password is still set, remote access still gates.
+    let after = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, after).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked token must stop authenticating immediately"
+    );
+
+    // Unknown id → 404.
+    let unknown = test::TestRequest::delete()
+        .uri("/v2/devices/bamboo_doesnotexist")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// `POST /v2/devices/{id}/rotate` issues a NEW working token; the OLD token stops
+/// verifying; device_id is unchanged; unknown id → 404.
+#[actix_web::test]
+async fn v2_devices_rotate_swaps_token_and_404s_unknown() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "555555", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "555555", "label": "Laptop" }))
+        .to_request();
+    let resp = test::call_service(&app, redeem).await;
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let old_token = payload["device_token"].as_str().unwrap().to_string();
+
+    // Rotate (local bypass → reaches the gated handler).
+    let rot = test::TestRequest::post()
+        .uri(&format!("/v2/devices/{device_id}/rotate"))
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let rot_resp = test::call_service(&app, rot).await;
+    assert_eq!(rot_resp.status(), StatusCode::OK);
+    let rbody = actix_web::body::to_bytes(rot_resp.into_body())
+        .await
+        .unwrap();
+    let rpayload: serde_json::Value = serde_json::from_slice(&rbody).unwrap();
+    let new_id = rpayload["device_id"].as_str().unwrap().to_string();
+    let new_token = rpayload["device_token"].as_str().unwrap().to_string();
+    assert_eq!(new_id, device_id, "device_id is unchanged across rotation");
+    assert_ne!(new_token, old_token, "rotation issues a different token");
+
+    // OLD token no longer verifies.
+    let old_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {old_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, old_req).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "old token must stop verifying after rotation"
+    );
+
+    // NEW token works, and the label/created_at are preserved.
+    let new_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {new_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, new_req).await.status(),
+        StatusCode::OK
+    );
+    {
+        let config = app_state.config.read().await;
+        let d = &config.access_control.as_ref().unwrap().devices[0];
+        assert_eq!(d.label, "Laptop", "label preserved across rotation");
+        assert!(!d.revoked);
+    }
+
+    // Unknown id → 404.
+    let unknown = test::TestRequest::post()
+        .uri("/v2/devices/bamboo_nope/rotate")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// `POST /v2/pair/code` is GATED: a remote unauthenticated caller is 401 by the
+/// middleware (mirrors `v2_stream_is_behind_access_middleware`).
+#[actix_web::test]
+async fn v2_pair_code_requires_auth() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair/code")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/pair/code must be behind the access middleware"
+    );
+}
+
+/// `POST /v2/pair/code` from a local (bypass) caller returns a 6-digit code +
+/// ttl, and that code then redeems at `/v2/pair`.
+#[actix_web::test]
+async fn v2_pair_code_local_issue_then_redeem() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // Local request → bypass → reaches the gated handler.
+    let code_req = test::TestRequest::post()
+        .uri("/v2/pair/code")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let code_resp = test::call_service(&app, code_req).await;
+    assert_eq!(code_resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(code_resp.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = payload["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 6);
+    assert!(code.chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(payload["ttl"].as_u64().unwrap(), 120);
+
+    // Redeem it.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": code, "label": "redeemed" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, redeem).await.status(),
+        StatusCode::OK
+    );
+}

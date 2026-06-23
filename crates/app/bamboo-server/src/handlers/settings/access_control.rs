@@ -1,4 +1,6 @@
 use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use actix_web::{
     body::{EitherBody, MessageBody},
@@ -9,7 +11,7 @@ use actix_web::{
     web, HttpRequest, HttpResponse, ResponseError,
 };
 use chrono::{SecondsFormat, Utc};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -569,9 +571,14 @@ pub async fn update_access_password(
 
 #[derive(Debug, Deserialize)]
 pub struct PairDeviceRequest {
-    /// Owner root password — authorizes first-device pairing.
+    /// Owner root password — authorizes first-device pairing (slice 1 path).
     #[serde(default)]
     pub root_password: String,
+    /// One-time 6-digit pairing code — authorizes subsequent-device pairing
+    /// (slice 2 path). Requested by an already-authenticated device via
+    /// `POST /v2/pair/code`.
+    #[serde(default)]
+    pub code: String,
     /// Human-readable device label, e.g. "iPhone 15".
     #[serde(default)]
     pub label: String,
@@ -585,15 +592,17 @@ pub struct PairDeviceResponse {
     pub expires_hint: &'static str,
 }
 
-/// `POST /v2/pair` — first-device pairing via the owner root password.
+/// `POST /v2/pair` — redeem a credential to pair a NEW device. Two paths:
 ///
-/// Slice 1 implements ONLY the root-password path. Pairing CODES
-/// (`POST /v2/pair/code` + code-based `/v2/pair`) are deferred to slice 2.
+/// - **code** (slice 2): a one-time 6-digit pairing code requested by an already
+///   authenticated device via `POST /v2/pair/code`. This is the public route a
+///   brand-new device with no credential uses, so it carries a brute-force guard
+///   (see [`PairingCodeGuard`]).
+/// - **root_password** (slice 1): the owner root password directly authorizes
+///   first-device pairing. Unchanged byte-for-byte from slice 1.
 ///
 /// The endpoint is on the public whitelist (a new device has no credential), so
-/// it self-gates: it requires the owner root password. If no root password is
-/// configured, pairing is refused with a clear instruction to set one first —
-/// the root credential is required to authorize issuing device tokens.
+/// it self-gates on one of the two credentials above.
 pub async fn pair_device(
     payload: web::Json<PairDeviceRequest>,
     app_state: web::Data<AppState>,
@@ -603,6 +612,29 @@ pub async fn pair_device(
         return Err(AppError::BadRequest("label is required".to_string()));
     }
 
+    let code = payload.code.trim();
+    let root_password = payload.root_password.trim();
+
+    // Dispatch: a non-empty code takes the slice-2 code-redemption path; else a
+    // non-empty root password takes the unchanged slice-1 path; else 400.
+    if !code.is_empty() {
+        return pair_device_with_code(&app_state, code, label).await;
+    }
+    if !root_password.is_empty() {
+        return pair_device_with_root_password(&app_state, root_password, label).await;
+    }
+
+    Err(AppError::BadRequest(
+        "provide either a root_password or a one-time pairing code".to_string(),
+    ))
+}
+
+/// Slice-1 root-password pairing path. Behavior is identical to slice 1.
+async fn pair_device_with_root_password(
+    app_state: &AppState,
+    root_password: &str,
+    label: &str,
+) -> Result<HttpResponse, AppError> {
     let config = app_state.config.read().await.clone();
 
     let password_enabled = config
@@ -616,11 +648,60 @@ pub async fn pair_device(
         ));
     }
 
-    let root_password = payload.root_password.trim();
-    if root_password.is_empty() || !verify_password(&config, root_password) {
+    if !verify_password(&config, root_password) {
         return Err(AppError::Unauthorized("invalid root password".to_string()));
     }
 
+    persist_new_device(app_state, label).await
+}
+
+/// Slice-2 code-redemption pairing path. The code must EXIST and be UNEXPIRED in
+/// the ephemeral store and is consumed ONE-TIME (atomically removed on a
+/// successful match) so it cannot be reused. Guarded against brute force.
+async fn pair_device_with_code(
+    app_state: &AppState,
+    code: &str,
+    label: &str,
+) -> Result<HttpResponse, AppError> {
+    // Brute-force gate FIRST: if we are in a cooldown, reject before touching the
+    // store so an attacker can't probe code validity during the cooldown.
+    if app_state.pairing_code_guard.in_cooldown() {
+        return Err(AppError::Unauthorized(
+            "too many failed pairing attempts — try again later".to_string(),
+        ));
+    }
+
+    // One-time consume: `remove` is atomic in DashMap, so two concurrent redeems
+    // of the SAME code race on the single removal — exactly one wins the `Some`,
+    // the other gets `None` and is treated as an invalid code. After taking the
+    // entry we still check expiry (a stale-but-present entry must not pair).
+    let consumed = app_state.pairing_codes.remove(code);
+    let valid = match consumed {
+        Some((_k, entry)) => !entry.is_expired(),
+        None => false,
+    };
+
+    if !valid {
+        // Record the failure; trip the cooldown after the threshold and
+        // proactively invalidate outstanding codes so a near-miss attacker can't
+        // keep probing the rest of the (small) code space.
+        if app_state.pairing_code_guard.record_failure() {
+            app_state.pairing_codes.clear();
+        }
+        return Err(AppError::Unauthorized(
+            "invalid or expired pairing code".to_string(),
+        ));
+    }
+
+    // Success resets the failure counter.
+    app_state.pairing_code_guard.record_success();
+    persist_new_device(app_state, label).await
+}
+
+/// Issue a fresh device credential for `label`, append it to the persisted
+/// devices (preserving every existing field + device), and return the plaintext
+/// token ONCE.
+async fn persist_new_device(app_state: &AppState, label: &str) -> Result<HttpResponse, AppError> {
     let (credential, token) = issue_device_token(label);
     let device_id = credential.device_id.clone();
 
@@ -639,6 +720,297 @@ pub async fn pair_device(
 
     // NOTE: `token` is the plaintext credential — it is returned to the client
     // here ONCE and is never logged.
+    Ok(HttpResponse::Ok().json(PairDeviceResponse {
+        device_id,
+        device_token: token,
+        expires_hint: "rotate-on-demand",
+    }))
+}
+
+// ── v2-P2 pairing codes + brute-force guard (#181, slice 2) ──────────────────
+
+/// Default code lifetime (~2 minutes).
+const PAIRING_CODE_TTL: Duration = Duration::from_secs(120);
+/// Failed code-redemption attempts within the window before the cooldown trips.
+const PAIRING_FAILURE_THRESHOLD: u32 = 10;
+/// How long the code-redemption path stays locked once the threshold is hit.
+const PAIRING_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// An in-memory one-time pairing code entry. Holds only an `Instant` expiry —
+/// the code itself is the DashMap key. PROCESS-EPHEMERAL: never persisted.
+#[derive(Debug, Clone)]
+pub struct PairingCodeEntry {
+    expires_at: Instant,
+}
+
+impl PairingCodeEntry {
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self {
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    /// Whether this code has passed its TTL. Pure predicate over `Instant` —
+    /// directly unit-testable by constructing an already-elapsed expiry.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+}
+
+/// Per-process brute-force guard for the public code-redemption path.
+///
+/// Design (flagged for review): a 6-digit numeric code is only ~1M wide, and
+/// `POST /v2/pair { code }` is public, so without a guard it is brute-forceable
+/// within a code's 120s TTL. The guard is a simple bounded failed-attempt
+/// counter with a cooldown:
+///
+/// - Each failed code redemption increments a counter.
+/// - After [`PAIRING_FAILURE_THRESHOLD`] (10) failures, a [`PAIRING_COOLDOWN`]
+///   (60s) lockout trips: all further code redemptions are rejected for the
+///   duration, AND the caller proactively clears outstanding codes (so a
+///   near-miss attacker can't resume probing the small space). The counter
+///   resets when the cooldown elapses, or on any successful redemption.
+///
+/// This is per-PROCESS, not per-IP (the public route sits behind no reverse
+/// proxy that reliably carries client IPs in this deployment), so it is a global
+/// rate cap on the code path. The root-password path is untouched (its own
+/// throttling is tracked separately in #190). Trade-off: a global cooldown means
+/// a determined attacker can also deny a legitimate device's pairing for 60s by
+/// burning failures — acceptable for a short, operator-initiated pairing window.
+#[derive(Debug, Default)]
+pub struct PairingCodeGuard {
+    inner: Mutex<PairingGuardState>,
+}
+
+#[derive(Debug, Default)]
+struct PairingGuardState {
+    failures: u32,
+    /// When set and still in the future, the code path is locked.
+    cooldown_until: Option<Instant>,
+}
+
+impl PairingCodeGuard {
+    /// Whether the code-redemption path is currently locked out. Clears an
+    /// elapsed cooldown (and its failure count) as a side effect.
+    pub fn in_cooldown(&self) -> bool {
+        let mut state = self.inner.lock().expect("pairing guard mutex poisoned");
+        match state.cooldown_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                // Cooldown elapsed → reset.
+                state.cooldown_until = None;
+                state.failures = 0;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Record a failed redemption. Returns `true` IFF this failure tripped the
+    /// cooldown (so the caller can invalidate outstanding codes).
+    pub fn record_failure(&self) -> bool {
+        let mut state = self.inner.lock().expect("pairing guard mutex poisoned");
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= PAIRING_FAILURE_THRESHOLD {
+            state.cooldown_until = Some(Instant::now() + PAIRING_COOLDOWN);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset the guard after a successful redemption.
+    pub fn record_success(&self) {
+        let mut state = self.inner.lock().expect("pairing guard mutex poisoned");
+        state.failures = 0;
+        state.cooldown_until = None;
+    }
+}
+
+/// Generate a fresh 6-digit numeric code, e.g. "842913". Leading zeros are kept.
+///
+/// Uses `gen_range` (uniform rejection sampling) rather than `% 1_000_000` to
+/// avoid the modulo bias that would make a handful of low codes very slightly
+/// more probable. `thread_rng` is a CSPRNG, so codes are unpredictable.
+fn generate_pairing_code() -> String {
+    let n = rand::thread_rng().gen_range(0..1_000_000);
+    format!("{n:06}")
+}
+
+/// Drop every expired entry from the ephemeral code store (opportunistic GC).
+fn purge_expired_codes(codes: &dashmap::DashMap<String, PairingCodeEntry>) {
+    codes.retain(|_code, entry| !entry.is_expired());
+}
+
+#[derive(Serialize)]
+pub struct PairingCodeResponse {
+    pub code: String,
+    /// TTL in whole seconds.
+    pub ttl: u64,
+}
+
+/// `POST /v2/pair/code` — an ALREADY-AUTHENTICATED device/owner requests a
+/// one-time pairing code for a new device.
+///
+/// GATED: this route sits behind `enforce_access_password_middleware` (NOT on
+/// the public whitelist), so only a local_bypass desktop, a valid device token,
+/// or the verified password cookie can reach it. The generated code is the
+/// short-lived credential the brand-new device then redeems at `/v2/pair`.
+pub async fn create_pairing_code(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    // Opportunistic GC so the store can't grow unbounded with stale codes.
+    purge_expired_codes(&app_state.pairing_codes);
+
+    let code = generate_pairing_code();
+    let entry = PairingCodeEntry::new(PAIRING_CODE_TTL);
+    // Overwrite on the astronomically-rare collision — the latest request wins.
+    app_state.pairing_codes.insert(code.clone(), entry);
+
+    Ok(HttpResponse::Ok().json(PairingCodeResponse {
+        code,
+        ttl: PAIRING_CODE_TTL.as_secs(),
+    }))
+}
+
+// ── v2-P2 device management (#181, slice 2) ──────────────────────────────────
+
+/// Summary DTO for `GET /v2/devices`. CRITICAL: this MUST NOT carry
+/// `token_hash`/`token_salt` — a credential leak here would let any reader of
+/// the device list mint a matching token. Only non-secret metadata is exposed.
+#[derive(Serialize)]
+pub struct DeviceSummary {
+    pub device_id: String,
+    pub label: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked: bool,
+}
+
+impl DeviceSummary {
+    fn from_credential(d: &DeviceCredential) -> Self {
+        Self {
+            device_id: d.device_id.clone(),
+            label: d.label.clone(),
+            created_at: d.created_at.clone(),
+            last_used_at: d.last_used_at.clone(),
+            revoked: d.revoked,
+        }
+    }
+}
+
+/// `GET /v2/devices` — list paired devices (GATED). Returns the summary DTO with
+/// NO secret material.
+pub async fn list_devices(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    let config = app_state.config.read().await.clone();
+    let devices: Vec<DeviceSummary> = config
+        .access_control
+        .as_ref()
+        .map(|access| {
+            access
+                .devices
+                .iter()
+                .map(DeviceSummary::from_credential)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(HttpResponse::Ok().json(devices))
+}
+
+/// `DELETE /v2/devices/{device_id}` — revoke a device (GATED).
+///
+/// Sets `revoked = true` (the audit row is KEPT, not removed) and persists.
+/// Revocation is instant: `verify_device_token` already rejects revoked devices
+/// and `has_active_devices` recomputes, so the revoked token stops working on
+/// the very next request. Returns 404 if the device id is unknown.
+pub async fn revoke_device(
+    path: web::Path<String>,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let device_id = path.into_inner();
+
+    // Existence check up front so an unknown id is a clean 404 without a
+    // (no-op) persist.
+    {
+        let config = app_state.config.read().await;
+        let exists = config
+            .access_control
+            .as_ref()
+            .map(|access| access.devices.iter().any(|d| d.device_id == device_id))
+            .unwrap_or(false);
+        if !exists {
+            return Err(AppError::NotFound(format!("unknown device {device_id}")));
+        }
+    }
+
+    let target = device_id.clone();
+    app_state
+        .update_config(
+            move |config| {
+                if let Some(access) = config.access_control.as_mut() {
+                    if let Some(device) = access.devices.iter_mut().find(|d| d.device_id == target)
+                    {
+                        device.revoked = true;
+                    }
+                }
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "device_id": device_id, "revoked": true })))
+}
+
+/// `POST /v2/devices/{device_id}/rotate` — issue a NEW token for the SAME device
+/// (GATED).
+///
+/// Keeps `device_id`/`label`/`created_at`, resets `revoked = false`, and
+/// replaces `token_hash`/`token_salt` with a fresh pair. The OLD token stops
+/// verifying immediately (its salt is gone). Returns the new plaintext token
+/// ONCE. Returns 404 if the device id is unknown.
+pub async fn rotate_device(
+    path: web::Path<String>,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let device_id = path.into_inner();
+
+    // Existence check up front so an unknown id is a clean 404 without persisting
+    // a no-op config snapshot.
+    {
+        let config = app_state.config.read().await;
+        let exists = config
+            .access_control
+            .as_ref()
+            .map(|access| access.devices.iter().any(|d| d.device_id == device_id))
+            .unwrap_or(false);
+        if !exists {
+            return Err(AppError::NotFound(format!("unknown device {device_id}")));
+        }
+    }
+
+    // Generate a brand-new credential, then graft its secret material onto the
+    // existing device row (reusing `issue_device_token` for the fresh salt+hash).
+    let (fresh, token) = issue_device_token("");
+
+    let target = device_id.clone();
+    app_state
+        .update_config(
+            move |config| {
+                if let Some(access) = config.access_control.as_mut() {
+                    if let Some(device) = access.devices.iter_mut().find(|d| d.device_id == target)
+                    {
+                        device.token_hash = fresh.token_hash.clone();
+                        device.token_salt = fresh.token_salt.clone();
+                        device.revoked = false;
+                        device.last_used_at = None;
+                    }
+                }
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await?;
+
+    // NOTE: `token` is the plaintext credential — returned ONCE, never logged.
     Ok(HttpResponse::Ok().json(PairDeviceResponse {
         device_id,
         device_token: token,
@@ -846,5 +1218,121 @@ mod tests {
             .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
             .to_http_request();
         assert!(!request_has_valid_device_token(&no_id, &config));
+    }
+
+    // ── v2-P2 pairing codes + brute-force guard (#181, slice 2) ────────────
+
+    #[test]
+    fn generated_pairing_code_is_six_digits() {
+        for _ in 0..1000 {
+            let code = generate_pairing_code();
+            assert_eq!(code.len(), 6, "code {code:?} must be 6 chars");
+            assert!(
+                code.chars().all(|c| c.is_ascii_digit()),
+                "code {code:?} must be all digits"
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_code_expiry_predicate() {
+        // A fresh code with a positive TTL is not expired.
+        let fresh = PairingCodeEntry::new(Duration::from_secs(120));
+        assert!(!fresh.is_expired());
+
+        // A zero-TTL code is immediately expired (expires_at == now).
+        let zero = PairingCodeEntry::new(Duration::from_secs(0));
+        assert!(zero.is_expired());
+
+        // An entry whose expiry is in the past is expired.
+        let past = PairingCodeEntry {
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(past.is_expired());
+    }
+
+    #[test]
+    fn purge_expired_codes_drops_only_expired() {
+        let codes: dashmap::DashMap<String, PairingCodeEntry> = dashmap::DashMap::new();
+        codes.insert(
+            "live".into(),
+            PairingCodeEntry::new(Duration::from_secs(120)),
+        );
+        codes.insert(
+            "dead".into(),
+            PairingCodeEntry {
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        purge_expired_codes(&codes);
+        assert!(codes.contains_key("live"));
+        assert!(!codes.contains_key("dead"));
+    }
+
+    #[test]
+    fn guard_trips_cooldown_after_threshold() {
+        let guard = PairingCodeGuard::default();
+        assert!(!guard.in_cooldown());
+        // The first THRESHOLD-1 failures do not trip the cooldown.
+        for _ in 0..(PAIRING_FAILURE_THRESHOLD - 1) {
+            assert!(!guard.record_failure());
+            assert!(!guard.in_cooldown());
+        }
+        // The THRESHOLD-th failure trips it.
+        assert!(guard.record_failure());
+        assert!(guard.in_cooldown());
+    }
+
+    #[test]
+    fn guard_success_resets_failures() {
+        let guard = PairingCodeGuard::default();
+        for _ in 0..(PAIRING_FAILURE_THRESHOLD - 1) {
+            guard.record_failure();
+        }
+        guard.record_success();
+        // After a reset, the counter starts over — one more failure does NOT trip.
+        assert!(!guard.record_failure());
+        assert!(!guard.in_cooldown());
+    }
+
+    #[test]
+    fn guard_clears_elapsed_cooldown() {
+        let guard = PairingCodeGuard::default();
+        // Force a cooldown that has already elapsed.
+        {
+            let mut state = guard.inner.lock().unwrap();
+            state.failures = PAIRING_FAILURE_THRESHOLD;
+            state.cooldown_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        // in_cooldown observes the elapsed deadline and resets.
+        assert!(!guard.in_cooldown());
+        assert!(!guard.record_failure(), "counter was reset to 0");
+    }
+
+    #[test]
+    fn device_summary_excludes_secret_material() {
+        // Serialized JSON of the GET /v2/devices DTO MUST NOT carry the token
+        // hash or salt. Assert on the serialized keys/values directly.
+        let (cred, _t) = issue_device_token("iPhone");
+        let summary = DeviceSummary::from_credential(&cred);
+        let json = serde_json::to_value(&summary).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("token_hash"),
+            "must not expose token_hash"
+        );
+        assert!(
+            !obj.contains_key("token_salt"),
+            "must not expose token_salt"
+        );
+        // And the actual secret VALUES must not leak under any key.
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains(&cred.token_hash));
+        assert!(!serialized.contains(&cred.token_salt));
+        // Expected non-secret fields ARE present.
+        assert!(obj.contains_key("device_id"));
+        assert!(obj.contains_key("label"));
+        assert!(obj.contains_key("created_at"));
+        assert!(obj.contains_key("revoked"));
     }
 }

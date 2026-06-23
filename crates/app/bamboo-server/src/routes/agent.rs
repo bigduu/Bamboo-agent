@@ -270,11 +270,25 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     // v2-P2 (#181): `/v2/pair` is on the public whitelist (a new device has no
     // credential yet) and self-gates via the owner root password in its body.
     // `/v2/stream` stays GATED by the same middleware.
+    // v2-P2 (#181, slice 2): `/v2/pair/code` (request a one-time code) and the
+    // `/v2/devices` management endpoints (list / revoke / rotate) are all GATED
+    // by the same middleware — only `/v2/pair` itself is on the public whitelist,
+    // because a brand-new device redeeming a code has no credential yet.
     let v2_scope = web::scope("/v2")
         .wrap(actix_web::middleware::from_fn(
             settings::enforce_access_password_middleware,
         ))
         .route("/pair", web::post().to(settings::pair_device))
+        .route("/pair/code", web::post().to(settings::create_pairing_code))
+        .route("/devices", web::get().to(settings::list_devices))
+        .route(
+            "/devices/{device_id}",
+            web::delete().to(settings::revoke_device),
+        )
+        .route(
+            "/devices/{device_id}/rotate",
+            web::post().to(settings::rotate_device),
+        )
         .route("/stream", web::get().to(agent::ws_v2::handler));
     cfg.service(v2_scope);
 }

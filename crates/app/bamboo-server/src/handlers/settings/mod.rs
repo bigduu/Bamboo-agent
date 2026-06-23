@@ -16,8 +16,9 @@ mod workflows;
 
 pub(crate) use access_control::verify_device_token;
 pub use access_control::{
-    enforce_access_password_middleware, get_access_status, pair_device, update_access_password,
-    verify_access_password,
+    create_pairing_code, enforce_access_password_middleware, get_access_status, list_devices,
+    pair_device, revoke_device, rotate_device, update_access_password, verify_access_password,
+    PairingCodeEntry, PairingCodeGuard,
 };
 pub use bamboo_config::{
     get_bamboo_config, get_bamboo_tools, get_model_limit_defaults, get_proxy_auth_status,
