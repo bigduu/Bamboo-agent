@@ -674,6 +674,48 @@ mod tests {
         }
     }
 
+    // ── Subprotocol negotiation (v2-P3) ───────────────────────────────────────
+
+    fn negotiate_for(header: Option<&str>) -> (Encoding, Option<&'static str>) {
+        let mut req = actix_web::test::TestRequest::default();
+        if let Some(h) = header {
+            req = req.insert_header((actix_web::http::header::SEC_WEBSOCKET_PROTOCOL, h));
+        }
+        negotiate_encoding(&req.to_http_request())
+    }
+
+    #[test]
+    fn negotiate_encoding_branches() {
+        // No header / empty → JSON default, NO echo (unchanged for old clients).
+        assert_eq!(negotiate_for(None), (Encoding::Json, None));
+        assert_eq!(negotiate_for(Some("")), (Encoding::Json, None));
+        // Explicit JSON subprotocol → JSON, echo it.
+        assert_eq!(
+            negotiate_for(Some("bamboo.v2")),
+            (Encoding::Json, Some(SUBPROTOCOL_JSON))
+        );
+        // Msgpack offered → Msgpack, echo it.
+        assert_eq!(
+            negotiate_for(Some("bamboo.v2.msgpack")),
+            (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+        );
+        // Multi-offer: msgpack preferred regardless of order, and whitespace is trimmed.
+        assert_eq!(
+            negotiate_for(Some("bamboo.v2.msgpack, bamboo.v2")),
+            (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+        );
+        assert_eq!(
+            negotiate_for(Some("  bamboo.v2 ,  bamboo.v2.msgpack ")),
+            (Encoding::Msgpack, Some(SUBPROTOCOL_MSGPACK))
+        );
+        // Unknown-only offer → JSON, and NO bogus echo (echoing a non-offered
+        // subprotocol would violate RFC 6455).
+        assert_eq!(
+            negotiate_for(Some("some.other.proto")),
+            (Encoding::Json, None)
+        );
+    }
+
     // ── Pure classification (no AppState) ─────────────────────────────────────
 
     #[test]
