@@ -11,7 +11,7 @@ use actix_web::{
     web, HttpRequest, HttpResponse, ResponseError,
 };
 use chrono::{SecondsFormat, Utc};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -828,8 +828,12 @@ impl PairingCodeGuard {
 }
 
 /// Generate a fresh 6-digit numeric code, e.g. "842913". Leading zeros are kept.
+///
+/// Uses `gen_range` (uniform rejection sampling) rather than `% 1_000_000` to
+/// avoid the modulo bias that would make a handful of low codes very slightly
+/// more probable. `thread_rng` is a CSPRNG, so codes are unpredictable.
 fn generate_pairing_code() -> String {
-    let n = rand::thread_rng().next_u32() % 1_000_000;
+    let n = rand::thread_rng().gen_range(0..1_000_000);
     format!("{n:06}")
 }
 
