@@ -166,6 +166,42 @@ fn is_local_request(req: &HttpRequest) -> bool {
     false
 }
 
+/// Best-effort client-IP key for per-IP throttling (#190).
+///
+/// Mirrors the precedence `is_local_request` uses to read the client address:
+/// `peer_addr` first (the real TCP peer — the hardest to spoof when there is no
+/// reverse proxy), then `connection_info().realip_remote_addr()` (an
+/// `X-Forwarded-For`-derived address, used when a trusted proxy fronts the app),
+/// then the raw `connection_info().peer_addr()`. The address is normalized
+/// (stripping an `::ffff:` v4-mapped prefix) so the same client maps to one key
+/// regardless of representation. Returns `None` when no address can be
+/// determined, in which case the caller falls back to a single shared key so the
+/// path is still rate-capped rather than unguarded.
+///
+/// CAVEAT: behind a proxy that does NOT set a trusted forwarded header, every
+/// request shares the proxy's peer IP and would collapse onto one key (global
+/// cap). And per-IP keying is inherently defeatable by an attacker who can rotate
+/// source IPs — this raises the cost of a brute force, it does not make it
+/// impossible. This is the documented trade-off of per-IP throttling.
+fn client_ip_key(req: &HttpRequest) -> Option<String> {
+    if let Some(peer) = req.peer_addr() {
+        return Some(normalize_ip(&peer.ip().to_string()).to_string());
+    }
+
+    let conn = req.connection_info();
+    for candidate in [conn.realip_remote_addr(), conn.peer_addr()]
+        .into_iter()
+        .flatten()
+    {
+        let normalized = normalize_ip(candidate).trim();
+        if !normalized.is_empty() {
+            return Some(normalized.to_string());
+        }
+    }
+
+    None
+}
+
 fn compute_password_hash(password: &str, salt_hex: &str) -> Option<String> {
     let salt = hex::decode(salt_hex).ok()?;
     let mut hasher = Sha256::new();
@@ -509,9 +545,29 @@ pub async fn verify_access_password(
         return Err(AppError::BadRequest("password is required".to_string()));
     }
 
+    // #190: per-IP brute-force throttle. A local/desktop request is exempt
+    // (`root_throttle_key` returns None) so the desktop never locks itself out.
+    // If the key is in cooldown, reject with 429 + Retry-After BEFORE comparing.
+    let throttle_key = root_throttle_key(&req);
+    if let Some(key) = throttle_key.as_deref() {
+        if let RootGuardDecision::Cooldown { retry_after_secs } =
+            app_state.root_password_guard.check(key)
+        {
+            return Ok(too_many_requests_response(retry_after_secs));
+        }
+    }
+
     let config = app_state.config.read().await.clone();
     if !verify_password(&config, password) {
+        if let Some(key) = throttle_key.as_deref() {
+            app_state.root_password_guard.record_failure(key);
+        }
         return Err(AppError::Unauthorized("invalid password".to_string()));
+    }
+
+    // Correct password resets this key's counter.
+    if let Some(key) = throttle_key.as_deref() {
+        app_state.root_password_guard.record_success(key);
     }
 
     let secure = req.connection_info().scheme().eq_ignore_ascii_case("https");
@@ -625,6 +681,7 @@ pub struct PairDeviceResponse {
 /// The endpoint is on the public whitelist (a new device has no credential), so
 /// it self-gates on one of the two credentials above.
 pub async fn pair_device(
+    req: HttpRequest,
     payload: web::Json<PairDeviceRequest>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -642,7 +699,7 @@ pub async fn pair_device(
         return pair_device_with_code(&app_state, code, label).await;
     }
     if !root_password.is_empty() {
-        return pair_device_with_root_password(&app_state, root_password, label).await;
+        return pair_device_with_root_password(&req, &app_state, root_password, label).await;
     }
 
     Err(AppError::BadRequest(
@@ -650,12 +707,26 @@ pub async fn pair_device(
     ))
 }
 
-/// Slice-1 root-password pairing path. Behavior is identical to slice 1.
+/// Slice-1 root-password pairing path. Behavior is identical to slice 1, plus the
+/// #190 per-IP brute-force throttle in front of the password compare.
 async fn pair_device_with_root_password(
+    req: &HttpRequest,
     app_state: &AppState,
     root_password: &str,
     label: &str,
 ) -> Result<HttpResponse, AppError> {
+    // #190: per-IP brute-force throttle. Loopback/desktop is exempt
+    // (`root_throttle_key` returns None). If in cooldown, reject with 429 +
+    // Retry-After BEFORE comparing the password.
+    let throttle_key = root_throttle_key(req);
+    if let Some(key) = throttle_key.as_deref() {
+        if let RootGuardDecision::Cooldown { retry_after_secs } =
+            app_state.root_password_guard.check(key)
+        {
+            return Ok(too_many_requests_response(retry_after_secs));
+        }
+    }
+
     let config = app_state.config.read().await.clone();
 
     let password_enabled = config
@@ -670,7 +741,15 @@ async fn pair_device_with_root_password(
     }
 
     if !verify_password(&config, root_password) {
+        if let Some(key) = throttle_key.as_deref() {
+            app_state.root_password_guard.record_failure(key);
+        }
         return Err(AppError::Unauthorized("invalid root password".to_string()));
+    }
+
+    // Correct password resets this key's counter.
+    if let Some(key) = throttle_key.as_deref() {
+        app_state.root_password_guard.record_success(key);
     }
 
     persist_new_device(app_state, label).await
@@ -846,6 +925,153 @@ impl PairingCodeGuard {
         state.failures = 0;
         state.cooldown_until = None;
     }
+}
+
+// ── #190: per-IP root-password brute-force guard ────────────────────────────
+//
+// Both public root-password-checking endpoints — `POST /v1/bamboo/access/verify`
+// (`verify_access_password`) and `POST /v2/pair` on its root-password path
+// (`pair_device_with_root_password`) — accept the owner root password with no
+// rate limiting. `verify_password` is constant-time (no timing leak), but
+// nothing caps the request RATE, so an attacker can brute-force the password.
+//
+// `RootPasswordGuard` is a per-client-IP failed-attempt counter with a cooldown.
+// It mirrors the SHAPE of `PairingCodeGuard` (failure threshold → cooldown,
+// self-healing decay, success resets) but is keyed per IP via a `DashMap` so one
+// attacker cannot lock out every other client. A loopback/desktop request is
+// exempted by the caller (see `is_local_request`) so the desktop can never lock
+// itself out.
+
+/// Consecutive failed root-password attempts from one key before the cooldown
+/// trips. Lower than the code path's threshold (10) — a root password is the
+/// high-value secret and there is no legitimate reason to fail it 5 times.
+const ROOT_PASSWORD_FAILURE_THRESHOLD: u32 = 5;
+/// How long a key stays locked once the threshold is hit.
+const ROOT_PASSWORD_COOLDOWN: Duration = Duration::from_secs(60);
+/// Cap on tracked IP keys. Per-IP keying means an attacker rotating source IPs
+/// could otherwise grow the map unbounded (slow memory DoS). When a NEW key
+/// would exceed this, we first sweep keys not in an active cooldown (abandoned
+/// partial-failures + elapsed cooldowns), which are inert anyway — so memory is
+/// bounded to roughly the set of IPs actively in a 60s lockout.
+const ROOT_PASSWORD_MAX_KEYS: usize = 10_000;
+
+/// Per-key attempt state for the root-password guard.
+#[derive(Debug, Default, Clone)]
+struct RootAttemptState {
+    failures: u32,
+    /// When set and still in the future, this key is locked.
+    cooldown_until: Option<Instant>,
+}
+
+/// Per-client-IP brute-force guard for the root-password endpoints (#190).
+///
+/// Keyed by a best-effort client-IP string (see `client_ip_key`) so a single
+/// attacker only locks out their own key, not every client. Each key:
+///
+/// - increments a failure counter on a wrong password;
+/// - after [`ROOT_PASSWORD_FAILURE_THRESHOLD`] (5) consecutive failures, trips a
+///   [`ROOT_PASSWORD_COOLDOWN`] (60s) lockout — further attempts from that key
+///   are rejected with HTTP 429 BEFORE the password is even compared;
+/// - resets on any successful password check;
+/// - self-heals: once the cooldown elapses the key's state is cleared, so a key
+///   that simply made a few mistakes recovers automatically.
+///
+/// Loopback exemption is the CALLER's responsibility (it never calls into the
+/// guard for a local request) so the desktop can never lock itself out.
+///
+/// This is per-PROCESS state and is NOT persisted — a restart clears all
+/// counters by design. The code-redemption path keeps its own `PairingCodeGuard`
+/// (a separate, global guard); this is strictly the root-password paths.
+#[derive(Debug, Default)]
+pub struct RootPasswordGuard {
+    inner: dashmap::DashMap<String, RootAttemptState>,
+}
+
+/// Outcome of consulting the guard for a key.
+pub enum RootGuardDecision {
+    /// Not locked — proceed to compare the password.
+    Allow,
+    /// Locked — reject with 429 and this many whole seconds in `Retry-After`.
+    Cooldown { retry_after_secs: u64 },
+}
+
+impl RootPasswordGuard {
+    /// Check whether `key` is currently locked. Clears an elapsed cooldown (and
+    /// its failure count) as a side effect so a recovered key returns `Allow`.
+    pub fn check(&self, key: &str) -> RootGuardDecision {
+        let now = Instant::now();
+        if let Some(mut entry) = self.inner.get_mut(key) {
+            if let Some(until) = entry.cooldown_until {
+                if now < until {
+                    let retry_after_secs = (until - now).as_secs().max(1);
+                    return RootGuardDecision::Cooldown { retry_after_secs };
+                }
+                // Cooldown elapsed → reset this key.
+                entry.failures = 0;
+                entry.cooldown_until = None;
+            }
+        }
+        RootGuardDecision::Allow
+    }
+
+    /// Record a failed root-password attempt for `key`. Trips the cooldown once
+    /// the threshold is reached.
+    pub fn record_failure(&self, key: &str) {
+        let now = Instant::now();
+        // Bound memory: before adding a NEW key past the cap, drop every key not
+        // in an active cooldown (those are inert — an elapsed cooldown or an
+        // abandoned sub-threshold failure count contributes nothing to gating).
+        if !self.inner.contains_key(key) && self.inner.len() >= ROOT_PASSWORD_MAX_KEYS {
+            self.inner
+                .retain(|_, st| matches!(st.cooldown_until, Some(until) if now < until));
+        }
+        let mut entry = self.inner.entry(key.to_string()).or_default();
+        // A still-live cooldown shouldn't be reachable here (the caller checks
+        // first), but if it is, leave it; otherwise count the failure.
+        if matches!(entry.cooldown_until, Some(until) if now < until) {
+            return;
+        }
+        // If a previous cooldown elapsed, this is a fresh window.
+        if entry.cooldown_until.is_some() {
+            entry.failures = 0;
+            entry.cooldown_until = None;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= ROOT_PASSWORD_FAILURE_THRESHOLD {
+            entry.cooldown_until = Some(now + ROOT_PASSWORD_COOLDOWN);
+        }
+    }
+
+    /// Reset `key` after a successful root-password check.
+    pub fn record_success(&self, key: &str) {
+        self.inner.remove(key);
+    }
+}
+
+/// Resolve the throttle key for a request, honoring the loopback exemption.
+///
+/// Returns `None` for a local/loopback request (desktop is NEVER throttled), or
+/// `Some(key)` for a remote request — the per-IP key when an address is
+/// available, else a single shared `"unknown"` key so the path still has a
+/// global rate cap rather than being silently unguarded.
+fn root_throttle_key(req: &HttpRequest) -> Option<String> {
+    if is_local_request(req) {
+        return None;
+    }
+    Some(client_ip_key(req).unwrap_or_else(|| "unknown".to_string()))
+}
+
+/// Build the 429 response for a tripped root-password cooldown, with a
+/// `Retry-After` header (whole seconds). The body carries no secret material.
+fn too_many_requests_response(retry_after_secs: u64) -> HttpResponse {
+    HttpResponse::TooManyRequests()
+        .insert_header((header::RETRY_AFTER, retry_after_secs.to_string()))
+        .json(serde_json::json!({
+            "error": {
+                "message": "too many failed password attempts — try again later",
+                "type": "api_error",
+            }
+        }))
 }
 
 /// Generate a fresh 6-digit numeric code, e.g. "842913". Leading zeros are kept.
@@ -1409,6 +1635,126 @@ mod tests {
         // in_cooldown observes the elapsed deadline and resets.
         assert!(!guard.in_cooldown());
         assert!(!guard.record_failure(), "counter was reset to 0");
+    }
+
+    // ── #190: per-IP root-password brute-force guard ───────────────────────
+
+    #[test]
+    fn root_guard_trips_cooldown_after_threshold_per_key() {
+        let guard = RootPasswordGuard::default();
+        let key = "203.0.113.7";
+        // The first THRESHOLD-1 failures do not trip the cooldown.
+        for _ in 0..(ROOT_PASSWORD_FAILURE_THRESHOLD - 1) {
+            guard.record_failure(key);
+            assert!(matches!(guard.check(key), RootGuardDecision::Allow));
+        }
+        // The THRESHOLD-th failure trips it.
+        guard.record_failure(key);
+        match guard.check(key) {
+            RootGuardDecision::Cooldown { retry_after_secs } => {
+                assert!(retry_after_secs >= 1);
+                assert!(retry_after_secs <= ROOT_PASSWORD_COOLDOWN.as_secs());
+            }
+            RootGuardDecision::Allow => panic!("key must be in cooldown after threshold"),
+        }
+    }
+
+    #[test]
+    fn root_guard_keys_are_independent() {
+        // Per-IP isolation: tripping one key must NOT lock out a different key.
+        let guard = RootPasswordGuard::default();
+        for _ in 0..ROOT_PASSWORD_FAILURE_THRESHOLD {
+            guard.record_failure("198.51.100.1");
+        }
+        assert!(matches!(
+            guard.check("198.51.100.1"),
+            RootGuardDecision::Cooldown { .. }
+        ));
+        // A different IP is untouched.
+        assert!(matches!(
+            guard.check("198.51.100.2"),
+            RootGuardDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn root_guard_success_resets_key() {
+        let guard = RootPasswordGuard::default();
+        let key = "203.0.113.9";
+        for _ in 0..(ROOT_PASSWORD_FAILURE_THRESHOLD - 1) {
+            guard.record_failure(key);
+        }
+        guard.record_success(key);
+        // After a reset, the counter starts over — one more failure does NOT trip.
+        guard.record_failure(key);
+        assert!(matches!(guard.check(key), RootGuardDecision::Allow));
+    }
+
+    #[test]
+    fn root_guard_clears_elapsed_cooldown() {
+        let guard = RootPasswordGuard::default();
+        let key = "203.0.113.10";
+        // Force a cooldown that has already elapsed.
+        guard.inner.insert(
+            key.to_string(),
+            RootAttemptState {
+                failures: ROOT_PASSWORD_FAILURE_THRESHOLD,
+                cooldown_until: Some(Instant::now() - Duration::from_secs(1)),
+            },
+        );
+        // check() observes the elapsed deadline, resets, and allows.
+        assert!(matches!(guard.check(key), RootGuardDecision::Allow));
+        // The counter was reset to 0 — one fresh failure does not re-trip.
+        guard.record_failure(key);
+        assert!(matches!(guard.check(key), RootGuardDecision::Allow));
+    }
+
+    #[test]
+    fn root_guard_evicts_inert_keys_past_the_cap() {
+        let guard = RootPasswordGuard::default();
+        // Fill to the cap with single-failure (inert, no cooldown) keys, plus a
+        // few extra to trip the sweep. The map must NOT grow unbounded.
+        for i in 0..(ROOT_PASSWORD_MAX_KEYS + 50) {
+            guard.record_failure(&format!("10.0.{}.{}", i / 256, i % 256));
+        }
+        assert!(
+            guard.inner.len() <= ROOT_PASSWORD_MAX_KEYS,
+            "inert keys must be swept so the map stays bounded (was {})",
+            guard.inner.len()
+        );
+        // An actively cooling-down key survives a sweep.
+        let hot = "203.0.113.200";
+        for _ in 0..ROOT_PASSWORD_FAILURE_THRESHOLD {
+            guard.record_failure(hot);
+        }
+        for i in 0..(ROOT_PASSWORD_MAX_KEYS + 50) {
+            guard.record_failure(&format!("172.16.{}.{}", i / 256, i % 256));
+        }
+        assert!(
+            matches!(guard.check(hot), RootGuardDecision::Cooldown { .. }),
+            "a key in active cooldown must survive eviction sweeps"
+        );
+    }
+
+    #[test]
+    fn root_throttle_key_exempts_loopback_and_keys_remote() {
+        // Loopback/desktop is exempt → no key → never throttled.
+        assert!(root_throttle_key(&local_req()).is_none());
+
+        // A remote request with a peer addr yields that IP as the key.
+        let remote = TestRequest::default()
+            .peer_addr("203.0.113.5:443".parse().unwrap())
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .to_http_request();
+        assert_eq!(root_throttle_key(&remote).as_deref(), Some("203.0.113.5"));
+    }
+
+    #[test]
+    fn client_ip_key_strips_v4_mapped_prefix() {
+        let req = TestRequest::default()
+            .peer_addr("[::ffff:203.0.113.5]:443".parse().unwrap())
+            .to_http_request();
+        assert_eq!(client_ip_key(&req).as_deref(), Some("203.0.113.5"));
     }
 
     #[test]

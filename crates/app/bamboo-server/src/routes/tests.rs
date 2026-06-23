@@ -1006,3 +1006,240 @@ async fn v2_pair_code_local_issue_then_redeem() {
         StatusCode::OK
     );
 }
+
+// --- #190: per-IP root-password brute-force throttle -------------------------
+
+/// `POST /v1/bamboo/access/verify`: a few wrong passwords still 401; after the
+/// 5th consecutive wrong attempt from one IP the next request gets 429 with a
+/// Retry-After header, and the throttle is keyed PER IP (a different IP is not
+/// blocked). A correct password before the threshold succeeds and resets.
+#[actix_web::test]
+async fn access_verify_throttles_after_threshold_per_ip() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let attacker = "203.0.113.50:5555".parse().unwrap();
+    let wrong = |peer| {
+        test::TestRequest::post()
+            .uri("/v1/bamboo/access/verify")
+            .peer_addr(peer)
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "password": "wrong" }))
+            .to_request()
+    };
+
+    // First 5 wrong attempts are plain 401 (Unauthorized), not throttled.
+    for _ in 0..5 {
+        let resp = test::call_service(&app, wrong(attacker)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The 6th request from the SAME IP is now 429 with a Retry-After header, and
+    // the password is not even compared.
+    let blocked = test::call_service(&app, wrong(attacker)).await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        blocked.headers().get(header::RETRY_AFTER).is_some(),
+        "429 must carry a Retry-After header"
+    );
+
+    // A DIFFERENT IP is unaffected (per-IP isolation): a correct password from a
+    // fresh IP succeeds.
+    let other = "198.51.100.77:6666".parse().unwrap();
+    let ok = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .peer_addr(other)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, ok).await.status(), StatusCode::OK);
+}
+
+/// A correct password BEFORE the threshold succeeds and resets the counter, so a
+/// later wrong attempt starts a fresh window (no premature lockout for a user who
+/// fat-fingers a couple of times then gets it right).
+#[actix_web::test]
+async fn access_verify_success_resets_counter() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let peer = "203.0.113.51:5555".parse().unwrap();
+    // 3 wrong attempts (under the threshold).
+    for _ in 0..3 {
+        let resp = test::TestRequest::post()
+            .uri("/v1/bamboo/access/verify")
+            .peer_addr(peer)
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "password": "wrong" }))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, resp).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // A correct password succeeds AND resets the counter.
+    let ok = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .peer_addr(peer)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, ok).await.status(), StatusCode::OK);
+
+    // Counter is reset: a single wrong attempt is still just 401, not 429.
+    let after = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .peer_addr(peer)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "wrong" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, after).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A local/loopback request is NEVER throttled, even past the threshold, so the
+/// desktop can never lock itself out.
+#[actix_web::test]
+async fn access_verify_loopback_is_never_throttled() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // 10 wrong attempts from a loopback host — well over the threshold.
+    for _ in 0..10 {
+        let resp = test::TestRequest::post()
+            .uri("/v1/bamboo/access/verify")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .insert_header((header::HOST, "localhost:9562"))
+            .set_json(serde_json::json!({ "password": "wrong" }))
+            .to_request();
+        // Local is never 429; a wrong local password is still a plain 401.
+        assert_eq!(
+            test::call_service(&app, resp).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "loopback must never be throttled"
+        );
+    }
+}
+
+/// `POST /v2/pair` root-password path: after 5 wrong root passwords from one IP,
+/// the next request is 429 with Retry-After (the password is not compared).
+#[actix_web::test]
+async fn v2_pair_root_password_throttles_after_threshold() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let attacker = "203.0.113.60:7777".parse().unwrap();
+    let wrong = || {
+        test::TestRequest::post()
+            .uri("/v2/pair")
+            .peer_addr(attacker)
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "root_password": "wrong", "label": "x" }))
+            .to_request()
+    };
+
+    // 5 wrong root passwords → plain 401.
+    for _ in 0..5 {
+        assert_eq!(
+            test::call_service(&app, wrong()).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // 6th is throttled with Retry-After.
+    let blocked = test::call_service(&app, wrong()).await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers().get(header::RETRY_AFTER).is_some());
+}
+
+/// The root-password throttle is INDEPENDENT of the existing code-path guard:
+/// burning failures on the root-password path must NOT lock out the code path
+/// (and vice versa). Confirms we did not accidentally double-guard or share state.
+#[actix_web::test]
+async fn root_password_throttle_does_not_block_code_path() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Trip the root-password guard for this IP (>= threshold wrong root passwords).
+    let attacker = "203.0.113.61:8888".parse().unwrap();
+    for _ in 0..6 {
+        let _ = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/v2/pair")
+                .peer_addr(attacker)
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .set_json(serde_json::json!({ "root_password": "wrong", "label": "x" }))
+                .to_request(),
+        )
+        .await;
+    }
+
+    // The code path (separate guard) still works: inject + redeem a valid code
+    // from the SAME IP succeeds, proving the guards are not shared.
+    inject_code(&app_state, "424242", Duration::from_secs(120));
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .peer_addr(attacker)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "424242", "label": "code-device" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, redeem).await.status(),
+        StatusCode::OK,
+        "code path must be unaffected by the root-password throttle"
+    );
+}

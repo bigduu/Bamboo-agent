@@ -343,6 +343,14 @@ pub struct AppState {
     /// ~1M space, so a public redeem endpoint is brute-forceable without a guard.
     /// Tracks recent FAILED code-redemption attempts and a cooldown deadline.
     pub pairing_code_guard: Arc<crate::handlers::settings::PairingCodeGuard>,
+
+    /// #190: per-client-IP brute-force guard for the public root-password
+    /// endpoints (`POST /v1/bamboo/access/verify` and the root-password path of
+    /// `POST /v2/pair`). Tracks recent FAILED root-password attempts per IP and a
+    /// per-key cooldown; loopback/desktop requests are exempted by the handlers
+    /// so the desktop can never lock itself out. PROCESS-EPHEMERAL — never
+    /// persisted; a restart clears all counters.
+    pub root_password_guard: Arc<crate::handlers::settings::RootPasswordGuard>,
 }
 
 impl AppState {
