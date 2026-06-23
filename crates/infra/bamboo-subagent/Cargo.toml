@@ -17,6 +17,12 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "io-util", "io-std", "rt", "rt-multi-thread", "sync", "macros", "net", "time", "process"] }
 tokio-util = "0.7"
 tokio-tungstenite = "0.24"
+# TLS termination for a remotely-reachable worker (remote-actor-plan P1, #181).
+# default-features=false + ["ring","std","tls12"] matches the server's TLS face
+# (#183) so the workspace resolves a single rustls/ring provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

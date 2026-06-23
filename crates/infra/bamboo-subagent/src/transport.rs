@@ -7,14 +7,21 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{accept_async, accept_hdr_async, connect_async, MaybeTlsStream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -36,30 +43,91 @@ pub enum TransportError {
     Decode(#[from] serde_json::Error),
     #[error("protocol: {0}")]
     Protocol(String),
+    /// TLS configuration / handshake failure (bad cert/key, provider, etc.).
+    #[error("tls: {0}")]
+    Tls(String),
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
 
 // ---- child side --------------------------------------------------------------
 
-/// A loopback WebSocket server an actor runs to receive work.
+/// A WebSocket server an actor runs to receive work.
+///
+/// Three knobs, all optional and independent (remote-actor-plan §3.2 / §3.4):
+/// - `listener`/`addr`: where it binds (`bind_loopback` for local default,
+///   `bind`/`bind_tls` for a remotely-reachable worker on `0.0.0.0:PORT`).
+/// - `tls`: when `Some`, every accepted connection is wrapped in TLS before the
+///   WS upgrade and the advertised endpoint is `wss://`.
+/// - `expected_token`: when `Some`, the WS upgrade is rejected (401) unless the
+///   client presents `Authorization: Bearer <token>`. None ⇒ accept any
+///   (loopback default, zero regression).
 pub struct WsServer {
     listener: TcpListener,
     addr: SocketAddr,
+    tls: Option<TlsAcceptor>,
+    expected_token: Option<String>,
 }
 
 impl WsServer {
-    /// Bind an arbitrary address. Pass `0.0.0.0:PORT` for a remotely-reachable
-    /// worker/broker; [`bind_loopback`](Self::bind_loopback) is the local default.
-    /// (TLS — `wss://` — is added with the broker in a later phase; see
-    /// `docs/remote-actor-plan.md` §3.2.)
+    /// Bind an arbitrary address with NO TLS and NO token. Pass `0.0.0.0:PORT`
+    /// for a remotely-reachable worker/broker; [`bind_loopback`](Self::bind_loopback)
+    /// is the local default. Use [`bind_with_token`](Self::bind_with_token) /
+    /// [`bind_tls`](Self::bind_tls) to require auth.
     pub async fn bind(addr: SocketAddr) -> TransportResult<Self> {
-        let listener = TcpListener::bind(addr).await?;
-        let addr = listener.local_addr()?;
-        Ok(Self { listener, addr })
+        Self::bind_with_token(addr, None).await
     }
 
-    /// Bind `127.0.0.1:0` (ephemeral port) — the local default.
+    /// Bind plaintext but optionally require a bearer token on the WS upgrade.
+    ///
+    /// A token WITHOUT TLS is insecure (the bearer crosses the wire in the
+    /// clear) — acceptable only on a trusted/loopback link (e.g. the
+    /// deterministic `remote_connect_e2e` test). For real remote exposure use
+    /// [`bind_tls`](Self::bind_tls).
+    pub async fn bind_with_token(
+        addr: SocketAddr,
+        expected_token: Option<String>,
+    ) -> TransportResult<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        Ok(Self {
+            listener,
+            addr,
+            tls: None,
+            expected_token,
+        })
+    }
+
+    /// Bind with TLS termination (`wss://`) and an optional bearer token.
+    ///
+    /// Builds a `tokio_rustls::TlsAcceptor` from `cert_file`/`key_file` (PEM)
+    /// against an explicit `ring` provider — the same approach as the server's
+    /// HTTP TLS face (`bamboo-server`'s `build_rustls_config`) so the workspace
+    /// resolves a single crypto provider and never hits the rustls 0.23
+    /// no-default-provider panic.
+    ///
+    /// **Fail-fast:** a missing/unreadable/unparseable cert or key returns
+    /// `Err` — it never silently downgrades to plaintext.
+    pub async fn bind_tls(
+        addr: SocketAddr,
+        cert_file: &Path,
+        key_file: &Path,
+        expected_token: Option<String>,
+    ) -> TransportResult<Self> {
+        let server_config =
+            build_server_config(cert_file, key_file).map_err(TransportError::Tls)?;
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        Ok(Self {
+            listener,
+            addr,
+            tls: Some(acceptor),
+            expected_token,
+        })
+    }
+
+    /// Bind `127.0.0.1:0` (ephemeral port) — the local default (no TLS, no token).
     pub async fn bind_loopback() -> TransportResult<Self> {
         Self::bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).await
     }
@@ -68,9 +136,11 @@ impl WsServer {
         self.addr
     }
 
-    /// The reachable `ws://127.0.0.1:<port>` endpoint to advertise.
+    /// The reachable endpoint to advertise: `wss://` when TLS is active,
+    /// `ws://` otherwise.
     pub fn ws_endpoint(&self) -> String {
-        format!("ws://{}", self.addr)
+        let scheme = if self.tls.is_some() { "wss" } else { "ws" };
+        format!("{scheme}://{}", self.addr)
     }
 
     /// Serve exactly one connection (owned child / demo), then return.
@@ -79,7 +149,7 @@ impl WsServer {
         executor: Arc<E>,
     ) -> TransportResult<()> {
         let (stream, _) = self.listener.accept().await?;
-        handle_conn(stream, executor).await
+        accept_and_handle(stream, &self.tls, &self.expected_token, executor).await
     }
 
     /// Serve exactly one connection, but give up if no client connects within
@@ -98,7 +168,7 @@ impl WsServer {
                     "no connection within {accept_timeout:?}; exiting"
                 ))
             })??;
-        handle_conn(stream, executor).await
+        accept_and_handle(stream, &self.tls, &self.expected_token, executor).await
     }
 
     /// Serve connection-after-connection for a **reusable** actor, one at a time.
@@ -122,7 +192,8 @@ impl WsServer {
                 Err(_) => return Ok(()), // idle: reclaim self, clean exit
             };
             // Handle this assignment to completion before accepting the next.
-            let _ = handle_conn(stream, executor.clone()).await;
+            let _ =
+                accept_and_handle(stream, &self.tls, &self.expected_token, executor.clone()).await;
         }
     }
 
@@ -131,18 +202,153 @@ impl WsServer {
         loop {
             let (stream, _) = self.listener.accept().await?;
             let exec = executor.clone();
+            // The TLS handshake + auth callback run inside the spawned task (not
+            // on the accept loop) so a slow/hostile client cannot stall the
+            // server from accepting other connections. Clones are cheap:
+            // `TlsAcceptor` is `Arc`-backed, the token is a short `String`.
+            let tls = self.tls.clone();
+            let token = self.expected_token.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(stream, exec).await;
+                let _ = accept_and_handle(stream, &tls, &token, exec).await;
             });
         }
     }
 }
 
-async fn handle_conn<E: ChildExecutor + ?Sized>(
+/// Apply TLS (if configured) + the bearer-auth WS upgrade to a freshly-accepted
+/// `TcpStream`, then drive the connection. Plaintext + no-token reduces to the
+/// historical `accept_async(stream)` path (zero regression).
+async fn accept_and_handle<E: ChildExecutor + ?Sized>(
     stream: TcpStream,
+    tls: &Option<TlsAcceptor>,
+    expected_token: &Option<String>,
     executor: Arc<E>,
 ) -> TransportResult<()> {
-    let ws = accept_async(stream).await?;
+    match tls {
+        Some(acceptor) => {
+            // Terminate TLS before the WS upgrade so the bearer + frames ride an
+            // encrypted link.
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| TransportError::Tls(format!("accept handshake: {e}")))?;
+            let ws = ws_upgrade(tls_stream, expected_token).await?;
+            handle_conn(ws, executor).await
+        }
+        None => {
+            let ws = ws_upgrade(stream, expected_token).await?;
+            handle_conn(ws, executor).await
+        }
+    }
+}
+
+/// Perform the WS upgrade over an arbitrary stream, validating the bearer token
+/// at the upgrade layer when one is expected. When `expected_token` is `None`
+/// this is exactly `accept_async` (any client accepted) — zero regression.
+async fn ws_upgrade<S>(
+    stream: S,
+    expected_token: &Option<String>,
+) -> TransportResult<tokio_tungstenite::WebSocketStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match expected_token {
+        None => Ok(accept_async(stream).await?),
+        Some(token) => {
+            let callback = BearerCallback {
+                expected: token.clone(),
+            };
+            Ok(accept_hdr_async(stream, callback).await?)
+        }
+    }
+}
+
+/// WS-upgrade callback that enforces `Authorization: Bearer <token>`. Rejecting
+/// here means the WebSocket never establishes — the wire protocol
+/// (`ParentFrame`/`ChildFrame`) stays byte-identical; auth lives entirely at the
+/// HTTP upgrade (remote-actor-plan §6.3). The token is never logged.
+struct BearerCallback {
+    expected: String,
+}
+
+impl Callback for BearerCallback {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        let presented = request
+            .headers()
+            .get(tokio_tungstenite::tungstenite::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let ok = matches!(presented, Some(h) if bearer_matches(h, &self.expected));
+        if ok {
+            Ok(response)
+        } else {
+            let err = ErrorResponse::new(Some("unauthorized: bad or missing bearer token".into()));
+            let (mut parts, body) = err.into_parts();
+            parts.status = StatusCode::UNAUTHORIZED;
+            Err(ErrorResponse::from_parts(parts, body))
+        }
+    }
+}
+
+/// Constant-form check that an `Authorization` header is `Bearer <expected>`.
+fn bearer_matches(header: &str, expected: &str) -> bool {
+    header
+        .strip_prefix("Bearer ")
+        .map(|t| t == expected)
+        .unwrap_or(false)
+}
+
+/// Build a rustls [`rustls::ServerConfig`] from PEM cert/key files against an
+/// explicit `ring` provider (mirrors `bamboo-server`'s `build_rustls_config`).
+fn build_server_config(cert_file: &Path, key_file: &Path) -> Result<rustls::ServerConfig, String> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_path = cert_file.display();
+    let key_path = key_file.display();
+
+    let cf = File::open(cert_file).map_err(|e| format!("open cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cf))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "no certificates in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
+        ));
+    }
+
+    let kf = File::open(key_file).map_err(|e| format!("open key_file '{key_path}': {e}"))?;
+    let key = match rustls_pemfile::private_key(&mut BufReader::new(kf)) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return Err(format!(
+                "no private key in key_file '{key_path}' (expected PKCS#8/RSA/SEC1)"
+            ))
+        }
+        Err(e) => return Err(format!("parse key_file '{key_path}': {e}")),
+    };
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| {
+            format!("rustls rejected cert/key (cert '{cert_path}', key '{key_path}'): {e}")
+        })
+}
+
+/// Drive an already-upgraded WS connection (generic over the underlying stream
+/// so it serves both plaintext `TcpStream` and `TlsStream<TcpStream>`).
+async fn handle_conn<S, E>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    executor: Arc<E>,
+) -> TransportResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    E: ChildExecutor + ?Sized,
+{
     let (ws_tx, mut ws_rx) = ws.split();
     // One writer task owns the sink; runs push frames through this channel (decouples read/write).
     let (out_tx, out_rx) = mpsc::unbounded_channel::<ChildFrame>();
@@ -219,10 +425,12 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(
     Ok(())
 }
 
-async fn writer_task(
-    mut ws_tx: SplitSink<WebSocketStream<TcpStream>, Message>,
+async fn writer_task<S>(
+    mut ws_tx: SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     mut out_rx: mpsc::UnboundedReceiver<ChildFrame>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     while let Some(frame) = out_rx.recv().await {
         if ws_tx.send(Message::text(frame.to_text())).await.is_err() {
             break;
@@ -293,7 +501,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
 
 // ---- parent side -------------------------------------------------------------
 
-type ClientStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type ClientStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Parent-side connection to a child actor.
 pub struct ChildClient {
@@ -302,8 +510,31 @@ pub struct ChildClient {
 }
 
 impl ChildClient {
+    /// Connect with no bearer token (loopback / trusted-link default). Identical
+    /// to `connect_with_auth(endpoint, None)` — zero regression.
     pub async fn connect(endpoint: &str) -> TransportResult<Self> {
-        let (ws, _resp) = connect_async(endpoint).await?;
+        Self::connect_with_auth(endpoint, None).await
+    }
+
+    /// Connect to a worker endpoint, optionally presenting a bearer token on the
+    /// WS upgrade (`Authorization: Bearer <token>`). A `wss://` endpoint flows
+    /// through `MaybeTlsStream` transparently. The token is never logged.
+    pub async fn connect_with_auth(endpoint: &str, token: Option<&str>) -> TransportResult<Self> {
+        let (ws, _resp) = match token {
+            None => connect_async(endpoint).await?,
+            Some(token) => {
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                let mut request = endpoint.into_client_request().map_err(TransportError::Ws)?;
+                let value = format!("Bearer {token}")
+                    .parse()
+                    .map_err(|e| TransportError::Protocol(format!("bad bearer header: {e}")))?;
+                request.headers_mut().insert(
+                    tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+                    value,
+                );
+                connect_async(request).await?
+            }
+        };
         let (tx, rx) = ws.split();
         Ok(Self { tx, rx })
     }
@@ -374,6 +605,74 @@ mod tests {
 
         let _ = client.close().await;
         let _ = srv.await;
+    }
+
+    /// `bind_with_token` gates the WS upgrade: the right bearer connects + runs,
+    /// a wrong / missing bearer is rejected at the upgrade (no WS, no Terminal).
+    #[tokio::test]
+    async fn bearer_token_gates_the_upgrade() {
+        let server = WsServer::bind_with_token(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            Some("T-secret".into()),
+        )
+        .await
+        .unwrap();
+        let endpoint = server.ws_endpoint();
+        // ws:// (no TLS) even though a token is set — token alone never upgrades scheme.
+        assert!(endpoint.starts_with("ws://"));
+        let srv = tokio::spawn(async move { server.serve(Arc::new(EchoExecutor)).await });
+
+        // Correct token: connects and runs to completion.
+        let mut client = ChildClient::connect_with_auth(&endpoint, Some("T-secret"))
+            .await
+            .expect("correct bearer should connect");
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: "go".into(),
+                reasoning_effort: None,
+                messages: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let mut terminal = None;
+        while let Some(frame) = client.next_frame().await.unwrap() {
+            if let ChildFrame::Terminal { status, .. } = frame {
+                terminal = Some(status);
+                break;
+            }
+        }
+        assert_eq!(terminal, Some(TerminalStatus::Completed));
+        let _ = client.close().await;
+
+        // Wrong token: the upgrade is rejected — connect itself errors.
+        let bad = ChildClient::connect_with_auth(&endpoint, Some("WRONG")).await;
+        assert!(bad.is_err(), "wrong bearer must be rejected at the upgrade");
+
+        // Missing token: same rejection.
+        let missing = ChildClient::connect(&endpoint).await;
+        assert!(
+            missing.is_err(),
+            "missing bearer must be rejected when a token is required"
+        );
+
+        srv.abort();
+    }
+
+    /// `bind_tls` fails fast on a missing cert/key (never falls back to plaintext).
+    #[tokio::test]
+    async fn bind_tls_fails_fast_on_missing_cert() {
+        let result = WsServer::bind_tls(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            Path::new("/nonexistent/bamboo-subagent/cert.pem"),
+            Path::new("/nonexistent/bamboo-subagent/key.pem"),
+            None,
+        )
+        .await;
+        match result {
+            Err(TransportError::Tls(m)) if m.contains("cert_file") => {}
+            Err(other) => panic!("expected a TLS error naming cert_file, got {other:?}"),
+            Ok(_) => panic!("missing cert must fail"),
+        }
     }
 
     async fn run_once(endpoint: &str, assignment: &str) -> (TerminalStatus, Option<String>) {

@@ -20,20 +20,39 @@ use crate::proto::AgentRecord;
 use crate::provision::ProvisionSpec;
 use crate::transport::{TransportError, TransportResult};
 
-/// A spawned actor subprocess plus its discovered record. Killed on drop (`kill_on_drop`).
+/// A launched actor plus its discovered record.
+///
+/// `process` is `Some` for a locally-spawned subprocess (killed on drop via
+/// `kill_on_drop`) and `None` for a remote resident worker reached over the
+/// network (remote-actor-plan P1, #181): a `ConnectLauncher` owns no OS process,
+/// so `kill()` is a no-op and `pid()` returns `None`. The parent reclaims a
+/// remote worker by closing the connection + the worker's own idle timeout, not
+/// by killing a process it does not own.
 pub struct SpawnedChild {
     pub record: AgentRecord,
-    process: Child,
+    process: Option<Child>,
 }
 
 impl SpawnedChild {
-    /// Terminate the child process.
+    /// Build a record-only handle for a worker this process does not own (a
+    /// remote resident worker connected to, not spawned). `kill()`/`pid()` are
+    /// inert.
+    pub fn remote(record: AgentRecord) -> Self {
+        Self {
+            record,
+            process: None,
+        }
+    }
+
+    /// Terminate the child process. A no-op for a remote (process-less) worker.
     pub async fn kill(mut self) {
-        let _ = self.process.kill().await;
+        if let Some(mut process) = self.process.take() {
+            let _ = process.kill().await;
+        }
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.process.id()
+        self.process.as_ref().and_then(|p| p.id())
     }
 }
 
@@ -79,7 +98,10 @@ pub async fn spawn_worker(
     let deadline = Instant::now() + wait;
     loop {
         if let Ok(Some(record)) = fab.resolve(&child_id).await {
-            return Ok(SpawnedChild { record, process });
+            return Ok(SpawnedChild {
+                record,
+                process: Some(process),
+            });
         }
         // bail early if the worker died before registering
         if let Ok(Some(status)) = process.try_wait() {
