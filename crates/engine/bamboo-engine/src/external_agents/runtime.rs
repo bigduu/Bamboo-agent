@@ -240,6 +240,22 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
 /// misconfig fails SAFE to the local path rather than connecting to a remote
 /// worker with no bearer. A placement with no `token_env` connects tokenless
 /// (trusted/loopback link only). Duplicate roles: last one wins.
+/// Heuristic: does this endpoint reach off-box (so a missing bearer is a real
+/// exposure)? `wss://` is always public-grade; for `ws://` we flag any host that
+/// is not loopback/localhost.
+fn endpoint_looks_public(endpoint: &str) -> bool {
+    if endpoint.starts_with("wss://") {
+        return true;
+    }
+    let host = endpoint
+        .strip_prefix("ws://")
+        .unwrap_or(endpoint)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty())
+}
+
 fn resolve_remote_placements(
     placements: &[bamboo_config::RemoteActorPlacement],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedRemotePlacement> {
@@ -258,7 +274,21 @@ fn resolve_remote_placements(
                     continue;
                 }
             },
-            None => None,
+            None => {
+                // A tokenless placement is only safe on a trusted link. Warn if
+                // it targets what looks like a public endpoint (wss:// or a
+                // non-loopback host) so an operator footgun is visible in logs.
+                if endpoint_looks_public(&p.endpoint) {
+                    tracing::warn!(
+                        "remote placement for role '{}' has no token_env but targets a \
+                         public-looking endpoint '{}'; work will be dispatched with NO bearer. \
+                         Set token_env (and use wss://) for any non-loopback worker.",
+                        p.role,
+                        p.endpoint
+                    );
+                }
+                None
+            }
         };
         out.insert(
             p.role.clone(),
