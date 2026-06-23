@@ -35,6 +35,27 @@ fn coalesce_key(event: &AgentEvent) -> Option<CoalesceKey> {
     }
 }
 
+/// Upper bound on the concatenated `content` of a single pending merged event.
+///
+/// The `batch_ms` window bounds coalescing latency, but not the *size* of the
+/// buffer: a fast producer can emit an unbounded number of token chunks within
+/// one window, all concatenated into one growing `String`. This cap force-flushes
+/// the pending event once its content exceeds the threshold, so a pathological
+/// token stream cannot amplify memory. 64 KiB is far larger than any real token
+/// burst yet small enough to bound the allocation.
+const MAX_PENDING_CONTENT_BYTES: usize = 64 * 1024;
+
+/// Returns the byte length of a coalescible event's `content`, or 0 for
+/// non-token events (which are never buffered).
+fn pending_content_len(event: &AgentEvent) -> usize {
+    match event {
+        AgentEvent::Token { content }
+        | AgentEvent::ReasoningToken { content }
+        | AgentEvent::ToolToken { content, .. } => content.len(),
+        _ => 0,
+    }
+}
+
 /// Appends `content` from a same-key incoming token event onto the pending
 /// merged event of the same variant. Callers guarantee both events share the
 /// same [`CoalesceKey`], so the variants always match.
@@ -93,6 +114,13 @@ impl Coalescer {
                 if same_key {
                     if let Some(pending) = self.pending.as_mut() {
                         merge_token_into(pending, event);
+                        // Force-flush if the merged buffer has grown too large,
+                        // so an unbounded token burst within one window cannot
+                        // amplify memory. Order is preserved: the oversized
+                        // buffer is emitted now, before any later event.
+                        if pending_content_len(pending) >= MAX_PENDING_CONTENT_BYTES {
+                            return self.pending.take().into_iter().collect();
+                        }
                     }
                     Vec::new()
                 } else {
@@ -348,6 +376,16 @@ pub(super) fn live_stream_response(
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_skipped)) => {
+                                    // A lag gap means intervening events were
+                                    // dropped. Flush the pending buffer so we do
+                                    // not merge tokens across the gap and fabricate
+                                    // adjacency the producer never emitted.
+                                    if let Some(pending) = coalescer.take_pending() {
+                                        if let Some(sse_data) = event_sse_data(&pending) {
+                                            yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
+                                        }
+                                        flush_deadline = None;
+                                    }
                                     continue;
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
@@ -581,6 +619,29 @@ mod coalesce_tests {
         assert_eq!(content_of(&out[0]), "final answer");
         assert!(matches!(out[1], AgentEvent::Complete { .. }));
         assert!(!c.has_pending());
+    }
+
+    /// The pending buffer force-flushes once its content exceeds
+    /// `MAX_PENDING_CONTENT_BYTES`, so an unbounded token burst within one
+    /// window cannot amplify memory. The flush happens on the `push` that
+    /// crosses the threshold and preserves order (oldest content first).
+    #[test]
+    fn oversized_buffer_force_flushes() {
+        let mut c = Coalescer::default();
+        // Each chunk is half the cap; the second push crosses it.
+        let chunk = "x".repeat(MAX_PENDING_CONTENT_BYTES / 2 + 1);
+        assert!(
+            c.push(token(&chunk)).is_empty(),
+            "first chunk stays buffered (under cap)"
+        );
+        let out = c.push(token(&chunk));
+        assert_eq!(out.len(), 1, "second chunk crosses the cap → force-flush");
+        assert!(matches!(out[0], AgentEvent::Token { .. }));
+        assert_eq!(content_of(&out[0]).len(), chunk.len() * 2);
+        // Buffer is drained after the force-flush; subsequent tokens start fresh.
+        assert!(!c.has_pending());
+        assert!(c.push(token("next")).is_empty());
+        assert_eq!(content_of(&c.take_pending().unwrap()), "next");
     }
 
     /// The merged event keeps the SAME serialized shape (a `Token`), not a new

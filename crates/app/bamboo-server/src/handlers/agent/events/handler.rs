@@ -5,6 +5,12 @@ use super::stream::{live_stream_response, terminal_response};
 use super::terminal::terminal_event_if_ready;
 use crate::app_state::{AgentStatus, AppState};
 
+/// Upper bound for the client-supplied token-coalescing window (milliseconds).
+///
+/// `batch_ms` is an untrusted query parameter; this caps the buffering window
+/// so a hostile/typo'd value cannot defer flushes out to the heartbeat interval.
+pub(super) const MAX_BATCH_MS: u64 = 1_000;
+
 /// Query parameters for the per-session events (SSE) endpoint.
 #[derive(Debug, Default, Deserialize)]
 pub struct EventsQuery {
@@ -35,7 +41,12 @@ pub async fn handler(
     _req: HttpRequest,
 ) -> impl Responder {
     let session_id = path.into_inner();
-    let batch_ms = query.batch_ms;
+    // Clamp the client-supplied window to a sane ceiling. `batch_ms` is an
+    // untrusted query parameter; without a cap a pathological value (up to
+    // u64::MAX ms) would push the effective flush bound out to the 15s
+    // heartbeat and let the coalescing buffer grow for the whole window.
+    // 1s is well beyond any useful coalescing window (mobile uses ~50ms).
+    let batch_ms = query.batch_ms.min(MAX_BATCH_MS);
     tracing::debug!("[{}] Events subscription requested", session_id);
 
     // Validate session exists (index-backed).
