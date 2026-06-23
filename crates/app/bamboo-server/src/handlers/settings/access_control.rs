@@ -241,8 +241,10 @@ pub(crate) fn issue_device_token(label: &str) -> (DeviceCredential, String) {
     let token = format!("{DEVICE_TOKEN_PREFIX}{}", random_hex(16));
     let salt_hex = random_hex(16);
     // compute_password_hash only returns None on a non-hex salt; ours is always
-    // valid hex, so the hash is infallible here.
-    let token_hash = compute_password_hash(&token, &salt_hex).unwrap_or_default();
+    // valid hex, so the hash is infallible here. Fail loudly rather than persist
+    // an empty (dead) token_hash if that invariant is ever broken.
+    let token_hash =
+        compute_password_hash(&token, &salt_hex).expect("device salt is always valid hex");
     let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
     let credential = DeviceCredential {
@@ -265,6 +267,8 @@ pub(crate) fn verify_device_token(config: &Config, device_id: &str, token: &str)
     let Some(access) = config.access_control.as_ref() else {
         return false;
     };
+    // device_id is a public, non-secret companion id; a plain `==` lookup here is
+    // intentional. Only the token hash compare below must be constant-time.
     let Some(device) = access.devices.iter().find(|d| d.device_id == device_id) else {
         return false;
     };
