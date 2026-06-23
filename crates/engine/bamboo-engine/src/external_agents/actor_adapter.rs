@@ -151,14 +151,19 @@ pub struct ActorChildRunner {
     /// workers instead of all landing on the first candidate. Best-effort spread,
     /// not a load balancer — the registry's live set can change between picks.
     schedule_cursor: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// Per-`registry_url` cache of built [`RegistryFabric`]s (#202). A fabric
+    /// Per-`(registry_url, token)` cache of built [`RegistryFabric`]s (#202). A fabric
     /// holds a reqwest `Client` (already connection-pooled), so under sibling
     /// fan-out we construct ONE fabric per registry and reuse it across schedules
     /// instead of rebuilding a fresh client every spawn. Construct-once-then-reuse;
     /// a benign duplicate build under a startup race is harmless (last writer wins,
     /// the loser's fabric drops). The bearer lives INSIDE the fabric's sensitive
     /// `Authorization` header — never logged, never re-stringified here.
-    fabric_cache: Arc<std::sync::Mutex<HashMap<String, Arc<bamboo_subagent::RegistryFabric>>>>,
+    // Keyed by (registry_url, token) — NOT url alone — so two placements that
+    // share a registry but present DIFFERENT bearers never reuse each other's
+    // fabric (which would issue a discover query with the wrong token). #202.
+    fabric_cache: Arc<
+        std::sync::Mutex<HashMap<(String, Option<String>), Arc<bamboo_subagent::RegistryFabric>>>,
+    >,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -560,13 +565,10 @@ impl ActorChildRunner {
         placement: &ResolvedSchedulablePlacement,
         role: &str,
     ) -> std::result::Result<Arc<bamboo_subagent::RegistryFabric>, AgentError> {
-        if let Some(fabric) = self
-            .fabric_cache
-            .lock()
-            .unwrap()
-            .get(&placement.registry_url)
-            .cloned()
-        {
+        // (registry_url, token) identity: a wrong-token fabric must never be
+        // reused for a discover query (#202).
+        let key = (placement.registry_url.clone(), placement.token.clone());
+        if let Some(fabric) = self.fabric_cache.lock().unwrap().get(&key).cloned() {
             return Ok(fabric);
         }
 
@@ -589,10 +591,7 @@ impl ActorChildRunner {
         // Insert-or-reuse: if a concurrent caller already populated the slot, take
         // theirs (the duplicate we built drops) so all siblings share one fabric.
         let mut cache = self.fabric_cache.lock().unwrap();
-        Ok(cache
-            .entry(placement.registry_url.clone())
-            .or_insert(arc)
-            .clone())
+        Ok(cache.entry(key).or_insert(arc).clone())
     }
 
     /// Pick a live worker for a SCHEDULABLE role from the agent registry (#181,
@@ -1863,13 +1862,39 @@ mod tests {
         assert_eq!(
             cache.len(),
             1,
-            "three resolves to the same registry_url reused ONE cached fabric"
+            "three resolves to the same (registry_url, token) reused ONE cached fabric"
         );
-        assert!(cache.contains_key(&registry.uri()));
+        assert!(cache.contains_key(&(registry.uri(), None)));
         drop(cache);
         for h in handles {
             h.abort();
         }
+    }
+
+    #[test]
+    fn fabric_cache_keys_on_registry_url_and_token() {
+        // Two placements sharing a registry_url but presenting DIFFERENT tokens
+        // must NOT share a fabric — a reused wrong-bearer fabric would issue the
+        // discover query with the other role's token (#202 review F1).
+        let runner = bogus_sched_runner(HashMap::new(), HashMap::new());
+        let url = "http://127.0.0.1:9/".to_string();
+        let mut p = sched_placement("pool", url.clone());
+
+        p.token = Some("token-a".into());
+        let fa = runner.fabric_for(&p, "role-a").expect("build a");
+        p.token = Some("token-b".into());
+        let fb = runner.fabric_for(&p, "role-b").expect("build b");
+        // Same url, different token → two distinct cache entries (not aliased).
+        assert!(
+            !Arc::ptr_eq(&fa, &fb),
+            "different tokens must not share a fabric"
+        );
+        assert_eq!(runner.fabric_cache.lock().unwrap().len(), 2);
+        // Re-requesting token-a reuses the first fabric.
+        p.token = Some("token-a".into());
+        let fa2 = runner.fabric_for(&p, "role-a").expect("reuse a");
+        assert!(Arc::ptr_eq(&fa, &fa2), "same (url, token) must reuse");
+        assert_eq!(runner.fabric_cache.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
