@@ -19,7 +19,7 @@ pub(crate) use access_control::issue_device_token;
 pub use access_control::{
     create_pairing_code, enforce_access_password_middleware, get_access_status, list_devices,
     pair_device, revoke_device, rotate_device, update_access_password, verify_access_password,
-    PairingCodeEntry, PairingCodeGuard,
+    PairingCodeEntry, PairingCodeGuard, RootPasswordGuard,
 };
 pub(crate) use access_control::{request_is_authorized, verify_device_token};
 pub use bamboo_config::{

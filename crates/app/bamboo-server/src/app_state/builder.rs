@@ -487,6 +487,7 @@ impl AppState {
             title_gen_in_flight: Arc::new(dashmap::DashSet::new()),
             pairing_codes: Arc::new(dashmap::DashMap::new()),
             pairing_code_guard: Arc::new(crate::handlers::settings::PairingCodeGuard::default()),
+            root_password_guard: Arc::new(crate::handlers::settings::RootPasswordGuard::default()),
         })
     }
 }
