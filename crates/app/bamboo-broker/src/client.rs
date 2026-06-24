@@ -260,7 +260,7 @@ impl BrokerClient {
     /// Consume this (already connected + subscribed) client into a multiplexed
     /// request/reply driver so concurrent correlated requests on ONE connection
     /// no longer serialize behind a single exclusive lock. The background reader
-    /// + supervisor keep running (detached) and feed `messages`, which the mux's
+    /// and supervisor keep running (detached) and feed `messages`, which the mux's
     /// router drains and routes to per-request waiters by `correlation_id`. For a
     /// replies-only connection (e.g. the MCP proxy) where every inbound message
     /// is a correlated reply. #56.

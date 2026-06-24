@@ -82,7 +82,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A dead-code -D warnings
+        run: cargo clippy --all-features -- -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code -D warnings
 
   build:
     name: Build

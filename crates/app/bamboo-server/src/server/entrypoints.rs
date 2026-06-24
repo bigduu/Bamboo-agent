@@ -304,6 +304,11 @@ pub async fn run_with_bind_and_static_tls(
             .wrap(Governor::new(&rate_limiter))
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
+            // Immutable long-cache for hashed `/assets/*` (Docker / `serve -s`
+            // path, fronted by a proxy/CDN — same fix as the other factories).
+            .wrap(actix_web::middleware::from_fn(
+                crate::config::add_asset_cache_headers,
+            ))
             .configure(configure_routes_with_rate_limiting);
 
         if let Some(static_path) = &static_dir {

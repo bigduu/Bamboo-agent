@@ -280,7 +280,7 @@ fn valid_utf8_prefix(bytes: Vec<u8>) -> String {
 fn valid_utf8_suffix(bytes: Vec<u8>) -> String {
     let mut start = 0;
     while start < bytes.len() {
-        if let Ok(_) = std::str::from_utf8(&bytes[start..]) {
+        if std::str::from_utf8(&bytes[start..]).is_ok() {
             return String::from_utf8_lossy(&bytes[start..]).into_owned();
         }
         start += 1;

@@ -141,10 +141,10 @@ pub(crate) async fn has_running_child(state: &web::Data<AppState>, session_id: &
         let runners = state.agent_runners.read().await;
         runners
             .iter()
-            .filter_map(|(running_id, runner)| {
-                (matches!(runner.status, AgentStatus::Running) && running_id.as_str() != session_id)
-                    .then(|| running_id.clone())
+            .filter(|(running_id, runner)| {
+                matches!(runner.status, AgentStatus::Running) && running_id.as_str() != session_id
             })
+            .map(|(running_id, _)| running_id.clone())
             .collect()
     };
 
