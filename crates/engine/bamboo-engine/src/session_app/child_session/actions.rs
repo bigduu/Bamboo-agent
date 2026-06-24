@@ -297,7 +297,7 @@ pub fn assemble_session_tree(
 /// Materialize the full transitive parent→child session graph rooted at
 /// `root_id` from the persisted session index (Phase 6). BFS-fetches each
 /// level's children via [`ChildSessionPort::list_children`] (a first-visit guard
-/// + a hard node cap protect against cycles / runaway trees), then assembles the
+/// and a hard node cap protect against cycles / runaway trees), then assembles the
 /// tree. The graph is derived from durable index state, so it survives restarts.
 pub async fn build_session_tree_action(
     port: &dyn ChildSessionPort,

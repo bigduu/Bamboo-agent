@@ -272,9 +272,7 @@ async fn maybe_suspend_for_outstanding_bash(
     // Should-fix 1: a suspend without durable backing or a resume hook would
     // strand the session forever — the self-resume task reloads from
     // persistence, and without a wired hook no resume can ever fire.
-    if config.persistence.is_none() {
-        return None;
-    }
+    config.persistence.as_ref()?;
     let hook = config.bash_resume_hook.as_ref()?;
 
     let mut bash_ids = bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id);

@@ -699,13 +699,9 @@ pub fn is_read_only_command(command: &str) -> bool {
                     return false;
                 }
             }
-            b'|' => {
-                // A doubled `|` is logical OR (chaining) → reject; a single `|`
-                // is a pipe → allowed, validated per-segment below.
-                if bytes.get(i + 1) == Some(&b'|') {
-                    return false;
-                }
-            }
+            // A doubled `|` is logical OR (chaining) → reject; a single `|`
+            // is a pipe → allowed, validated per-segment below.
+            b'|' if bytes.get(i + 1) == Some(&b'|') => return false,
             _ => {}
         }
         i += 1;
@@ -713,9 +709,7 @@ pub fn is_read_only_command(command: &str) -> bool {
 
     // Rule 2: split on single `|` pipes and require EVERY segment to be a read-only
     // base command. (A command with no pipe is a single segment.)
-    trimmed
-        .split('|')
-        .all(|segment| segment_is_read_only(segment))
+    trimmed.split('|').all(segment_is_read_only)
 }
 
 /// Split a command into tokens with leading wrappers (time/nohup/timeout/nice/env)

@@ -96,8 +96,8 @@ pub struct Capabilities {
     /// host bridge to proxy to — real actor runs always do.
     #[serde(default)]
     pub enforce_permissions: bool,
-    /// When `true`, the worker builds its OWN external-child runner + scheduler
-    /// + adapter and runs the REAL `SubAgent` tool directly, so a nested worker
+    /// When `true`, the worker builds its OWN external-child runner, scheduler,
+    /// and adapter and runs the REAL `SubAgent` tool directly, so a nested worker
     /// can spawn grandchildren in-process (Phase 6: direct nested execution).
     /// Default `false` — the worker has no `SubAgent` tool (a leaf sub-agent).
     #[serde(default)]
