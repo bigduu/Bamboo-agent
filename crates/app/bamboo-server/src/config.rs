@@ -22,8 +22,10 @@
 use actix_cors::Cors;
 use actix_governor::governor::middleware::NoOpMiddleware;
 use actix_governor::{GovernorConfig, GovernorConfigBuilder, PeerIpKeyExtractor};
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::header;
-use actix_web::middleware::DefaultHeaders;
+use actix_web::middleware::{DefaultHeaders, Next};
 use std::collections::HashSet;
 use tracing::info;
 use tracing::warn;
@@ -384,6 +386,34 @@ pub fn build_security_headers() -> DefaultHeaders {
         .add((header::CONTENT_SECURITY_POLICY, csp_value))
 }
 
+/// Long-cache content-hashed frontend assets at the proxy/CDN edge.
+///
+/// Vite emits hashed filenames under `/assets/` (e.g. `main-B6snAd4S.css`), so
+/// they are inherently immutable — any content change yields a NEW filename.
+/// Tagging them `immutable, max-age=1y` lets Cloudflare and browsers cache them
+/// at the edge instead of round-tripping every chunk through the tunnel to
+/// origin. Besides being faster, this removes the transient per-asset failures
+/// (an occasional reset of one of many parallel preload requests over a
+/// cloudflared tunnel) that surface in the browser as Vite's
+/// "Unable to preload CSS for …" / "Failed to fetch dynamically imported module".
+///
+/// Only `/assets/*` is affected; `index.html` and API routes are left untouched
+/// so they always serve fresh (a new deploy must be picked up immediately).
+pub async fn add_asset_cache_headers<B: MessageBody + 'static>(
+    req: ServiceRequest,
+    next: Next<B>,
+) -> Result<ServiceResponse<B>, actix_web::Error> {
+    let is_asset = req.path().starts_with("/assets/");
+    let mut res = next.call(req).await?;
+    if is_asset {
+        res.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
+    Ok(res)
+}
+
 /// Build CORS middleware based on bind address and port
 ///
 /// Automatically configures CORS policy based on deployment environment:
@@ -555,6 +585,47 @@ mod tests {
         // valid (no panic).
         let _ = rate_limiter_config(0, 0);
         let _ = rate_limiter_config(1000, 1);
+    }
+
+    #[actix_web::test]
+    async fn asset_cache_headers_only_tag_hashed_assets() {
+        use actix_web::http::header::CACHE_CONTROL;
+        use actix_web::{test, web, App, HttpResponse};
+
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_web::middleware::from_fn(add_asset_cache_headers))
+                .route(
+                    "/assets/main-abc123.css",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                )
+                .route(
+                    "/index.html",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+
+        // A hashed `/assets/*` file gets the immutable long-cache header.
+        let req = test::TestRequest::get()
+            .uri("/assets/main-abc123.css")
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(
+            res.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+        );
+
+        // `index.html` (and anything outside `/assets/`) must stay fresh so a new
+        // deploy is picked up immediately — no long-cache header added.
+        let req = test::TestRequest::get().uri("/index.html").to_request();
+        let res = test::call_service(&app, req).await;
+        assert!(
+            res.headers().get(CACHE_CONTROL).is_none(),
+            "non-asset routes must not be long-cached"
+        );
     }
 
     #[actix_web::test]

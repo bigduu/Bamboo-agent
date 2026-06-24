@@ -113,6 +113,12 @@ pub async fn run_with_tls(
         let mut app = App::new()
             .app_data(app_state.clone())
             .wrap(build_cors("127.0.0.1", port))
+            // Immutable long-cache for hashed `/assets/*` (parity with the web
+            // service path; harmless on localhost, useful when this binary is
+            // fronted by a proxy/CDN).
+            .wrap(actix_web::middleware::from_fn(
+                crate::config::add_asset_cache_headers,
+            ))
             .configure(configure_routes); // No rate limiting for desktop mode
 
         if let Some(static_path) = &static_dir {
