@@ -187,6 +187,12 @@ impl WebService {
                 .wrap(Governor::new(&rate_limiter))
                 .wrap(build_cors(&bind_addr, port))
                 .wrap(build_security_headers())
+                // Immutable long-cache for hashed `/assets/*` so a proxy/CDN
+                // (e.g. Cloudflare tunnel) caches chunks at the edge instead of
+                // round-tripping each one to origin (#preload-error fix).
+                .wrap(actix_web::middleware::from_fn(
+                    crate::config::add_asset_cache_headers,
+                ))
                 .configure(configure_routes_with_rate_limiting)
                 .service(
                     fs::Files::new("/", static_dir.clone())
