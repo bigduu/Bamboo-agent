@@ -8,6 +8,10 @@ mod system_sections;
 mod task;
 
 pub(crate) use external_memory::{PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY};
+// Only tests reference this through the `prompt_context` re-export, so gate it to
+// `cfg(test)` — otherwise the lib-only clippy check flags it as an unused import.
+#[cfg(test)]
+pub(crate) use external_memory::EXTERNAL_MEMORY_RENDERED_KEY;
 
 pub(crate) async fn refresh_external_memory_context(
     session: &mut bamboo_agent_core::Session,
