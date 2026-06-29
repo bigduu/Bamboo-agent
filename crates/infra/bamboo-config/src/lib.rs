@@ -10,6 +10,7 @@
 //! Name: kept as `domain-config` for backward compatibility, but semantically
 //! this is infrastructure/runtime config rather than a stable business domain.
 
+pub mod cluster_fabric;
 #[allow(clippy::module_inception)]
 pub mod config;
 pub mod config_crypto;
@@ -22,6 +23,7 @@ pub mod provider_instance;
 pub mod settings;
 pub mod settings_loader;
 
+pub use cluster_fabric::*;
 pub use config::*;
 pub use encryption::*;
 pub use keyword_masking::*;

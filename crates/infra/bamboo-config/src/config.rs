@@ -397,8 +397,14 @@ pub struct BrokerClientConfig {
     /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
     pub endpoint: String,
     /// Bearer token presented in the broker handshake.
+    ///
+    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
+    /// empty on disk and hydrated in memory on load (mirrors [`EnvVarEntry`]).
     #[serde(default)]
     pub token: String,
+    /// Encrypted ciphertext of `token` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_encrypted: Option<String>,
 }
 
 /// Main configuration structure for Bamboo agent
@@ -529,6 +535,12 @@ pub struct Config {
     /// `bamboo config`.
     #[serde(default)]
     pub subagents: SubagentsConfig,
+
+    /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
+    /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
+    /// ⇒ empty. SSH secrets are encrypted at rest (see [`crate::cluster_fabric`]).
+    #[serde(default, skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty")]
+    pub cluster_fabric: crate::cluster_fabric::ClusterFabricConfig,
 
     /// MCP server configuration.
     ///
@@ -1364,6 +1376,10 @@ impl Config {
         config.hydrate_mcp_secrets_from_encrypted();
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
+        // Decrypt encrypted cluster-fabric SSH secrets into in-memory plaintext.
+        config.hydrate_cluster_fabric_from_encrypted();
+        // Decrypt the encrypted broker token into in-memory plaintext.
+        config.hydrate_broker_token_from_encrypted();
         config.normalize_tool_settings();
         config.normalize_skill_settings();
 
@@ -1448,6 +1464,8 @@ impl Config {
             config.hydrate_provider_instance_api_keys_from_encrypted();
             config.hydrate_mcp_secrets_from_encrypted();
             config.hydrate_env_vars_from_encrypted();
+            config.hydrate_cluster_fabric_from_encrypted();
+            config.hydrate_broker_token_from_encrypted();
             config.normalize_tool_settings();
             config.normalize_skill_settings();
             config
@@ -1957,6 +1975,7 @@ impl Config {
             proxy_auth_encrypted: None,
             headless_auth: false,
             subagents: SubagentsConfig::default(),
+            cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
             providers: ProviderConfigs::default(),
             provider_instances: HashMap::new(),
@@ -2010,6 +2029,10 @@ impl Config {
         to_save.refresh_provider_instance_api_keys_encrypted()?;
         to_save.refresh_env_vars_encrypted()?;
         to_save.sanitize_env_vars_for_disk();
+        to_save.refresh_cluster_fabric_encrypted()?;
+        to_save.sanitize_cluster_fabric_for_disk();
+        to_save.refresh_broker_token_encrypted()?;
+        to_save.sanitize_broker_token_for_disk();
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
         let content =
@@ -3776,6 +3799,50 @@ mod tests {
             }
         }
         panic!("TEST_PUBLISH not found in cache after retries");
+    }
+
+    #[test]
+    fn broker_token_round_trips_encrypt_sanitize_hydrate() {
+        let mut config = Config::default();
+        config.subagents.broker = Some(BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:9600".to_string(),
+            token: "super-secret-token".to_string(),
+            token_encrypted: None,
+        });
+
+        // Persist path: encrypt then sanitize (what save_to_dir does).
+        config.refresh_broker_token_encrypted().unwrap();
+        config.sanitize_broker_token_for_disk();
+        let broker = config.subagents.broker.as_ref().unwrap();
+        assert!(broker.token.is_empty(), "plaintext cleared for disk");
+        assert!(broker.token_encrypted.is_some(), "ciphertext stored");
+        assert_ne!(
+            broker.token_encrypted.as_deref(),
+            Some("super-secret-token")
+        );
+
+        // Load path: hydrate restores plaintext.
+        config.hydrate_broker_token_from_encrypted();
+        assert_eq!(
+            config.subagents.broker.as_ref().unwrap().token,
+            "super-secret-token"
+        );
+    }
+
+    #[test]
+    fn broker_token_empty_refresh_preserves_ciphertext() {
+        // A redacted round-trip (token empty) must not wipe the stored ciphertext.
+        let mut config = Config::default();
+        config.subagents.broker = Some(BrokerClientConfig {
+            endpoint: "ws://h:9600".to_string(),
+            token: String::new(),
+            token_encrypted: Some("existing-cipher".to_string()),
+        });
+        config.refresh_broker_token_encrypted().unwrap();
+        assert_eq!(
+            config.subagents.broker.as_ref().unwrap().token_encrypted.as_deref(),
+            Some("existing-cipher"),
+        );
     }
 
     #[test]
