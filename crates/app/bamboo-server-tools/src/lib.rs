@@ -7,8 +7,10 @@
 //! schedule) live in `bamboo-server::tools` and reach this crate through ports.
 
 pub mod ask_agent;
+pub mod cluster_tool;
 pub mod compact;
 pub mod deploy_agent;
+pub mod fabric_deploy;
 pub mod memory;
 pub mod overlay_executor;
 pub mod session_inspector;
@@ -17,8 +19,9 @@ pub mod sub_agent;
 pub mod surface;
 
 pub use ask_agent::AskAgentTool;
+pub use cluster_tool::ClusterTool;
 pub use compact::CompactContextTool;
-pub use deploy_agent::{DeployAgentTool, DeployedRegistry};
+pub use deploy_agent::{Deployed, DeployAgentTool, DeployedRegistry};
 pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;
 pub use session_inspector::SessionInspectorTool;

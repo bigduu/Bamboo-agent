@@ -82,6 +82,46 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         }
     }
 
+    // Redact the broker client token (subagents.broker.token).
+    if let Some(broker) = root
+        .get_mut("subagents")
+        .and_then(|s| s.get_mut("broker"))
+        .and_then(|b| b.as_object_mut())
+    {
+        if broker
+            .get("token")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+            || broker.contains_key("token_encrypted")
+        {
+            broker.insert("token".to_string(), Value::String("****...****".to_string()));
+        }
+        broker.remove("token_encrypted");
+    }
+
+    // Redact cluster-fabric SSH secrets on each node's placement.auth.
+    if let Some(nodes) = root
+        .get_mut("cluster_fabric")
+        .and_then(|f| f.get_mut("nodes"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for node in nodes.iter_mut() {
+            if let Some(auth) = node
+                .get_mut("placement")
+                .and_then(|p| p.get_mut("auth"))
+                .and_then(|a| a.as_object_mut())
+            {
+                for field in ["password", "private_key", "passphrase"] {
+                    if auth.get(field).and_then(|v| v.as_str()).is_some() {
+                        auth.insert(field.to_string(), Value::String("****...****".to_string()));
+                    }
+                    auth.remove(&format!("{field}_encrypted"));
+                }
+            }
+        }
+    }
+
     value
 }
 

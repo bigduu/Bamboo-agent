@@ -214,6 +214,56 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             "/bamboo/settings/provider-instances/default",
             web::post().to(settings::set_default_provider_instance),
         )
+        // ── Cluster Fabric: nodes & clusters ──────────────────────────
+        .route("/bamboo/settings/nodes", web::get().to(settings::list_nodes))
+        .route(
+            "/bamboo/settings/nodes",
+            web::post().to(settings::create_node),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}",
+            web::get().to(settings::get_node),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}",
+            web::put().to(settings::update_node),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}",
+            web::delete().to(settings::delete_node),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}/test",
+            web::post().to(settings::node_test),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}/deploy",
+            web::post().to(settings::node_deploy),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}/stop",
+            web::post().to(settings::node_stop),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}/status",
+            web::get().to(settings::node_status),
+        )
+        .route(
+            "/bamboo/settings/nodes/{id}/logs",
+            web::get().to(settings::node_logs),
+        )
+        .route(
+            "/bamboo/settings/clusters",
+            web::post().to(settings::create_cluster),
+        )
+        .route(
+            "/bamboo/settings/clusters/{name}",
+            web::put().to(settings::update_cluster),
+        )
+        .route(
+            "/bamboo/settings/clusters/{name}",
+            web::delete().to(settings::delete_cluster),
+        )
 }
 
 /// Configure Bamboo internal `/v1/*` routes.

@@ -153,7 +153,7 @@ pub(super) fn build_root_tools(
         schedule_manager,
         session_store.clone(),
         storage.clone(),
-        config,
+        config.clone(),
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
@@ -179,16 +179,33 @@ pub(super) fn build_root_tools(
                     b.token.clone(),
                 )),
             ));
-            // Deployed worker handles are kill-on-drop, so the tool keeps them in
+            // Deployed worker handles are kill-on-drop, so the tools keep them in
             // this registry for the server's lifetime (torn down via stop / exit).
+            // Shared by deploy_agent + cluster so both see/manage each other's
+            // workers (deploy_agent list/stop covers cluster-deployed nodes too).
             let registry: crate::tools::DeployedRegistry =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let bamboo_bin =
                 std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
-            Arc::new(crate::tools::OverlayToolExecutor::new(
+            let with_deploy: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 with_ask,
                 Arc::new(crate::tools::DeployAgentTool::new(
-                    b.endpoint, b.token, bamboo_bin, registry,
+                    b.endpoint.clone(),
+                    b.token.clone(),
+                    bamboo_bin.clone(),
+                    registry.clone(),
+                )),
+            ));
+            // `cluster`: progressive-disclosure inventory (list/describe/status)
+            // + dispatch (deploy/stop) onto managed nodes with server-resolved creds.
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                with_deploy,
+                Arc::new(crate::tools::ClusterTool::new(
+                    config,
+                    b.endpoint,
+                    b.token,
+                    bamboo_bin,
+                    registry,
                 )),
             ))
         }

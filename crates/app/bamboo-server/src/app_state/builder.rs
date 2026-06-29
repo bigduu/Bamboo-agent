@@ -450,6 +450,12 @@ impl AppState {
         let bash_resume_hook: Arc<dyn bamboo_engine::BashResumeHook> =
             child_completion_coordinator.clone();
 
+        // Cluster-fabric reconcile: session-bound workers died with the previous
+        // bamboo process (kill-on-drop child / in-memory russh session), so any
+        // persisted `Running`/`Deploying` node state is stale on boot. Flip it to
+        // `Unreachable` so the UI/agent see reality (a redeploy brings it back).
+        reconcile_fabric_on_boot(&config, &bamboo_home_dir).await;
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -491,5 +497,43 @@ impl AppState {
             // remote-actor P2a (#181): empty in-memory agent registry.
             agent_registry: Arc::new(crate::handlers::agent::agents::AgentRegistry::new()),
         })
+    }
+}
+
+/// On boot, mark stale cluster-fabric node state as `Unreachable`: workers
+/// deployed by the previous process were session-bound (they died with it), so a
+/// persisted `Running`/`Deploying` status no longer reflects reality. Best-effort
+/// + persisted so the UI and `cluster status` don't show phantom-running nodes.
+async fn reconcile_fabric_on_boot(
+    config: &Arc<RwLock<bamboo_llm::Config>>,
+    data_dir: &std::path::Path,
+) {
+    use bamboo_config::cluster_fabric::NodeStatus;
+
+    let snapshot = {
+        let mut cfg = config.write().await;
+        let mut changed = 0usize;
+        for node in &mut cfg.cluster_fabric.nodes {
+            if let Some(state) = node.state.as_mut() {
+                if matches!(state.status, NodeStatus::Running | NodeStatus::Deploying) {
+                    state.status = NodeStatus::Unreachable;
+                    state.last_error =
+                        Some("orchestrator restarted; worker no longer tracked".to_string());
+                    changed += 1;
+                }
+            }
+        }
+        if changed == 0 {
+            return;
+        }
+        tracing::info!(
+            reconciled = changed,
+            "cluster-fabric: marked stale Running nodes Unreachable on boot"
+        );
+        cfg.clone()
+    };
+
+    if let Err(e) = snapshot.save_to_dir(data_dir.to_path_buf()) {
+        tracing::warn!("cluster-fabric boot reconcile: failed to persist: {e}");
     }
 }
