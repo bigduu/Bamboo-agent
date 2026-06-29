@@ -32,20 +32,60 @@ pub struct AgentDeployment {
     pub echo: bool,
     /// Proxy MCP to this orchestrator id over the broker (host-bound servers).
     pub mcp_proxy: Option<String>,
+    /// When set, redirect the worker's stdout+stderr to this file (a LOCAL path
+    /// for local deploys, a REMOTE path for ssh/russh) so `tail_log` can read it.
+    pub log_path: Option<String>,
 }
 
 /// Brings up a broker-agent in some environment and returns a handle to it.
 #[async_trait]
 pub trait Deployer: Send + Sync {
     async fn deploy(&self, agent: &AgentDeployment) -> BrokerResult<DeployedAgent>;
+
+    /// Connectivity preflight WITHOUT deploying: prove the target is reachable
+    /// and (for SSH) the credentials authenticate, returning a short status
+    /// string (e.g. remote `uname`). Default: trivially Ok (local/docker).
+    async fn preflight(&self) -> BrokerResult<String> {
+        Ok("ok".to_string())
+    }
+
+    /// Read the last `lines` lines of the worker's log at `log_path` (a local
+    /// path for local deploys, a remote path for ssh/russh). Default: unsupported.
+    async fn tail_log(&self, _log_path: &str, _lines: usize) -> BrokerResult<String> {
+        Err(BrokerError::Transport(
+            "log tail is not supported for this deployer".to_string(),
+        ))
+    }
+}
+
+/// A handle to a deployment that is NOT a local child process (e.g. a remote
+/// worker reached over an in-process `russh` session). Owning this keeps the
+/// remote alive; `shutdown` tears it down (kill the remote process + close the
+/// connection/tunnel).
+#[async_trait]
+pub trait RemoteDeployment: Send + Sync {
+    /// Remote OS pid of the launched worker, if the deployer captured one.
+    fn remote_pid(&self) -> Option<u32> {
+        None
+    }
+    /// Tear down the remote worker and release the connection/tunnel.
+    async fn shutdown(&self);
 }
 
 /// A running deployment. Killed on drop (`kill_on_drop`); `shutdown` also runs
-/// any cleanup (e.g. `docker rm -f`).
+/// any cleanup (e.g. `docker rm -f`). Holds either a local child process
+/// (local/docker/system-ssh) or an in-process remote handle (russh).
 pub struct DeployedAgent {
     pub id: String,
-    child: tokio::process::Child,
-    cleanup: Option<Vec<String>>,
+    inner: DeployedInner,
+}
+
+enum DeployedInner {
+    Process {
+        child: tokio::process::Child,
+        cleanup: Option<Vec<String>>,
+    },
+    Remote(Box<dyn RemoteDeployment>),
 }
 
 impl DeployedAgent {
@@ -60,29 +100,49 @@ impl DeployedAgent {
     ) -> Self {
         Self {
             id: id.into(),
-            child,
-            cleanup,
+            inner: DeployedInner::Process { child, cleanup },
+        }
+    }
+
+    /// Build from an in-process remote handle (e.g. a `russh` session that keeps
+    /// the reverse tunnel + remote worker alive).
+    pub fn from_remote(id: impl Into<String>, handle: Box<dyn RemoteDeployment>) -> Self {
+        Self {
+            id: id.into(),
+            inner: DeployedInner::Remote(handle),
         }
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        match &self.inner {
+            DeployedInner::Process { child, .. } => child.id(),
+            DeployedInner::Remote(h) => h.remote_pid(),
+        }
     }
 
-    /// Stop the deployment: kill the launched process, then run cleanup if any.
-    pub async fn shutdown(mut self) {
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
-        if let Some(args) = self.cleanup {
-            if let Some((bin, rest)) = args.split_first() {
-                let _ = Command::new(bin).args(rest).status().await;
+    /// Stop the deployment: kill the launched process / remote worker, then run
+    /// cleanup if any.
+    pub async fn shutdown(self) {
+        match self.inner {
+            DeployedInner::Process {
+                mut child,
+                cleanup,
+            } => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if let Some(args) = cleanup {
+                    if let Some((bin, rest)) = args.split_first() {
+                        let _ = Command::new(bin).args(rest).status().await;
+                    }
+                }
             }
+            DeployedInner::Remote(h) => h.shutdown().await,
         }
     }
 }
 
 /// The `broker-agent serve …` argv (token is NOT here — it rides the env).
-fn agent_argv(d: &AgentDeployment) -> Vec<String> {
+pub(crate) fn agent_argv(d: &AgentDeployment) -> Vec<String> {
     let mut a = vec![
         "broker-agent".to_string(),
         "serve".to_string(),
@@ -137,9 +197,34 @@ impl Deployer for LocalProcessDeployer {
         cmd.args(agent_argv(d))
             .env("BAMBOO_BROKER_TOKEN", &d.token)
             .kill_on_drop(true);
+        // Redirect stdout+stderr to the log file so `tail_log` can read it.
+        if let Some(log_path) = &d.log_path {
+            if let Some(dir) = std::path::Path::new(log_path).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(file) = std::fs::File::create(log_path) {
+                if let Ok(err_file) = file.try_clone() {
+                    cmd.stdout(std::process::Stdio::from(file))
+                        .stderr(std::process::Stdio::from(err_file));
+                }
+            }
+        }
         let child = cmd.spawn().map_err(spawn_err)?;
         Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
     }
+
+    async fn tail_log(&self, log_path: &str, lines: usize) -> BrokerResult<String> {
+        tail_local_file(log_path, lines).await
+    }
+}
+
+/// Read the last `lines` lines of a local file (best-effort).
+async fn tail_local_file(path: &str, lines: usize) -> BrokerResult<String> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| BrokerError::Transport(format!("read log '{path}': {e}")))?;
+    let tail: Vec<&str> = content.lines().rev().take(lines).collect();
+    Ok(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
 }
 
 /// Deploy in a Docker container (`docker run --rm …`). The image must contain a
@@ -268,12 +353,29 @@ impl Deployer for DockerDeployer {
     }
 }
 
+/// A binary to upload (SFTP/scp) to the remote before launch.
+#[derive(Debug, Clone)]
+pub struct UploadSpec {
+    /// Local-on-orchestrator path to the (correct-arch) bamboo binary.
+    pub local_path: String,
+    /// Absolute remote path to write it to (e.g. `~/.bamboo-deploy/bamboo-<sha8>`).
+    pub remote_path: String,
+}
+
 /// Deploy on a remote host over SSH. `bamboo_on_remote` is the binary path on
 /// that host. The token rides as an env prefix in the remote command.
 pub struct SshDeployer {
     pub host: String,
     pub ssh_bin: String,
+    pub scp_bin: String,
     pub bamboo_on_remote: String,
+    /// SSH port (`-p`); `None` ⇒ the ssh default (22 / ssh-config).
+    pub port: Option<u16>,
+    /// Identity file (`-i`) for key-based auth via system ssh.
+    pub identity_file: Option<String>,
+    /// When set, upload this binary (hash-skip) before launch and run it as the
+    /// remote bamboo (overrides `bamboo_on_remote`).
+    pub upload: Option<UploadSpec>,
 }
 
 impl SshDeployer {
@@ -281,8 +383,133 @@ impl SshDeployer {
         Self {
             host: host.into(),
             ssh_bin: "ssh".into(),
+            scp_bin: "scp".into(),
             bamboo_on_remote: "bamboo".into(),
+            port: None,
+            identity_file: None,
+            upload: None,
         }
+    }
+
+    pub fn with_port(mut self, port: Option<u16>) -> Self {
+        // 22 is the ssh default; don't bother passing `-p 22`.
+        self.port = port.filter(|p| *p != 22);
+        self
+    }
+
+    pub fn with_identity(mut self, identity: Option<String>) -> Self {
+        self.identity_file = identity.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    pub fn with_upload(mut self, upload: Option<UploadSpec>) -> Self {
+        if let Some(u) = &upload {
+            self.bamboo_on_remote = u.remote_path.clone();
+        }
+        self.upload = upload;
+        self
+    }
+
+    /// Common ssh connection flags (host-key TOFU, optional port/identity) shared
+    /// by the control commands (hash check, chmod) and the launch.
+    fn ssh_conn_flags(&self) -> Vec<String> {
+        let mut a = vec![
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if let Some(p) = self.port {
+            a.push("-p".into());
+            a.push(p.to_string());
+        }
+        if let Some(id) = &self.identity_file {
+            a.push("-i".into());
+            a.push(id.clone());
+        }
+        a
+    }
+
+    /// Run a one-shot remote command over ssh, returning its stdout (trimmed).
+    async fn ssh_capture(&self, remote_cmd: &str) -> BrokerResult<String> {
+        let mut args = self.ssh_conn_flags();
+        args.push(self.host.clone());
+        args.push(remote_cmd.to_string());
+        let out = Command::new(&self.ssh_bin)
+            .args(args)
+            .output()
+            .await
+            .map_err(spawn_err)?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// Upload the binary if the remote copy is absent or its hash differs
+    /// (idempotent redeploy), then `chmod +x`. No-op when `upload` is unset.
+    async fn upload_if_needed(&self) -> BrokerResult<()> {
+        let Some(spec) = &self.upload else {
+            return Ok(());
+        };
+
+        // Local hash (shell out; portable across mac/linux orchestrators).
+        let local_hash = file_sha256(&spec.local_path).await;
+        // Remote hash (sha256sum on Linux nodes, shasum on macOS). Empty if absent.
+        let remote_hash = self
+            .ssh_capture(&format!(
+                "sha256sum {p} 2>/dev/null || shasum -a 256 {p} 2>/dev/null || true",
+                p = sh_quote(&spec.remote_path)
+            ))
+            .await
+            .unwrap_or_default();
+        let remote_hash = remote_hash.split_whitespace().next().unwrap_or("");
+
+        if let Some(local) = &local_hash {
+            if remote_hash == local && !remote_hash.is_empty() {
+                return Ok(()); // already present & identical — skip the upload.
+            }
+        }
+
+        // Ensure the remote dir exists.
+        if let Some(dir) = spec.remote_path.rsplit_once('/').map(|(d, _)| d) {
+            if !dir.is_empty() {
+                let _ = self
+                    .ssh_capture(&format!("mkdir -p {}", sh_quote(dir)))
+                    .await;
+            }
+        }
+
+        // scp upload to a temp path, then atomic rename + chmod +x.
+        let tmp = format!("{}.upload", spec.remote_path);
+        let mut scp_args = vec![
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if let Some(p) = self.port {
+            // scp uses uppercase -P for the port.
+            scp_args.push("-P".into());
+            scp_args.push(p.to_string());
+        }
+        if let Some(id) = &self.identity_file {
+            scp_args.push("-i".into());
+            scp_args.push(id.clone());
+        }
+        scp_args.push(spec.local_path.clone());
+        scp_args.push(format!("{}:{}", self.host, tmp));
+        let status = Command::new(&self.scp_bin)
+            .args(scp_args)
+            .status()
+            .await
+            .map_err(spawn_err)?;
+        if !status.success() {
+            return Err(BrokerError::Transport(format!(
+                "scp upload to {} failed (status {status})",
+                self.host
+            )));
+        }
+        self.ssh_capture(&format!(
+            "chmod +x {tmp} && mv -f {tmp} {dst}",
+            tmp = sh_quote(&tmp),
+            dst = sh_quote(&spec.remote_path)
+        ))
+        .await?;
+        Ok(())
     }
 
     /// `ssh` argv: the host, then a single remote command string (env prefix +
@@ -314,6 +541,14 @@ impl SshDeployer {
             "-o".to_string(),
             "StrictHostKeyChecking=accept-new".to_string(),
         ];
+        if let Some(p) = self.port {
+            a.push("-p".to_string());
+            a.push(p.to_string());
+        }
+        if let Some(id) = &self.identity_file {
+            a.push("-i".to_string());
+            a.push(id.clone());
+        }
         if let Some(p) = port {
             a.push("-R".to_string());
             a.push(format!("{p}:127.0.0.1:{p}"));
@@ -331,6 +566,10 @@ impl SshDeployer {
             remote.push(' ');
             remote.push_str(&sh_quote(&arg));
         }
+        // Redirect the worker's output to its log file on the remote.
+        if let Some(log_path) = &d.log_path {
+            remote.push_str(&format!(" > {} 2>&1", sh_quote(log_path)));
+        }
         a.push(remote);
         a
     }
@@ -339,21 +578,62 @@ impl SshDeployer {
 #[async_trait]
 impl Deployer for SshDeployer {
     async fn deploy(&self, d: &AgentDeployment) -> BrokerResult<DeployedAgent> {
+        // Upload the binary first (hash-skip) so the remote bamboo exists.
+        self.upload_if_needed().await?;
         let mut cmd = Command::new(&self.ssh_bin);
         cmd.args(self.argv(d)).kill_on_drop(true);
         let child = cmd.spawn().map_err(spawn_err)?;
         Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
     }
+
+    /// `uname -s -m` over ssh (proves reachability + the key/agent authenticate).
+    async fn preflight(&self) -> BrokerResult<String> {
+        let out = self.ssh_capture("uname -s -m").await?;
+        if out.trim().is_empty() {
+            return Err(BrokerError::Transport(format!(
+                "ssh preflight to {} produced no output (unreachable or auth failed)",
+                self.host
+            )));
+        }
+        Ok(out)
+    }
+
+    async fn tail_log(&self, log_path: &str, lines: usize) -> BrokerResult<String> {
+        self.ssh_capture(&format!(
+            "tail -n {lines} {} 2>/dev/null || true",
+            sh_quote(log_path)
+        ))
+        .await
+    }
+}
+
+/// Compute the SHA-256 of a local file by shelling out (portable across the
+/// mac/linux orchestrator host). Returns `None` if neither tool is available.
+async fn file_sha256(path: &str) -> Option<String> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sha256sum {p} 2>/dev/null || shasum -a 256 {p} 2>/dev/null",
+            p = sh_quote(path)
+        ))
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Minimal POSIX single-quote escaping for an SSH remote command argument.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Parse the port out of a `ws://host:port[/path]` broker endpoint, for the
 /// reverse tunnel (`ssh -R port:127.0.0.1:port`).
-fn broker_port(endpoint: &str) -> Option<u16> {
+pub(crate) fn broker_port(endpoint: &str) -> Option<u16> {
     let after_host = endpoint.rsplit_once(':')?.1;
     after_host.split(['/', '?']).next()?.parse().ok()
 }
@@ -372,6 +652,7 @@ mod tests {
             workspace: None,
             echo: true,
             mcp_proxy: None,
+            log_path: None,
         }
     }
 
@@ -455,6 +736,65 @@ mod tests {
     #[test]
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn ssh_argv_includes_port_and_identity_when_set() {
+        let s = SshDeployer::new("user@gpu-host")
+            .with_port(Some(2222))
+            .with_identity(Some("/keys/id_ed25519".into()));
+        let a = s.argv(&dep());
+        assert!(a.windows(2).any(|w| w == ["-p".to_string(), "2222".to_string()]));
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["-i".to_string(), "/keys/id_ed25519".to_string()]));
+    }
+
+    #[test]
+    fn with_port_omits_default_22() {
+        let s = SshDeployer::new("h").with_port(Some(22));
+        assert_eq!(s.port, None, "port 22 is the ssh default; not passed");
+        let a = s.argv(&dep());
+        assert!(!a.iter().any(|x| x == "-p"));
+    }
+
+    #[test]
+    fn with_upload_points_remote_binary_at_uploaded_path() {
+        let s = SshDeployer::new("user@box").with_upload(Some(UploadSpec {
+            local_path: "/local/bamboo".into(),
+            remote_path: ".bamboo-deploy/bamboo".into(),
+        }));
+        assert_eq!(s.bamboo_on_remote, ".bamboo-deploy/bamboo");
+        // The launch command runs the uploaded binary, not a PATH `bamboo`.
+        let remote = s.argv(&dep()).last().unwrap().clone();
+        assert!(remote.contains("'.bamboo-deploy/bamboo'"));
+    }
+
+    #[test]
+    fn with_identity_ignores_blank() {
+        let s = SshDeployer::new("h").with_identity(Some("   ".into()));
+        assert_eq!(s.identity_file, None);
+    }
+
+    #[test]
+    fn ssh_argv_appends_log_redirect_when_set() {
+        let s = SshDeployer::new("user@box");
+        let mut d = dep();
+        d.log_path = Some(".bamboo-deploy/node-x.log".into());
+        let remote = s.argv(&d).last().unwrap().clone();
+        assert!(
+            remote.trim_end().ends_with("> '.bamboo-deploy/node-x.log' 2>&1"),
+            "got: {remote}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_local_file_returns_last_lines() {
+        let path = std::env::temp_dir().join("bamboo-tail-test.log");
+        tokio::fs::write(&path, "l1\nl2\nl3\nl4\nl5\n").await.unwrap();
+        let out = tail_local_file(path.to_str().unwrap(), 2).await.unwrap();
+        assert_eq!(out, "l4\nl5");
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[test]

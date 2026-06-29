@@ -20,6 +20,7 @@ pub mod ask;
 pub mod client;
 pub mod core;
 pub mod deploy;
+pub mod deploy_russh;
 pub mod mcp;
 pub mod mux;
 pub mod proto;
@@ -36,8 +37,10 @@ pub use crate::ask::{ask_agent, ask_over, request_over};
 pub use crate::client::BrokerClient;
 pub use crate::core::BrokerCore;
 pub use crate::deploy::{
-    AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
+    AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer,
+    RemoteDeployment, SshDeployer, UploadSpec,
 };
+pub use crate::deploy_russh::{RusshAuth, RusshDeployer};
 pub use crate::error::{BrokerError, BrokerResult};
 pub use crate::mcp::{
     serve_mcp_proxy, serve_mcp_proxy_supervised, McpProxyExecutor, McpReply, McpRequest,
