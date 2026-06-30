@@ -1,20 +1,281 @@
-//! Shared "node → deployer" construction for the Remote Cluster Fabric.
+//! Remote Cluster Fabric deploy engine.
 //!
-//! Both the operator HTTP path (`bamboo-server`) and the agent-initiated
-//! dispatch tool ([`crate::cluster_tool::ClusterTool`]) turn a persisted
-//! [`Node`] into a [`bamboo_broker::Deployer`]. Keeping that logic here (the one
-//! crate that sees both `bamboo-config`'s `Node` and `bamboo-broker`'s
-//! deployers) keeps the two callers in agreement on placement/auth handling.
+//! [`FabricDeployer`] is the SINGLE orchestration path — `deploy` / `stop` /
+//! `test` / `read_logs` — shared by the operator HTTP handlers and the agent
+//! [`crate::cluster_tool::ClusterTool`]. Both hold the same `Arc<FabricDeployer>`
+//! so they share ONE worker registry (stop from either side sees the same
+//! workers) and one persistence path. Living here (the one crate that sees both
+//! `bamboo-config`'s `Node` and `bamboo-broker`'s deployers) keeps placement/
+//! auth handling in one place.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use bamboo_broker::{
-    Deployer, LocalProcessDeployer, RusshAuth, RusshDeployer, SshDeployer, UploadSpec,
+    AgentDeployment, Deployer, LocalProcessDeployer, RusshAuth, RusshDeployer, SshDeployer,
+    UploadSpec, ORCHESTRATOR_ID,
 };
-use bamboo_config::cluster_fabric::{Node, NodePlacement, SshAuth, SshTarget};
+use bamboo_config::cluster_fabric::{Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget};
+use bamboo_config::Config;
+
+use crate::deploy_agent::{Deployed, DeployedRegistry};
+
+/// Typed error so callers (HTTP / agent tool) can map to the right status/kind.
+#[derive(Debug)]
+pub enum FabricError {
+    NotFound(String),
+    BadRequest(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for FabricError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FabricError::NotFound(m) | FabricError::BadRequest(m) | FabricError::Internal(m) => {
+                write!(f, "{m}")
+            }
+        }
+    }
+}
+
+type FabricResult<T> = Result<T, FabricError>;
+
+/// The shared fabric deploy engine: turns persisted nodes into running
+/// `broker-agent` workers, holding their handles + persisting `NodeState`.
+pub struct FabricDeployer {
+    config: Arc<RwLock<Config>>,
+    /// Serializes the mutate+persist of a fabric config write (same guarantee as
+    /// `AppState::update_config`'s io-lock — #126).
+    config_io_lock: Arc<Mutex<()>>,
+    data_dir: PathBuf,
+    /// Worker handles, keyed by node id — SHARED with `deploy_agent` so both
+    /// surfaces see/manage the same workers.
+    registry: DeployedRegistry,
+    bamboo_bin: PathBuf,
+}
+
+impl FabricDeployer {
+    pub fn new(
+        config: Arc<RwLock<Config>>,
+        config_io_lock: Arc<Mutex<()>>,
+        data_dir: impl Into<PathBuf>,
+        registry: DeployedRegistry,
+        bamboo_bin: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            config,
+            config_io_lock,
+            data_dir: data_dir.into(),
+            registry,
+            bamboo_bin: bamboo_bin.into(),
+        }
+    }
+
+    /// The shared worker registry (so `deploy_agent` can reuse it).
+    pub fn registry(&self) -> DeployedRegistry {
+        self.registry.clone()
+    }
+
+    fn node_snapshot(&self, cfg: &Config, node_id: &str) -> FabricResult<Node> {
+        cfg.cluster_fabric
+            .node(node_id)
+            .cloned()
+            .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))
+    }
+
+    /// Deploy a worker onto a node and persist its running state.
+    ///
+    /// `echo=true` runs the dependency-free echo executor (no LLM) — a
+    /// connectivity smoke test.
+    pub async fn deploy(&self, node_id: &str, echo: bool) -> FabricResult<NodeState> {
+        let (node, broker) = {
+            let cfg = self.config.read().await;
+            (self.node_snapshot(&cfg, node_id)?, cfg.subagents.broker.clone())
+        };
+        if !node.enabled {
+            return Err(FabricError::BadRequest(format!("Node '{node_id}' is disabled")));
+        }
+        let broker = broker.filter(|b| !b.endpoint.trim().is_empty()).ok_or_else(|| {
+            FabricError::BadRequest(
+                "No broker configured (subagents.broker) — a worker has nowhere to dial home"
+                    .to_string(),
+            )
+        })?;
+
+        let worker_id = worker_id_for(&node);
+        let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
+        let log_path = log_path_for(&node);
+
+        let deployment = AgentDeployment {
+            id: worker_id.clone(),
+            role: node.deploy.default_role.clone(),
+            broker_endpoint: broker.endpoint.clone(),
+            token: broker.token.clone(),
+            model: node.deploy.model.clone(),
+            workspace: node.deploy.workspace.clone(),
+            echo,
+            mcp_proxy: Some(ORCHESTRATOR_ID.to_string()),
+            log_path: Some(log_path.clone()),
+        };
+
+        // Release any prior worker FIRST so its reverse tunnel frees the broker
+        // port before the new deploy requests the same forward.
+        if let Some(prev) = self.registry.lock().await.remove(node_id) {
+            prev.handle.shutdown().await;
+        }
+
+        let handle = match build.deployer.deploy(&deployment).await {
+            Ok(h) => h,
+            Err(e) => {
+                let failed = NodeState {
+                    status: NodeStatus::Failed,
+                    last_error: Some(e.to_string()),
+                    ..Default::default()
+                };
+                let _ = self.persist_state(node_id, Some(failed)).await;
+                tracing::warn!(
+                    audit = "cluster_fabric.deploy",
+                    node = node_id,
+                    placement = placement_env(&node),
+                    outcome = "failed",
+                    error = %e,
+                );
+                return Err(FabricError::Internal(format!("deploy node '{node_id}' failed: {e}")));
+            }
+        };
+        let pid = handle.pid();
+        tracing::info!(
+            audit = "cluster_fabric.deploy",
+            node = node_id,
+            placement = placement_env(&node),
+            worker_id = %worker_id,
+            echo,
+            outcome = "deployed",
+        );
+
+        self.registry.lock().await.insert(
+            node_id.to_string(),
+            Deployed {
+                env: placement_env(&node).to_string(),
+                handle,
+            },
+        );
+
+        // TOFU: pin the observed host-key fingerprint if not already set.
+        if let Some(cell) = build.observed_fp {
+            if let Some(fp) = cell.lock().await.clone() {
+                self.pin_fingerprint_if_absent(node_id, &fp).await;
+            }
+        }
+
+        let state = NodeState {
+            status: NodeStatus::Running,
+            worker_id: Some(worker_id),
+            remote_pid: pid,
+            log_path: Some(log_path),
+            deployed_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        };
+        self.persist_state(node_id, Some(state.clone())).await?;
+        Ok(state)
+    }
+
+    /// Stop a node's worker (if running) and persist the stopped state.
+    pub async fn stop(&self, node_id: &str) -> FabricResult<NodeState> {
+        {
+            let cfg = self.config.read().await;
+            self.node_snapshot(&cfg, node_id)?;
+        }
+        if let Some(d) = self.registry.lock().await.remove(node_id) {
+            d.handle.shutdown().await;
+        }
+        tracing::info!(audit = "cluster_fabric.stop", node = node_id, outcome = "stopped");
+        let state = NodeState {
+            status: NodeStatus::Stopped,
+            ..Default::default()
+        };
+        self.persist_state(node_id, Some(state.clone())).await?;
+        Ok(state)
+    }
+
+    /// Connectivity preflight: connect + auth + `uname`, WITHOUT deploying.
+    pub async fn test(&self, node_id: &str) -> FabricResult<String> {
+        let node = {
+            let cfg = self.config.read().await;
+            self.node_snapshot(&cfg, node_id)?
+        };
+        let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
+        let result = build.deployer.preflight().await;
+        tracing::info!(
+            audit = "cluster_fabric.test",
+            node = node_id,
+            placement = placement_env(&node),
+            outcome = if result.is_ok() { "ok" } else { "failed" },
+        );
+        result.map_err(|e| FabricError::Internal(format!("preflight failed: {e}")))
+    }
+
+    /// Tail the last `lines` lines of a node worker's log.
+    pub async fn read_logs(&self, node_id: &str, lines: usize) -> FabricResult<String> {
+        let node = {
+            let cfg = self.config.read().await;
+            self.node_snapshot(&cfg, node_id)?
+        };
+        let log_path = node
+            .state
+            .as_ref()
+            .and_then(|s| s.log_path.clone())
+            .unwrap_or_else(|| log_path_for(&node));
+        let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
+        build
+            .deployer
+            .tail_log(&log_path, lines)
+            .await
+            .map_err(|e| FabricError::Internal(format!("read logs failed: {e}")))
+    }
+
+    /// Persist `state` onto a node (engine-owned field): io-lock + atomic save,
+    /// mirroring `AppState::update_config` minus the provider/MCP side effects.
+    async fn persist_state(&self, node_id: &str, state: Option<NodeState>) -> FabricResult<()> {
+        let _io = self.config_io_lock.lock().await;
+        let snapshot = {
+            let mut cfg = self.config.write().await;
+            let node = cfg
+                .cluster_fabric
+                .node_mut(node_id)
+                .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
+            node.state = state;
+            cfg.clone()
+        };
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || snapshot.save_to_dir(data_dir))
+            .await
+            .map_err(|e| FabricError::Internal(format!("persist task: {e}")))?
+            .map_err(|e| FabricError::Internal(format!("save config: {e}")))?;
+        Ok(())
+    }
+
+    /// Pin `fp` onto a node's SSH target if it has no fingerprint yet (TOFU).
+    async fn pin_fingerprint_if_absent(&self, node_id: &str, fp: &str) {
+        let _io = self.config_io_lock.lock().await;
+        let snapshot = {
+            let mut cfg = self.config.write().await;
+            if let Some(node) = cfg.cluster_fabric.node_mut(node_id) {
+                if let NodePlacement::Ssh(target) = &mut node.placement {
+                    if target.host_key_fingerprint.is_some() {
+                        return;
+                    }
+                    target.host_key_fingerprint = Some(fp.to_string());
+                }
+            }
+            cfg.clone()
+        };
+        let data_dir = self.data_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || snapshot.save_to_dir(data_dir)).await;
+    }
+}
 
 /// Shared handle to the russh TOFU-observed fingerprint cell (read after deploy).
 pub type FingerprintCell = Arc<Mutex<Option<String>>>;

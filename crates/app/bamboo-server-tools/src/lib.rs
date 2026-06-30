@@ -21,6 +21,7 @@ pub mod surface;
 pub use ask_agent::AskAgentTool;
 pub use cluster_tool::ClusterTool;
 pub use compact::CompactContextTool;
+pub use fabric_deploy::{FabricDeployer, FabricError};
 pub use deploy_agent::{Deployed, DeployAgentTool, DeployedRegistry};
 pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;

@@ -389,6 +389,22 @@ impl AppState {
             ))
         };
 
+        // Config-write io-lock + the shared Remote Cluster Fabric deploy engine.
+        // The engine is built once and shared by the HTTP handlers (via AppState)
+        // and the `cluster` agent tool, so both use ONE worker registry.
+        let config_io_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let fabric_registry: crate::tools::DeployedRegistry =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let fabric_bamboo_bin =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
+        let fabric_deployer = Arc::new(bamboo_server_tools::FabricDeployer::new(
+            config.clone(),
+            config_io_lock.clone(),
+            bamboo_home_dir.clone(),
+            fabric_registry,
+            fabric_bamboo_bin,
+        ));
+
         let tools = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
@@ -404,6 +420,7 @@ impl AppState {
             config.clone(),
             provider_registry.clone(),
             config_snapshot.subagents.broker.clone(),
+            fabric_deployer.clone(),
         );
 
         child_completion_coordinator
@@ -459,7 +476,8 @@ impl AppState {
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
-            config_io_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_io_lock,
+            fabric_deployer,
             provider: provider_lock,
             provider_handle,
             sessions,

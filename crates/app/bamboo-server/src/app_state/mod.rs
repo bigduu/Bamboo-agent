@@ -173,6 +173,10 @@ pub struct AppState {
     /// unblocked during a write's disk I/O. #126.
     pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Shared Remote Cluster Fabric deploy engine (one worker registry across the
+    /// HTTP operator handlers and the `cluster` agent tool).
+    pub fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
+
     /// Hot-reloadable LLM provider with direct access
     ///
     /// This eliminates the proxy pattern where we created an AgentAppState

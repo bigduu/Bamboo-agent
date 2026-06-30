@@ -12,7 +12,6 @@
 //! agent commands the resulting worker with `ask_agent` by the `worker_id` this
 //! tool surfaces.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,39 +20,29 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_broker::{AgentDeployment, ORCHESTRATOR_ID};
 use bamboo_config::cluster_fabric::{Node, NodePlacement};
 use bamboo_config::Config;
 
-use crate::deploy_agent::{Deployed, DeployedRegistry};
-use crate::fabric_deploy::{build_deployer, log_path_for, placement_env, worker_id_for};
+use crate::fabric_deploy::{FabricDeployer, FabricError};
 
 pub struct ClusterTool {
+    /// Read-only access for the inventory actions (list/describe/status).
     config: Arc<RwLock<Config>>,
-    /// Broker the deployed worker dials home to (shared with `ask_agent`).
-    broker_endpoint: String,
-    broker_token: String,
-    /// Local `bamboo` binary path (used for `placement = Local`).
-    bamboo_bin: PathBuf,
-    /// Shared with `deploy_agent` so `deploy_agent list/stop` see these workers.
-    registry: DeployedRegistry,
+    /// Shared deploy engine (one registry across HTTP + agent surfaces).
+    deployer: Arc<FabricDeployer>,
 }
 
 impl ClusterTool {
-    pub fn new(
-        config: Arc<RwLock<Config>>,
-        broker_endpoint: impl Into<String>,
-        broker_token: impl Into<String>,
-        bamboo_bin: impl Into<PathBuf>,
-        registry: DeployedRegistry,
-    ) -> Self {
-        Self {
-            config,
-            broker_endpoint: broker_endpoint.into(),
-            broker_token: broker_token.into(),
-            bamboo_bin: bamboo_bin.into(),
-            registry,
-        }
+    pub fn new(config: Arc<RwLock<Config>>, deployer: Arc<FabricDeployer>) -> Self {
+        Self { config, deployer }
+    }
+}
+
+/// Map a fabric engine error to a tool error.
+fn to_tool_error(e: FabricError) -> ToolError {
+    match e {
+        FabricError::NotFound(m) | FabricError::BadRequest(m) => ToolError::InvalidArguments(m),
+        FabricError::Internal(m) => ToolError::Execution(m),
     }
 }
 
@@ -185,62 +174,10 @@ impl ClusterTool {
     }
 
     async fn deploy(&self, node_id: &str, echo: bool) -> Result<ToolResult, ToolError> {
-        // Snapshot the node (its SSH secrets are hydrated to plaintext in memory).
-        let node: Node = {
-            let cfg = self.config.read().await;
-            cfg.cluster_fabric
-                .node(node_id)
-                .cloned()
-                .ok_or_else(|| ToolError::InvalidArguments(format!("unknown node '{node_id}'")))?
-        };
-        if !node.enabled {
-            return Err(ToolError::InvalidArguments(format!(
-                "node '{node_id}' is disabled"
-            )));
-        }
-
-        let worker_id = worker_id_for(&node);
-        let build = build_deployer(&node, &self.bamboo_bin)
-            .map_err(|e| ToolError::Execution(format!("cannot deploy node '{node_id}': {e}")))?;
-
-        let deployment = AgentDeployment {
-            id: worker_id.clone(),
-            role: node.deploy.default_role.clone(),
-            broker_endpoint: self.broker_endpoint.clone(),
-            token: self.broker_token.clone(),
-            model: node.deploy.model.clone(),
-            workspace: node.deploy.workspace.clone(),
-            echo,
-            mcp_proxy: Some(ORCHESTRATOR_ID.to_string()),
-            log_path: Some(log_path_for(&node)),
-        };
-
-        // Release any prior worker for this node first (frees its tunnel port).
-        if let Some(prev) = self.registry.lock().await.remove(node_id) {
-            prev.handle.shutdown().await;
-        }
-        let handle = build
-            .deployer
-            .deploy(&deployment)
-            .await
-            .map_err(|e| ToolError::Execution(format!("deploy node '{node_id}' failed: {e}")))?;
-        self.registry.lock().await.insert(
-            node_id.to_string(),
-            Deployed {
-                env: placement_env(&node).to_string(),
-                handle,
-            },
-        );
-        // Audit (no secrets): agent-initiated dispatch onto a managed node.
-        tracing::info!(
-            audit = "cluster_fabric.agent_deploy",
-            node = node_id,
-            placement = placement_env(&node),
-            worker_id = %worker_id,
-            echo,
-            outcome = "deployed",
-        );
-
+        // Delegate to the shared engine (one registry across HTTP + agent), which
+        // resolves stored creds server-side and persists NodeState.
+        let state = self.deployer.deploy(node_id, echo).await.map_err(to_tool_error)?;
+        let worker_id = state.worker_id.clone().unwrap_or_default();
         Ok(tool_json(json!({
             "node": node_id,
             "worker_id": worker_id,
@@ -252,14 +189,8 @@ impl ClusterTool {
     }
 
     async fn stop(&self, node_id: &str) -> Result<ToolResult, ToolError> {
-        let removed = self.registry.lock().await.remove(node_id);
-        match removed {
-            Some(d) => {
-                d.handle.shutdown().await;
-                Ok(tool_json(json!({ "node": node_id, "status": "stopped" })))
-            }
-            None => Ok(tool_json(json!({ "node": node_id, "status": "not_running" }))),
-        }
+        self.deployer.stop(node_id).await.map_err(to_tool_error)?;
+        Ok(tool_json(json!({ "node": node_id, "status": "stopped" })))
     }
 }
 
@@ -347,14 +278,19 @@ mod tests {
         Arc::new(RwLock::new(cfg))
     }
 
-    fn tool(config: Arc<RwLock<Config>>) -> ClusterTool {
-        ClusterTool::new(
+    fn deployer_for(config: Arc<RwLock<Config>>) -> Arc<crate::fabric_deploy::FabricDeployer> {
+        Arc::new(crate::fabric_deploy::FabricDeployer::new(
             config,
-            "ws://127.0.0.1:9600",
-            "tok",
-            "/bin/true",
+            Arc::new(tokio::sync::Mutex::new(())),
+            std::env::temp_dir(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        )
+            "/usr/bin/true",
+        ))
+    }
+
+    fn tool(config: Arc<RwLock<Config>>) -> ClusterTool {
+        let deployer = deployer_for(config.clone());
+        ClusterTool::new(config, deployer)
     }
 
     fn ssh_node(id: &str, running: bool) -> Node {
@@ -452,17 +388,29 @@ mod tests {
     #[tokio::test]
     async fn deploy_local_node_registers_worker_then_stop_clears_it() {
         // Use a harmless binary as "bamboo": LocalProcessDeployer spawns it with
-        // broker-agent args (ignored by /bin/true), exercising deploy/register/stop.
-        let cfg = config_with(vec![local_node("n1")], vec![]);
-        let registry: DeployedRegistry =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let t = ClusterTool::new(
-            cfg,
-            "ws://127.0.0.1:9600",
-            "tok",
+        // broker-agent args (ignored by /usr/bin/true), exercising the shared
+        // deploy engine's register/stop via the tool.
+        let mut config = Config::default();
+        config.cluster_fabric.nodes = vec![local_node("n1")];
+        config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:9600".into(),
+            token: "tok".into(),
+            token_encrypted: None,
+        });
+        let cfg = Arc::new(RwLock::new(config));
+
+        // Unique data dir so the persisted config.json doesn't collide with peers.
+        let data_dir = std::env::temp_dir().join(format!("bamboo-clustertool-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&data_dir);
+        let deployer = Arc::new(crate::fabric_deploy::FabricDeployer::new(
+            cfg.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            &data_dir,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             "/usr/bin/true",
-            registry.clone(),
-        );
+        ));
+        let registry = deployer.registry();
+        let t = ClusterTool::new(cfg, deployer);
 
         let out = parse(t.deploy("n1", true).await.unwrap());
         assert_eq!(out["worker_id"], "node-n1");
@@ -472,6 +420,7 @@ mod tests {
         let stopped = parse(t.stop("n1").await.unwrap());
         assert_eq!(stopped["status"], "stopped");
         assert!(!registry.lock().await.contains_key("n1"), "handle removed");
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
