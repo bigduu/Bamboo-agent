@@ -128,6 +128,14 @@ impl BrokerServer {
                         Ok(Some(ClientFrame::Cancel { to, correlation_id })) => {
                             self.core.cancel(&to, &correlation_id).await;
                         }
+                        // Presence query: which actors are connected serving `role`.
+                        // The subscriber table IS the registry (Phase 3).
+                        Ok(Some(ClientFrame::ListConnected { role })) => {
+                            let ids = self.core.connected_by_role(&role).await;
+                            if send(&mut sink, BrokerFrame::Connected { ids }).await.is_err() {
+                                break Ok(());
+                            }
+                        }
                         Ok(None) => break Ok(()),   // client closed
                         Err(e) => break Err(e),
                     }

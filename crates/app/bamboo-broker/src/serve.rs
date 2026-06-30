@@ -1080,4 +1080,47 @@ mod tests {
         let oc: bamboo_subagent::ChildOutcome = serde_json::from_value(outcome.body).unwrap();
         assert_eq!(oc.result.as_deref(), Some("echo: ping pong"));
     }
+
+    /// The bus answers "who's connected serving role X" over the WS protocol — the
+    /// Phase 3 presence query the schedulable cutover uses instead of an HTTP
+    /// registry. Subscribing with a role makes a connection discoverable.
+    #[tokio::test]
+    async fn list_connected_finds_subscribed_actors_by_role() {
+        let (endpoint, _dir) = start().await;
+
+        async fn join(endpoint: &str, id: &str, role: &str) -> BrokerClient {
+            let mut c = BrokerClient::connect(
+                endpoint,
+                AgentRef {
+                    session_id: id.into(),
+                    role: Some(role.into()),
+                },
+                TOKEN,
+            )
+            .await
+            .unwrap();
+            c.subscribe().await.unwrap();
+            c
+        }
+        let _w1 = join(&endpoint, "w1", "gpu-pool").await;
+        let _w2 = join(&endpoint, "w2", "gpu-pool").await;
+        let _w3 = join(&endpoint, "w3", "cpu-pool").await;
+
+        let mut q = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+
+        let mut gpu = q.list_connected("gpu-pool").await.unwrap();
+        gpu.sort();
+        assert_eq!(gpu, vec!["w1".to_string(), "w2".to_string()]);
+        assert_eq!(q.list_connected("cpu-pool").await.unwrap(), vec!["w3".to_string()]);
+        assert!(q.list_connected("none").await.unwrap().is_empty());
+    }
 }

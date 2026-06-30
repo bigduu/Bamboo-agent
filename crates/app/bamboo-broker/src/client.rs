@@ -46,6 +46,10 @@ pub struct BrokerClient {
     /// by the background reader independently of `messages` — so a Cancel reaches
     /// the worker even while its work loop is blocked on an in-flight run. #50.
     cancels: mpsc::UnboundedReceiver<MsgId>,
+    /// Answers to [`ClientFrame::ListConnected`] — the connected actor ids of a
+    /// queried role (Phase 3 presence query). One reply per request; `&mut self`
+    /// on `list_connected` keeps requests serialized.
+    connected: mpsc::UnboundedReceiver<Vec<String>>,
     /// Cleared by [`reader_supervisor`] the instant the background reader exits
     /// (clean close / panic / cancellation), so callers can tell "no messages
     /// right now" (`next_message() -> None` but still alive) apart from "the
@@ -94,6 +98,7 @@ impl BrokerClient {
         let (msg_tx, messages) = mpsc::unbounded_channel();
         let (del_tx, delivered) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
+        let (conn_tx, connected) = mpsc::unbounded_channel();
         // The demux loop pushes `Message`/`Delivered`/`Cancel` frames into their
         // respective channels and ends when the stream closes or errors.
         let reader = tokio::spawn(async move {
@@ -108,6 +113,9 @@ impl BrokerClient {
                         }
                         Ok(BrokerFrame::Cancel { correlation_id }) => {
                             let _ = cancel_tx.send(correlation_id);
+                        }
+                        Ok(BrokerFrame::Connected { ids }) => {
+                            let _ = conn_tx.send(ids);
                         }
                         _ => {}
                     },
@@ -131,6 +139,7 @@ impl BrokerClient {
             messages,
             delivered,
             cancels,
+            connected,
             reader_alive,
             _supervisor: supervisor,
         })
@@ -193,6 +202,24 @@ impl BrokerClient {
     /// [`next_message`](Self::next_message).
     pub async fn subscribe(&mut self) -> BrokerResult<()> {
         self.send(ClientFrame::Subscribe).await
+    }
+
+    /// Ask the broker which actors are currently connected serving `role` — the
+    /// bus-native live-actor registry (Phase 3). `&mut self` serializes requests,
+    /// so the single `connected` reply is unambiguously ours. Bounded by
+    /// [`DELIVER_RECEIPT_TIMEOUT`] so a stalled broker can't hang the caller.
+    pub async fn list_connected(&mut self, role: &str) -> BrokerResult<Vec<String>> {
+        self.send(ClientFrame::ListConnected { role: role.into() })
+            .await?;
+        match tokio::time::timeout(DELIVER_RECEIPT_TIMEOUT, self.connected.recv()).await {
+            Ok(Some(ids)) => Ok(ids),
+            Ok(None) => Err(BrokerError::Transport(
+                "connection closed before connected-actors reply".into(),
+            )),
+            Err(_) => Err(BrokerError::Transport(
+                "timed out waiting for connected-actors reply from broker".into(),
+            )),
+        }
     }
 
     /// Next pushed message, or `None` once the connection closes.
