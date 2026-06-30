@@ -77,20 +77,15 @@ pub struct ResolvedRemotePlacement {
     pub ca_cert_file: Option<PathBuf>,
 }
 
-/// A role routed to a registry-SCHEDULED worker (remote-actor-plan §3.4 / P2b,
-/// #181), resolved at runner-build time from `SubagentsConfig.schedulable_placements`.
-/// Unlike a fixed `ResolvedRemotePlacement` (one endpoint), this names the agent
-/// `registry_url` to query and the logical `pool` (= the registry `role`) whose
-/// LIVE workers are scheduling candidates. The env-named bearer is already READ
-/// into `token` here (the raw token never rides the config) and is used for BOTH
-/// the registry query and the chosen worker's `wss://` connect. `ca_cert_file`
-/// pins a self-signed worker/registry cert (`None` ⇒ default webpki roots).
+/// A role routed to a SCHEDULED worker (remote-actor-plan §3.4 / P2b, #181),
+/// resolved at runner-build time from `SubagentsConfig.schedulable_placements`.
+/// Names the logical `pool` (= the bus role) whose LIVE connected workers are the
+/// scheduling candidates — the runner picks one via the bus presence query
+/// (`BrokerClient::list_connected`). Phase 3 retired the old HTTP registry, so a
+/// pool is now just a role on the bus.
 #[derive(Debug, Clone)]
 pub struct ResolvedSchedulablePlacement {
     pub pool: String,
-    pub registry_url: String,
-    pub token: Option<String>,
-    pub ca_cert_file: Option<PathBuf>,
 }
 
 /// How `execute_external_child` should obtain its worker connection, decided
@@ -531,19 +526,16 @@ impl ActorChildRunner {
             spec.secrets.worker_auth_token = placement.token.clone();
         } else if let Some(placement) = self.schedulable_placements.get(spec.identity.role.as_str())
         {
-            // #181 (P2b): route this role to a registry-SCHEDULED worker — ONLY
-            // when it is NOT already pinned to a fixed remote endpoint (the
-            // `else if` makes remote_placements take precedence for a role in
-            // both). The concrete endpoint is resolved at run time in
-            // `execute_external_child`; here we only flip the placement to
-            // Schedulable{pool} and ride the bearer on the scoped secrets
-            // envelope (used for the registry query AND the worker connect). No
-            // match in either map leaves the default `Placement::Local`, so the
-            // local path is byte-for-byte unchanged for every non-routed role.
+            // #181 (P2b): route this role to a SCHEDULED worker — ONLY when it is
+            // NOT already pinned to a fixed remote endpoint (the `else if` makes
+            // remote_placements take precedence for a role in both). The concrete
+            // worker is picked at run time in `execute_external_child` from the bus
+            // (a live connected worker of the pool role). No per-placement bearer
+            // now — the bus connection uses the bus token. No match in either map
+            // leaves the default `Placement::Local`.
             spec.placement = Placement::Schedulable {
                 pool: placement.pool.clone(),
             };
-            spec.secrets.worker_auth_token = placement.token.clone();
         }
         spec
     }
@@ -1611,26 +1603,17 @@ mod tests {
         .with_schedulable_placements(sched)
     }
 
-    fn sched_placement(
-        pool: &str,
-        registry_url: impl Into<String>,
-    ) -> ResolvedSchedulablePlacement {
-        ResolvedSchedulablePlacement {
-            pool: pool.into(),
-            registry_url: registry_url.into(),
-            token: None,
-            ca_cert_file: None,
-        }
+    fn sched_placement(pool: &str, _registry_url: impl Into<String>) -> ResolvedSchedulablePlacement {
+        ResolvedSchedulablePlacement { pool: pool.into() }
     }
 
     #[test]
     fn build_spec_sets_schedulable_placement_for_matching_role() {
         let mut sched = HashMap::new();
-        sched.insert("explorer".to_string(), {
-            let mut p = sched_placement("gpu-pool", "https://control-plane:9562");
-            p.token = Some("T-sched".into());
-            p
-        });
+        sched.insert(
+            "explorer".to_string(),
+            sched_placement("gpu-pool", "unused"),
+        );
         let runner = bogus_sched_runner(HashMap::new(), sched);
 
         let s = session_of_role("explorer", "do the thing");
@@ -1639,8 +1622,8 @@ mod tests {
             Placement::Schedulable { pool } => assert_eq!(pool, "gpu-pool"),
             other => panic!("expected Schedulable, got {other:?}"),
         }
-        // The bearer rides the scoped secrets envelope (registry + worker connect).
-        assert_eq!(spec.secrets.worker_auth_token.as_deref(), Some("T-sched"));
+        // No per-placement bearer now — the bus connection carries the bus token.
+        assert!(spec.secrets.worker_auth_token.is_none());
     }
 
     #[test]

@@ -26,11 +26,6 @@ pub enum StoreError {
     /// to a worker (e.g. both `mcp` and `mcp_proxy` set).
     #[error("invalid provision spec: {0}")]
     Invalid(String),
-    /// A network/transport failure from the HTTP `Discovery` backend
-    /// ([`crate::registry_fabric::RegistryFabric`]). The message is scrubbed of
-    /// any credential — never format a bearer token into this.
-    #[error("registry network error: {0}")]
-    Network(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

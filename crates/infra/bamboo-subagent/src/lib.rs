@@ -19,7 +19,6 @@ pub mod fleet;
 pub mod mailbox;
 pub mod proto;
 pub mod provision;
-pub mod registry_fabric;
 pub mod store;
 pub mod transport;
 
@@ -36,7 +35,6 @@ pub use provision::{
     BusEndpoint, Capabilities, ChildIdentity, ExecutorSpec, Limits, McpProxyConfig, ModelRefSpec,
     Placement, ProvisionSpec, ScopedCredential, SecretsEnvelope, PROVISION_VERSION,
 };
-pub use registry_fabric::RegistryFabric;
 pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,
     RootEntry, RootFields, SessionLoc, SubagentStore,

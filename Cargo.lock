@@ -1332,7 +1332,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
- "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1344,7 +1343,6 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "uuid",
- "wiremock",
 ]
 
 [[package]]

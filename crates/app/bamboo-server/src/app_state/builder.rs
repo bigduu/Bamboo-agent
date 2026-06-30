@@ -523,7 +523,6 @@ impl AppState {
             pairing_code_guard: Arc::new(crate::handlers::settings::PairingCodeGuard::default()),
             root_password_guard: Arc::new(crate::handlers::settings::RootPasswordGuard::default()),
             // remote-actor P2a (#181): empty in-memory agent registry.
-            agent_registry: Arc::new(crate::handlers::agent::agents::AgentRegistry::new()),
         })
     }
 }
