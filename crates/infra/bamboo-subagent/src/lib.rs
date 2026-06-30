@@ -25,7 +25,7 @@ pub mod transport;
 
 pub use discovery::{Discovery, Fabric, FileFabric};
 pub use error::{Result, StoreError};
-pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink, SteerInbox};
+pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink, HostBridge, SteerInbox};
 pub use fleet::{spawn_worker, spawn_worker_on_bus, SpawnedChild};
 pub use mailbox::{
     AdmittedSet, AgentRef, AskBody, AskMode, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,

@@ -231,12 +231,19 @@ where
 {
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // Per-run coordination so a SEPARATE Steer / ApprovalReply mailbox message can
+    // reach the channels of the Run it belongs to (the Run + its control messages
+    // arrive as independent messages handled by independent tasks).
+    let coords: RunCoords = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let waiters: ApprovalWaiters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let endpoint_owned = endpoint.to_string();
     let token_owned = token.to_string();
     let me_owned = me.clone();
     serve_mailbox(endpoint, me, token, move |msg, cancel| {
         let executor = Arc::clone(&executor);
         let context = Arc::clone(&context);
+        let coords = Arc::clone(&coords);
+        let waiters = Arc::clone(&waiters);
         let endpoint = endpoint_owned.clone();
         let token = token_owned.clone();
         let me = me_owned.clone();
@@ -245,7 +252,51 @@ where
                 // A full child session over the bus (the actor-over-mailbox path):
                 // stream events back to the parent live, then the terminal outcome.
                 InboxKind::Run => {
-                    handle_run(executor.as_ref(), &endpoint, &token, &me, msg, cancel).await
+                    handle_run(
+                        executor.as_ref(),
+                        &endpoint,
+                        &token,
+                        &me,
+                        msg,
+                        cancel,
+                        &coords,
+                        &waiters,
+                    )
+                    .await
+                }
+                // In-band steer for a running Run: route to its steer inbox.
+                InboxKind::Steer => {
+                    if let Some(run_id) = &msg.correlation_id {
+                        let text = msg
+                            .body
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if let Some(coord) = coords.lock().await.get(run_id) {
+                            let _ = coord.steer_tx.send(text);
+                        }
+                    }
+                    Handled::Ack
+                }
+                // Approval decision for a gated tool a Run proxied up: wake the
+                // waiting tool call, keyed by the approval-request id in the body.
+                InboxKind::ApprovalReply => {
+                    let id = msg
+                        .body
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let approved = msg
+                        .body
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(tx) = waiters.lock().await.remove(&id) {
+                        let _ = tx.send(approved);
+                    }
+                    Handled::Ack
                 }
                 // Ask/Task: the conversational query/steer path (unchanged).
                 _ => handle_with_executor(executor.as_ref(), &context, msg, cancel).await,
@@ -255,6 +306,16 @@ where
     .await
 }
 
+/// Live steer channel for a running [`InboxKind::Run`], keyed by run id so an
+/// out-of-band [`InboxKind::Steer`] message can be pushed into the run's inbox.
+struct RunCoord {
+    steer_tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+type RunCoords = Arc<tokio::sync::Mutex<HashMap<MsgId, RunCoord>>>;
+/// Pending gated-tool approvals a Run proxied up, keyed by approval-request id;
+/// an [`InboxKind::ApprovalReply`] fulfils the matching one.
+type ApprovalWaiters = Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+
 /// Drive a full child session ([`InboxKind::Run`]) over the bus: parse the
 /// `RunSpec`, run the executor, and forward its streamed events + terminal
 /// outcome to the parent's mailbox over a dedicated deliver connection (the same
@@ -263,6 +324,7 @@ where
 /// The serve loop only `Ack`s the run; the real result flows as `Event`s and a
 /// final `Outcome`, both correlated to the run id, so the parent can stream them
 /// exactly like it would over a direct WS connection.
+#[allow(clippy::too_many_arguments)]
 async fn handle_run<E>(
     executor: &E,
     endpoint: &str,
@@ -270,11 +332,13 @@ async fn handle_run<E>(
     me: &AgentRef,
     msg: InboxMessage,
     cancel: CancellationToken,
+    coords: &RunCoords,
+    waiters: &ApprovalWaiters,
 ) -> Handled
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
-    use bamboo_subagent::{EventSink, RunSpec, SteerInbox};
+    use bamboo_subagent::{EventSink, HostBridge, RunSpec, SteerInbox};
 
     let spec: RunSpec = match serde_json::from_value(msg.body) {
         Ok(s) => s,
@@ -287,16 +351,29 @@ where
     let parent = msg.from.session_id.clone();
 
     let (sink, mut events) = EventSink::channel();
+    // Steer: register this run's steer inbox so out-of-band Steer messages route in.
+    let (steer_tx, steer_inbox) = SteerInbox::channel();
+    coords
+        .lock()
+        .await
+        .insert(run_id.clone(), RunCoord { steer_tx });
+    // Approval: a host bridge on the sink; its requests are pumped to the parent.
+    let (host_bridge, mut host_rx) = HostBridge::channel();
+    let sink = sink.with_host_bridge(host_bridge);
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
 
-    // Forward task: own one deliver connection; stream Events live, then the
-    // Outcome once the run finishes (sink dropped ⇒ `events` closes).
     let endpoint = endpoint.to_string();
     let token = token.to_string();
     let me = me.clone();
+
+    // Forward task: own one deliver connection; stream Events live, then the
+    // Outcome once the run finishes (sink dropped ⇒ `events` closes).
     let run_id_fwd = run_id.clone();
+    let me_fwd = me.clone();
+    let parent_fwd = parent.clone();
+    let (ep_fwd, tok_fwd) = (endpoint.clone(), token.clone());
     let forward = tokio::spawn(async move {
-        let mut deliver = match BrokerClient::connect(&endpoint, me.clone(), &token).await {
+        let mut deliver = match BrokerClient::connect(&ep_fwd, me_fwd.clone(), &tok_fwd).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("run {run_id_fwd:?}: event deliver connect failed: {e}");
@@ -305,7 +382,7 @@ where
         };
         let emit = |kind, body| InboxMessage {
             id: MsgId::new(),
-            from: me.clone(),
+            from: me_fwd.clone(),
             kind,
             body,
             created_at: Utc::now(),
@@ -313,7 +390,7 @@ where
         };
         while let Some(event) = events.recv().await {
             if deliver
-                .deliver(&parent, emit(InboxKind::Event, event))
+                .deliver(&parent_fwd, emit(InboxKind::Event, event))
                 .await
                 .is_err()
             {
@@ -322,17 +399,61 @@ where
         }
         if let Ok(outcome) = outcome_rx.await {
             let body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
-            let _ = deliver.deliver(&parent, emit(InboxKind::Outcome, body)).await;
+            let _ = deliver.deliver(&parent_fwd, emit(InboxKind::Outcome, body)).await;
+        }
+    });
+
+    // Approval drain: each gated-tool approval the executor raises is delivered to
+    // the parent as an ApprovalRequest (correlated to the run); the matching
+    // ApprovalReply wakes the registered waiter, whose decision answers the tool.
+    // Ends when the run drops the sink ⇒ the host bridge ⇒ `host_rx` closes.
+    let waiters_drain = Arc::clone(waiters);
+    let run_id_appr = run_id.clone();
+    let approval = tokio::spawn(async move {
+        let mut deliver = match BrokerClient::connect(&endpoint, me.clone(), &token).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("run {run_id_appr:?}: approval deliver connect failed: {e}");
+                // Drain + deny so the worker's permission flow never hangs.
+                while let Some(req) = host_rx.recv().await {
+                    let _ = req.reply.send(serde_json::json!({ "approved": false }));
+                }
+                return;
+            }
+        };
+        while let Some(req) = host_rx.recv().await {
+            let approval_id = MsgId::new();
+            let approval_id_str = format!("{approval_id:?}");
+            let (atx, arx) = tokio::sync::oneshot::channel::<bool>();
+            waiters_drain
+                .lock()
+                .await
+                .insert(approval_id_str.clone(), atx);
+            let m = InboxMessage {
+                id: MsgId::new(),
+                from: me.clone(),
+                kind: InboxKind::ApprovalRequest,
+                body: serde_json::json!({ "id": approval_id_str, "request": req.body }),
+                created_at: Utc::now(),
+                correlation_id: Some(run_id_appr.clone()),
+            };
+            if deliver.deliver(&parent, m).await.is_err() {
+                let _ = req.reply.send(serde_json::json!({ "approved": false }));
+                continue;
+            }
+            // Await the parent's decision; a dropped reply (link gone) fail-closes.
+            let approved = arx.await.unwrap_or(false);
+            let _ = req.reply.send(serde_json::json!({ "approved": approved }));
         }
     });
 
     // Run to completion (events stream into `sink`); dropping `sink` closes the
-    // forward loop's `events`, which then delivers the outcome.
-    let outcome = executor
-        .run(spec, sink, SteerInbox::disconnected(), cancel)
-        .await;
+    // forward loop's `events` (→ outcome) and the approval drain's `host_rx`.
+    let outcome = executor.run(spec, sink, steer_inbox, cancel).await;
+    coords.lock().await.remove(&run_id);
     let _ = outcome_tx.send(outcome);
     let _ = forward.await;
+    let _ = approval.await;
     Handled::Ack
 }
 

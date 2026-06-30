@@ -77,6 +77,21 @@ pub enum InboxKind {
     /// serialized [`crate::executor::ChildOutcome`]. `reply_to` correlates it to
     /// the `Run`.
     Outcome,
+    /// Parent→child: an in-band steering message for a running [`InboxKind::Run`]
+    /// (the actor `ParentFrame::Message`). `body` is `{"text": "..."}`;
+    /// `correlation_id` is the run id, so the worker routes it to that run's steer
+    /// inbox.
+    Steer,
+    /// Child→parent: a gated-tool approval request raised mid-[`InboxKind::Run`]
+    /// (the actor `ChildFrame::ApprovalRequest`). `body` is `{"id": "...",
+    /// "request": {...}}`; `correlation_id` is the run id. The parent answers with
+    /// an [`InboxKind::ApprovalReply`] carrying the same `id`.
+    ApprovalRequest,
+    /// Parent→child: the decision for an [`InboxKind::ApprovalRequest`] (the actor
+    /// `ParentFrame::ApprovalReply`). `body` is `{"approved": bool}`;
+    /// `correlation_id` is the approval request `id`, so the worker routes it to
+    /// the waiting tool call.
+    ApprovalReply,
 }
 
 /// How a sub-agent should answer an [`InboxKind::Ask`].

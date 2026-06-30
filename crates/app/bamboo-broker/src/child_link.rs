@@ -77,10 +77,25 @@ impl BrokerChildLink {
                     self.client.cancel(&self.child, &rid).await?;
                 }
             }
-            // Steer / approval-delegation over the bus land in a later phase
-            // (the worker's Run handler uses a disconnected steer inbox today).
-            ParentFrame::Message { .. } | ParentFrame::ApprovalReply { .. } => {
-                tracing::debug!("BrokerChildLink: steer/approval not yet carried over the bus");
+            // In-band steering: deliver to the child's mailbox correlated to the
+            // run, so the worker routes it to that run's steer inbox.
+            ParentFrame::Message { text } => {
+                let m = self.msg(
+                    InboxKind::Steer,
+                    serde_json::json!({ "text": text }),
+                    self.run_id.clone(),
+                );
+                self.client.deliver(&self.child, m).await?;
+            }
+            // Approval decision: the worker routes it to the waiting tool call by
+            // the approval-request `id` carried in the body.
+            ParentFrame::ApprovalReply { id, approved } => {
+                let m = self.msg(
+                    InboxKind::ApprovalReply,
+                    serde_json::json!({ "id": id, "approved": approved }),
+                    self.run_id.clone(),
+                );
+                self.client.deliver(&self.child, m).await?;
             }
         }
         Ok(())
@@ -105,6 +120,22 @@ impl BrokerChildLink {
             }
             let frame = match msg.kind {
                 InboxKind::Event => Some(ChildFrame::Event { event: msg.body }),
+                InboxKind::ApprovalRequest => {
+                    // body = {"id": "...", "request": {...}}: the worker proxied a
+                    // gated-tool approval up. Surface it for the host to decide.
+                    let id = msg
+                        .body
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let body = msg
+                        .body
+                        .get("request")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    Some(ChildFrame::ApprovalRequest { id, body })
+                }
                 InboxKind::Outcome => {
                     let oc: ChildOutcome = serde_json::from_value(msg.body)
                         .map_err(|e| BrokerError::Transport(format!("decode ChildOutcome: {e}")))?;
@@ -116,7 +147,6 @@ impl BrokerChildLink {
                         transcript: oc.transcript,
                     })
                 }
-                // ApprovalRequest etc. are not produced over the bus yet.
                 _ => None,
             };
             self.client.ack(id).await.ok();
@@ -222,5 +252,165 @@ mod tests {
 
         // After the terminal, the link is drained.
         assert!(link.next_frame().await.unwrap().is_none());
+    }
+
+    async fn start_broker() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(core, "t"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (format!("ws://{addr}"), dir)
+    }
+
+    fn spawn_worker(endpoint: &str, exec: Arc<dyn bamboo_subagent::ChildExecutor>) {
+        let ep = endpoint.to_string();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &ep,
+                AgentRef { session_id: "child".into(), role: None },
+                "t",
+                exec,
+            )
+            .await;
+        });
+    }
+
+    async fn connect_parent(endpoint: &str) -> BrokerChildLink {
+        BrokerChildLink::connect(
+            endpoint,
+            AgentRef { session_id: "parent".into(), role: None },
+            "t",
+            "child",
+        )
+        .await
+        .expect("connect link")
+    }
+
+    /// An executor that emits a `ready` event then returns the FIRST steer it
+    /// receives — proving an in-band steer reaches a running bus child.
+    struct SteerEcho;
+    #[async_trait::async_trait]
+    impl bamboo_subagent::ChildExecutor for SteerEcho {
+        async fn run(
+            &self,
+            _spec: RunSpec,
+            events: bamboo_subagent::EventSink,
+            mut steer: bamboo_subagent::SteerInbox,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> bamboo_subagent::ChildOutcome {
+            events.emit(serde_json::json!({ "type": "ready" }));
+            let s = steer.recv().await.unwrap_or_default();
+            bamboo_subagent::ChildOutcome::completed(format!("steered: {s}"))
+        }
+    }
+
+    /// An executor that proxies one gated-tool approval to the host and reports
+    /// the decision — proving the approval round-trip works over the bus.
+    struct AskApproval;
+    #[async_trait::async_trait]
+    impl bamboo_subagent::ChildExecutor for AskApproval {
+        async fn run(
+            &self,
+            _spec: RunSpec,
+            events: bamboo_subagent::EventSink,
+            _steer: bamboo_subagent::SteerInbox,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> bamboo_subagent::ChildOutcome {
+            let approved = match events.host().cloned() {
+                Some(host) => host
+                    .approval_call(serde_json::json!({ "tool_name": "Bash", "resource": "rm -rf /" }))
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("approved").and_then(|b| b.as_bool()))
+                    .unwrap_or(false),
+                None => false,
+            };
+            bamboo_subagent::ChildOutcome::completed(
+                if approved { "approved" } else { "denied" }.to_string(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn carries_an_in_band_steer_over_the_bus() {
+        let (endpoint, _dir) = start_broker().await;
+        spawn_worker(&endpoint, Arc::new(SteerEcho));
+        let mut link = connect_parent(&endpoint).await;
+
+        link.send(ParentFrame::Run(RunSpec {
+            assignment: "go".into(),
+            reasoning_effort: None,
+            messages: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Wait for the worker's `ready` event (run started ⇒ steer inbox armed),
+        // THEN steer it.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
+                .await
+                .expect("a frame")
+                .expect("ok")
+            {
+                Some(ChildFrame::Event { .. }) => break,
+                other => panic!("expected ready event first, got {other:?}"),
+            }
+        }
+        link.send(ParentFrame::Message { text: "turn-left".into() })
+            .await
+            .unwrap();
+
+        let result = loop {
+            match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
+                .await
+                .expect("a frame")
+                .expect("ok")
+            {
+                Some(ChildFrame::Terminal { result, .. }) => break result,
+                _ => continue,
+            }
+        };
+        assert_eq!(result.as_deref(), Some("steered: turn-left"));
+    }
+
+    #[tokio::test]
+    async fn carries_an_approval_round_trip_over_the_bus() {
+        let (endpoint, _dir) = start_broker().await;
+        spawn_worker(&endpoint, Arc::new(AskApproval));
+        let mut link = connect_parent(&endpoint).await;
+
+        link.send(ParentFrame::Run(RunSpec {
+            assignment: "do the dangerous thing".into(),
+            reasoning_effort: None,
+            messages: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let mut saw_request = false;
+        let result = loop {
+            match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
+                .await
+                .expect("a frame")
+                .expect("ok")
+            {
+                Some(ChildFrame::ApprovalRequest { id, body }) => {
+                    saw_request = true;
+                    assert_eq!(body.get("tool_name").and_then(|v| v.as_str()), Some("Bash"));
+                    link.send(ParentFrame::ApprovalReply { id, approved: true })
+                        .await
+                        .unwrap();
+                }
+                Some(ChildFrame::Terminal { result, .. }) => break result,
+                _ => continue,
+            }
+        };
+        assert!(saw_request, "the worker must proxy an approval request up");
+        assert_eq!(result.as_deref(), Some("approved"));
     }
 }
