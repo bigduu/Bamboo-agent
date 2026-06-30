@@ -20,7 +20,6 @@ use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_subagent::discovery::Discovery;
 use bamboo_subagent::fleet::{spawn_worker_on_bus, SpawnedChild};
 use bamboo_subagent::proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 use bamboo_subagent::provision::{
@@ -165,19 +164,6 @@ pub struct ActorChildRunner {
     /// workers instead of all landing on the first candidate. Best-effort spread,
     /// not a load balancer — the registry's live set can change between picks.
     schedule_cursor: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// Per-`(registry_url, token)` cache of built [`RegistryFabric`]s (#202). A fabric
-    /// holds a reqwest `Client` (already connection-pooled), so under sibling
-    /// fan-out we construct ONE fabric per registry and reuse it across schedules
-    /// instead of rebuilding a fresh client every spawn. Construct-once-then-reuse;
-    /// a benign duplicate build under a startup race is harmless (last writer wins,
-    /// the loser's fabric drops). The bearer lives INSIDE the fabric's sensitive
-    /// `Authorization` header — never logged, never re-stringified here.
-    // Keyed by (registry_url, token) — NOT url alone — so two placements that
-    // share a registry but present DIFFERENT bearers never reuse each other's
-    // fabric (which would issue a discover query with the wrong token). #202.
-    fabric_cache: Arc<
-        std::sync::Mutex<HashMap<(String, Option<String>), Arc<bamboo_subagent::RegistryFabric>>>,
-    >,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -287,7 +273,6 @@ impl ActorChildRunner {
             remote_placements: HashMap::new(),
             schedulable_placements: HashMap::new(),
             schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            fabric_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -563,83 +548,17 @@ impl ActorChildRunner {
         spec
     }
 
-    /// Max DISTINCT live candidates a single schedulable resolve will try to
-    /// connect to before giving up (#202). Bounds the connect-fail failover so a
-    /// pool full of stale-but-leased workers can't make one spawn walk the whole
-    /// fleet; the effective cap is `min(candidates.len(), MAX_SCHEDULE_CONNECT_ATTEMPTS)`.
-    const MAX_SCHEDULE_CONNECT_ATTEMPTS: usize = 3;
-
-    /// Get-or-build the [`RegistryFabric`] for `placement.registry_url`, caching
-    /// it on the runner (#202). A fabric wraps a connection-pooled reqwest
-    /// `Client`; under sibling fan-out this reuses ONE client per registry instead
-    /// of constructing a fresh one every schedule. Construct-once-then-reuse: a
-    /// cache miss builds (Bearer if configured) and stores it. The bearer stays
-    /// inside the fabric's sensitive `Authorization` header — never logged here.
-    ///
-    /// Concurrency: a brief race can build two fabrics for the same url; that is
-    /// harmless (both are valid, last-insert wins, the loser drops). We never hold
-    /// the cache lock across the build, so an `await`-free critical section can't
-    /// deadlock or stall siblings.
-    fn fabric_for(
-        &self,
-        placement: &ResolvedSchedulablePlacement,
-        role: &str,
-    ) -> std::result::Result<Arc<bamboo_subagent::RegistryFabric>, AgentError> {
-        // (registry_url, token) identity: a wrong-token fabric must never be
-        // reused for a discover query (#202).
-        let key = (placement.registry_url.clone(), placement.token.clone());
-        if let Some(fabric) = self.fabric_cache.lock().unwrap().get(&key).cloned() {
-            return Ok(fabric);
-        }
-
-        // Cache miss: build outside the lock (construction is sync + cheap but we
-        // keep the critical section minimal and await-free regardless).
-        let built = match placement.token.as_deref() {
-            Some(token) => {
-                bamboo_subagent::RegistryFabric::with_token(placement.registry_url.clone(), token)
-            }
-            None => bamboo_subagent::RegistryFabric::new(placement.registry_url.clone()),
-        }
-        .map_err(|e| {
-            AgentError::LLM(format!(
-                "schedulable role '{role}': registry client for '{}' failed: {e}",
-                placement.registry_url
-            ))
-        })?;
-        let arc = Arc::new(built);
-
-        // Insert-or-reuse: if a concurrent caller already populated the slot, take
-        // theirs (the duplicate we built drops) so all siblings share one fabric.
-        let mut cache = self.fabric_cache.lock().unwrap();
-        Ok(cache.entry(key).or_insert(arc).clone())
-    }
-
-    /// Pick a live worker for a SCHEDULABLE role from the agent registry (#181,
-    /// P2b) and CONNECT to it, with connect-fail failover (#202).
-    ///
-    /// Uses a cached [`RegistryFabric`] (per `registry_url`) to list live records
-    /// (the registry already excludes expired leases — health == a live lease),
-    /// filters to those whose `role` == the configured `pool`, then picks a
-    /// starting candidate via per-pool ROUND-ROBIN. Because a live lease is only a
-    /// COARSE health signal (a leased worker can have a dead process / a network
-    /// blip), it does not connect blindly to that one pick: it attempts
-    /// `connect_with_auth_tls`, and on failure WALKS FORWARD to the next DISTINCT
-    /// live candidate and retries — up to `min(candidates.len(),
-    /// MAX_SCHEDULE_CONNECT_ATTEMPTS)` attempts. A single stale-but-leased worker
-    /// therefore no longer fails the whole schedule.
-    ///
-    /// Returns the connected [`ChildClient`] plus the chosen [`AgentRecord`] and
-    /// the placement. No live candidate (empty pool) ⇒ a terminal `AgentError`;
-    /// ALL attempted candidates failing to connect ⇒ a terminal `AgentError` —
-    /// the caller NEVER falls back to a local subprocess (that would silently
-    /// defeat the placement). A registry-query failure is likewise terminal. The
-    /// error logs HOW MANY candidates were tried, never the token.
+    /// Pick a live worker for a SCHEDULABLE role from the BUS (#181, Phase 3):
+    /// ask the broker which actors are connected serving the pool role (presence
+    /// is connection-truth — no HTTP registry, no leases, no connect-fail
+    /// failover), then round-robin one per resolve for spread. Returns the chosen
+    /// worker's mailbox id. An empty pool ⇒ a terminal `AgentError` — NEVER a
+    /// local-subprocess fallback (that would silently defeat the placement).
     async fn resolve_schedulable_worker(
         &self,
         role: &str,
-    ) -> std::result::Result<(ChildClient, AgentRecord, ResolvedSchedulablePlacement), AgentError>
-    {
-        let placement = self
+    ) -> std::result::Result<String, AgentError> {
+        let pool = self
             .schedulable_placements
             .get(role)
             .ok_or_else(|| {
@@ -647,107 +566,49 @@ impl ActorChildRunner {
                     "schedulable placement for role '{role}' vanished before scheduling"
                 ))
             })?
+            .pool
             .clone();
-
-        // Query the registry through the cached, connection-pooled fabric (#202).
-        let fabric = self.fabric_for(&placement, role)?;
-        let records = fabric.discover().await.map_err(|e| {
+        let bus = self.bus.as_ref().ok_or_else(|| {
             AgentError::LLM(format!(
-                "schedulable role '{role}': registry '{}' query failed: {e}",
-                placement.registry_url
+                "schedulable role '{role}': no mailbox bus configured (subagents.broker)"
             ))
         })?;
 
-        // Live candidates = records published under the pool's role. The registry
-        // already dropped expired leases, so presence == health.
-        let candidates: Vec<AgentRecord> = records
-            .into_iter()
-            .filter(|r| r.role == placement.pool)
-            .collect();
+        // Ask the BUS who is connected serving the pool role — presence is
+        // connection-truth (no HTTP registry, no leases, no stale-record failover).
+        let mut q = bamboo_broker::BrokerClient::connect(
+            &bus.endpoint,
+            bamboo_subagent::AgentRef {
+                session_id: format!("sched-q-{role}"),
+                role: None,
+            },
+            &bus.token,
+        )
+        .await
+        .map_err(|e| AgentError::LLM(format!("schedulable role '{role}': bus connect failed: {e}")))?;
+        let candidates = q.list_connected(&pool).await.map_err(|e| {
+            AgentError::LLM(format!("schedulable role '{role}': bus presence query failed: {e}"))
+        })?;
 
         if candidates.is_empty() {
             return Err(AgentError::LLM(format!(
-                "schedulable role '{role}': no live worker in pool '{}' at registry '{}' \
-                 (NOT spawning a local subprocess — a schedulable role has no local fallback)",
-                placement.pool, placement.registry_url
+                "schedulable role '{role}': no live worker in pool '{pool}' on the bus \
+                 (NOT spawning a local subprocess — a schedulable role has no local fallback)"
             )));
         }
 
-        // Round-robin START: advance a per-pool cursor ONCE to pick the starting
-        // index, then walk forward through the remaining candidates on connect
-        // failure. Bumping the cursor only once per resolve keeps the spread
-        // across sibling spawns (each resolve starts one slot further on); the
-        // failover walk is local to this resolve and does not perturb the cursor.
-        let start = {
+        // Round-robin: advance a per-pool cursor once per resolve so successive
+        // sibling spawns spread across the connected pool workers. No failover
+        // needed — a listed worker is connected NOW (the bus only lists live
+        // subscribers), so there is no stale-but-leased candidate to skip.
+        let idx = {
             let mut cursors = self.schedule_cursor.lock().unwrap();
-            let cursor = cursors.entry(placement.pool.clone()).or_insert(0);
+            let cursor = cursors.entry(pool.clone()).or_insert(0);
             let i = *cursor % candidates.len();
             *cursor = cursor.wrapping_add(1);
             i
         };
-
-        // Derive the TLS trust ONCE (pinned CA or default roots / plaintext ws://).
-        let trust_cfg = match placement.ca_cert_file.as_deref() {
-            Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
-                AgentError::LLM(format!(
-                    "scheduled worker CA cert '{}': {e}",
-                    path.display()
-                ))
-            })?),
-            None => None,
-        };
-
-        // Connect-fail failover: try the starting candidate, then walk forward to
-        // the NEXT DISTINCT live candidate on failure, up to the bounded cap. Each
-        // attempt hits a different candidate (modulo wrap from the start index).
-        let max_attempts = candidates.len().min(Self::MAX_SCHEDULE_CONNECT_ATTEMPTS);
-        let mut last_err: Option<String> = None;
-        for attempt in 0..max_attempts {
-            let idx = (start + attempt) % candidates.len();
-            let record = &candidates[idx];
-            let endpoint = record.endpoint.clone();
-            match ChildClient::connect_with_auth_tls(
-                &endpoint,
-                placement.token.as_deref(),
-                trust_cfg.clone(),
-            )
-            .await
-            {
-                Ok(client) => {
-                    if attempt > 0 {
-                        // We skipped one or more stale-but-leased workers — record
-                        // how many (never the endpoint contents beyond the host we
-                        // connected to, never the token).
-                        tracing::info!(
-                            "schedulable role '{role}': connected to pool '{}' worker after \
-                             {attempt} stale candidate(s) skipped",
-                            placement.pool
-                        );
-                    }
-                    return Ok((client, candidates[idx].clone(), placement));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "schedulable role '{role}': pool '{}' candidate connect failed \
-                         (attempt {}/{max_attempts}): {e}",
-                        placement.pool,
-                        attempt + 1
-                    );
-                    last_err = Some(e.to_string());
-                }
-            }
-        }
-
-        // All attempted candidates failed to connect ⇒ terminal error. NO spawn
-        // fallback (a schedulable role has none). Log how many were tried, not the
-        // token.
-        Err(AgentError::LLM(format!(
-            "schedulable role '{role}': all {max_attempts} live candidate(s) in pool '{}' at \
-             registry '{}' failed to connect (last error: {}) — NOT spawning a local subprocess",
-            placement.pool,
-            placement.registry_url,
-            last_err.as_deref().unwrap_or("unknown")
-        )))
+        Ok(candidates[idx].clone())
     }
 }
 
@@ -884,23 +745,51 @@ impl ExternalChildRunner for ActorChildRunner {
                 (actor, client)
             }
             PlacementKind::Schedulable => {
-                // SCHEDULABLE branch (#181, P2b + #202): resolve a LIVE worker from
-                // the registry (round-robin over the pool's live records) AND
-                // connect to it, with connect-fail failover — on a stale-but-leased
-                // worker, resolve walks to the next live candidate (bounded). No
-                // spawn, no pool, no kill, NO local fallback — no live worker, or
-                // ALL candidates dead ⇒ a terminal error (raised inside
-                // resolve_schedulable_worker, which owns the connect now).
-                let (client, record, _placement) = self
+                // SCHEDULABLE branch (#181): pick a LIVE worker of the pool role
+                // from the BUS (presence = connection-truth; no HTTP registry, no
+                // leases, no failover) and drive it by mailbox id. The pool worker
+                // stays connected and is reused next time. No spawn, no kill, NO
+                // local fallback — an empty pool is a terminal error (raised in
+                // resolve_schedulable_worker).
+                let bus = self.bus.as_ref().ok_or_else(|| {
+                    AgentError::LLM(
+                        "schedulable sub-agents require a mailbox bus (subagents.broker)"
+                            .to_string(),
+                    )
+                })?;
+                let mailbox_id = self
                     .resolve_schedulable_worker(spec.identity.role.as_str())
                     .await?;
-                // The chosen registry record IS the AgentRecord — synthesize the
-                // process-less handle straight from it (registry-managed worker).
-                let actor = PooledWorker {
-                    worker: SpawnedChild::remote(record),
-                    mailbox_id: job.child_session_id.clone(),
+                let parent = bamboo_subagent::AgentRef {
+                    session_id: format!("p-{}", job.child_session_id),
+                    role: None,
                 };
-                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
+                let link = bamboo_broker::BrokerChildLink::connect(
+                    &bus.endpoint,
+                    parent,
+                    &bus.token,
+                    mailbox_id.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    AgentError::LLM(format!("schedulable link connect to '{mailbox_id}' failed: {e}"))
+                })?;
+                // Process-less handle — a bus-resident pool worker is never ours to
+                // kill (remote ⇒ dropped, not pooled, after the run).
+                let actor = PooledWorker {
+                    worker: SpawnedChild::remote(AgentRecord {
+                        agent_id: mailbox_id.clone(),
+                        role: spec.identity.role.clone(),
+                        labels: Vec::new(),
+                        endpoint: bus.endpoint.clone(),
+                        pid: 0,
+                        version: String::new(),
+                        started_at: chrono::Utc::now(),
+                        lease_expires_at: chrono::Utc::now(),
+                    }),
+                    mailbox_id,
+                };
+                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
                 (actor, client)
             }
             PlacementKind::Local => {
@@ -1700,8 +1589,6 @@ mod tests {
 
     // ---- #181 (P2b): schedulable placement routing --------------------------
 
-    use wiremock::matchers::{method as wm_method, path as wm_path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A bogus-worker_bin runner carrying SCHEDULABLE placements (and optionally
     /// remote ones, to test precedence). A local spawn here would fail on
@@ -1733,19 +1620,6 @@ mod tests {
             registry_url: registry_url.into(),
             token: None,
             ca_cert_file: None,
-        }
-    }
-
-    fn live_record(agent_id: &str, role: &str, endpoint: &str) -> AgentRecord {
-        AgentRecord {
-            agent_id: agent_id.into(),
-            role: role.into(),
-            labels: Vec::new(),
-            endpoint: endpoint.into(),
-            pid: 0,
-            version: String::new(),
-            started_at: chrono::Utc::now(),
-            lease_expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
         }
     }
 
@@ -1812,349 +1686,88 @@ mod tests {
         assert!(spec.secrets.worker_auth_token.is_none());
     }
 
-    /// Spin up `n` loopback Echo `WsServer`s; returns their endpoints and the
-    /// JoinHandles (abort on test end). Each is a REAL connectable worker.
-    async fn spawn_echo_workers(n: usize) -> (Vec<String>, Vec<tokio::task::JoinHandle<()>>) {
-        let mut endpoints = Vec::new();
-        let mut handles = Vec::new();
-        for _ in 0..n {
-            let server = bamboo_subagent::transport::WsServer::bind_loopback()
-                .await
-                .expect("bind echo worker");
-            endpoints.push(server.ws_endpoint());
-            handles.push(tokio::spawn(async move {
-                let _ = server
-                    .serve(Arc::new(bamboo_subagent::executor::EchoExecutor))
-                    .await;
-            }));
-        }
-        (endpoints, handles)
-    }
+    // ---- #181: schedulable selection over the BUS (Phase 3 cutover) ----------
 
-    #[tokio::test]
-    async fn resolve_schedulable_worker_round_robin_spreads_over_candidates() {
-        // Registry returns three live, CONNECTABLE workers in the pool; successive
-        // picks must advance the per-pool cursor and cover all three (round-robin
-        // spread). resolve now also connects, so the candidates are real servers.
-        let (eps, handles) = spawn_echo_workers(3).await;
-        let registry = MockServer::start().await;
-        let recs = vec![
-            live_record("w-0", "gpu-pool", &eps[0]),
-            live_record("w-1", "gpu-pool", &eps[1]),
-            live_record("w-2", "gpu-pool", &eps[2]),
-            // A worker in a DIFFERENT pool must be filtered out.
-            live_record("other", "cpu-pool", "ws://127.0.0.1:9"),
-        ];
-        Mock::given(wm_method("GET"))
-            .and(wm_path("/v1/agents"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recs))
-            .mount(&registry)
-            .await;
-
-        let mut sched = HashMap::new();
-        sched.insert(
-            "explorer".to_string(),
-            sched_placement("gpu-pool", registry.uri()),
-        );
-        let runner = bogus_sched_runner(HashMap::new(), sched);
-
-        // Three picks → cursor 0,1,2 → agent_ids w-0, w-1, w-2 in order.
-        let mut picked = Vec::new();
-        for _ in 0..3 {
-            let (client, rec, placement) = match runner.resolve_schedulable_worker("explorer").await
-            {
-                Ok(v) => v,
-                Err(e) => panic!("a live worker is picked: {e}"),
-            };
-            assert_eq!(placement.pool, "gpu-pool");
-            assert_eq!(rec.role, "gpu-pool", "only pool workers are candidates");
-            picked.push(rec.agent_id);
-            let _ = client.close().await;
-        }
-        picked.sort();
-        assert_eq!(
-            picked,
-            vec!["w-0".to_string(), "w-1".to_string(), "w-2".to_string()],
-            "round-robin covered every candidate over three picks"
-        );
-        for h in handles {
-            h.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_schedulable_worker_fails_over_dead_first_candidate() {
-        // The FIRST candidate (by cursor order: cursor starts at 0) points at a
-        // DEAD endpoint (no listener on a closed port); a LATER candidate is a real
-        // Echo worker. resolve must SKIP the dead one and connect to the live one,
-        // returning the live record — connect-fail failover (#202).
-        let (eps, handles) = spawn_echo_workers(1).await;
-        // A port with no listener: bind then drop to free it (best-effort closed).
-        let dead = {
-            let l = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let port = l.local_addr().unwrap().port();
-            drop(l);
-            format!("ws://127.0.0.1:{port}")
-        };
-        let registry = MockServer::start().await;
-        let recs = vec![
-            // idx 0 = cursor start = DEAD
-            live_record("w-dead", "gpu-pool", &dead),
-            // idx 1 = LIVE echo worker
-            live_record("w-live", "gpu-pool", &eps[0]),
-        ];
-        Mock::given(wm_method("GET"))
-            .and(wm_path("/v1/agents"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recs))
-            .mount(&registry)
-            .await;
-
-        let mut sched = HashMap::new();
-        sched.insert(
-            "explorer".to_string(),
-            sched_placement("gpu-pool", registry.uri()),
-        );
-        let runner = bogus_sched_runner(HashMap::new(), sched);
-
-        let (client, rec, _placement) = match runner.resolve_schedulable_worker("explorer").await {
-            Ok(v) => v,
-            Err(e) => panic!("failover skips the dead candidate, connects to the live one: {e}"),
-        };
-        assert_eq!(
-            rec.agent_id, "w-live",
-            "the dead first candidate was skipped; the live one was chosen"
-        );
-        let _ = client.close().await;
-        for h in handles {
-            h.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_schedulable_worker_errors_when_all_candidates_dead() {
-        // ALL candidates point at dead endpoints: resolve must error (no panic),
-        // and CRUCIALLY no spawn (a schedulable role has no local fallback). The
-        // error names how many were tried.
-        let mut dead = Vec::new();
-        for _ in 0..2 {
-            let l = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let port = l.local_addr().unwrap().port();
-            drop(l);
-            dead.push(format!("ws://127.0.0.1:{port}"));
-        }
-        let registry = MockServer::start().await;
-        let recs = vec![
-            live_record("d-0", "gpu-pool", &dead[0]),
-            live_record("d-1", "gpu-pool", &dead[1]),
-        ];
-        Mock::given(wm_method("GET"))
-            .and(wm_path("/v1/agents"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recs))
-            .mount(&registry)
-            .await;
-
-        let mut sched = HashMap::new();
-        sched.insert(
-            "explorer".to_string(),
-            sched_placement("gpu-pool", registry.uri()),
-        );
-        let runner = bogus_sched_runner(HashMap::new(), sched);
-
-        let msg = match runner.resolve_schedulable_worker("explorer").await {
-            Ok(_) => panic!("all candidates dead must error, not connect"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            msg.contains("failed to connect"),
-            "names the connect failure: {msg}"
-        );
-        assert!(msg.contains("gpu-pool"), "names the pool: {msg}");
-        assert!(
-            msg.contains("NOT spawning"),
-            "confirms no local-subprocess fallback: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn fabric_cache_reuses_one_fabric_per_registry_url() {
-        // Two resolves to the SAME registry_url must REUSE one cached fabric (#202):
-        // after N calls the cache has exactly one entry for that url.
-        let (eps, handles) = spawn_echo_workers(1).await;
-        let registry = MockServer::start().await;
-        Mock::given(wm_method("GET"))
-            .and(wm_path("/v1/agents"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(vec![live_record("w-0", "gpu-pool", &eps[0])]),
-            )
-            .mount(&registry)
-            .await;
-
-        let mut sched = HashMap::new();
-        sched.insert(
-            "explorer".to_string(),
-            sched_placement("gpu-pool", registry.uri()),
-        );
-        let runner = bogus_sched_runner(HashMap::new(), sched);
-
-        for _ in 0..3 {
-            let (client, _rec, _p) = match runner.resolve_schedulable_worker("explorer").await {
-                Ok(v) => v,
-                Err(e) => panic!("resolve succeeds: {e}"),
-            };
-            let _ = client.close().await;
-        }
-
-        let cache = runner.fabric_cache.lock().unwrap();
-        assert_eq!(
-            cache.len(),
-            1,
-            "three resolves to the same (registry_url, token) reused ONE cached fabric"
-        );
-        assert!(cache.contains_key(&(registry.uri(), None)));
-        drop(cache);
-        for h in handles {
-            h.abort();
-        }
-    }
-
-    #[test]
-    fn fabric_cache_keys_on_registry_url_and_token() {
-        // Two placements sharing a registry_url but presenting DIFFERENT tokens
-        // must NOT share a fabric — a reused wrong-bearer fabric would issue the
-        // discover query with the other role's token (#202 review F1).
-        let runner = bogus_sched_runner(HashMap::new(), HashMap::new());
-        let url = "http://127.0.0.1:9/".to_string();
-        let mut p = sched_placement("pool", url.clone());
-
-        p.token = Some("token-a".into());
-        let fa = runner.fabric_for(&p, "role-a").expect("build a");
-        p.token = Some("token-b".into());
-        let fb = runner.fabric_for(&p, "role-b").expect("build b");
-        // Same url, different token → two distinct cache entries (not aliased).
-        assert!(
-            !Arc::ptr_eq(&fa, &fb),
-            "different tokens must not share a fabric"
-        );
-        assert_eq!(runner.fabric_cache.lock().unwrap().len(), 2);
-        // Re-requesting token-a reuses the first fabric.
-        p.token = Some("token-a".into());
-        let fa2 = runner.fabric_for(&p, "role-a").expect("reuse a");
-        assert!(Arc::ptr_eq(&fa, &fa2), "same (url, token) must reuse");
-        assert_eq!(runner.fabric_cache.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn resolve_schedulable_worker_errors_with_no_live_worker() {
-        // The pool has no live workers (registry returns an empty / off-pool set):
-        // a clear error, and CRUCIALLY no spawn (a schedulable role has no local
-        // fallback).
-        let registry = MockServer::start().await;
-        Mock::given(wm_method("GET"))
-            .and(wm_path("/v1/agents"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![live_record(
-                "x",
-                "cpu-pool",
-                "ws://127.0.0.1:9",
-            )]))
-            .mount(&registry)
-            .await;
-        let mut sched = HashMap::new();
-        sched.insert(
-            "explorer".to_string(),
-            sched_placement("gpu-pool", registry.uri()),
-        );
-        let runner = bogus_sched_runner(HashMap::new(), sched);
-
-        let msg = match runner.resolve_schedulable_worker("explorer").await {
-            Ok(_) => panic!("no live worker in pool must error, not connect"),
-            Err(e) => e.to_string(),
-        };
-        assert!(msg.contains("no live worker"), "clear error: {msg}");
-        assert!(msg.contains("gpu-pool"), "names the pool: {msg}");
-    }
-
-    /// Full schedulable e2e: a resident `WsServer` Echo worker is registered (via a
-    /// wiremock registry) into pool "gpu-pool"; the runner is configured with a
-    /// schedulable placement for role "explorer" → that pool, plus a BOGUS
-    /// worker_bin (`/bin/false`). A passing run proves the SCHEDULABLE path RESOLVES
-    /// the worker from the registry and connects to it WITHOUT ever spawning a local
-    /// subprocess (a spawn would fail on /bin/false), and that an echo result flows
-    /// back.
-    #[tokio::test]
-    async fn execute_external_child_schedules_role_from_registry_without_spawning() {
-        // 1. Stand up the resident Echo worker on loopback (no bearer needed here).
-        let server = bamboo_subagent::transport::WsServer::bind_loopback()
-            .await
-            .expect("bind resident worker");
-        let endpoint = server.ws_endpoint(); // ws://127.0.0.1:<port>
-        let srv = tokio::spawn(async move {
-            let _ = server
-                .serve(Arc::new(bamboo_subagent::executor::EchoExecutor))
-                .await;
+    async fn start_bus() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
+        let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
         });
+        (format!("ws://{addr}"), dir)
+    }
 
-        // 2. Registry: returns the live worker registered into pool "gpu-pool"
-        //    pointing at the real worker endpoint.
-        let registry = MockServer::start().await;
-        Mock::given(wm_method("GET"))
-            .and(wm_path("/v1/agents"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![live_record(
-                "live-explorer",
-                "gpu-pool",
-                &endpoint,
-            )]))
-            .mount(&registry)
-            .await;
-
-        // 3. Runner: role "explorer" → schedulable on "gpu-pool"; bogus worker_bin.
-        let mut sched = HashMap::new();
-        sched.insert(
-            "explorer".to_string(),
-            sched_placement("gpu-pool", registry.uri()),
-        );
-        let runner = bogus_sched_runner(HashMap::new(), sched);
-
-        // 4. Drive a real run for that role.
-        let mut session = session_of_role("explorer", "hello scheduled");
-        let job = job_for("child-1");
-        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
-        let cancel = CancellationToken::new();
-
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            runner.execute_external_child(&mut session, &job, event_tx, cancel),
+    async fn join_pool(endpoint: &str, id: &str, pool: &str) -> bamboo_broker::BrokerClient {
+        let mut c = bamboo_broker::BrokerClient::connect(
+            endpoint,
+            bamboo_subagent::AgentRef {
+                session_id: id.into(),
+                role: Some(pool.into()),
+            },
+            "t",
         )
         .await
-        .expect("run did not hang")
-        .expect("scheduled run succeeded (resolved from registry, did not spawn)");
+        .unwrap();
+        c.subscribe().await.unwrap();
+        c
+    }
 
-        // The EchoExecutor's reply is written back — proof a terminal flowed back.
-        let last = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::Assistant))
-            .expect("an assistant reply was written back");
-        assert!(
-            last.content.contains("echo:"),
-            "expected echo reply, got {:?}",
-            last.content
-        );
+    fn sched_runner_on_bus(endpoint: &str, child_role: &str, pool: &str) -> ActorChildRunner {
+        let mut sched = HashMap::new();
+        sched.insert(child_role.to_string(), sched_placement(pool, "unused"));
+        bogus_sched_runner(HashMap::new(), sched).with_bus(Some(bamboo_subagent::BusEndpoint {
+            endpoint: endpoint.into(),
+            token: "t".into(),
+        }))
+    }
 
-        // Best-effort: confirm streamed events also flowed.
-        let mut saw_event = false;
-        while let Ok(Some(_ev)) =
-            tokio::time::timeout(Duration::from_millis(50), event_rx.recv()).await
-        {
-            saw_event = true;
+    #[tokio::test]
+    async fn resolve_schedulable_picks_a_live_bus_worker() {
+        let (endpoint, _dir) = start_bus().await;
+        let _w = join_pool(&endpoint, "w-gpu", "gpu-pool").await;
+        let runner = sched_runner_on_bus(&endpoint, "explorer", "gpu-pool");
+
+        let mailbox = runner
+            .resolve_schedulable_worker("explorer")
+            .await
+            .expect("a live pool worker is found on the bus");
+        assert_eq!(mailbox, "w-gpu");
+    }
+
+    #[tokio::test]
+    async fn resolve_schedulable_round_robins_over_pool_workers() {
+        let (endpoint, _dir) = start_bus().await;
+        let _a = join_pool(&endpoint, "w-a", "gpu-pool").await;
+        let _b = join_pool(&endpoint, "w-b", "gpu-pool").await;
+        let runner = sched_runner_on_bus(&endpoint, "explorer", "gpu-pool");
+
+        // Successive resolves spread across both connected workers.
+        let mut picked = std::collections::HashSet::new();
+        for _ in 0..6 {
+            picked.insert(runner.resolve_schedulable_worker("explorer").await.unwrap());
         }
-        let _ = saw_event;
+        assert_eq!(
+            picked,
+            ["w-a".to_string(), "w-b".to_string()].into_iter().collect(),
+            "round-robin must cover every connected pool worker"
+        );
+    }
 
-        srv.abort();
+    #[tokio::test]
+    async fn resolve_schedulable_errors_on_empty_pool() {
+        let (endpoint, _dir) = start_bus().await;
+        // No worker subscribes to "gpu-pool".
+        let runner = sched_runner_on_bus(&endpoint, "explorer", "gpu-pool");
+
+        let err = runner
+            .resolve_schedulable_worker("explorer")
+            .await
+            .expect_err("an empty pool is terminal — no local fallback")
+            .to_string();
+        assert!(err.contains("no live worker in pool"), "got: {err}");
+        assert!(err.contains("NOT spawning"), "got: {err}");
     }
 }
