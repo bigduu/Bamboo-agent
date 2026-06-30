@@ -549,14 +549,25 @@ async fn maybe_embed_broker(
     config: &mut bamboo_llm::Config,
     data_dir: &std::path::Path,
 ) -> Option<EmbeddedBroker> {
-    // Respect an externally-configured broker (multi-host / shared bus).
-    if config
-        .subagents
-        .broker
-        .as_ref()
-        .is_some_and(|b| !b.endpoint.trim().is_empty())
-    {
-        return None;
+    // Respect an externally-configured broker (multi-host / shared bus) ONLY if
+    // it is actually REACHABLE. A persisted-but-DEAD endpoint — most commonly a
+    // PRIOR run's embedded auto-port that leaked into config.json — must never be
+    // trusted: fall through and embed a fresh broker, overriding it below.
+    // Without this every sub-agent (and the MCP proxy) hits "connect refused" on
+    // the stale port — sub-agents fail to launch with no streaming. Probing keeps
+    // a genuinely live external / standalone broker working.
+    if let Some(b) = config.subagents.broker.as_ref() {
+        let endpoint = b.endpoint.trim();
+        if !endpoint.is_empty() && broker_endpoint_reachable(endpoint).await {
+            return None;
+        }
+        if !endpoint.is_empty() {
+            tracing::warn!(
+                %endpoint,
+                "configured subagents.broker is unreachable (stale embedded port?) — \
+                 embedding a fresh in-process broker and overriding it"
+            );
+        }
     }
 
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -598,6 +609,31 @@ async fn maybe_embed_broker(
     Some(EmbeddedBroker { task, gc_task })
 }
 
+/// Best-effort TCP reachability probe of a `ws[s]://host:port[/path]` broker
+/// endpoint. Used to tell a LIVE external/standalone broker (keep) apart from a
+/// DEAD persisted endpoint (a prior run's embedded auto-port that leaked into
+/// config.json — re-embed). A short timeout keeps boot fast when it's dead.
+async fn broker_endpoint_reachable(endpoint: &str) -> bool {
+    let host_port = endpoint
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if host_port.is_empty() {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(host_port),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 /// On boot, mark stale cluster-fabric node state as `Unreachable`: workers
 /// deployed by the previous process were session-bound (they died with it), so a
 /// persisted `Running`/`Deploying` status no longer reflects reality. Best-effort
@@ -633,5 +669,29 @@ async fn reconcile_fabric_on_boot(
 
     if let Err(e) = snapshot.save_to_dir(data_dir.to_path_buf()) {
         tracing::warn!("cluster-fabric boot reconcile: failed to persist: {e}");
+    }
+}
+
+#[cfg(test)]
+mod broker_embed_tests {
+    use super::broker_endpoint_reachable;
+
+    #[tokio::test]
+    async fn reachability_probe_distinguishes_live_from_dead() {
+        // Bound-then-dropped port: nothing listening ⇒ unreachable (a stale
+        // persisted embedded endpoint must NOT be trusted).
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = l.local_addr().unwrap();
+        drop(l);
+        assert!(!broker_endpoint_reachable(&format!("ws://{dead}")).await);
+
+        // Empty / malformed ⇒ never trusted.
+        assert!(!broker_endpoint_reachable("").await);
+        assert!(!broker_endpoint_reachable("ws://").await);
+
+        // A LIVE listener (with a path) ⇒ reachable (a real external broker is kept).
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = live.local_addr().unwrap();
+        assert!(broker_endpoint_reachable(&format!("ws://{addr}/stream")).await);
     }
 }
