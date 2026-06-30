@@ -114,6 +114,15 @@ impl AppState {
         // In-memory session cache (shared across handlers and background jobs).
         let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
 
+        // Embed the mailbox bus (broker) in-process unless an external one is
+        // configured. Mutates `config.subagents.broker` to point at the loopback
+        // bus BEFORE it is wrapped/read downstream, so ask_agent / deploy_agent /
+        // cluster all wire to it — and a standalone `bamboo broker serve` is no
+        // longer required for sub-agent dispatch. (Foundation for routing local
+        // actors onto the bus.)
+        let mut config = config;
+        let embedded_broker = maybe_embed_broker(&mut config, &data_dir).await;
+
         let config = Arc::new(RwLock::new(config));
 
         // Wire the configured-default-workspace resolver into agent-core. This keeps
@@ -478,6 +487,7 @@ impl AppState {
             config,
             config_io_lock,
             fabric_deployer,
+            embedded_broker,
             provider: provider_lock,
             provider_handle,
             sessions,
@@ -516,6 +526,70 @@ impl AppState {
             agent_registry: Arc::new(crate::handlers::agent::agents::AgentRegistry::new()),
         })
     }
+}
+
+/// A handle to the in-process mailbox bus (broker) so it can be shut down with
+/// the server. Dropping it aborts the serve task.
+pub struct EmbeddedBroker {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for EmbeddedBroker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Start an in-process broker on `127.0.0.1:<auto>` and point
+/// `config.subagents.broker` at it — UNLESS an external broker is already
+/// configured (then use that). Returns `None` when an external broker is used
+/// or the bind fails (sub-agent dispatch then degrades exactly as before).
+async fn maybe_embed_broker(
+    config: &mut bamboo_llm::Config,
+    data_dir: &std::path::Path,
+) -> Option<EmbeddedBroker> {
+    // Respect an externally-configured broker (multi-host / shared bus).
+    if config
+        .subagents
+        .broker
+        .as_ref()
+        .is_some_and(|b| !b.endpoint.trim().is_empty())
+    {
+        return None;
+    }
+
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("embedded broker: bind failed, sub-agent dispatch disabled: {e}");
+            return None;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => {
+            tracing::warn!("embedded broker: local_addr failed: {e}");
+            return None;
+        }
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let root = data_dir.join("broker");
+    let core = Arc::new(bamboo_broker::BrokerCore::new(root));
+    let server = Arc::new(bamboo_broker::BrokerServer::new(core, token.clone()));
+
+    let task = tokio::spawn(async move {
+        if let Err(e) = server.serve(listener).await {
+            tracing::error!("embedded broker serve loop ended: {e}");
+        }
+    });
+
+    config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
+        endpoint: format!("ws://127.0.0.1:{port}"),
+        token,
+        token_encrypted: None,
+    });
+    tracing::info!(port, "embedded mailbox bus (broker) started in-process");
+    Some(EmbeddedBroker { task })
 }
 
 /// On boot, mark stale cluster-fabric node state as `Unreachable`: workers

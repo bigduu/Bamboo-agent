@@ -177,6 +177,13 @@ pub struct AppState {
     /// HTTP operator handlers and the `cluster` agent tool).
     pub fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
 
+    /// In-process mailbox bus (broker), when not externally configured. Held so
+    /// it lives for the server's lifetime (dropping it aborts the bus). `None`
+    /// when an external broker is configured or the bus couldn't bind. Never read
+    /// — its only job is to keep the bus task alive until AppState drops.
+    #[allow(dead_code)]
+    embedded_broker: Option<builder::EmbeddedBroker>,
+
     /// Hot-reloadable LLM provider with direct access
     ///
     /// This eliminates the proxy pattern where we created an AgentAppState
