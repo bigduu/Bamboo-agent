@@ -527,12 +527,11 @@ pub struct Config {
 
     /// Sub-agent execution settings.
     ///
-    /// The one knob most users need is `runtime`:
-    /// `"subagents": { "runtime": "actor" }` runs every sub-agent as an
-    /// independent actor process (crash isolation, true parallelism).
-    /// Everything else (worker binary, discovery dir) is derived
-    /// automatically. Always serialized so the knob is discoverable in
-    /// `bamboo config`.
+    /// Sub-agents ALWAYS run as independent actor subprocesses (crash isolation,
+    /// true parallelism) — the in-process runtime was removed, so there is no
+    /// `runtime` toggle (a stray `runtime`/`overrides` key in an old config is
+    /// silently ignored). Most users need nothing here; the fields below
+    /// (`max_concurrent`, `broker`, remote/schedulable placements) are advanced.
     #[serde(default)]
     pub subagents: SubagentsConfig,
 

@@ -136,9 +136,18 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     // #73: a deployed broker-agent is definitionally unattended — no interactive
     // human to answer approvals. Mark it so that IF gating is ever enabled for
     // it, its (and its sub-agents') gated actions are model-reviewed locally
-    // rather than hard-denied (host=None, reviewer=None). A no-op today since the
-    // broker-agent doesn't set `enforce_permissions`.
+    // rather than hard-denied (host=None, reviewer=None).
     spec.capabilities.no_human_approver = true;
+
+    // DELIBERATE DIVERGENCE (audited): unlike the actor child runner — which
+    // hard-sets `enforce_permissions = true` because it owns the per-run
+    // ApprovalProxy bridge — this path leaves it `false`. A broker-agent has NO
+    // approval-delegation channel over the broker, so a permission gate here
+    // would have nowhere to escalate (it would fail-closed and break legitimate
+    // dangerous-but-needed ops). Flipping this on REQUIRES first wiring
+    // approval-delegation over the broker; until then this is the intentional
+    // (trusted-infra) posture, not an oversight.
+    // spec.capabilities.enforce_permissions stays false — see provision.rs.
 
     Ok(spec)
 }

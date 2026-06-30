@@ -53,6 +53,9 @@ pub struct ProvisionSpec {
     /// (role/provider/model/workspace/tools), so N sibling sub-agents no longer
     /// mean N processes. Each run still gets a fresh session rehydrated from the
     /// run's `messages`, so context stays isolated across reuses.
+    ///
+    /// (The production actor runner always sets this `true`; the `false` path is
+    /// exercised only by one-shot CLI/test workers.)
     #[serde(default)]
     pub reusable: bool,
     /// Where this actor runs. `Local` (default) — the parent spawns a local
@@ -91,9 +94,13 @@ pub struct Capabilities {
     /// When `true`, the worker builds its tool executor WITH a permission
     /// checker, so gated tools hit `ConfirmationRequired` and delegate the
     /// decision to the host via the per-run `ApprovalProxy` (Phase 2:
-    /// child → parent approval). Default `false` preserves the legacy behavior
-    /// (the worker runs all tools unchecked). Only meaningful when the run has a
-    /// host bridge to proxy to — real actor runs always do.
+    /// child → parent approval). Default `false` runs all tools unchecked.
+    ///
+    /// In practice this is effectively fixed per spawn path, not a free knob:
+    /// the actor runner hard-sets it `true` (it has the ApprovalProxy bridge),
+    /// while the broker-agent path leaves it `false` ON PURPOSE — that path has
+    /// no approval delegation over the broker, so a gate would have nothing to
+    /// delegate to. Only meaningful when the run has a host bridge to proxy to.
     #[serde(default)]
     pub enforce_permissions: bool,
     /// When `true`, the worker builds its OWN external-child runner + scheduler

@@ -9,7 +9,10 @@
 //!
 //! Topology: a single central broker (hub-and-spoke). It is a *pure message
 //! bus* — it routes messages, it does not spawn actors or coordinate with other
-//! brokers. Placement/spawning lives behind `bamboo_subagent::WorkerLauncher`.
+//! brokers. Spawning the PUSH-side workers lives in [`deploy`] (the `Deployer`
+//! family: local / docker / ssh / russh). (The `bamboo_subagent::WorkerLauncher`
+//! trait that earlier docs referenced was never wired and has been removed; the
+//! PULL-side actor runner dispatches placement inline.)
 //!
 //! Layers:
 //! - [`proto`] — the client↔broker wire frames.

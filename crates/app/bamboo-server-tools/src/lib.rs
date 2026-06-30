@@ -11,6 +11,7 @@ pub mod cluster_tool;
 pub mod compact;
 pub mod deploy_agent;
 pub mod fabric_deploy;
+pub mod registry_keys;
 pub mod memory;
 pub mod overlay_executor;
 pub mod session_inspector;

@@ -122,7 +122,7 @@ impl FabricDeployer {
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker
         // port before the new deploy requests the same forward.
-        if let Some(prev) = self.registry.lock().await.remove(node_id) {
+        if let Some(prev) = self.registry.lock().await.remove(&crate::registry_keys::node_key(node_id)) {
             prev.handle.shutdown().await;
         }
 
@@ -156,7 +156,7 @@ impl FabricDeployer {
         );
 
         self.registry.lock().await.insert(
-            node_id.to_string(),
+            crate::registry_keys::node_key(node_id),
             Deployed {
                 env: placement_env(&node).to_string(),
                 handle,
@@ -188,7 +188,7 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             self.node_snapshot(&cfg, node_id)?;
         }
-        if let Some(d) = self.registry.lock().await.remove(node_id) {
+        if let Some(d) = self.registry.lock().await.remove(&crate::registry_keys::node_key(node_id)) {
             d.handle.shutdown().await;
         }
         tracing::info!(audit = "cluster_fabric.stop", node = node_id, outcome = "stopped");

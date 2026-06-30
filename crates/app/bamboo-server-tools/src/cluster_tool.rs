@@ -412,14 +412,15 @@ mod tests {
         let registry = deployer.registry();
         let t = ClusterTool::new(cfg, deployer);
 
+        let key = crate::registry_keys::node_key("n1");
         let out = parse(t.deploy("n1", true).await.unwrap());
         assert_eq!(out["worker_id"], "node-n1");
         assert_eq!(out["status"], "deployed");
-        assert!(registry.lock().await.contains_key("n1"), "handle registered");
+        assert!(registry.lock().await.contains_key(&key), "handle registered");
 
         let stopped = parse(t.stop("n1").await.unwrap());
         assert_eq!(stopped["status"], "stopped");
-        assert!(!registry.lock().await.contains_key("n1"), "handle removed");
+        assert!(!registry.lock().await.contains_key(&key), "handle removed");
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
