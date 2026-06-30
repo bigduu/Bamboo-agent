@@ -35,11 +35,13 @@ pub struct AgentDeployment {
     /// When set, redirect the worker's stdout+stderr to this file (a LOCAL path
     /// for local deploys, a REMOTE path for ssh/russh) so `tail_log` can read it.
     pub log_path: Option<String>,
-    /// A parent-resolved `ProvisionSpec` (serialized JSON) to pipe to the worker's
-    /// stdin with `--spec-stdin` — the orchestrator decides model/creds/MCP/bus,
-    /// the worker stops self-resolving from its host config. `None` keeps the
-    /// legacy argv+env self-resolve bootstrap. Honored by deployers that pipe
-    /// stdin (local today); others ignore it and self-resolve.
+    /// A parent-resolved `ProvisionSpec` (serialized JSON) the orchestrator ships
+    /// to the worker — model/creds/MCP/bus all decided here, so the worker stops
+    /// self-resolving from its host config (a remote node needs no bamboo config
+    /// of its own). Delivery is per-deployer: Local pipes it to stdin
+    /// (`--spec-stdin`); Ssh/Russh upload it to a remote file (`--spec-file`).
+    /// `None` keeps the legacy argv+env self-resolve bootstrap (Docker still
+    /// self-resolves via its mounted home).
     pub spec_json: Option<String>,
 }
 
@@ -541,7 +543,7 @@ impl SshDeployer {
 
     /// `ssh` argv: the host, then a single remote command string (env prefix +
     /// bamboo + args, each shell-quoted). `-tt` so a local kill propagates.
-    fn argv(&self, d: &AgentDeployment) -> Vec<String> {
+    fn argv(&self, d: &AgentDeployment, spec_file: Option<&str>) -> Vec<String> {
         // Reverse-tunnel the broker port to the remote's loopback (`-R`), so the
         // worker reaches the host broker via 127.0.0.1 over THIS ssh connection —
         // no host-reachable IP and no inbound access to the remote needed (the
@@ -593,12 +595,63 @@ impl SshDeployer {
             remote.push(' ');
             remote.push_str(&sh_quote(&arg));
         }
+        // Parent-resolved spec uploaded to the remote: read it instead of
+        // self-resolving from the remote's (possibly absent) local config.
+        if let Some(path) = spec_file {
+            remote.push_str(" --spec-file ");
+            remote.push_str(&sh_quote(path));
+        }
         // Redirect the worker's output to its log file on the remote.
         if let Some(log_path) = &d.log_path {
             remote.push_str(&format!(" > {} 2>&1", sh_quote(log_path)));
         }
         a.push(remote);
         a
+    }
+
+    /// scp a parent-built ProvisionSpec (JSON) to a remote temp file and return
+    /// its remote path, for the worker to read via `--spec-file`. Mirrors the
+    /// binary upload (local temp → scp → atomic rename).
+    async fn upload_spec_file(&self, spec_json: &str, id: &str) -> BrokerResult<String> {
+        let local = std::env::temp_dir().join(format!("bamboo-spec-{id}.json"));
+        tokio::fs::write(&local, spec_json)
+            .await
+            .map_err(|e| BrokerError::Transport(format!("write local spec temp: {e}")))?;
+        let remote_path = format!("/tmp/bamboo-spec-{id}.json");
+        let tmp = format!("{remote_path}.upload");
+        let mut scp_args = vec![
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if let Some(p) = self.port {
+            scp_args.push("-P".into());
+            scp_args.push(p.to_string());
+        }
+        if let Some(idf) = &self.identity_file {
+            scp_args.push("-i".into());
+            scp_args.push(idf.clone());
+        }
+        scp_args.push(local.to_string_lossy().into_owned());
+        scp_args.push(format!("{}:{}", self.host, tmp));
+        let status = Command::new(&self.scp_bin)
+            .args(scp_args)
+            .status()
+            .await
+            .map_err(spawn_err)?;
+        let _ = tokio::fs::remove_file(&local).await;
+        if !status.success() {
+            return Err(BrokerError::Transport(format!(
+                "scp spec upload to {} failed (status {status})",
+                self.host
+            )));
+        }
+        self.ssh_capture(&format!(
+            "mv -f {tmp} {dst}",
+            tmp = sh_quote(&tmp),
+            dst = sh_quote(&remote_path)
+        ))
+        .await?;
+        Ok(remote_path)
     }
 }
 
@@ -607,8 +660,15 @@ impl Deployer for SshDeployer {
     async fn deploy(&self, d: &AgentDeployment) -> BrokerResult<DeployedAgent> {
         // Upload the binary first (hash-skip) so the remote bamboo exists.
         self.upload_if_needed().await?;
+        // Upload the parent-built spec (if any) so the worker reads it via
+        // --spec-file instead of self-resolving from the remote's config.
+        let remote_spec_path = match &d.spec_json {
+            Some(spec_json) => Some(self.upload_spec_file(spec_json, &d.id).await?),
+            None => None,
+        };
         let mut cmd = Command::new(&self.ssh_bin);
-        cmd.args(self.argv(d)).kill_on_drop(true);
+        cmd.args(self.argv(d, remote_spec_path.as_deref()))
+            .kill_on_drop(true);
         let child = cmd.spawn().map_err(spawn_err)?;
         Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
     }
@@ -718,7 +778,7 @@ mod tests {
     #[test]
     fn ssh_argv_reverse_tunnels_broker_and_quotes_remote() {
         let s = SshDeployer::new("gpu-host");
-        let a = s.argv(&dep()); // dep() broker_endpoint = ws://broker:9600
+        let a = s.argv(&dep(), None); // dep() broker_endpoint = ws://broker:9600
         assert_eq!(a[0], "-tt");
         // Host-key checking: trust-on-first-use (accept new host keys, reject a
         // changed key on a known host) — must always be in the constructed argv.
@@ -747,7 +807,7 @@ mod tests {
         // Same-host (localhost) deploy: no -R (it would collide with the broker
         // on the same port); the worker uses the broker endpoint directly.
         let s = SshDeployer::new("localhost");
-        let a = s.argv(&dep());
+        let a = s.argv(&dep(), None);
         assert_eq!(a[0], "-tt");
         // Host-key checking still enforced on same-host deploys.
         assert!(a.windows(2).any(|w| w
@@ -771,7 +831,7 @@ mod tests {
         let s = SshDeployer::new("user@gpu-host")
             .with_port(Some(2222))
             .with_identity(Some("/keys/id_ed25519".into()));
-        let a = s.argv(&dep());
+        let a = s.argv(&dep(), None);
         assert!(a.windows(2).any(|w| w == ["-p".to_string(), "2222".to_string()]));
         assert!(a
             .windows(2)
@@ -782,7 +842,7 @@ mod tests {
     fn with_port_omits_default_22() {
         let s = SshDeployer::new("h").with_port(Some(22));
         assert_eq!(s.port, None, "port 22 is the ssh default; not passed");
-        let a = s.argv(&dep());
+        let a = s.argv(&dep(), None);
         assert!(!a.iter().any(|x| x == "-p"));
     }
 
@@ -794,7 +854,7 @@ mod tests {
         }));
         assert_eq!(s.bamboo_on_remote, ".bamboo-deploy/bamboo");
         // The launch command runs the uploaded binary, not a PATH `bamboo`.
-        let remote = s.argv(&dep()).last().unwrap().clone();
+        let remote = s.argv(&dep(), None).last().unwrap().clone();
         assert!(remote.contains("'.bamboo-deploy/bamboo'"));
     }
 
@@ -809,7 +869,12 @@ mod tests {
         let s = SshDeployer::new("user@box");
         let mut d = dep();
         d.log_path = Some(".bamboo-deploy/node-x.log".into());
-        let remote = s.argv(&d).last().unwrap().clone();
+        let remote = s.argv(&d, Some("/tmp/spec.json")).last().unwrap().clone();
+        assert!(
+            remote.contains("--spec-file '/tmp/spec.json'"),
+            "spec-file must be on the remote command: {remote}"
+        );
+        let remote = s.argv(&d, None).last().unwrap().clone();
         assert!(
             remote.trim_end().ends_with("> '.bamboo-deploy/node-x.log' 2>&1"),
             "got: {remote}"
