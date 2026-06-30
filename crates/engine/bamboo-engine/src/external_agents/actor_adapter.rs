@@ -47,6 +47,14 @@ const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
 /// itself (must comfortably exceed the gap between sibling spawns).
 const POOLED_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Deadline for a local worker's FIRST frame after a Run is dispatched. A warm
+/// worker answers in seconds; a cold spawn within tens. Total silence past this
+/// means the worker is dead (e.g. a pooled worker that exited right after its
+/// liveness check) and its Run is queued with nobody to serve it — trip it so the
+/// runner respawns once instead of hanging forever. Generous, to never false-trip
+/// a slow-but-healthy cold start.
+const WORKER_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A warm worker on the mailbox bus, parked for reuse between runs. It stays
 /// dialed-in + subscribed to `mailbox_id`; the next interchangeable child
 /// delivers its `Run` there instead of spawning a fresh process. Dropping it
@@ -815,6 +823,14 @@ impl ExternalChildRunner for ActorChildRunner {
         };
         let remote = !matches!(kind, PlacementKind::Local);
 
+        // Retry-once loop: a pooled local worker can die between its liveness
+        // check and handling the Run (a tiny TOCTOU window) — its Run then sits
+        // queued with no server. The first-frame watchdog in `drive` surfaces that
+        // as `WorkerUnresponsive`; we reap the dead worker and re-acquire ONCE
+        // (which spawns fresh / reuses the next live one). Remote/schedulable have
+        // no spawn fallback, so they never retry.
+        let mut attempt = 0u8;
+        let (result, actor) = loop {
         let (actor, mut client) = match kind {
             PlacementKind::Remote => {
                 // REMOTE branch: connect to a resident worker. No spawn, no pool
@@ -919,14 +935,20 @@ impl ExternalChildRunner for ActorChildRunner {
             }
         };
 
-        client
+        if let Err(e) = client
             .send(ParentFrame::Run(RunSpec {
-                assignment,
+                // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
+                assignment: assignment.clone(),
                 reasoning_effort: None,
-                messages,
+                messages: messages.clone(),
             }))
             .await
-            .map_err(|e| AgentError::LLM(format!("actor run dispatch failed: {e}")))?;
+        {
+            if !remote {
+                actor.worker.kill().await;
+            }
+            return Err(AgentError::LLM(format!("actor run dispatch failed: {e}")));
+        }
 
         // Register as a live actor so send_message (running, no interrupt) can
         // steer this child in-band over the existing WS connection. The guard
@@ -938,10 +960,13 @@ impl ExternalChildRunner for ActorChildRunner {
             &mut *client,
             &job.child_session_id,
             self.approval_decider.as_ref(),
-            escalation,
+            escalation.clone(),
             &event_tx,
             &cancel_token,
             &mut live_rx,
+            // Only the local (spawn-capable) path can respawn; remote/schedulable
+            // wait without a watchdog (no fallback worker to retry on).
+            if remote { None } else { Some(WORKER_FIRST_FRAME_TIMEOUT) },
         )
         .await;
         // Unregister IMMEDIATELY: after drive returns nobody consumes live_rx,
@@ -950,13 +975,26 @@ impl ExternalChildRunner for ActorChildRunner {
         // (Even if one slipped in earlier, send_message also appends it to the
         // durable transcript, so the next activation still rehydrates it.)
         drop(live_guard);
-
         // Close the parent link (dropping it closes our broker connection; the
-        // worker stays dialed-in + subscribed, ready for its next Run). Then park
-        // the warm worker for reuse on a clean run, or kill it on error/cancel (a
-        // wedged worker must not be reused). Remote / schedulable workers are
-        // registry-managed — never ours to pool/kill, just drop.
+        // worker stays dialed-in + subscribed, ready for its next Run).
         drop(client);
+
+        // A dead pooled local worker: reap it and re-acquire ONCE before giving up.
+        if !remote && attempt == 0 && matches!(result, Err(AgentError::WorkerUnresponsive(_))) {
+            tracing::warn!(
+                "actor child {} got no first frame; reaping the worker and respawning once",
+                job.child_session_id
+            );
+            actor.worker.kill().await;
+            attempt += 1;
+            continue;
+        }
+        break (result, actor);
+        };
+
+        // Park the warm worker for reuse on a clean run, or kill it on
+        // error/cancel (a wedged worker must not be reused). Remote / schedulable
+        // workers are registry-managed — never ours to pool/kill, just drop.
         if remote {
             drop(actor);
         } else {
@@ -1000,12 +1038,32 @@ async fn drive(
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
     live_rx: &mut mpsc::UnboundedReceiver<ParentFrame>,
+    first_frame_timeout: Option<Duration>,
 ) -> crate::runtime::runner::Result<Option<String>> {
+    // First-frame watchdog: a live worker emits its first frame (run-started /
+    // first token) within seconds; total silence past the deadline means the
+    // worker is dead (e.g. a pooled worker that exited right after checkout), so
+    // its Run sits queued forever. We trip ONLY before the first frame — once any
+    // frame arrives the worker is proven live and a legitimately long run (a slow
+    // tool between tokens) never trips it.
+    let mut got_first_frame = false;
+    let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 // fall through to the cancel handling below
                 break;
+            }
+            _ = async {
+                match first_frame_watch.as_mut() {
+                    Some(s) => s.as_mut().await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if !got_first_frame => {
+                return Err(AgentError::WorkerUnresponsive(format!(
+                    "child {child_session_id} produced no frame within {:?}",
+                    first_frame_timeout.unwrap_or_default()
+                )));
             }
             Some(frame) = live_rx.recv() => {
                 // Forward in-band steering to the worker over the existing WS.
@@ -1014,6 +1072,10 @@ async fn drive(
                 }
             }
             frame = client.next_frame() => {
+                // Any frame (event / approval / terminal / close / error) proves
+                // the worker responded — disarm the first-frame watchdog.
+                got_first_frame = true;
+                first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
                         // AgentEvent is serialized verbatim on the wire (zero mapping).
@@ -1344,6 +1406,94 @@ mod tests {
         async fn decide(&self, _child: &str, _req: &serde_json::Value) -> bool {
             self.0
         }
+    }
+
+    // ---- first-frame watchdog (dead-pooled-worker recovery) -----------------
+
+    /// A link that never yields a frame — models a worker that died (or never
+    /// subscribed) so its Run sits queued with no server.
+    struct SilentLink;
+    #[async_trait]
+    impl bamboo_subagent::ChildLink for SilentLink {
+        async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            Ok(())
+        }
+        async fn next_frame(
+            &mut self,
+        ) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+            std::future::pending().await
+        }
+    }
+
+    /// A link that immediately yields one terminal frame (a healthy fast worker).
+    struct InstantTerminalLink {
+        done: bool,
+    }
+    #[async_trait]
+    impl bamboo_subagent::ChildLink for InstantTerminalLink {
+        async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            Ok(())
+        }
+        async fn next_frame(
+            &mut self,
+        ) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+            if self.done {
+                std::future::pending().await
+            } else {
+                self.done = true;
+                Ok(Some(ChildFrame::Terminal {
+                    status: TerminalStatus::Completed,
+                    result: Some("done".into()),
+                    error: None,
+                    transcript: vec![],
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_trips_first_frame_watchdog_on_a_silent_worker() {
+        let (event_tx, _rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+        let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let mut link = SilentLink;
+        let r = drive(
+            &mut link,
+            "child-x",
+            None,
+            None,
+            &event_tx,
+            &cancel,
+            &mut live_rx,
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(AgentError::WorkerUnresponsive(_))),
+            "a silent worker must trip the first-frame watchdog, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_does_not_trip_when_a_frame_arrives() {
+        let (event_tx, _rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+        let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let mut link = InstantTerminalLink { done: false };
+        // Even a tiny timeout must NOT trip: the terminal frame arrives first and
+        // disarms the watchdog.
+        let r = drive(
+            &mut link,
+            "child-y",
+            None,
+            None,
+            &event_tx,
+            &cancel,
+            &mut live_rx,
+            Some(Duration::from_millis(50)),
+        )
+        .await;
+        assert_eq!(r.ok().flatten().as_deref(), Some("done"));
     }
 
     #[tokio::test]
