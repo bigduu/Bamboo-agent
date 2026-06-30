@@ -35,6 +35,12 @@ pub struct AgentDeployment {
     /// When set, redirect the worker's stdout+stderr to this file (a LOCAL path
     /// for local deploys, a REMOTE path for ssh/russh) so `tail_log` can read it.
     pub log_path: Option<String>,
+    /// A parent-resolved `ProvisionSpec` (serialized JSON) to pipe to the worker's
+    /// stdin with `--spec-stdin` — the orchestrator decides model/creds/MCP/bus,
+    /// the worker stops self-resolving from its host config. `None` keeps the
+    /// legacy argv+env self-resolve bootstrap. Honored by deployers that pipe
+    /// stdin (local today); others ignore it and self-resolve.
+    pub spec_json: Option<String>,
 }
 
 /// Brings up a broker-agent in some environment and returns a handle to it.
@@ -194,7 +200,14 @@ impl LocalProcessDeployer {
 impl Deployer for LocalProcessDeployer {
     async fn deploy(&self, d: &AgentDeployment) -> BrokerResult<DeployedAgent> {
         let mut cmd = Command::new(&self.bamboo_bin);
-        cmd.args(agent_argv(d))
+        let mut argv = agent_argv(d);
+        // Ship a parent-resolved spec over stdin when present (worker stops
+        // self-resolving); otherwise the legacy argv+env bootstrap.
+        if d.spec_json.is_some() {
+            argv.push("--spec-stdin".to_string());
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        cmd.args(argv)
             .env("BAMBOO_BROKER_TOKEN", &d.token)
             .kill_on_drop(true);
         // Redirect stdout+stderr to the log file so `tail_log` can read it.
@@ -209,7 +222,21 @@ impl Deployer for LocalProcessDeployer {
                 }
             }
         }
-        let child = cmd.spawn().map_err(spawn_err)?;
+        let mut child = cmd.spawn().map_err(spawn_err)?;
+        // Feed the spec, then close stdin so the worker reads to EOF.
+        if let Some(spec_json) = &d.spec_json {
+            use tokio::io::AsyncWriteExt;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(spec_json.as_bytes())
+                    .await
+                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
+            }
+        }
         Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
     }
 
@@ -653,6 +680,7 @@ mod tests {
             echo: true,
             mcp_proxy: None,
             log_path: None,
+            spec_json: None,
         }
     }
 

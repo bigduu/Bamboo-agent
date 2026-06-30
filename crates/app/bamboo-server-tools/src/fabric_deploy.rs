@@ -118,6 +118,7 @@ impl FabricDeployer {
             echo,
             mcp_proxy: Some(ORCHESTRATOR_ID.to_string()),
             log_path: Some(log_path.clone()),
+            spec_json: None,
         };
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker

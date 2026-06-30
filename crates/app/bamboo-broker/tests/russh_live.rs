@@ -87,6 +87,7 @@ async fn russh_deploys_through_reverse_tunnel() {
         echo: true,
         mcp_proxy: None,
         log_path: None,
+        spec_json: None,
     };
 
     let handle = deployer.deploy(&deployment).await.expect("russh deploy");

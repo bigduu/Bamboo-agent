@@ -467,6 +467,7 @@ mod tests {
             echo: true,
             mcp_proxy: Some("bamboo-orchestrator".into()),
             log_path: None,
+            spec_json: None,
         }
     }
 
