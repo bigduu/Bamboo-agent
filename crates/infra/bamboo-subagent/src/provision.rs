@@ -273,7 +273,28 @@ impl ProvisionSpec {
         }
     }
 
+    /// Cross-field invariants enforced before a spec is shipped to a worker.
+    ///
+    /// `mcp` (direct portable servers) and `mcp_proxy` (proxy ALL MCP to the
+    /// orchestrator) are mutually exclusive — the proxy already covers every
+    /// server, so carrying both is contradictory. The worker would silently
+    /// honor only `mcp_proxy`; fail closed here instead (D4 from the drift
+    /// audit: this invariant was documented but never guarded).
+    pub fn validate(&self) -> Result<()> {
+        if self.capabilities.mcp.is_some() && self.capabilities.mcp_proxy.is_some() {
+            return Err(StoreError::Invalid(
+                "capabilities.mcp and capabilities.mcp_proxy are mutually exclusive \
+                 (proxy covers all MCP) — set exactly one"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn to_json(&self) -> Result<String> {
+        // Enforce the invariants on EVERY serialization path (local spawn over
+        // stdin, deploy, tests) so an invalid spec can never reach a worker.
+        self.validate()?;
         serde_json::to_string(self)
             .map_err(|e| StoreError::decode(std::path::Path::new("<provision>"), e))
     }
@@ -328,6 +349,25 @@ mod tests {
             provider_type: None,
         });
         s
+    }
+
+    #[test]
+    fn validate_rejects_both_mcp_and_mcp_proxy() {
+        let mut s = spec();
+        s.capabilities.mcp = Some(serde_json::json!({"servers": []}));
+        s.capabilities.mcp_proxy = Some(McpProxyConfig {
+            orchestrator: "bamboo-orchestrator".into(),
+            endpoint: "ws://127.0.0.1:9600".into(),
+            token: "t".into(),
+        });
+        // validate() rejects, and to_json() (the universal ship path) propagates it.
+        assert!(matches!(s.validate(), Err(StoreError::Invalid(_))));
+        assert!(s.to_json().is_err());
+
+        // Exactly one is fine.
+        s.capabilities.mcp = None;
+        assert!(s.validate().is_ok());
+        assert!(s.to_json().is_ok());
     }
 
     #[test]
