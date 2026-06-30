@@ -227,7 +227,7 @@ pub async fn serve_executor<E>(
     executor: Arc<E>,
 ) -> BrokerResult<()>
 where
-    E: bamboo_subagent::ChildExecutor,
+    E: bamboo_subagent::ChildExecutor + ?Sized,
 {
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -272,7 +272,7 @@ async fn handle_run<E>(
     cancel: CancellationToken,
 ) -> Handled
 where
-    E: bamboo_subagent::ChildExecutor,
+    E: bamboo_subagent::ChildExecutor + ?Sized,
 {
     use bamboo_subagent::{EventSink, RunSpec, SteerInbox};
 
@@ -345,7 +345,7 @@ async fn handle_with_executor<E>(
     cancel: CancellationToken,
 ) -> Handled
 where
-    E: bamboo_subagent::ChildExecutor,
+    E: bamboo_subagent::ChildExecutor + ?Sized,
 {
     use bamboo_subagent::{AskBody, AskMode, EventSink, RunSpec, SteerInbox};
 

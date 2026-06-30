@@ -68,7 +68,21 @@ pub async fn run() -> std::result::Result<(), String> {
         }
     };
 
-    // Stage 3: bind, self-register (with lease renewal), serve, cleanup.
+    // Stage 3a (unified transport): if a mailbox bus is provisioned, dial it and
+    // serve the executor over it — the worker is addressed by mailbox id, no
+    // listen socket, no file-discovery. This is the actor+mailbox unification:
+    // local children run over the in-process bus exactly like deployed ones.
+    if let Some(bus) = &spec.bus {
+        let me = bamboo_subagent::AgentRef {
+            session_id: spec.identity.child_id.clone(),
+            role: Some(spec.identity.role.clone()),
+        };
+        return bamboo_broker::serve_executor(&bus.endpoint, me, &bus.token, executor)
+            .await
+            .map_err(|e| format!("bus serve: {e}"));
+    }
+
+    // Stage 3 (legacy direct-WS): bind, self-register (with lease renewal), serve.
     let server = WsServer::bind_loopback()
         .await
         .map_err(|e| format!("bind loopback ws server: {e}"))?;

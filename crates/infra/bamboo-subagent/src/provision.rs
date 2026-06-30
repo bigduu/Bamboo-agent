@@ -29,8 +29,14 @@ pub struct ProvisionSpec {
     pub identity: ChildIdentity,
     /// Which execution engine this actor runs (worker maps it via its factory).
     pub executor: ExecutorSpec,
-    /// Tier-1 fabric directory the worker self-registers into.
+    /// Tier-1 fabric directory the worker self-registers into (legacy direct-WS
+    /// path). Ignored when `bus` is set.
     pub fabric_dir: String,
+    /// The mailbox bus this actor dials home to instead of listening for a direct
+    /// WS connection. When set, the worker serves its mailbox over the bus (the
+    /// unified actor+mailbox transport); the parent drives it by mailbox id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<BusEndpoint>,
     /// Isolated storage root for this actor's own session/mailbox files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_dir: Option<String>,
@@ -147,6 +153,15 @@ pub struct Capabilities {
     pub guardian_read_only: bool,
 }
 
+/// The mailbox bus an actor dials home to (the unified transport).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusEndpoint {
+    /// Broker WebSocket endpoint, e.g. `ws://127.0.0.1:9600`.
+    pub endpoint: String,
+    /// Bearer token presented in the broker handshake.
+    pub token: String,
+}
+
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpProxyConfig {
@@ -261,6 +276,7 @@ impl ProvisionSpec {
             identity,
             executor,
             fabric_dir,
+            bus: None,
             storage_dir: None,
             workspace: None,
             model: None,
