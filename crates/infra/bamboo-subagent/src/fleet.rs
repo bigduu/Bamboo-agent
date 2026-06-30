@@ -54,6 +54,17 @@ impl SpawnedChild {
     pub fn pid(&self) -> Option<u32> {
         self.process.as_ref().and_then(|p| p.id())
     }
+
+    /// Whether the owned child process is still running (best-effort, non-blocking
+    /// `try_wait`). A remote (process-less) handle reports `false` — it is never
+    /// pool-owned. Used by the warm pool to skip + reap a worker that exited while
+    /// parked before handing it out for reuse.
+    pub fn is_alive(&mut self) -> bool {
+        match self.process.as_mut() {
+            Some(p) => matches!(p.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
 }
 
 /// Spawn `worker_bin worker_args…`, provision it with `spec` over stdin, then poll the fabric

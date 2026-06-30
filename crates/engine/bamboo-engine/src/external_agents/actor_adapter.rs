@@ -41,17 +41,21 @@ pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 8;
 pub const MAX_SPAWN_DEPTH: u32 = 4;
 
 /// Default cap on idle pooled (warm, reusable) workers kept per fingerprint.
+const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
 
 /// How long a pooled worker waits for its next assignment before reclaiming
 /// itself (must comfortably exceed the gap between sibling spawns).
 const POOLED_IDLE_TIMEOUT_SECS: u64 = 300;
 
-/// The worker handle held for the duration of a child run. Dropping it kills a
-/// local kill-on-drop subprocess; for a remote / schedulable worker the handle
-/// is process-less (`kill()` is a no-op — it self-manages via its idle timeout).
-struct WorkerHandle {
-    #[allow(dead_code)] // held purely so its Drop kills the subprocess
+/// A warm worker on the mailbox bus, parked for reuse between runs. It stays
+/// dialed-in + subscribed to `mailbox_id`; the next interchangeable child
+/// delivers its `Run` there instead of spawning a fresh process. Dropping it
+/// kills a local kill-on-drop subprocess; a remote / schedulable handle is
+/// process-less (`kill()` is a no-op — it self-manages via its idle timeout).
+struct PooledWorker {
     worker: SpawnedChild,
+    /// The bus mailbox this worker subscribes to (where its `Run`s are delivered).
+    mailbox_id: String,
 }
 
 /// A role pinned to a remote resident worker (remote-actor-plan §3.4 / P1.5,
@@ -105,14 +109,20 @@ pub struct ActorChildRunner {
     credentials: Vec<ScopedCredential>,
     /// Parent's default provider (used when the child has no explicit one).
     default_provider: String,
-    /// The mailbox bus to run children over (the unified transport). When set,
-    /// local children dial this bus and are driven by mailbox id; when `None`
-    /// they use the legacy direct-WS + file-discovery path (kept for tests /
-    /// no-broker configs).
+    /// The mailbox bus to run local children over (the unified transport). Local
+    /// sub-agents require it; `None` only when no broker could be embedded.
     bus: Option<bamboo_subagent::BusEndpoint>,
     /// Backpressure: bounds the number of concurrently *running* actors; further
-    /// runs wait for a slot instead of exploding the process table.
+    /// runs wait for a slot instead of exploding the process table. (Idle pooled
+    /// workers do not hold a slot.)
     concurrency: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Warm-worker pool keyed by a reuse fingerprint
+    /// (role/provider/model/workspace/disabled-tools/baked-caps). A finished run
+    /// parks its bus worker here so the next interchangeable child reuses it
+    /// (delivers its `Run` to the same mailbox) instead of spawning a fresh
+    /// process — collapsing N sibling sub-agents onto a few warm workers.
+    pool: Arc<tokio::sync::Mutex<HashMap<String, Vec<PooledWorker>>>>,
+    max_idle_per_key: usize,
     /// Host-side decision for a child's gated-tool approval request (Phase 2).
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
@@ -262,6 +272,8 @@ impl ActorChildRunner {
             default_provider,
             bus: None,
             concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
             approval_decider: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
             remote_placements: HashMap::new(),
@@ -326,9 +338,9 @@ impl ActorChildRunner {
     /// shipped per-run in the `RunSpec` and does not affect the fingerprint.
     /// Reuse fingerprint (role/provider/model/workspace/disabled-tools/baked
     /// caps): two children with the same fingerprint are interchangeable on one
-    /// warm worker. Retained for the warm-pool-over-bus follow-up; exercised by
-    /// the `fingerprint_*` tests below.
-    #[cfg(test)]
+    /// warm worker, so they share a pool bucket. Any axis the worker bakes ONCE
+    /// at provision time MUST be in here, else a worker baked for one posture
+    /// gets reused for another (see the `fingerprint_*` tests).
     fn fingerprint(spec: &ProvisionSpec) -> String {
         let role = spec.identity.role.as_str();
         let (provider, model) = spec
@@ -360,6 +372,58 @@ impl ActorChildRunner {
             // ordinary child (which expects unrestricted Bash), and vice-versa.
             caps.guardian_read_only,
         )
+    }
+
+    /// Check out a warm bus worker for `key`, reusing a live parked one if any,
+    /// else spawning a fresh one that dials the bus. The returned worker is OWNED
+    /// by the caller for the run's duration (checkout removes it from the pool, so
+    /// a concurrent sibling gets a different worker or spawns its own — one run per
+    /// worker at a time, matching the pre-bus pool semantics).
+    async fn acquire_bus_worker(
+        &self,
+        key: &str,
+        spec: &ProvisionSpec,
+    ) -> crate::runtime::runner::Result<PooledWorker> {
+        // Drain the bucket, skipping (and reaping) any worker whose process exited
+        // while parked. A live one is handed straight out for reuse.
+        loop {
+            let candidate = {
+                let mut pool = self.pool.lock().await;
+                pool.get_mut(key).and_then(|bucket| bucket.pop())
+            };
+            let Some(mut candidate) = candidate else { break };
+            if candidate.worker.is_alive() {
+                return Ok(candidate);
+            }
+            candidate.worker.kill().await;
+        }
+
+        let spawned = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, spec)
+            .await
+            .map_err(|e| AgentError::LLM(format!("actor spawn (bus) failed: {e}")))?;
+        let mailbox_id = spawned.record.agent_id.clone();
+        Ok(PooledWorker {
+            worker: spawned,
+            mailbox_id,
+        })
+    }
+
+    /// Park a warm bus worker for reuse after a clean run; if its bucket is full
+    /// (or it died), kill it instead. The worker stays dialed-in + subscribed
+    /// while parked, so a reusing child just delivers a new `Run` to its mailbox.
+    async fn release_bus_worker(&self, key: &str, mut worker: PooledWorker) {
+        if !worker.worker.is_alive() {
+            worker.worker.kill().await;
+            return;
+        }
+        let mut pool = self.pool.lock().await;
+        let bucket = pool.entry(key.to_string()).or_default();
+        if bucket.len() >= self.max_idle_per_key {
+            drop(pool);
+            worker.worker.kill().await;
+            return;
+        }
+        bucket.push(worker);
     }
 
     /// Assemble the parent-resolved provisioning document for this child.
@@ -710,12 +774,12 @@ impl ExternalChildRunner for ActorChildRunner {
         let assignment = extract_assignment(session);
         let mut spec = self.build_spec(session, job);
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
-        // orphaned. (Warm-pool reuse over the bus is a follow-up; today each local
-        // child spawns a fresh worker.)
+        // orphaned. Warm bus workers are pooled per fingerprint and reused.
         spec.reusable = true;
         if spec.limits.idle_timeout_secs.is_none() {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);
         }
+        let pool_key = Self::fingerprint(&spec);
         // Rehydration: the child session in the parent's store is the actor's
         // durable state. Ship the full conversation so a reactivation
         // (send_message / update / rerun) carries its history. A reused worker is
@@ -796,8 +860,9 @@ impl ExternalChildRunner for ActorChildRunner {
                     lease_expires_at: chrono::Utc::now(),
                 };
                 let _ = endpoint;
-                let actor = WorkerHandle {
+                let actor = PooledWorker {
                     worker: SpawnedChild::remote(record),
+                    mailbox_id: job.child_session_id.clone(),
                 };
                 let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
                 (actor, client)
@@ -815,18 +880,20 @@ impl ExternalChildRunner for ActorChildRunner {
                     .await?;
                 // The chosen registry record IS the AgentRecord — synthesize the
                 // process-less handle straight from it (registry-managed worker).
-                let actor = WorkerHandle {
+                let actor = PooledWorker {
                     worker: SpawnedChild::remote(record),
+                    mailbox_id: job.child_session_id.clone(),
                 };
                 let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
                 (actor, client)
             }
             PlacementKind::Local => {
-                // LOCAL = the mailbox bus (the unified transport): spawn a worker
-                // that dials the in-process bus and drive it by mailbox id — no
-                // listen socket, no file discovery, no respawn-on-connect-miss (the
-                // broker queues the Run until the worker subscribes). The legacy
-                // direct-WS + warm-pool path was retired here; the bus is required.
+                // LOCAL = the mailbox bus (the unified transport): check out a warm
+                // pooled worker (reuse a live parked one, else spawn fresh) and
+                // drive it by mailbox id — no listen socket, no file discovery, no
+                // respawn-on-connect-miss (the broker queues the Run until the
+                // worker handles it). The legacy direct-WS path was retired; the bus
+                // is required.
                 let bus = self.bus.as_ref().ok_or_else(|| {
                     AgentError::LLM(
                         "local sub-agents require a mailbox bus (subagents.broker); none is \
@@ -834,10 +901,7 @@ impl ExternalChildRunner for ActorChildRunner {
                             .to_string(),
                     )
                 })?;
-                let spawned = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, &spec)
-                    .await
-                    .map_err(|e| AgentError::LLM(format!("actor spawn (bus) failed: {e}")))?;
-                let agent_id = spawned.record.agent_id.clone();
+                let actor = self.acquire_bus_worker(&pool_key, &spec).await?;
                 let parent = bamboo_subagent::AgentRef {
                     session_id: format!("p-{}", job.child_session_id),
                     role: None,
@@ -846,11 +910,10 @@ impl ExternalChildRunner for ActorChildRunner {
                     &bus.endpoint,
                     parent,
                     &bus.token,
-                    agent_id,
+                    actor.mailbox_id.clone(),
                 )
                 .await
                 .map_err(|e| AgentError::LLM(format!("broker child link connect failed: {e}")))?;
-                let actor = WorkerHandle { worker: spawned };
                 let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
                 (actor, client)
             }
@@ -888,14 +951,20 @@ impl ExternalChildRunner for ActorChildRunner {
         // durable transcript, so the next activation still rehydrates it.)
         drop(live_guard);
 
-        // Close the connection (dropping the link closes the WS / bus channel) and
-        // release the worker. Local bus workers are not pooled (drop = kill the
-        // kill-on-drop subprocess); remote / schedulable workers are
-        // registry-managed (their `SpawnedChild::remote.kill()` is a no-op — they
-        // self-manage via their own idle timeout). Either way: just drop.
+        // Close the parent link (dropping it closes our broker connection; the
+        // worker stays dialed-in + subscribed, ready for its next Run). Then park
+        // the warm worker for reuse on a clean run, or kill it on error/cancel (a
+        // wedged worker must not be reused). Remote / schedulable workers are
+        // registry-managed — never ours to pool/kill, just drop.
         drop(client);
-        let _ = remote; // (kept for the event/log context above)
-        drop(actor);
+        if remote {
+            drop(actor);
+        } else {
+            match &result {
+                Ok(_) => self.release_bus_worker(&pool_key, actor).await,
+                Err(_) => actor.worker.kill().await,
+            }
+        }
 
         // Write-back: persist the actor's final reply onto the child session so
         // the transcript survives and the NEXT activation sees it as history.
