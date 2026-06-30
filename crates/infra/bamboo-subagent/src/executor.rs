@@ -93,7 +93,7 @@ impl EventSink {
 }
 
 /// Result of running a task to completion (or suspension).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChildOutcome {
     pub status: TerminalStatus,
     pub result: Option<String>,

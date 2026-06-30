@@ -231,12 +231,109 @@ where
 {
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let endpoint_owned = endpoint.to_string();
+    let token_owned = token.to_string();
+    let me_owned = me.clone();
     serve_mailbox(endpoint, me, token, move |msg, cancel| {
         let executor = Arc::clone(&executor);
         let context = Arc::clone(&context);
-        async move { handle_with_executor(executor.as_ref(), &context, msg, cancel).await }
+        let endpoint = endpoint_owned.clone();
+        let token = token_owned.clone();
+        let me = me_owned.clone();
+        async move {
+            match msg.kind {
+                // A full child session over the bus (the actor-over-mailbox path):
+                // stream events back to the parent live, then the terminal outcome.
+                InboxKind::Run => {
+                    handle_run(executor.as_ref(), &endpoint, &token, &me, msg, cancel).await
+                }
+                // Ask/Task: the conversational query/steer path (unchanged).
+                _ => handle_with_executor(executor.as_ref(), &context, msg, cancel).await,
+            }
+        }
     })
     .await
+}
+
+/// Drive a full child session ([`InboxKind::Run`]) over the bus: parse the
+/// `RunSpec`, run the executor, and forward its streamed events + terminal
+/// outcome to the parent's mailbox over a dedicated deliver connection (the same
+/// pattern [`crate::mcp::serve_mcp_proxy`] uses for worker→orchestrator I/O).
+///
+/// The serve loop only `Ack`s the run; the real result flows as `Event`s and a
+/// final `Outcome`, both correlated to the run id, so the parent can stream them
+/// exactly like it would over a direct WS connection.
+async fn handle_run<E>(
+    executor: &E,
+    endpoint: &str,
+    token: &str,
+    me: &AgentRef,
+    msg: InboxMessage,
+    cancel: CancellationToken,
+) -> Handled
+where
+    E: bamboo_subagent::ChildExecutor,
+{
+    use bamboo_subagent::{EventSink, RunSpec, SteerInbox};
+
+    let spec: RunSpec = match serde_json::from_value(msg.body) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("run {:?}: malformed RunSpec, dropping: {e}", msg.id);
+            return Handled::Ack;
+        }
+    };
+    let run_id = msg.id.clone();
+    let parent = msg.from.session_id.clone();
+
+    let (sink, mut events) = EventSink::channel();
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
+    // Forward task: own one deliver connection; stream Events live, then the
+    // Outcome once the run finishes (sink dropped ⇒ `events` closes).
+    let endpoint = endpoint.to_string();
+    let token = token.to_string();
+    let me = me.clone();
+    let run_id_fwd = run_id.clone();
+    let forward = tokio::spawn(async move {
+        let mut deliver = match BrokerClient::connect(&endpoint, me.clone(), &token).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("run {run_id_fwd:?}: event deliver connect failed: {e}");
+                return;
+            }
+        };
+        let emit = |kind, body| InboxMessage {
+            id: MsgId::new(),
+            from: me.clone(),
+            kind,
+            body,
+            created_at: Utc::now(),
+            correlation_id: Some(run_id_fwd.clone()),
+        };
+        while let Some(event) = events.recv().await {
+            if deliver
+                .deliver(&parent, emit(InboxKind::Event, event))
+                .await
+                .is_err()
+            {
+                return; // parent/connection gone — stop forwarding.
+            }
+        }
+        if let Ok(outcome) = outcome_rx.await {
+            let body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
+            let _ = deliver.deliver(&parent, emit(InboxKind::Outcome, body)).await;
+        }
+    });
+
+    // Run to completion (events stream into `sink`); dropping `sink` closes the
+    // forward loop's `events`, which then delivers the outcome.
+    let outcome = executor
+        .run(spec, sink, SteerInbox::disconnected(), cancel)
+        .await;
+    let _ = outcome_tx.send(outcome);
+    let _ = forward.await;
+    Handled::Ack
 }
 
 /// Answer one inbound message by running `executor`, applying query/steer
@@ -777,5 +874,89 @@ mod tests {
             ask_mode(&mut orch, "w", "again", AskMode::Query).await,
             "ctx=0"
         );
+    }
+
+    /// A full child session over the bus: deliver a `Run`, and the worker streams
+    /// `Event`s then a terminal `Outcome` to the parent — the actor-over-mailbox
+    /// path (P1.3). Proves the broker carries run/events/outcome with no wire
+    /// change, exactly mirroring a direct-WS child run.
+    #[tokio::test]
+    async fn run_streams_events_then_outcome_to_parent() {
+        use bamboo_subagent::{EchoExecutor, RunSpec};
+
+        let (endpoint, _dir) = start().await;
+
+        // Echo worker on the bus (serve_executor now also handles Run).
+        let worker_ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_ep,
+                AgentRef {
+                    session_id: "w".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(EchoExecutor),
+            )
+            .await;
+        });
+
+        // Parent subscribes, then delivers a Run to the worker.
+        let mut parent = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        parent.subscribe().await.unwrap();
+
+        let spec = RunSpec {
+            assignment: "ping pong".into(),
+            reasoning_effort: None,
+            messages: vec![],
+        };
+        let run = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            kind: InboxKind::Run,
+            body: serde_json::to_value(&spec).unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let run_id = run.id.clone();
+        parent.deliver("w", run).await.unwrap();
+
+        // Collect streamed Events until the terminal Outcome (all correlated).
+        let mut events = 0usize;
+        let outcome = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), parent.next_message())
+                .await
+                .expect("a run message arrives")
+                .expect("stream open");
+            assert_eq!(
+                msg.correlation_id.as_ref(),
+                Some(&run_id),
+                "run messages must correlate to the run id"
+            );
+            match msg.kind {
+                InboxKind::Event => {
+                    events += 1;
+                    parent.ack(msg.id).await.ok();
+                }
+                InboxKind::Outcome => break msg,
+                other => panic!("unexpected kind during run: {other:?}"),
+            }
+        };
+
+        assert!(events >= 1, "expected streamed events, got {events}");
+        let oc: bamboo_subagent::ChildOutcome = serde_json::from_value(outcome.body).unwrap();
+        assert_eq!(oc.result.as_deref(), Some("echo: ping pong"));
     }
 }
