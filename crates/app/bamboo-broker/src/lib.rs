@@ -20,6 +20,7 @@
 //! - the WebSocket server + auth + `bamboo broker serve` wiring layer on top (added next).
 
 pub mod ask;
+pub mod child_link;
 pub mod client;
 pub mod core;
 pub mod deploy;
@@ -37,6 +38,7 @@ mod error;
 pub const ORCHESTRATOR_ID: &str = "bamboo-orchestrator";
 
 pub use crate::ask::{ask_agent, ask_over, request_over};
+pub use crate::child_link::BrokerChildLink;
 pub use crate::client::BrokerClient;
 pub use crate::core::BrokerCore;
 pub use crate::deploy::{
