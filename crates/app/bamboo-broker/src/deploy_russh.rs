@@ -251,10 +251,21 @@ impl Deployer for RusshDeployer {
             .await
             .map_err(|e| transport(format!("reverse tunnel (tcpip_forward {bport}) failed: {e}")))?;
 
+        // 4b. Upload the parent-built ProvisionSpec (if any) so the worker reads
+        //     it via --spec-file instead of self-resolving from the remote's config.
+        let remote_spec_path = if let Some(spec_json) = &d.spec_json {
+            let path = format!("/tmp/bamboo-spec-{}.json", d.id);
+            sftp_write_bytes(&session, &path, spec_json.as_bytes()).await?;
+            Some(path)
+        } else {
+            None
+        };
+
         // 5. Launch the worker pointed at the tunnel mouth on the remote loopback.
         let mut tunneled = d.clone();
         tunneled.broker_endpoint = format!("ws://127.0.0.1:{bport}");
-        let remote_cmd = build_launch_cmd(&tunneled, &self.bamboo_on_remote);
+        let remote_cmd =
+            build_launch_cmd(&tunneled, &self.bamboo_on_remote, remote_spec_path.as_deref());
         let channel = session
             .channel_open_session()
             .await
@@ -309,7 +320,7 @@ impl Deployer for RusshDeployer {
 }
 
 /// Build the remote launch command: `BAMBOO_BROKER_TOKEN=… <bamboo> broker-agent serve …`.
-fn build_launch_cmd(d: &AgentDeployment, bamboo_on_remote: &str) -> String {
+fn build_launch_cmd(d: &AgentDeployment, bamboo_on_remote: &str, spec_file: Option<&str>) -> String {
     let mut cmd = format!("BAMBOO_BROKER_TOKEN={}", sh_quote(&d.token));
     cmd.push(' ');
     cmd.push_str(&sh_quote(bamboo_on_remote));
@@ -317,11 +328,56 @@ fn build_launch_cmd(d: &AgentDeployment, bamboo_on_remote: &str) -> String {
         cmd.push(' ');
         cmd.push_str(&sh_quote(&arg));
     }
+    // Parent-resolved spec uploaded next to the binary: the worker reads it
+    // instead of self-resolving from this host's (possibly absent) local config.
+    if let Some(path) = spec_file {
+        cmd.push_str(" --spec-file ");
+        cmd.push_str(&sh_quote(path));
+    }
     // Redirect the worker's output to its log file on the remote.
     if let Some(log_path) = &d.log_path {
         cmd.push_str(&format!(" > {} 2>&1", sh_quote(log_path)));
     }
     cmd
+}
+
+/// SFTP-write `bytes` to `remote_path` (CREATE|TRUNCATE). Used to upload a
+/// parent-built ProvisionSpec so the remote worker reads it via `--spec-file`.
+async fn sftp_write_bytes(
+    session: &Handle<FabricHandler>,
+    remote_path: &str,
+    bytes: &[u8],
+) -> BrokerResult<()> {
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| transport(format!("open sftp channel failed: {e}")))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| transport(format!("request sftp subsystem failed: {e}")))?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| transport(format!("sftp init failed: {e}")))?;
+    if let Some((dir, _)) = remote_path.rsplit_once('/') {
+        if !dir.is_empty() {
+            let _ = sftp.create_dir(dir).await;
+        }
+    }
+    let mut file = sftp
+        .open_with_flags(
+            remote_path.to_string(),
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .map_err(|e| transport(format!("sftp open '{remote_path}' failed: {e}")))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| transport(format!("sftp write '{remote_path}' failed: {e}")))?;
+    file.shutdown()
+        .await
+        .map_err(|e| transport(format!("sftp flush '{remote_path}' failed: {e}")))?;
+    Ok(())
 }
 
 /// Parse an inline OpenSSH private key, decrypting with the passphrase if needed.
@@ -473,7 +529,7 @@ mod tests {
 
     #[test]
     fn launch_cmd_carries_token_in_env_and_runs_remote_binary() {
-        let cmd = build_launch_cmd(&dep(), ".bamboo-deploy/bamboo");
+        let cmd = build_launch_cmd(&dep(), ".bamboo-deploy/bamboo", None);
         assert!(cmd.starts_with("BAMBOO_BROKER_TOKEN='tok'"));
         assert!(cmd.contains("'.bamboo-deploy/bamboo'"));
         assert!(cmd.contains("'broker-agent'") && cmd.contains("'serve'"));
@@ -484,9 +540,18 @@ mod tests {
     fn launch_cmd_appends_log_redirect_when_set() {
         let mut d = dep();
         d.log_path = Some(".bamboo-deploy/node-abc.log".to_string());
-        let cmd = build_launch_cmd(&d, ".bamboo-deploy/bamboo");
+        let cmd = build_launch_cmd(&d, ".bamboo-deploy/bamboo", None);
         assert!(
             cmd.trim_end().ends_with("> '.bamboo-deploy/node-abc.log' 2>&1"),
+            "got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn launch_cmd_appends_spec_file_when_set() {
+        let cmd = build_launch_cmd(&dep(), ".bamboo-deploy/bamboo", Some("/tmp/spec.json"));
+        assert!(
+            cmd.contains("--spec-file '/tmp/spec.json'"),
             "got: {cmd}"
         );
     }

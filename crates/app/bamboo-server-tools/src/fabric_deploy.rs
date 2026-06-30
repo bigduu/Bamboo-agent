@@ -108,6 +108,15 @@ impl FabricDeployer {
         let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
         let log_path = log_path_for(&node);
 
+        // Resolve the worker's full ProvisionSpec PARENT-side (model + creds + MCP
+        // + bus) so a remote node needs no bamboo config of its own. Deployers that
+        // deliver it (local stdin / russh file-upload) ship it; others fall back to
+        // the legacy argv+env self-resolve (spec_json is then ignored, harmless).
+        let spec_json = {
+            let cfg = self.config.read().await;
+            build_resident_spec(&node, &broker.endpoint, &broker.token, &cfg, echo, &worker_id)
+        };
+
         let deployment = AgentDeployment {
             id: worker_id.clone(),
             role: node.deploy.default_role.clone(),
@@ -118,7 +127,7 @@ impl FabricDeployer {
             echo,
             mcp_proxy: Some(ORCHESTRATOR_ID.to_string()),
             log_path: Some(log_path.clone()),
-            spec_json: None,
+            spec_json,
         };
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker
@@ -293,6 +302,97 @@ pub fn worker_id_for(node: &Node) -> String {
     format!("node-{short}")
 }
 
+/// Resolve a deployed worker's FULL `ProvisionSpec` parent-side (model + creds +
+/// MCP-proxy + bus + identity) — the orchestrator counterpart to the self-resolve
+/// `broker-agent` does from local config. Returned as JSON to ship to the worker
+/// (stdin for local, file-upload for russh). `None` when there are no credentials
+/// to ship and it is not an echo deploy — the worker then self-resolves (legacy
+/// fallback), so we never deploy a real worker with no model/creds.
+fn build_resident_spec(
+    node: &Node,
+    broker_endpoint: &str,
+    broker_token: &str,
+    config: &Config,
+    echo: bool,
+    worker_id: &str,
+) -> Option<String> {
+    use bamboo_subagent::provision::{
+        BusEndpoint, ChildIdentity, ExecutorSpec, McpProxyConfig, ModelRefSpec, ProvisionSpec,
+    };
+
+    let credentials =
+        bamboo_engine::external_agents::runtime::extract_provider_credentials(config);
+    if credentials.is_empty() && !echo {
+        return None;
+    }
+
+    let role = node
+        .deploy
+        .default_role
+        .clone()
+        .unwrap_or_else(|| "general-purpose".to_string());
+    let mut spec = ProvisionSpec::new(
+        ChildIdentity {
+            child_id: worker_id.to_string(),
+            parent_id: None,
+            project_key: None,
+            role,
+            depth: 0,
+        },
+        if echo {
+            ExecutorSpec::Echo
+        } else {
+            ExecutorSpec::BambooRuntime
+        },
+        std::env::temp_dir()
+            .join("bamboo-fabric-agents")
+            .join(worker_id)
+            .to_string_lossy()
+            .into_owned(),
+    );
+    spec.bus = Some(BusEndpoint {
+        endpoint: broker_endpoint.to_string(),
+        token: broker_token.to_string(),
+    });
+    // Model: the node's pinned `provider:model`, else the configured sub-agent /
+    // chat default (resolved HERE, on the orchestrator, not on the remote).
+    spec.model = node
+        .deploy
+        .model
+        .as_deref()
+        .and_then(parse_provider_model)
+        .or_else(|| {
+            config.defaults.as_ref().and_then(|d| {
+                d.sub_agent.as_ref().or(Some(&d.chat)).map(|r| ModelRefSpec {
+                    provider: r.provider.clone(),
+                    model: r.model.clone(),
+                })
+            })
+        });
+    spec.workspace = node.deploy.workspace.clone();
+    spec.secrets.provider_credentials = credentials;
+    // Deployed workers proxy ALL MCP to the orchestrator (single MCP host).
+    spec.capabilities.mcp_proxy = Some(McpProxyConfig {
+        orchestrator: ORCHESTRATOR_ID.to_string(),
+        endpoint: broker_endpoint.to_string(),
+        token: broker_token.to_string(),
+    });
+    // `to_json` enforces the mcp XOR mcp_proxy guard before it goes on the wire.
+    spec.to_json().ok()
+}
+
+/// Parse a `provider:model` reference; `None` for empty or provider-less input
+/// (the config-default fallback handles those).
+fn parse_provider_model(s: &str) -> Option<bamboo_subagent::provision::ModelRefSpec> {
+    let s = s.trim();
+    s.split_once(':').and_then(|(p, m)| {
+        (!p.is_empty() && !m.is_empty()).then(|| bamboo_subagent::provision::ModelRefSpec {
+            provider: p.to_string(),
+            model: m.to_string(),
+        })
+    })
+}
+
 /// Short label for which environment a node deploys into.
 pub fn placement_env(node: &Node) -> &'static str {
     match &node.placement {
@@ -422,4 +522,21 @@ fn build_russh(node: &Node, target: &SshTarget) -> Result<RusshDeployer, String>
             .with_fingerprint(target.host_key_fingerprint.clone())
             .with_upload(upload),
     )
+}
+
+#[cfg(test)]
+mod resident_spec_tests {
+    use super::parse_provider_model;
+
+    #[test]
+    fn parse_provider_model_splits_and_guards() {
+        let r = parse_provider_model("anthropic:claude-opus-4-8").unwrap();
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model, "claude-opus-4-8");
+        // Bare model (no provider) and empty parts fall back to config defaults.
+        assert!(parse_provider_model("just-a-model").is_none());
+        assert!(parse_provider_model(":m").is_none());
+        assert!(parse_provider_model("p:").is_none());
+        assert!(parse_provider_model("  ").is_none());
+    }
 }

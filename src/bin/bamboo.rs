@@ -309,6 +309,11 @@ enum BrokerAgentCommands {
         /// are ignored (the spec is authoritative).
         #[arg(long = "spec-stdin")]
         spec_stdin: bool,
+
+        /// Like --spec-stdin, but read the spec from this FILE (a remote deployer
+        /// uploads it next to the binary). Takes precedence over --spec-stdin.
+        #[arg(long = "spec-file")]
+        spec_file: Option<String>,
     },
 }
 
@@ -726,6 +731,7 @@ async fn main() {
                 echo,
                 mcp_proxy,
                 spec_stdin,
+                spec_file,
             } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
@@ -750,6 +756,7 @@ async fn main() {
                     echo,
                     mcp_proxy,
                     spec_stdin,
+                    spec_file,
                 })
                 .await;
             if let Err(e) = result {

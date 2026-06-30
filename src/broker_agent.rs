@@ -38,18 +38,36 @@ pub struct BrokerAgentArgs {
     /// a local subprocess worker gets (model/creds/MCP/identity/bus all decided by
     /// the parent). Unifies the deployed-actor bootstrap with the local one.
     pub spec_stdin: bool,
+    /// Like `spec_stdin`, but read the spec from a FILE the orchestrator uploaded
+    /// (the delivery a remote deployer uses — it SFTP/scp-uploads the spec next to
+    /// the binary rather than piping a TTY'd stdin).
+    pub spec_file: Option<String>,
 }
 
 /// Connect to the broker and serve until the connection drops.
 pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
-    // Parent-shipped bootstrap: read the authoritative ProvisionSpec from stdin —
-    // identity, bus, model, creds, MCP all resolved by the orchestrator (the same
-    // bootstrap a local subprocess worker gets). Unifies the deployed-actor path
-    // with the local one; no self-resolution from this host's config.
-    if args.spec_stdin {
-        let spec = bamboo_subagent::ProvisionSpec::read_from_stdin()
+    // Parent-shipped bootstrap: read the authoritative ProvisionSpec the
+    // orchestrator resolved (identity, bus, model, creds, MCP) — from an uploaded
+    // file (remote deploy) or stdin (local). Unifies the deployed-actor path with
+    // the local one; no self-resolution from this host's config.
+    let piped_spec = if let Some(path) = &args.spec_file {
+        let bytes = tokio::fs::read(path)
             .await
-            .map_err(|e| format!("broker-agent: read ProvisionSpec from stdin: {e}"))?;
+            .map_err(|e| format!("broker-agent: read spec file '{path}': {e}"))?;
+        Some(
+            serde_json::from_slice::<bamboo_subagent::ProvisionSpec>(&bytes)
+                .map_err(|e| format!("broker-agent: parse spec file '{path}': {e}"))?,
+        )
+    } else if args.spec_stdin {
+        Some(
+            bamboo_subagent::ProvisionSpec::read_from_stdin()
+                .await
+                .map_err(|e| format!("broker-agent: read ProvisionSpec from stdin: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(spec) = piped_spec {
         let me = AgentRef {
             session_id: spec.identity.child_id.clone(),
             role: Some(spec.identity.role.clone()),
