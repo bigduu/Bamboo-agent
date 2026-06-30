@@ -64,6 +64,19 @@ pub enum InboxKind {
     McpRequest,
     /// The orchestrator's answer to an [`InboxKind::McpRequest`].
     McpReply,
+    /// Parent→child: run a full child session. `body` is a serialized
+    /// [`crate::proto::RunSpec`] (the actor `Run` frame, carried over the mailbox
+    /// bus instead of a direct WS connection). The unification target — a local
+    /// child is driven over the bus exactly like a deployed one.
+    Run,
+    /// Child→parent: one streamed agent event during a [`InboxKind::Run`]. `body`
+    /// is the verbatim event JSON (the actor `ChildFrame::Event`). `reply_to`
+    /// correlates it to the `Run` it belongs to.
+    Event,
+    /// Child→parent: the terminal result of a [`InboxKind::Run`]. `body` is a
+    /// serialized [`crate::executor::ChildOutcome`]. `reply_to` correlates it to
+    /// the `Run`.
+    Outcome,
 }
 
 /// How a sub-agent should answer an [`InboxKind::Ask`].
