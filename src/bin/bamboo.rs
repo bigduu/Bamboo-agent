@@ -301,6 +301,14 @@ enum BrokerAgentCommands {
         /// (host-bound MCP servers run only there).
         #[arg(long = "mcp-proxy")]
         mcp_proxy: Option<String>,
+
+        /// Read a parent-resolved `ProvisionSpec` (model/creds/MCP/identity/bus)
+        /// from stdin instead of self-resolving from this host's local config.
+        /// The orchestrator pipes it on deploy — the same bootstrap a local
+        /// subprocess worker already gets. When set, --model/--workspace/--mcp-proxy
+        /// are ignored (the spec is authoritative).
+        #[arg(long = "spec-stdin")]
+        spec_stdin: bool,
     },
 }
 
@@ -717,6 +725,7 @@ async fn main() {
                 workspace,
                 echo,
                 mcp_proxy,
+                spec_stdin,
             } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
@@ -740,6 +749,7 @@ async fn main() {
                     workspace,
                     echo,
                     mcp_proxy,
+                    spec_stdin,
                 })
                 .await;
             if let Err(e) = result {

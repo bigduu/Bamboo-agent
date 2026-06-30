@@ -33,10 +33,43 @@ pub struct BrokerAgentArgs {
     /// When set, proxy all MCP tool calls to this orchestrator id over the broker
     /// (host-bound servers run only there) instead of syncing servers directly.
     pub mcp_proxy: Option<String>,
+    /// Read a parent-resolved `ProvisionSpec` from stdin instead of self-resolving
+    /// from local config — the orchestrator ships the same authoritative bootstrap
+    /// a local subprocess worker gets (model/creds/MCP/identity/bus all decided by
+    /// the parent). Unifies the deployed-actor bootstrap with the local one.
+    pub spec_stdin: bool,
 }
 
 /// Connect to the broker and serve until the connection drops.
 pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
+    // Parent-shipped bootstrap: read the authoritative ProvisionSpec from stdin —
+    // identity, bus, model, creds, MCP all resolved by the orchestrator (the same
+    // bootstrap a local subprocess worker gets). Unifies the deployed-actor path
+    // with the local one; no self-resolution from this host's config.
+    if args.spec_stdin {
+        let spec = bamboo_subagent::ProvisionSpec::read_from_stdin()
+            .await
+            .map_err(|e| format!("broker-agent: read ProvisionSpec from stdin: {e}"))?;
+        let me = AgentRef {
+            session_id: spec.identity.child_id.clone(),
+            role: Some(spec.identity.role.clone()),
+        };
+        // The spec's bus is authoritative when present; fall back to the CLI flags.
+        let (endpoint, token) = match &spec.bus {
+            Some(bus) => (bus.endpoint.clone(), bus.token.clone()),
+            None => (args.broker.clone(), args.token.clone()),
+        };
+        tracing::info!(id = %me.session_id, broker = %endpoint, "broker-agent serving from piped spec");
+        let executor: Arc<dyn bamboo_subagent::ChildExecutor> = match spec.executor {
+            ExecutorSpec::Echo => Arc::new(EchoExecutor),
+            _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
+        };
+        return bamboo_broker::serve_executor(&endpoint, me, &token, executor)
+            .await
+            .map_err(|e| format!("broker-agent (spec) failed: {e}"));
+    }
+
+    // Legacy self-resolve path: build the spec from local config + CLI args.
     let me = AgentRef {
         session_id: args.id.clone(),
         role: args.role.clone(),
