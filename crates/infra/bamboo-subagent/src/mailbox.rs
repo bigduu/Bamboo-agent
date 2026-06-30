@@ -164,6 +164,27 @@ impl Mailbox {
         self.dir.join("corrupt")
     }
 
+    /// True if the mailbox holds NO messages at all — nothing pending in `new/`
+    /// NOR claimed-in-flight in `cur/` (stricter than [`is_empty`](Self::is_empty),
+    /// which only checks `new/`). A purge-safe emptiness check for mailbox GC: an
+    /// empty, unsubscribed mailbox can be deleted (it is re-created on the next
+    /// deliver/subscribe), reclaiming the per-run parent-link dirs that accumulate.
+    pub fn is_fully_empty(&self) -> bool {
+        fn has_message(d: &std::path::Path) -> bool {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.flatten().any(|e| {
+                        let n = e.file_name();
+                        let n = n.to_string_lossy();
+                        // Skip the atomic-write temp (`.`-prefixed); count real msgs.
+                        !n.starts_with('.') && n.ends_with(".json")
+                    })
+                })
+                .unwrap_or(false)
+        }
+        !has_message(&self.new_dir()) && !has_message(&self.cur_dir())
+    }
+
     pub async fn ensure_dirs(&self) -> Result<()> {
         for d in [self.new_dir(), self.cur_dir(), self.corrupt_dir()] {
             tokio::fs::create_dir_all(&d)

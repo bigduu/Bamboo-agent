@@ -531,11 +531,13 @@ impl AppState {
 /// the server. Dropping it aborts the serve task.
 pub struct EmbeddedBroker {
     task: tokio::task::JoinHandle<()>,
+    gc_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for EmbeddedBroker {
     fn drop(&mut self) {
         self.task.abort();
+        self.gc_task.abort();
     }
 }
 
@@ -574,6 +576,11 @@ async fn maybe_embed_broker(
     let token = uuid::Uuid::new_v4().simple().to_string();
     let root = data_dir.join("broker");
     let core = Arc::new(bamboo_broker::BrokerCore::new(root));
+    // Reclaim orphan mailbox dirs (one-shot parent links, killed pool workers)
+    // every 5 min so `<data>/broker/mailboxes/` doesn't grow unbounded.
+    let gc_task = core
+        .clone()
+        .spawn_mailbox_gc(std::time::Duration::from_secs(300));
     let server = Arc::new(bamboo_broker::BrokerServer::new(core, token.clone()));
 
     let task = tokio::spawn(async move {
@@ -588,7 +595,7 @@ async fn maybe_embed_broker(
         token_encrypted: None,
     });
     tracing::info!(port, "embedded mailbox bus (broker) started in-process");
-    Some(EmbeddedBroker { task })
+    Some(EmbeddedBroker { task, gc_task })
 }
 
 /// On boot, mark stale cluster-fabric node state as `Unreachable`: workers

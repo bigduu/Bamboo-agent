@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bamboo_subagent::{InboxMessage, Mailbox, MsgId};
 use tokio::sync::{mpsc, Mutex};
@@ -130,6 +132,55 @@ impl BrokerCore {
     /// True if a client is currently subscribed to `session_id`.
     pub async fn is_subscribed(&self, session_id: &str) -> bool {
         self.subscribers.lock().await.contains_key(session_id)
+    }
+
+    /// Reclaim orphan mailbox dirs: delete every mailbox that is EMPTY and has NO
+    /// live subscriber. Each child run leaves a one-shot parent-link mailbox
+    /// (`p-<child>`) behind, and a killed pool worker's mailbox lingers — all
+    /// empty after their acks. An empty, unsubscribed mailbox holds no work and
+    /// is re-created on the next deliver/subscribe, so deleting it is lossless.
+    /// Returns the count purged. Holds the subscriber lock across the sweep so a
+    /// concurrent subscribe can't be raced into deletion.
+    pub async fn gc_empty_mailboxes(&self) -> usize {
+        let root = self.root.join("mailboxes");
+        let subs = self.subscribers.lock().await;
+        let mut purged = 0;
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if subs.contains_key(&id) {
+                continue; // a live subscriber owns it — keep.
+            }
+            if Mailbox::at(&path).is_fully_empty() {
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    purged += 1;
+                }
+            }
+        }
+        purged
+    }
+
+    /// Spawn a background sweep that reclaims empty, unsubscribed mailbox dirs
+    /// every `interval` (see [`gc_empty_mailboxes`](Self::gc_empty_mailboxes)).
+    /// Returns the task handle — abort it to stop the sweep.
+    pub fn spawn_mailbox_gc(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                let n = self.gc_empty_mailboxes().await;
+                if n > 0 {
+                    tracing::debug!("broker mailbox GC reclaimed {n} empty mailbox(es)");
+                }
+            }
+        })
     }
 
     /// Every currently-connected actor as `(mailbox_id, role)` — the bus IS the
@@ -326,5 +377,29 @@ mod tests {
         // Presence is connection-truth: unsubscribing drops it from the registry.
         c.unsubscribe("w1").await;
         assert_eq!(c.connected_by_role("explorer").await, vec!["w2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn gc_purges_empty_unsubscribed_mailboxes_only() {
+        let (_d, c) = core();
+
+        // "done": subscribe → deliver (claimed) → ack ⇒ empty dir; then unsubscribe.
+        {
+            let mut rx = c.subscribe("done", None).await.unwrap();
+            let id = c.deliver("done", &msg(1)).await.unwrap();
+            let _ = expect_message(rx.recv().await.unwrap());
+            c.ack("done", &id).await.unwrap();
+        }
+        c.unsubscribe("done").await;
+
+        // "pending": a delivered-but-unacked message ⇒ NON-empty ⇒ kept.
+        let _ = c.deliver("pending", &msg(2)).await.unwrap();
+        // "live": currently subscribed ⇒ kept even though empty.
+        let _live = c.subscribe("live", None).await.unwrap();
+
+        // Only the empty + unsubscribed mailbox is reclaimed.
+        assert_eq!(c.gc_empty_mailboxes().await, 1);
+        // pending (non-empty) + live (subscribed) survive a second sweep.
+        assert_eq!(c.gc_empty_mailboxes().await, 0);
     }
 }

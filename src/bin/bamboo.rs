@@ -713,6 +713,10 @@ async fn main() {
                 .unwrap_or_else(|_| bind.clone());
             tracing::info!(%addr, root = %root.display(), "bamboo broker serving");
             let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(root));
+            // Reclaim empty, unsubscribed mailbox dirs every 5 minutes.
+            let _gc = core
+                .clone()
+                .spawn_mailbox_gc(std::time::Duration::from_secs(300));
             let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, token));
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
