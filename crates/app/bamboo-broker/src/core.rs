@@ -34,11 +34,21 @@ pub enum PushItem {
     Cancel(MsgId),
 }
 
+/// A live subscriber: its push sink plus the role it announced at handshake.
+/// The subscriber table doubles as the live-actor registry — presence here is
+/// connection-truth (subscribed == reachable now), fresher than any lease.
+struct Subscriber {
+    sink: mpsc::UnboundedSender<PushItem>,
+    /// Role announced in the `Hello` (`subagent_type`), if any — lets the bus
+    /// answer "which connected actors serve role X" without a separate registry.
+    role: Option<String>,
+}
+
 /// In-process routing engine: owns the mailbox root and the live subscriber table.
 pub struct BrokerCore {
     root: PathBuf,
-    /// session_id -> live subscriber sink. Present only while a client is subscribed.
-    subscribers: Mutex<HashMap<String, mpsc::UnboundedSender<PushItem>>>,
+    /// session_id -> live subscriber. Present only while a client is subscribed.
+    subscribers: Mutex<HashMap<String, Subscriber>>,
 }
 
 impl BrokerCore {
@@ -68,12 +78,16 @@ impl BrokerCore {
     pub async fn subscribe(
         &self,
         session_id: &str,
+        role: Option<&str>,
     ) -> BrokerResult<mpsc::UnboundedReceiver<PushItem>> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.subscribers
-            .lock()
-            .await
-            .insert(session_id.to_string(), tx.clone());
+        self.subscribers.lock().await.insert(
+            session_id.to_string(),
+            Subscriber {
+                sink: tx.clone(),
+                role: role.map(str::to_string),
+            },
+        );
 
         let mb = self.mailbox(session_id);
         // Crash leftovers first (claimed-but-unacked from a previous connection),
@@ -96,7 +110,7 @@ impl BrokerCore {
     pub async fn cancel(&self, to: &str, correlation_id: &MsgId) -> bool {
         let subs = self.subscribers.lock().await;
         match subs.get(to) {
-            Some(tx) => tx.send(PushItem::Cancel(correlation_id.clone())).is_ok(),
+            Some(sub) => sub.sink.send(PushItem::Cancel(correlation_id.clone())).is_ok(),
             None => false,
         }
     }
@@ -118,6 +132,31 @@ impl BrokerCore {
         self.subscribers.lock().await.contains_key(session_id)
     }
 
+    /// Every currently-connected actor as `(mailbox_id, role)` — the bus IS the
+    /// live-actor registry (presence is connection-truth, no leases). Replaces
+    /// "list workers" reads against the file/HTTP registries.
+    pub async fn connected(&self) -> Vec<(String, Option<String>)> {
+        self.subscribers
+            .lock()
+            .await
+            .iter()
+            .map(|(id, sub)| (id.clone(), sub.role.clone()))
+            .collect()
+    }
+
+    /// Mailbox ids of every connected actor announcing `role` — the bus-native
+    /// answer to "find a live actor of role X" (replaces the registry discover +
+    /// lease-liveness + connect-fail-failover dance for schedulable selection).
+    pub async fn connected_by_role(&self, role: &str) -> Vec<String> {
+        self.subscribers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, sub)| sub.role.as_deref() == Some(role))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Claim newly-delivered messages for `session_id` and push to its live
     /// subscriber. No-op when no one is subscribed (the message stays durably in
     /// `new/` until someone subscribes). Does NOT `recover` — in-flight `cur/`
@@ -127,7 +166,7 @@ impl BrokerCore {
         let tx = {
             let subs = self.subscribers.lock().await;
             match subs.get(session_id) {
-                Some(tx) => tx.clone(),
+                Some(sub) => sub.sink.clone(),
                 None => return Ok(()),
             }
         };
@@ -180,7 +219,7 @@ mod tests {
         // not subscribed yet -> message waits durably
         assert!(!c.is_subscribed("child").await);
 
-        let mut rx = c.subscribe("child").await.unwrap();
+        let mut rx = c.subscribe("child", None).await.unwrap();
         let got = expect_message(rx.try_recv().expect("backlog delivered on subscribe"));
         assert_eq!(got.id, m.id);
     }
@@ -188,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_then_deliver_pushes_live() {
         let (_d, c) = core();
-        let mut rx = c.subscribe("child").await.unwrap();
+        let mut rx = c.subscribe("child", None).await.unwrap();
         assert!(rx.try_recv().is_err()); // empty initially
 
         let m = msg(2);
@@ -202,14 +241,14 @@ mod tests {
         let (_d, c) = core();
         let m = msg(3);
         c.deliver("child", &m).await.unwrap();
-        let mut rx = c.subscribe("child").await.unwrap();
+        let mut rx = c.subscribe("child", None).await.unwrap();
         let got = expect_message(rx.recv().await.unwrap());
         assert_eq!(got.id, m.id);
 
         // ack + drop subscription, then resubscribe: nothing redelivered.
         c.ack("child", &got.id).await.unwrap();
         c.unsubscribe("child").await;
-        let mut rx2 = c.subscribe("child").await.unwrap();
+        let mut rx2 = c.subscribe("child", None).await.unwrap();
         assert!(rx2.try_recv().is_err(), "acked message must not redeliver");
     }
 
@@ -218,13 +257,13 @@ mod tests {
         let (_d, c) = core();
         let m = msg(4);
         c.deliver("child", &m).await.unwrap();
-        let mut rx = c.subscribe("child").await.unwrap();
+        let mut rx = c.subscribe("child", None).await.unwrap();
         let got = expect_message(rx.recv().await.unwrap()); // pushed, NOT acked
         assert_eq!(got.id, m.id);
 
         // connection drops without ack -> message stays in cur/ -> re-pushed.
         c.unsubscribe("child").await;
-        let mut rx2 = c.subscribe("child").await.unwrap();
+        let mut rx2 = c.subscribe("child", None).await.unwrap();
         let again = expect_message(rx2.try_recv().expect("unacked message redelivers"));
         assert_eq!(again.id, m.id);
     }
@@ -235,7 +274,7 @@ mod tests {
         c.deliver("a", &msg(1)).await.unwrap();
         c.deliver("b", &msg(2)).await.unwrap();
         // subscriber for "a" sees only a's mailbox.
-        let mut rx_a = c.subscribe("a").await.unwrap();
+        let mut rx_a = c.subscribe("a", None).await.unwrap();
         assert!(rx_a.try_recv().is_ok());
         assert!(rx_a.try_recv().is_err());
     }
@@ -249,7 +288,7 @@ mod tests {
         assert!(!c.cancel("worker", &cid).await);
 
         // Subscribed -> the live subscriber receives a Cancel control item.
-        let mut rx = c.subscribe("worker").await.unwrap();
+        let mut rx = c.subscribe("worker", None).await.unwrap();
         assert!(
             c.cancel("worker", &cid).await,
             "a live subscriber received the cancel"
@@ -262,10 +301,30 @@ mod tests {
         // Out-of-band: the cancel left NO durable mailbox trace, so a fresh
         // subscribe re-pushes nothing (no new/ or cur/ entry was created).
         c.unsubscribe("worker").await;
-        let mut rx2 = c.subscribe("worker").await.unwrap();
+        let mut rx2 = c.subscribe("worker", None).await.unwrap();
         assert!(
             rx2.try_recv().is_err(),
             "cancel must not persist anything to the mailbox"
         );
+    }
+
+    #[tokio::test]
+    async fn subscriber_table_is_the_live_actor_registry() {
+        let (_d, c) = core();
+        let _a = c.subscribe("w1", Some("explorer")).await.unwrap();
+        let _b = c.subscribe("w2", Some("explorer")).await.unwrap();
+        let _r = c.subscribe("w3", Some("reviewer")).await.unwrap();
+        let _n = c.subscribe("w4", None).await.unwrap();
+
+        let mut explorers = c.connected_by_role("explorer").await;
+        explorers.sort();
+        assert_eq!(explorers, vec!["w1".to_string(), "w2".to_string()]);
+        assert_eq!(c.connected_by_role("reviewer").await, vec!["w3".to_string()]);
+        assert!(c.connected_by_role("missing").await.is_empty());
+        assert_eq!(c.connected().await.len(), 4, "all four are live");
+
+        // Presence is connection-truth: unsubscribing drops it from the registry.
+        c.unsubscribe("w1").await;
+        assert_eq!(c.connected_by_role("explorer").await, vec!["w2".to_string()]);
     }
 }
