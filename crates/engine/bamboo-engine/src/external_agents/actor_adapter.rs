@@ -992,7 +992,7 @@ impl ExternalChildRunner for ActorChildRunner {
 /// fire-and-forget grandchild that outlives its spawning run still escalate to
 /// the correct (then-current) parent bridge rather than a stale/overwritten one.
 async fn drive(
-    client: &mut ChildClient,
+    client: &mut dyn bamboo_subagent::ChildLink,
     child_session_id: &str,
     approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
     escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,

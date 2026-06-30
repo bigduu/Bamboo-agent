@@ -9,7 +9,8 @@
 //! mailbox unification).
 
 use bamboo_subagent::{
-    AgentRef, ChildFrame, ChildOutcome, InboxKind, InboxMessage, MsgId, ParentFrame,
+    AgentRef, ChildFrame, ChildLink, ChildOutcome, InboxKind, InboxMessage, MsgId, ParentFrame,
+    TransportError, TransportResult,
 };
 use chrono::Utc;
 
@@ -123,6 +124,22 @@ impl BrokerChildLink {
                 return Ok(Some(f));
             }
         }
+    }
+}
+
+/// Drive a child over the bus with the SAME interface as a direct-WS
+/// `ChildClient`, so the actor runner's `drive()` is transport-agnostic.
+#[async_trait::async_trait]
+impl ChildLink for BrokerChildLink {
+    async fn send(&mut self, frame: ParentFrame) -> TransportResult<()> {
+        BrokerChildLink::send(self, frame)
+            .await
+            .map_err(|e| TransportError::Protocol(format!("broker link send: {e}")))
+    }
+    async fn next_frame(&mut self) -> TransportResult<Option<ChildFrame>> {
+        BrokerChildLink::next_frame(self)
+            .await
+            .map_err(|e| TransportError::Protocol(format!("broker link recv: {e}")))
     }
 }
 
