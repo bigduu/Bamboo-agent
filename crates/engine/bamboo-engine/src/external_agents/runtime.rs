@@ -230,7 +230,11 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
                 .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
         )
         .with_remote_placements(resolve_remote_placements(&sub.remote_placements))
-        .with_schedulable_placements(resolve_schedulable_placements(&sub.schedulable_placements)),
+        .with_schedulable_placements(resolve_schedulable_placements(&sub.schedulable_placements))
+        .with_bus(sub.broker.as_ref().map(|b| bamboo_subagent::BusEndpoint {
+            endpoint: b.endpoint.clone(),
+            token: b.token.clone(),
+        })),
     ))
 }
 

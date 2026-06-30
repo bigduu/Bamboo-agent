@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::discovery::{Discovery, Fabric};
-use bamboo_subagent::fleet::{spawn_worker, SpawnedChild};
+use bamboo_subagent::fleet::{spawn_worker, spawn_worker_on_bus, SpawnedChild};
 use bamboo_subagent::proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
@@ -106,6 +106,11 @@ pub struct ActorChildRunner {
     credentials: Vec<ScopedCredential>,
     /// Parent's default provider (used when the child has no explicit one).
     default_provider: String,
+    /// The mailbox bus to run children over (the unified transport). When set,
+    /// local children dial this bus and are driven by mailbox id; when `None`
+    /// they use the legacy direct-WS + file-discovery path (kept for tests /
+    /// no-broker configs).
+    bus: Option<bamboo_subagent::BusEndpoint>,
     /// Backpressure: bounds the number of concurrently *running* actors; further
     /// runs wait for a slot instead of exploding the process table. (Idle pooled
     /// workers do not hold a slot.)
@@ -264,6 +269,7 @@ impl ActorChildRunner {
             executor,
             credentials,
             default_provider,
+            bus: None,
             concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
             spawn_timeout: Duration::from_secs(30),
             pool: Arc::new(Mutex::new(HashMap::new())),
@@ -275,6 +281,15 @@ impl ActorChildRunner {
             schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fabric_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Run children over the mailbox bus (the unified actor+mailbox transport).
+    /// When set, local children dial this bus and are driven by mailbox id; when
+    /// unset they use the legacy direct-WS path. The server passes its in-process
+    /// broker here (`subagents.broker`); tests without a broker leave it unset.
+    pub fn with_bus(mut self, bus: Option<bamboo_subagent::BusEndpoint>) -> Self {
+        self.bus = bus.filter(|b| !b.endpoint.trim().is_empty());
+        self
     }
 
     /// Wire the host-side decider for child gated-tool approval requests
@@ -439,6 +454,9 @@ impl ActorChildRunner {
             self.fabric_dir.to_string_lossy().into_owned(),
         );
         spec.workspace = session.workspace.clone();
+        // Unified transport: when a bus is configured, the child dials it (no
+        // listen socket / file discovery) and the parent drives it by mailbox id.
+        spec.bus = self.bus.clone();
         // Final model: the session's pinned model_ref (create.model / routing already applied),
         // falling back to the job's bare model on the parent's default provider.
         spec.model = session
@@ -852,6 +870,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     endpoint,
                     agent_id: job.child_session_id.clone(),
                 };
+                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
                 (actor, client)
             }
             PlacementKind::Schedulable => {
@@ -873,12 +892,45 @@ impl ExternalChildRunner for ActorChildRunner {
                     endpoint,
                     agent_id: job.child_session_id.clone(),
                 };
+                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
+                (actor, client)
+            }
+            PlacementKind::Local if self.bus.is_some() => {
+                // BUS branch (the unified transport): spawn a worker that dials the
+                // in-process bus and drive it by mailbox id — no listen socket, no
+                // file discovery, no respawn-on-connect-miss (the broker queues the
+                // Run until the worker subscribes). Not pooled in this first cut;
+                // warm-pool-over-bus is a follow-up.
+                let bus = self.bus.clone().expect("bus is some in this arm");
+                let spawned =
+                    spawn_worker_on_bus(&self.worker_bin, &self.worker_args, &spec)
+                        .await
+                        .map_err(|e| AgentError::LLM(format!("actor spawn (bus) failed: {e}")))?;
+                let agent_id = spawned.record.agent_id.clone();
+                let endpoint = spawned.record.endpoint.clone();
+                let parent = bamboo_subagent::AgentRef {
+                    session_id: format!("p-{}", job.child_session_id),
+                    role: None,
+                };
+                let link = bamboo_broker::BrokerChildLink::connect(
+                    &bus.endpoint,
+                    parent,
+                    &bus.token,
+                    agent_id.clone(),
+                )
+                .await
+                .map_err(|e| AgentError::LLM(format!("broker child link connect failed: {e}")))?;
+                let actor = PooledActor {
+                    worker: spawned,
+                    endpoint,
+                    agent_id,
+                };
+                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
                 (actor, client)
             }
             PlacementKind::Local => {
-                // LOCAL branch — the EXACT pre-#193 path: reuse-or-spawn + the
-                // respawn-on-connect-miss fallback. Unchanged in behavior, ordering,
-                // and error text.
+                // LEGACY direct-WS branch (no bus configured) — the EXACT pre-#193
+                // path: reuse-or-spawn + the respawn-on-connect-miss fallback.
                 let mut actor = self.acquire_worker(&pool_key, &spec).await?;
                 let client = match ChildClient::connect(&actor.endpoint).await {
                     Ok(client) => client,
@@ -909,6 +961,7 @@ impl ExternalChildRunner for ActorChildRunner {
                         client
                     }
                 };
+                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
                 (actor, client)
             }
         };
@@ -929,7 +982,7 @@ impl ExternalChildRunner for ActorChildRunner {
         let live_guard = super::live::register(&job.child_session_id, live_tx);
 
         let result = drive(
-            &mut client,
+            &mut *client,
             &job.child_session_id,
             self.approval_decider.as_ref(),
             escalation,
@@ -945,11 +998,14 @@ impl ExternalChildRunner for ActorChildRunner {
         // durable transcript, so the next activation still rehydrates it.)
         drop(live_guard);
 
-        // Close the connection: the worker's serve loop then accepts the next
-        // assignment (reuse) or idles out. Park the worker on a clean run; retire
-        // it on error/cancel (a wedged worker must not be reused).
-        let _ = client.close().await;
-        if remote {
+        // Close the connection (dropping the link closes the WS / bus channel):
+        // the worker's serve loop then accepts the next assignment (reuse) or
+        // idles out. Park the worker on a clean run; retire it on error/cancel.
+        drop(client);
+        // Bus workers are not pooled in this first cut (no file-discovery liveness
+        // check); drop the handle, which kills the kill-on-drop worker. Remote /
+        // schedulable workers are registry-managed (never ours to pool/kill).
+        if remote || self.bus.is_some() {
             // #193 / #181: we do NOT own a remote or scheduled worker — never park
             // it into the local pool (its endpoint/agent_id are not ours to
             // recycle) and never kill it (`SpawnedChild::remote.kill()` is a no-op

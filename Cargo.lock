@@ -958,6 +958,7 @@ dependencies = [
  "async-trait",
  "bamboo-a2a",
  "bamboo-agent-core",
+ "bamboo-broker",
  "bamboo-compression",
  "bamboo-config",
  "bamboo-domain",
