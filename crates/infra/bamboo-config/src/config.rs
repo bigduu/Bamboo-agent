@@ -353,7 +353,10 @@ pub struct SchedulablePlacement {
     pub role: String,
     /// Logical pool name — the registry `role` to query for live workers.
     pub pool: String,
-    /// Base URL of the agent registry, e.g. `https://control-plane:9562`.
+    /// VESTIGIAL (Phase 3 retired the HTTP agent registry — pools are now bus
+    /// roles resolved via broker presence). Kept for config back-compat; ignored
+    /// by the resolver. Optional so a placement is just `{role, pool}`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub registry_url: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
     /// `auth_ref`). Used for BOTH the registry query and the worker connect.
