@@ -300,10 +300,13 @@ pub struct SubagentsConfig {
     /// to verify the actor chain end-to-end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
-    /// When set, root agents get an `ask_agent` tool that asks broker-deployed
-    /// agents (local / Docker / remote) over this message broker, in `query` or
-    /// `steer` mode. Omit to leave the tool off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The active message-broker endpoint the `ask_agent` tool / sub-agent bus
+    /// dials. RUNTIME-ONLY (`#[serde(skip)]`): never read from nor written to
+    /// `config.json`. It is populated in memory each boot by `maybe_embed_broker`
+    /// — either from a user-managed external broker in `<data_dir>/broker.json`,
+    /// or from the freshly-embedded in-process broker (whose ephemeral loopback
+    /// port must NEVER be persisted, else a later boot dials a dead port).
+    #[serde(skip)]
     pub broker: Option<BrokerClientConfig>,
     /// Remote placements: pin specific sub-agent roles to resident workers
     /// reached over `wss://` instead of a locally-spawned subprocess
@@ -2030,8 +2033,8 @@ impl Config {
         to_save.sanitize_env_vars_for_disk();
         to_save.refresh_cluster_fabric_encrypted()?;
         to_save.sanitize_cluster_fabric_for_disk();
-        to_save.refresh_broker_token_encrypted()?;
-        to_save.sanitize_broker_token_for_disk();
+        // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
+        // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
         let content =

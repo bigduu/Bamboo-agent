@@ -542,32 +542,35 @@ impl Drop for EmbeddedBroker {
 }
 
 /// Start an in-process broker on `127.0.0.1:<auto>` and point
-/// `config.subagents.broker` at it — UNLESS an external broker is already
-/// configured (then use that). Returns `None` when an external broker is used
-/// or the bind fails (sub-agent dispatch then degrades exactly as before).
+/// `config.subagents.broker` (RUNTIME-ONLY, `#[serde(skip)]`) at it — UNLESS a
+/// user-managed external broker is configured in `<data_dir>/broker.json` and
+/// reachable (then use that). Returns `None` when an external broker is used or
+/// the bind fails (sub-agent dispatch then degrades exactly as before).
+///
+/// The broker's endpoint deliberately lives in EITHER the in-memory config (for
+/// the embedded case, regenerated each boot) or its own `broker.json` (for the
+/// external case) — NEVER in `config.json`. That is what stops a prior run's
+/// ephemeral auto-port from leaking into the user's config and being dialed dead
+/// on the next boot (every sub-agent + the MCP proxy would hit "connect refused").
 async fn maybe_embed_broker(
     config: &mut bamboo_llm::Config,
     data_dir: &std::path::Path,
 ) -> Option<EmbeddedBroker> {
-    // Respect an externally-configured broker (multi-host / shared bus) ONLY if
-    // it is actually REACHABLE. A persisted-but-DEAD endpoint — most commonly a
-    // PRIOR run's embedded auto-port that leaked into config.json — must never be
-    // trusted: fall through and embed a fresh broker, overriding it below.
-    // Without this every sub-agent (and the MCP proxy) hits "connect refused" on
-    // the stale port — sub-agents fail to launch with no streaming. Probing keeps
-    // a genuinely live external / standalone broker working.
-    if let Some(b) = config.subagents.broker.as_ref() {
-        let endpoint = b.endpoint.trim();
-        if !endpoint.is_empty() && broker_endpoint_reachable(endpoint).await {
+    // A user-managed EXTERNAL broker (multi-host / shared standalone bus) lives in
+    // its OWN file, `<data_dir>/broker.json` — separate from config.json. Honour
+    // it ONLY if actually REACHABLE; a dead endpoint (standalone broker not up)
+    // falls through to a fresh in-process broker so dispatch still works.
+    if let Some(external) = load_external_broker(data_dir) {
+        let endpoint = external.endpoint.trim().to_string();
+        if broker_endpoint_reachable(&endpoint).await {
+            tracing::info!(%endpoint, "using external broker from broker.json");
+            config.subagents.broker = Some(external);
             return None;
         }
-        if !endpoint.is_empty() {
-            tracing::warn!(
-                %endpoint,
-                "configured subagents.broker is unreachable (stale embedded port?) — \
-                 embedding a fresh in-process broker and overriding it"
-            );
-        }
+        tracing::warn!(
+            %endpoint,
+            "broker.json endpoint is unreachable — embedding a fresh in-process broker instead"
+        );
     }
 
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -600,6 +603,8 @@ async fn maybe_embed_broker(
         }
     });
 
+    // Set the endpoint IN MEMORY ONLY — `subagents.broker` is `#[serde(skip)]`, so
+    // this ephemeral loopback port is regenerated every boot and never touches disk.
     config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
         endpoint: format!("ws://127.0.0.1:{port}"),
         token,
@@ -607,6 +612,30 @@ async fn maybe_embed_broker(
     });
     tracing::info!(port, "embedded mailbox bus (broker) started in-process");
     Some(EmbeddedBroker { task, gc_task })
+}
+
+/// Load a user-managed EXTERNAL broker from `<data_dir>/broker.json`, if present.
+/// This file is the SEPARATE, persisted home for a standalone/remote broker —
+/// deliberately NOT `config.json`, so the embedded broker's ephemeral runtime
+/// port can never leak into the user's config (the stale-dead-port bug). An
+/// absent file or a parse error yields `None` (embed a fresh in-process broker).
+///
+/// Format is a plain [`BrokerClientConfig`] JSON object, e.g.:
+/// `{ "endpoint": "wss://broker.example:9600", "token": "…" }`.
+fn load_external_broker(data_dir: &std::path::Path) -> Option<bamboo_config::BrokerClientConfig> {
+    let path = data_dir.join("broker.json");
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<bamboo_config::BrokerClientConfig>(&bytes) {
+        Ok(cfg) if !cfg.endpoint.trim().is_empty() => Some(cfg),
+        Ok(_) => {
+            tracing::warn!(?path, "broker.json has an empty endpoint — ignoring");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(?path, "broker.json present but unparseable: {e}");
+            None
+        }
+    }
 }
 
 /// Best-effort TCP reachability probe of a `ws[s]://host:port[/path]` broker
@@ -674,7 +703,32 @@ async fn reconcile_fabric_on_boot(
 
 #[cfg(test)]
 mod broker_embed_tests {
-    use super::broker_endpoint_reachable;
+    use super::{broker_endpoint_reachable, load_external_broker};
+
+    #[test]
+    fn load_external_broker_reads_broker_json_not_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file ⇒ None (embed a fresh in-process broker).
+        assert!(load_external_broker(dir.path()).is_none());
+
+        // A well-formed broker.json ⇒ parsed external broker.
+        std::fs::write(
+            dir.path().join("broker.json"),
+            r#"{ "endpoint": "wss://broker.example:9600", "token": "t" }"#,
+        )
+        .unwrap();
+        let got = load_external_broker(dir.path()).expect("parsed");
+        assert_eq!(got.endpoint, "wss://broker.example:9600");
+        assert_eq!(got.token, "t");
+
+        // Empty endpoint ⇒ ignored (treated as absent).
+        std::fs::write(dir.path().join("broker.json"), r#"{ "endpoint": "  " }"#).unwrap();
+        assert!(load_external_broker(dir.path()).is_none());
+
+        // Garbage ⇒ ignored, never panics.
+        std::fs::write(dir.path().join("broker.json"), "not json").unwrap();
+        assert!(load_external_broker(dir.path()).is_none());
+    }
 
     #[tokio::test]
     async fn reachability_probe_distinguishes_live_from_dead() {
