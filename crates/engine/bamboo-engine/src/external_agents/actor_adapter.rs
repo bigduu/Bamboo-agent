@@ -75,6 +75,10 @@ pub struct ResolvedRemotePlacement {
     pub endpoint: String,
     pub token: Option<String>,
     pub ca_cert_file: Option<PathBuf>,
+    /// Display name for the machine this role runs on — the matching cluster
+    /// node's `label`/host, surfaced on the UI placement badge. `None` ⇒ derive
+    /// from the endpoint host.
+    pub host_label: Option<String>,
 }
 
 /// A role routed to a SCHEDULED worker (remote-actor-plan §3.4 / P2b, #181),
@@ -86,6 +90,10 @@ pub struct ResolvedRemotePlacement {
 #[derive(Debug, Clone)]
 pub struct ResolvedSchedulablePlacement {
     pub pool: String,
+    /// Display name for the machine this pool's workers run on — the matching
+    /// cluster node's `label`/host, surfaced on the UI placement badge. `None` ⇒
+    /// fall back to the pool name.
+    pub host_label: Option<String>,
 }
 
 /// How `execute_external_child` should obtain its worker connection, decided
@@ -681,7 +689,18 @@ impl ExternalChildRunner for ActorChildRunner {
         // Only remote/scheduled placements need a stamp — a Local child falls through
         // to the DTO default (this backend's own host). Persisted by the caller with
         // the rest of the child session after we return.
-        if let Some(placement_meta) = placement_metadata(&spec.placement) {
+        let host_label = match &spec.placement {
+            Placement::Remote { .. } => self
+                .remote_placements
+                .get(spec.identity.role.as_str())
+                .and_then(|p| p.host_label.as_deref()),
+            Placement::Schedulable { .. } => self
+                .schedulable_placements
+                .get(spec.identity.role.as_str())
+                .and_then(|p| p.host_label.as_deref()),
+            Placement::Local => None,
+        };
+        if let Some(placement_meta) = placement_metadata(&spec.placement, host_label) {
             session
                 .metadata
                 .insert("placement".to_string(), placement_meta);
@@ -917,13 +936,19 @@ impl ExternalChildRunner for ActorChildRunner {
 /// → the UI's machine badge. `None` for `Local` (those fall through to the DTO's
 /// default of this backend's own host). The value is a JSON string matching
 /// `bamboo_storage::SessionPlacement { kind, host }`.
-fn placement_metadata(placement: &Placement) -> Option<String> {
+fn placement_metadata(placement: &Placement, host_label: Option<&str>) -> Option<String> {
+    // Prefer the cluster node's own label/host (its metadata) when the placement
+    // maps to a node; else fall back to the raw endpoint host / pool name.
     let value = match placement {
         Placement::Local => return None,
-        Placement::Remote { endpoint } => {
-            serde_json::json!({ "kind": "remote", "host": host_of_endpoint(endpoint) })
-        }
-        Placement::Schedulable { pool } => serde_json::json!({ "kind": "pool", "host": pool }),
+        Placement::Remote { endpoint } => serde_json::json!({
+            "kind": "remote",
+            "host": host_label.map(str::to_string).unwrap_or_else(|| host_of_endpoint(endpoint)),
+        }),
+        Placement::Schedulable { pool } => serde_json::json!({
+            "kind": "remote",
+            "host": host_label.unwrap_or(pool),
+        }),
     };
     serde_json::to_string(&value).ok()
 }
@@ -1497,6 +1522,7 @@ mod tests {
                 endpoint: "wss://gpu-host:8443".into(),
                 token: Some("T-secret".into()),
                 ca_cert_file: None,
+                host_label: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -1520,6 +1546,7 @@ mod tests {
                 endpoint: "wss://gpu-host:8443".into(),
                 token: Some("T".into()),
                 ca_cert_file: None,
+                host_label: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -1543,28 +1570,40 @@ mod tests {
     #[test]
     fn placement_metadata_stamps_remote_and_schedulable_not_local() {
         // Local children carry no stamp — the DTO defaults them to the backend host.
-        assert_eq!(placement_metadata(&Placement::Local), None);
+        assert_eq!(placement_metadata(&Placement::Local, None), None);
 
-        // Remote → {kind:"remote", host:<endpoint host>}.
-        let r = placement_metadata(&Placement::Remote {
-            endpoint: "wss://mini.local:8443/stream".into(),
-        })
+        // Remote, no node label → host derived from the endpoint.
+        let r = placement_metadata(
+            &Placement::Remote {
+                endpoint: "wss://10.0.0.5:8443/stream".into(),
+            },
+            None,
+        )
         .unwrap();
         assert!(r.contains(r#""kind":"remote""#), "{r}");
-        assert!(r.contains(r#""host":"mini.local""#), "{r}");
+        assert!(r.contains(r#""host":"10.0.0.5""#), "{r}");
 
-        // Schedulable → {kind:"pool", host:<pool>}.
-        let s = placement_metadata(&Placement::Schedulable {
-            pool: "explorers".into(),
-        })
+        // A cluster node's label (its metadata) OVERRIDES the raw endpoint host.
+        let labeled = placement_metadata(
+            &Placement::Remote {
+                endpoint: "ws://169.254.230.101:8899".into(),
+            },
+            Some("mini"),
+        )
         .unwrap();
-        assert!(s.contains(r#""kind":"pool""#), "{s}");
-        assert!(s.contains(r#""host":"explorers""#), "{s}");
+        assert!(labeled.contains(r#""host":"mini""#), "{labeled}");
+
+        // Schedulable → {kind:"remote", host:<node label, else pool>}.
+        let s =
+            placement_metadata(&Placement::Schedulable { pool: "explorers".into() }, Some("mini"))
+                .unwrap();
+        assert!(s.contains(r#""kind":"remote""#), "{s}");
+        assert!(s.contains(r#""host":"mini""#), "{s}");
 
         // The stamp round-trips through the storage placement type.
-        let p: bamboo_storage::SessionPlacement = serde_json::from_str(&r).unwrap();
+        let p: bamboo_storage::SessionPlacement = serde_json::from_str(&labeled).unwrap();
         assert_eq!(p.kind, "remote");
-        assert_eq!(p.host, "mini.local");
+        assert_eq!(p.host, "mini");
     }
 
     /// End-to-end remote run through `execute_external_child`: a resident worker
@@ -1598,7 +1637,8 @@ mod tests {
             ResolvedRemotePlacement {
                 endpoint: endpoint.clone(),
                 token: Some(token.to_string()),
-                ca_cert_file: None, // plaintext ws:// loopback, default trust
+                ca_cert_file: None,
+                host_label: None, // plaintext ws:// loopback, default trust
             },
         );
         let runner = bogus_runner(placements);
@@ -1670,7 +1710,7 @@ mod tests {
     }
 
     fn sched_placement(pool: &str, _registry_url: impl Into<String>) -> ResolvedSchedulablePlacement {
-        ResolvedSchedulablePlacement { pool: pool.into() }
+        ResolvedSchedulablePlacement { pool: pool.into(), host_label: None }
     }
 
     #[test]
@@ -1703,6 +1743,7 @@ mod tests {
                 endpoint: "wss://fixed-host:8443".into(),
                 token: Some("T-remote".into()),
                 ca_cert_file: None,
+                host_label: None,
             },
         );
         let mut sched = HashMap::new();

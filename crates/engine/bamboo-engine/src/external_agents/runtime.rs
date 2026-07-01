@@ -229,8 +229,14 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
             sub.max_concurrent
                 .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
         )
-        .with_remote_placements(resolve_remote_placements(&sub.remote_placements))
-        .with_schedulable_placements(resolve_schedulable_placements(&sub.schedulable_placements))
+        .with_remote_placements(resolve_remote_placements(
+            &sub.remote_placements,
+            &config.cluster_fabric.nodes,
+        ))
+        .with_schedulable_placements(resolve_schedulable_placements(
+            &sub.schedulable_placements,
+            &config.cluster_fabric.nodes,
+        ))
         .with_bus(sub.broker.as_ref().map(|b| bamboo_subagent::BusEndpoint {
             endpoint: b.endpoint.clone(),
             token: b.token.clone(),
@@ -248,6 +254,7 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
 /// Duplicate roles: last one wins.
 fn resolve_schedulable_placements(
     placements: &[bamboo_config::SchedulablePlacement],
+    nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedSchedulablePlacement> {
     // Phase 3: a pool is just a bus role. The runner picks a live connected worker
     // of that role via the bus presence query — no registry url / token / cert.
@@ -258,10 +265,62 @@ fn resolve_schedulable_placements(
                 p.role.clone(),
                 super::actor_adapter::ResolvedSchedulablePlacement {
                     pool: p.pool.clone(),
+                    // The badge shows the cluster node's own metadata: a node
+                    // deployed to serve this pool (its `deploy.default_role`).
+                    host_label: node_label_for_role(nodes, &p.pool),
                 },
             )
         })
         .collect()
+}
+
+/// Friendly display name for a cluster node whose worker serves `role`
+/// (`deploy.default_role`) — the operator `label`, else its ssh host. Used to
+/// stamp the UI placement badge from the node's own metadata.
+fn node_label_for_role(
+    nodes: &[bamboo_config::cluster_fabric::Node],
+    role: &str,
+) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| n.deploy.default_role.as_deref() == Some(role))
+        .map(node_display_name)
+}
+
+/// Friendly display name for a cluster node whose ssh host matches `endpoint`'s
+/// host — so a `remote_placements` endpoint pointing at a known node shows the
+/// node's label rather than a bare IP.
+fn node_label_for_endpoint(
+    nodes: &[bamboo_config::cluster_fabric::Node],
+    endpoint: &str,
+) -> Option<String> {
+    let host = endpoint
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    nodes
+        .iter()
+        .find(|n| match &n.placement {
+            bamboo_config::cluster_fabric::NodePlacement::Ssh(t) => t.host == host,
+            bamboo_config::cluster_fabric::NodePlacement::Local => false,
+        })
+        .map(node_display_name)
+}
+
+fn node_display_name(n: &bamboo_config::cluster_fabric::Node) -> String {
+    if !n.label.trim().is_empty() {
+        return n.label.clone();
+    }
+    match &n.placement {
+        bamboo_config::cluster_fabric::NodePlacement::Ssh(t) => t.host.clone(),
+        bamboo_config::cluster_fabric::NodePlacement::Local => "local".to_string(),
+    }
 }
 
 /// Resolve config `remote_placements` into runner-ready handles (#193), keyed by
@@ -289,6 +348,7 @@ fn endpoint_looks_public(endpoint: &str) -> bool {
 
 fn resolve_remote_placements(
     placements: &[bamboo_config::RemoteActorPlacement],
+    nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedRemotePlacement> {
     let mut out = std::collections::HashMap::new();
     for p in placements {
@@ -327,6 +387,9 @@ fn resolve_remote_placements(
                 endpoint: p.endpoint.clone(),
                 token,
                 ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+                // Badge from the node's own metadata when the endpoint points at
+                // a known cluster node; else the endpoint host is used downstream.
+                host_label: node_label_for_endpoint(nodes, &p.endpoint),
             },
         );
     }
