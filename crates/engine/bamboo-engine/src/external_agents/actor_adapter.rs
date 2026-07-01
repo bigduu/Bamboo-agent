@@ -676,6 +676,17 @@ impl ExternalChildRunner for ActorChildRunner {
         };
         let remote = !matches!(kind, PlacementKind::Local);
 
+        // Stamp WHICH machine this child runs on onto its session metadata, so the
+        // UI can show it (mirrored into the session index → SessionSummary.placement).
+        // Only remote/scheduled placements need a stamp — a Local child falls through
+        // to the DTO default (this backend's own host). Persisted by the caller with
+        // the rest of the child session after we return.
+        if let Some(placement_meta) = placement_metadata(&spec.placement) {
+            session
+                .metadata
+                .insert("placement".to_string(), placement_meta);
+        }
+
         // Retry-once loop: a pooled local worker can die between its liveness
         // check and handling the Run (a tiny TOCTOU window) — its Run then sits
         // queued with no server. The first-frame watchdog in `drive` surfaces that
@@ -899,6 +910,34 @@ impl ExternalChildRunner for ActorChildRunner {
             Err(e) => Err(e),
         }
     }
+}
+
+/// The `{kind,host}` placement descriptor stamped onto a child session's metadata
+/// under `"placement"` — read back by the storage index → `SessionSummary.placement`
+/// → the UI's machine badge. `None` for `Local` (those fall through to the DTO's
+/// default of this backend's own host). The value is a JSON string matching
+/// `bamboo_storage::SessionPlacement { kind, host }`.
+fn placement_metadata(placement: &Placement) -> Option<String> {
+    let value = match placement {
+        Placement::Local => return None,
+        Placement::Remote { endpoint } => {
+            serde_json::json!({ "kind": "remote", "host": host_of_endpoint(endpoint) })
+        }
+        Placement::Schedulable { pool } => serde_json::json!({ "kind": "pool", "host": pool }),
+    };
+    serde_json::to_string(&value).ok()
+}
+
+/// Extract the host from a `ws[s]://host:port[/path]` bus endpoint, for display.
+fn host_of_endpoint(endpoint: &str) -> String {
+    endpoint
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or(endpoint)
+        .to_string()
 }
 
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
@@ -1499,6 +1538,33 @@ mod tests {
         let spec = runner.build_spec(&s, &job_for("child-1"));
         assert_eq!(spec.placement, Placement::Local);
         assert!(spec.secrets.worker_auth_token.is_none());
+    }
+
+    #[test]
+    fn placement_metadata_stamps_remote_and_schedulable_not_local() {
+        // Local children carry no stamp — the DTO defaults them to the backend host.
+        assert_eq!(placement_metadata(&Placement::Local), None);
+
+        // Remote → {kind:"remote", host:<endpoint host>}.
+        let r = placement_metadata(&Placement::Remote {
+            endpoint: "wss://mini.local:8443/stream".into(),
+        })
+        .unwrap();
+        assert!(r.contains(r#""kind":"remote""#), "{r}");
+        assert!(r.contains(r#""host":"mini.local""#), "{r}");
+
+        // Schedulable → {kind:"pool", host:<pool>}.
+        let s = placement_metadata(&Placement::Schedulable {
+            pool: "explorers".into(),
+        })
+        .unwrap();
+        assert!(s.contains(r#""kind":"pool""#), "{s}");
+        assert!(s.contains(r#""host":"explorers""#), "{s}");
+
+        // The stamp round-trips through the storage placement type.
+        let p: bamboo_storage::SessionPlacement = serde_json::from_str(&r).unwrap();
+        assert_eq!(p.kind, "remote");
+        assert_eq!(p.host, "mini.local");
     }
 
     /// End-to-end remote run through `execute_external_child`: a resident worker
