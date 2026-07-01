@@ -413,7 +413,11 @@ mod tests {
         let t = ClusterTool::new(cfg, deployer);
 
         let key = crate::registry_keys::node_key("n1");
-        let out = parse(t.deploy("n1", true).await.unwrap());
+        // echo=false: this exercises register/stop plumbing with a fake binary.
+        // echo=true would trigger the post-deploy bus round-trip verify, which a
+        // `/usr/bin/true` "worker" (never connects to a broker) can't satisfy —
+        // the echo round-trip itself is covered by bamboo-broker's ask tests.
+        let out = parse(t.deploy("n1", false).await.unwrap());
         assert_eq!(out["worker_id"], "node-n1");
         assert_eq!(out["status"], "deployed");
         assert!(registry.lock().await.contains_key(&key), "handle registered");

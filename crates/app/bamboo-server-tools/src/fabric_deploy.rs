@@ -10,15 +10,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock};
 
 use bamboo_broker::{
-    AgentDeployment, Deployer, LocalProcessDeployer, RusshAuth, RusshDeployer, SshDeployer,
-    UploadSpec, ORCHESTRATOR_ID,
+    ask_agent, AgentDeployment, Deployer, LocalProcessDeployer, RusshAuth, RusshDeployer,
+    SshDeployer, UploadSpec, ORCHESTRATOR_ID,
 };
 use bamboo_config::cluster_fabric::{Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget};
-use bamboo_config::Config;
+use bamboo_config::{BrokerClientConfig, Config};
+use bamboo_subagent::{AgentRef, AskMode};
 
 use crate::deploy_agent::{Deployed, DeployedRegistry};
 
@@ -90,7 +92,7 @@ impl FabricDeployer {
     /// `echo=true` runs the dependency-free echo executor (no LLM) — a
     /// connectivity smoke test.
     pub async fn deploy(&self, node_id: &str, echo: bool) -> FabricResult<NodeState> {
-        let (node, broker) = {
+        let (mut node, broker) = {
             let cfg = self.config.read().await;
             (self.node_snapshot(&cfg, node_id)?, cfg.subagents.broker.clone())
         };
@@ -103,6 +105,35 @@ impl FabricDeployer {
                     .to_string(),
             )
         })?;
+
+        // Zero-config default: if the operator didn't pin an artifact, ship our OWN
+        // `bamboo` binary so a fresh remote node needs no manual install — but only
+        // when the remote arch matches (a cross-arch binary can't run there). We
+        // preflight `uname` for the arch; a mismatch is a clear error, not a wasted
+        // 100MB+ upload that silently fails to exec. (Local placement runs the
+        // binary directly, so it never needs an upload.)
+        if node.deploy.artifact_path.is_none() && matches!(node.placement, NodePlacement::Ssh(_)) {
+            let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
+            let uname = build.deployer.preflight().await.map_err(|e| {
+                FabricError::Internal(format!("preflight for '{node_id}' failed: {e}"))
+            })?;
+            if remote_matches_orchestrator(&uname) {
+                node.deploy.artifact_path =
+                    Some(self.bamboo_bin.to_string_lossy().into_owned());
+                tracing::info!(
+                    node = node_id,
+                    %uname,
+                    "no artifact_path set — auto-uploading orchestrator binary (arch match)"
+                );
+            } else {
+                return Err(FabricError::BadRequest(format!(
+                    "node '{node_id}': remote is '{uname}' but the orchestrator binary is \
+                     {}/{} — set deploy.artifact_path to a bamboo binary built for the remote arch",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                )));
+            }
+        }
 
         let worker_id = worker_id_for(&node);
         let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
@@ -178,6 +209,50 @@ impl FabricDeployer {
             if let Some(fp) = cell.lock().await.clone() {
                 self.pin_fingerprint_if_absent(node_id, &fp).await;
             }
+        }
+
+        // Verify-on-deploy (echo smoke test): exec'ing the worker used to report
+        // "running" even when the worker never dialed home (phantom success — e.g.
+        // a missing/incompatible binary silently failed to exec). For the echo
+        // executor, actually round-trip a ping over the bus so a broken
+        // deploy→tunnel→broker→worker chain surfaces HERE, not as a hung ask later.
+        if echo {
+            if let Err(e) = verify_echo_worker(&broker, &worker_id).await {
+                // Tear the half-dead worker down and report the real failure.
+                if let Some(d) = self
+                    .registry
+                    .lock()
+                    .await
+                    .remove(&crate::registry_keys::node_key(node_id))
+                {
+                    d.handle.shutdown().await;
+                }
+                let msg = format!(
+                    "worker deployed but never answered on the bus (echo verify failed): {e} — \
+                     check that `bamboo` runs on the remote (arch/deps) and see the node log"
+                );
+                let failed = NodeState {
+                    status: NodeStatus::Failed,
+                    worker_id: Some(worker_id.clone()),
+                    log_path: Some(log_path.clone()),
+                    last_error: Some(msg.clone()),
+                    ..Default::default()
+                };
+                let _ = self.persist_state(node_id, Some(failed)).await;
+                tracing::warn!(
+                    audit = "cluster_fabric.deploy",
+                    node = node_id,
+                    worker_id = %worker_id,
+                    outcome = "verify_failed",
+                    error = %e,
+                );
+                return Err(FabricError::Internal(format!("deploy node '{node_id}': {msg}")));
+            }
+            tracing::info!(
+                node = node_id,
+                worker_id = %worker_id,
+                "echo verify ok — worker is reachable on the bus"
+            );
         }
 
         let state = NodeState {
@@ -439,6 +514,44 @@ pub fn remote_artifact_path(node: &Node) -> String {
         .map(|h| format!("bamboo-{}", &h[..8]))
         .unwrap_or_else(|| "bamboo".to_string());
     format!("{dir}/{name}")
+}
+
+/// True if a remote `uname -s -m` string (e.g. `"Darwin arm64"`) matches the
+/// orchestrator's own OS + arch, so this process's `bamboo` binary can run there.
+fn remote_matches_orchestrator(uname: &str) -> bool {
+    let os = match std::env::consts::OS {
+        "macos" => "Darwin",
+        "linux" => "Linux",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        other => other,
+    };
+    uname.contains(os) && uname.contains(arch)
+}
+
+/// Round-trip a ping to a freshly-deployed **echo** worker over the bus, proving
+/// the deploy → reverse-tunnel → broker → worker chain is actually live. Returns
+/// `Ok` once the worker echoes back, or a timeout/transport error otherwise.
+async fn verify_echo_worker(broker: &BrokerClientConfig, worker_id: &str) -> Result<(), String> {
+    let me = AgentRef {
+        session_id: format!("{ORCHESTRATOR_ID}-deploy-verify"),
+        role: Some("orchestrator".to_string()),
+    };
+    ask_agent(
+        &broker.endpoint,
+        me,
+        &broker.token,
+        worker_id,
+        "ping",
+        AskMode::Query,
+        Duration::from_secs(30),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Build the deployer for a node. `bamboo_bin` is the local `bamboo` path used
