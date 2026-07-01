@@ -240,6 +240,12 @@ impl Tool for DeployAgentTool {
          worker connects back to the same message broker you are on, and inherits your MCP servers \
          + skills (via the orchestrator MCP proxy), so it can do real work — not just echo.\n\
          \n\
+         PREFER LOCAL. Default to a local `SubAgent` (an in-context child) for delegation. Reach for \
+         a REMOTE worker (env=ssh, or a cluster node) ONLY when the task genuinely needs THAT \
+         machine — its data, GPU, network location/proximity, or a clean sandbox. Remote adds a \
+         binary upload, deploy cost, network latency, and can hit host firewalls; do not pick it by \
+         default. Local-subprocess (env=local) is fine for extra parallel hands here.\n\
+         \n\
          THREE PLACEMENTS (action=deploy, pick with `env`):\n\
          - env=local (default) — a subprocess on THIS machine. Fastest; use for extra parallel \
          hands here.\n\

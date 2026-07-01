@@ -213,6 +213,10 @@ impl Tool for ClusterTool {
         "Inspect your operator-managed remote clusters: machines (\"nodes\") grouped into clusters \
          that you can run work on. Use this to DISCOVER what compute you have, then dispatch to it.\n\
          \n\
+         PREFER LOCAL: default to a local `SubAgent` for delegation. Dispatch to a cluster node ONLY \
+         when the task genuinely needs THAT machine (its data, GPU, network location). Deploying a \
+         node uploads a binary and adds network latency — don't route here by default.\n\
+         \n\
          ACTIONS:\n\
          - action=list — compact inventory: every node's id, label, target (user@host or local), \
          status, its worker_id if deployed, and cluster membership. Start here.\n\
