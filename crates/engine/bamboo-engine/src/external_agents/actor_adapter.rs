@@ -548,6 +548,26 @@ impl ActorChildRunner {
         spec
     }
 
+    /// The `metadata["placement"]` JSON to stamp on a child from its resolved
+    /// placement, preferring the matching cluster node's `host_label` (its
+    /// operator label/host) over the raw endpoint/pool. `None` for a Local child
+    /// (the DTO defaults it to the backend's own host). Split out of
+    /// `execute_external_child` so the role→placement→host resolution is unit-testable.
+    fn placement_stamp_for(&self, spec: &ProvisionSpec) -> Option<String> {
+        let host_label = match &spec.placement {
+            Placement::Remote { .. } => self
+                .remote_placements
+                .get(spec.identity.role.as_str())
+                .and_then(|p| p.host_label.as_deref()),
+            Placement::Schedulable { .. } => self
+                .schedulable_placements
+                .get(spec.identity.role.as_str())
+                .and_then(|p| p.host_label.as_deref()),
+            Placement::Local => None,
+        };
+        placement_metadata(&spec.placement, host_label)
+    }
+
     /// Pick a live worker for a SCHEDULABLE role from the BUS (#181, Phase 3):
     /// ask the broker which actors are connected serving the pool role (presence
     /// is connection-truth — no HTTP registry, no leases, no connect-fail
@@ -689,18 +709,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // Only remote/scheduled placements need a stamp — a Local child falls through
         // to the DTO default (this backend's own host). Persisted by the caller with
         // the rest of the child session after we return.
-        let host_label = match &spec.placement {
-            Placement::Remote { .. } => self
-                .remote_placements
-                .get(spec.identity.role.as_str())
-                .and_then(|p| p.host_label.as_deref()),
-            Placement::Schedulable { .. } => self
-                .schedulable_placements
-                .get(spec.identity.role.as_str())
-                .and_then(|p| p.host_label.as_deref()),
-            Placement::Local => None,
-        };
-        if let Some(placement_meta) = placement_metadata(&spec.placement, host_label) {
+        if let Some(placement_meta) = self.placement_stamp_for(&spec) {
             session
                 .metadata
                 .insert("placement".to_string(), placement_meta);
@@ -1638,7 +1647,7 @@ mod tests {
                 endpoint: endpoint.clone(),
                 token: Some(token.to_string()),
                 ca_cert_file: None,
-                host_label: None, // plaintext ws:// loopback, default trust
+                host_label: Some("mini-e2e".into()), // node label, surfaced on the badge
             },
         );
         let runner = bogus_runner(placements);
@@ -1671,6 +1680,15 @@ mod tests {
             "expected echo reply, got {:?}",
             last.content
         );
+
+        // A remote run must stamp WHICH machine it ran on onto the child session
+        // (mirrored to the UI badge) using the placement's node label.
+        let placement = session
+            .metadata
+            .get("placement")
+            .expect("remote child session stamped with a placement");
+        assert!(placement.contains(r#""kind":"remote""#), "{placement}");
+        assert!(placement.contains(r#""host":"mini-e2e""#), "{placement}");
 
         // Drain a couple of streamed events to confirm the event pipe carried the
         // worker's tokens too (best-effort; the reply assertion above is primary).
@@ -1774,6 +1792,69 @@ mod tests {
         let spec = runner.build_spec(&s, &job_for("child-1"));
         assert_eq!(spec.placement, Placement::Local);
         assert!(spec.secrets.worker_auth_token.is_none());
+    }
+
+    /// The full role → resolved-placement → badge-host chain: a child routed to a
+    /// remote/schedulable placement carrying a cluster node's `host_label` stamps
+    /// that label; without a label it falls back to the endpoint host / pool; a
+    /// Local child gets no stamp (the DTO defaults it to the backend host).
+    #[test]
+    fn placement_stamp_uses_node_label_for_remote_and_schedulable() {
+        // Remote WITH a node label → {remote, <label>}, overriding the raw IP.
+        let mut remote = HashMap::new();
+        remote.insert(
+            "explorer".to_string(),
+            ResolvedRemotePlacement {
+                endpoint: "ws://169.254.230.101:8899".into(),
+                token: None,
+                ca_cert_file: None,
+                host_label: Some("mini".into()),
+            },
+        );
+        let runner = bogus_runner(remote);
+        let spec = runner.build_spec(&session_of_role("explorer", "go"), &job_for("c1"));
+        let stamp = runner.placement_stamp_for(&spec).expect("remote child is stamped");
+        assert!(stamp.contains(r#""kind":"remote""#), "{stamp}");
+        assert!(stamp.contains(r#""host":"mini""#), "{stamp}");
+
+        // Remote WITHOUT a node label → falls back to the endpoint host.
+        let mut remote_nolabel = HashMap::new();
+        remote_nolabel.insert(
+            "explorer".to_string(),
+            ResolvedRemotePlacement {
+                endpoint: "ws://169.254.230.101:8899".into(),
+                token: None,
+                ca_cert_file: None,
+                host_label: None,
+            },
+        );
+        let r2 = bogus_runner(remote_nolabel);
+        let spec2 = r2.build_spec(&session_of_role("explorer", "go"), &job_for("c1"));
+        assert!(
+            r2.placement_stamp_for(&spec2)
+                .unwrap()
+                .contains(r#""host":"169.254.230.101""#)
+        );
+
+        // Schedulable WITH a node label → {remote, <label>} (a node, not a pool name).
+        let mut sched = HashMap::new();
+        sched.insert(
+            "mac-mini-monitor".to_string(),
+            ResolvedSchedulablePlacement {
+                pool: "mac-mini-monitor".into(),
+                host_label: Some("mini".into()),
+            },
+        );
+        let sr = bogus_sched_runner(HashMap::new(), sched);
+        let spec3 = sr.build_spec(&session_of_role("mac-mini-monitor", "go"), &job_for("c1"));
+        let stamp3 = sr.placement_stamp_for(&spec3).expect("scheduled child is stamped");
+        assert!(stamp3.contains(r#""kind":"remote""#), "{stamp3}");
+        assert!(stamp3.contains(r#""host":"mini""#), "{stamp3}");
+
+        // A Local (unmatched) child gets NO stamp.
+        let local = bogus_runner(HashMap::new());
+        let spec4 = local.build_spec(&session_of_role("writer", "go"), &job_for("c1"));
+        assert_eq!(local.placement_stamp_for(&spec4), None);
     }
 
     // ---- #181: schedulable selection over the BUS (Phase 3 cutover) ----------

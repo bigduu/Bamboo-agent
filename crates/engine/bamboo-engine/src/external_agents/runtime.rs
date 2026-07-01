@@ -443,3 +443,97 @@ pub fn extract_provider_credentials(
 
     out
 }
+
+#[cfg(test)]
+mod placement_resolver_tests {
+    use super::{node_display_name, resolve_remote_placements, resolve_schedulable_placements};
+    use bamboo_config::cluster_fabric::{
+        DeployProfile, Node, NodePlacement, SshAuth, SshTarget, TrustLevel,
+    };
+    use bamboo_config::{RemoteActorPlacement, SchedulablePlacement};
+
+    fn ssh_node(id: &str, label: &str, host: &str, default_role: Option<&str>) -> Node {
+        Node {
+            id: id.into(),
+            label: label.into(),
+            placement: NodePlacement::Ssh(SshTarget {
+                host: host.into(),
+                port: 22,
+                username: "u".into(),
+                auth: SshAuth::SystemSshConfig,
+                host_key_fingerprint: None,
+            }),
+            trust_level: TrustLevel::default(),
+            deploy: DeployProfile {
+                default_role: default_role.map(String::from),
+                ..Default::default()
+            },
+            state: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn node_display_name_prefers_label_then_ssh_host() {
+        let n = ssh_node("n1", "mini", "mini.local", None);
+        assert_eq!(node_display_name(&n), "mini");
+        let mut unlabeled = n.clone();
+        unlabeled.label = String::new();
+        assert_eq!(node_display_name(&unlabeled), "mini.local");
+    }
+
+    #[test]
+    fn schedulable_placement_takes_host_label_from_node_by_default_role() {
+        let nodes = vec![ssh_node("n1", "mini", "mini.local", Some("mac-mini-monitor"))];
+        let placements = vec![SchedulablePlacement {
+            role: "mac-mini-monitor".into(),
+            pool: "mac-mini-monitor".into(),
+            ..Default::default()
+        }];
+        let out = resolve_schedulable_placements(&placements, &nodes);
+        let r = out.get("mac-mini-monitor").expect("role resolved");
+        assert_eq!(r.pool, "mac-mini-monitor");
+        assert_eq!(r.host_label.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn remote_placement_takes_host_label_from_node_by_ssh_host() {
+        let nodes = vec![ssh_node("n1", "mini", "mini.local", None)];
+        let placements = vec![RemoteActorPlacement {
+            role: "explorer".into(),
+            endpoint: "ws://mini.local:8899".into(),
+            ..Default::default()
+        }];
+        let out = resolve_remote_placements(&placements, &nodes);
+        assert_eq!(out.get("explorer").unwrap().host_label.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn no_host_label_when_no_node_matches() {
+        let nodes = vec![ssh_node("n1", "mini", "mini.local", Some("other-role"))];
+        let sched = vec![SchedulablePlacement {
+            role: "x".into(),
+            pool: "unmatched".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            resolve_schedulable_placements(&sched, &nodes)
+                .get("x")
+                .unwrap()
+                .host_label,
+            None
+        );
+        let remote = vec![RemoteActorPlacement {
+            role: "y".into(),
+            endpoint: "ws://other-host:9000".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            resolve_remote_placements(&remote, &nodes)
+                .get("y")
+                .unwrap()
+                .host_label,
+            None
+        );
+    }
+}
