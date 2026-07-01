@@ -84,6 +84,19 @@ pub(crate) fn validate_session_id(session_id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Where a session's agent physically runs: the deployment kind plus the host.
+/// Mirrored into the index from `session.metadata["placement"]` so the frontend
+/// can show "which machine this session runs on" without loading session.json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPlacement {
+    /// Deployment kind: `"local"` (this backend's own host), `"docker"`, or
+    /// `"ssh"` (a remote node the child was deployed to).
+    pub kind: String,
+    /// Host the agent runs on — the backend's hostname for `local`, or the
+    /// target host for a remote/ssh deployment.
+    pub host: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionIndexEntry {
     pub id: String,
@@ -164,6 +177,12 @@ pub struct SessionIndexEntry {
     /// `SubAgent.create` find and reuse the resident without loading session.json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident_name: Option<String>,
+    /// Where this session's agent physically runs (deployment kind + host).
+    /// Mirrored from `session.metadata["placement"]`. `None` for legacy rows and
+    /// for local sessions that were never stamped; the session DTO layer defaults
+    /// `None` to the backend's own local host so the frontend always has a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<SessionPlacement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +556,14 @@ impl SessionStoreV2 {
             .agent_runtime_state
             .as_ref()
             .is_some_and(|state| state.bypass_permissions);
+        // Placement (which machine the agent runs on) is stamped by the spawn
+        // path into `metadata["placement"]` as a JSON `{kind,host}` object for
+        // remote/deployed children; local sessions leave it unset and the DTO
+        // layer defaults them to this backend's own host.
+        let placement = session
+            .metadata
+            .get("placement")
+            .and_then(|v| serde_json::from_str::<SessionPlacement>(v).ok());
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -570,6 +597,7 @@ impl SessionStoreV2 {
                     subagent_type,
                     lifecycle,
                     resident_name,
+                    placement,
                 },
             );
             Ok(())

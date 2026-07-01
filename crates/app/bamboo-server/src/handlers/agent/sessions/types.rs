@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 use bamboo_engine::config::GoldConfig;
-use bamboo_storage::SessionIndexEntry;
+use bamboo_storage::{SessionIndexEntry, SessionPlacement};
 
 use bamboo_engine::model_config_helper::parse_session_gold_config;
 
@@ -74,6 +74,11 @@ pub struct SessionSummary {
     /// session); list endpoints leave it `false`.
     #[serde(default)]
     pub bypass_permissions: bool,
+    /// Which machine this session's agent runs on (deployment kind + host).
+    /// Always present: a session with no stamped placement (root sessions,
+    /// local children, legacy rows) defaults to this backend's own local host,
+    /// so the frontend can always render a "machine" badge.
+    pub placement: SessionPlacement,
 }
 
 impl SessionSummary {
@@ -110,7 +115,18 @@ impl SessionSummary {
             running_child_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
             bypass_permissions: entry.bypass_permissions,
+            placement: entry.placement.unwrap_or_else(local_placement),
         }
+    }
+}
+
+/// The default placement for a session that was never stamped: this backend's
+/// own machine, deployment kind `"local"`. Covers root sessions, local children,
+/// and legacy rows so the frontend always has a machine to display.
+pub(crate) fn local_placement() -> SessionPlacement {
+    SessionPlacement {
+        kind: "local".to_string(),
+        host: bamboo_config::local_hostname().to_string(),
     }
 }
 
@@ -363,6 +379,7 @@ mod tests {
         let summary = SessionSummary {
             id: "test-id".to_string(),
             bypass_permissions: false,
+            placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,
@@ -406,6 +423,7 @@ mod tests {
         let summary = SessionSummary {
             id: "session-123".to_string(),
             bypass_permissions: false,
+            placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
             title_version: 0,
@@ -536,6 +554,7 @@ mod tests {
         let summary = SessionSummary {
             id: "test".to_string(),
             bypass_permissions: false,
+            placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,

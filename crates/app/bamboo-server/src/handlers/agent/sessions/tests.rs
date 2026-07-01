@@ -37,6 +37,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         subagent_type: None,
         lifecycle: None,
         resident_name: None,
+        placement: None,
     };
 
     let summary = SessionSummary::from_entry(entry, false);
@@ -81,6 +82,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         subagent_type: Some("plan".to_string()),
         lifecycle: None,
         resident_name: None,
+        placement: None,
     };
 
     let summary = SessionSummary::from_entry(entry, false);
