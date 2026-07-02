@@ -60,7 +60,7 @@ impl BrokerServer {
         let (mut sink, mut source) = ws.split();
 
         // 1. Handshake — the first frame must be a Hello with a valid token.
-        let session_id = match read_client_frame(&mut source).await? {
+        let (session_id, role) = match read_client_frame(&mut source).await? {
             Some(ClientFrame::Hello { agent, token }) => {
                 if token != self.token {
                     let _ = send(
@@ -72,7 +72,9 @@ impl BrokerServer {
                     .await;
                     return Err(BrokerError::Auth("invalid token".into()));
                 }
-                agent.session_id
+                // Keep the role: it makes this connection discoverable as a live
+                // actor of role X via the bus's subscriber table (Phase 3).
+                (agent.session_id, agent.role)
             }
             Some(_) => {
                 let _ = send(
@@ -107,7 +109,7 @@ impl BrokerServer {
                                 }
                             }
                         }
-                        Ok(Some(ClientFrame::Subscribe)) => match self.core.subscribe(&session_id).await {
+                        Ok(Some(ClientFrame::Subscribe)) => match self.core.subscribe(&session_id, role.as_deref()).await {
                             Ok(rx) => sub_rx = Some(rx),
                             Err(e) => {
                                 let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string() }).await;
@@ -125,6 +127,14 @@ impl BrokerServer {
                         // write — pure control signal. #50.
                         Ok(Some(ClientFrame::Cancel { to, correlation_id })) => {
                             self.core.cancel(&to, &correlation_id).await;
+                        }
+                        // Presence query: which actors are connected serving `role`.
+                        // The subscriber table IS the registry (Phase 3).
+                        Ok(Some(ClientFrame::ListConnected { role })) => {
+                            let ids = self.core.connected_by_role(&role).await;
+                            if send(&mut sink, BrokerFrame::Connected { ids }).await.is_err() {
+                                break Ok(());
+                            }
                         }
                         Ok(None) => break Ok(()),   // client closed
                         Err(e) => break Err(e),

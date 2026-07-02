@@ -117,6 +117,7 @@ pub(super) fn build_root_tools(
     config: Arc<RwLock<Config>>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
     broker: Option<bamboo_config::BrokerClientConfig>,
+    fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -153,7 +154,7 @@ pub(super) fn build_root_tools(
         schedule_manager,
         session_store.clone(),
         storage.clone(),
-        config,
+        config.clone(),
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
@@ -179,17 +180,24 @@ pub(super) fn build_root_tools(
                     b.token.clone(),
                 )),
             ));
-            // Deployed worker handles are kill-on-drop, so the tool keeps them in
-            // this registry for the server's lifetime (torn down via stop / exit).
-            let registry: crate::tools::DeployedRegistry =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            // deploy_agent shares the fabric deployer's registry, so its
+            // list/stop covers cluster-deployed workers too (and vice versa).
             let bamboo_bin =
                 std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
-            Arc::new(crate::tools::OverlayToolExecutor::new(
+            let with_deploy: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 with_ask,
                 Arc::new(crate::tools::DeployAgentTool::new(
-                    b.endpoint, b.token, bamboo_bin, registry,
+                    b.endpoint,
+                    b.token,
+                    bamboo_bin,
+                    fabric_deployer.registry(),
                 )),
+            ));
+            // `cluster`: progressive-disclosure inventory (list/describe/status)
+            // + dispatch (deploy/stop) via the SAME shared deploy engine.
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                with_deploy,
+                Arc::new(crate::tools::ClusterTool::new(config, fabric_deployer)),
             ))
         }
         _ => tools_with_inspector,

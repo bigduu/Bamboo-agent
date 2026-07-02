@@ -54,6 +54,17 @@ impl SpawnedChild {
     pub fn pid(&self) -> Option<u32> {
         self.process.as_ref().and_then(|p| p.id())
     }
+
+    /// Whether the owned child process is still running (best-effort, non-blocking
+    /// `try_wait`). A remote (process-less) handle reports `false` — it is never
+    /// pool-owned. Used by the warm pool to skip + reap a worker that exited while
+    /// parked before handing it out for reuse.
+    pub fn is_alive(&mut self) -> bool {
+        match self.process.as_mut() {
+            Some(p) => matches!(p.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
 }
 
 /// Spawn `worker_bin worker_args…`, provision it with `spec` over stdin, then poll the fabric
@@ -117,4 +128,57 @@ pub async fn spawn_worker(
         }
         sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Spawn a worker that dials the mailbox bus (`spec.bus`) instead of listening
+/// for a direct WS connection. Returns as soon as the process is spawned + fed
+/// its spec — there is no file-discovery rendezvous to wait for; the worker
+/// dials the bus asynchronously and the broker queues any `Run` until it
+/// subscribes. The returned [`SpawnedChild`] carries a synthetic record (the
+/// worker is addressed by mailbox id, not a listen endpoint) + the kill-on-drop
+/// process handle.
+pub async fn spawn_worker_on_bus(
+    worker_bin: &Path,
+    worker_args: &[String],
+    spec: &ProvisionSpec,
+) -> TransportResult<SpawnedChild> {
+    let spec_json = spec
+        .to_json()
+        .map_err(|e| TransportError::Protocol(format!("provision spec encode: {e}")))?;
+
+    let mut cmd = Command::new(worker_bin);
+    cmd.args(worker_args);
+    cmd.stdin(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let mut process = cmd.spawn().map_err(TransportError::Io)?;
+    {
+        let mut stdin = process
+            .stdin
+            .take()
+            .ok_or_else(|| TransportError::Protocol("worker stdin unavailable".to_string()))?;
+        stdin
+            .write_all(spec_json.as_bytes())
+            .await
+            .map_err(TransportError::Io)?;
+        stdin.shutdown().await.map_err(TransportError::Io)?;
+    }
+
+    let record = AgentRecord {
+        agent_id: spec.identity.child_id.clone(),
+        role: spec.identity.role.clone(),
+        labels: Vec::new(),
+        endpoint: spec
+            .bus
+            .as_ref()
+            .map(|b| b.endpoint.clone())
+            .unwrap_or_default(),
+        pid: process.id().unwrap_or(0),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: chrono::Utc::now(),
+        lease_expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+    };
+    Ok(SpawnedChild {
+        record,
+        process: Some(process),
+    })
 }

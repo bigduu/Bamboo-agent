@@ -173,6 +173,17 @@ pub struct AppState {
     /// unblocked during a write's disk I/O. #126.
     pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Shared Remote Cluster Fabric deploy engine (one worker registry across the
+    /// HTTP operator handlers and the `cluster` agent tool).
+    pub fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
+
+    /// In-process mailbox bus (broker), when not externally configured. Held so
+    /// it lives for the server's lifetime (dropping it aborts the bus). `None`
+    /// when an external broker is configured or the bus couldn't bind. Never read
+    /// — its only job is to keep the bus task alive until AppState drops.
+    #[allow(dead_code)]
+    embedded_broker: Option<builder::EmbeddedBroker>,
+
     /// Hot-reloadable LLM provider with direct access
     ///
     /// This eliminates the proxy pattern where we created an AgentAppState
@@ -337,15 +348,6 @@ pub struct AppState {
     /// all outstanding codes by design. Keyed by `Instant`-based expiry; expired
     /// entries are purged opportunistically on insert/lookup.
     pub pairing_codes: Arc<dashmap::DashMap<String, crate::handlers::settings::PairingCodeEntry>>,
-
-    /// remote-actor P2a (#181): the in-memory `/v1/agents` control-plane registry.
-    /// Cross-host agent discovery — the network counterpart of the local-file
-    /// `bamboo_subagent::FileFabric`. Workers on other machines register/heartbeat
-    /// here; parents resolve/list/withdraw. PROCESS-EPHEMERAL — never persisted; a
-    /// restart drops all registrations (workers re-register on their next
-    /// heartbeat). Lease expiry is enforced lazily on read (see
-    /// [`crate::handlers::agent::agents::AgentRegistry`]).
-    pub agent_registry: Arc<crate::handlers::agent::agents::AgentRegistry>,
 
     /// v2-P2 (#181, slice 2): per-process brute-force guard for the public
     /// code-redemption path (`POST /v2/pair { code }`). A 6-digit code is only

@@ -292,26 +292,9 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route("/stream", web::get().to(agent::ws_v2::handler));
     cfg.service(v2_scope);
 
-    // remote-actor P2a (#181): the `/v1/agents` control-plane registry. GATED by
-    // the SAME access-password middleware as everything else — registration is a
-    // control-plane WRITE, and a forged record could poison routing
-    // (remote-actor-plan §5 "活性伪造:注册需持 token"). It is deliberately NOT on
-    // the public whitelist (`is_public_access_route`): a remote, credential-less
-    // caller is rejected with 401, while a local-bypass desktop / valid device
-    // token / verified cookie reaches the handlers. The client side is
-    // `bamboo_subagent::RegistryFabric`.
-    let agents_scope = web::scope("/v1/agents")
-        .wrap(actix_web::middleware::from_fn(
-            settings::enforce_access_password_middleware,
-        ))
-        .route("", web::post().to(agent::agents::register_agent))
-        .route("", web::get().to(agent::agents::list_agents))
-        .route("/{agent_id}", web::get().to(agent::agents::get_agent))
-        .route(
-            "/{agent_id}",
-            web::delete().to(agent::agents::withdraw_agent),
-        );
-    cfg.service(agents_scope);
+    // (The `/v1/agents` HTTP control-plane registry was retired in Phase 3 — the
+    // mailbox bus's connection table is the live-actor registry now; schedulable
+    // selection queries it via `ListConnected`.)
 }
 
 /// Whether the dev-only HTTP endpoints (e.g. `POST /api/v1/dev/reset`) should be

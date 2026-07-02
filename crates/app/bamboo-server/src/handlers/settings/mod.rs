@@ -5,6 +5,7 @@
 
 mod access_control;
 mod bamboo_config;
+mod cluster_fabric;
 mod env_vars;
 mod keyword_masking;
 mod permission;
@@ -26,6 +27,10 @@ pub use bamboo_config::{
     get_bamboo_config, get_bamboo_tools, get_model_limit_defaults, get_proxy_auth_status,
     reset_bamboo_config, set_bamboo_config, set_proxy_auth, validate_bamboo_config_patch,
     ProxyAuthPayload,
+};
+pub use cluster_fabric::{
+    create_cluster, create_node, delete_cluster, delete_node, get_node, list_nodes, node_deploy,
+    node_logs, node_status, node_stop, node_test, update_cluster, update_node,
 };
 pub use env_vars::{delete_env_var, list_env_vars, replace_env_vars, upsert_env_var};
 pub use keyword_masking::{

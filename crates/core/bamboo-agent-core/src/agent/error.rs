@@ -39,6 +39,13 @@ pub enum AgentError {
     /// Agent execution was cancelled by user
     #[error("Cancelled")]
     Cancelled,
+
+    /// An actor child worker produced no first frame within the deadline — it is
+    /// presumed dead (e.g. a pooled worker that exited after its liveness check
+    /// but before handling the Run). Signals the runner to reap it and retry on a
+    /// fresh worker, rather than waiting forever on a queued Run nobody serves.
+    #[error("Worker unresponsive: {0}")]
+    WorkerUnresponsive(String),
 }
 
 impl AgentError {

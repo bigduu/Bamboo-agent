@@ -300,10 +300,13 @@ pub struct SubagentsConfig {
     /// to verify the actor chain end-to-end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
-    /// When set, root agents get an `ask_agent` tool that asks broker-deployed
-    /// agents (local / Docker / remote) over this message broker, in `query` or
-    /// `steer` mode. Omit to leave the tool off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The active message-broker endpoint the `ask_agent` tool / sub-agent bus
+    /// dials. RUNTIME-ONLY (`#[serde(skip)]`): never read from nor written to
+    /// `config.json`. It is populated in memory each boot by `maybe_embed_broker`
+    /// — either from a user-managed external broker in `<data_dir>/broker.json`,
+    /// or from the freshly-embedded in-process broker (whose ephemeral loopback
+    /// port must NEVER be persisted, else a later boot dials a dead port).
+    #[serde(skip)]
     pub broker: Option<BrokerClientConfig>,
     /// Remote placements: pin specific sub-agent roles to resident workers
     /// reached over `wss://` instead of a locally-spawned subprocess
@@ -350,7 +353,10 @@ pub struct SchedulablePlacement {
     pub role: String,
     /// Logical pool name — the registry `role` to query for live workers.
     pub pool: String,
-    /// Base URL of the agent registry, e.g. `https://control-plane:9562`.
+    /// VESTIGIAL (Phase 3 retired the HTTP agent registry — pools are now bus
+    /// roles resolved via broker presence). Kept for config back-compat; ignored
+    /// by the resolver. Optional so a placement is just `{role, pool}`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub registry_url: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
     /// `auth_ref`). Used for BOTH the registry query and the worker connect.
@@ -397,8 +403,14 @@ pub struct BrokerClientConfig {
     /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
     pub endpoint: String,
     /// Bearer token presented in the broker handshake.
+    ///
+    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
+    /// empty on disk and hydrated in memory on load (mirrors [`EnvVarEntry`]).
     #[serde(default)]
     pub token: String,
+    /// Encrypted ciphertext of `token` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_encrypted: Option<String>,
 }
 
 /// Main configuration structure for Bamboo agent
@@ -521,14 +533,19 @@ pub struct Config {
 
     /// Sub-agent execution settings.
     ///
-    /// The one knob most users need is `runtime`:
-    /// `"subagents": { "runtime": "actor" }` runs every sub-agent as an
-    /// independent actor process (crash isolation, true parallelism).
-    /// Everything else (worker binary, discovery dir) is derived
-    /// automatically. Always serialized so the knob is discoverable in
-    /// `bamboo config`.
+    /// Sub-agents ALWAYS run as independent actor subprocesses (crash isolation,
+    /// true parallelism) — the in-process runtime was removed, so there is no
+    /// `runtime` toggle (a stray `runtime`/`overrides` key in an old config is
+    /// silently ignored). Most users need nothing here; the fields below
+    /// (`max_concurrent`, `broker`, remote/schedulable placements) are advanced.
     #[serde(default)]
     pub subagents: SubagentsConfig,
+
+    /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
+    /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
+    /// ⇒ empty. SSH secrets are encrypted at rest (see [`crate::cluster_fabric`]).
+    #[serde(default, skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty")]
+    pub cluster_fabric: crate::cluster_fabric::ClusterFabricConfig,
 
     /// MCP server configuration.
     ///
@@ -1364,6 +1381,10 @@ impl Config {
         config.hydrate_mcp_secrets_from_encrypted();
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
+        // Decrypt encrypted cluster-fabric SSH secrets into in-memory plaintext.
+        config.hydrate_cluster_fabric_from_encrypted();
+        // Decrypt the encrypted broker token into in-memory plaintext.
+        config.hydrate_broker_token_from_encrypted();
         config.normalize_tool_settings();
         config.normalize_skill_settings();
 
@@ -1448,6 +1469,8 @@ impl Config {
             config.hydrate_provider_instance_api_keys_from_encrypted();
             config.hydrate_mcp_secrets_from_encrypted();
             config.hydrate_env_vars_from_encrypted();
+            config.hydrate_cluster_fabric_from_encrypted();
+            config.hydrate_broker_token_from_encrypted();
             config.normalize_tool_settings();
             config.normalize_skill_settings();
             config
@@ -1957,6 +1980,7 @@ impl Config {
             proxy_auth_encrypted: None,
             headless_auth: false,
             subagents: SubagentsConfig::default(),
+            cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
             providers: ProviderConfigs::default(),
             provider_instances: HashMap::new(),
@@ -2010,6 +2034,10 @@ impl Config {
         to_save.refresh_provider_instance_api_keys_encrypted()?;
         to_save.refresh_env_vars_encrypted()?;
         to_save.sanitize_env_vars_for_disk();
+        to_save.refresh_cluster_fabric_encrypted()?;
+        to_save.sanitize_cluster_fabric_for_disk();
+        // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
+        // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
         let content =
@@ -3776,6 +3804,50 @@ mod tests {
             }
         }
         panic!("TEST_PUBLISH not found in cache after retries");
+    }
+
+    #[test]
+    fn broker_token_round_trips_encrypt_sanitize_hydrate() {
+        let mut config = Config::default();
+        config.subagents.broker = Some(BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:9600".to_string(),
+            token: "super-secret-token".to_string(),
+            token_encrypted: None,
+        });
+
+        // Persist path: encrypt then sanitize (what save_to_dir does).
+        config.refresh_broker_token_encrypted().unwrap();
+        config.sanitize_broker_token_for_disk();
+        let broker = config.subagents.broker.as_ref().unwrap();
+        assert!(broker.token.is_empty(), "plaintext cleared for disk");
+        assert!(broker.token_encrypted.is_some(), "ciphertext stored");
+        assert_ne!(
+            broker.token_encrypted.as_deref(),
+            Some("super-secret-token")
+        );
+
+        // Load path: hydrate restores plaintext.
+        config.hydrate_broker_token_from_encrypted();
+        assert_eq!(
+            config.subagents.broker.as_ref().unwrap().token,
+            "super-secret-token"
+        );
+    }
+
+    #[test]
+    fn broker_token_empty_refresh_preserves_ciphertext() {
+        // A redacted round-trip (token empty) must not wipe the stored ciphertext.
+        let mut config = Config::default();
+        config.subagents.broker = Some(BrokerClientConfig {
+            endpoint: "ws://h:9600".to_string(),
+            token: String::new(),
+            token_encrypted: Some("existing-cipher".to_string()),
+        });
+        config.refresh_broker_token_encrypted().unwrap();
+        assert_eq!(
+            config.subagents.broker.as_ref().unwrap().token_encrypted.as_deref(),
+            Some("existing-cipher"),
+        );
     }
 
     #[test]

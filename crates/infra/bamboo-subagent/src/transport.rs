@@ -646,6 +646,29 @@ impl ChildClient {
     }
 }
 
+/// The parent→child control link, abstracted over transport so the actor runner
+/// drives a child identically whether it is reached by a direct WS connection
+/// ([`ChildClient`]) or over the mailbox bus
+/// (`bamboo_broker::BrokerChildLink`). This trait is the seam where the two
+/// sub-agent families (PULL direct / PUSH broker) collapse into one drive path.
+#[async_trait::async_trait]
+pub trait ChildLink: Send {
+    /// Send a parent→child frame (Run / Cancel / steer / approval reply).
+    async fn send(&mut self, frame: ParentFrame) -> TransportResult<()>;
+    /// Next child→parent frame, or `None` once the run is terminal / the link closes.
+    async fn next_frame(&mut self) -> TransportResult<Option<ChildFrame>>;
+}
+
+#[async_trait::async_trait]
+impl ChildLink for ChildClient {
+    async fn send(&mut self, frame: ParentFrame) -> TransportResult<()> {
+        ChildClient::send(self, frame).await
+    }
+    async fn next_frame(&mut self) -> TransportResult<Option<ChildFrame>> {
+        ChildClient::next_frame(self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

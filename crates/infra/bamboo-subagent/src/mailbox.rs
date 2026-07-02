@@ -64,6 +64,34 @@ pub enum InboxKind {
     McpRequest,
     /// The orchestrator's answer to an [`InboxKind::McpRequest`].
     McpReply,
+    /// Parent→child: run a full child session. `body` is a serialized
+    /// [`crate::proto::RunSpec`] (the actor `Run` frame, carried over the mailbox
+    /// bus instead of a direct WS connection). The unification target — a local
+    /// child is driven over the bus exactly like a deployed one.
+    Run,
+    /// Child→parent: one streamed agent event during a [`InboxKind::Run`]. `body`
+    /// is the verbatim event JSON (the actor `ChildFrame::Event`). `reply_to`
+    /// correlates it to the `Run` it belongs to.
+    Event,
+    /// Child→parent: the terminal result of a [`InboxKind::Run`]. `body` is a
+    /// serialized [`crate::executor::ChildOutcome`]. `reply_to` correlates it to
+    /// the `Run`.
+    Outcome,
+    /// Parent→child: an in-band steering message for a running [`InboxKind::Run`]
+    /// (the actor `ParentFrame::Message`). `body` is `{"text": "..."}`;
+    /// `correlation_id` is the run id, so the worker routes it to that run's steer
+    /// inbox.
+    Steer,
+    /// Child→parent: a gated-tool approval request raised mid-[`InboxKind::Run`]
+    /// (the actor `ChildFrame::ApprovalRequest`). `body` is `{"id": "...",
+    /// "request": {...}}`; `correlation_id` is the run id. The parent answers with
+    /// an [`InboxKind::ApprovalReply`] carrying the same `id`.
+    ApprovalRequest,
+    /// Parent→child: the decision for an [`InboxKind::ApprovalRequest`] (the actor
+    /// `ParentFrame::ApprovalReply`). `body` is `{"approved": bool}`;
+    /// `correlation_id` is the approval request `id`, so the worker routes it to
+    /// the waiting tool call.
+    ApprovalReply,
 }
 
 /// How a sub-agent should answer an [`InboxKind::Ask`].
@@ -134,6 +162,27 @@ impl Mailbox {
     }
     fn corrupt_dir(&self) -> PathBuf {
         self.dir.join("corrupt")
+    }
+
+    /// True if the mailbox holds NO messages at all — nothing pending in `new/`
+    /// NOR claimed-in-flight in `cur/` (stricter than [`is_empty`](Self::is_empty),
+    /// which only checks `new/`). A purge-safe emptiness check for mailbox GC: an
+    /// empty, unsubscribed mailbox can be deleted (it is re-created on the next
+    /// deliver/subscribe), reclaiming the per-run parent-link dirs that accumulate.
+    pub fn is_fully_empty(&self) -> bool {
+        fn has_message(d: &std::path::Path) -> bool {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.flatten().any(|e| {
+                        let n = e.file_name();
+                        let n = n.to_string_lossy();
+                        // Skip the atomic-write temp (`.`-prefixed); count real msgs.
+                        !n.starts_with('.') && n.ends_with(".json")
+                    })
+                })
+                .unwrap_or(false)
+        }
+        !has_message(&self.new_dir()) && !has_message(&self.cur_dir())
     }
 
     pub async fn ensure_dirs(&self) -> Result<()> {

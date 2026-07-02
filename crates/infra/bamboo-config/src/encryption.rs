@@ -284,6 +284,15 @@ fn derived_fallback_identifier() -> Option<String> {
     (parts.len() > 2).then(|| parts.join("|"))
 }
 
+/// The backend machine's hostname, detected once and cached for the process.
+/// Falls back to `"localhost"` when detection fails. Used to label which machine
+/// a session runs on (the "local" placement host shown in the UI).
+pub fn local_hostname() -> &'static str {
+    use std::sync::OnceLock;
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| system_hostname().unwrap_or_else(|| "localhost".to_string()))
+}
+
 fn system_hostname() -> Option<String> {
     if let Some(hostname) = read_first_env_var(&["HOSTNAME", "COMPUTERNAME"]) {
         return Some(hostname);

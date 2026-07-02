@@ -33,10 +33,61 @@ pub struct BrokerAgentArgs {
     /// When set, proxy all MCP tool calls to this orchestrator id over the broker
     /// (host-bound servers run only there) instead of syncing servers directly.
     pub mcp_proxy: Option<String>,
+    /// Read a parent-resolved `ProvisionSpec` from stdin instead of self-resolving
+    /// from local config — the orchestrator ships the same authoritative bootstrap
+    /// a local subprocess worker gets (model/creds/MCP/identity/bus all decided by
+    /// the parent). Unifies the deployed-actor bootstrap with the local one.
+    pub spec_stdin: bool,
+    /// Like `spec_stdin`, but read the spec from a FILE the orchestrator uploaded
+    /// (the delivery a remote deployer uses — it SFTP/scp-uploads the spec next to
+    /// the binary rather than piping a TTY'd stdin).
+    pub spec_file: Option<String>,
 }
 
 /// Connect to the broker and serve until the connection drops.
 pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
+    // Parent-shipped bootstrap: read the authoritative ProvisionSpec the
+    // orchestrator resolved (identity, bus, model, creds, MCP) — from an uploaded
+    // file (remote deploy) or stdin (local). Unifies the deployed-actor path with
+    // the local one; no self-resolution from this host's config.
+    let piped_spec = if let Some(path) = &args.spec_file {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("broker-agent: read spec file '{path}': {e}"))?;
+        Some(
+            serde_json::from_slice::<bamboo_subagent::ProvisionSpec>(&bytes)
+                .map_err(|e| format!("broker-agent: parse spec file '{path}': {e}"))?,
+        )
+    } else if args.spec_stdin {
+        Some(
+            bamboo_subagent::ProvisionSpec::read_from_stdin()
+                .await
+                .map_err(|e| format!("broker-agent: read ProvisionSpec from stdin: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(spec) = piped_spec {
+        let me = AgentRef {
+            session_id: spec.identity.child_id.clone(),
+            role: Some(spec.identity.role.clone()),
+        };
+        // The spec's bus is authoritative when present; fall back to the CLI flags.
+        let (endpoint, token) = match &spec.bus {
+            Some(bus) => (bus.endpoint.clone(), bus.token.clone()),
+            None => (args.broker.clone(), args.token.clone()),
+        };
+        tracing::info!(id = %me.session_id, broker = %endpoint, "broker-agent serving from piped spec");
+        let executor: Arc<dyn bamboo_subagent::ChildExecutor> = match spec.executor {
+            ExecutorSpec::Echo => Arc::new(EchoExecutor),
+            _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
+        };
+        return bamboo_broker::serve_executor(&endpoint, me, &token, executor)
+            .await
+            .map_err(|e| format!("broker-agent (spec) failed: {e}"));
+    }
+
+    // Legacy self-resolve path: build the spec from local config + CLI args.
     let me = AgentRef {
         session_id: args.id.clone(),
         role: args.role.clone(),
@@ -136,9 +187,18 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     // #73: a deployed broker-agent is definitionally unattended — no interactive
     // human to answer approvals. Mark it so that IF gating is ever enabled for
     // it, its (and its sub-agents') gated actions are model-reviewed locally
-    // rather than hard-denied (host=None, reviewer=None). A no-op today since the
-    // broker-agent doesn't set `enforce_permissions`.
+    // rather than hard-denied (host=None, reviewer=None).
     spec.capabilities.no_human_approver = true;
+
+    // DELIBERATE DIVERGENCE (audited): unlike the actor child runner — which
+    // hard-sets `enforce_permissions = true` because it owns the per-run
+    // ApprovalProxy bridge — this path leaves it `false`. A broker-agent has NO
+    // approval-delegation channel over the broker, so a permission gate here
+    // would have nowhere to escalate (it would fail-closed and break legitimate
+    // dangerous-but-needed ops). Flipping this on REQUIRES first wiring
+    // approval-delegation over the broker; until then this is the intentional
+    // (trusted-infra) posture, not an oversight.
+    // spec.capabilities.enforce_permissions stays false — see provision.rs.
 
     Ok(spec)
 }

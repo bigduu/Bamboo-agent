@@ -29,8 +29,14 @@ pub struct ProvisionSpec {
     pub identity: ChildIdentity,
     /// Which execution engine this actor runs (worker maps it via its factory).
     pub executor: ExecutorSpec,
-    /// Tier-1 fabric directory the worker self-registers into.
+    /// Tier-1 fabric directory the worker self-registers into (legacy direct-WS
+    /// path). Ignored when `bus` is set.
     pub fabric_dir: String,
+    /// The mailbox bus this actor dials home to instead of listening for a direct
+    /// WS connection. When set, the worker serves its mailbox over the bus (the
+    /// unified actor+mailbox transport); the parent drives it by mailbox id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<BusEndpoint>,
     /// Isolated storage root for this actor's own session/mailbox files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_dir: Option<String>,
@@ -53,6 +59,9 @@ pub struct ProvisionSpec {
     /// (role/provider/model/workspace/tools), so N sibling sub-agents no longer
     /// mean N processes. Each run still gets a fresh session rehydrated from the
     /// run's `messages`, so context stays isolated across reuses.
+    ///
+    /// (The production actor runner always sets this `true`; the `false` path is
+    /// exercised only by one-shot CLI/test workers.)
     #[serde(default)]
     pub reusable: bool,
     /// Where this actor runs. `Local` (default) — the parent spawns a local
@@ -91,9 +100,13 @@ pub struct Capabilities {
     /// When `true`, the worker builds its tool executor WITH a permission
     /// checker, so gated tools hit `ConfirmationRequired` and delegate the
     /// decision to the host via the per-run `ApprovalProxy` (Phase 2:
-    /// child → parent approval). Default `false` preserves the legacy behavior
-    /// (the worker runs all tools unchecked). Only meaningful when the run has a
-    /// host bridge to proxy to — real actor runs always do.
+    /// child → parent approval). Default `false` runs all tools unchecked.
+    ///
+    /// In practice this is effectively fixed per spawn path, not a free knob:
+    /// the actor runner hard-sets it `true` (it has the ApprovalProxy bridge),
+    /// while the broker-agent path leaves it `false` ON PURPOSE — that path has
+    /// no approval delegation over the broker, so a gate would have nothing to
+    /// delegate to. Only meaningful when the run has a host bridge to proxy to.
     #[serde(default)]
     pub enforce_permissions: bool,
     /// When `true`, the worker builds its OWN external-child runner, scheduler,
@@ -138,6 +151,15 @@ pub struct Capabilities {
     /// marker. Mirrors `no_human_approver` above.
     #[serde(default)]
     pub guardian_read_only: bool,
+}
+
+/// The mailbox bus an actor dials home to (the unified transport).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusEndpoint {
+    /// Broker WebSocket endpoint, e.g. `ws://127.0.0.1:9600`.
+    pub endpoint: String,
+    /// Bearer token presented in the broker handshake.
+    pub token: String,
 }
 
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
@@ -254,6 +276,7 @@ impl ProvisionSpec {
             identity,
             executor,
             fabric_dir,
+            bus: None,
             storage_dir: None,
             workspace: None,
             model: None,
@@ -266,7 +289,28 @@ impl ProvisionSpec {
         }
     }
 
+    /// Cross-field invariants enforced before a spec is shipped to a worker.
+    ///
+    /// `mcp` (direct portable servers) and `mcp_proxy` (proxy ALL MCP to the
+    /// orchestrator) are mutually exclusive — the proxy already covers every
+    /// server, so carrying both is contradictory. The worker would silently
+    /// honor only `mcp_proxy`; fail closed here instead (D4 from the drift
+    /// audit: this invariant was documented but never guarded).
+    pub fn validate(&self) -> Result<()> {
+        if self.capabilities.mcp.is_some() && self.capabilities.mcp_proxy.is_some() {
+            return Err(StoreError::Invalid(
+                "capabilities.mcp and capabilities.mcp_proxy are mutually exclusive \
+                 (proxy covers all MCP) — set exactly one"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn to_json(&self) -> Result<String> {
+        // Enforce the invariants on EVERY serialization path (local spawn over
+        // stdin, deploy, tests) so an invalid spec can never reach a worker.
+        self.validate()?;
         serde_json::to_string(self)
             .map_err(|e| StoreError::decode(std::path::Path::new("<provision>"), e))
     }
@@ -321,6 +365,25 @@ mod tests {
             provider_type: None,
         });
         s
+    }
+
+    #[test]
+    fn validate_rejects_both_mcp_and_mcp_proxy() {
+        let mut s = spec();
+        s.capabilities.mcp = Some(serde_json::json!({"servers": []}));
+        s.capabilities.mcp_proxy = Some(McpProxyConfig {
+            orchestrator: "bamboo-orchestrator".into(),
+            endpoint: "ws://127.0.0.1:9600".into(),
+            token: "t".into(),
+        });
+        // validate() rejects, and to_json() (the universal ship path) propagates it.
+        assert!(matches!(s.validate(), Err(StoreError::Invalid(_))));
+        assert!(s.to_json().is_err());
+
+        // Exactly one is fine.
+        s.capabilities.mcp = None;
+        assert!(s.validate().is_ok());
+        assert!(s.to_json().is_ok());
     }
 
     #[test]

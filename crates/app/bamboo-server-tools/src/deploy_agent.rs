@@ -163,14 +163,18 @@ impl DeployAgentTool {
             echo,
             // Deployed workers proxy MCP to the orchestrator (single MCP host).
             mcp_proxy: Some(bamboo_broker::ORCHESTRATOR_ID.to_string()),
+            log_path: None,
+            spec_json: None,
         };
         let handle = deployer
             .deploy(&deployment)
             .await
             .map_err(|e| ToolError::Execution(format!("deploy '{id}' ({env}) failed: {e}")))?;
 
+        // Namespace the registry key so an agent-chosen id can never collide
+        // with a cluster-fabric node id in the SHARED registry (cross-eviction).
         self.registry.lock().await.insert(
-            id.clone(),
+            crate::registry_keys::agent_key(&id),
             Deployed {
                 env: env.clone(),
                 handle,
@@ -186,7 +190,12 @@ impl DeployAgentTool {
     }
 
     async fn stop(&self, id: String) -> Result<ToolResult, ToolError> {
-        match self.registry.lock().await.remove(&id) {
+        match self
+            .registry
+            .lock()
+            .await
+            .remove(&crate::registry_keys::agent_key(&id))
+        {
             Some(d) => {
                 d.handle.shutdown().await;
                 Ok(tool_json(json!({ "id": id, "status": "stopped" })))
@@ -197,9 +206,14 @@ impl DeployAgentTool {
 
     async fn list(&self) -> Result<ToolResult, ToolError> {
         let reg = self.registry.lock().await;
+        // The registry is shared with the cluster fabric, so show every worker
+        // with its source (agent-deployed vs cluster node) and the bare id.
         let agents: Vec<_> = reg
             .iter()
-            .map(|(id, d)| json!({ "id": id, "env": d.env }))
+            .map(|(key, d)| {
+                let (source, id) = crate::registry_keys::split(key);
+                json!({ "id": id, "source": source, "env": d.env })
+            })
             .collect();
         Ok(tool_json(json!({ "agents": agents })))
     }
@@ -225,6 +239,12 @@ impl Tool for DeployAgentTool {
          scale yourself out: you deploy a fresh broker-agent, then drive it with ask_agent. The \
          worker connects back to the same message broker you are on, and inherits your MCP servers \
          + skills (via the orchestrator MCP proxy), so it can do real work — not just echo.\n\
+         \n\
+         PREFER LOCAL. Default to a local `SubAgent` (an in-context child) for delegation. Reach for \
+         a REMOTE worker (env=ssh, or a cluster node) ONLY when the task genuinely needs THAT \
+         machine — its data, GPU, network location/proximity, or a clean sandbox. Remote adds a \
+         binary upload, deploy cost, network latency, and can hit host firewalls; do not pick it by \
+         default. Local-subprocess (env=local) is fine for extra parallel hands here.\n\
          \n\
          THREE PLACEMENTS (action=deploy, pick with `env`):\n\
          - env=local (default) — a subprocess on THIS machine. Fastest; use for extra parallel \
@@ -333,10 +353,11 @@ mod tests {
         let tool = tool_with(registry.clone());
 
         // (1) register a worker (the registry effect of a successful deploy); list shows it.
+        // Use the namespaced key so the tool's stop()/list() find it.
         let agent = spawn_sleeper("w1", None);
         let pid = agent.pid().expect("child has a pid");
         registry.lock().await.insert(
-            "w1".to_string(),
+            crate::registry_keys::agent_key("w1"),
             Deployed {
                 env: "local".into(),
                 handle: agent,

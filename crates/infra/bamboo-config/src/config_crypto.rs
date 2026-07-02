@@ -384,4 +384,44 @@ impl Config {
             }
         }
     }
+
+    // ── Broker client token encryption ─────────────────────────────────
+
+    /// Decrypt the broker token into in-memory plaintext after loading config.
+    pub fn hydrate_broker_token_from_encrypted(&mut self) {
+        let Some(broker) = self.subagents.broker.as_mut() else {
+            return;
+        };
+        if !broker.token.trim().is_empty() {
+            return; // already has plaintext
+        }
+        if let Some(encrypted) = &broker.token_encrypted {
+            match crate::encryption::decrypt(encrypted) {
+                Ok(value) => broker.token = value,
+                Err(e) => tracing::warn!("Failed to decrypt broker token: {}", e),
+            }
+        }
+    }
+
+    /// Re-encrypt the broker token before persisting to disk.
+    pub fn refresh_broker_token_encrypted(&mut self) -> Result<()> {
+        let Some(broker) = self.subagents.broker.as_mut() else {
+            return Ok(());
+        };
+        if broker.token.trim().is_empty() {
+            // Keep any existing ciphertext (a redacted round-trip never re-sends it).
+            return Ok(());
+        }
+        broker.token_encrypted = Some(
+            crate::encryption::encrypt(&broker.token).context("Failed to encrypt broker token")?,
+        );
+        Ok(())
+    }
+
+    /// Clear the plaintext broker token before serialization to disk.
+    pub fn sanitize_broker_token_for_disk(&mut self) {
+        if let Some(broker) = self.subagents.broker.as_mut() {
+            broker.token = String::new();
+        }
+    }
 }

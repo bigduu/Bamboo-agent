@@ -301,6 +301,19 @@ enum BrokerAgentCommands {
         /// (host-bound MCP servers run only there).
         #[arg(long = "mcp-proxy")]
         mcp_proxy: Option<String>,
+
+        /// Read a parent-resolved `ProvisionSpec` (model/creds/MCP/identity/bus)
+        /// from stdin instead of self-resolving from this host's local config.
+        /// The orchestrator pipes it on deploy — the same bootstrap a local
+        /// subprocess worker already gets. When set, --model/--workspace/--mcp-proxy
+        /// are ignored (the spec is authoritative).
+        #[arg(long = "spec-stdin")]
+        spec_stdin: bool,
+
+        /// Like --spec-stdin, but read the spec from this FILE (a remote deployer
+        /// uploads it next to the binary). Takes precedence over --spec-stdin.
+        #[arg(long = "spec-file")]
+        spec_file: Option<String>,
     },
 }
 
@@ -700,6 +713,10 @@ async fn main() {
                 .unwrap_or_else(|_| bind.clone());
             tracing::info!(%addr, root = %root.display(), "bamboo broker serving");
             let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(root));
+            // Reclaim empty, unsubscribed mailbox dirs every 5 minutes.
+            let _gc = core
+                .clone()
+                .spawn_mailbox_gc(std::time::Duration::from_secs(300));
             let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, token));
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
@@ -717,6 +734,8 @@ async fn main() {
                 workspace,
                 echo,
                 mcp_proxy,
+                spec_stdin,
+                spec_file,
             } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
@@ -740,6 +759,8 @@ async fn main() {
                     workspace,
                     echo,
                     mcp_proxy,
+                    spec_stdin,
+                    spec_file,
                 })
                 .await;
             if let Err(e) = result {

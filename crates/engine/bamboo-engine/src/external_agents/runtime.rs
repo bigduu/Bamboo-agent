@@ -229,8 +229,18 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
             sub.max_concurrent
                 .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
         )
-        .with_remote_placements(resolve_remote_placements(&sub.remote_placements))
-        .with_schedulable_placements(resolve_schedulable_placements(&sub.schedulable_placements)),
+        .with_remote_placements(resolve_remote_placements(
+            &sub.remote_placements,
+            &config.cluster_fabric.nodes,
+        ))
+        .with_schedulable_placements(resolve_schedulable_placements(
+            &sub.schedulable_placements,
+            &config.cluster_fabric.nodes,
+        ))
+        .with_bus(sub.broker.as_ref().map(|b| bamboo_subagent::BusEndpoint {
+            endpoint: b.endpoint.clone(),
+            token: b.token.clone(),
+        })),
     ))
 }
 
@@ -244,49 +254,73 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
 /// Duplicate roles: last one wins.
 fn resolve_schedulable_placements(
     placements: &[bamboo_config::SchedulablePlacement],
+    nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedSchedulablePlacement> {
-    let mut out = std::collections::HashMap::new();
-    for p in placements {
-        let token = match p.token_env.as_deref() {
-            Some(env_var) => match std::env::var(env_var) {
-                Ok(token) => Some(token),
-                Err(_) => {
-                    tracing::error!(
-                        "schedulable placement for role '{}' token_env '{}' is not set; \
-                         skipping (role falls back to local, NOT an unauthenticated registry query)",
-                        p.role,
-                        env_var
-                    );
-                    continue;
-                }
-            },
-            None => {
-                // A tokenless schedulable placement only makes sense on a trusted
-                // link. Warn if it targets what looks like a public registry so an
-                // operator footgun is visible in logs.
-                if registry_url_looks_public(&p.registry_url) {
-                    tracing::warn!(
-                        "schedulable placement for role '{}' has no token_env but targets a \
-                         public-looking registry '{}'; the registry query AND the worker connect \
-                         will carry NO bearer. Set token_env for any non-loopback control plane.",
-                        p.role,
-                        p.registry_url
-                    );
-                }
-                None
-            }
-        };
-        out.insert(
-            p.role.clone(),
-            super::actor_adapter::ResolvedSchedulablePlacement {
-                pool: p.pool.clone(),
-                registry_url: p.registry_url.clone(),
-                token,
-                ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
-            },
-        );
+    // Phase 3: a pool is just a bus role. The runner picks a live connected worker
+    // of that role via the bus presence query — no registry url / token / cert.
+    placements
+        .iter()
+        .map(|p| {
+            (
+                p.role.clone(),
+                super::actor_adapter::ResolvedSchedulablePlacement {
+                    pool: p.pool.clone(),
+                    // The badge shows the cluster node's own metadata: a node
+                    // deployed to serve this pool (its `deploy.default_role`).
+                    host_label: node_label_for_role(nodes, &p.pool),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Friendly display name for a cluster node whose worker serves `role`
+/// (`deploy.default_role`) — the operator `label`, else its ssh host. Used to
+/// stamp the UI placement badge from the node's own metadata.
+fn node_label_for_role(
+    nodes: &[bamboo_config::cluster_fabric::Node],
+    role: &str,
+) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| n.deploy.default_role.as_deref() == Some(role))
+        .map(node_display_name)
+}
+
+/// Friendly display name for a cluster node whose ssh host matches `endpoint`'s
+/// host — so a `remote_placements` endpoint pointing at a known node shows the
+/// node's label rather than a bare IP.
+fn node_label_for_endpoint(
+    nodes: &[bamboo_config::cluster_fabric::Node],
+    endpoint: &str,
+) -> Option<String> {
+    let host = endpoint
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        return None;
     }
-    out
+    nodes
+        .iter()
+        .find(|n| match &n.placement {
+            bamboo_config::cluster_fabric::NodePlacement::Ssh(t) => t.host == host,
+            bamboo_config::cluster_fabric::NodePlacement::Local => false,
+        })
+        .map(node_display_name)
+}
+
+fn node_display_name(n: &bamboo_config::cluster_fabric::Node) -> String {
+    if !n.label.trim().is_empty() {
+        return n.label.clone();
+    }
+    match &n.placement {
+        bamboo_config::cluster_fabric::NodePlacement::Ssh(t) => t.host.clone(),
+        bamboo_config::cluster_fabric::NodePlacement::Local => "local".to_string(),
+    }
 }
 
 /// Resolve config `remote_placements` into runner-ready handles (#193), keyed by
@@ -312,24 +346,9 @@ fn endpoint_looks_public(endpoint: &str) -> bool {
     !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty())
 }
 
-/// Like `endpoint_looks_public` but for a registry URL (`http://` / `https://`).
-/// `https://` is always public-grade; for `http://` we flag any non-loopback
-/// host. Used to surface a tokenless-schedulable-placement footgun in logs.
-fn registry_url_looks_public(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
-    }
-    let host = url
-        .strip_prefix("http://")
-        .unwrap_or(url)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("");
-    !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty())
-}
-
 fn resolve_remote_placements(
     placements: &[bamboo_config::RemoteActorPlacement],
+    nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedRemotePlacement> {
     let mut out = std::collections::HashMap::new();
     for p in placements {
@@ -368,6 +387,9 @@ fn resolve_remote_placements(
                 endpoint: p.endpoint.clone(),
                 token,
                 ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+                // Badge from the node's own metadata when the endpoint points at
+                // a known cluster node; else the endpoint host is used downstream.
+                host_label: node_label_for_endpoint(nodes, &p.endpoint),
             },
         );
     }
@@ -420,4 +442,98 @@ pub fn extract_provider_credentials(
     }));
 
     out
+}
+
+#[cfg(test)]
+mod placement_resolver_tests {
+    use super::{node_display_name, resolve_remote_placements, resolve_schedulable_placements};
+    use bamboo_config::cluster_fabric::{
+        DeployProfile, Node, NodePlacement, SshAuth, SshTarget, TrustLevel,
+    };
+    use bamboo_config::{RemoteActorPlacement, SchedulablePlacement};
+
+    fn ssh_node(id: &str, label: &str, host: &str, default_role: Option<&str>) -> Node {
+        Node {
+            id: id.into(),
+            label: label.into(),
+            placement: NodePlacement::Ssh(SshTarget {
+                host: host.into(),
+                port: 22,
+                username: "u".into(),
+                auth: SshAuth::SystemSshConfig,
+                host_key_fingerprint: None,
+            }),
+            trust_level: TrustLevel::default(),
+            deploy: DeployProfile {
+                default_role: default_role.map(String::from),
+                ..Default::default()
+            },
+            state: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn node_display_name_prefers_label_then_ssh_host() {
+        let n = ssh_node("n1", "mini", "mini.local", None);
+        assert_eq!(node_display_name(&n), "mini");
+        let mut unlabeled = n.clone();
+        unlabeled.label = String::new();
+        assert_eq!(node_display_name(&unlabeled), "mini.local");
+    }
+
+    #[test]
+    fn schedulable_placement_takes_host_label_from_node_by_default_role() {
+        let nodes = vec![ssh_node("n1", "mini", "mini.local", Some("mac-mini-monitor"))];
+        let placements = vec![SchedulablePlacement {
+            role: "mac-mini-monitor".into(),
+            pool: "mac-mini-monitor".into(),
+            ..Default::default()
+        }];
+        let out = resolve_schedulable_placements(&placements, &nodes);
+        let r = out.get("mac-mini-monitor").expect("role resolved");
+        assert_eq!(r.pool, "mac-mini-monitor");
+        assert_eq!(r.host_label.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn remote_placement_takes_host_label_from_node_by_ssh_host() {
+        let nodes = vec![ssh_node("n1", "mini", "mini.local", None)];
+        let placements = vec![RemoteActorPlacement {
+            role: "explorer".into(),
+            endpoint: "ws://mini.local:8899".into(),
+            ..Default::default()
+        }];
+        let out = resolve_remote_placements(&placements, &nodes);
+        assert_eq!(out.get("explorer").unwrap().host_label.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn no_host_label_when_no_node_matches() {
+        let nodes = vec![ssh_node("n1", "mini", "mini.local", Some("other-role"))];
+        let sched = vec![SchedulablePlacement {
+            role: "x".into(),
+            pool: "unmatched".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            resolve_schedulable_placements(&sched, &nodes)
+                .get("x")
+                .unwrap()
+                .host_label,
+            None
+        );
+        let remote = vec![RemoteActorPlacement {
+            role: "y".into(),
+            endpoint: "ws://other-host:9000".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            resolve_remote_placements(&remote, &nodes)
+                .get("y")
+                .unwrap()
+                .host_label,
+            None
+        );
+    }
 }

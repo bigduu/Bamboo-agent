@@ -114,6 +114,15 @@ impl AppState {
         // In-memory session cache (shared across handlers and background jobs).
         let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
 
+        // Embed the mailbox bus (broker) in-process unless an external one is
+        // configured. Mutates `config.subagents.broker` to point at the loopback
+        // bus BEFORE it is wrapped/read downstream, so ask_agent / deploy_agent /
+        // cluster all wire to it — and a standalone `bamboo broker serve` is no
+        // longer required for sub-agent dispatch. (Foundation for routing local
+        // actors onto the bus.)
+        let mut config = config;
+        let embedded_broker = maybe_embed_broker(&mut config, &data_dir).await;
+
         let config = Arc::new(RwLock::new(config));
 
         // Wire the configured-default-workspace resolver into agent-core. This keeps
@@ -389,6 +398,22 @@ impl AppState {
             ))
         };
 
+        // Config-write io-lock + the shared Remote Cluster Fabric deploy engine.
+        // The engine is built once and shared by the HTTP handlers (via AppState)
+        // and the `cluster` agent tool, so both use ONE worker registry.
+        let config_io_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let fabric_registry: crate::tools::DeployedRegistry =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let fabric_bamboo_bin =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
+        let fabric_deployer = Arc::new(bamboo_server_tools::FabricDeployer::new(
+            config.clone(),
+            config_io_lock.clone(),
+            bamboo_home_dir.clone(),
+            fabric_registry,
+            fabric_bamboo_bin,
+        ));
+
         let tools = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
@@ -404,6 +429,7 @@ impl AppState {
             config.clone(),
             provider_registry.clone(),
             config_snapshot.subagents.broker.clone(),
+            fabric_deployer.clone(),
         );
 
         child_completion_coordinator
@@ -450,10 +476,18 @@ impl AppState {
         let bash_resume_hook: Arc<dyn bamboo_engine::BashResumeHook> =
             child_completion_coordinator.clone();
 
+        // Cluster-fabric reconcile: session-bound workers died with the previous
+        // bamboo process (kill-on-drop child / in-memory russh session), so any
+        // persisted `Running`/`Deploying` node state is stale on boot. Flip it to
+        // `Unreachable` so the UI/agent see reality (a redeploy brings it back).
+        reconcile_fabric_on_boot(&config, &bamboo_home_dir).await;
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
-            config_io_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_io_lock,
+            fabric_deployer,
+            embedded_broker,
             provider: provider_lock,
             provider_handle,
             sessions,
@@ -489,7 +523,229 @@ impl AppState {
             pairing_code_guard: Arc::new(crate::handlers::settings::PairingCodeGuard::default()),
             root_password_guard: Arc::new(crate::handlers::settings::RootPasswordGuard::default()),
             // remote-actor P2a (#181): empty in-memory agent registry.
-            agent_registry: Arc::new(crate::handlers::agent::agents::AgentRegistry::new()),
         })
+    }
+}
+
+/// A handle to the in-process mailbox bus (broker) so it can be shut down with
+/// the server. Dropping it aborts the serve task.
+pub struct EmbeddedBroker {
+    task: tokio::task::JoinHandle<()>,
+    gc_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for EmbeddedBroker {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.gc_task.abort();
+    }
+}
+
+/// Start an in-process broker on `127.0.0.1:<auto>` and point
+/// `config.subagents.broker` (RUNTIME-ONLY, `#[serde(skip)]`) at it — UNLESS a
+/// user-managed external broker is configured in `<data_dir>/broker.json` and
+/// reachable (then use that). Returns `None` when an external broker is used or
+/// the bind fails (sub-agent dispatch then degrades exactly as before).
+///
+/// The broker's endpoint deliberately lives in EITHER the in-memory config (for
+/// the embedded case, regenerated each boot) or its own `broker.json` (for the
+/// external case) — NEVER in `config.json`. That is what stops a prior run's
+/// ephemeral auto-port from leaking into the user's config and being dialed dead
+/// on the next boot (every sub-agent + the MCP proxy would hit "connect refused").
+async fn maybe_embed_broker(
+    config: &mut bamboo_llm::Config,
+    data_dir: &std::path::Path,
+) -> Option<EmbeddedBroker> {
+    // A user-managed EXTERNAL broker (multi-host / shared standalone bus) lives in
+    // its OWN file, `<data_dir>/broker.json` — separate from config.json. Honour
+    // it ONLY if actually REACHABLE; a dead endpoint (standalone broker not up)
+    // falls through to a fresh in-process broker so dispatch still works.
+    if let Some(external) = load_external_broker(data_dir) {
+        let endpoint = external.endpoint.trim().to_string();
+        if broker_endpoint_reachable(&endpoint).await {
+            tracing::info!(%endpoint, "using external broker from broker.json");
+            config.subagents.broker = Some(external);
+            return None;
+        }
+        tracing::warn!(
+            %endpoint,
+            "broker.json endpoint is unreachable — embedding a fresh in-process broker instead"
+        );
+    }
+
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("embedded broker: bind failed, sub-agent dispatch disabled: {e}");
+            return None;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => {
+            tracing::warn!("embedded broker: local_addr failed: {e}");
+            return None;
+        }
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let root = data_dir.join("broker");
+    let core = Arc::new(bamboo_broker::BrokerCore::new(root));
+    // Reclaim orphan mailbox dirs (one-shot parent links, killed pool workers)
+    // every 5 min so `<data>/broker/mailboxes/` doesn't grow unbounded.
+    let gc_task = core
+        .clone()
+        .spawn_mailbox_gc(std::time::Duration::from_secs(300));
+    let server = Arc::new(bamboo_broker::BrokerServer::new(core, token.clone()));
+
+    let task = tokio::spawn(async move {
+        if let Err(e) = server.serve(listener).await {
+            tracing::error!("embedded broker serve loop ended: {e}");
+        }
+    });
+
+    // Set the endpoint IN MEMORY ONLY — `subagents.broker` is `#[serde(skip)]`, so
+    // this ephemeral loopback port is regenerated every boot and never touches disk.
+    config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
+        endpoint: format!("ws://127.0.0.1:{port}"),
+        token,
+        token_encrypted: None,
+    });
+    tracing::info!(port, "embedded mailbox bus (broker) started in-process");
+    Some(EmbeddedBroker { task, gc_task })
+}
+
+/// Load a user-managed EXTERNAL broker from `<data_dir>/broker.json`, if present.
+/// This file is the SEPARATE, persisted home for a standalone/remote broker —
+/// deliberately NOT `config.json`, so the embedded broker's ephemeral runtime
+/// port can never leak into the user's config (the stale-dead-port bug). An
+/// absent file or a parse error yields `None` (embed a fresh in-process broker).
+///
+/// Format is a plain [`BrokerClientConfig`] JSON object, e.g.:
+/// `{ "endpoint": "wss://broker.example:9600", "token": "…" }`.
+fn load_external_broker(data_dir: &std::path::Path) -> Option<bamboo_config::BrokerClientConfig> {
+    let path = data_dir.join("broker.json");
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<bamboo_config::BrokerClientConfig>(&bytes) {
+        Ok(cfg) if !cfg.endpoint.trim().is_empty() => Some(cfg),
+        Ok(_) => {
+            tracing::warn!(?path, "broker.json has an empty endpoint — ignoring");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(?path, "broker.json present but unparseable: {e}");
+            None
+        }
+    }
+}
+
+/// Best-effort TCP reachability probe of a `ws[s]://host:port[/path]` broker
+/// endpoint. Used to tell a LIVE external/standalone broker (keep) apart from a
+/// DEAD persisted endpoint (a prior run's embedded auto-port that leaked into
+/// config.json — re-embed). A short timeout keeps boot fast when it's dead.
+async fn broker_endpoint_reachable(endpoint: &str) -> bool {
+    let host_port = endpoint
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if host_port.is_empty() {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(host_port),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// On boot, mark stale cluster-fabric node state as `Unreachable`: workers
+/// deployed by the previous process were session-bound (they died with it), so a
+/// persisted `Running`/`Deploying` status no longer reflects reality. Best-effort
+/// + persisted so the UI and `cluster status` don't show phantom-running nodes.
+async fn reconcile_fabric_on_boot(
+    config: &Arc<RwLock<bamboo_llm::Config>>,
+    data_dir: &std::path::Path,
+) {
+    use bamboo_config::cluster_fabric::NodeStatus;
+
+    let snapshot = {
+        let mut cfg = config.write().await;
+        let mut changed = 0usize;
+        for node in &mut cfg.cluster_fabric.nodes {
+            if let Some(state) = node.state.as_mut() {
+                if matches!(state.status, NodeStatus::Running | NodeStatus::Deploying) {
+                    state.status = NodeStatus::Unreachable;
+                    state.last_error =
+                        Some("orchestrator restarted; worker no longer tracked".to_string());
+                    changed += 1;
+                }
+            }
+        }
+        if changed == 0 {
+            return;
+        }
+        tracing::info!(
+            reconciled = changed,
+            "cluster-fabric: marked stale Running nodes Unreachable on boot"
+        );
+        cfg.clone()
+    };
+
+    if let Err(e) = snapshot.save_to_dir(data_dir.to_path_buf()) {
+        tracing::warn!("cluster-fabric boot reconcile: failed to persist: {e}");
+    }
+}
+
+#[cfg(test)]
+mod broker_embed_tests {
+    use super::{broker_endpoint_reachable, load_external_broker};
+
+    #[test]
+    fn load_external_broker_reads_broker_json_not_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file ⇒ None (embed a fresh in-process broker).
+        assert!(load_external_broker(dir.path()).is_none());
+
+        // A well-formed broker.json ⇒ parsed external broker.
+        std::fs::write(
+            dir.path().join("broker.json"),
+            r#"{ "endpoint": "wss://broker.example:9600", "token": "t" }"#,
+        )
+        .unwrap();
+        let got = load_external_broker(dir.path()).expect("parsed");
+        assert_eq!(got.endpoint, "wss://broker.example:9600");
+        assert_eq!(got.token, "t");
+
+        // Empty endpoint ⇒ ignored (treated as absent).
+        std::fs::write(dir.path().join("broker.json"), r#"{ "endpoint": "  " }"#).unwrap();
+        assert!(load_external_broker(dir.path()).is_none());
+
+        // Garbage ⇒ ignored, never panics.
+        std::fs::write(dir.path().join("broker.json"), "not json").unwrap();
+        assert!(load_external_broker(dir.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn reachability_probe_distinguishes_live_from_dead() {
+        // Bound-then-dropped port: nothing listening ⇒ unreachable (a stale
+        // persisted embedded endpoint must NOT be trusted).
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = l.local_addr().unwrap();
+        drop(l);
+        assert!(!broker_endpoint_reachable(&format!("ws://{dead}")).await);
+
+        // Empty / malformed ⇒ never trusted.
+        assert!(!broker_endpoint_reachable("").await);
+        assert!(!broker_endpoint_reachable("ws://").await);
+
+        // A LIVE listener (with a path) ⇒ reachable (a real external broker is kept).
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = live.local_addr().unwrap();
+        assert!(broker_endpoint_reachable(&format!("ws://{addr}/stream")).await);
     }
 }

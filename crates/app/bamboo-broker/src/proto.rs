@@ -28,6 +28,11 @@ pub enum ClientFrame {
     /// acked. A control signal, deliberately off the at-least-once work path so a
     /// cancel can never queue behind the very work it cancels. #50.
     Cancel { to: String, correlation_id: MsgId },
+    /// Ask the broker which actors are currently connected serving `role` — the
+    /// bus IS the live-actor registry (presence is connection-truth). The broker
+    /// answers with [`BrokerFrame::Connected`]. Replaces the HTTP `/v1/agents`
+    /// registry discover for schedulable worker selection (Phase 3).
+    ListConnected { role: String },
 }
 
 /// Broker → client.
@@ -46,6 +51,9 @@ pub enum BrokerFrame {
     /// Out-of-band cancel pushed to a live subscriber: abort the in-flight run
     /// correlated to `correlation_id`. Ephemeral — never persisted/acked (#50).
     Cancel { correlation_id: MsgId },
+    /// Answer to [`ClientFrame::ListConnected`]: the mailbox ids of every actor
+    /// currently connected serving the requested role.
+    Connected { ids: Vec<String> },
 }
 
 impl ClientFrame {
@@ -110,6 +118,9 @@ mod tests {
                 to: "child".into(),
                 correlation_id: MsgId::new(),
             },
+            ClientFrame::ListConnected {
+                role: "gpu-pool".into(),
+            },
         ];
         for f in frames {
             assert_eq!(ClientFrame::from_text(&f.to_text()).unwrap(), f);
@@ -139,6 +150,9 @@ mod tests {
             BrokerFrame::Delivered { id: MsgId::new() },
             BrokerFrame::Cancel {
                 correlation_id: MsgId::new(),
+            },
+            BrokerFrame::Connected {
+                ids: vec!["w-1".into(), "w-2".into()],
             },
         ];
         for f in frames {

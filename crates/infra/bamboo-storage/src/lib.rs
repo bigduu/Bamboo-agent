@@ -14,4 +14,6 @@ pub mod v2;
 pub use jsonl::JsonlStorage;
 pub use search_index::{SessionSearchIndex, SessionSearchMatch};
 pub use session_merge::{merge_save_session, LockedSessionStore};
-pub use v2::{CleanupMode, CleanupResult, SessionIndexEntry, SessionStoreV2, SessionsIndex};
+pub use v2::{
+    CleanupMode, CleanupResult, SessionIndexEntry, SessionPlacement, SessionStoreV2, SessionsIndex,
+};
