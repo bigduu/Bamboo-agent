@@ -329,6 +329,36 @@ mod tests {
         serde_json::from_str(&r.result).unwrap()
     }
 
+    /// A throwaway in-process broker on a random port (token `"t"`).
+    async fn start_broker() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
+        let server = Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (format!("ws://{addr}"), dir)
+    }
+
+    /// Join a worker to the bus so the post-deploy presence verify can see it
+    /// (mailbox id == worker id, registered under `role`). Keep the handle alive.
+    async fn join_worker(endpoint: &str, id: &str, role: &str) -> bamboo_broker::BrokerClient {
+        let mut c = bamboo_broker::BrokerClient::connect(
+            endpoint,
+            bamboo_subagent::AgentRef {
+                session_id: id.into(),
+                role: Some(role.into()),
+            },
+            "t",
+        )
+        .await
+        .unwrap();
+        c.subscribe().await.unwrap();
+        c
+    }
+
     #[tokio::test]
     async fn list_summarizes_nodes_without_secrets() {
         let cfg = config_with(
@@ -391,17 +421,24 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_local_node_registers_worker_then_stop_clears_it() {
-        // Use a harmless binary as "bamboo": LocalProcessDeployer spawns it with
-        // broker-agent args (ignored by /usr/bin/true), exercising the shared
-        // deploy engine's register/stop via the tool.
+        // Exercises the register/stop plumbing through the tool. `/usr/bin/true`
+        // stands in for the `bamboo` binary (spawned with broker-agent args it
+        // ignores), so it drives the spawn/register path only. Deploy now runs a
+        // post-deploy presence verify for NON-echo workers too, so we stand up a
+        // real broker and join a matching worker (id "node-n1" under the resident
+        // default role "general-purpose") to stand in for the process dialing home.
+        let (endpoint, _broker_dir) = start_broker().await;
         let mut config = Config::default();
         config.cluster_fabric.nodes = vec![local_node("n1")];
         config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
-            endpoint: "ws://127.0.0.1:9600".into(),
-            token: "tok".into(),
+            endpoint: endpoint.clone(),
+            token: "t".into(),
             token_encrypted: None,
         });
         let cfg = Arc::new(RwLock::new(config));
+
+        // The worker "dials home": a live bus client under the node's resolved role.
+        let _worker = join_worker(&endpoint, "node-n1", "general-purpose").await;
 
         // Unique data dir so the persisted config.json doesn't collide with peers.
         let data_dir = std::env::temp_dir().join(format!("bamboo-clustertool-{}", std::process::id()));
@@ -417,10 +454,6 @@ mod tests {
         let t = ClusterTool::new(cfg, deployer);
 
         let key = crate::registry_keys::node_key("n1");
-        // echo=false: this exercises register/stop plumbing with a fake binary.
-        // echo=true would trigger the post-deploy bus round-trip verify, which a
-        // `/usr/bin/true` "worker" (never connects to a broker) can't satisfy —
-        // the echo round-trip itself is covered by bamboo-broker's ask tests.
         let out = parse(t.deploy("n1", false).await.unwrap());
         assert_eq!(out["worker_id"], "node-n1");
         assert_eq!(out["status"], "deployed");

@@ -10,13 +10,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
 
 use bamboo_broker::{
-    ask_agent, AgentDeployment, Deployer, LocalProcessDeployer, RusshAuth, RusshDeployer,
-    SshDeployer, UploadSpec, ORCHESTRATOR_ID,
+    ask_agent, AgentDeployment, BrokerClient, Deployer, LocalProcessDeployer, RusshAuth,
+    RusshDeployer, SshDeployer, UploadSpec, ORCHESTRATOR_ID,
 };
 use bamboo_config::cluster_fabric::{Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget};
 use bamboo_config::{BrokerClientConfig, Config};
@@ -211,49 +211,63 @@ impl FabricDeployer {
             }
         }
 
-        // Verify-on-deploy (echo smoke test): exec'ing the worker used to report
-        // "running" even when the worker never dialed home (phantom success — e.g.
-        // a missing/incompatible binary silently failed to exec). For the echo
-        // executor, actually round-trip a ping over the bus so a broken
-        // deploy→tunnel→broker→worker chain surfaces HERE, not as a hung ask later.
-        if echo {
-            if let Err(e) = verify_echo_worker(&broker, &worker_id).await {
-                // Tear the half-dead worker down and report the real failure.
-                if let Some(d) = self
-                    .registry
-                    .lock()
-                    .await
-                    .remove(&crate::registry_keys::node_key(node_id))
-                {
-                    d.handle.shutdown().await;
-                }
-                let msg = format!(
-                    "worker deployed but never answered on the bus (echo verify failed): {e} — \
-                     check that `bamboo` runs on the remote (arch/deps) and see the node log"
-                );
-                let failed = NodeState {
-                    status: NodeStatus::Failed,
-                    worker_id: Some(worker_id.clone()),
-                    log_path: Some(log_path.clone()),
-                    last_error: Some(msg.clone()),
-                    ..Default::default()
-                };
-                let _ = self.persist_state(node_id, Some(failed)).await;
-                tracing::warn!(
-                    audit = "cluster_fabric.deploy",
-                    node = node_id,
-                    worker_id = %worker_id,
-                    outcome = "verify_failed",
-                    error = %e,
-                );
-                return Err(FabricError::Internal(format!("deploy node '{node_id}': {msg}")));
+        // Verify-on-deploy: exec'ing the worker used to report "running" even when
+        // the worker never dialed home (phantom success — e.g. a missing/incompatible
+        // binary silently failed to exec). Surface a broken deploy→tunnel→broker→worker
+        // chain HERE, not as a hung ask on the first real task.
+        //   • echo executor → round-trip a `ping` (proves the executor loop runs).
+        //   • real executor → presence probe on the bus. A live LLM worker must NOT
+        //     be handed a bogus task, so we only confirm it registered its mailbox —
+        //     enough to prove the chain is live. The role matches what the resident
+        //     registers under (the spec's `default_role`, else `general-purpose`).
+        let verify = if echo {
+            verify_echo_worker(&broker, &worker_id).await
+        } else {
+            let role = node
+                .deploy
+                .default_role
+                .clone()
+                .unwrap_or_else(|| "general-purpose".to_string());
+            verify_worker_connected(&broker, &worker_id, &role, Duration::from_secs(30)).await
+        };
+        if let Err(e) = verify {
+            // Tear the half-dead worker down and report the real failure.
+            if let Some(d) = self
+                .registry
+                .lock()
+                .await
+                .remove(&crate::registry_keys::node_key(node_id))
+            {
+                d.handle.shutdown().await;
             }
-            tracing::info!(
+            let msg = format!(
+                "worker deployed but never came up on the bus (verify failed): {e} — \
+                 check that `bamboo` runs on the remote (arch/deps) and see the node log"
+            );
+            let failed = NodeState {
+                status: NodeStatus::Failed,
+                worker_id: Some(worker_id.clone()),
+                log_path: Some(log_path.clone()),
+                last_error: Some(msg.clone()),
+                ..Default::default()
+            };
+            let _ = self.persist_state(node_id, Some(failed)).await;
+            tracing::warn!(
+                audit = "cluster_fabric.deploy",
                 node = node_id,
                 worker_id = %worker_id,
-                "echo verify ok — worker is reachable on the bus"
+                echo,
+                outcome = "verify_failed",
+                error = %e,
             );
+            return Err(FabricError::Internal(format!("deploy node '{node_id}': {msg}")));
         }
+        tracing::info!(
+            node = node_id,
+            worker_id = %worker_id,
+            echo,
+            "deploy verify ok — worker is reachable on the bus"
+        );
 
         let state = NodeState {
             status: NodeStatus::Running,
@@ -438,9 +452,15 @@ fn build_resident_spec(
         .and_then(parse_provider_model)
         .or_else(|| {
             config.defaults.as_ref().and_then(|d| {
-                d.sub_agent.as_ref().or(Some(&d.chat)).map(|r| ModelRefSpec {
-                    provider: r.provider.clone(),
-                    model: r.model.clone(),
+                // sub_agent default, else chat. Guard emptiness so we never ship an
+                // invalid `{provider:"", model:""}` spec — a modelless non-echo worker
+                // then fails the presence verify at deploy instead of at first task.
+                let r = d.sub_agent.as_ref().unwrap_or(&d.chat);
+                (!r.provider.trim().is_empty() && !r.model.trim().is_empty()).then(|| {
+                    ModelRefSpec {
+                        provider: r.provider.clone(),
+                        model: r.model.clone(),
+                    }
                 })
             })
         });
@@ -554,6 +574,45 @@ async fn verify_echo_worker(broker: &BrokerClientConfig, worker_id: &str) -> Res
     .map_err(|e| e.to_string())
 }
 
+/// Presence probe for a freshly-deployed **non-echo** worker. Unlike the echo
+/// verify it sends NO task (a live LLM worker must not be handed a bogus ping):
+/// it polls the bus's live-actor registry until the worker's mailbox appears
+/// under `role`, proving the deploy → tunnel → broker → worker chain came up.
+/// A worker that never dialed home (wrong arch, missing deps, failed exec) fails
+/// the deploy HERE instead of silently reporting "Running" and hanging the first
+/// task. `role` must match what the resident registers under (the spec's
+/// `default_role`, else the `general-purpose` default).
+async fn verify_worker_connected(
+    broker: &BrokerClientConfig,
+    worker_id: &str,
+    role: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let me = AgentRef {
+        session_id: format!("{ORCHESTRATOR_ID}-deploy-presence"),
+        role: Some("orchestrator".to_string()),
+    };
+    let mut client = BrokerClient::connect(&broker.endpoint, me, &broker.token)
+        .await
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match client.list_connected(role).await {
+            Ok(ids) if ids.iter().any(|id| id == worker_id) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "worker '{worker_id}' never registered on the bus under role \
+                 '{role}' within {}s",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Build the deployer for a node. `bamboo_bin` is the local `bamboo` path used
 /// for `placement = Local`. Returns a human-readable error for misconfigured
 /// nodes (missing secret, etc.).
@@ -651,5 +710,93 @@ mod resident_spec_tests {
         assert!(parse_provider_model(":m").is_none());
         assert!(parse_provider_model("p:").is_none());
         assert!(parse_provider_model("  ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod presence_verify_tests {
+    //! The non-echo deploy verify is a task-free presence probe: it must confirm a
+    //! worker registered on the bus under its role, fail fast when it never came
+    //! up, and stay role-scoped (so a worker under a different role doesn't count).
+    use super::verify_worker_connected;
+    use bamboo_config::BrokerClientConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn start_broker() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
+        let server = Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (format!("ws://{addr}"), dir)
+    }
+
+    /// Connect + subscribe a worker so the broker's live-actor registry lists it
+    /// under `role` (mailbox id == worker id, matching a resident deploy).
+    async fn join(endpoint: &str, id: &str, role: &str) -> bamboo_broker::BrokerClient {
+        let mut c = bamboo_broker::BrokerClient::connect(
+            endpoint,
+            bamboo_subagent::AgentRef {
+                session_id: id.into(),
+                role: Some(role.into()),
+            },
+            "t",
+        )
+        .await
+        .unwrap();
+        c.subscribe().await.unwrap();
+        c
+    }
+
+    fn cfg(endpoint: &str) -> BrokerClientConfig {
+        BrokerClientConfig {
+            endpoint: endpoint.to_string(),
+            token: "t".into(),
+            token_encrypted: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ok_when_worker_registered_under_role() {
+        let (endpoint, _dir) = start_broker().await;
+        let _worker = join(&endpoint, "w-mon", "monitor").await;
+        let out =
+            verify_worker_connected(&cfg(&endpoint), "w-mon", "monitor", Duration::from_secs(3))
+                .await;
+        assert!(out.is_ok(), "present worker should verify: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn times_out_when_worker_absent() {
+        let (endpoint, _dir) = start_broker().await;
+        // Nobody joined "monitor" — the probe must fail fast, never hang.
+        let out = verify_worker_connected(
+            &cfg(&endpoint),
+            "w-mon",
+            "monitor",
+            Duration::from_millis(400),
+        )
+        .await;
+        assert!(out.is_err(), "absent worker should fail verify");
+        assert!(out.unwrap_err().contains("never registered"));
+    }
+
+    #[tokio::test]
+    async fn role_scoped_ignores_worker_under_other_role() {
+        let (endpoint, _dir) = start_broker().await;
+        // Right id, wrong role bucket → must not satisfy a "monitor" probe.
+        let _other = join(&endpoint, "w-mon", "builder").await;
+        let out = verify_worker_connected(
+            &cfg(&endpoint),
+            "w-mon",
+            "monitor",
+            Duration::from_millis(400),
+        )
+        .await;
+        assert!(out.is_err(), "a worker under a different role must not count");
     }
 }

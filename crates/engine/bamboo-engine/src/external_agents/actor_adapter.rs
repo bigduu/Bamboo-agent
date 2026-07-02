@@ -884,9 +884,13 @@ impl ExternalChildRunner for ActorChildRunner {
             &event_tx,
             &cancel_token,
             &mut live_rx,
-            // Only the local (spawn-capable) path can respawn; remote/schedulable
-            // wait without a watchdog (no fallback worker to retry on).
-            if remote { None } else { Some(WORKER_FIRST_FRAME_TIMEOUT) },
+            // First-frame watchdog for EVERY placement: a wedged-but-connected
+            // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
+            // no first frame; without a deadline drive() blocks forever. Bounding it
+            // turns the "running-but-unresponsive" hang into a recoverable
+            // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
+            // on a fixed remote endpoint).
+            Some(WORKER_FIRST_FRAME_TIMEOUT),
         )
         .await;
         // Unregister IMMEDIATELY: after drive returns nobody consumes live_rx,
@@ -899,15 +903,34 @@ impl ExternalChildRunner for ActorChildRunner {
         // worker stays dialed-in + subscribed, ready for its next Run).
         drop(client);
 
-        // A dead pooled local worker: reap it and re-acquire ONCE before giving up.
-        if !remote && attempt == 0 && matches!(result, Err(AgentError::WorkerUnresponsive(_))) {
-            tracing::warn!(
-                "actor child {} got no first frame; reaping the worker and respawning once",
-                job.child_session_id
-            );
-            actor.worker.kill().await;
-            attempt += 1;
-            continue;
+        // No first frame ⇒ the worker is wedged. Recover ONCE before giving up:
+        //   - Local: reap the dead pooled worker + respawn.
+        //   - Schedulable: not ours to kill — drop it and re-select a live pool
+        //     member (a wedged worker must not fail the run when the pool has others).
+        //   - Remote: a FIXED endpoint has no alternative — fall through to a bounded
+        //     WorkerUnresponsive error (far better than the previous infinite hang).
+        if attempt == 0 && matches!(result, Err(AgentError::WorkerUnresponsive(_))) {
+            match kind {
+                PlacementKind::Local => {
+                    tracing::warn!(
+                        "actor child {} got no first frame; reaping the worker and respawning once",
+                        job.child_session_id
+                    );
+                    actor.worker.kill().await;
+                    attempt += 1;
+                    continue;
+                }
+                PlacementKind::Schedulable => {
+                    tracing::warn!(
+                        "scheduled actor child {} got no first frame; re-selecting a pool worker",
+                        job.child_session_id
+                    );
+                    drop(actor);
+                    attempt += 1;
+                    continue;
+                }
+                PlacementKind::Remote => {}
+            }
         }
         break (result, actor);
         };

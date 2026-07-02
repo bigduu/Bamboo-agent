@@ -204,6 +204,10 @@ impl client::Handler for FabricHandler {
 struct RusshHandle {
     session: Mutex<Option<Handle<FabricHandler>>>,
     worker_id: String,
+    /// Parent-resolved spec file on the remote (holds provider keys + the broker
+    /// token). Removed on shutdown, and — being globally unique — the safest
+    /// `pkill` anchor (the truncated worker_id can substring-collide across nodes).
+    remote_spec_path: Option<String>,
 }
 
 #[async_trait]
@@ -212,12 +216,16 @@ impl RemoteDeployment for RusshHandle {
         let Some(session) = self.session.lock().await.take() else {
             return;
         };
-        // Best-effort: kill the remote worker, then disconnect (which also tears
-        // down the reverse tunnel).
+        // Best-effort: kill the worker (anchored on its unique spec path when
+        // present — the truncated worker_id can substring-collide), remove the
+        // creds-bearing spec file, then disconnect (tears down the reverse tunnel).
+        let kill_anchor = self.remote_spec_path.as_deref().unwrap_or(&self.worker_id);
+        let mut cmd = format!("pkill -f {}", sh_quote(kill_anchor));
+        if let Some(spec) = &self.remote_spec_path {
+            cmd.push_str(&format!("; rm -f {}", sh_quote(spec)));
+        }
         if let Ok(channel) = session.channel_open_session().await {
-            let _ = channel
-                .exec(false, format!("pkill -f {}", sh_quote(&self.worker_id)))
-                .await;
+            let _ = channel.exec(false, cmd).await;
         }
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "", "")
@@ -256,6 +264,10 @@ impl Deployer for RusshDeployer {
         let remote_spec_path = if let Some(spec_json) = &d.spec_json {
             let path = format!("/tmp/bamboo-spec-{}.json", d.id);
             sftp_write_bytes(&session, &path, spec_json.as_bytes()).await?;
+            // The spec holds provider API keys + the broker token: restrict it to
+            // the owner (default umask would leave it world-readable) — it's
+            // removed on shutdown.
+            let _ = exec_capture(&session, &format!("chmod 600 {}", sh_quote(&path))).await;
             Some(path)
         } else {
             None
@@ -290,6 +302,7 @@ impl Deployer for RusshDeployer {
             Box::new(RusshHandle {
                 session: Mutex::new(Some(session)),
                 worker_id: d.id.clone(),
+                remote_spec_path,
             }),
         ))
     }
