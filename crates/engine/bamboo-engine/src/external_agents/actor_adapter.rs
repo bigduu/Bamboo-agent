@@ -1941,4 +1941,101 @@ mod tests {
         assert!(err.contains("no live worker in pool"), "got: {err}");
         assert!(err.contains("NOT spawning"), "got: {err}");
     }
+
+    /// FULL schedulable run over the bus: a worker SERVING `EchoExecutor` joins the
+    /// pool by role; `execute_external_child` with a Schedulable placement resolves
+    /// it from the bus (no local subprocess — the worker_bin is `/bin/false`),
+    /// drives the run, gets the echo back, AND stamps the child session with the
+    /// pool's cluster-node label — `{kind:remote, host:"mini"}`. The end-to-end
+    /// analogue of the live `mac-mini-monitor`→mini run.
+    #[tokio::test]
+    async fn execute_external_child_runs_schedulable_over_bus_and_stamps_node_label() {
+        let (endpoint, _dir) = start_bus().await;
+
+        // A bus worker SERVING runs (not just presence), joined to the pool by role.
+        let ep = endpoint.clone();
+        let worker = tokio::spawn(async move {
+            let _ = bamboo_broker::serve_executor(
+                &ep,
+                bamboo_subagent::AgentRef {
+                    session_id: "mmm-worker".into(),
+                    role: Some("mac-mini-monitor".into()),
+                },
+                "t",
+                std::sync::Arc::new(bamboo_subagent::executor::EchoExecutor),
+            )
+            .await;
+        });
+
+        // Wait until the worker is visible on the bus so the pool is non-empty
+        // when execute_external_child resolves it (serve_executor connects async).
+        let mut probe = bamboo_broker::BrokerClient::connect(
+            &endpoint,
+            bamboo_subagent::AgentRef { session_id: "probe".into(), role: None },
+            "t",
+        )
+        .await
+        .unwrap();
+        let mut ready = false;
+        for _ in 0..100 {
+            if probe
+                .list_connected("mac-mini-monitor")
+                .await
+                .unwrap()
+                .iter()
+                .any(|id| id == "mmm-worker")
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(ready, "worker never joined the pool");
+
+        // Runner: child role → schedulable pool "mac-mini-monitor" carrying the
+        // cluster node's label "mini"; bogus worker_bin so any local spawn fails.
+        let mut sched = HashMap::new();
+        sched.insert(
+            "mac-mini-monitor".to_string(),
+            ResolvedSchedulablePlacement {
+                pool: "mac-mini-monitor".into(),
+                host_label: Some("mini".into()),
+            },
+        );
+        let runner = bogus_sched_runner(HashMap::new(), sched).with_bus(Some(
+            bamboo_subagent::BusEndpoint { endpoint: endpoint.clone(), token: "t".into() },
+        ));
+
+        let mut session = session_of_role("mac-mini-monitor", "hello scheduled");
+        let job = job_for("child-1");
+        let (event_tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        let cancel = CancellationToken::new();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            runner.execute_external_child(&mut session, &job, event_tx, cancel),
+        )
+        .await
+        .expect("run did not hang")
+        .expect("schedulable run succeeded over the bus (no local spawn)");
+
+        // Echo reply flowed back — proves it routed to the bus worker, not local.
+        let last = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Assistant))
+            .expect("an assistant reply was written back");
+        assert!(last.content.contains("echo:"), "got {:?}", last.content);
+
+        // ...and the child is stamped with the pool's cluster-node label.
+        let placement = session
+            .metadata
+            .get("placement")
+            .expect("scheduled child session stamped with a placement");
+        assert!(placement.contains(r#""kind":"remote""#), "{placement}");
+        assert!(placement.contains(r#""host":"mini""#), "{placement}");
+
+        worker.abort();
+    }
 }
