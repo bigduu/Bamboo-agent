@@ -33,12 +33,29 @@ pub struct ClusterFabricConfig {
     /// The registered machines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<Node>,
+    /// Seconds between background health probes of Running/Unreachable nodes.
+    /// Omitted → the built-in default (30s); `0` disables the health monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_interval_secs: Option<u64>,
 }
+
+/// Default health-probe cadence when `health_interval_secs` is unset.
+pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 30;
 
 impl ClusterFabricConfig {
     /// True when there are no clusters and no nodes (the serialize-skip gate).
     pub fn is_empty(&self) -> bool {
         self.clusters.is_empty() && self.nodes.is_empty()
+    }
+
+    /// Resolve the health-monitor cadence: `None` when disabled (`0`), else the
+    /// configured seconds or the [`DEFAULT_HEALTH_INTERVAL_SECS`] default.
+    pub fn health_interval(&self) -> Option<std::time::Duration> {
+        match self.health_interval_secs {
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(s)),
+            None => Some(std::time::Duration::from_secs(DEFAULT_HEALTH_INTERVAL_SECS)),
+        }
     }
 
     /// Look up a node by id.
@@ -201,6 +218,10 @@ pub struct DeployProfile {
     /// Workspace override for the deployed worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Auto-redeploy this node when the health monitor finds its worker gone
+    /// (opt-in; only recovers a node that WAS Running, never a user-Stopped one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_recover: bool,
 }
 
 /// Engine-owned live state. Written by the deploy engine (P2), not the operator.
