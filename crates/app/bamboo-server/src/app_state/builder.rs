@@ -413,6 +413,15 @@ impl AppState {
             fabric_registry,
             fabric_bamboo_bin,
         ));
+        // Cluster health monitor: periodically probe deployed workers on the bus and
+        // flip node status live (Running↔Unreachable) + auto-recover. Server-scoped
+        // — it runs under BOTH the embedded and an external broker (it reads the
+        // broker endpoint lazily each tick), and is aborted when the server drops.
+        let health_monitor = fabric_deployer
+            .clone()
+            .spawn_health_monitor()
+            .await
+            .map(HealthMonitor);
 
         let tools = build_root_tools(
             tools_with_task.clone(),
@@ -488,6 +497,7 @@ impl AppState {
             config_io_lock,
             fabric_deployer,
             embedded_broker,
+            health_monitor,
             provider: provider_lock,
             provider_handle,
             sessions,
@@ -538,6 +548,17 @@ impl Drop for EmbeddedBroker {
     fn drop(&mut self) {
         self.task.abort();
         self.gc_task.abort();
+    }
+}
+
+/// Server-scoped handle to the cluster health monitor. Kept separate from
+/// [`EmbeddedBroker`] so the monitor runs under BOTH the embedded broker and an
+/// external (`broker.json`) one; aborts the sweep on drop.
+pub struct HealthMonitor(tokio::task::JoinHandle<()>);
+
+impl Drop for HealthMonitor {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

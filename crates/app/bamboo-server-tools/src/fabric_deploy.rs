@@ -8,6 +8,7 @@
 //! `bamboo-config`'s `Node` and `bamboo-broker`'s deployers) keeps placement/
 //! auth handling in one place.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,7 +57,31 @@ pub struct FabricDeployer {
     /// surfaces see/manage the same workers.
     registry: DeployedRegistry,
     bamboo_bin: PathBuf,
+    /// Per-node auto-recovery bookkeeping (debounce + backoff + attempt cap).
+    /// Ephemeral: cleared on recovery and re-derived after a restart.
+    recovery: Arc<Mutex<HashMap<String, RecoveryState>>>,
 }
+
+/// Auto-recovery state for one node (see [`FabricDeployer::recovery_decision`]).
+#[derive(Default)]
+struct RecoveryState {
+    /// Consecutive Unreachable observations (the debounce counter).
+    consecutive_unreachable: u32,
+    /// Redeploy attempts made this outage.
+    attempts: u32,
+    /// Earliest time the next attempt may fire (exponential backoff gate).
+    next_eligible: Option<tokio::time::Instant>,
+    /// Set once the attempt cap is hit + the node marked Failed (don't repeat).
+    gave_up: bool,
+    /// A redeploy is currently running — don't launch an overlapping one (a slow
+    /// SSH deploy can outlast the sweep interval).
+    in_flight: bool,
+}
+
+/// Consecutive Unreachable probes before the first redeploy (ride out a blip).
+const RECOVERY_DEBOUNCE: u32 = 2;
+/// Redeploy attempts before giving up and marking the node Failed.
+const RECOVERY_MAX_ATTEMPTS: u32 = 3;
 
 impl FabricDeployer {
     pub fn new(
@@ -72,6 +97,7 @@ impl FabricDeployer {
             data_dir: data_dir.into(),
             registry,
             bamboo_bin: bamboo_bin.into(),
+            recovery: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -333,6 +359,279 @@ impl FabricDeployer {
             .tail_log(&log_path, lines)
             .await
             .map_err(|e| FabricError::Internal(format!("read logs failed: {e}")))
+    }
+
+    /// Single-probe timeout. Fast when the worker is present (returns on first
+    /// sighting); this only bounds how long a genuinely-gone worker is chased.
+    const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Health-check `node_id` with the production probe timeout.
+    pub async fn health_check(&self, node_id: &str) -> FabricResult<NodeState> {
+        self.health_check_within(node_id, Self::HEALTH_PROBE_TIMEOUT).await
+    }
+
+    /// Probe a Running/Unreachable node's worker on the bus and reconcile its live
+    /// state: a worker present on the bus → `Running` + fresh `last_health`; a
+    /// vanished one → `Unreachable`. Nodes not meant to be up
+    /// (NotDeployed/Deploying/Stopped/Failed) are left untouched. A status FLIP is
+    /// persisted to disk (durable + audited); a steady-state heartbeat only
+    /// refreshes `last_health` in memory, so a healthy cluster doesn't rewrite
+    /// config.json every tick. Presence is checked (never a task ping), so a live
+    /// LLM worker is never disturbed — same rationale as the deploy verify.
+    async fn health_check_within(
+        &self,
+        node_id: &str,
+        probe_timeout: Duration,
+    ) -> FabricResult<NodeState> {
+        let (node, broker) = {
+            let cfg = self.config.read().await;
+            (self.node_snapshot(&cfg, node_id)?, cfg.subagents.broker.clone())
+        };
+        let current = node.state.clone().unwrap_or_default();
+        if !matches!(current.status, NodeStatus::Running | NodeStatus::Unreachable) {
+            return Ok(current); // only nodes that should be up are monitored
+        }
+        let worker_id = current.worker_id.clone().unwrap_or_else(|| worker_id_for(&node));
+        let role = node
+            .deploy
+            .default_role
+            .clone()
+            .unwrap_or_else(|| "general-purpose".to_string());
+        let Some(broker) = broker.filter(|b| !b.endpoint.trim().is_empty()) else {
+            return Ok(current); // no broker configured → nothing to probe against
+        };
+
+        // Fast when present (returns on first sighting); costs the timeout only
+        // when the worker is genuinely gone. The short window absorbs a blip — a
+        // false Unreachable self-corrects on the next tick.
+        let alive = verify_worker_connected(&broker, &worker_id, &role, probe_timeout)
+            .await
+            .is_ok();
+
+        let new_status = if alive {
+            NodeStatus::Running
+        } else {
+            NodeStatus::Unreachable
+        };
+        let new_error = if alive {
+            None
+        } else {
+            Some(format!("worker '{worker_id}' not present on the bus under role '{role}'"))
+        };
+
+        // Commit under the io + write lock, RE-CHECKING the live status. The probe
+        // above ran UNLOCKED for up to `probe_timeout`, so a concurrent stop()/
+        // deploy() may have moved this node out of the monitored set meanwhile —
+        // blindly writing back the stale decision would e.g. resurrect a
+        // user-Stopped node as Unreachable and hand it to auto-recover. If the live
+        // status is no longer Running/Unreachable, the concurrent write wins.
+        let _io = self.config_io_lock.lock().await;
+        let (next, from, snapshot) = {
+            let mut cfg = self.config.write().await;
+            let Some(node) = cfg.cluster_fabric.node_mut(node_id) else {
+                return Ok(current);
+            };
+            let live = node.state.clone().unwrap_or_default();
+            if !matches!(live.status, NodeStatus::Running | NodeStatus::Unreachable) {
+                return Ok(live); // moved out of the monitored set mid-probe → leave it
+            }
+            let from = live.status;
+            let next = NodeState {
+                status: new_status,
+                last_health: Some(chrono::Utc::now().to_rfc3339()),
+                last_error: new_error,
+                ..live
+            };
+            node.state = Some(next.clone());
+            // A status FLIP is durable + audited; a steady-state heartbeat stays in
+            // memory only (no config.json churn) — so snapshot to disk only on a flip.
+            (next, from, (from != new_status).then(|| cfg.clone()))
+        };
+        if let Some(snapshot) = snapshot {
+            let data_dir = self.data_dir.clone();
+            tokio::task::spawn_blocking(move || snapshot.save_to_dir(data_dir))
+                .await
+                .map_err(|e| FabricError::Internal(format!("persist task: {e}")))?
+                .map_err(|e| FabricError::Internal(format!("save config: {e}")))?;
+            tracing::info!(
+                audit = "cluster_fabric.health",
+                node = node_id,
+                worker_id = %worker_id,
+                from = ?from,
+                to = ?next.status,
+                "node health changed",
+            );
+        }
+        Ok(next)
+    }
+
+    /// Node ids whose persisted status is Running or Unreachable — the set the
+    /// health monitor sweeps.
+    async fn monitored_node_ids(&self) -> Vec<String> {
+        let cfg = self.config.read().await;
+        cfg.cluster_fabric
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.state
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.status, NodeStatus::Running | NodeStatus::Unreachable))
+            })
+            .map(|n| n.id.clone())
+            .collect()
+    }
+
+    /// Decide whether to auto-recover `node_id` given its just-probed `state`,
+    /// advancing the debounce/backoff bookkeeping. `Some(attempt)` ⇒ the caller
+    /// should redeploy now; `None` ⇒ hold (not opted in, still debouncing, inside
+    /// backoff, or exhausted). On exhausting [`RECOVERY_MAX_ATTEMPTS`] it marks the
+    /// node `Failed` once and stops. A node that is no longer Unreachable clears its
+    /// recovery progress (a recovered node starts fresh next outage). A user-Stopped
+    /// node never reaches here — `health_check` only probes Running/Unreachable.
+    async fn recovery_decision(&self, node_id: &str, state: &NodeState) -> Option<u32> {
+        if state.status != NodeStatus::Unreachable {
+            self.recovery.lock().await.remove(node_id);
+            return None;
+        }
+        let auto = {
+            let cfg = self.config.read().await;
+            cfg.cluster_fabric
+                .node(node_id)
+                .map(|n| n.deploy.auto_recover)
+                .unwrap_or(false)
+        };
+        if !auto {
+            return None;
+        }
+
+        let mut map = self.recovery.lock().await;
+        let rs = map.entry(node_id.to_string()).or_default();
+        rs.consecutive_unreachable = rs.consecutive_unreachable.saturating_add(1);
+        if rs.consecutive_unreachable < RECOVERY_DEBOUNCE {
+            return None; // ride out a blip before touching a live node
+        }
+        if rs.in_flight {
+            return None; // a redeploy is still running — don't overlap it
+        }
+        if rs.attempts >= RECOVERY_MAX_ATTEMPTS {
+            let first_give_up = !rs.gave_up;
+            rs.gave_up = true;
+            drop(map);
+            if first_give_up {
+                self.mark_failed(
+                    node_id,
+                    &format!("auto-recover gave up after {RECOVERY_MAX_ATTEMPTS} attempts"),
+                )
+                .await;
+            }
+            return None;
+        }
+        if let Some(t) = rs.next_eligible {
+            if tokio::time::Instant::now() < t {
+                return None; // inside backoff
+            }
+        }
+        rs.attempts += 1;
+        rs.in_flight = true;
+        let attempt = rs.attempts;
+        rs.next_eligible = Some(tokio::time::Instant::now() + Self::recovery_backoff(attempt));
+        Some(attempt)
+    }
+
+    /// Clear the in-flight guard after a recovery redeploy settles, so a later tick
+    /// can retry (on failure); on success the next `health_check` resets the entry.
+    async fn clear_recovery_in_flight(&self, node_id: &str) {
+        if let Some(rs) = self.recovery.lock().await.get_mut(node_id) {
+            rs.in_flight = false;
+        }
+    }
+
+    /// Exponential backoff between recovery attempts: ~10s, 20s, 40s… capped 300s.
+    fn recovery_backoff(attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(5);
+        Duration::from_secs((10u64 << shift).min(300))
+    }
+
+    /// Persist a node as `Failed` with `reason`, preserving its other engine fields.
+    async fn mark_failed(&self, node_id: &str, reason: &str) {
+        let current = {
+            let cfg = self.config.read().await;
+            cfg.cluster_fabric
+                .node(node_id)
+                .and_then(|n| n.state.clone())
+                .unwrap_or_default()
+        };
+        let failed = NodeState {
+            status: NodeStatus::Failed,
+            last_error: Some(reason.to_string()),
+            ..current
+        };
+        if let Err(e) = self.persist_state(node_id, Some(failed)).await {
+            tracing::warn!(node = node_id, error = %e, "failed to persist Failed state");
+        }
+        tracing::warn!(
+            audit = "cluster_fabric.recover",
+            node = node_id,
+            reason,
+            "auto-recover exhausted → Failed",
+        );
+    }
+
+    /// Spawn the background health monitor: every `cluster_fabric.health_interval`
+    /// it [`health_check`](Self::health_check)s each Running/Unreachable node.
+    /// `None` (no task) when disabled (`health_interval_secs = 0`); abort the
+    /// handle to stop it. The cadence is read once at spawn (change → restart).
+    pub async fn spawn_health_monitor(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = {
+            let cfg = self.config.read().await;
+            cfg.cluster_fabric.health_interval()?
+        };
+        tracing::info!(interval_secs = interval.as_secs(), "cluster health monitor started");
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                for id in self.monitored_node_ids().await {
+                    match self.health_check(&id).await {
+                        Ok(state) => {
+                            if let Some(attempt) = self.recovery_decision(&id, &state).await {
+                                // Redeploy OFF the sweep's critical path so a slow
+                                // deploy doesn't stall other nodes' health checks;
+                                // the backoff gate was already advanced, so the next
+                                // tick won't re-trigger until it elapses.
+                                let this = self.clone();
+                                let node = id.clone();
+                                tokio::spawn(async move {
+                                    tracing::warn!(
+                                        audit = "cluster_fabric.recover",
+                                        node = %node,
+                                        attempt,
+                                        "auto-recovering unreachable node",
+                                    );
+                                    match this.deploy(&node, false).await {
+                                        Ok(_) => tracing::info!(
+                                            node = %node,
+                                            attempt,
+                                            "auto-recover redeploy succeeded"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            node = %node,
+                                            attempt,
+                                            error = %e,
+                                            "auto-recover redeploy failed"
+                                        ),
+                                    }
+                                    this.clear_recovery_in_flight(&node).await;
+                                });
+                            }
+                        }
+                        Err(e) => tracing::warn!(node = %id, error = %e, "health check failed"),
+                    }
+                }
+            }
+        }))
     }
 
     /// Persist `state` onto a node (engine-owned field): io-lock + atomic save,
@@ -798,5 +1097,258 @@ mod presence_verify_tests {
         )
         .await;
         assert!(out.is_err(), "a worker under a different role must not count");
+    }
+}
+
+#[cfg(test)]
+mod health_check_tests {
+    //! The health probe drives node status live: worker present → Running +
+    //! last_health; worker gone → Unreachable; a non-deployed node is untouched.
+    use super::*;
+    use bamboo_config::cluster_fabric::{
+        DeployProfile, Node, NodePlacement, NodeState, NodeStatus, TrustLevel,
+    };
+    use bamboo_config::{BrokerClientConfig, Config};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    async fn start_broker() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
+        let server = Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (format!("ws://{addr}"), dir)
+    }
+
+    async fn join(endpoint: &str, id: &str, role: &str) -> bamboo_broker::BrokerClient {
+        let mut c = bamboo_broker::BrokerClient::connect(
+            endpoint,
+            bamboo_subagent::AgentRef {
+                session_id: id.into(),
+                role: Some(role.into()),
+            },
+            "t",
+        )
+        .await
+        .unwrap();
+        c.subscribe().await.unwrap();
+        c
+    }
+
+    fn running_node(id: &str, worker_id: &str, role: &str) -> Node {
+        Node {
+            id: id.into(),
+            label: id.into(),
+            placement: NodePlacement::Local,
+            trust_level: TrustLevel::Trusted,
+            deploy: DeployProfile {
+                default_role: Some(role.into()),
+                ..Default::default()
+            },
+            state: Some(NodeState {
+                status: NodeStatus::Running,
+                worker_id: Some(worker_id.into()),
+                ..Default::default()
+            }),
+            enabled: true,
+        }
+    }
+
+    fn deployer_with(nodes: Vec<Node>, endpoint: &str) -> Arc<FabricDeployer> {
+        let mut cfg = Config::default();
+        cfg.cluster_fabric.nodes = nodes;
+        cfg.subagents.broker = Some(BrokerClientConfig {
+            endpoint: endpoint.into(),
+            token: "t".into(),
+            token_encrypted: None,
+        });
+        Arc::new(FabricDeployer::new(
+            Arc::new(RwLock::new(cfg)),
+            Arc::new(Mutex::new(())),
+            std::env::temp_dir(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/usr/bin/true",
+        ))
+    }
+
+    #[tokio::test]
+    async fn keeps_running_when_worker_present() {
+        let (endpoint, _dir) = start_broker().await;
+        let _w = join(&endpoint, "node-a", "mon").await;
+        let d = deployer_with(vec![running_node("a", "node-a", "mon")], &endpoint);
+        let st = d
+            .health_check_within("a", Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(st.status, NodeStatus::Running);
+        assert!(st.last_health.is_some(), "heartbeat stamped");
+        assert!(st.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn flips_to_unreachable_when_worker_gone() {
+        let (endpoint, _dir) = start_broker().await;
+        // Nobody joined the bus → the node's worker is absent.
+        let d = deployer_with(vec![running_node("a", "node-a", "mon")], &endpoint);
+        let st = d
+            .health_check_within("a", Duration::from_millis(400))
+            .await
+            .unwrap();
+        assert_eq!(st.status, NodeStatus::Unreachable);
+        assert!(st.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn leaves_non_deployed_node_untouched() {
+        let (endpoint, _dir) = start_broker().await;
+        let mut node = running_node("a", "node-a", "mon");
+        node.state = Some(NodeState {
+            status: NodeStatus::Stopped,
+            ..Default::default()
+        });
+        let d = deployer_with(vec![node], &endpoint);
+        let st = d
+            .health_check_within("a", Duration::from_millis(400))
+            .await
+            .unwrap();
+        assert_eq!(st.status, NodeStatus::Stopped, "a stopped node is not probed");
+        assert!(st.last_health.is_none(), "no probe → no heartbeat");
+    }
+
+    #[tokio::test]
+    async fn does_not_clobber_a_concurrent_status_change() {
+        // The probe runs UNLOCKED; a stop() landing during it must win (otherwise a
+        // user-Stopped node gets resurrected as Unreachable → wrongly auto-recovered).
+        let (endpoint, _dir) = start_broker().await;
+        // No worker joined → the probe runs its full timeout before deciding.
+        let d = deployer_with(vec![running_node("a", "node-a", "mon")], &endpoint);
+        let probe = {
+            let d = d.clone();
+            tokio::spawn(async move { d.health_check_within("a", Duration::from_millis(1500)).await })
+        };
+        // Mid-probe, flip the node to Stopped as stop() would.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        {
+            let mut cfg = d.config.write().await;
+            cfg.cluster_fabric.node_mut("a").unwrap().state = Some(NodeState {
+                status: NodeStatus::Stopped,
+                ..Default::default()
+            });
+        }
+        let observed = probe.await.unwrap().unwrap();
+        assert_eq!(observed.status, NodeStatus::Stopped, "health_check yields to the stop");
+        let cfg = d.config.read().await;
+        let st = cfg.cluster_fabric.node("a").unwrap().state.as_ref().unwrap();
+        assert_eq!(st.status, NodeStatus::Stopped, "Stopped not overwritten to Unreachable");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    //! Auto-recovery POLICY (no bus/deploy needed): opt-in gate, 2-miss debounce,
+    //! exponential backoff between attempts, and a cap that marks the node Failed.
+    use super::*;
+    use bamboo_config::cluster_fabric::{
+        DeployProfile, Node, NodePlacement, NodeState, NodeStatus, TrustLevel,
+    };
+    use bamboo_config::Config;
+    use tokio::sync::{Mutex, RwLock};
+
+    fn recoverable_node(id: &str) -> Node {
+        Node {
+            id: id.into(),
+            label: id.into(),
+            placement: NodePlacement::Local,
+            trust_level: TrustLevel::Trusted,
+            deploy: DeployProfile {
+                default_role: Some("mon".into()),
+                auto_recover: true,
+                ..Default::default()
+            },
+            state: Some(NodeState {
+                status: NodeStatus::Unreachable,
+                ..Default::default()
+            }),
+            enabled: true,
+        }
+    }
+
+    fn deployer(nodes: Vec<Node>) -> (Arc<FabricDeployer>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.cluster_fabric.nodes = nodes;
+        let d = Arc::new(FabricDeployer::new(
+            Arc::new(RwLock::new(cfg)),
+            Arc::new(Mutex::new(())),
+            dir.path().to_path_buf(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/usr/bin/true",
+        ));
+        (d, dir)
+    }
+
+    fn unreachable() -> NodeState {
+        NodeState {
+            status: NodeStatus::Unreachable,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounces_backs_off_then_caps_to_failed() {
+        let (d, _dir) = deployer(vec![recoverable_node("a")]);
+        let un = unreachable();
+
+        // 1st miss → debounce (no action); 2nd → first redeploy (attempt in flight).
+        assert_eq!(d.recovery_decision("a", &un).await, None);
+        assert_eq!(d.recovery_decision("a", &un).await, Some(1));
+        // In-flight guard: no overlapping attempt, even once backoff elapses.
+        assert_eq!(d.recovery_decision("a", &un).await, None);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert_eq!(d.recovery_decision("a", &un).await, None, "still in-flight");
+        // Redeploy settled (failed) → guard clears; past backoff(1) → attempt 2.
+        d.clear_recovery_in_flight("a").await;
+        assert_eq!(d.recovery_decision("a", &un).await, Some(2));
+        d.clear_recovery_in_flight("a").await;
+        tokio::time::advance(Duration::from_secs(21)).await;
+        assert_eq!(d.recovery_decision("a", &un).await, Some(3));
+        // Past backoff(3) → cap reached → None, and the node is marked Failed.
+        d.clear_recovery_in_flight("a").await;
+        tokio::time::advance(Duration::from_secs(41)).await;
+        assert_eq!(d.recovery_decision("a", &un).await, None);
+        let cfg = d.config.read().await;
+        let st = cfg.cluster_fabric.node("a").unwrap().state.as_ref().unwrap();
+        assert_eq!(st.status, NodeStatus::Failed);
+        assert!(st.last_error.as_deref().unwrap_or_default().contains("gave up"));
+    }
+
+    #[tokio::test]
+    async fn no_recovery_when_flag_off() {
+        let mut node = recoverable_node("a");
+        node.deploy.auto_recover = false;
+        let (d, _dir) = deployer(vec![node]);
+        let un = unreachable();
+        assert_eq!(d.recovery_decision("a", &un).await, None);
+        assert_eq!(d.recovery_decision("a", &un).await, None, "opt-out never redeploys");
+    }
+
+    #[tokio::test]
+    async fn recovered_node_clears_progress() {
+        let (d, _dir) = deployer(vec![recoverable_node("a")]);
+        let un = unreachable();
+        let ok = NodeState {
+            status: NodeStatus::Running,
+            ..Default::default()
+        };
+        assert_eq!(d.recovery_decision("a", &un).await, None); // miss 1
+        assert_eq!(d.recovery_decision("a", &ok).await, None); // recovered → reset
+        // Debounce restarts from zero, so it takes another 2 misses.
+        assert_eq!(d.recovery_decision("a", &un).await, None);
+        assert_eq!(d.recovery_decision("a", &un).await, Some(1));
     }
 }
