@@ -5,11 +5,13 @@
 //! to clients. The agent loop passes a `ToolExecutionContext` that allows tools
 //! to emit `AgentEvent`s while they run.
 
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 use serde_json::Value;
 
-use crate::tools::ToolSchema;
+use crate::tools::{BashCompletionSink, ToolSchema};
 use crate::{AgentEvent, Session};
 
 /// Per-session flags that flow into every tool call's [`ToolExecutionContext`].
@@ -50,7 +52,7 @@ impl ToolExecutionSessionFlags {
 /// flag through [`ToolExecutionSessionFlags`] so a new flag can't be wired into
 /// one loop and silently skipped in the other. Struct literals are for tests
 /// and tools that synthesize a child context.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ToolExecutionContext<'a> {
     /// Bamboo session id that is executing the tool.
     pub session_id: Option<&'a str>,
@@ -74,6 +76,17 @@ pub struct ToolExecutionContext<'a> {
     /// the dispatch site — NOT session-derived — so it is a direct
     /// `for_dispatch` parameter rather than a `ToolExecutionSessionFlags` field.
     pub can_async_resume: bool,
+    /// Loop-facing sink invoked once when a background Bash shell owned by this
+    /// session completes (issue #84 Phase 2b follow-up). When wired, the Bash
+    /// tool hands it to the background completion-poll task so the shell's result
+    /// is pushed into the loop (injected at the next round boundary while it is
+    /// actively looping, or via a resume when it is idle) — instead of the model
+    /// having to poll `BashOutput`. Borrowed like `event_tx` (kept `Copy`) and
+    /// cloned into the spawned task via [`Self::cloned_bash_completion_sink`].
+    /// Derived from the loop config at the dispatch site — NOT session-derived —
+    /// so it is a direct `for_dispatch` parameter, not a session flag. `None`
+    /// leaves the push inert (the durable end-of-turn poll backstop still runs).
+    pub bash_completion_sink: Option<&'a Arc<dyn BashCompletionSink>>,
     /// The tool call's `function.arguments` JSON string, already parsed once by
     /// the dispatching agent loop (which also parses it to populate the
     /// `ToolStart` event). When `Some`, downstream executors should reuse this
@@ -86,6 +99,23 @@ pub struct ToolExecutionContext<'a> {
     pub pre_parsed_args: Option<&'a Value>,
 }
 
+// Hand-written so implementors of `BashCompletionSink` (a trait object stored
+// here) don't have to be `Debug`. The sink is rendered as a presence flag.
+impl std::fmt::Debug for ToolExecutionContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolExecutionContext")
+            .field("session_id", &self.session_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("event_tx", &self.event_tx)
+            .field("available_tool_schemas", &self.available_tool_schemas)
+            .field("bypass_permissions", &self.bypass_permissions)
+            .field("can_async_resume", &self.can_async_resume)
+            .field("bash_completion_sink", &self.bash_completion_sink.is_some())
+            .field("pre_parsed_args", &self.pre_parsed_args)
+            .finish()
+    }
+}
+
 impl<'a> ToolExecutionContext<'a> {
     pub fn none(tool_call_id: &'a str) -> Self {
         Self {
@@ -95,6 +125,7 @@ impl<'a> ToolExecutionContext<'a> {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         }
     }
@@ -115,6 +146,11 @@ impl<'a> ToolExecutionContext<'a> {
         // When `false`, the Bash auto path stays synchronous (issue #84,
         // phase 2d). NOT session-derived — set by the dispatch site.
         can_async_resume: bool,
+        // Loop-facing sink for background-Bash completion (issue #84 Phase 2b
+        // follow-up). Set by the dispatch site from the loop config; `None` on
+        // loops without the engine suspend/resume machinery so the push stays
+        // inert. NOT session-derived.
+        bash_completion_sink: Option<&'a Arc<dyn BashCompletionSink>>,
         // The call's arguments, already parsed once at the dispatch site (to
         // populate the `ToolStart` event). Threaded down so the executor reuses
         // it instead of re-parsing the raw JSON string (issue #106). Only pass
@@ -131,6 +167,7 @@ impl<'a> ToolExecutionContext<'a> {
             available_tool_schemas: Some(available_tool_schemas),
             bypass_permissions: flags.bypass_permissions,
             can_async_resume,
+            bash_completion_sink,
             pre_parsed_args,
         }
     }
@@ -138,6 +175,14 @@ impl<'a> ToolExecutionContext<'a> {
     /// Clone the sender (when present) for use in spawned tasks.
     pub fn cloned_sender(&self) -> Option<mpsc::Sender<AgentEvent>> {
         self.event_tx.cloned()
+    }
+
+    /// Clone the background-Bash completion sink (when present) into an owned
+    /// handle for a spawned task — mirrors [`Self::cloned_sender`]. Returns an
+    /// owned `Arc` so the shell's detached completion-poll task can outlive the
+    /// borrowed dispatch context.
+    pub fn cloned_bash_completion_sink(&self) -> Option<Arc<dyn BashCompletionSink>> {
+        self.bash_completion_sink.map(Arc::clone)
     }
 
     /// Best-effort emit of an event (ignored if no sender).
@@ -205,6 +250,7 @@ mod session_flags_tests {
             },
             true,
             None,
+            None,
         );
         assert_eq!(ctx.session_id, Some("s1"));
         assert!(ctx.bypass_permissions);
@@ -223,6 +269,7 @@ mod session_flags_tests {
             &[],
             ToolExecutionSessionFlags::default(),
             false,
+            None,
             Some(&parsed),
         );
         assert_eq!(ctx.pre_parsed_args, Some(&parsed));
@@ -248,6 +295,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -277,6 +325,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -308,6 +357,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -350,6 +400,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -403,6 +454,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -429,6 +481,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -460,6 +513,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -490,6 +544,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -517,6 +572,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -548,6 +604,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -575,6 +632,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -600,6 +658,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 

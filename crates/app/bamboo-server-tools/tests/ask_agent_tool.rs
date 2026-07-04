@@ -24,6 +24,7 @@ async fn ask_agent_tool_queries_a_broker_agent() {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
     let result = tool
@@ -55,6 +56,7 @@ async fn ask_agent_tool_rejects_unknown_mode() {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
     let err = tool
@@ -122,6 +124,7 @@ async fn concurrent_asks_to_one_worker_are_each_answered_correctly() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             };
             let result = tool

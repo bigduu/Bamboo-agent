@@ -200,7 +200,7 @@ mod tests {
     async fn bash_input_feeds_interactive_shell_and_output_appears() {
         prime_test_command_environment();
         // `cat` echoes its stdin to stdout — perfect for round-trip verification.
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
         assert_eq!(shell.status(), "running");
@@ -227,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn write_stdin_errors_on_non_interactive_shell() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false)
+        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
 
@@ -249,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn write_stdin_errors_on_exited_interactive_shell() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("true", None, None, None, true)
+        let shell = bash_runtime::spawn_background("true", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
@@ -287,7 +287,7 @@ mod tests {
     async fn non_interactive_stdin_reader_gets_eof_and_terminates() {
         prime_test_command_environment();
         // `cat` reads stdin; with Stdio::null() it receives immediate EOF and exits 0.
-        let shell = bash_runtime::spawn_background("cat", None, None, None, false)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
 
@@ -332,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn bash_input_errors_on_non_interactive_shell_via_tool() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false)
+        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
 
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn bash_input_append_newline_false_sends_utf8_bytes() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
@@ -420,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn bash_input_eof_closes_stdin_and_lets_consumer_terminate() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
@@ -462,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn bash_input_eof_allows_empty_input() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 

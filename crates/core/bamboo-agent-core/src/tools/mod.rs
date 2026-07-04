@@ -92,6 +92,7 @@
 
 pub mod accumulator;
 pub mod agentic;
+pub mod bash_completion;
 pub mod context;
 pub mod executor;
 pub mod registry;
@@ -99,6 +100,7 @@ pub mod result_handler;
 pub mod smart_code_review;
 pub mod types;
 
+pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
 pub use accumulator::{
     finalize_tool_calls, update_partial_tool_call, PartialToolCall, ToolCallAccumulator,
 };

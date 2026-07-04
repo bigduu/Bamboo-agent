@@ -293,6 +293,7 @@ fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecution
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     }
 }
@@ -548,6 +549,7 @@ async fn create_emits_sub_agent_started_event_after_queueing() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -617,6 +619,7 @@ async fn create_uses_async_subagent_model_resolver() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -660,6 +663,7 @@ async fn resident_create_reuses_same_child_session() {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
     let create = |name_task: &'static str, prompt: &'static str| {
@@ -784,6 +788,7 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -819,6 +824,7 @@ async fn send_message_appends_follow_up_without_replacing_history() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -873,6 +879,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -942,6 +949,7 @@ async fn send_message_can_interrupt_running_child() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -994,6 +1002,7 @@ async fn send_message_can_queue_child_immediately() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1080,6 +1089,7 @@ async fn cancel_stops_running_child() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1109,6 +1119,7 @@ async fn list_returns_children() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1154,6 +1165,7 @@ async fn get_returns_runner_diagnostics() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1193,6 +1205,7 @@ async fn create_returns_duration_hint() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1244,6 +1257,7 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1298,6 +1312,7 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1357,6 +1372,7 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1394,6 +1410,7 @@ async fn delete_removes_child() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1433,6 +1450,7 @@ async fn create_requires_workspace() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -1473,6 +1491,7 @@ async fn create_sets_child_workspace() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )

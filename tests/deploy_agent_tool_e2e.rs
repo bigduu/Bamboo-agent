@@ -25,6 +25,7 @@ fn ctx() -> ToolExecutionContext<'static> {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     }
 }

@@ -167,6 +167,11 @@ pub(super) async fn execute_tool_call_only(
         // 2d). On hook-less paths (e.g. the schedule loop) this is false, so the
         // auto path stays synchronous and never orphans a promoted shell.
         ctx.config.bash_resume_hook.is_some() && ctx.config.persistence.is_some(),
+        // Loop-facing background-Bash completion sink (issue #84 Phase 2b
+        // follow-up). Threaded from the loop config so the Bash tool can push a
+        // shell's result into this loop on completion. `None` on loops without
+        // it wired, leaving the push inert (the poll backstop still runs).
+        ctx.config.bash_completion_sink.as_ref(),
         // Reuse the args parsed above (for the `ToolStart` event) instead of
         // re-parsing the raw JSON string downstream in the executor (issue #106).
         // `args` came from `parse_tool_args_best_effort`, the same parser the

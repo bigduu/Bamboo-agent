@@ -21,7 +21,9 @@ use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{
+    AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session,
+};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
@@ -970,6 +972,100 @@ impl BashResumeHook for ChildCompletionCoordinator {
     }
 }
 
+/// Build the injected user-message body for a completed background shell — a
+/// concise notice plus a bounded output tail — so the model can act on the
+/// result without a mandatory `BashOutput` round-trip (issue #84 Phase 2b
+/// follow-up).
+fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
+    let exit = match info.exit_code {
+        Some(code) => code.to_string(),
+        None => "none (signal/killed)".to_string(),
+    };
+    let mut body = format!(
+        "Runtime notification: background shell `{}` (`{}`) finished — status {}, exit code {}.",
+        info.bash_id, info.command, info.status, exit
+    );
+    if info.output_tail.trim().is_empty() {
+        body.push_str(" It produced no captured output.");
+    } else {
+        body.push_str("\n\nOutput tail:\n");
+        body.push_str(&info.output_tail);
+    }
+    body.push_str(&format!(
+        "\n\nUse BashOutput with bash_id=\"{}\" for the full output, then continue the task.",
+        info.bash_id
+    ));
+    body
+}
+
+/// Loop-facing background-Bash completion delivery (issue #84 Phase 2b
+/// follow-up). Pushes a completed shell's result into its owning session's loop,
+/// mirroring how a sub-agent completion reaches its parent — but via the
+/// running-loop channel, which children never exercise (a parent waiting on
+/// children is always suspended when one completes; bash is the first completion
+/// source that can land on a *live, iterating* loop).
+///
+/// The push enqueues onto `pending_injected_messages`, the same round-boundary
+/// steering channel `send_message` uses. That covers every reachable loop state:
+/// an actively-looping session drains it at its next round
+/// (`merge_pending_injected_messages`); a session suspended on `waiting_for_bash`
+/// drains it when the durable end-of-turn poll backstop (`bash_resume_hook`)
+/// resumes it at round 0. A wired-sink session is never idle-with-a-running-shell
+/// (ending a turn with one suspends), so no separate idle-wake path is needed —
+/// keeping the push a pure latency optimization that never races the backstop.
+impl ChildCompletionCoordinator {
+    async fn deliver_bash_completion(&self, info: BashCompletionInfo) {
+        let body = bash_completion_injection_body(&info);
+        let queued = serde_json::json!({
+            "content": body,
+            "created_at": Utc::now(),
+        });
+        // Race-safe append: `update_runtime_config` loads the freshest session
+        // under the per-session lock and re-saves, so it can never revert a
+        // message the live loop appended concurrently — unlike `merge_save_runtime`
+        // (which writes the caller's whole `messages` snapshot verbatim).
+        let result = self
+            .persistence
+            .update_runtime_config(&info.session_id, move |session| {
+                let mut pending = session.pending_injected_messages().unwrap_or_default();
+                pending.push(queued);
+                session.set_pending_injected_messages(pending);
+            })
+            .await;
+        match result {
+            Ok(Some(_)) => tracing::info!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                status = %info.status,
+                "background bash completion queued for injection at the next round boundary"
+            ),
+            Ok(None) => tracing::warn!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                "background bash completion: owning session not found; nothing to notify"
+            ),
+            Err(error) => tracing::warn!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                %error,
+                "background bash completion: failed to queue injection"
+            ),
+        }
+    }
+}
+
+impl BashCompletionSink for ChildCompletionCoordinator {
+    fn on_bash_completed(&self, info: BashCompletionInfo) {
+        // Best-effort, off the shell's completion-poll task: hand the delivery to
+        // a detached task so the producer is never blocked (mirrors
+        // `arrange_bash_self_resume`).
+        let coordinator = Arc::new(self.clone());
+        tokio::spawn(async move {
+            coordinator.deliver_bash_completion(info).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,5 +1387,46 @@ mod tests {
             &ResumeOutcome::AlreadyRunning { run_id: "r".into() },
             false
         ));
+    }
+
+    // ── bash completion injection body (Phase 2b follow-up) ──────────────
+
+    #[test]
+    fn injection_body_includes_status_exit_command_and_tail() {
+        let info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "abc123".into(),
+            command: "make build".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "BUILD OK".into(),
+        };
+        let body = bash_completion_injection_body(&info);
+        assert!(body.contains("abc123"), "body: {body}");
+        assert!(body.contains("make build"), "body: {body}");
+        assert!(body.contains("completed"), "body: {body}");
+        assert!(body.contains("exit code 0"), "body: {body}");
+        assert!(body.contains("BUILD OK"), "body: {body}");
+        // The model is pointed at BashOutput for the full log.
+        assert!(body.contains("BashOutput"), "body: {body}");
+        assert!(body.contains("bash_id=\"abc123\""), "body: {body}");
+    }
+
+    #[test]
+    fn injection_body_handles_no_output_and_signal_kill() {
+        let info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "xyz".into(),
+            command: "sleep 99".into(),
+            exit_code: None,
+            status: "killed".into(),
+            output_tail: String::new(),
+        };
+        let body = bash_completion_injection_body(&info);
+        assert!(body.contains("killed"), "body: {body}");
+        assert!(body.contains("none (signal/killed)"), "body: {body}");
+        assert!(body.contains("no captured output"), "body: {body}");
+        // No output tail section when there is nothing to show.
+        assert!(!body.contains("Output tail:"), "body: {body}");
     }
 }

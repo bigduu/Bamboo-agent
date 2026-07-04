@@ -125,6 +125,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
 
@@ -190,6 +191,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
 
@@ -261,6 +263,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
     let read_ctx = ToolExecutionContext {
@@ -270,6 +273,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
 

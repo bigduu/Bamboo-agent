@@ -448,6 +448,15 @@ pub struct AgentLoopConfig {
     /// without a wired hook, so a session can never strand itself without a
     /// resume path. Wired by the server (the completion coordinator impl).
     pub(crate) bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
+    /// Late-bound sink that pushes a completed background Bash shell's result
+    /// into this session's loop (issue #84 Phase 2b follow-up) — injected at the
+    /// next round boundary while the loop is actively iterating, or delivered via
+    /// resume when it is idle. Threaded onto the tool dispatch context (like
+    /// `can_async_resume`) so the Bash tool can hand it to the shell's
+    /// completion-poll task. `None` (the default) leaves the push inert; the
+    /// durable end-of-turn suspend/poll backstop (`bash_resume_hook`) still runs.
+    /// Wired by the server (the completion coordinator impl).
+    pub(crate) bash_completion_sink: Option<Arc<dyn bamboo_agent_core::BashCompletionSink>>,
     /// Late-bound delegate that routes a child's gated-tool approval request up
     /// to its parent (Phase 2). `None` (the default) leaves child gating on its
     /// legacy path. Wired by the server.
@@ -537,6 +546,7 @@ impl Default for AgentLoopConfig {
             guardian_config: None,
             guardian_spawner: None,
             bash_resume_hook: None,
+            bash_completion_sink: None,
             approval_delegate: None,
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,

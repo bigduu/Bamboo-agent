@@ -413,6 +413,7 @@ impl BashTool {
                 ctx.session_id.map(str::to_string),
                 prepared_env.diagnostics.clone(),
                 ctx.cloned_sender(),
+                ctx.cloned_bash_completion_sink(),
             )
             .await
             .map_err(ToolError::Execution)?;
@@ -554,6 +555,7 @@ impl Tool for BashTool {
                 ctx.cloned_sender(),
                 ctx.session_id.map(str::to_string),
                 true,
+                ctx.cloned_bash_completion_sink(),
             )
             .await
             .map_err(ToolError::Execution)?;
@@ -594,6 +596,7 @@ impl Tool for BashTool {
                     ctx.cloned_sender(),
                     ctx.session_id.map(str::to_string),
                     false,
+                    ctx.cloned_bash_completion_sink(),
                 )
                 .await
                 .map_err(ToolError::Execution)?;
@@ -736,6 +739,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    bash_completion_sink: None,
                     pre_parsed_args: None,
                 },
             )
@@ -886,7 +890,7 @@ mod tests {
     async fn bash_background_emits_completion_event_with_exit_code() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -919,7 +923,7 @@ mod tests {
     async fn bash_background_emits_completion_event_for_failing_command() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -951,7 +955,7 @@ mod tests {
     async fn bash_background_emits_killed_when_shell_is_killed() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -984,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn bash_background_without_sender_still_completes() {
         prime_test_command_environment();
-        let shell = super::bash_runtime::spawn_background("true", None, None, None, false)
+        let shell = super::bash_runtime::spawn_background("true", None, None, None, false, None)
             .await
             .expect("background shell should spawn");
 
@@ -1016,7 +1020,7 @@ mod tests {
         })
         .expect("prefill channel slot");
 
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
 
@@ -1064,6 +1068,7 @@ mod tests {
             &[],
             ToolExecutionSessionFlags::default(),
             true,
+            None,
             None,
         );
 
@@ -1122,6 +1127,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    bash_completion_sink: None,
                     pre_parsed_args: None,
                 },
             )
@@ -1167,6 +1173,7 @@ mod tests {
             None,
             Some("sess-A".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn a1");
@@ -1176,6 +1183,7 @@ mod tests {
             None,
             Some("sess-A".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn a2");
@@ -1186,11 +1194,12 @@ mod tests {
             None,
             Some("sess-B".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn b");
         // An untagged (None) long-running shell.
-        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None, false)
+        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None, false, None)
             .await
             .expect("spawn untagged");
         // A sess-A shell that completes immediately — must be excluded once done.
@@ -1200,6 +1209,7 @@ mod tests {
             None,
             Some("sess-A".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn done");
@@ -1254,6 +1264,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -1295,6 +1306,7 @@ mod tests {
             // `can_async_resume` is irrelevant here — this test drives
             // promotion directly via run_streaming_command(Some(200)).
             true,
+            None,
             None,
         );
         let cwd = super::workspace_state::workspace_or_process_cwd(Some(session_id));
@@ -1436,6 +1448,7 @@ mod tests {
             Some("session_seed_test".to_string()),
             test_environment_diagnostics(),
             None,
+            None,
         )
         .await
         .expect("adopt should succeed");
@@ -1452,5 +1465,124 @@ mod tests {
 
         let _ = session.kill().await;
         let _ = super::bash_runtime::remove_shell(&session.id);
+    }
+
+    // ── Phase 2b follow-up: loop-facing completion push (BashCompletionSink) ──
+
+    /// A `BashCompletionSink` that records every completion it receives, so a
+    /// test can assert the producer pushed the right info + output tail.
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        received: std::sync::Arc<std::sync::Mutex<Vec<bamboo_agent_core::BashCompletionInfo>>>,
+    }
+
+    impl bamboo_agent_core::BashCompletionSink for RecordingSink {
+        fn on_bash_completed(&self, info: bamboo_agent_core::BashCompletionInfo) {
+            self.received.lock().unwrap().push(info);
+        }
+    }
+
+    async fn wait_for_sink(
+        recorder: &RecordingSink,
+        what: &str,
+    ) -> bamboo_agent_core::BashCompletionInfo {
+        let started = Instant::now();
+        loop {
+            if let Some(info) = recorder.received.lock().unwrap().first().cloned() {
+                return info;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("completion sink was not called for {what}");
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn background_completion_pushes_to_sink_with_output_tail() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        let shell = super::bash_runtime::spawn_background(
+            "echo hello-sink",
+            None,
+            None,
+            Some("sess-sink".to_string()),
+            false,
+            Some(sink),
+        )
+        .await
+        .expect("spawn");
+
+        let info = wait_for_sink(&recorder, "echo").await;
+        assert_eq!(info.session_id, "sess-sink");
+        assert_eq!(info.bash_id, shell.id);
+        assert_eq!(info.status, "completed");
+        assert_eq!(info.exit_code, Some(0));
+        assert!(
+            info.output_tail.contains("hello-sink"),
+            "output tail should carry the command output, got: {:?}",
+            info.output_tail
+        );
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+
+    #[tokio::test]
+    async fn background_completion_carries_nonzero_exit_code() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        let shell = super::bash_runtime::spawn_background(
+            "exit 3",
+            None,
+            None,
+            Some("sess-exit".to_string()),
+            false,
+            Some(sink),
+        )
+        .await
+        .expect("spawn");
+
+        let info = wait_for_sink(&recorder, "exit 3").await;
+        assert_eq!(info.status, "completed");
+        assert_eq!(info.exit_code, Some(3));
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+
+    #[tokio::test]
+    async fn untagged_shell_does_not_invoke_sink() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        // session_id = None → no owning loop to notify → the sink must not fire,
+        // even though it is wired.
+        let shell =
+            super::bash_runtime::spawn_background("true", None, None, None, false, Some(sink))
+                .await
+                .expect("spawn");
+
+        let started = Instant::now();
+        while shell.status() == "running" {
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("shell never completed");
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        // Give the poll task's post-exit emit path time to run.
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            recorder.received.lock().unwrap().is_empty(),
+            "an untagged (session-less) shell must not push a completion"
+        );
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
     }
 }
