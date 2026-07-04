@@ -249,6 +249,16 @@ impl ToolExecutor for BuiltinToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        self.execute_with_context_outcome(call, ctx)
+            .await
+            .map(ToolOutcome::into_tool_result)
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
         // Reuse the args the dispatching agent loop already parsed (for the
         // `ToolStart` event) when it threaded them through the context, instead
         // of re-parsing the raw JSON string here (issue #106, deferred B1 from
@@ -382,12 +392,15 @@ impl ToolExecutor for BuiltinToolExecutor {
                                     "options": ["Approve", "Deny"],
                                     "allow_custom": false,
                                 });
-                                return Ok(ToolResult {
+                                // Permission-gate synthesized question stays on
+                                // the Completed→sniff path for now (a later Phase B
+                                // step converts this to ToolOutcome::NeedsHuman).
+                                return Ok(ToolOutcome::Completed(ToolResult {
                                     success: true,
                                     result: payload.to_string(),
                                     display_preference: Some("request_permissions".to_string()),
                                     images: Vec::new(),
-                                });
+                                }));
                             }
 
                             // Non-interactive (no event sink to surface the prompt):
@@ -413,16 +426,7 @@ impl ToolExecutor for BuiltinToolExecutor {
         // be produced (no tool returns it in this phase). Phase B makes the outcome
         // authoritative and removes this unwrap.
         let tool_ctx = ctx.to_tool_ctx();
-        match tool.invoke(args, tool_ctx).await? {
-            ToolOutcome::Completed(result) => Ok(result),
-            ToolOutcome::Running(handle) => Ok(handle.ack),
-            ToolOutcome::NeedsHuman(_) => Ok(ToolResult {
-                success: false,
-                result: "tool requested human input (not yet wired on this path)".to_string(),
-                display_preference: None,
-                images: Vec::new(),
-            }),
-        }
+        tool.invoke(args, tool_ctx).await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {

@@ -179,13 +179,18 @@ pub(super) async fn execute_tool_call_only(
         Some(&args),
     );
 
-    let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context(
+    // Route through the outcome-aware dispatch. The loop is not yet branching on
+    // Running/NeedsHuman (Phase B), so collapse to a ToolResult at this boundary
+    // (behavior-identical): Completed -> its result, Running -> its synthetic ack,
+    // NeedsHuman -> a placeholder result. Next Phase B step branches here instead.
+    let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
         ctx.tool_call,
         ctx.tools.as_ref(),
         ctx.config.composition_executor.as_ref().map(Arc::clone),
         tool_ctx,
     )
-    .await;
+    .await
+    .map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
 
     let tool_duration = tool_timer.elapsed();
 

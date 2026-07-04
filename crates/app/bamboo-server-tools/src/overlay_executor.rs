@@ -59,6 +59,23 @@ impl ToolExecutor for OverlayToolExecutor {
         self.base.execute_with_context(call, ctx).await
     }
 
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let name = normalize_tool_name(&call.function.name);
+        let is_overlay_call = name == self.overlay.name()
+            || normalize_tool_ref(name)
+                .as_deref()
+                .is_some_and(|normalized| normalized == self.overlay.name());
+        if is_overlay_call {
+            let (args, _) = parse_tool_args_best_effort(&call.function.arguments);
+            return self.overlay.invoke(args, ctx.to_tool_ctx()).await;
+        }
+        self.base.execute_with_context_outcome(call, ctx).await
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.base.list_tools();
 
