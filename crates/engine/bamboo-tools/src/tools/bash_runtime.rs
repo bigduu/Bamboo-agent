@@ -15,6 +15,7 @@ use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
@@ -44,7 +45,12 @@ pub struct ShellSession {
     /// per-session. `None` means the shell is untagged (e.g. spawned from tests).
     pub session_id: Option<String>,
     pub environment: CommandEnvironmentDiagnostics,
-    child: Arc<Mutex<Child>>,
+    /// Kill request for the still-running child. The child handle itself is owned
+    /// by the completion task, which awaits its exit via `child.wait()` (truly
+    /// event-driven — no polling). Because that task holds the handle across the
+    /// await, a kill cannot lock the handle without deadlocking; instead `kill()`
+    /// fires this `Notify` and the completion task's `select!` reaps the child.
+    kill_notify: Arc<Notify>,
     /// Retained stdin handle for an interactive shell (issue #89). `Some` only
     /// when the shell was spawned with `interactive: true` (a piped stdin);
     /// `None` for every non-interactive shell so the default EOF-on-read
@@ -96,13 +102,16 @@ impl ShellSession {
         (new_lines, next_cursor, dropped_lines)
     }
 
+    /// Request termination of the background shell. Flips `running` optimistically
+    /// so [`Self::status`] reflects the kill immediately, then signals the
+    /// completion task (the sole owner of the child handle) to `start_kill` and
+    /// reap. The real exit code + the completion event/push are recorded by that
+    /// task when the process is reaped. Never locks the child handle — see
+    /// [`ShellSession::kill_notify`].
+    #[allow(clippy::unused_async)] // async kept: callers `.await` it; symmetry with the other handle ops.
     pub async fn kill(&self) -> Result<(), String> {
-        let mut child = self.child.lock().await;
-        child
-            .kill()
-            .await
-            .map_err(|e| format!("Failed to kill shell '{}': {}", self.id, e))?;
         self.running.store(false, Ordering::Relaxed);
+        self.kill_notify.notify_one();
         Ok(())
     }
 
@@ -272,13 +281,14 @@ pub async fn spawn_background(
     let base_index = Arc::new(Mutex::new(0usize));
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(Mutex::new(None));
+    let kill_notify = Arc::new(Notify::new());
 
     let session = Arc::new(ShellSession {
         id: shell_id.clone(),
         command: command.to_string(),
         session_id,
         environment: prepared_env.diagnostics.clone(),
-        child: Arc::new(Mutex::new(child)),
+        kill_notify: kill_notify.clone(),
         stdin: Arc::new(Mutex::new(stdin_handle)),
         output: output.clone(),
         base_index: base_index.clone(),
@@ -303,7 +313,8 @@ pub async fn spawn_background(
     };
 
     spawn_completion_poll(
-        session.child.clone(),
+        child,
+        kill_notify,
         shell_id.clone(),
         command.to_string(),
         running,
@@ -328,7 +339,8 @@ pub async fn spawn_background(
 /// (issue #84, phase 2d + Phase 2b follow-up).
 #[allow(clippy::too_many_arguments)]
 fn spawn_completion_poll(
-    child: Arc<Mutex<Child>>,
+    mut child: Child,
+    kill_notify: Arc<Notify>,
     shell_id: String,
     command: String,
     running: Arc<AtomicBool>,
@@ -338,8 +350,8 @@ fn spawn_completion_poll(
     event_tx: Option<mpsc::Sender<AgentEvent>>,
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     // Stdout/stderr pump task handles. Awaited (bounded) before reading the
-    // completion tail so it reflects the fully-drained output — `try_wait`
-    // observing exit can race the pumps that are still flushing the final lines.
+    // completion tail so it reflects the fully-drained output — observing exit
+    // can race the pumps that are still flushing the final lines.
     pump_handles: Vec<tokio::task::JoinHandle<()>>,
 ) {
     let session_id_for_gc = shell_id.clone();
@@ -348,34 +360,29 @@ fn spawn_completion_poll(
     let command_for_event = command.clone();
     let command_for_sink = command;
     tokio::spawn(async move {
-        let (status_str, exit_code_value) = loop {
-            let poll = {
-                let mut guard = child.lock().await;
-                guard.try_wait()
-            };
-            match poll {
-                Ok(Some(status)) => {
-                    let code = status.code();
-                    *exit_code.lock().await = code;
-                    running.store(false, Ordering::Relaxed);
-                    break (
-                        if code.is_none() {
-                            "killed"
-                        } else {
-                            "completed"
-                        },
-                        code,
-                    );
-                }
-                Ok(None) => {
-                    sleep(Duration::from_millis(100)).await;
-                }
-                Err(_) => {
-                    running.store(false, Ordering::Relaxed);
-                    break ("error", None);
-                }
+        // Event-driven exit detection: await the process directly (`child.wait()`
+        // is OS-notified via tokio's process driver — no polling). A kill request
+        // (`kill_notify`, fired by `ShellSession::kill`) races the natural exit via
+        // `select!`; whichever wins, we then reap and read the exit status. This
+        // task owns the child handle, so no lock is contended and no killer blocks.
+        let wait_result = tokio::select! {
+            result = child.wait() => result,
+            _ = kill_notify.notified() => {
+                let _ = child.start_kill();
+                child.wait().await
             }
         };
+        let (status_str, exit_code_value) = match wait_result {
+            Ok(status) => {
+                let code = status.code();
+                // `code.is_none()` ⇒ terminated by signal (our SIGKILL, or an
+                // external one) ⇒ "killed"; otherwise a normal exit ⇒ "completed".
+                (if code.is_none() { "killed" } else { "completed" }, code)
+            }
+            Err(_) => ("error", None),
+        };
+        *exit_code.lock().await = exit_code_value;
+        running.store(false, Ordering::Relaxed);
 
         // Phase 1 (issue #84): emit a completion signal so clients can react
         // to a long-running background command finishing. This is the ONLY
@@ -476,6 +483,7 @@ pub async fn adopt_running_child(
     let base_index = Arc::new(Mutex::new(0usize));
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(Mutex::new(None));
+    let kill_notify = Arc::new(Notify::new());
 
     // Seed the output buffer with already-captured lines so they are not lost
     // across the foreground→background hand-off. Lines captured by the
@@ -490,7 +498,7 @@ pub async fn adopt_running_child(
         command: command.to_string(),
         session_id,
         environment,
-        child: Arc::new(Mutex::new(child)),
+        kill_notify: kill_notify.clone(),
         // The foreground streamer always spawns with Stdio::null() (bash.rs), so
         // a promoted shell has no stdin pipe — None preserves EOF-on-read.
         stdin: Arc::new(Mutex::new(None)),
@@ -520,7 +528,8 @@ pub async fn adopt_running_child(
     };
 
     spawn_completion_poll(
-        session.child.clone(),
+        child,
+        kill_notify,
         shell_id.clone(),
         command.to_string(),
         running,
