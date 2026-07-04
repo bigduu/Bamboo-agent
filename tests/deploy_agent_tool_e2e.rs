@@ -55,11 +55,12 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
 
     // 1. The agent deploys a worker (local subprocess, echo executor).
     let r = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({ "action": "deploy", "id": "w1", "env": "local", "echo": true }),
-            ctx(),
+            ctx().to_tool_ctx(),
         )
         .await
+        .map(|o| o.into_tool_result())
         .expect("deploy succeeds");
     let v: serde_json::Value = serde_json::from_str(&r.result).unwrap();
     assert_eq!(v["status"], "deployed");
@@ -84,8 +85,9 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
 
     // 3. list shows it.
     let r = tool
-        .execute_with_context(serde_json::json!({ "action": "list" }), ctx())
+        .invoke(serde_json::json!({ "action": "list" }), ctx().to_tool_ctx())
         .await
+        .map(|o| o.into_tool_result())
         .expect("list succeeds");
     assert!(
         r.result.contains("w1"),
@@ -95,8 +97,9 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
 
     // 4. stop tears it down.
     let r = tool
-        .execute_with_context(serde_json::json!({ "action": "stop", "id": "w1" }), ctx())
+        .invoke(serde_json::json!({ "action": "stop", "id": "w1" }), ctx().to_tool_ctx())
         .await
+        .map(|o| o.into_tool_result())
         .expect("stop succeeds");
     let v: serde_json::Value = serde_json::from_str(&r.result).unwrap();
     assert_eq!(v["status"], "stopped");

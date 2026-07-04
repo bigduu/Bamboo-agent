@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -52,7 +52,11 @@ impl Tool for ExitPlanModeTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: ExitPlanModeArgs = serde_json::from_value(args).map_err(|e| {
             ToolError::InvalidArguments(format!("Invalid ExitPlanMode args: {}", e))
         })?;
@@ -100,12 +104,12 @@ impl Tool for ExitPlanModeTool {
             "exit_mode": parsed.exit_mode,
         });
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: payload.to_string(),
             display_preference: Some("conclusion_with_options".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -145,12 +149,18 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_accepts_valid_plan() {
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": "Implement feature X"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": "Implement feature X"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
 
@@ -170,12 +180,18 @@ mod tests {
     async fn exit_plan_mode_includes_plan_in_payload() {
         let tool = ExitPlanModeTool::new();
         let plan_text = "1. Read config\n2. Update database\n3. Deploy changes";
-        let result = tool
-            .execute(json!({
-                "plan": plan_text
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": plan_text
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -185,12 +201,18 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_sets_display_preference_to_conclusion_with_options() {
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": "Test plan"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": "Test plan"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert_eq!(
             result.display_preference,
@@ -201,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_rejects_missing_plan() {
         let tool = ExitPlanModeTool::new();
-        let result = tool.execute(json!({})).await;
+        let result = tool.invoke(json!({}), ToolCtx::none("t")).await;
 
         assert!(result.is_err());
         let error = result.unwrap_err();
@@ -212,9 +234,12 @@ mod tests {
     async fn exit_plan_mode_rejects_invalid_plan_type() {
         let tool = ExitPlanModeTool::new();
         let result = tool
-            .execute(json!({
-                "plan": 123
-            }))
+            .invoke(
+                json!({
+                    "plan": 123
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_err());
@@ -230,9 +255,12 @@ mod tests {
     async fn exit_plan_mode_rejects_null_plan() {
         let tool = ExitPlanModeTool::new();
         let result = tool
-            .execute(json!({
-                "plan": null
-            }))
+            .invoke(
+                json!({
+                    "plan": null
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_err());
@@ -242,12 +270,18 @@ mod tests {
     async fn exit_plan_mode_accepts_empty_plan_string() {
         // Empty string is technically valid
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": ""
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": ""
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -258,12 +292,18 @@ mod tests {
     async fn exit_plan_mode_accepts_multiline_plan() {
         let tool = ExitPlanModeTool::new();
         let multiline_plan = "Step 1: Setup\nStep 2: Execute\nStep 3: Cleanup";
-        let result = tool
-            .execute(json!({
-                "plan": multiline_plan
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": multiline_plan
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -282,12 +322,18 @@ mod tests {
 ## Phase 2
 - Task C
 "#;
-        let result = tool
-            .execute(json!({
-                "plan": markdown_plan
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": markdown_plan
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -298,12 +344,18 @@ mod tests {
     async fn exit_plan_mode_accepts_unicode_plan() {
         let tool = ExitPlanModeTool::new();
         let unicode_plan = "实施计划 🎯\n1. 读取配置\n2. 更新数据库";
-        let result = tool
-            .execute(json!({
-                "plan": unicode_plan
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": unicode_plan
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -316,15 +368,21 @@ mod tests {
         // serde_json with additionalProperties: false may not strictly reject extra fields
         // during deserialization, so this test verifies the behavior
         let result = tool
-            .execute(json!({
-                "plan": "Test plan",
-                "extra_field": "should be ignored"
-            }))
+            .invoke(
+                json!({
+                    "plan": "Test plan",
+                    "extra_field": "should be ignored"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         // Depending on serde configuration, this might succeed (ignoring extra fields)
         // or fail (rejecting extra fields). The test documents the actual behavior.
-        if let Ok(tool_result) = result {
+        if let Ok(out) = result {
+            let ToolOutcome::Completed(tool_result) = out else {
+                panic!("expected Completed")
+            };
             // If it succeeds, verify the plan was captured correctly
             assert!(tool_result.success);
             let payload: serde_json::Value = serde_json::from_str(&tool_result.result).unwrap();
@@ -339,12 +397,18 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_payload_has_correct_structure() {
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": "Test"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": "Test"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
 
@@ -367,12 +431,18 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_options_has_four_choices_by_default() {
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": "Test"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": "Test"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         let options = payload["options"].as_array().unwrap();
@@ -387,13 +457,19 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_with_accept_edits_exit_mode() {
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": "Test",
-                "exit_mode": "accept_edits"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": "Test",
+                    "exit_mode": "accept_edits"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         let options = payload["options"].as_array().unwrap();
@@ -404,12 +480,18 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_empty_plan_changes_question() {
         let tool = ExitPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "plan": ""
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": ""
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert!(payload["question"]
@@ -428,12 +510,18 @@ mod tests {
     async fn exit_plan_mode_long_plan() {
         let tool = ExitPlanModeTool::new();
         let long_plan = "Step\n".repeat(1000);
-        let result = tool
-            .execute(json!({
-                "plan": long_plan.clone()
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": long_plan.clone()
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();

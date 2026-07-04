@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde_json::json;
 use tokio::fs;
 
@@ -28,12 +28,8 @@ impl Tool for GetFileInfoTool {
         "Get file metadata such as type, size, modification time, and existence without loading file contents."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -50,7 +46,11 @@ impl Tool for GetFileInfoTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -68,7 +68,7 @@ impl Tool for GetFileInfoTool {
                 // When the path simply does not exist, return a structured
                 // `exists: false` response so this tool subsumes FileExists.
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    return Ok(ToolResult {
+                    return Ok(ToolOutcome::Completed(ToolResult {
                         success: true,
                         result: json!({
                             "path": path,
@@ -77,14 +77,14 @@ impl Tool for GetFileInfoTool {
                         .to_string(),
                         display_preference: Some("json".to_string()),
                         images: Vec::new(),
-                    });
+                    }));
                 }
-                return Ok(ToolResult {
+                return Ok(ToolOutcome::Completed(ToolResult {
                     success: false,
                     result: format!("Failed to read metadata for '{path}': {error}"),
                     display_preference: Some("error".to_string()),
                     images: Vec::new(),
-                });
+                }));
             }
         };
 
@@ -94,7 +94,7 @@ impl Tool for GetFileInfoTool {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs());
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({
                 "path": path,
@@ -107,7 +107,7 @@ impl Tool for GetFileInfoTool {
             .to_string(),
             display_preference: Some("json".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -122,10 +122,16 @@ mod tests {
         tokio::fs::write(&file_path, "hello").await.unwrap();
 
         let tool = GetFileInfoTool::new();
-        let result = tool
-            .execute(json!({"path": file_path.to_string_lossy()}))
+        let out = tool
+            .invoke(
+                json!({"path": file_path.to_string_lossy()}),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(result.result.contains("\"is_file\":true"));
@@ -135,10 +141,16 @@ mod tests {
     #[tokio::test]
     async fn get_file_info_returns_exists_false_for_missing_path() {
         let tool = GetFileInfoTool::new();
-        let result = tool
-            .execute(json!({"path": "/tmp/bamboo-file-info-missing-xyz-98765"}))
+        let out = tool
+            .invoke(
+                json!({"path": "/tmp/bamboo-file-info-missing-xyz-98765"}),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();

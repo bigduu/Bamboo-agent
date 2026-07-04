@@ -4,7 +4,7 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::ReasoningEffort;
 use bamboo_engine::session_app::child_session::{
@@ -445,17 +445,12 @@ impl Tool for SubAgentTool {
         subagent_parameters_schema()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let parent_session_id = ctx.session_id.ok_or_else(|| {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let parent_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
         })?;
 
@@ -483,7 +478,8 @@ impl Tool for SubAgentTool {
                 "default_provider": catalog.default_provider(),
                 "providers": providers,
                 "usage": "Pass create.model as 'provider:model' (or a bare model id to use the parent's provider).",
-            }));
+            }))
+            .map(ToolOutcome::Completed);
         }
 
         let parent = self
@@ -797,7 +793,8 @@ impl Tool for SubAgentTool {
                         "status": "no_active_children",
                         "parent_session_id": parent_session_id,
                         "note": "No active child sessions to wait for; the parent continues running.",
-                    }));
+                    }))
+                    .map(ToolOutcome::Completed);
                 }
 
                 let count = self
@@ -955,6 +952,7 @@ impl Tool for SubAgentTool {
             // Handled by the session-independent short-circuit above.
             SubAgentArgs::ListModels => unreachable!("list_models short-circuits earlier"),
         }
+        .map(ToolOutcome::Completed)
     }
 }
 

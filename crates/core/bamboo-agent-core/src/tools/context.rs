@@ -185,6 +185,28 @@ impl<'a> ToolExecutionContext<'a> {
         self.bash_completion_sink.map(Arc::clone)
     }
 
+    /// TRANSITIONAL bridge to the owned [`ToolCtx`](crate::tools::ToolCtx) that the
+    /// rewritten `Tool::invoke` takes. Clones this borrowed dispatch context into
+    /// owned/`Arc` form at the concrete-executor seam, so the trait + dispatch
+    /// path keep using `ToolExecutionContext` (no wide ripple) while tools run on
+    /// `ToolCtx`. Removed in Phase B when the dispatch path adopts `ToolCtx`
+    /// directly.
+    pub fn to_tool_ctx(&self) -> crate::tools::ToolCtx {
+        crate::tools::ToolCtx {
+            session_id: self.session_id.map(Arc::from),
+            tool_call_id: Arc::from(self.tool_call_id),
+            event_tx: self.event_tx.cloned(),
+            available_tool_schemas: self
+                .available_tool_schemas
+                .map(Arc::from)
+                .unwrap_or_else(|| Arc::from(Vec::new())),
+            bypass_permissions: self.bypass_permissions,
+            can_async_resume: self.can_async_resume,
+            async_completion_sink: None,
+            bash_completion_sink: self.bash_completion_sink.map(Arc::clone),
+        }
+    }
+
     /// Best-effort emit of an event (ignored if no sender).
     pub async fn emit(&self, event: AgentEvent) {
         if let Some(tx) = self.event_tx {

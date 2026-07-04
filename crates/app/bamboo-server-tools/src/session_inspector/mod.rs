@@ -3,7 +3,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_storage::SessionStoreV2;
 
 mod args;
@@ -94,17 +94,16 @@ impl Tool for SessionInspectorTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let _caller_session_id = ctx.session_id.ok_or_else(|| {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let _caller_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution(
                 "session_history requires a session_id in tool context".to_string(),
             )
@@ -207,5 +206,6 @@ impl Tool for SessionInspectorTool {
                 .await
             }
         }
+        .map(ToolOutcome::Completed)
     }
 }

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -46,7 +46,11 @@ impl Tool for EnterPlanModeTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: EnterPlanModeArgs = serde_json::from_value(args).map_err(|e| {
             ToolError::InvalidArguments(format!("Invalid EnterPlanMode args: {}", e))
         })?;
@@ -67,12 +71,12 @@ impl Tool for EnterPlanModeTool {
             "allow_custom": false,
         });
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: payload.to_string(),
             display_preference: Some("conclusion_with_options".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -97,7 +101,10 @@ mod tests {
     #[tokio::test]
     async fn enter_plan_mode_returns_conclusion_with_options() {
         let tool = EnterPlanModeTool::new();
-        let result = tool.execute(json!({})).await.unwrap();
+        let out = tool.invoke(json!({}), ToolCtx::none("t")).await.unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert_eq!(
@@ -121,12 +128,18 @@ mod tests {
     #[tokio::test]
     async fn enter_plan_mode_includes_reason() {
         let tool = EnterPlanModeTool::new();
-        let result = tool
-            .execute(json!({
-                "reason": "This is a complex refactor"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "reason": "This is a complex refactor"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -137,7 +150,10 @@ mod tests {
     #[tokio::test]
     async fn enter_plan_mode_accepts_empty_args() {
         let tool = EnterPlanModeTool::new();
-        let result = tool.execute(json!({})).await.unwrap();
+        let out = tool.invoke(json!({}), ToolCtx::none("t")).await.unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
     }
 }

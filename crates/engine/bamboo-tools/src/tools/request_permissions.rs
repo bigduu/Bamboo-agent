@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde_json::json;
 
 use crate::permission::PermissionType;
@@ -92,7 +92,11 @@ impl Tool for RequestPermissionsTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let reason = args["reason"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("Missing 'reason' parameter".to_string()))?
@@ -170,12 +174,12 @@ impl Tool for RequestPermissionsTool {
             "allow_custom": false
         });
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: result_payload.to_string(),
             display_preference: Some("request_permissions".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -192,16 +196,22 @@ mod tests {
     #[tokio::test]
     async fn test_valid_single_permission_request() {
         let tool = RequestPermissionsTool::new();
-        let result = tool
-            .execute(json!({
-                "reason": "Need to write deployment config",
-                "permissions": [{
-                    "type": "write_file",
-                    "resource": "/etc/nginx/conf.d/*"
-                }]
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "reason": "Need to write deployment config",
+                    "permissions": [{
+                        "type": "write_file",
+                        "resource": "/etc/nginx/conf.d/*"
+                    }]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert_eq!(
@@ -222,24 +232,30 @@ mod tests {
     #[tokio::test]
     async fn test_valid_multiple_permissions() {
         let tool = RequestPermissionsTool::new();
-        let result = tool
-            .execute(json!({
-                "reason": "Need to deploy the application",
-                "permissions": [
-                    {
-                        "type": "execute_command",
-                        "resource": "docker compose up -d",
-                        "description": "Start Docker containers"
-                    },
-                    {
-                        "type": "http_request",
-                        "resource": "registry.example.com",
-                        "description": "Pull container images"
-                    }
-                ]
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "reason": "Need to deploy the application",
+                    "permissions": [
+                        {
+                            "type": "execute_command",
+                            "resource": "docker compose up -d",
+                            "description": "Start Docker containers"
+                        },
+                        {
+                            "type": "http_request",
+                            "resource": "registry.example.com",
+                            "description": "Pull container images"
+                        }
+                    ]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -252,9 +268,12 @@ mod tests {
     async fn test_missing_reason() {
         let tool = RequestPermissionsTool::new();
         let err = tool
-            .execute(json!({
-                "permissions": [{"type": "write_file", "resource": "/tmp/test"}]
-            }))
+            .invoke(
+                json!({
+                    "permissions": [{"type": "write_file", "resource": "/tmp/test"}]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap_err();
 
@@ -265,10 +284,13 @@ mod tests {
     async fn test_empty_reason() {
         let tool = RequestPermissionsTool::new();
         let err = tool
-            .execute(json!({
-                "reason": "   ",
-                "permissions": [{"type": "write_file", "resource": "/tmp/test"}]
-            }))
+            .invoke(
+                json!({
+                    "reason": "   ",
+                    "permissions": [{"type": "write_file", "resource": "/tmp/test"}]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap_err();
 
@@ -279,9 +301,12 @@ mod tests {
     async fn test_missing_permissions() {
         let tool = RequestPermissionsTool::new();
         let err = tool
-            .execute(json!({
-                "reason": "Need access"
-            }))
+            .invoke(
+                json!({
+                    "reason": "Need access"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap_err();
 
@@ -292,10 +317,13 @@ mod tests {
     async fn test_empty_permissions_array() {
         let tool = RequestPermissionsTool::new();
         let err = tool
-            .execute(json!({
-                "reason": "Need access",
-                "permissions": []
-            }))
+            .invoke(
+                json!({
+                    "reason": "Need access",
+                    "permissions": []
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap_err();
 
@@ -306,10 +334,13 @@ mod tests {
     async fn test_invalid_permission_type() {
         let tool = RequestPermissionsTool::new();
         let err = tool
-            .execute(json!({
-                "reason": "Need access",
-                "permissions": [{"type": "invalid_type", "resource": "/tmp"}]
-            }))
+            .invoke(
+                json!({
+                    "reason": "Need access",
+                    "permissions": [{"type": "invalid_type", "resource": "/tmp"}]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap_err();
 
@@ -322,10 +353,13 @@ mod tests {
     async fn test_missing_resource() {
         let tool = RequestPermissionsTool::new();
         let err = tool
-            .execute(json!({
-                "reason": "Need access",
-                "permissions": [{"type": "write_file"}]
-            }))
+            .invoke(
+                json!({
+                    "reason": "Need access",
+                    "permissions": [{"type": "write_file"}]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap_err();
 
@@ -346,10 +380,13 @@ mod tests {
 
         for ptype in types {
             let result = tool
-                .execute(json!({
-                    "reason": format!("Test {}", ptype),
-                    "permissions": [{"type": ptype, "resource": "/test"}]
-                }))
+                .invoke(
+                    json!({
+                        "reason": format!("Test {}", ptype),
+                        "permissions": [{"type": ptype, "resource": "/test"}]
+                    }),
+                    ToolCtx::none("t"),
+                )
                 .await;
             assert!(
                 result.is_ok(),
@@ -373,10 +410,13 @@ mod tests {
 
         for ptype in types {
             let result = tool
-                .execute(json!({
-                    "reason": format!("Test {}", ptype),
-                    "permissions": [{"type": ptype, "resource": "/test"}]
-                }))
+                .invoke(
+                    json!({
+                        "reason": format!("Test {}", ptype),
+                        "permissions": [{"type": ptype, "resource": "/test"}]
+                    }),
+                    ToolCtx::none("t"),
+                )
                 .await;
             assert!(
                 result.is_ok(),

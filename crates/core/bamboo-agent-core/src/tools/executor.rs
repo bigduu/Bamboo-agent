@@ -245,7 +245,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::tools::{FunctionCall, Tool, ToolRegistry};
+    use crate::tools::{FunctionCall, Tool, ToolCtx, ToolOutcome, ToolRegistry};
 
     use super::*;
 
@@ -286,16 +286,17 @@ mod tests {
             })
         }
 
-        async fn execute(
+        async fn invoke(
             &self,
             _args: serde_json::Value,
-        ) -> std::result::Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+            _ctx: ToolCtx,
+        ) -> std::result::Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "from-composition".to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use globset::{GlobBuilder, GlobSet};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
@@ -301,12 +301,8 @@ impl Tool for GrepTool {
         "Search file contents using ripgrep-style regex parameters. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -335,20 +331,15 @@ impl Tool for GrepTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Grep"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: GrepArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Grep args: {}", e)))?;
 
-        let cwd = workspace_state::workspace_or_process_cwd(ctx.session_id);
+        let cwd = workspace_state::workspace_or_process_cwd(ctx.session_id());
         let root = Self::resolve_search_root(parsed.path.as_deref(), &cwd);
 
         let output_mode = parsed.output_mode.unwrap_or_default();
@@ -474,12 +465,12 @@ impl Tool for GrepTool {
             return Err(ToolError::Execution(RESULT_TOO_LARGE_ERROR.to_string()));
         }
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result,
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -487,6 +478,13 @@ impl Tool for GrepTool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn run(tool: &GrepTool, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        match tool.invoke(args, ToolCtx::none("t")).await? {
+            ToolOutcome::Completed(r) => Ok(r),
+            _ => panic!("expected Completed"),
+        }
+    }
 
     fn result_lines(result: &ToolResult) -> Vec<&str> {
         result
@@ -516,8 +514,7 @@ mod tests {
             .unwrap();
 
         let tool = GrepTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "pattern": "needle",
                 "path": dir.path()
             }))
@@ -539,8 +536,7 @@ mod tests {
             .unwrap();
 
         let tool = GrepTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "pattern": "needle",
                 "path": file,
                 "output_mode": "content",
@@ -569,8 +565,7 @@ mod tests {
         tokio::fs::write(&file_txt, "foo\n").await.unwrap();
 
         let tool = GrepTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "pattern": "foo",
                 "path": dir.path(),
                 "output_mode": "count",
@@ -598,8 +593,7 @@ mod tests {
             .unwrap();
 
         let tool = GrepTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "pattern": "hello\\s+world",
                 "path": dir.path(),
                 "glob": "**/one.rs",
@@ -617,8 +611,7 @@ mod tests {
     #[tokio::test]
     async fn grep_content_mode_requires_scope_hint() {
         let tool = GrepTool::new();
-        let error = tool
-            .execute(json!({
+        let error = run(&tool,json!({
                 "pattern": "needle",
                 "output_mode": "content"
             }))
@@ -632,8 +625,7 @@ mod tests {
     #[tokio::test]
     async fn grep_multiline_requires_explicit_narrowed_path() {
         let tool = GrepTool::new();
-        let error = tool
-            .execute(json!({
+        let error = run(&tool,json!({
                 "pattern": "a\\s+b",
                 "multiline": true
             }))
@@ -645,8 +637,7 @@ mod tests {
             .contains(MULTILINE_REQUIRES_NARROWED_PATH_ERROR));
 
         let cwd = std::env::current_dir().unwrap();
-        let error = tool
-            .execute(json!({
+        let error = run(&tool,json!({
                 "pattern": "a\\s+b",
                 "multiline": true,
                 "path": cwd
@@ -668,8 +659,7 @@ mod tests {
         }
 
         let tool = GrepTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "pattern": "needle",
                 "path": dir.path()
             }))
@@ -692,8 +682,7 @@ mod tests {
         tokio::fs::write(&file, content).await.unwrap();
 
         let tool = GrepTool::new();
-        let error = tool
-            .execute(json!({
+        let error = run(&tool,json!({
                 "pattern": "needle",
                 "path": file
             }))

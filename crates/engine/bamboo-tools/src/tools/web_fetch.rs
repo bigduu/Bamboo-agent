@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use futures::StreamExt;
 use regex::Regex;
 use serde::Deserialize;
@@ -118,12 +118,8 @@ impl Tool for WebFetchTool {
         "Fetch an HTTP(S) URL and return a cleaned text excerpt plus metadata. The `prompt` field is caller context only; this tool does not run an extra model."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL.promotable()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -145,7 +141,7 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(&self, args: serde_json::Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         let parsed: WebFetchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid WebFetch args: {}", e)))?;
         let url = parsed.url.trim();
@@ -213,7 +209,7 @@ impl Tool for WebFetchTool {
         let text = Self::strip_html(&body)?;
         let excerpt: String = text.chars().take(20_000).collect();
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({
                 "url": parsed.url,
@@ -225,7 +221,7 @@ impl Tool for WebFetchTool {
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -279,10 +275,13 @@ mod tests {
     async fn execute_rejects_non_http_schemes() {
         let tool = WebFetchTool::new();
         let err = tool
-            .execute(json!({
-                "url": "file:///etc/passwd",
-                "prompt": "read"
-            }))
+            .invoke(
+                json!({
+                    "url": "file:///etc/passwd",
+                    "prompt": "read"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect_err("non-http scheme should fail");
 
@@ -293,10 +292,13 @@ mod tests {
     async fn execute_rejects_restricted_hosts_before_network_call() {
         let tool = WebFetchTool::new();
         let err = tool
-            .execute(json!({
-                "url": "http://localhost:8080",
-                "prompt": "read"
-            }))
+            .invoke(
+                json!({
+                    "url": "http://localhost:8080",
+                    "prompt": "read"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect_err("localhost should be blocked");
 

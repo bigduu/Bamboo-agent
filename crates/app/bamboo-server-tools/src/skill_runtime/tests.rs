@@ -130,7 +130,10 @@ Use this demo skill."#,
     };
 
     let error = tool
-        .execute_with_context(serde_json::json!({ "skill_id": "demo-skill" }), ctx)
+        .invoke(
+            serde_json::json!({ "skill_id": "demo-skill" }),
+            ctx.to_tool_ctx(),
+        )
         .await
         .expect_err("disabled skill should be rejected");
 
@@ -196,7 +199,10 @@ Use this demo skill."#,
     };
 
     let _ = tool
-        .execute_with_context(serde_json::json!({ "skill_id": "demo-skill" }), ctx)
+        .invoke(
+            serde_json::json!({ "skill_id": "demo-skill" }),
+            ctx.to_tool_ctx(),
+        )
         .await
         .expect("load_skill should succeed");
 
@@ -278,19 +284,22 @@ Use this demo skill."#,
     };
 
     let _ = load_tool
-        .execute_with_context(serde_json::json!({ "skill_id": "demo-skill" }), load_ctx)
+        .invoke(
+            serde_json::json!({ "skill_id": "demo-skill" }),
+            load_ctx.to_tool_ctx(),
+        )
         .await
         .expect("load_skill should succeed");
 
     let _ = read_tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "skill_id": "demo-skill",
                 "resource_path": "references/policy.md",
                 "offset": 1,
                 "limit": 1
             }),
-            read_ctx,
+            read_ctx.to_tool_ctx(),
         )
         .await
         .expect("read_skill_resource should succeed");

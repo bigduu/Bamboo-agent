@@ -7,7 +7,9 @@ use tokio::sync::{broadcast, RwLock};
 use serde_json::json;
 use uuid::Uuid;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{
+    Tool, ToolCtx, ToolError, ToolExecutionContext, ToolOutcome, ToolResult,
+};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_engine::session_app::child_session;
 
@@ -22,6 +24,22 @@ use bamboo_metrics::collector::MetricsCollector;
 use bamboo_metrics::storage::SqliteMetricsStorage;
 use bamboo_skills::SkillManager;
 use bamboo_storage::SessionStoreV2;
+
+/// Invoke the `SubAgent` tool (a `Tool`, not an executor) and unwrap the
+/// synchronous `Completed` outcome these tests expect, yielding the same
+/// `ToolResult`/`ToolError` the pre-rewrite `execute_with_context` returned so
+/// existing `.expect`/`.unwrap_err`/`is_ok`/`{:?}` assertions keep working.
+async fn invoke_completed(
+    tool: &SubAgentTool,
+    args: serde_json::Value,
+    ctx: ToolCtx,
+) -> Result<ToolResult, ToolError> {
+    match tool.invoke(args, ctx).await {
+        Ok(ToolOutcome::Completed(result)) => Ok(result),
+        Ok(_) => panic!("expected a Completed outcome"),
+        Err(e) => Err(e),
+    }
+}
 
 struct NoopProvider;
 
@@ -301,9 +319,8 @@ fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecution
 #[tokio::test]
 async fn create_without_subagent_type_defaults_to_worker_label() {
     let harness = build_test_harness().await;
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "No Label Child",
@@ -312,7 +329,7 @@ async fn create_without_subagent_type_defaults_to_worker_label() {
                 "workspace": "/tmp/ws"
                 // subagent_type intentionally omitted
             }),
-            ctx_for(&harness.parent_session_id, "tc_no_label"),
+            ctx_for(&harness.parent_session_id, "tc_no_label").to_tool_ctx(),
         )
         .await
         .expect("create must succeed without subagent_type");
@@ -335,11 +352,10 @@ async fn create_refused_at_max_spawn_depth() {
     parent.spawn_depth = bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH;
     harness.storage.save_session(&parent).await.unwrap();
 
-    let err = harness
-        .tool
-        .execute_with_context(
+    let err = invoke_completed(
+        &harness.tool,
             json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":"/tmp/ws"}),
-            ctx_for(&harness.parent_session_id, "tc_depth_cap"),
+            ctx_for(&harness.parent_session_id, "tc_depth_cap").to_tool_ctx(),
         )
         .await
         .expect_err("create at the depth cap must be refused");
@@ -362,11 +378,10 @@ async fn create_allowed_just_below_max_spawn_depth() {
     parent.spawn_depth = bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH - 1;
     harness.storage.save_session(&parent).await.unwrap();
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":"/tmp/ws"}),
-            ctx_for(&harness.parent_session_id, "tc_depth_ok"),
+            ctx_for(&harness.parent_session_id, "tc_depth_ok").to_tool_ctx(),
         )
         .await;
     assert!(
@@ -378,9 +393,8 @@ async fn create_allowed_just_below_max_spawn_depth() {
 #[tokio::test]
 async fn create_with_wait_true_suspends_and_registers_wait() {
     let harness = build_test_harness().await;
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Blocking Child",
@@ -390,7 +404,7 @@ async fn create_with_wait_true_suspends_and_registers_wait() {
                 "workspace": "/tmp/ws",
                 "wait": true
             }),
-            ctx_for(&harness.parent_session_id, "tc_create_wait"),
+            ctx_for(&harness.parent_session_id, "tc_create_wait").to_tool_ctx(),
         )
         .await
         .expect("create should succeed");
@@ -418,15 +432,14 @@ async fn create_with_wait_true_suspends_and_registers_wait() {
 #[tokio::test]
 async fn wait_action_with_explicit_children_suspends_and_registers() {
     let harness = build_test_harness().await;
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "wait",
                 "child_session_ids": ["k1", "k2", "k3"],
                 "wait_for": "any"
             }),
-            ctx_for(&harness.parent_session_id, "tc_wait"),
+            ctx_for(&harness.parent_session_id, "tc_wait").to_tool_ctx(),
         )
         .await
         .expect("wait should succeed");
@@ -463,11 +476,10 @@ async fn wait_action_is_noop_when_no_active_children() {
     let harness = build_test_harness().await;
     // No explicit ids and (in the jsonl-backed harness) no derivable active
     // children → must NOT suspend, and must NOT register an empty wait.
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({ "action": "wait" }),
-            ctx_for(&harness.parent_session_id, "tc_wait_noop"),
+            ctx_for(&harness.parent_session_id, "tc_wait_noop").to_tool_ctx(),
         )
         .await
         .expect("wait should succeed");
@@ -503,9 +515,8 @@ async fn wait_action_is_noop_when_no_active_children() {
 async fn create_requires_session_id_in_tool_context() {
     let harness = build_test_harness().await;
 
-    let err = harness
-        .tool
-        .execute_with_context(
+    let err = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "demo task",
@@ -514,7 +525,7 @@ async fn create_requires_session_id_in_tool_context() {
                 "subagent_type": "general-purpose",
                 "workspace": "/tmp/test-workspace"
             }),
-            ToolExecutionContext::none("tool_call"),
+            ToolCtx::none("tool_call"),
         )
         .await
         .unwrap_err();
@@ -531,9 +542,8 @@ async fn create_requires_session_id_in_tool_context() {
 async fn create_emits_sub_agent_started_event_after_queueing() {
     let mut harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Child A",
@@ -551,7 +561,8 @@ async fn create_emits_sub_agent_started_event_after_queueing() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("SubAgent should enqueue a child session");
@@ -600,9 +611,8 @@ async fn create_uses_async_subagent_model_resolver() {
     });
     let harness = build_test_harness_with_resolver(Some(resolver)).await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Coder Child",
@@ -621,7 +631,8 @@ async fn create_uses_async_subagent_model_resolver() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("SubAgent should create a child using async model resolver");
@@ -680,11 +691,10 @@ async fn resident_create_reuses_same_child_session() {
     };
 
     // First resident create: spins up the essayist.
-    let r1 = harness
-        .tool
-        .execute_with_context(
+    let r1 = invoke_completed(
+        &harness.tool,
             create("Essay: 溪流", "Write ~150 words about 溪流."),
-            ctx("tc1"),
+            ctx("tc1").to_tool_ctx(),
         )
         .await
         .expect("first resident create");
@@ -711,11 +721,10 @@ async fn resident_create_reuses_same_child_session() {
         .unwrap();
 
     // Second resident create with the SAME name: reuses the same session.
-    let r2 = harness
-        .tool
-        .execute_with_context(
+    let r2 = invoke_completed(
+        &harness.tool,
             create("Essay: 山峰", "Write ~150 words about 山峰."),
-            ctx("tc2"),
+            ctx("tc2").to_tool_ctx(),
         )
         .await
         .expect("second resident create");
@@ -744,9 +753,8 @@ async fn resident_create_reuses_same_child_session() {
     );
 
     // A one-shot create makes a DIFFERENT session.
-    let r3 = harness
-        .tool
-        .execute_with_context(
+    let r3 = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "OneShot",
@@ -755,7 +763,7 @@ async fn resident_create_reuses_same_child_session() {
                 "workspace": "/tmp/test-workspace",
                 "auto_run": false
             }),
-            ctx("tc3"),
+            ctx("tc3").to_tool_ctx(),
         )
         .await
         .expect("oneshot create");
@@ -771,9 +779,8 @@ async fn resident_create_reuses_same_child_session() {
 async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "title": "Legacy Child",
                 "responsibility": "Test backward compat",
@@ -790,7 +797,8 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("legacy SubAgent call without action should default to create");
@@ -808,9 +816,8 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
 async fn send_message_appends_follow_up_without_replacing_history() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "send_message",
                 "child_session_id": harness.child_session_id,
@@ -826,7 +833,8 @@ async fn send_message_appends_follow_up_without_replacing_history() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("send_message should succeed");
@@ -864,9 +872,8 @@ async fn send_message_queues_on_running_child_without_interrupt() {
         runners.insert(harness.child_session_id.clone(), runner);
     }
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "send_message",
                 "child_session_id": harness.child_session_id,
@@ -881,7 +888,8 @@ async fn send_message_queues_on_running_child_without_interrupt() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("send_message should queue message on running child");
@@ -932,9 +940,8 @@ async fn send_message_can_interrupt_running_child() {
         }
     });
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "send_message",
                 "child_session_id": harness.child_session_id,
@@ -951,7 +958,8 @@ async fn send_message_can_interrupt_running_child() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("send_message should interrupt running child");
@@ -987,9 +995,8 @@ async fn send_message_can_interrupt_running_child() {
 async fn send_message_can_queue_child_immediately() {
     let mut harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "send_message",
                 "child_session_id": harness.child_session_id,
@@ -1004,7 +1011,8 @@ async fn send_message_can_queue_child_immediately() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("send_message should queue the child");
@@ -1075,9 +1083,8 @@ async fn cancel_stops_running_child() {
         }
     });
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "cancel",
                 "child_session_id": harness.child_session_id
@@ -1091,7 +1098,8 @@ async fn cancel_stops_running_child() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("cancel should succeed");
@@ -1108,9 +1116,8 @@ async fn cancel_stops_running_child() {
 async fn list_returns_children() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({"action": "list"}),
             ToolExecutionContext {
                 session_id: Some(harness.parent_session_id.as_str()),
@@ -1121,7 +1128,8 @@ async fn list_returns_children() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("list should succeed");
@@ -1151,9 +1159,8 @@ async fn get_returns_runner_diagnostics() {
         runners.insert(harness.child_session_id.clone(), runner);
     }
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "get",
                 "child_session_id": harness.child_session_id
@@ -1167,7 +1174,8 @@ async fn get_returns_runner_diagnostics() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("get should succeed");
@@ -1187,9 +1195,8 @@ async fn get_returns_runner_diagnostics() {
 async fn create_returns_duration_hint() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Test Child",
@@ -1207,7 +1214,8 @@ async fn create_returns_duration_hint() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("create should succeed");
@@ -1237,9 +1245,8 @@ async fn create_returns_duration_hint() {
 async fn create_persists_explicit_reasoning_effort_to_child_session() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Reasoning Child",
@@ -1259,7 +1266,8 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("create should succeed");
@@ -1293,9 +1301,8 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
 async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Default Child",
@@ -1314,7 +1321,8 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("create should succeed");
@@ -1357,9 +1365,8 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
         .expect("seeded child exists");
     assert_eq!(seeded.reasoning_effort, None);
 
-    let _ = harness
-        .tool
-        .execute_with_context(
+    let _ = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "update",
                 "child_session_id": harness.child_session_id,
@@ -1374,7 +1381,8 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("update should succeed");
@@ -1396,9 +1404,8 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
 async fn delete_removes_child() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "delete",
                 "child_session_id": harness.child_session_id
@@ -1412,7 +1419,8 @@ async fn delete_removes_child() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("delete should succeed");
@@ -1433,9 +1441,8 @@ async fn delete_removes_child() {
 async fn create_requires_workspace() {
     let harness = build_test_harness().await;
 
-    let err = harness
-        .tool
-        .execute_with_context(
+    let err = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "No Workspace Child",
@@ -1452,7 +1459,8 @@ async fn create_requires_workspace() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -1472,9 +1480,8 @@ async fn create_requires_workspace() {
 async fn create_sets_child_workspace() {
     let harness = build_test_harness().await;
 
-    let result = harness
-        .tool
-        .execute_with_context(
+    let result = invoke_completed(
+        &harness.tool,
             json!({
                 "action": "create",
                 "title": "Workspace Child",
@@ -1493,7 +1500,8 @@ async fn create_sets_child_workspace() {
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .expect("create should succeed with workspace");

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::json;
@@ -72,12 +72,8 @@ impl Tool for GlobTool {
         "Fast file pattern matching tool. Use it to find candidate files before deeper Read or Grep steps. Avoid unbounded root patterns without narrowing path or pattern."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -102,16 +98,11 @@ impl Tool for GlobTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Glob"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: GlobArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Glob args: {}", e)))?;
 
@@ -121,7 +112,7 @@ impl Tool for GlobTool {
             ));
         }
 
-        let default_root = workspace_state::workspace_or_process_cwd(ctx.session_id);
+        let default_root = workspace_state::workspace_or_process_cwd(ctx.session_id());
         let root = parsed
             .path
             .as_ref()
@@ -221,19 +212,19 @@ impl Tool for GlobTool {
             ));
         }
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: result_lines.join("\n"),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::GlobTool;
-    use bamboo_agent_core::Tool;
+    use bamboo_agent_core::{Tool, ToolCtx, ToolOutcome};
     use serde_json::json;
 
     fn result_lines(result: &bamboo_agent_core::ToolResult) -> Vec<&str> {
@@ -248,9 +239,12 @@ mod tests {
     async fn glob_rejects_unbounded_default_root_pattern() {
         let tool = GlobTool::new();
         let error = tool
-            .execute(json!({
-                "pattern": "**/*"
-            }))
+            .invoke(
+                json!({
+                    "pattern": "**/*"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect_err("unbounded root glob should fail");
         assert!(error
@@ -267,14 +261,20 @@ mod tests {
         }
 
         let tool = GlobTool::new();
-        let result = tool
-            .execute(json!({
-                "pattern": "**/*.txt",
-                "path": dir.path(),
-                "limit": 120
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "pattern": "**/*.txt",
+                    "path": dir.path(),
+                    "limit": 120
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let lines = result_lines(&result);
         assert_eq!(lines.len(), 121);
@@ -300,14 +300,20 @@ mod tests {
         tokio::fs::write(&skipped, "skip").await.unwrap();
 
         let tool = GlobTool::new();
-        let result = tool
-            .execute(json!({
-                "pattern": "**/*.txt",
-                "path": dir.path(),
-                "limit": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "pattern": "**/*.txt",
+                    "path": dir.path(),
+                    "limit": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.result.contains("keep.txt"));
         assert!(!result.result.contains("node_modules"));

@@ -10,7 +10,7 @@ use bamboo_skills::access_control;
 use bamboo_skills::resource_helpers::list_skill_resource_paths;
 use bamboo_skills::SkillManager;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 
 use super::{skill_access_error_to_tool_error, SkillToolAccess};
 
@@ -58,16 +58,11 @@ impl Tool for LoadSkillTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: LoadSkillArgs = serde_json::from_value(args).map_err(|err| {
             ToolError::InvalidArguments(format!("Invalid load_skill args: {err}"))
         })?;
@@ -78,10 +73,10 @@ impl Tool for LoadSkillTool {
             ));
         }
 
-        access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id)
+        access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id())
             .await
             .map_err(skill_access_error_to_tool_error)?;
-        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id).await;
+        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id()).await;
 
         let skill = self
             .access
@@ -102,11 +97,11 @@ impl Tool for LoadSkillTool {
         let canonical_skill_root = tokio::fs::canonicalize(&skill_root)
             .await
             .unwrap_or(skill_root);
-        access_control::mark_skill_loaded(&self.access, skill_id, ctx.session_id)
+        access_control::mark_skill_loaded(&self.access, skill_id, ctx.session_id())
             .await
             .map_err(skill_access_error_to_tool_error)?;
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({
                 "skill_id": skill.id,
@@ -122,6 +117,6 @@ impl Tool for LoadSkillTool {
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }

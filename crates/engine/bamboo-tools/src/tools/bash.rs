@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
     preferred_bash_shell, render_command_line, trace_windows_command,
@@ -231,7 +231,7 @@ impl BashTool {
         timeout_ms: u64,
         promote_after_ms: Option<u64>,
         cwd: &Path,
-        ctx: ToolExecutionContext<'_>,
+        ctx: ToolCtx,
     ) -> Result<ToolResult, ToolError> {
         let shell = preferred_bash_shell();
         trace_windows_command(
@@ -410,7 +410,7 @@ impl BashTool {
                 stdout_lines,
                 stderr_lines,
                 command,
-                ctx.session_id.map(str::to_string),
+                ctx.session_id().map(str::to_string),
                 prepared_env.diagnostics.clone(),
                 ctx.cloned_sender(),
                 ctx.cloned_bash_completion_sink(),
@@ -521,16 +521,11 @@ impl Tool for BashTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Bash"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: BashArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Bash args: {}", e)))?;
 
@@ -543,7 +538,7 @@ impl Tool for BashTool {
 
         let _ = parsed.description;
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
-        let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
+        let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id());
         let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
 
         if parsed.interactive == Some(true) {
@@ -556,7 +551,7 @@ impl Tool for BashTool {
                 command,
                 Some(&cwd),
                 ctx.cloned_sender(),
-                ctx.session_id.map(str::to_string),
+                ctx.session_id().map(str::to_string),
                 true,
                 ctx.cloned_bash_completion_sink(),
             )
@@ -574,7 +569,7 @@ impl Tool for BashTool {
                 });
             }
 
-            return Ok(ToolResult {
+            return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: json!({
                     "bash_id": shell.id,
@@ -587,7 +582,7 @@ impl Tool for BashTool {
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
-            });
+            }));
         }
 
         match parsed.run_in_background {
@@ -597,7 +592,7 @@ impl Tool for BashTool {
                     command,
                     Some(&cwd),
                     ctx.cloned_sender(),
-                    ctx.session_id.map(str::to_string),
+                    ctx.session_id().map(str::to_string),
                     false,
                     ctx.cloned_bash_completion_sink(),
                 )
@@ -615,7 +610,7 @@ impl Tool for BashTool {
                     });
                 }
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({
                         "bash_id": shell.id,
@@ -627,7 +622,7 @@ impl Tool for BashTool {
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             Some(false) => {
                 // Force synchronous — pure foreground, no promotion (issue #84,
@@ -635,6 +630,7 @@ impl Tool for BashTool {
                 // exactly like the pre-2d behavior.
                 self.run_streaming_command(command, timeout_ms, None, &cwd, ctx)
                     .await
+                    .map(ToolOutcome::Completed)
             }
             None => {
                 // Auto-sync promotion (issue #84, phase 2d). Runs foreground but
@@ -651,6 +647,7 @@ impl Tool for BashTool {
                 };
                 self.run_streaming_command(command, timeout_ms, promote_after_ms, &cwd, ctx)
                     .await
+                    .map(ToolOutcome::Completed)
             }
         }
     }
@@ -660,7 +657,7 @@ impl Tool for BashTool {
 mod tests {
     use super::*;
     use bamboo_agent_core::tools::ToolExecutionSessionFlags;
-    use bamboo_agent_core::AgentEvent;
+    use bamboo_agent_core::{AgentEvent, ToolExecutionContext};
     use bamboo_infrastructure::process::{
         clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
         CommandEnvironmentDiagnostics, CommandEnvironmentSource, PythonDiscoveryDiagnostics,
@@ -730,8 +727,8 @@ mod tests {
         let tool = BashTool::new();
         let (tx, mut rx) = mpsc::channel(32);
 
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({
                     "command": mixed_output_command()
                 }),
@@ -744,10 +741,14 @@ mod tests {
                     can_async_resume: false,
                     bash_completion_sink: None,
                     pre_parsed_args: None,
-                },
+                }
+                .to_tool_ctx(),
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
 
@@ -799,13 +800,19 @@ mod tests {
         prime_test_command_environment();
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({
-                "command": invalid_utf8_stderr_command()
-            }))
+            .invoke(
+                json!({
+                    "command": invalid_utf8_stderr_command()
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_ok(), "invalid UTF-8 stderr should not fail");
-        let payload: Value = serde_json::from_str(&result.unwrap().result).unwrap();
+        let ToolOutcome::Completed(result) = result.unwrap() else {
+            panic!("expected Completed")
+        };
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
         let stderr = payload["stderr"].as_str().unwrap_or_default();
         assert!(!stderr.is_empty());
     }
@@ -815,12 +822,18 @@ mod tests {
     async fn bash_foreground_failure_includes_full_python_tried_list() {
         prime_test_command_environment();
         let tool = BashTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "false"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "false"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(!result.success);
         let payload: Value = serde_json::from_str(&result.result).unwrap();
@@ -834,12 +847,18 @@ mod tests {
     async fn bash_foreground_sets_stdout_truncated_when_output_exceeds_cap() {
         prime_test_command_environment();
         let tool = BashTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "i=0; while [ $i -lt 70000 ]; do printf 'aaaaaaaaaa'; i=$((i+1)); done; printf '\\n'"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "i=0; while [ $i -lt 70000 ]; do printf 'aaaaaaaaaa'; i=$((i+1)); done; printf '\\n'"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["timed_out"], false);
@@ -851,14 +870,20 @@ mod tests {
     async fn bash_background_honors_explicit_timeout() {
         prime_test_command_environment();
         let tool = BashTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "sleep 2",
-                "run_in_background": true,
-                "timeout": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "sleep 2",
+                    "run_in_background": true,
+                    "timeout": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["environment"]["source"], "process_env");
         assert_eq!(
@@ -1075,10 +1100,16 @@ mod tests {
             None,
         );
 
-        let result = tool
-            .execute_with_context(json!({ "command": "true", "run_in_background": true }), ctx)
+        let out = tool
+            .invoke(
+                json!({ "command": "true", "run_in_background": true }),
+                ctx.to_tool_ctx(),
+            )
             .await
             .expect("background dispatch should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
@@ -1117,8 +1148,8 @@ mod tests {
         let session_id = format!("session_{}", uuid::Uuid::new_v4());
         super::workspace_state::set_workspace(&session_id, base.canonicalize().unwrap());
 
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({
                     "command": "pwd",
                     "workdir": "nested"
@@ -1132,10 +1163,14 @@ mod tests {
                     can_async_resume: false,
                     bash_completion_sink: None,
                     pre_parsed_args: None,
-                },
+                }
+                .to_tool_ctx(),
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         let expected =
@@ -1150,10 +1185,13 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
 
         let result = tool
-            .execute(json!({
-                "command": "echo hello",
-                "workdir": file.path()
-            }))
+            .invoke(
+                json!({
+                    "command": "echo hello",
+                    "workdir": file.path()
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(
@@ -1271,10 +1309,13 @@ mod tests {
             pre_parsed_args: None,
         };
 
-        let result = tool
-            .execute_with_context(json!({ "command": "echo auto-fast-output" }), ctx)
+        let out = tool
+            .invoke(json!({ "command": "echo auto-fast-output" }), ctx.to_tool_ctx())
             .await
             .expect("auto fast command should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert!(
@@ -1319,7 +1360,7 @@ mod tests {
         // on the production 10s default or the None dispatch arm's
         // `can_async_resume` gating.
         let result = tool
-            .run_streaming_command("sleep 10", 60000, Some(200), &cwd, ctx)
+            .run_streaming_command("sleep 10", 60000, Some(200), &cwd, ctx.to_tool_ctx())
             .await
             .expect("auto promote should succeed");
 
@@ -1368,14 +1409,20 @@ mod tests {
         prime_test_command_environment();
         let tool = BashTool::new();
 
-        let result = tool
-            .execute(json!({
-                "command": "sleep 10",
-                "run_in_background": false,
-                "timeout": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "sleep 10",
+                    "run_in_background": false,
+                    "timeout": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("force-sync should produce a timed-out result");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert!(
@@ -1399,13 +1446,19 @@ mod tests {
         prime_test_command_environment();
         let tool = BashTool::new();
 
-        let result = tool
-            .execute(json!({
-                "command": "sleep 10",
-                "timeout": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "sleep 10",
+                    "timeout": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("non-resume-capable auto path should produce a result");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert!(

@@ -1,7 +1,7 @@
 //! Tests for Tool Composition DSL
 
 use super::*;
-use crate::tools::{Tool, ToolError, ToolResult};
+use crate::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,18 +58,18 @@ impl Tool for MockTool {
         })
     }
 
-    async fn execute(&self, _args: Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(&self, _args: Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
         if self.should_fail {
             Err(ToolError::Execution("Mock failure".to_string()))
         } else {
-            Ok(ToolResult {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: self.result_value.clone(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 }

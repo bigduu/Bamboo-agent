@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_subagent::{AgentRef, AskMode};
 
 /// Default / max wait for an answer.
@@ -100,17 +100,16 @@ impl Tool for AskAgentTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::MUTATING_SERIAL.promotable()
     }
 
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let caller = ctx.session_id.ok_or_else(|| {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let caller = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("ask_agent requires a session_id in tool context".to_string())
         })?;
         let parsed: AskArgs = serde_json::from_value(args)
@@ -153,12 +152,12 @@ impl Tool for AskAgentTool {
         } else {
             "query"
         };
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({ "from": parsed.target, "mode": mode_str, "answer": answer })
                 .to_string(),
             display_preference: None,
             images: Vec::new(),
-        })
+        }))
     }
 }

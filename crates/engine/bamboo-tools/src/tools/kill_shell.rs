@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -70,7 +70,11 @@ impl Tool for KillShellTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: KillShellArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid KillShell args: {}", e)))?;
 
@@ -91,7 +95,7 @@ impl Tool for KillShellTool {
         }
         let _ = bash_runtime::remove_shell(shell_id);
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({
                 "shell_id": shell_id,
@@ -101,7 +105,7 @@ impl Tool for KillShellTool {
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -124,24 +128,36 @@ mod tests {
     #[tokio::test]
     async fn kill_shell_terminates_and_removes_session() {
         let bash = BashTool::new();
-        let spawned = bash
-            .execute(json!({
-                "command": long_running_command(),
-                "run_in_background": true
-            }))
+        let spawned_out = bash
+            .invoke(
+                json!({
+                    "command": long_running_command(),
+                    "run_in_background": true
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(spawned) = spawned_out else {
+            panic!("expected Completed")
+        };
         let spawned_payload: Value = serde_json::from_str(&spawned.result).unwrap();
         let shell_id = spawned_payload["bash_id"].as_str().unwrap().to_string();
         assert!(super::bash_runtime::get_shell(&shell_id).is_some());
 
         let kill = KillShellTool::new();
-        let result = kill
-            .execute(json!({
-                "shell_id": shell_id
-            }))
+        let out = kill
+            .invoke(
+                json!({
+                    "shell_id": shell_id
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
@@ -152,23 +168,35 @@ mod tests {
     #[tokio::test]
     async fn kill_shell_accepts_bash_id_alias() {
         let bash = BashTool::new();
-        let spawned = bash
-            .execute(json!({
-                "command": long_running_command(),
-                "run_in_background": true
-            }))
+        let spawned_out = bash
+            .invoke(
+                json!({
+                    "command": long_running_command(),
+                    "run_in_background": true
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(spawned) = spawned_out else {
+            panic!("expected Completed")
+        };
         let spawned_payload: Value = serde_json::from_str(&spawned.result).unwrap();
         let shell_id = spawned_payload["bash_id"].as_str().unwrap().to_string();
 
         let kill = KillShellTool::new();
-        let result = kill
-            .execute(json!({
-                "bash_id": shell_id
-            }))
+        let out = kill
+            .invoke(
+                json!({
+                    "bash_id": shell_id
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
     }
 }

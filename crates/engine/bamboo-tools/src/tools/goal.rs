@@ -13,7 +13,7 @@
 //! ordinary sessions.
 
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -70,8 +70,8 @@ impl Tool for UpdateGoalTool {
     /// Treated as read-only for approval/scheduling purposes: it touches no
     /// filesystem or external state. The durable goal-state mutation happens in
     /// the engine post-execution handler (same pattern as `session_note`).
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -89,7 +89,11 @@ impl Tool for UpdateGoalTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let arguments = args.to_string();
         let status = parse_update_goal_status(&arguments).map_err(ToolError::InvalidArguments)?;
 
@@ -103,7 +107,7 @@ impl Tool for UpdateGoalTool {
             _ => "Recorded goal status: blocked.",
         };
 
-        Ok(ToolResult::text(true, message))
+        Ok(ToolOutcome::Completed(ToolResult::text(true, message)))
     }
 }
 
@@ -115,10 +119,13 @@ mod tests {
     #[tokio::test]
     async fn complete_status_is_recorded() {
         let tool = UpdateGoalTool::new();
-        let result = tool
-            .execute(json!({"status": "complete"}))
+        let out = tool
+            .invoke(json!({"status": "complete"}), ToolCtx::none("t"))
             .await
             .expect("complete accepted");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
         assert!(result.result.to_lowercase().contains("complete"));
     }
@@ -126,10 +133,13 @@ mod tests {
     #[tokio::test]
     async fn blocked_status_is_recorded() {
         let tool = UpdateGoalTool::new();
-        let result = tool
-            .execute(json!({"status": "BLOCKED"}))
+        let out = tool
+            .invoke(json!({"status": "BLOCKED"}), ToolCtx::none("t"))
             .await
             .expect("blocked accepted (case-insensitive)");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
         assert!(result.result.to_lowercase().contains("blocked"));
     }
@@ -137,14 +147,19 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_status() {
         let tool = UpdateGoalTool::new();
-        let result = tool.execute(json!({"status": "paused"})).await;
+        let result = tool
+            .invoke(json!({"status": "paused"}), ToolCtx::none("t"))
+            .await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
 
     #[tokio::test]
     async fn rejects_missing_status() {
         let tool = UpdateGoalTool::new();
-        assert!(tool.execute(json!({})).await.is_err());
+        assert!(tool
+            .invoke(json!({}), ToolCtx::none("t"))
+            .await
+            .is_err());
     }
 
     #[test]

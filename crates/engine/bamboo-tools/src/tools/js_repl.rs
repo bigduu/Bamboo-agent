@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -101,6 +101,10 @@ impl Tool for JsReplTool {
         "Execute JavaScript code using Node.js. Supports top-level await and ES modules. The code is run in a fresh process each time; use js_repl_reset is not needed since state is not shared between calls."
     }
 
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::MUTATING_SERIAL.promotable()
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -119,7 +123,7 @@ impl Tool for JsReplTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(&self, args: serde_json::Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         let parsed: JsReplArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid js_repl args: {}", e)))?;
 
@@ -174,7 +178,7 @@ impl Tool for JsReplTool {
                 let exit_code = output.status.code();
                 let success = output.status.success();
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success,
                     result: json!({
                         "exit_code": exit_code,
@@ -187,7 +191,7 @@ impl Tool for JsReplTool {
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             Ok(Err(e)) => Err(ToolError::Execution(format!(
                 "Node.js process error: {}",
@@ -195,7 +199,7 @@ impl Tool for JsReplTool {
             ))),
             Err(_) => {
                 // Timeout — child is killed on drop via kill_on_drop(true)
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: false,
                     result: json!({
                         "exit_code": null,
@@ -208,7 +212,7 @@ impl Tool for JsReplTool {
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
         }
     }
@@ -217,6 +221,14 @@ impl Tool for JsReplTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn run(tool: &JsReplTool, args: serde_json::Value) -> ToolResult {
+        let out = tool.invoke(args, ToolCtx::none("t")).await.unwrap();
+        let ToolOutcome::Completed(r) = out else {
+            panic!("expected Completed")
+        };
+        r
+    }
 
     #[test]
     fn test_tool_name() {
@@ -243,10 +255,7 @@ mod tests {
             return;
         }
         let tool = JsReplTool::new();
-        let result = tool
-            .execute(json!({ "code": "console.log(2 + 2)" }))
-            .await
-            .unwrap();
+        let result = run(&tool, json!({ "code": "console.log(2 + 2)" })).await;
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -261,12 +270,13 @@ mod tests {
             return;
         }
         let tool = JsReplTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(
+            &tool,
+            json!({
                 "code": "const result = await Promise.resolve(42); console.log(result)"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -279,10 +289,7 @@ mod tests {
             return;
         }
         let tool = JsReplTool::new();
-        let result = tool
-            .execute(json!({ "code": "throw new Error('test error')" }))
-            .await
-            .unwrap();
+        let result = run(&tool, json!({ "code": "throw new Error('test error')" })).await;
 
         assert!(!result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -293,14 +300,20 @@ mod tests {
     #[tokio::test]
     async fn test_empty_code_rejected() {
         let tool = JsReplTool::new();
-        let err = tool.execute(json!({ "code": "  " })).await.unwrap_err();
+        let err = tool
+            .invoke(json!({ "code": "  " }), ToolCtx::none("t"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("empty")));
     }
 
     #[tokio::test]
     async fn test_missing_code_rejected() {
         let tool = JsReplTool::new();
-        let err = tool.execute(json!({})).await.unwrap_err();
+        let err = tool
+            .invoke(json!({}), ToolCtx::none("t"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
@@ -334,12 +347,13 @@ mod tests {
             return;
         }
         let tool = JsReplTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(
+            &tool,
+            json!({
                 "code": "const a = 10;\nconst b = 20;\nconsole.log(a + b);"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();

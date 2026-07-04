@@ -25,7 +25,7 @@ pub use bamboo_domain::{
 pub use storage::Storage;
 pub use tools::{
     AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
-    RunningHandle, SharedToolV2, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture, ToolV2,
+    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
 };
 pub use tools::{
     BashCompletionInfo, BashCompletionSink,

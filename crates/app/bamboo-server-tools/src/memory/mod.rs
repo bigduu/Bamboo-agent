@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::Session;
 use bamboo_memory::memory_store::{
     DurableMemoryStatus, MemoryQueryOptions, MemoryScope, MemoryStore, MAX_MAX_CHARS,
@@ -126,7 +126,7 @@ impl Tool for MemoryTool {
         })
     }
 
-    fn call_mutability(&self, args: &serde_json::Value) -> bamboo_tools::ToolMutability {
+    fn classify(&self, args: &serde_json::Value) -> ToolClass {
         let action = args
             .get("action")
             .and_then(|value| value.as_str())
@@ -141,29 +141,17 @@ impl Tool for MemoryTool {
             | "find_duplicates"
             | "scan_blobs"
             | "scan_duplicates"
-            | "inspect" => bamboo_tools::ToolMutability::ReadOnly,
-            _ => bamboo_tools::ToolMutability::Mutating,
+            | "inspect" => ToolClass::READONLY_PARALLEL,
+            _ => ToolClass::MUTATING_SERIAL,
         }
     }
 
-    fn call_concurrency_safe(&self, args: &serde_json::Value) -> bool {
-        matches!(
-            self.call_mutability(args),
-            bamboo_tools::ToolMutability::ReadOnly
-        )
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let session_id = ctx.session_id.ok_or_else(|| {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("memory requires a session_id in tool context".to_string())
         })?;
 
@@ -171,7 +159,7 @@ impl Tool for MemoryTool {
             ToolError::InvalidArguments(format!("Invalid memory args: {error}"))
         })?;
 
-        match parsed {
+        let result = match parsed {
             MemoryArgs::SessionRead { topic, options } => {
                 let max_chars = options.and_then(|value| value.max_chars);
                 execute_session_memory_action(
@@ -863,6 +851,7 @@ impl Tool for MemoryTool {
                     images: Vec::new(),
                 })
             }
-        }
+        }?;
+        Ok(ToolOutcome::Completed(result))
     }
 }

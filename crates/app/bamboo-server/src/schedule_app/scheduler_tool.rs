@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::{ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger};
 use crate::handlers::agent::schedules::ScheduleView;
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::{Session, SessionKind};
 use bamboo_engine::model_config_helper::get_schedule_model_from_config;
 use bamboo_llm::Config;
@@ -204,17 +204,12 @@ impl Tool for ScheduleTasksTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let caller_session_id = ctx.session_id.ok_or_else(|| {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let caller_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("scheduler requires a session_id in tool context".to_string())
         })?;
 
@@ -237,12 +232,12 @@ impl Tool for ScheduleTasksTool {
                     .into_iter()
                     .map(ScheduleView::from)
                     .collect::<Vec<_>>();
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({ "schedules": items }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             ScheduleTasksArgs::Create {
                 name,
@@ -292,7 +287,7 @@ impl Tool for ScheduleTasksTool {
                     )
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to create schedule: {e}")))?;
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({
                         "schedule": ScheduleView::from(created),
@@ -301,7 +296,7 @@ impl Tool for ScheduleTasksTool {
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             ScheduleTasksArgs::Patch {
                 schedule_id,
@@ -362,12 +357,12 @@ impl Tool for ScheduleTasksTool {
                     )));
                 };
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({ "schedule": ScheduleView::from(schedule) }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             ScheduleTasksArgs::Delete { schedule_id } => {
                 if schedule_id.trim().is_empty() {
@@ -386,13 +381,13 @@ impl Tool for ScheduleTasksTool {
                         schedule_id.trim()
                     )));
                 }
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({ "success": true, "schedule_id": schedule_id.trim() })
                         .to_string(),
                     display_preference: Some("Default".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             ScheduleTasksArgs::RunNow { schedule_id } => {
                 if schedule_id.trim().is_empty() {
@@ -426,7 +421,7 @@ impl Tool for ScheduleTasksTool {
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to enqueue run: {e}")))?;
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({
                         "success": true,
@@ -437,7 +432,7 @@ impl Tool for ScheduleTasksTool {
                     .to_string(),
                     display_preference: Some("Default".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             ScheduleTasksArgs::ListSessions { schedule_id } => {
                 if schedule_id.trim().is_empty() {
@@ -455,12 +450,12 @@ impl Tool for ScheduleTasksTool {
                     .map(|e| crate::handlers::agent::sessions::SessionSummary::from_entry(e, false))
                     .collect::<Vec<_>>();
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({ "schedule_id": schedule_id, "sessions": sessions }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
         }
     }

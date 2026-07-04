@@ -516,7 +516,11 @@ impl Composition for ToolComposition {
             }
         }
 
-        let result = self.tool.execute(final_args).await?;
+        let result = self
+            .tool
+            .invoke(final_args, crate::tools::ToolCtx::none(self.tool.name()))
+            .await?
+            .into_tool_result();
         let success = result.success;
 
         let mut new_ctx = ctx;

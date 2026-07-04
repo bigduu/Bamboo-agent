@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
@@ -148,12 +148,8 @@ impl Tool for ReadTool {
         "Read a local file or directory with line-numbered output (supports offset/limit). Use this before Edit/Write on existing files. Safe for text files and directories; binary files are omitted and blocking device paths are rejected."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -178,16 +174,11 @@ impl Tool for ReadTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Read"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: ReadArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Read args: {}", e)))?;
 
@@ -233,12 +224,12 @@ impl Tool for ReadTool {
 
             let rendered =
                 render_directory_entries(&entries, parsed.offset.unwrap_or(0), parsed.limit);
-            return Ok(ToolResult {
+            return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: rendered,
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
-            });
+            }));
         }
 
         if metadata.len() > MAX_READ_SIZE {
@@ -255,29 +246,29 @@ impl Tool for ReadTool {
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?;
 
-        if let Some(session_id) = ctx.session_id {
+        if let Some(session_id) = ctx.session_id() {
             read_tracker::mark_read(session_id, parsed.file_path.trim()).await;
         }
 
         if bytes.contains(&0) {
-            return Ok(ToolResult {
+            return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "[Binary file omitted]".to_string(),
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
-            });
+            }));
         }
 
         let content = String::from_utf8_lossy(&bytes).to_string();
         let rendered =
             render_file_with_line_numbers(&content, parsed.offset.unwrap_or(0), parsed.limit);
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: rendered,
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -294,36 +285,42 @@ mod tests {
             .await
             .unwrap();
         let file_path = file.path().to_string_lossy().to_string();
-        let ctx = ToolExecutionContext {
-            session_id: Some("session_binary_read"),
-            tool_call_id: "call_1",
+        let make_ctx = || ToolCtx {
+            session_id: Some(std::sync::Arc::from("session_binary_read")),
+            tool_call_id: std::sync::Arc::from("call_1"),
             event_tx: None,
-            available_tool_schemas: None,
+            available_tool_schemas: std::sync::Arc::from(Vec::new()),
             bypass_permissions: false,
             can_async_resume: false,
+            async_completion_sink: None,
             bash_completion_sink: None,
-            pre_parsed_args: None,
         };
 
         let read_tool = ReadTool::new();
-        let read_result = read_tool
-            .execute_with_context(json!({ "file_path": file_path }), ctx)
+        let read_out = read_tool
+            .invoke(json!({ "file_path": file_path }), make_ctx())
             .await
             .unwrap();
+        let ToolOutcome::Completed(read_result) = read_out else {
+            panic!("expected Completed")
+        };
         assert!(read_result.success);
         assert!(read_result.result.contains("Binary file omitted"));
 
         let write_tool = WriteTool::new();
-        let write_result = write_tool
-            .execute_with_context(
+        let write_out = write_tool
+            .invoke(
                 json!({
                     "file_path": file.path(),
                     "content": "now text"
                 }),
-                ctx,
+                make_ctx(),
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(write_result) = write_out else {
+            panic!("expected Completed")
+        };
         assert!(write_result.success);
     }
 
@@ -341,14 +338,20 @@ mod tests {
             .unwrap();
 
         let tool = ReadTool::new();
-        let result = tool
-            .execute(json!({
-                "file_path": dir.path(),
-                "offset": 1,
-                "limit": 1
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "file_path": dir.path(),
+                    "offset": 1,
+                    "limit": 1
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(result.result.contains("b-dir/"));
@@ -361,14 +364,20 @@ mod tests {
         tokio::fs::write(file.path(), "l1\nl2\nl3\n").await.unwrap();
 
         let tool = ReadTool::new();
-        let result = tool
-            .execute(json!({
-                "file_path": file.path(),
-                "offset": 0,
-                "limit": 1
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "offset": 0,
+                    "limit": 1
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(result.result.contains("l1"));
@@ -379,9 +388,12 @@ mod tests {
     async fn read_rejects_blocking_device_paths() {
         let tool = ReadTool::new();
         let result = tool
-            .execute(json!({
-                "file_path": "/dev/stdin"
-            }))
+            .invoke(
+                json!({
+                    "file_path": "/dev/stdin"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         let error = result.expect_err("device path should be rejected");

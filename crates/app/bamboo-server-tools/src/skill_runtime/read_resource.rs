@@ -14,7 +14,7 @@ use bamboo_skills::resource_helpers::{
 use bamboo_skills::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY;
 use bamboo_skills::SkillManager;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 
 use super::{skill_access_error_to_tool_error, SkillToolAccess, MAX_RESOURCE_CONTENT_CHARS};
 
@@ -79,16 +79,11 @@ impl Tool for ReadSkillResourceTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: ReadSkillResourceArgs = serde_json::from_value(args).map_err(|err| {
             ToolError::InvalidArguments(format!("Invalid read_skill_resource args: {err}"))
         })?;
@@ -99,13 +94,13 @@ impl Tool for ReadSkillResourceTool {
             ));
         }
 
-        access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id)
+        access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id())
             .await
             .map_err(skill_access_error_to_tool_error)?;
-        access_control::ensure_skill_loaded(&self.access, skill_id, ctx.session_id)
+        access_control::ensure_skill_loaded(&self.access, skill_id, ctx.session_id())
             .await
             .map_err(skill_access_error_to_tool_error)?;
-        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id).await;
+        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id()).await;
 
         let resource_path = normalize_relative_resource_path(&parsed.resource_path)
             .map_err(ToolError::InvalidArguments)?;
@@ -173,7 +168,7 @@ impl Tool for ReadSkillResourceTool {
                     "truncated": truncated,
                     "binary": false
                 });
-                if let Some(session_id) = ctx.session_id {
+                if let Some(session_id) = ctx.session_id() {
                     if let Some(mut session) =
                         self.access.session_for_context(Some(session_id)).await
                     {
@@ -207,11 +202,11 @@ impl Tool for ReadSkillResourceTool {
             }),
         };
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: result.to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }

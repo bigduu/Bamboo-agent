@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_broker::{
     AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
 };
@@ -288,16 +288,15 @@ impl Tool for DeployAgentTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::MUTATING_SERIAL.promotable()
     }
 
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        _ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: DeployArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid deploy_agent args: {e}")))?;
         match parsed {
@@ -305,6 +304,7 @@ impl Tool for DeployAgentTool {
             DeployArgs::Stop { id } => self.stop(id).await,
             DeployArgs::List => self.list().await,
         }
+        .map(ToolOutcome::Completed)
     }
 }
 

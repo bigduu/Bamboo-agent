@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
@@ -55,16 +55,11 @@ impl Tool for WriteTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Write"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: WriteArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Write args: {}", e)))?;
 
@@ -78,7 +73,7 @@ impl Tool for WriteTool {
         }
 
         if path.exists() {
-            if let Some(session_id) = ctx.session_id {
+            if let Some(session_id) = ctx.session_id() {
                 match read_tracker::read_state(session_id, file_path).await {
                     ReadState::Unread => {
                         return Err(ToolError::Execution(
@@ -113,12 +108,12 @@ impl Tool for WriteTool {
         );
         content_diagnostics::attach_file_diagnostics(&mut payload, path, &next_content);
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: payload.to_string(),
             display_preference: Some("Default".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -128,16 +123,16 @@ mod tests {
     use crate::tools::ReadTool;
     use serde_json::json;
 
-    fn ctx<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
-        ToolExecutionContext {
-            session_id: Some(session_id),
-            tool_call_id: "call_1",
+    fn ctx(session_id: &str) -> ToolCtx {
+        ToolCtx {
+            session_id: Some(std::sync::Arc::from(session_id)),
+            tool_call_id: std::sync::Arc::from("call_1"),
             event_tx: None,
-            available_tool_schemas: None,
+            available_tool_schemas: std::sync::Arc::from(Vec::new()),
             bypass_permissions: false,
             can_async_resume: false,
+            async_completion_sink: None,
             bash_completion_sink: None,
-            pre_parsed_args: None,
         }
     }
 
@@ -149,7 +144,7 @@ mod tests {
         let read_tool = ReadTool::new();
 
         let denied = write_tool
-            .execute_with_context(
+            .invoke(
                 json!({"file_path": file.path(), "content": "v2"}),
                 ctx("session_a"),
             )
@@ -157,7 +152,7 @@ mod tests {
         assert!(matches!(denied, Err(ToolError::Execution(_))));
 
         let _ = read_tool
-            .execute_with_context(json!({"file_path": file.path()}), ctx("session_a"))
+            .invoke(json!({"file_path": file.path()}), ctx("session_a"))
             .await
             .unwrap();
 
@@ -166,7 +161,7 @@ mod tests {
             .unwrap();
 
         let stale = write_tool
-            .execute_with_context(
+            .invoke(
                 json!({"file_path": file.path(), "content": "v3"}),
                 ctx("session_a"),
             )
@@ -174,16 +169,19 @@ mod tests {
         assert!(matches!(stale, Err(ToolError::Execution(msg)) if msg.contains("changed")));
 
         let _ = read_tool
-            .execute_with_context(json!({"file_path": file.path()}), ctx("session_a"))
+            .invoke(json!({"file_path": file.path()}), ctx("session_a"))
             .await
             .unwrap();
-        let ok = write_tool
-            .execute_with_context(
+        let out = write_tool
+            .invoke(
                 json!({"file_path": file.path(), "content": "final"}),
                 ctx("session_a"),
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(ok) = out else {
+            panic!("expected Completed")
+        };
         assert!(ok.success);
     }
 
@@ -199,10 +197,13 @@ mod tests {
 
         let write_tool = WriteTool::new();
         let result = write_tool
-            .execute(json!({
-                "file_path": link.join("test.txt"),
-                "content": "hello"
-            }))
+            .invoke(
+                json!({
+                    "file_path": link.join("test.txt"),
+                    "content": "hello"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
         assert!(matches!(result, Err(ToolError::Execution(msg)) if msg.contains("symlinked")));
     }
@@ -212,13 +213,19 @@ mod tests {
         let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
         let write_tool = WriteTool::new();
 
-        let result = write_tool
-            .execute(json!({
-                "file_path": file.path(),
-                "content": "{"
-            }))
+        let out = write_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "content": "{"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["diagnostics"]["format"], "json");
