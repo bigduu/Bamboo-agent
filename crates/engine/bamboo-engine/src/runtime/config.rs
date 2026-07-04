@@ -184,6 +184,11 @@ pub trait GuardianSpawner: Send + Sync {
 /// desync from the other and silently drop the resume trigger.
 pub const BASH_COMPLETION_RESUME_KIND: &str = "bash_completion_resume";
 
+/// Re-exported so peers that already `use crate::runtime::config::{BashResumeHook, …}`
+/// (the runtime/spawn threading) can name the completion sink the same way,
+/// rather than reaching into `bamboo_agent_core` separately.
+pub use bamboo_agent_core::BashCompletionSink;
+
 /// Late-bound hook that arranges a self-resume for a session suspended waiting
 /// on background Bash shells (issue #84 Phase 2b). Injected per-request on
 /// [`AgentLoopConfig`] exactly like [`GuardianSpawner`]; the implementation

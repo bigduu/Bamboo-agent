@@ -762,6 +762,12 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 let hook: Arc<dyn BashResumeHook> = Arc::new(self.clone());
                 Some(hook)
             },
+            bash_completion_sink: {
+                // Resumed runs keep the push wired too, so a background shell
+                // launched after resume still notifies the loop.
+                let sink: Arc<dyn BashCompletionSink> = Arc::new(self.clone());
+                Some(sink)
+            },
             app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
@@ -1013,26 +1019,34 @@ fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
 /// resumes it at round 0. A wired-sink session is never idle-with-a-running-shell
 /// (ending a turn with one suspends), so no separate idle-wake path is needed —
 /// keeping the push a pure latency optimization that never races the backstop.
+/// Enqueue a completed shell's summary as a pending injected message on the
+/// owning session. Race-safe: `update_runtime_config` loads the freshest session
+/// under the per-session lock and re-saves, so it can never revert a message the
+/// live loop appended concurrently — unlike `merge_save_runtime` (which writes
+/// the caller's whole `messages` snapshot verbatim). Free fn so it is unit-
+/// testable without constructing a full coordinator. Returns the saved session,
+/// or `None` if the owning session no longer exists.
+async fn enqueue_bash_completion_injection(
+    persistence: &LockedSessionStore,
+    info: &BashCompletionInfo,
+) -> std::io::Result<Option<Session>> {
+    let body = bash_completion_injection_body(info);
+    let queued = serde_json::json!({
+        "content": body,
+        "created_at": Utc::now(),
+    });
+    persistence
+        .update_runtime_config(&info.session_id, move |session| {
+            let mut pending = session.pending_injected_messages().unwrap_or_default();
+            pending.push(queued);
+            session.set_pending_injected_messages(pending);
+        })
+        .await
+}
+
 impl ChildCompletionCoordinator {
     async fn deliver_bash_completion(&self, info: BashCompletionInfo) {
-        let body = bash_completion_injection_body(&info);
-        let queued = serde_json::json!({
-            "content": body,
-            "created_at": Utc::now(),
-        });
-        // Race-safe append: `update_runtime_config` loads the freshest session
-        // under the per-session lock and re-saves, so it can never revert a
-        // message the live loop appended concurrently — unlike `merge_save_runtime`
-        // (which writes the caller's whole `messages` snapshot verbatim).
-        let result = self
-            .persistence
-            .update_runtime_config(&info.session_id, move |session| {
-                let mut pending = session.pending_injected_messages().unwrap_or_default();
-                pending.push(queued);
-                session.set_pending_injected_messages(pending);
-            })
-            .await;
-        match result {
+        match enqueue_bash_completion_injection(&self.persistence, &info).await {
             Ok(Some(_)) => tracing::info!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
@@ -1428,5 +1442,66 @@ mod tests {
         assert!(body.contains("no captured output"), "body: {body}");
         // No output tail section when there is nothing to show.
         assert!(!body.contains("Output tail:"), "body: {body}");
+    }
+
+    async fn temp_store() -> (tempfile::TempDir, Arc<dyn Storage>, LockedSessionStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::v2::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("storage init"),
+        );
+        let persistence = LockedSessionStore::new(storage.clone());
+        (temp, storage, persistence)
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_pending_injection_and_preserves_messages() {
+        let (_temp, storage, persistence) = temp_store().await;
+
+        let mut session = Session::new("sess-enq", "test-model");
+        session.add_message(Message::user("do the build"));
+        storage.save_session(&session).await.unwrap();
+
+        let info = BashCompletionInfo {
+            session_id: "sess-enq".into(),
+            bash_id: "sh-1".into(),
+            command: "make".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "done".into(),
+        };
+        let saved = enqueue_bash_completion_injection(&persistence, &info)
+            .await
+            .expect("enqueue io ok")
+            .expect("session exists");
+
+        let pending = saved
+            .pending_injected_messages()
+            .expect("pending injection present");
+        assert_eq!(pending.len(), 1);
+        let content = pending[0].get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(content.contains("sh-1"), "content: {content}");
+        assert!(content.contains("make"), "content: {content}");
+        assert!(content.contains("done"), "content: {content}");
+        // The pre-existing conversation is untouched (no clobber).
+        assert_eq!(saved.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_none_for_missing_session() {
+        let (_temp, _storage, persistence) = temp_store().await;
+        let info = BashCompletionInfo {
+            session_id: "does-not-exist".into(),
+            bash_id: "x".into(),
+            command: "true".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: String::new(),
+        };
+        let result = enqueue_bash_completion_injection(&persistence, &info)
+            .await
+            .expect("io ok");
+        assert!(result.is_none(), "no session → nothing enqueued");
     }
 }

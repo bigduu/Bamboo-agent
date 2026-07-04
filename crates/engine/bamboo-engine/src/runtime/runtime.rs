@@ -23,8 +23,8 @@ use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
 
 use crate::runtime::config::{
-    AgentLoopConfig, AuxiliaryModelConfig, BashResumeHook, GoldConfig, GuardianConfig,
-    GuardianSpawner, ImageFallbackConfig, PromptMemoryFlags,
+    AgentLoopConfig, AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig,
+    GuardianConfig, GuardianSpawner, ImageFallbackConfig, PromptMemoryFlags,
 };
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
@@ -301,6 +301,9 @@ pub struct ExecuteRequest {
     /// Late-bound hook that arranges a self-resume after a background-bash
     /// suspend (issue #84 Phase 2b). Wired by the server.
     pub bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
+    /// Late-bound sink that pushes a completed background-bash shell's result
+    /// into this loop (issue #84 Phase 2b follow-up). Wired by the server.
+    pub bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
 }
@@ -352,6 +355,7 @@ pub struct ExecuteRequestBuilder {
     guardian_config: Option<GuardianConfig>,
     guardian_spawner: Option<Arc<dyn GuardianSpawner>>,
     bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -390,6 +394,7 @@ impl ExecuteRequestBuilder {
             guardian_config: None,
             guardian_spawner: None,
             bash_resume_hook: None,
+            bash_completion_sink: None,
             app_data_dir: None,
         }
     }
@@ -564,6 +569,16 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the late-bound bash completion sink (crate-visible; wired by the
+    /// server so a completed background shell's result is pushed into the loop).
+    pub(crate) fn bash_completion_sink(
+        mut self,
+        v: Option<Arc<dyn BashCompletionSink>>,
+    ) -> Self {
+        self.bash_completion_sink = v;
+        self
+    }
+
     /// Set the Bamboo application data directory.
     pub fn app_data_dir(mut self, v: std::path::PathBuf) -> Self {
         self.app_data_dir = Some(v);
@@ -608,6 +623,7 @@ impl ExecuteRequestBuilder {
             guardian_config: self.guardian_config,
             guardian_spawner: self.guardian_spawner,
             bash_resume_hook: self.bash_resume_hook,
+            bash_completion_sink: self.bash_completion_sink,
             app_data_dir: self.app_data_dir,
         }
     }
@@ -661,6 +677,7 @@ impl AgentRuntime {
             guardian_config,
             guardian_spawner,
             bash_resume_hook,
+            bash_completion_sink,
             app_data_dir,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
@@ -747,6 +764,7 @@ impl AgentRuntime {
             guardian_config,
             guardian_spawner,
             bash_resume_hook,
+            bash_completion_sink,
             // Capture the tool executor's server-level guidance (connected MCP
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.

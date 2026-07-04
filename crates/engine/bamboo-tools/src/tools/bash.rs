@@ -478,8 +478,11 @@ impl Tool for BashTool {
          synchronous (block until timeout), or true to force immediate background. \
          Set interactive to true to spawn in the background with a piped stdin so \
          input can be fed over time via BashInput (interactive implies background; \
-         use it only to answer an interactive prompt). Backgrounded commands are \
-         observed via BashOutput and the loop waits for them at turn end. Default \
+         use it only to answer an interactive prompt). A backgrounded command runs \
+         detached and does NOT block the loop: keep working, and when it finishes \
+         you are automatically notified with a message carrying its exit status and \
+         a tail of its output — you do NOT need to poll. Use BashOutput only when \
+         you want the full output before then; KillShell to stop it early. Default \
          timeout is 120000ms (max 600000ms); captured stdout/stderr are each \
          capped at 512KB."
     }
@@ -502,7 +505,7 @@ impl Tool for BashTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Controls execution mode. Omit (default) for auto: runs synchronously but auto-backgrounds if the command runs longer than ~10s. Set to false to force synchronous (block until timeout). Set to true to force immediate background (observe via BashOutput; the loop waits at turn end)."
+                    "description": "Controls execution mode. Omit (default) for auto: runs synchronously but auto-backgrounds if the command runs longer than ~10s. Set to false to force synchronous (block until timeout). Set to true to force immediate background: returns a bash_id at once and runs detached; you are notified with the result (exit status + output tail) when it finishes, so keep working instead of polling. BashOutput is available for the full log; KillShell stops it early."
                 },
                 "interactive": {
                     "type": "boolean",
