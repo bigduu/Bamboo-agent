@@ -184,6 +184,12 @@ pub struct AppState {
     #[allow(dead_code)]
     embedded_broker: Option<builder::EmbeddedBroker>,
 
+    /// The cluster health monitor sweep. Lives for the server's lifetime (dropping
+    /// it aborts the sweep). `None` when the monitor is disabled
+    /// (`health_interval_secs = 0`). Never read — held only to keep the task alive.
+    #[allow(dead_code)]
+    health_monitor: Option<builder::HealthMonitor>,
+
     /// Hot-reloadable LLM provider with direct access
     ///
     /// This eliminates the proxy pattern where we created an AgentAppState

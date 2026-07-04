@@ -121,7 +121,7 @@ impl AppState {
         // longer required for sub-agent dispatch. (Foundation for routing local
         // actors onto the bus.)
         let mut config = config;
-        let mut embedded_broker = maybe_embed_broker(&mut config, &data_dir).await;
+        let embedded_broker = maybe_embed_broker(&mut config, &data_dir).await;
 
         let config = Arc::new(RwLock::new(config));
 
@@ -413,12 +413,15 @@ impl AppState {
             fabric_registry,
             fabric_bamboo_bin,
         ));
-        // Cluster health monitor: periodically probe deployed workers on the bus
-        // and flip node status live (Running↔Unreachable). Its handle rides the
-        // EmbeddedBroker so it's aborted when the server shuts down.
-        if let Some(eb) = embedded_broker.as_mut() {
-            eb.health_task = fabric_deployer.clone().spawn_health_monitor().await;
-        }
+        // Cluster health monitor: periodically probe deployed workers on the bus and
+        // flip node status live (Running↔Unreachable) + auto-recover. Server-scoped
+        // — it runs under BOTH the embedded and an external broker (it reads the
+        // broker endpoint lazily each tick), and is aborted when the server drops.
+        let health_monitor = fabric_deployer
+            .clone()
+            .spawn_health_monitor()
+            .await
+            .map(HealthMonitor);
 
         let tools = build_root_tools(
             tools_with_task.clone(),
@@ -494,6 +497,7 @@ impl AppState {
             config_io_lock,
             fabric_deployer,
             embedded_broker,
+            health_monitor,
             provider: provider_lock,
             provider_handle,
             sessions,
@@ -538,18 +542,23 @@ impl AppState {
 pub struct EmbeddedBroker {
     task: tokio::task::JoinHandle<()>,
     gc_task: tokio::task::JoinHandle<()>,
-    /// Cluster-fabric health monitor (set post-construction once the fabric
-    /// deployer exists; `None` when the monitor is disabled). Aborted on drop.
-    health_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for EmbeddedBroker {
     fn drop(&mut self) {
         self.task.abort();
         self.gc_task.abort();
-        if let Some(h) = self.health_task.take() {
-            h.abort();
-        }
+    }
+}
+
+/// Server-scoped handle to the cluster health monitor. Kept separate from
+/// [`EmbeddedBroker`] so the monitor runs under BOTH the embedded broker and an
+/// external (`broker.json`) one; aborts the sweep on drop.
+pub struct HealthMonitor(tokio::task::JoinHandle<()>);
+
+impl Drop for HealthMonitor {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -623,11 +632,7 @@ async fn maybe_embed_broker(
         token_encrypted: None,
     });
     tracing::info!(port, "embedded mailbox bus (broker) started in-process");
-    Some(EmbeddedBroker {
-        task,
-        gc_task,
-        health_task: None,
-    })
+    Some(EmbeddedBroker { task, gc_task })
 }
 
 /// Load a user-managed EXTERNAL broker from `<data_dir>/broker.json`, if present.
