@@ -139,21 +139,19 @@ pub async fn select_relevant_memories(
     }
 
     match rerank_candidate_ids(query, &shortlist, limit, rerank_context).await {
-        Ok(ids) => {
-            let reranked = reorder_candidates_by_ids(&shortlist, &ids, limit);
-            if reranked.is_empty() {
-                let mut lexical = shortlist;
-                lexical.truncate(limit);
-                return Ok(MemoryRecallSelection {
-                    candidates: lexical,
-                    strategy: MemoryRecallStrategy::RerankFallback,
-                });
-            }
-            Ok(MemoryRecallSelection {
-                candidates: reranked,
-                strategy: MemoryRecallStrategy::Reranked,
-            })
-        }
+        // A VALID but empty selection means the reranker judged NONE of the lexical
+        // shortlist relevant to the query. Respect that — return no memories rather
+        // than resurrecting the noisy shortlist (which otherwise surfaces unrelated
+        // memories the reranker explicitly rejected). This is NOT a failure, so it
+        // doesn't warn or fall back — only a genuine rerank error (Err) does.
+        Ok(ids) if ids.is_empty() => Ok(MemoryRecallSelection {
+            candidates: Vec::new(),
+            strategy: MemoryRecallStrategy::Reranked,
+        }),
+        Ok(ids) => Ok(MemoryRecallSelection {
+            candidates: reorder_candidates_by_ids(&shortlist, &ids, limit),
+            strategy: MemoryRecallStrategy::Reranked,
+        }),
         Err(error) => {
             tracing::warn!(
                 "Relevant memory rerank failed for model '{}': {}. Falling back to lexical shortlist.",
@@ -486,7 +484,11 @@ fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option
         out.push(trimmed.to_string());
     }
 
-    (!out.is_empty()).then_some(out)
+    // The response PARSED — return the (possibly empty) selection. `None` is
+    // reserved for genuinely unparseable output (handled above via `.ok()?`), so
+    // an empty `{"ids":[]}` — the reranker judging NONE relevant — is a valid
+    // result, not a parse failure. (Empty is acted on by the caller.)
+    Some(out)
 }
 
 fn strip_markdown_fence(raw: &str) -> String {
@@ -1030,6 +1032,73 @@ mod tests {
         assert_eq!(selection.candidates.len(), 2);
         assert_eq!(selection.candidates[0].id, lexical_first.frontmatter.id);
         assert_eq!(selection.candidates[1].id, lexical_second.frontmatter.id);
+    }
+
+    #[tokio::test]
+    async fn empty_rerank_selection_returns_no_memories_not_lexical() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        // Two lexically-matched candidates the reranker will reject.
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Release freeze checklist",
+                "Generic release freeze checklist for shipping work.",
+                &["release".to_string(), "freeze".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Mobile launch blocker",
+                "This durable note captures the release freeze decision for the mobile app.",
+                &["mobile".to_string(), "launch".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The reranker judges NONE of the shortlist relevant → `{"ids":[]}`.
+        let selection = select_relevant_memories(
+            &store,
+            Some("proj-1"),
+            "release freeze for mobile",
+            &MemoryRecallOptions {
+                shortlist_limit: 2,
+                include_global_fallback: false,
+                max_candidates_per_scope: 12,
+            },
+            Some(&MemoryRecallRerankContext {
+                llm: Arc::new(StaticResponseProvider::new("{\"ids\":[]}")),
+                model: "rerank-fast-model".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Respect the reranker: no memories surfaced, and it is NOT treated as a
+        // failure/fallback (the pre-fix bug misreported `{"ids":[]}` as a parse
+        // error → lexical fallback → surfaced the rejected memories).
+        assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
+        assert!(
+            selection.candidates.is_empty(),
+            "an empty rerank selection must surface no memories, got {}",
+            selection.candidates.len()
+        );
     }
 
     /// Provider that captures `max_output_tokens` and `reasoning_effort` from `chat_stream_with_options`.
