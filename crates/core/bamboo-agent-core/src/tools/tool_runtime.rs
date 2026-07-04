@@ -33,10 +33,15 @@ pub enum ToolOutcome {
     /// `pending_injected_messages` boundary. Loop control == Continue.
     Running(RunningHandle),
 
-    /// Suspend the turn for a human decision, carrying a fully-formed
-    /// [`PendingQuestion`] directly instead of encoding intent in result JSON.
-    /// Loop control == Break.
-    NeedsHuman(PendingQuestion),
+    /// Suspend the turn for a human decision. Carries the structured
+    /// [`PendingQuestion`] (drives the pending-question state, no marker sniff)
+    /// AND the tool's `result` — the rich display payload (conclusion / plan /
+    /// permission data) that becomes the paired `tool_result` in the transcript
+    /// and the `ToolComplete` UI event. Loop control == Break.
+    NeedsHuman {
+        question: PendingQuestion,
+        result: ToolResult,
+    },
 }
 
 // Hand-written: `RunningHandle` holds non-`Debug` fields (a `Box<dyn FnOnce>` and
@@ -49,7 +54,9 @@ impl std::fmt::Debug for ToolOutcome {
             ToolOutcome::Running(handle) => {
                 write!(f, "Running(tool_call_id={:?})", handle.tool_call_id)
             }
-            ToolOutcome::NeedsHuman(_) => f.write_str("NeedsHuman(..)"),
+            ToolOutcome::NeedsHuman { question, .. } => {
+                write!(f, "NeedsHuman(tool_call_id={:?})", question.tool_call_id)
+            }
         }
     }
 }
@@ -65,12 +72,7 @@ impl ToolOutcome {
         match self {
             ToolOutcome::Completed(result) => result,
             ToolOutcome::Running(handle) => handle.ack,
-            ToolOutcome::NeedsHuman(_) => ToolResult {
-                success: false,
-                result: "tool requested human input (not yet wired on this path)".to_string(),
-                display_preference: None,
-                images: Vec::new(),
-            },
+            ToolOutcome::NeedsHuman { result, .. } => result,
         }
     }
 }

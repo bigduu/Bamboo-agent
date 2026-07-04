@@ -6,7 +6,7 @@ use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
     parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags,
-    ToolExecutor, ToolResult, ToolSchema,
+    ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_metrics::MetricsCollector;
@@ -74,6 +74,11 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 
 pub(super) struct ToolExecutionOutcome {
     pub result: Result<ToolResult, String>,
+    /// Set when the tool returned [`ToolOutcome::NeedsHuman`] — the structured
+    /// pending question the loop suspends on (its display `result` is carried in
+    /// `result` above, so the compressor/policy path is unchanged). Handled in
+    /// [`apply_tool_execution_outcome`] before the normal success path.
+    pub needs_human: Option<bamboo_agent_core::PendingQuestion>,
     pub tool_duration: std::time::Duration,
 }
 
@@ -90,6 +95,7 @@ pub(super) async fn execute_tool_call_only(
             policy_error
         );
         return ToolExecutionOutcome {
+            needs_human: None,
             result: Err(policy_error),
             tool_duration: std::time::Duration::ZERO,
         };
@@ -179,18 +185,23 @@ pub(super) async fn execute_tool_call_only(
         Some(&args),
     );
 
-    // Route through the outcome-aware dispatch. The loop is not yet branching on
-    // Running/NeedsHuman (Phase B), so collapse to a ToolResult at this boundary
-    // (behavior-identical): Completed -> its result, Running -> its synthetic ack,
-    // NeedsHuman -> a placeholder result. Next Phase B step branches here instead.
-    let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
-        ctx.tool_call,
-        ctx.tools.as_ref(),
-        ctx.config.composition_executor.as_ref().map(Arc::clone),
-        tool_ctx,
-    )
-    .await
-    .map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
+    // Outcome-aware dispatch. Extract a NeedsHuman pending question (handled in
+    // apply before the success path) and collapse the rest to a ToolResult so the
+    // compressor / policy / transcript path is unchanged. Completed -> its result,
+    // Running -> its synthetic ack, NeedsHuman -> its rich display result.
+    let (needs_human, result) =
+        match bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
+            ctx.tool_call,
+            ctx.tools.as_ref(),
+            ctx.config.composition_executor.as_ref().map(Arc::clone),
+            tool_ctx,
+        )
+        .await
+        {
+            Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result)),
+            Ok(other) => (None, Ok(other.into_tool_result())),
+            Err(error) => (None, Err(error)),
+        };
 
     let tool_duration = tool_timer.elapsed();
 
@@ -220,6 +231,7 @@ pub(super) async fn execute_tool_call_only(
 
     ToolExecutionOutcome {
         result: result.map_err(|error| error.to_string()),
+        needs_human,
         tool_duration,
     }
 }
@@ -237,7 +249,32 @@ pub(super) async fn apply_tool_execution_outcome(
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
 
-    let result = match outcome.result {
+    // The tool asked for a human decision (Phase B): suspend directly on the
+    // returned PendingQuestion — no marker sniff. Its rich display result is the
+    // `Ok` value in `outcome.result`.
+    let result = if let Some(pending_question) = outcome.needs_human {
+        let display_result = outcome.result.unwrap_or_else(|_| ToolResult {
+            success: true,
+            result: String::new(),
+            display_preference: None,
+            images: Vec::new(),
+        });
+        super::clarification::suspend_for_pending_question(
+            ctx.tool_call,
+            pending_question,
+            display_result,
+            ctx.session,
+            ctx.event_tx,
+            ctx.metrics_collector,
+            ctx.session_id,
+            ctx.round_id,
+            ctx.config,
+        )
+        .await;
+        ctx.state.mark_awaiting_clarification();
+        true
+    } else {
+        match outcome.result {
         Ok(result) => {
             let r = execution_paths::handle_successful_tool_result(
                 execution_paths::SuccessPathContext {
@@ -273,6 +310,7 @@ pub(super) async fn apply_tool_execution_outcome(
             )
             .await;
             false
+        }
         }
     };
 

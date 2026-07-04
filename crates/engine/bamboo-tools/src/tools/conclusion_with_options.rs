@@ -171,7 +171,7 @@ impl Tool for ConclusionWithOptionsTool {
     async fn invoke(
         &self,
         args: serde_json::Value,
-        _ctx: ToolCtx,
+        ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
         let parsed: ConclusionWithOptionsArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid conclusion_with_options args: {error}"))
@@ -198,7 +198,19 @@ impl Tool for ConclusionWithOptionsTool {
 
         let allow_custom = parsed.allow_custom;
 
-        // Build the result payload that will be handled by the agent loop
+        // The structured pending question drives the loop's suspend directly
+        // (Phase B: no marker sniff). Built before the display payload, which
+        // consumes `question`/`options`.
+        let pending_question = bamboo_agent_core::PendingQuestion {
+            tool_call_id: ctx.tool_call_id.to_string(),
+            tool_name: self.name().to_string(),
+            question: question.clone(),
+            options: options.clone(),
+            allow_custom,
+            source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+        };
+
+        // Build the display payload (rich conclusion data for the transcript + UI)
         let result_payload = json!({
             "status": "awaiting_user_input",
             "type": "conclusion_with_options",
@@ -218,12 +230,15 @@ impl Tool for ConclusionWithOptionsTool {
             }
         });
 
-        Ok(ToolOutcome::Completed(ToolResult {
-            success: true,
-            result: result_payload.to_string(),
-            display_preference: Some("conclusion_with_options".to_string()),
-            images: Vec::new(),
-        }))
+        Ok(ToolOutcome::NeedsHuman {
+            question: pending_question,
+            result: ToolResult {
+                success: true,
+                result: result_payload.to_string(),
+                display_preference: Some("conclusion_with_options".to_string()),
+                images: Vec::new(),
+            },
+        })
     }
 }
 
@@ -261,8 +276,8 @@ mod tests {
             )
             .await
             .expect("tool should execute successfully");
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
         };
 
         assert!(result.success);
@@ -318,8 +333,8 @@ mod tests {
             )
             .await
             .expect("tool should execute with fallback defaults");
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
         };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -340,8 +355,8 @@ mod tests {
             )
             .await
             .expect("tool should execute without options");
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
         };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -363,8 +378,8 @@ mod tests {
             )
             .await
             .expect("tool should execute and truncate options");
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
         };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -387,8 +402,8 @@ mod tests {
             )
             .await
             .expect("tool should execute");
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
         };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
