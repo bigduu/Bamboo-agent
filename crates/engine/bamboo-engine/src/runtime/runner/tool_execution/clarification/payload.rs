@@ -1,11 +1,20 @@
 use bamboo_agent_core::tools::{ToolCall, ToolResult};
 
-/// Names of tools that pause the agent loop to wait for user input/approval.
-const PAUSE_TOOLS: [&str; 3] = [
-    "ExitPlanMode",
-    "conclusion_with_options",
-    "request_permissions",
-];
+/// Names of tools that still pause the agent loop via this LEGACY sniff path
+/// (result-marker → suspend). `conclusion_with_options` has migrated off this to
+/// `ToolOutcome::NeedsHuman` (handled in `apply_tool_execution_outcome` before the
+/// success path), so it is no longer listed here.
+///
+/// What remains is deliberately carved out:
+/// - `ExitPlanMode` — PLAN MODE. Left on this legacy path on purpose: plan mode
+///   is a cross-cutting state machine (status + permission capture/restore + plan
+///   file + read-only gating spread across respond.rs / clarification.rs /
+///   PLAN_MODE_EXEMPT_TOOLS) and will be redesigned as a first-class concern
+///   separately. Do NOT fold it into the generic NeedsHuman question path.
+/// - `request_permissions` + the permission-gate synth (`display_preference =
+///   "request_permissions"`) — may migrate to NeedsHuman later (needs the
+///   child→parent approval-delegation branch).
+const PAUSE_TOOLS: [&str; 2] = ["ExitPlanMode", "request_permissions"];
 
 #[derive(Debug, Clone)]
 pub(super) struct UserQuestionPayload {
@@ -15,11 +24,12 @@ pub(super) struct UserQuestionPayload {
 }
 
 /// Returns `true` when the tool call + result represent a user-facing question
-/// that should pause the agent loop and wait for the user response.
+/// that should pause the agent loop via the LEGACY sniff path. (Generic
+/// interactive tools now return `ToolOutcome::NeedsHuman` instead; this remains
+/// only for the carved-out cases below.)
 ///
-/// Currently recognises:
-/// - `conclusion_with_options` — general purpose question
-/// - `ExitPlanMode` — plan confirmation
+/// Recognises:
+/// - `ExitPlanMode` — plan-mode approval (carved out; redesign later)
 /// - `request_permissions` — permission approval request
 /// - any tool whose result is a synthesized permission-approval prompt (the
 ///   permission checker gates a mutating tool and returns the same shape as
