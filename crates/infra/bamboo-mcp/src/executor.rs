@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{
     parse_tool_args_best_effort, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
-    ToolResult, ToolResultImage, ToolSchema,
+    ToolOutcome, ToolResult, ToolResultImage, ToolSchema,
 };
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -231,6 +231,31 @@ impl ToolExecutor for CompositeToolExecutor {
         self.mcp.execute_with_context(call, ctx).await
     }
 
+    /// Outcome-aware dispatch. MUST be overridden here (not left to the trait
+    /// default) so a builtin tool's `ToolOutcome::NeedsHuman`/`Running` survives to
+    /// the engine's outcome-aware loop. The default would call
+    /// `execute_with_context(...).map(Completed)`, and this composite's
+    /// `execute_with_context` collapses the builtin outcome via `into_tool_result`
+    /// (dropping the `PendingQuestion`) — so an interactive tool like
+    /// `conclusion_with_options` would never suspend on the live overlay→composite
+    /// stack. Mirror `execute_with_context`: try built-in first, fall through to MCP
+    /// on `NotFound`.
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> std::result::Result<ToolOutcome, ToolError> {
+        match self.builtin.execute_with_context_outcome(call, ctx).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(ToolError::NotFound(_)) => {
+                // Fall through to MCP.
+            }
+            Err(e) => return Err(e),
+        }
+
+        self.mcp.execute_with_context_outcome(call, ctx).await
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.builtin.list_tools();
         tools.extend(self.mcp.list_tools());
@@ -311,6 +336,63 @@ mod tests {
     fn default_tool_guidance_is_none() {
         // The trait default contributes nothing unless an executor opts in.
         assert!(GuidanceStub(None).tool_guidance().is_none());
+    }
+
+    /// A builtin stub that returns an interactive `NeedsHuman` outcome (mirrors
+    /// `conclusion_with_options`), used to prove the composite forwards it.
+    struct NeedsHumanBuiltin;
+
+    #[async_trait]
+    impl ToolExecutor for NeedsHumanBuiltin {
+        async fn execute(&self, _call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+            Err(ToolError::NotFound("stub".into()))
+        }
+        async fn execute_with_context_outcome(
+            &self,
+            _call: &ToolCall,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> std::result::Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::NeedsHuman {
+                question: bamboo_agent_core::PendingQuestion {
+                    tool_call_id: "test-id".into(),
+                    tool_name: "conclusion_with_options".into(),
+                    question: "Pick one".into(),
+                    options: vec!["A".into(), "B".into()],
+                    allow_custom: false,
+                    source: bamboo_agent_core::PendingQuestionSource::default(),
+                },
+                result: ToolResult {
+                    success: true,
+                    result: "{}".into(),
+                    display_preference: Some("conclusion_with_options".into()),
+                    images: Vec::new(),
+                },
+            })
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    /// Regression (PR #211 review): the composite MUST override
+    /// `execute_with_context_outcome` and forward the inner outcome. The trait
+    /// default would call `execute_with_context(...).map(Completed)`, and the
+    /// composite's `execute_with_context` collapses the builtin outcome via
+    /// `into_tool_result` (dropping the `PendingQuestion`) — so an interactive tool
+    /// would never suspend on the live overlay→composite→builtin stack.
+    #[tokio::test]
+    async fn composite_preserves_builtin_needs_human_outcome() {
+        let composite =
+            CompositeToolExecutor::new(Arc::new(NeedsHumanBuiltin), Arc::new(GuidanceStub(None)));
+        let call = create_test_tool_call("conclusion_with_options", "{}");
+        let outcome = composite
+            .execute_with_context_outcome(&call, ToolExecutionContext::none("test-id"))
+            .await
+            .expect("outcome ok");
+        assert!(
+            matches!(outcome, ToolOutcome::NeedsHuman { .. }),
+            "composite must preserve the builtin NeedsHuman outcome, got {outcome:?}"
+        );
     }
 
     #[test]
