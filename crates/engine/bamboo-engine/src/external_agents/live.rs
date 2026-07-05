@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
+use bamboo_domain::poison::PoisonRecover;
 use bamboo_subagent::proto::ParentFrame;
 use tokio::sync::mpsc;
 
@@ -37,7 +38,7 @@ fn pending() -> &'static Mutex<HashMap<String, HashSet<String>>> {
 pub fn register_pending_approval(child_id: &str, request_id: &str) {
     pending()
         .lock()
-        .unwrap()
+        .recover_poison()
         .entry(child_id.to_string())
         .or_default()
         .insert(request_id.to_string());
@@ -47,7 +48,7 @@ pub fn register_pending_approval(child_id: &str, request_id: &str) {
 /// return whether it WAS present. A second call for the same pair returns
 /// `false`, so a request can't be answered (or replayed) twice.
 pub fn take_pending_approval(child_id: &str, request_id: &str) -> bool {
-    let mut guard = pending().lock().unwrap();
+    let mut guard = pending().lock().recover_poison();
     let Some(set) = guard.get_mut(child_id) else {
         return false;
     };
@@ -60,7 +61,7 @@ pub fn take_pending_approval(child_id: &str, request_id: &str) -> bool {
 
 /// Drop all pending approvals for a child (e.g. when its live connection ends).
 pub fn clear_pending_approvals_for(child_id: &str) {
-    pending().lock().unwrap().remove(child_id);
+    pending().lock().recover_poison().remove(child_id);
 }
 
 /// Validated external entry point: deliver an approval decision ONLY if the
@@ -86,7 +87,7 @@ pub struct LiveActorGuard {
 
 impl Drop for LiveActorGuard {
     fn drop(&mut self) {
-        map().lock().unwrap().remove(&self.child_id);
+        map().lock().recover_poison().remove(&self.child_id);
         // A disconnecting child can't answer any still-pending approval — drop
         // them so a late external POST finds nothing pending and is rejected.
         clear_pending_approvals_for(&self.child_id);
@@ -95,7 +96,7 @@ impl Drop for LiveActorGuard {
 
 /// Register a live child's frame sender for the duration of its run.
 pub fn register(child_id: &str, tx: mpsc::UnboundedSender<ParentFrame>) -> LiveActorGuard {
-    map().lock().unwrap().insert(child_id.to_string(), tx);
+    map().lock().recover_poison().insert(child_id.to_string(), tx);
     LiveActorGuard {
         child_id: child_id.to_string(),
     }
@@ -104,7 +105,7 @@ pub fn register(child_id: &str, tx: mpsc::UnboundedSender<ParentFrame>) -> LiveA
 /// Deliver an in-band steering message to a live child. Returns `false` when
 /// the child is not live (caller should use the durable queue instead).
 pub fn deliver_message(child_id: &str, text: &str) -> bool {
-    let guard = map().lock().unwrap();
+    let guard = map().lock().recover_poison();
     match guard.get(child_id) {
         Some(tx) => tx
             .send(ParentFrame::Message {
@@ -126,7 +127,7 @@ pub fn deliver_message(child_id: &str, text: &str) -> bool {
 /// `false` when the child is not live (no connection to answer on — the caller
 /// should treat that as a denied/expired request).
 pub fn deliver_approval(child_id: &str, request_id: &str, approved: bool) -> bool {
-    let guard = map().lock().unwrap();
+    let guard = map().lock().recover_poison();
     match guard.get(child_id) {
         Some(tx) => tx
             .send(ParentFrame::ApprovalReply {
@@ -140,7 +141,7 @@ pub fn deliver_approval(child_id: &str, request_id: &str, approved: bool) -> boo
 
 /// Whether a child currently has a live actor connection.
 pub fn is_live(child_id: &str) -> bool {
-    map().lock().unwrap().contains_key(child_id)
+    map().lock().recover_poison().contains_key(child_id)
 }
 
 #[cfg(test)]

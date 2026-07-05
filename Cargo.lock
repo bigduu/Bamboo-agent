@@ -1131,6 +1131,7 @@ name = "bamboo-notification"
 version = "0.0.0"
 dependencies = [
  "bamboo-agent-core",
+ "bamboo-domain",
  "chrono",
  "dashmap",
  "serde",

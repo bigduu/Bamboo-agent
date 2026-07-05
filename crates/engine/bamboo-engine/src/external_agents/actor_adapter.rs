@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
+use bamboo_domain::poison::PoisonRecover;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -622,7 +623,7 @@ impl ActorChildRunner {
         // needed — a listed worker is connected NOW (the bus only lists live
         // subscribers), so there is no stale-but-leased candidate to skip.
         let idx = {
-            let mut cursors = self.schedule_cursor.lock().unwrap();
+            let mut cursors = self.schedule_cursor.lock().recover_poison();
             let cursor = cursors.entry(pool.clone()).or_insert(0);
             let i = *cursor % candidates.len();
             *cursor = cursor.wrapping_add(1);
@@ -641,7 +642,7 @@ impl ExternalChildRunner for ActorChildRunner {
     }
 
     fn set_escalation_bridge(&self, bridge: Option<bamboo_subagent::executor::HostBridge>) {
-        *self.escalation_bridge.lock().unwrap() = bridge;
+        *self.escalation_bridge.lock().recover_poison() = bridge;
     }
 
     async fn execute_external_child(
@@ -659,7 +660,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // approval time: by then `run()` may have cleared/overwritten it (a worker
         // serves runs sequentially), and re-proxying through a closed bridge
         // fail-closed denies. Capturing at spawn pins the right bridge per run.
-        let escalation = self.escalation_bridge.lock().unwrap().clone();
+        let escalation = self.escalation_bridge.lock().recover_poison().clone();
         let assignment = extract_assignment(session);
         let mut spec = self.build_spec(session, job);
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
