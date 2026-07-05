@@ -259,6 +259,23 @@ pub(super) async fn apply_tool_execution_outcome(
             display_preference: None,
             images: Vec::new(),
         });
+        // Preserve the per-tool task-progress accounting that the success path
+        // runs for every tool. An interactive tool that suspends (e.g.
+        // conclusion_with_options) must still record its call against the active
+        // task item — parity with the pre-Phase-B Completed+sniff path, which ran
+        // handle_successful_tool_result (→ track_task_progress) before the sniff
+        // suspended. The other success-path steps (taskwrite/workspace/goal/
+        // agentic) are tool-specific no-ops here, and suspend_for_pending_question
+        // already emits the ToolComplete event.
+        super::task::track_task_progress(
+            ctx.task_context,
+            ctx.event_tx,
+            ctx.session_id,
+            ctx.tool_call,
+            &display_result,
+            ctx.round,
+        )
+        .await;
         super::clarification::suspend_for_pending_question(
             ctx.tool_call,
             pending_question,
