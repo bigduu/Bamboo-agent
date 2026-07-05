@@ -11,26 +11,39 @@
 //! bamboo-memory does not depend on bamboo-storage (where the sibling
 //! `atomic_write` for session JSONL lives), so this is a self-contained local
 //! helper rather than a shared one — deliberately keeping the crate boundary.
+//! [`plan_store`](crate::plan_store) has a matching *synchronous* atomic writer
+//! for the plan artifacts; the two stay split because that path is sync and this
+//! one is async, but they share [`unique_temp_path`] so temp naming can't drift.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-/// A unique sibling temp path (`.<name>.<pid>.<nanos>.tmp`) so concurrent
-/// writers to the same target never collide on the temp file.
-fn unique_temp_path(path: &Path) -> PathBuf {
+/// Process-wide monotonic counter so two writers to the *same* target within a
+/// single clock tick still get distinct temp names — `nanos` alone can collide.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique sibling temp path (`.<name>.<pid>.<nanos>.<seq>.tmp`) so concurrent
+/// writers to the same target never collide on the temp file. Shared with
+/// [`crate::plan_store`] so both atomic writers name temps identically.
+pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("artifact");
-    path.with_file_name(format!(".{file_name}.{}.{nanos}.tmp", std::process::id()))
+    path.with_file_name(format!(
+        ".{file_name}.{}.{nanos}.{seq}.tmp",
+        std::process::id()
+    ))
 }
 
 /// Write `bytes` to `tmp` and fsync so the bytes are durable before any rename
@@ -90,6 +103,14 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Best-effort removal of every staged temp. Temps already renamed into place
+/// are gone, so `remove_file` is a harmless no-op for those.
+async fn cleanup_temps(staged: &[(PathBuf, PathBuf)]) {
+    for (tmp, _) in staged {
+        let _ = fs::remove_file(tmp).await;
+    }
+}
+
 /// Commit multiple derived files with *staged* atomicity: every temp is written
 /// and fsync'd FIRST, and only once all have staged successfully are they
 /// renamed into place. If staging any file fails (serialization was done by the
@@ -104,28 +125,32 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// per-file generation manifest would give strict cross-file atomicity but is
 /// over-engineering for indexes that are always rebuildable from the documents.
 pub(crate) async fn atomic_write_batch(writes: Vec<(PathBuf, Vec<u8>)>) -> io::Result<()> {
-    // Phase 1: stage every temp. On any failure, roll back all staged temps.
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(writes.len());
+
+    // Phase 1: stage every temp. On ANY failure, roll back all staged temps so a
+    // failed batch leaves neither corruption nor litter.
     for (path, bytes) in &writes {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
+            if let Err(err) = fs::create_dir_all(parent).await {
+                cleanup_temps(&staged).await;
+                return Err(err);
+            }
         }
         let tmp = unique_temp_path(path);
         if let Err(err) = write_and_sync(&tmp, bytes).await {
             let _ = fs::remove_file(&tmp).await;
-            for (staged_tmp, _) in &staged {
-                let _ = fs::remove_file(staged_tmp).await;
-            }
+            cleanup_temps(&staged).await;
             return Err(err);
         }
         staged.push((tmp, path.clone()));
     }
 
-    // Phase 2: publish. Renames of already-fsync'd temps are the only fallible
-    // step left, and each is atomic on Unix.
-    for (tmp, path) in &staged {
+    // Phase 2: publish. A rename of an already-fsync'd temp is the only fallible
+    // step left (atomic on Unix); if one fails, sweep the temps not yet renamed
+    // (already-renamed ones are gone, so cleanup skips them harmlessly).
+    for (idx, (tmp, path)) in staged.iter().enumerate() {
         if let Err(err) = atomic_rename(tmp, path).await {
-            let _ = fs::remove_file(tmp).await;
+            cleanup_temps(&staged[idx..]).await;
             return Err(err);
         }
     }
@@ -217,5 +242,26 @@ mod tests {
         assert_eq!(fs::read(&c).await.unwrap(), b"# c");
         assert!(temp_litter(a.parent().unwrap()).is_empty());
         assert!(temp_litter(c.parent().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn atomic_write_batch_failure_publishes_nothing_and_leaves_no_temp() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.json");
+        // A pre-existing regular file; the second batch entry's parent IS this
+        // file, so `create_dir_all` fails mid-batch after `first` has staged.
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, b"keep").await.unwrap();
+        let bad = blocker.join("child.json");
+
+        let result =
+            atomic_write_batch(vec![(first.clone(), b"1".to_vec()), (bad, b"2".to_vec())]).await;
+
+        assert!(result.is_err(), "staging under a file-parent must fail");
+        // Rollback: the first entry was staged but never published, and no temp
+        // is left behind; the pre-existing file is untouched.
+        assert!(!first.exists(), "a failed batch must publish nothing");
+        assert_eq!(fs::read(&blocker).await.unwrap(), b"keep");
+        assert!(temp_litter(dir.path()).is_empty());
     }
 }

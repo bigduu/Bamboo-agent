@@ -181,7 +181,7 @@ impl MemoryStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(&path, content).await?;
+        crate::atomic_fs::atomic_write(&path, content.as_bytes()).await?;
         self.persist_session_state(session_id).await?;
         Ok(path)
     }
@@ -2170,7 +2170,7 @@ impl MemoryStore {
                 }
                 if let Err(_error) = fs::rename(&legacy_single, &target).await {
                     let content = fs::read_to_string(&legacy_single).await?;
-                    fs::write(&target, content).await?;
+                    crate::atomic_fs::atomic_write(&target, content.as_bytes()).await?;
                     fs::remove_file(&legacy_single).await?;
                 }
             } else {
@@ -2188,7 +2188,7 @@ impl MemoryStore {
                         if !target.exists() {
                             if let Err(_error) = fs::rename(&path, &target).await {
                                 let content = fs::read_to_string(&path).await?;
-                                fs::write(&target, content).await?;
+                                crate::atomic_fs::atomic_write(&target, content.as_bytes()).await?;
                                 fs::remove_file(&path).await?;
                             }
                         } else {
@@ -2222,7 +2222,8 @@ impl MemoryStore {
         }
         self.ensure_scope_dirs(MemoryScope::Global, None).await?;
         let content = fs::read_to_string(&legacy).await?;
-        fs::write(&view_path, build_dream_view(Some(&content))).await?;
+        crate::atomic_fs::atomic_write(&view_path, build_dream_view(Some(&content)).as_bytes())
+            .await?;
         let _ = fs::remove_file(&legacy).await;
         Ok(())
     }
@@ -2278,7 +2279,7 @@ impl MemoryStore {
         };
         existing.push_str(&line);
         existing.push('\n');
-        fs::write(path, existing).await
+        crate::atomic_fs::atomic_write(&path, existing.as_bytes()).await
     }
 
     async fn write_json_file<T: serde::Serialize>(
@@ -2353,7 +2354,7 @@ impl MemoryStore {
             .resolver
             .views_dir(scope, project_key)
             .join(DREAM_VIEW_FILE);
-        fs::write(&path, build_dream_view(Some(content))).await?;
+        crate::atomic_fs::atomic_write(&path, build_dream_view(Some(content)).as_bytes()).await?;
         self.write_state_marker(
             scope,
             project_key,

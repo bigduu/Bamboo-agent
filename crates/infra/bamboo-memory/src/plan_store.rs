@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const PLAN_FILE_NAME: &str = "plan.md";
 const PLAN_STATE_FILE_NAME: &str = "state.json";
@@ -267,24 +266,12 @@ impl PlanStore {
         Ok(dir)
     }
 
-    fn unique_temp_path(path: &Path) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("artifact");
-        path.with_file_name(format!(".{file_name}.{nanos}.{}.tmp", std::process::id()))
-    }
-
     fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), PlanStoreError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let temp_path = Self::unique_temp_path(path);
+        let temp_path = crate::atomic_fs::unique_temp_path(path);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
