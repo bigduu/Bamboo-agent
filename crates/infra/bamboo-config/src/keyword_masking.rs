@@ -1,3 +1,4 @@
+use bamboo_domain::poison::PoisonRecover;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -131,7 +132,7 @@ impl KeywordMaskingConfig {
         // never blocks other threads.
         {
             let missing: Vec<&str> = {
-                let read = cache.read().unwrap_or_else(|e| e.into_inner());
+                let read = cache.read().recover_poison();
                 self.entries
                     .iter()
                     .filter(|entry| {
@@ -143,7 +144,7 @@ impl KeywordMaskingConfig {
                     .collect()
             };
             if !missing.is_empty() {
-                let mut write = cache.write().unwrap_or_else(|e| e.into_inner());
+                let mut write = cache.write().recover_poison();
                 for pattern in missing {
                     write
                         .entry(pattern.to_string())
@@ -155,7 +156,7 @@ impl KeywordMaskingConfig {
         // Apply masking, reusing the cached compiled regexes. Regex entries that
         // failed to compile are stored as `None` and fall through (no masking),
         // matching the previous per-call `if let Ok(regex) = ...` behavior.
-        let read = cache.read().unwrap_or_else(|e| e.into_inner());
+        let read = cache.read().recover_poison();
         for entry in &self.entries {
             if !entry.enabled {
                 continue;
