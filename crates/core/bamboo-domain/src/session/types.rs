@@ -580,7 +580,11 @@ impl Session {
     /// set, otherwise the per-process resolved-budget cache
     /// (`resolved_token_budget`). Both are `None` until the first resolution.
     /// Downstream readers should use this rather than `token_budget` directly so
-    /// they observe the engine-resolved budget without persisting it. (#180)
+    /// they observe the engine-resolved budget without persisting it. Note the
+    /// cache is returned regardless of which model it was resolved for; that is
+    /// safe because `resolve_token_budget` runs at round start (re-keying to the
+    /// current model) before any reader — don't call this expecting model-freshness
+    /// without a preceding same-round resolve. (#180)
     pub fn effective_token_budget(&self) -> Option<&TokenBudget> {
         self.token_budget
             .as_ref()
