@@ -10,7 +10,8 @@ pub(super) async fn resolve_token_budget(
     model_name: &str,
     llm: &dyn LLMProvider,
 ) -> TokenBudget {
-    // Priority: session override > config override > model defaults.
+    // Priority: session/child override > config override > per-process cache >
+    // freshly-resolved model defaults.
     if let Some(ref budget) = session.token_budget {
         tracing::debug!("Using session-specific token budget");
         return budget.clone();
@@ -19,6 +20,18 @@ pub(super) async fn resolve_token_budget(
     if let Some(ref budget) = config.token_budget {
         tracing::debug!("Using config token budget");
         return budget.clone();
+    }
+
+    // Per-process cache of a previous resolution, reused only when it was
+    // resolved for the SAME model. It is never persisted (`#[serde(skip)]`), so a
+    // reloaded session falls through and re-resolves from the current
+    // `model_limits.json`; a mid-session model switch also falls through because
+    // the cached model key no longer matches. (#180)
+    if let Some((cached_model, budget)) = session.resolved_token_budget.as_ref() {
+        if cached_model.as_str() == model_name {
+            tracing::debug!("Using cached resolved token budget for '{model_name}'");
+            return budget.clone();
+        }
     }
 
     // Default to model limits:
@@ -85,14 +98,15 @@ pub(super) async fn resolve_token_budget(
         model_limit.get_safety_margin(),
     );
 
-    // Cache the resolved budget on the session so every downstream reader of
-    // `session.token_budget` sees the real, model-limit-derived budget instead
-    // of `None` (issue #20 bug 1). Previously this value was only ever returned
-    // to the immediate caller, so `build_context_pressure` (tool-output
-    // truncation), the server context bar, and `estimate_context_compression_exposure`
-    // all fell back to a default/empty-registry budget. The session-override
-    // early-return above makes this a one-time resolution per session.
-    session.token_budget = Some(resolved.clone());
+    // Cache the resolved budget on the session (keyed by model) so every
+    // downstream reader — `build_context_pressure` (tool-output truncation), the
+    // server context bar, `estimate_context_compression_exposure` — sees the
+    // real, model-limit-derived budget via `Session::effective_token_budget`
+    // instead of `None` (issue #20 bug 1). Unlike the persisted `token_budget`
+    // override, this cache is `#[serde(skip)]`: a reloaded session re-resolves
+    // (picking up a `model_limits.json` edit) and a mid-session model switch
+    // invalidates it. (#180)
+    session.resolved_token_budget = Some((model_name.to_string(), resolved.clone()));
 
     resolved
 }
@@ -197,17 +211,18 @@ mod tests {
         assert!(registry.get("legacy-model").is_none());
     }
 
-    // Issue #20 bug 1: `resolve_token_budget` must cache the resolved budget on
-    // `session.token_budget`, otherwise every downstream reader
-    // (build_context_pressure, the server context bar,
-    // estimate_context_compression_exposure) sees `None` and silently falls back
-    // to a default/empty-registry budget.
+    // Issue #20 bug 1: `resolve_token_budget` must cache the resolved budget so
+    // every downstream reader (build_context_pressure, the server context bar,
+    // estimate_context_compression_exposure) observes it via
+    // `effective_token_budget` instead of `None`. Per #180 the cache lives in the
+    // non-persisted `resolved_token_budget` slot (keyed by model), NOT the
+    // persisted `token_budget` override slot.
     #[tokio::test]
     async fn resolve_token_budget_caches_resolved_budget_on_session() {
         let mut session = bamboo_agent_core::Session::new("budget-cache", "some-model");
         assert!(
-            session.token_budget.is_none(),
-            "precondition: a fresh session has no cached budget"
+            session.effective_token_budget().is_none(),
+            "precondition: a fresh session has no budget"
         );
 
         let config = AgentLoopConfig::default();
@@ -215,15 +230,70 @@ mod tests {
 
         let resolved = resolve_token_budget(&mut session, &config, "some-model", &provider).await;
 
-        // The function returns the resolved budget AND caches it on the session,
-        // so the two are identical and `session.token_budget` is no longer None.
-        let cached = session
-            .token_budget
+        // The persisted override slot stays empty; the cache holds the resolved
+        // budget keyed by model, and effective_token_budget surfaces it.
+        assert!(
+            session.token_budget.is_none(),
+            "the resolved cache must NOT populate the persisted override slot (#180)"
+        );
+        let (cached_model, cached) = session
+            .resolved_token_budget
             .clone()
             .expect("resolved budget must be cached on the session (#20 bug 1)");
+        assert_eq!(cached_model, "some-model");
         assert_eq!(cached.max_context_tokens, resolved.max_context_tokens);
         assert_eq!(cached.max_output_tokens, resolved.max_output_tokens);
         assert_eq!(cached.safety_margin, resolved.safety_margin);
+        assert_eq!(
+            session.effective_token_budget().unwrap().max_context_tokens,
+            resolved.max_context_tokens
+        );
+    }
+
+    // #180: the resolved cache is `#[serde(skip)]`, so it never persists. A
+    // reloaded long-lived session therefore starts with no cache and re-resolves
+    // from the current `model_limits.json` — the exact staleness #180 fixes.
+    #[tokio::test]
+    async fn resolved_token_budget_is_not_persisted() {
+        let mut session = bamboo_agent_core::Session::new("budget-persist", "some-model");
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+        let _ = resolve_token_budget(&mut session, &config, "some-model", &provider).await;
+        assert!(session.resolved_token_budget.is_some(), "cache populated");
+
+        let json = serde_json::to_string(&session).expect("serialize");
+        assert!(
+            !json.contains("resolved_token_budget"),
+            "the resolved cache must not be serialized (#180)"
+        );
+        let reloaded: bamboo_agent_core::Session =
+            serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            reloaded.resolved_token_budget.is_none(),
+            "a reloaded session must have no cached budget, so it re-resolves (#180)"
+        );
+    }
+
+    // #180: a mid-session model switch invalidates the cache (keyed by model), so
+    // the budget is re-resolved for the new model instead of reusing the first
+    // model's cached budget.
+    #[tokio::test]
+    async fn resolve_token_budget_reresolves_on_model_switch() {
+        let mut session = bamboo_agent_core::Session::new("budget-switch", "model-a");
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+
+        let _ = resolve_token_budget(&mut session, &config, "model-a", &provider).await;
+        assert_eq!(session.resolved_token_budget.as_ref().unwrap().0, "model-a");
+
+        // Switch the model: the cache key no longer matches, so it re-resolves and
+        // re-keys instead of short-circuiting on "model-a".
+        let _ = resolve_token_budget(&mut session, &config, "model-b", &provider).await;
+        assert_eq!(
+            session.resolved_token_budget.as_ref().unwrap().0,
+            "model-b",
+            "a model switch must re-resolve and re-key the cache (#180)"
+        );
     }
 
     // A budget already present on the session is the highest-priority source and

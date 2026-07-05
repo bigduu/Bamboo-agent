@@ -159,7 +159,7 @@ pub async fn create_child_action(
     // Child sessions get more aggressive compression: trigger at 70% instead
     // of the default 85%, target 35% instead of 40%. This prevents long child
     // tasks from exhausting the context window before the parent can intervene.
-    if let Some(ref parent_budget) = input.parent_session.token_budget {
+    if let Some(parent_budget) = input.parent_session.effective_token_budget() {
         let mut child_budget = parent_budget.clone();
         child_budget.compression_trigger_percent = 70;
         child_budget.compression_target_percent = 35;
