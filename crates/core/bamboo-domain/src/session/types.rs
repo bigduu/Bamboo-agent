@@ -528,6 +528,13 @@ pub struct Session {
     pub metadata: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<TokenBudget>,
+    /// Per-process cache of the model-limit-derived budget, keyed by the model it
+    /// was resolved for. Never persisted (`#[serde(skip)]`), so a reloaded session
+    /// re-resolves from the current `model_limits.json`, and a mid-session model
+    /// switch invalidates it (the key no longer matches). `token_budget` above
+    /// stays the persisted genuine/child override that takes priority. (#180)
+    #[serde(skip)]
+    pub resolved_token_budget: Option<(String, TokenBudget)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenBudgetUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,6 +576,17 @@ pub enum SessionKind {
 }
 
 impl Session {
+    /// The effective token budget: a genuine/child override (`token_budget`) if
+    /// set, otherwise the per-process resolved-budget cache
+    /// (`resolved_token_budget`). Both are `None` until the first resolution.
+    /// Downstream readers should use this rather than `token_budget` directly so
+    /// they observe the engine-resolved budget without persisting it. (#180)
+    pub fn effective_token_budget(&self) -> Option<&TokenBudget> {
+        self.token_budget
+            .as_ref()
+            .or_else(|| self.resolved_token_budget.as_ref().map(|(_, budget)| budget))
+    }
+
     pub fn new(id: impl Into<String>, model: impl Into<String>) -> Self {
         let now = Utc::now();
         let id = id.into();
@@ -592,6 +610,7 @@ impl Session {
             reasoning_effort: None,
             metadata: std::collections::HashMap::new(),
             token_budget: None,
+            resolved_token_budget: None,
             token_usage: None,
             conversation_summary: None,
             prompt_snapshot: None,
@@ -674,6 +693,7 @@ impl Session {
             reasoning_effort: None,
             metadata: std::collections::HashMap::new(),
             token_budget: None,
+            resolved_token_budget: None,
             token_usage: None,
             conversation_summary: None,
             prompt_snapshot: None,

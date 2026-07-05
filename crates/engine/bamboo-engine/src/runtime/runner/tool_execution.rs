@@ -15,7 +15,7 @@ use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
-    let budget = session.token_budget.as_ref()?;
+    let budget = session.effective_token_budget()?;
     let trigger = budget.compression_trigger_context_tokens();
     if trigger == 0 {
         return None;
@@ -153,8 +153,7 @@ async fn execute_and_apply_single_tool_call(
                 session_id,
                 outcome,
                 session
-                    .token_budget
-                    .as_ref()
+                    .effective_token_budget()
                     .map(|b| b.max_tool_output_tokens)
                     .unwrap_or(0),
                 build_context_pressure(session),
@@ -248,8 +247,7 @@ async fn execute_and_apply_single_tool_call(
         session_id,
         outcome,
         session
-            .token_budget
-            .as_ref()
+            .effective_token_budget()
             .map(|b| b.max_tool_output_tokens)
             .unwrap_or(0),
         build_context_pressure(session),
@@ -607,8 +605,7 @@ pub(crate) async fn execute_round_tool_calls(
 
             // Compress all outcomes in parallel before applying sequentially.
             let max_tool_tokens = session
-                .token_budget
-                .as_ref()
+                .effective_token_budget()
                 .map(|b| b.max_tool_output_tokens)
                 .unwrap_or(0);
             let pressure = build_context_pressure(session);

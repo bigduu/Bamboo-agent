@@ -121,7 +121,7 @@ pub fn estimate_context_compression_exposure(
     configured_budget: Option<&TokenBudget>,
 ) -> ContextCompressionExposure {
     // When a budget was already resolved upstream (the production path — see
-    // `resolve_token_budget`, which now also caches it on `session.token_budget`,
+    // `resolve_token_budget`, which caches it in `session.resolved_token_budget` (#180),
     // issue #20 bug 1), use it directly. Only when none is available do we fall
     // back to a model-derived budget. No `model_limits.json` registry is in
     // scope synchronously here, so this fallback resolves to the global default
