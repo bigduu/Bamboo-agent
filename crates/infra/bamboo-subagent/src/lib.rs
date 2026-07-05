@@ -17,6 +17,7 @@ pub mod error;
 pub mod executor;
 pub mod fleet;
 pub mod mailbox;
+pub(crate) mod poison;
 pub mod proto;
 pub mod provision;
 pub mod store;

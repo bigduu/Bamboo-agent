@@ -2,6 +2,8 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use bamboo_domain::poison::PoisonRecover;
+
 use actix_web::{
     body::{EitherBody, MessageBody},
     cookie::{time::Duration as CookieDuration, Cookie, SameSite},
@@ -918,7 +920,7 @@ impl PairingCodeGuard {
     /// Whether the code-redemption path is currently locked out. Clears an
     /// elapsed cooldown (and its failure count) as a side effect.
     pub fn in_cooldown(&self) -> bool {
-        let mut state = self.inner.lock().expect("pairing guard mutex poisoned");
+        let mut state = self.inner.lock().recover_poison();
         match state.cooldown_until {
             Some(until) if Instant::now() < until => true,
             Some(_) => {
@@ -934,7 +936,7 @@ impl PairingCodeGuard {
     /// Record a failed redemption. Returns `true` IFF this failure tripped the
     /// cooldown (so the caller can invalidate outstanding codes).
     pub fn record_failure(&self) -> bool {
-        let mut state = self.inner.lock().expect("pairing guard mutex poisoned");
+        let mut state = self.inner.lock().recover_poison();
         state.failures = state.failures.saturating_add(1);
         if state.failures >= PAIRING_FAILURE_THRESHOLD {
             state.cooldown_until = Some(Instant::now() + PAIRING_COOLDOWN);
@@ -946,7 +948,7 @@ impl PairingCodeGuard {
 
     /// Reset the guard after a successful redemption.
     pub fn record_success(&self) {
-        let mut state = self.inner.lock().expect("pairing guard mutex poisoned");
+        let mut state = self.inner.lock().recover_poison();
         state.failures = 0;
         state.cooldown_until = None;
     }

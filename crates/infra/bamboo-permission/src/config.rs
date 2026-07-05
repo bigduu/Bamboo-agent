@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use bamboo_domain::poison::PoisonRecover;
 use tracing::warn;
 
 use dashmap::DashMap;
@@ -662,12 +663,12 @@ impl PermissionConfig {
 
     /// Get the current permission mode
     pub fn mode(&self) -> PermissionMode {
-        *self.mode.read().expect("mode lock poisoned")
+        *self.mode.read().recover_poison()
     }
 
     /// Set the permission mode
     pub fn set_mode(&self, mode: PermissionMode) {
-        *self.mode.write().expect("mode lock poisoned") = mode;
+        *self.mode.write().recover_poison() = mode;
     }
 
     /// Get the minimum risk level that requires confirmation.
@@ -675,7 +676,7 @@ impl PermissionConfig {
         *self
             .confirm_threshold
             .read()
-            .expect("confirm_threshold lock poisoned")
+            .recover_poison()
     }
 
     /// Set the minimum risk level that requires confirmation.
@@ -687,7 +688,7 @@ impl PermissionConfig {
         *self
             .confirm_threshold
             .write()
-            .expect("confirm_threshold lock poisoned") = threshold;
+            .recover_poison() = threshold;
     }
 
     /// Replace the "always ask" rules from a list of pattern strings (e.g.
@@ -698,7 +699,7 @@ impl PermissionConfig {
             .into_iter()
             .map(|p| ParsedRule::parse(&p))
             .collect();
-        *self.ask_rules.write().expect("ask_rules lock poisoned") = parsed;
+        *self.ask_rules.write().recover_poison() = parsed;
     }
 
     /// The configured "always ask" rules rendered back to pattern strings, for
@@ -706,7 +707,7 @@ impl PermissionConfig {
     pub fn ask_rule_patterns(&self) -> Vec<String> {
         self.ask_rules
             .read()
-            .expect("ask_rules lock poisoned")
+            .recover_poison()
             .iter()
             .map(|rule| match &rule.pattern {
                 Some(pattern) => format!("{}({})", rule.tool_name, pattern),
@@ -735,7 +736,7 @@ impl PermissionConfig {
         // Configured "always ask" rules.
         self.ask_rules
             .read()
-            .expect("ask_rules lock poisoned")
+            .recover_poison()
             .iter()
             .any(|rule| rule.matches_tool_call(tool_name, args))
     }
@@ -957,17 +958,17 @@ impl PermissionConfig {
         let mut ask_rules = self
             .ask_rules
             .read()
-            .expect("ask_rules lock poisoned")
+            .recover_poison()
             .clone();
         ask_rules.extend(
             other
                 .ask_rules
                 .read()
-                .expect("ask_rules lock poisoned")
+                .recover_poison()
                 .iter()
                 .cloned(),
         );
-        *merged.ask_rules.write().expect("ask_rules lock poisoned") = ask_rules;
+        *merged.ask_rules.write().recover_poison() = ask_rules;
 
         merged
     }

@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
+use bamboo_domain::poison::PoisonRecover;
+
 use crate::execution::{
     create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
     ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
@@ -151,7 +153,7 @@ fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::
 /// ([`ChildCompletionCoordinator::bash_self_resume`]) — can never double-resume.
 /// The inner sync `Mutex` guards only the brief map lookup (no await inside).
 fn session_resume_lock(session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut map = parent_locks().lock().expect("parent lock map poisoned");
+    let mut map = parent_locks().lock().recover_poison();
     map.entry(session_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()

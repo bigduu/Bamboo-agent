@@ -19,6 +19,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use bamboo_agent_core::AgentEvent;
+use bamboo_domain::poison::PoisonRecover;
 use dashmap::DashSet;
 
 use crate::policy;
@@ -69,12 +70,12 @@ impl NotificationService {
             let prefs = self
                 .preferences
                 .read()
-                .expect("notification preferences lock poisoned");
+                .recover_poison();
             policy::classify(session_id, event, &prefs)?
         };
 
         {
-            let mut dedup = self.dedup.lock().expect("notification dedup lock poisoned");
+            let mut dedup = self.dedup.lock().recover_poison();
             if let Some(last) = dedup.get(&classified.dedup_key) {
                 if last.elapsed() < Self::DEDUP_WINDOW {
                     return None;
@@ -102,7 +103,7 @@ impl NotificationService {
     pub fn preferences(&self) -> NotificationPreferences {
         self.preferences
             .read()
-            .expect("notification preferences lock poisoned")
+            .recover_poison()
             .clone()
     }
 
@@ -115,7 +116,7 @@ impl NotificationService {
             let mut guard = self
                 .preferences
                 .write()
-                .expect("notification preferences lock poisoned");
+                .recover_poison();
             *guard = prefs.clone();
         }
         prefs.save(&self.prefs_path)

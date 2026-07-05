@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use crate::provider::{LLMError, LLMProvider};
 use crate::provider_factory::create_provider_by_name;
 use bamboo_config::Config;
+use bamboo_domain::poison::PoisonRecover;
 use bamboo_config::ProviderInstanceConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,12 +95,12 @@ impl ProviderRegistry {
         // Recover from a poisoned lock rather than panicking the whole process: a
         // poisoned guard's inner data is still usable, and panicking here would be a
         // permanent DoS on the critical path for every LLM call.
-        *self.providers.write().unwrap_or_else(|e| e.into_inner()) = providers;
-        *self.metadata.write().unwrap_or_else(|e| e.into_inner()) = metadata;
+        *self.providers.write().recover_poison() = providers;
+        *self.metadata.write().recover_poison() = metadata;
         *self
             .default_provider
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = default_provider;
+            .recover_poison() = default_provider;
         Ok(())
     }
 
@@ -279,7 +280,7 @@ impl ProviderRegistry {
     pub fn get(&self, name: &str) -> Option<Arc<dyn LLMProvider>> {
         self.providers
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .get(name)
             .cloned()
     }
@@ -287,7 +288,7 @@ impl ProviderRegistry {
     pub fn get_metadata(&self, name: &str) -> Option<ProviderMetadata> {
         self.metadata
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .get(name)
             .cloned()
     }
@@ -295,7 +296,7 @@ impl ProviderRegistry {
     pub fn provider_metadata(&self) -> Vec<ProviderMetadata> {
         self.metadata
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .values()
             .cloned()
             .collect()
@@ -311,7 +312,7 @@ impl ProviderRegistry {
     pub fn default_provider_name(&self) -> String {
         self.default_provider
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .clone()
     }
 
@@ -319,7 +320,7 @@ impl ProviderRegistry {
     pub fn provider_names(&self) -> Vec<String> {
         self.providers
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .keys()
             .cloned()
             .collect()
@@ -329,7 +330,7 @@ impl ProviderRegistry {
     pub fn len(&self) -> usize {
         self.providers
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .len()
     }
 
@@ -337,7 +338,7 @@ impl ProviderRegistry {
     pub fn is_empty(&self) -> bool {
         self.providers
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .is_empty()
     }
 
@@ -345,11 +346,11 @@ impl ProviderRegistry {
     pub fn insert(&self, key: String, provider: Arc<dyn LLMProvider>) {
         self.providers
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .insert(key.clone(), provider);
         self.metadata
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .insert(
                 key.clone(),
                 ProviderMetadata {
@@ -364,11 +365,11 @@ impl ProviderRegistry {
     pub fn remove(&self, key: &str) -> Option<Arc<dyn LLMProvider>> {
         self.metadata
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .remove(key);
         self.providers
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .recover_poison()
             .remove(key)
     }
 
@@ -377,7 +378,7 @@ impl ProviderRegistry {
         *self
             .default_provider
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = key;
+            .recover_poison() = key;
     }
 }
 

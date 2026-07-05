@@ -25,6 +25,7 @@ use tokio_tungstenite::{accept_async, accept_hdr_async, connect_async, MaybeTlsS
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::poison::PoisonRecover;
 use crate::executor::{ChildExecutor, EventSink, HostBridge, HostRequestKind, SteerInbox};
 use crate::proto::{ChildFrame, ParentFrame, RunSpec};
 
@@ -425,7 +426,7 @@ where
                 // {"approved": bool}); a worker that proxied an `ApprovalRequest`
                 // awaits its oneshot here.
                 Ok(ParentFrame::ApprovalReply { id, approved }) => {
-                    if let Some(reply) = pending.lock().expect("pending lock").remove(&id) {
+                    if let Some(reply) = pending.lock().recover_poison().remove(&id) {
                         let _ = reply.send(serde_json::json!({ "approved": approved }));
                     }
                 }
@@ -532,7 +533,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
             let id = format!("sa-{}", Uuid::new_v4());
             pending_for_pump
                 .lock()
-                .expect("pending lock")
+                .recover_poison()
                 .insert(id.clone(), req.reply);
             let frame = match req.kind {
                 HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },

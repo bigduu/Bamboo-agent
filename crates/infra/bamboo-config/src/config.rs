@@ -48,6 +48,7 @@
 //! - `BAMBOO_HEADLESS`: Enable headless authentication mode
 
 use anyhow::{Context, Result};
+use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1945,13 +1946,13 @@ impl Config {
         let map = self.env_vars_as_map();
         let mut env_guard = env_vars_cache()
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .recover_poison();
         *env_guard = map;
 
         let prompt_safe = self.prompt_safe_env_vars();
         let mut prompt_guard = prompt_safe_env_vars_cache()
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .recover_poison();
         *prompt_guard = prompt_safe;
     }
 
@@ -1959,7 +1960,7 @@ impl Config {
     pub fn current_env_vars() -> HashMap<String, String> {
         env_vars_cache()
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recover_poison()
             .clone()
     }
 
@@ -1967,7 +1968,7 @@ impl Config {
     pub fn current_prompt_safe_env_vars() -> Vec<PromptSafeEnvVarEntry> {
         prompt_safe_env_vars_cache()
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recover_poison()
             .clone()
     }
 

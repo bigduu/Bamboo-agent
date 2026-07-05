@@ -1,4 +1,5 @@
 use super::{CachedWorkflow, WorkflowDefinition, WorkflowLoadError, WorkflowLoader};
+use bamboo_domain::poison::PoisonRecover;
 use serde_yaml::{Mapping, Value};
 use std::fs;
 use std::path::Path;
@@ -18,7 +19,7 @@ pub(super) fn load_from_file(
     let cache = loader
         .cache
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .recover_poison();
     if let Some(cached) = cache.get(path) {
         if cached.modified == modified {
             return Ok(cached.definition.clone());
@@ -37,7 +38,7 @@ pub(super) fn load_from_file(
     let mut cache = loader
         .cache
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .recover_poison();
     cache.insert(
         path.to_path_buf(),
         CachedWorkflow {
