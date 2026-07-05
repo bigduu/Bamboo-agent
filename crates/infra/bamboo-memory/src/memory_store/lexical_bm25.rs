@@ -218,10 +218,12 @@ impl Bm25Corpus {
         if matches!(doc.status, DurableMemoryStatus::Stale) {
             score *= STALE_MULTIPLIER;
         }
-        // Return the raw BM25 score (deterministic f64). No coarse rounding: BM25
-        // deltas between close docs can live past the 2nd decimal, and the score is
-        // only used for ordering, so finer precision gives a better tie-break.
-        Some(score)
+        // Round to 3 decimals: fine enough to keep genuinely-different relevance
+        // apart, but coarse enough that near-equal-relevance docs re-cluster into an
+        // exact-score tie — so the #61 cache-stable granularity tie-break in
+        // `sort_recall_candidates` still fires and the recalled block stays stable
+        // across repeated calls (BM25's raw f64 rarely ties on its own).
+        Some((score * 1000.0).round() / 1000.0)
     }
 }
 
@@ -399,5 +401,31 @@ mod tests {
         assert!(corpus.score(0, &q).is_none());
         assert!(corpus.score(1, &q).is_none());
         assert!(corpus.score(2, &q).is_none());
+    }
+
+    #[test]
+    fn chinese_recall_works_from_title_and_summary_without_chinese_keywords() {
+        // Production reality: the write-path extract_keywords/detect_entities are
+        // ASCII-only, so a real lexical.json carries NO Chinese keywords/entities —
+        // Chinese recall must ride on title + summary alone. Verify it still works.
+        let mut zh = item("zh", DurableMemoryStatus::Active, "多租户隔离设计", &[]);
+        zh.summary = "外层编排每租户一实例的方案".to_string();
+        let other = item(
+            "en",
+            DurableMemoryStatus::Active,
+            "cache architecture",
+            &["cache"],
+        );
+        let corpus = Bm25Corpus::build(&[zh, other]);
+
+        assert!(
+            corpus.score(0, &tokenize("多租户")).is_some(),
+            "title-only Chinese match"
+        );
+        assert!(
+            corpus.score(0, &tokenize("每租户")).is_some(),
+            "summary-only Chinese match"
+        );
+        assert!(corpus.score(1, &tokenize("多租户")).is_none());
     }
 }
