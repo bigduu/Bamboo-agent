@@ -212,6 +212,7 @@ mod tests {
             on_tool_approval: false,
             on_context_pressure: true,
             on_subagent_complete: false,
+            on_background_task_complete: true,
         };
         svc.set_preferences(updated.clone()).unwrap();
         assert_eq!(svc.preferences(), updated);

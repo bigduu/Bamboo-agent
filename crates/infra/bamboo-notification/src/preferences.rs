@@ -37,6 +37,9 @@ pub struct NotificationPreferences {
     /// Notify when a background sub-agent task completes.
     #[serde(default = "default_true")]
     pub on_subagent_complete: bool,
+    /// Notify when a background shell/command (Bash `run_in_background`) finishes.
+    #[serde(default = "default_true")]
+    pub on_background_task_complete: bool,
 }
 
 impl Default for NotificationPreferences {
@@ -47,6 +50,7 @@ impl Default for NotificationPreferences {
             on_tool_approval: true,
             on_context_pressure: true,
             on_subagent_complete: true,
+            on_background_task_complete: true,
         }
     }
 }
@@ -115,6 +119,7 @@ mod tests {
             on_tool_approval: true,
             on_context_pressure: false,
             on_subagent_complete: true,
+            on_background_task_complete: false,
         };
         prefs.save(&path).unwrap();
         let loaded = NotificationPreferences::load(&path);
