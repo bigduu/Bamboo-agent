@@ -14,6 +14,9 @@ use crate::preferences::NotificationPreferences;
 /// Maximum body length for a clarification notification, in characters.
 const CLARIFICATION_BODY_MAX: usize = 120;
 
+/// Maximum body length for a background-task-completed notification, in characters.
+const BACKGROUND_TASK_BODY_MAX: usize = 120;
+
 /// The kind of user-facing notification a classified event maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationCategory {
@@ -25,6 +28,8 @@ pub enum NotificationCategory {
     ContextCritical,
     /// A background sub-agent task has completed.
     SubagentCompleted,
+    /// A background shell/command (Bash `run_in_background`) has finished.
+    BackgroundTaskCompleted,
 }
 
 impl NotificationCategory {
@@ -35,6 +40,7 @@ impl NotificationCategory {
             NotificationCategory::NeedsClarification => "needs_clarification",
             NotificationCategory::ContextCritical => "context_critical",
             NotificationCategory::SubagentCompleted => "subagent_completed",
+            NotificationCategory::BackgroundTaskCompleted => "background_task_completed",
         }
     }
 }
@@ -185,6 +191,40 @@ pub fn classify(
             })
         }
 
+        AgentEvent::BashCompleted {
+            bash_id,
+            command,
+            exit_code,
+            status,
+        } => {
+            // A killed shell was terminated by the user (KillShell) — they already
+            // know; don't ping. Notify when a background command reaches a terminal
+            // state on its own ("completed" — any exit code — or an internal
+            // "error").
+            if status == "killed" {
+                return None;
+            }
+            if !prefs.on_background_task_complete {
+                return None;
+            }
+            let exit = match exit_code {
+                Some(code) => format!("exit {code}"),
+                None => "no exit code".to_string(),
+            };
+            Some(ClassifiedNotification {
+                category: NotificationCategory::BackgroundTaskCompleted,
+                priority: NotificationPriority::Normal,
+                title: "Background command finished".to_string(),
+                // Dedup by the shell id: the live `BashCompleted` fires once, but
+                // key on `bash_id` (not session) so distinct shells each notify.
+                body: truncate(
+                    &format!("{command} — {status}, {exit}"),
+                    BACKGROUND_TASK_BODY_MAX,
+                ),
+                dedup_key: format!("bash:{bash_id}"),
+            })
+        }
+
         _ => None,
     }
 }
@@ -217,6 +257,15 @@ mod tests {
             child_session_id: "child-1".to_string(),
             status: status.to_string(),
             error: None,
+        }
+    }
+
+    fn bash(bash_id: &str, status: &str, exit_code: Option<i32>) -> AgentEvent {
+        AgentEvent::BashCompleted {
+            bash_id: bash_id.to_string(),
+            command: "npm run build".to_string(),
+            exit_code,
+            status: status.to_string(),
         }
     }
 
@@ -333,6 +382,49 @@ mod tests {
     }
 
     #[test]
+    fn bash_completed_fires_and_dedups_by_bash_id() {
+        let prefs = NotificationPreferences::default();
+        let result = classify("sess", &bash("sh-9", "completed", Some(0)), &prefs).unwrap();
+        assert_eq!(
+            result.category,
+            NotificationCategory::BackgroundTaskCompleted
+        );
+        assert_eq!(result.priority, NotificationPriority::Normal);
+        assert_eq!(result.title, "Background command finished");
+        assert!(result.body.contains("npm run build"));
+        assert!(result.body.contains("exit 0"));
+        // Keyed on bash_id (not session), so distinct shells each notify.
+        assert_eq!(result.dedup_key, "bash:sh-9");
+    }
+
+    #[test]
+    fn bash_error_status_still_fires() {
+        let prefs = NotificationPreferences::default();
+        let result = classify("sess", &bash("sh-e", "error", None), &prefs).unwrap();
+        assert_eq!(
+            result.category,
+            NotificationCategory::BackgroundTaskCompleted
+        );
+        assert!(result.body.contains("no exit code"));
+    }
+
+    #[test]
+    fn bash_killed_is_none() {
+        // A user-killed shell must not ping (the user initiated the kill).
+        let prefs = NotificationPreferences::default();
+        assert!(classify("sess", &bash("sh-k", "killed", None), &prefs).is_none());
+    }
+
+    #[test]
+    fn bash_gated_by_on_background_task_complete() {
+        let prefs = NotificationPreferences {
+            on_background_task_complete: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify("sess", &bash("sh-1", "completed", Some(0)), &prefs).is_none());
+    }
+
+    #[test]
     fn master_switch_off_yields_none() {
         let prefs = NotificationPreferences {
             enabled: false,
@@ -341,6 +433,7 @@ mod tests {
         assert!(classify("sess", &context("critical"), &prefs).is_none());
         assert!(classify("sess", &subagent("completed"), &prefs).is_none());
         assert!(classify("sess", &clarification("q", None), &prefs).is_none());
+        assert!(classify("sess", &bash("sh-1", "completed", Some(0)), &prefs).is_none());
     }
 
     #[test]
