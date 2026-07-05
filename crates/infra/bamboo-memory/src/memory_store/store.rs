@@ -3553,6 +3553,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chinese_query_scope_matches_only_the_chinese_memory() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "多租户隔离设计",
+                "外层编排每租户一实例,数据按文件夹隔离。",
+                &[],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Release freeze checklist",
+                "Generic release freeze checklist for shipping work.",
+                &[],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Before #242 a Chinese query produced zero tokens and hit the
+        // `return Some(1.0)` path → matched EVERY doc (matched_count == 2). Now it
+        // tokenizes CJK-aware and matches only the Chinese memory.
+        let result = store
+            .query_scope(
+                MemoryScope::Project,
+                Some("proj-1"),
+                Some("多租户"),
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(10),
+                    max_chars: Some(5000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.matched_count, 1,
+            "a distinctly-Chinese query must match only the Chinese memory, not everything"
+        );
+    }
+
+    #[tokio::test]
     async fn query_scope_reports_cursor_and_truncation_across_multiple_matches() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
