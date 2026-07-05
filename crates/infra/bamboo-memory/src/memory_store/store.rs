@@ -48,6 +48,19 @@ const MAX_DURABLE_MEMORY_BODY_CHARS: usize = 4000;
 const MEMORY_SECTION_SEPARATOR: &str = "\n\n---\n\n";
 
 /// Projected body length (chars) after appending `content` to `body` with the
+/// Serialize `value` to pretty JSON bytes, mapping a serialization failure onto
+/// an `io::Error` so callers stay on `io::Result`. Shared by the single-file
+/// [`MemoryStore::write_json_file`] and the batched refresh so both encode
+/// artifacts identically.
+fn json_pretty_bytes<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(value).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize json: {error}"),
+        )
+    })
+}
+
 /// section separator. Mirrors the real append, which trims trailing whitespace
 /// first, so the structural blob guard estimates exactly, not conservatively.
 fn projected_merged_body_chars(body: &str, content: &str) -> usize {
@@ -168,7 +181,7 @@ impl MemoryStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(&path, content).await?;
+        crate::atomic_fs::atomic_write(&path, content.as_bytes()).await?;
         self.persist_session_state(session_id).await?;
         Ok(path)
     }
@@ -1896,7 +1909,9 @@ impl MemoryStore {
             fs::create_dir_all(parent).await?;
         }
         let rendered = render_markdown_document(&doc.frontmatter, &doc.body)?;
-        fs::write(&doc.path, rendered).await
+        // Atomic write so a crash mid-write can never truncate/corrupt a user
+        // memory document (#166, the worst-impact case from #35).
+        crate::atomic_fs::atomic_write(&doc.path, rendered.as_bytes()).await
     }
 
     async fn allocate_memory_id(
@@ -1931,6 +1946,17 @@ impl MemoryStore {
         let docs = self.list_memory_documents(scope, project_key).await?;
         let now = now_rfc3339();
 
+        let indexes_dir = self.resolver.indexes_dir(scope, project_key);
+        let views_dir = self.resolver.views_dir(scope, project_key);
+        let state_dir = self.resolver.state_dir(scope, project_key);
+
+        // Every artifact below is fully derived from `docs`. Stage them all, then
+        // commit together (all temps written+fsync'd first, then renamed) so a
+        // crash mid-refresh can't leave the index set half-updated and mutually
+        // inconsistent — each file stays individually complete and the set is
+        // regenerated on the next refresh (#166 item 2).
+        let mut artifacts: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+
         let lexical = LexicalIndex {
             generated_at: now.clone(),
             items: docs
@@ -1952,13 +1978,10 @@ impl MemoryStore {
                 })
                 .collect(),
         };
-        self.write_json_file(
-            self.resolver
-                .indexes_dir(scope, project_key)
-                .join(LEXICAL_INDEX_FILE),
-            &lexical,
-        )
-        .await?;
+        artifacts.push((
+            indexes_dir.join(LEXICAL_INDEX_FILE),
+            json_pretty_bytes(&lexical)?,
+        ));
 
         let recent = RecentIndex {
             generated_at: now.clone(),
@@ -1974,13 +1997,10 @@ impl MemoryStore {
                 })
                 .collect(),
         };
-        self.write_json_file(
-            self.resolver
-                .indexes_dir(scope, project_key)
-                .join(RECENT_INDEX_FILE),
-            &recent,
-        )
-        .await?;
+        artifacts.push((
+            indexes_dir.join(RECENT_INDEX_FILE),
+            json_pretty_bytes(&recent)?,
+        ));
 
         let graph = GraphIndex {
             generated_at: now.clone(),
@@ -1994,13 +2014,10 @@ impl MemoryStore {
                 })
                 .collect(),
         };
-        self.write_json_file(
-            self.resolver
-                .indexes_dir(scope, project_key)
-                .join(GRAPH_INDEX_FILE),
-            &graph,
-        )
-        .await?;
+        artifacts.push((
+            indexes_dir.join(GRAPH_INDEX_FILE),
+            json_pretty_bytes(&graph)?,
+        ));
 
         let stale = StaleCandidatesIndex {
             generated_at: now.clone(),
@@ -2016,13 +2033,10 @@ impl MemoryStore {
                 })
                 .collect(),
         };
-        self.write_json_file(
-            self.resolver
-                .indexes_dir(scope, project_key)
-                .join(STALE_CANDIDATES_INDEX_FILE),
-            &stale,
-        )
-        .await?;
+        artifacts.push((
+            indexes_dir.join(STALE_CANDIDATES_INDEX_FILE),
+            json_pretty_bytes(&stale)?,
+        ));
 
         let mut by_type = BTreeMap::new();
         let mut by_status = BTreeMap::new();
@@ -2045,52 +2059,40 @@ impl MemoryStore {
             by_scope,
             total: docs.len(),
         };
-        self.write_json_file(
-            self.resolver
-                .indexes_dir(scope, project_key)
-                .join(TAXONOMY_INDEX_FILE),
-            &taxonomy,
-        )
-        .await?;
+        artifacts.push((
+            indexes_dir.join(TAXONOMY_INDEX_FILE),
+            json_pretty_bytes(&taxonomy)?,
+        ));
 
-        let views_dir = self.resolver.views_dir(scope, project_key);
-        fs::create_dir_all(&views_dir).await?;
-        fs::write(
+        artifacts.push((
             views_dir.join(MEMORY_VIEW_FILE),
-            build_memory_markdown_view(scope, project_key, &docs),
-        )
-        .await?;
-        fs::write(
+            build_memory_markdown_view(scope, project_key, &docs).into_bytes(),
+        ));
+        artifacts.push((
             views_dir.join(RECENT_VIEW_FILE),
-            build_recent_markdown_view(&docs),
-        )
-        .await?;
-        fs::write(
+            build_recent_markdown_view(&docs).into_bytes(),
+        ));
+        artifacts.push((
             views_dir.join(STALE_VIEW_FILE),
-            build_stale_markdown_view(&docs),
-        )
-        .await?;
+            build_stale_markdown_view(&docs).into_bytes(),
+        ));
+        // The dream view is user-authored after its first seed, so stage it only
+        // when absent — never overwrite an existing one.
         let dream_path = views_dir.join(DREAM_VIEW_FILE);
         if !dream_path.exists() {
-            fs::write(&dream_path, build_dream_view(None)).await?;
+            artifacts.push((dream_path, build_dream_view(None).into_bytes()));
         }
 
-        self.write_json_file(
-            self.resolver
-                .state_dir(scope, project_key)
-                .join("schema_version.json"),
-            &serde_json::json!({ "version": super::MEMORY_SCHEMA_VERSION }),
-        )
-        .await?;
-        self.write_json_file(
-            self.resolver
-                .state_dir(scope, project_key)
-                .join("last_reindex.json"),
-            &serde_json::json!({ "updated_at": now, "count": docs.len() }),
-        )
-        .await?;
+        artifacts.push((
+            state_dir.join("schema_version.json"),
+            json_pretty_bytes(&serde_json::json!({ "version": super::MEMORY_SCHEMA_VERSION }))?,
+        ));
+        artifacts.push((
+            state_dir.join("last_reindex.json"),
+            json_pretty_bytes(&serde_json::json!({ "updated_at": now, "count": docs.len() }))?,
+        ));
 
-        Ok(())
+        crate::atomic_fs::atomic_write_batch(artifacts).await
     }
 
     async fn ensure_scope_dirs(
@@ -2168,7 +2170,7 @@ impl MemoryStore {
                 }
                 if let Err(_error) = fs::rename(&legacy_single, &target).await {
                     let content = fs::read_to_string(&legacy_single).await?;
-                    fs::write(&target, content).await?;
+                    crate::atomic_fs::atomic_write(&target, content.as_bytes()).await?;
                     fs::remove_file(&legacy_single).await?;
                 }
             } else {
@@ -2186,7 +2188,7 @@ impl MemoryStore {
                         if !target.exists() {
                             if let Err(_error) = fs::rename(&path, &target).await {
                                 let content = fs::read_to_string(&path).await?;
-                                fs::write(&target, content).await?;
+                                crate::atomic_fs::atomic_write(&target, content.as_bytes()).await?;
                                 fs::remove_file(&path).await?;
                             }
                         } else {
@@ -2220,7 +2222,8 @@ impl MemoryStore {
         }
         self.ensure_scope_dirs(MemoryScope::Global, None).await?;
         let content = fs::read_to_string(&legacy).await?;
-        fs::write(&view_path, build_dream_view(Some(&content))).await?;
+        crate::atomic_fs::atomic_write(&view_path, build_dream_view(Some(&content)).as_bytes())
+            .await?;
         let _ = fs::remove_file(&legacy).await;
         Ok(())
     }
@@ -2276,7 +2279,7 @@ impl MemoryStore {
         };
         existing.push_str(&line);
         existing.push('\n');
-        fs::write(path, existing).await
+        crate::atomic_fs::atomic_write(&path, existing.as_bytes()).await
     }
 
     async fn write_json_file<T: serde::Serialize>(
@@ -2284,16 +2287,8 @@ impl MemoryStore {
         path: PathBuf,
         value: &T,
     ) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let data = serde_json::to_vec_pretty(value).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to serialize json: {error}"),
-            )
-        })?;
-        fs::write(path, data).await
+        let data = json_pretty_bytes(value)?;
+        crate::atomic_fs::atomic_write(&path, &data).await
     }
 
     async fn read_optional_trimmed_text_file(&self, path: PathBuf) -> io::Result<Option<String>> {
@@ -2359,7 +2354,7 @@ impl MemoryStore {
             .resolver
             .views_dir(scope, project_key)
             .join(DREAM_VIEW_FILE);
-        fs::write(&path, build_dream_view(Some(content))).await?;
+        crate::atomic_fs::atomic_write(&path, build_dream_view(Some(content)).as_bytes()).await?;
         self.write_state_marker(
             scope,
             project_key,
