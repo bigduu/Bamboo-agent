@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod freshness;
+mod lexical_bm25;
 pub mod paths;
 pub mod recall;
 pub mod store;

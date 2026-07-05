@@ -10,10 +10,7 @@ use bamboo_agent_core::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
 
-use super::{
-    extract_keywords, parse_rfc3339, DurableMemoryStatus, LexicalIndexItem, MemoryScope,
-    MemoryStore, TemporalGranularity,
-};
+use super::{parse_rfc3339, DurableMemoryStatus, MemoryScope, MemoryStore, TemporalGranularity};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRecallCandidate {
@@ -209,15 +206,20 @@ async fn shortlist_scope(
         return Ok(Vec::new());
     };
 
-    let query_tokens = extract_keywords(query, "", &[]);
+    let query_tokens = super::lexical_bm25::tokenize(query);
     if query_tokens.is_empty() {
         return Ok(Vec::new());
     }
 
+    // BM25(F) over the loaded lexical index: corpus stats (df, avgdl) are computed
+    // once, then each doc is scored in O(query terms). CJK-aware tokenization makes
+    // the bilingual library searchable — the previous tokenizer dropped all Chinese.
+    let corpus = super::lexical_bm25::Bm25Corpus::build(&index.items);
     let mut candidates = index
         .items
         .iter()
-        .filter_map(|item| score_lexical_index_item(item, &query_tokens).map(|score| (item, score)))
+        .enumerate()
+        .filter_map(|(i, item)| corpus.score(i, &query_tokens).map(|score| (item, score)))
         .map(|(item, score)| MemoryRecallCandidate {
             id: item.id.clone(),
             title: item.title.clone(),
@@ -233,73 +235,6 @@ async fn shortlist_scope(
 
     sort_recall_candidates(&mut candidates);
     Ok(candidates)
-}
-
-fn score_lexical_index_item(item: &LexicalIndexItem, query_tokens: &[String]) -> Option<f64> {
-    match item.status {
-        DurableMemoryStatus::Superseded
-        | DurableMemoryStatus::Contradicted
-        | DurableMemoryStatus::Archived => return None,
-        DurableMemoryStatus::Active | DurableMemoryStatus::Stale => {}
-    }
-
-    let title = item.title.to_ascii_lowercase();
-    let summary = item.summary.to_ascii_lowercase();
-
-    let mut score = 0.0;
-    let mut matched_any = false;
-
-    for token in query_tokens {
-        let mut token_score = 0.0;
-        if title.contains(token) {
-            token_score += 3.0;
-        }
-        if item
-            .keywords
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(token))
-        {
-            token_score += 2.5;
-        }
-        if item
-            .tags
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(token))
-        {
-            token_score += 2.0;
-        }
-        if item
-            .entities
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(token))
-        {
-            token_score += 1.5;
-        }
-        if summary.contains(token) {
-            token_score += 1.0;
-        }
-        if token_score > 0.0 {
-            matched_any = true;
-            score += token_score;
-        }
-    }
-
-    if !matched_any {
-        return None;
-    }
-
-    score += lexical_status_adjustment(item.status);
-    Some((score / query_tokens.len() as f64 * 100.0).round() / 100.0)
-}
-
-fn lexical_status_adjustment(status: DurableMemoryStatus) -> f64 {
-    match status {
-        DurableMemoryStatus::Active => 0.0,
-        DurableMemoryStatus::Stale => -0.75,
-        DurableMemoryStatus::Superseded
-        | DurableMemoryStatus::Contradicted
-        | DurableMemoryStatus::Archived => -10.0,
-    }
 }
 
 fn sort_recall_candidates(candidates: &mut [MemoryRecallCandidate]) {
@@ -540,34 +475,6 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    #[allow(clippy::too_many_arguments)]
-    fn item(
-        id: &str,
-        title: &str,
-        status: DurableMemoryStatus,
-        updated_at: &str,
-        keywords: &[&str],
-        tags: &[&str],
-        entities: &[&str],
-        summary: &str,
-    ) -> LexicalIndexItem {
-        LexicalIndexItem {
-            id: id.to_string(),
-            title: title.to_string(),
-            scope: MemoryScope::Project,
-            project_key: Some("proj-1".to_string()),
-            r#type: DurableMemoryType::Project,
-            status,
-            tags: tags.iter().map(|v| v.to_string()).collect(),
-            keywords: keywords.iter().map(|v| v.to_string()).collect(),
-            entities: entities.iter().map(|v| v.to_string()).collect(),
-            updated_at: updated_at.to_string(),
-            created_at: updated_at.to_string(),
-            summary: summary.to_string(),
-            granularity: None,
-        }
-    }
-
     #[derive(Clone)]
     struct StaticResponseProvider {
         response: String,
@@ -648,92 +555,6 @@ mod tests {
         ];
         sort_recall_candidates(&mut candidates);
         assert_eq!(candidates[0].id, "day-high");
-    }
-
-    #[test]
-    fn title_matches_outrank_keyword_only_matches() {
-        let query_tokens = vec!["release".to_string(), "freeze".to_string()];
-        let title_item = item(
-            "a",
-            "Release freeze decision",
-            DurableMemoryStatus::Active,
-            "2026-04-09T00:00:00Z",
-            &[],
-            &[],
-            &[],
-            "summary",
-        );
-        let keyword_item = item(
-            "b",
-            "Deployment decision",
-            DurableMemoryStatus::Active,
-            "2026-04-09T00:00:00Z",
-            &["release", "freeze"],
-            &[],
-            &[],
-            "summary",
-        );
-
-        let title_score = score_lexical_index_item(&title_item, &query_tokens).unwrap();
-        let keyword_score = score_lexical_index_item(&keyword_item, &query_tokens).unwrap();
-        assert!(title_score > keyword_score);
-    }
-
-    #[test]
-    fn active_items_outrank_stale_items() {
-        let query_tokens = vec!["release".to_string()];
-        let active = item(
-            "a",
-            "Release freeze decision",
-            DurableMemoryStatus::Active,
-            "2026-04-09T00:00:00Z",
-            &[],
-            &[],
-            &[],
-            "summary",
-        );
-        let stale = item(
-            "b",
-            "Release freeze decision",
-            DurableMemoryStatus::Stale,
-            "2026-04-10T00:00:00Z",
-            &[],
-            &[],
-            &[],
-            "summary",
-        );
-
-        let active_score = score_lexical_index_item(&active, &query_tokens).unwrap();
-        let stale_score = score_lexical_index_item(&stale, &query_tokens).unwrap();
-        assert!(active_score > stale_score);
-    }
-
-    #[test]
-    fn contradicted_and_archived_items_are_filtered_out() {
-        let query_tokens = vec!["release".to_string()];
-        let contradicted = item(
-            "a",
-            "Release freeze decision",
-            DurableMemoryStatus::Contradicted,
-            "2026-04-09T00:00:00Z",
-            &[],
-            &[],
-            &[],
-            "summary",
-        );
-        let archived = item(
-            "b",
-            "Release freeze decision",
-            DurableMemoryStatus::Archived,
-            "2026-04-09T00:00:00Z",
-            &[],
-            &[],
-            &[],
-            "summary",
-        );
-
-        assert!(score_lexical_index_item(&contradicted, &query_tokens).is_none());
-        assert!(score_lexical_index_item(&archived, &query_tokens).is_none());
     }
 
     #[test]
@@ -1030,8 +851,29 @@ mod tests {
 
         assert_eq!(selection.strategy, MemoryRecallStrategy::RerankFallback);
         assert_eq!(selection.candidates.len(), 2);
-        assert_eq!(selection.candidates[0].id, lexical_first.frontmatter.id);
-        assert_eq!(selection.candidates[1].id, lexical_second.frontmatter.id);
+        // The fallback contract is "return the lexical shortlist in its own order",
+        // NOT any hard-coded doc order — verify it matches the pure lexical shortlist
+        // (which BM25 orders by relevance) and preserves both durable memories.
+        let lexical = shortlist_relevant_memories(
+            &store,
+            Some("proj-1"),
+            "release freeze for mobile",
+            &MemoryRecallOptions {
+                shortlist_limit: 2,
+                include_global_fallback: false,
+                max_candidates_per_scope: 12,
+            },
+        )
+        .await
+        .unwrap();
+        let fallback_ids: Vec<&str> = selection.candidates.iter().map(|c| c.id.as_str()).collect();
+        let lexical_ids: Vec<&str> = lexical.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            fallback_ids, lexical_ids,
+            "fallback must preserve lexical order"
+        );
+        assert!(fallback_ids.contains(&lexical_first.frontmatter.id.as_str()));
+        assert!(fallback_ids.contains(&lexical_second.frontmatter.id.as_str()));
     }
 
     #[tokio::test]
