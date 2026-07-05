@@ -26,10 +26,6 @@ use crate::runtime::config::{
     AgentLoopConfig, AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig,
     GuardianConfig, GuardianSpawner, ImageFallbackConfig, PromptMemoryFlags,
 };
-use crate::runtime::hooks::HookRunner;
-use crate::runtime::managers::{
-    LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager,
-};
 use crate::runtime::model_roster::{ModelRoster, RoleModel};
 use crate::runtime::runner::run_agent_loop_with_config;
 use bamboo_domain::RuntimeSessionPersistence;
@@ -58,20 +54,6 @@ pub struct AgentRuntime {
     /// Call sites that need a reduced tool set (child / schedule) pass their
     /// own via `ExecuteRequest::tools`.
     pub default_tools: Arc<dyn ToolExecutor>,
-
-    // -- Optional manager overrides ----------------------------------------
-    /// When `Some`, uses a custom prompt manager instead of the default adapter.
-    pub prompt_manager: Option<Arc<dyn PromptManager>>,
-    /// When `Some`, uses a custom memory manager instead of the default adapter.
-    pub memory_manager: Option<Arc<dyn MemoryManager>>,
-    /// When `Some`, uses a custom tool manager instead of the default adapter.
-    pub tool_manager: Option<Arc<dyn ToolManager>>,
-    /// When `Some`, uses a custom LLM manager instead of the default adapter.
-    pub llm_manager: Option<Arc<dyn LlmManager>>,
-    /// When `Some`, uses a custom lifecycle manager instead of the default adapter.
-    pub lifecycle_manager: Option<Arc<dyn LifecycleManager>>,
-    /// When `Some`, uses a custom hook runner instead of a no-op runner.
-    pub hook_runner: Option<HookRunner>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,12 +79,6 @@ pub struct AgentRuntimeBuilder {
     config: Option<Arc<RwLock<Config>>>,
     provider: Option<Arc<dyn LLMProvider>>,
     default_tools: Option<Arc<dyn ToolExecutor>>,
-    prompt_manager: Option<Arc<dyn PromptManager>>,
-    memory_manager: Option<Arc<dyn MemoryManager>>,
-    tool_manager: Option<Arc<dyn ToolManager>>,
-    llm_manager: Option<Arc<dyn LlmManager>>,
-    lifecycle_manager: Option<Arc<dyn LifecycleManager>>,
-    hook_runner: Option<HookRunner>,
 }
 
 impl AgentRuntimeBuilder {
@@ -116,12 +92,6 @@ impl AgentRuntimeBuilder {
             config: None,
             provider: None,
             default_tools: None,
-            prompt_manager: None,
-            memory_manager: None,
-            tool_manager: None,
-            llm_manager: None,
-            lifecycle_manager: None,
-            hook_runner: None,
         }
     }
 
@@ -165,36 +135,6 @@ impl AgentRuntimeBuilder {
         self
     }
 
-    pub fn prompt_manager(mut self, v: Arc<dyn PromptManager>) -> Self {
-        self.prompt_manager = Some(v);
-        self
-    }
-
-    pub fn memory_manager(mut self, v: Arc<dyn MemoryManager>) -> Self {
-        self.memory_manager = Some(v);
-        self
-    }
-
-    pub fn tool_manager(mut self, v: Arc<dyn ToolManager>) -> Self {
-        self.tool_manager = Some(v);
-        self
-    }
-
-    pub fn llm_manager(mut self, v: Arc<dyn LlmManager>) -> Self {
-        self.llm_manager = Some(v);
-        self
-    }
-
-    pub fn lifecycle_manager(mut self, v: Arc<dyn LifecycleManager>) -> Self {
-        self.lifecycle_manager = Some(v);
-        self
-    }
-
-    pub fn hook_runner(mut self, v: HookRunner) -> Self {
-        self.hook_runner = Some(v);
-        self
-    }
-
     pub fn build(self) -> Result<AgentRuntime, &'static str> {
         Ok(AgentRuntime {
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
@@ -215,12 +155,6 @@ impl AgentRuntimeBuilder {
             default_tools: self
                 .default_tools
                 .ok_or_else(|| format_missing("default_tools"))?,
-            prompt_manager: None,
-            memory_manager: None,
-            tool_manager: None,
-            llm_manager: None,
-            lifecycle_manager: None,
-            hook_runner: None,
         })
     }
 }
