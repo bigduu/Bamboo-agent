@@ -14,7 +14,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
         id: "ask-1".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: "conclusion_with_options".to_string(),
+            name: "request_permissions".to_string(),
             arguments: "{}".to_string(),
         },
     };
@@ -26,7 +26,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
             "allow_custom": false
         })
         .to_string(),
-        display_preference: Some("conclusion_with_options".to_string()),
+        display_preference: Some("request_permissions".to_string()),
         images: Vec::new(),
     };
 
@@ -58,7 +58,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
         .as_ref()
         .expect("pending question should be set");
     assert_eq!(pending.tool_call_id, "ask-1");
-    assert_eq!(pending.tool_name, "conclusion_with_options");
+    assert_eq!(pending.tool_name, "request_permissions");
     assert_eq!(pending.question, "Continue?");
     assert_eq!(pending.options, vec!["Yes".to_string(), "No".to_string()]);
     assert!(!pending.allow_custom);
@@ -91,7 +91,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
             assert_eq!(question, "Continue?");
             assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
             assert_eq!(tool_call_id, Some("ask-1".to_string()));
-            assert_eq!(tool_name, Some("conclusion_with_options".to_string()));
+            assert_eq!(tool_name, Some("request_permissions".to_string()));
             assert!(!allow_custom);
         }
         other => panic!("unexpected second event: {other:?}"),

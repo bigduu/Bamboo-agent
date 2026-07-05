@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::composition::{CompositionExecutor, ExecutionContext, ToolExpr};
-use crate::tools::{ToolCall, ToolResult, ToolSchema};
+use crate::tools::{ToolCall, ToolOutcome, ToolResult, ToolSchema};
 
 use super::result_handler::parse_tool_args_best_effort;
 use super::ToolExecutionContext;
@@ -85,6 +85,23 @@ pub trait ToolExecutor: Send + Sync {
         _ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult> {
         self.execute(call).await
+    }
+
+    /// Outcome-aware dispatch: returns the tool's [`ToolOutcome`] rather than the
+    /// collapsed [`ToolResult`], so the agent loop can branch on
+    /// `Completed`/`Running`/`NeedsHuman` directly instead of sniffing markers on
+    /// a result. The default collapses via the `execute_with_context` path
+    /// (always `Completed`), so executors that never surface `Running`/`NeedsHuman`
+    /// (composition, MCP, tests) need no override; the built-in + overlay
+    /// executors override this to return the real outcome.
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome> {
+        self.execute_with_context(call, ctx)
+            .await
+            .map(ToolOutcome::Completed)
     }
 
     /// Lists all available tools and their schemas
@@ -238,6 +255,34 @@ pub async fn execute_tool_call_with_context(
     tools.execute_with_context(tool_call, ctx).await
 }
 
+/// Outcome-aware variant of [`execute_tool_call_with_context`]: the composition
+/// path is always `Completed`; the direct path returns the executor's real
+/// [`ToolOutcome`] so the loop can branch on `NeedsHuman` / `Running` without
+/// sniffing markers on a `ToolResult`.
+pub async fn execute_tool_call_with_context_outcome(
+    tool_call: &ToolCall,
+    tools: &dyn ToolExecutor,
+    composition_executor: Option<Arc<CompositionExecutor>>,
+    ctx: ToolExecutionContext<'_>,
+) -> Result<ToolOutcome> {
+    if let Some(executor) = composition_executor {
+        let args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&tool_call.function.arguments).0
+        };
+        let expr = ToolExpr::call(tool_call.function.name.clone(), args);
+        let mut exec_ctx = ExecutionContext::new();
+        match executor.execute(&expr, &mut exec_ctx).await {
+            Ok(result) => return Ok(ToolOutcome::Completed(result)),
+            Err(ToolError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    tools.execute_with_context_outcome(tool_call, ctx).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -245,7 +290,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::tools::{FunctionCall, Tool, ToolRegistry};
+    use crate::tools::{FunctionCall, Tool, ToolCtx, ToolOutcome, ToolRegistry};
 
     use super::*;
 
@@ -286,16 +331,17 @@ mod tests {
             })
         }
 
-        async fn execute(
+        async fn invoke(
             &self,
             _args: serde_json::Value,
-        ) -> std::result::Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+            _ctx: ToolCtx,
+        ) -> std::result::Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "from-composition".to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 

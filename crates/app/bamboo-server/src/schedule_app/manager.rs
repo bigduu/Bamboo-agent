@@ -447,6 +447,9 @@ async fn run_schedule_job(
         // BashOutput; no strand can occur because the gate refuses to suspend
         // without the hook.
         bash_resume_hook: None,
+        // Hook-less loop: no suspend/resume machinery, so stay push-free too
+        // (consistent with `can_async_resume: false` on this path).
+        bash_completion_sink: None,
         app_data_dir: ctx.app_data_dir.clone(),
         runners: ctx.agent_runners.clone(),
         sessions_cache: ctx.sessions_cache.clone(),

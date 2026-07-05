@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_domain::{TaskPhase, TaskPriority};
 use serde::Deserialize;
@@ -445,7 +445,11 @@ impl Tool for TaskTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: TaskArgsRaw = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Task args: {e}")))?;
         let count = parsed.tasks.len();
@@ -455,12 +459,12 @@ impl Tool for TaskTool {
             ));
         }
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: format!("Task list updated with {count} items"),
             display_preference: Some("Default".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -471,18 +475,24 @@ mod tests {
     #[tokio::test]
     async fn task_execute_accepts_tasks_payload() {
         let tool = TaskTool::new();
-        let result = tool
-            .execute(json!({
-                "tasks": [
-                    {
-                        "content": "Summarize parser entrypoints",
-                        "status": "in_progress",
-                        "activeForm": "Summarizing parser entrypoints"
-                    }
-                ]
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "tasks": [
+                        {
+                            "content": "Summarize parser entrypoints",
+                            "status": "in_progress",
+                            "activeForm": "Summarizing parser entrypoints"
+                        }
+                    ]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("Task should validate payload");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(result.result.contains("1 items"));
@@ -492,7 +502,7 @@ mod tests {
     async fn task_execute_rejects_empty_payload() {
         let tool = TaskTool::new();
         let err = tool
-            .execute(json!({}))
+            .invoke(json!({}), ToolCtx::none("t"))
             .await
             .expect_err("Task should reject empty payload");
 
@@ -503,14 +513,17 @@ mod tests {
     async fn task_execute_rejects_legacy_todos_field() {
         let tool = TaskTool::new();
         let err = tool
-            .execute(json!({
-                "todos": [
-                    {
-                        "content": "Legacy path",
-                        "status": "pending"
-                    }
-                ]
-            }))
+            .invoke(
+                json!({
+                    "todos": [
+                        {
+                            "content": "Legacy path",
+                            "status": "pending"
+                        }
+                    ]
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect_err("Task should reject legacy todos field");
 

@@ -21,7 +21,9 @@ use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{
+    AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session,
+};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
@@ -140,6 +142,19 @@ fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Fetch (or create) the per-session async lock from [`parent_locks`]. Held
+/// across the load-check-clear-resume critical section so the three resume
+/// sources for one session — child completion, the loop-facing bash **push**
+/// ([`BashCompletionSink::on_bash_completed`]), and the bash **backstop** poll
+/// ([`ChildCompletionCoordinator::bash_self_resume`]) — can never double-resume.
+/// The inner sync `Mutex` guards only the brief map lookup (no await inside).
+fn session_resume_lock(session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = parent_locks().lock().expect("parent lock map poisoned");
+    map.entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn wait_policy_satisfied(
@@ -396,16 +411,11 @@ impl ChildCompletionCoordinator {
 #[async_trait]
 impl ChildCompletionHandler for ChildCompletionCoordinator {
     async fn on_child_completed(&self, completion: ChildCompletion) {
-        // Acquire a per-parent async lock to eliminate the concurrent
+        // Acquire the per-session async lock to eliminate the concurrent
         // double-resume race (see `parent_locks` for the full scenario). The
         // inner std::sync::Mutex is released immediately so no sync lock is
         // held across the await that follows.
-        let per_parent = {
-            let mut map = parent_locks().lock().expect("parent lock map poisoned");
-            map.entry(completion.parent_session_id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
+        let per_parent = session_resume_lock(&completion.parent_session_id);
         let _per_parent_guard = per_parent.lock().await;
 
         let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
@@ -760,6 +770,12 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 let hook: Arc<dyn BashResumeHook> = Arc::new(self.clone());
                 Some(hook)
             },
+            bash_completion_sink: {
+                // Resumed runs keep the push wired too, so a background shell
+                // launched after resume still notifies the loop.
+                let sink: Arc<dyn BashCompletionSink> = Arc::new(self.clone());
+                Some(sink)
+            },
             app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
@@ -822,101 +838,163 @@ fn bash_resume_should_retry(outcome: &ResumeOutcome, persisted_waiting_for_bash:
     }
 }
 
-/// Bash self-resume support (issue #84 Phase 2b).
+/// Whether a background-shell completion push should **resume** the owning loop
+/// (vs merely enqueue an injection). Resume only when the loop is actually
+/// suspended on a bash wait AND every shell it was waiting on has now finished —
+/// resuming while other waited shells are still running would drop them back into
+/// a foreground turn prematurely. The last shell to finish (or the backstop)
+/// drives the resume; earlier ones enqueue their notice. Pure so the invariant is
+/// unit-testable in isolation.
+fn bash_completion_should_resume(loop_suspended_on_bash: bool, all_waited_shells_done: bool) -> bool {
+    loop_suspended_on_bash && all_waited_shells_done
+}
+
+/// Apply the bash-resume state transition to a loaded session **in place**: clear
+/// the `waiting_for_bash` wait, mark the runtime Idle, drop the suspension +
+/// `runtime.suspend_reason`, and append `resume_message`. Returns `false` (a
+/// no-op) when the session was not actually waiting on bash — the double-resume
+/// guard shared by the push and the backstop. Pure (no I/O) so both
+/// [`ChildCompletionCoordinator::perform_bash_resume`] and unit tests exercise the
+/// exact same transition.
+fn apply_bash_resume_transition(session: &mut Session, resume_message: &Message) -> bool {
+    let mut runtime_state = read_runtime_state(session);
+    if runtime_state.waiting_for_bash.is_none() {
+        return false;
+    }
+    runtime_state.waiting_for_bash = None;
+    runtime_state.status = AgentStatusState::Idle;
+    runtime_state.suspension = None;
+    write_runtime_state(session, &runtime_state);
+    session.metadata.remove("runtime.suspend_reason");
+    session.add_message(resume_message.clone());
+    true
+}
+
+/// Bash self-resume support (issue #84 Phase 2b; push follow-up).
 impl ChildCompletionCoordinator {
-    /// Poll the live background-shell registry until all captured shells are no
-    /// longer running, then clear the bash wait and resume the session. This is
-    /// the liveness guarantee: **polling** the registry — not the one-shot
-    /// `BashCompleted` event — so even if a shell completed between the suspend
-    /// snapshot and this task's first poll, or before any event subscriber
-    /// existed, the registry reports it as not-running and the session resumes.
+    /// **Backstop** for a session suspended on `waiting_for_bash`. The primary,
+    /// event-driven wake is the loop-facing push
+    /// ([`BashCompletionSink::on_bash_completed`] → [`Self::deliver_bash_completion`]):
+    /// the shell's completion task fires it the instant the process exits, and it
+    /// resumes the loop directly. This task exists ONLY to catch a **lost push** —
+    /// the completion landing in the window before the suspend was persisted (so
+    /// the push saw no `waiting_for_bash` and only queued an injection), or a
+    /// configuration with no sink wired — and to honour the wait ceiling.
     ///
-    /// The clear→append→resume is a **bounded retry loop** that closes the
-    /// finalize-clobber strand. The suspending runner's `finalize_task_context`
-    /// runs a full `save_runtime_session` (same `merge_save_runtime`, which
-    /// overwrites the whole `messages` array) AFTER this task is spawned; if it
-    /// lands after ours it reverts `waiting_for_bash=Some` and drops our resume
-    /// message, so `has_pending_user_message` fails and `resume_parent` returns
-    /// `Completed` without spawning. We detect that (persisted wait still set
-    /// after a non-`Started` outcome) and re-clear/re-append/re-resume. It
-    /// converges because the runner's finalize persist is one-shot: once landed,
-    /// our retry's save is the last writer, the message sticks, and resume fires.
+    /// So it is deliberately NOT a hot spin: a coarse backoff (1 s → 30 s) that
+    /// **yields to the push**. In the happy path the push has already cleared
+    /// `waiting_for_bash` before the first check fires, so this returns after one
+    /// cheap load with no registry polling at all. It only performs a resume when
+    /// the shell(s) have finished but the loop is somehow still suspended, or the
+    /// 6 h wait ceiling is reached.
     async fn bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
-        let poll_interval = Duration::from_millis(200);
+        let mut delay = Duration::from_secs(1);
+        let max_delay = Duration::from_secs(30);
         // Hard ceiling: the wait lease (6 h) + the registry GC TTL (5 min) +
         // margin. After this the shells are gone from the registry regardless,
         // so force-resume to avoid stranding the session on a GC edge case.
         let max_poll = Duration::from_secs(6 * 3600 + 600);
         let deadline = tokio::time::Instant::now() + max_poll;
 
-        let mut timed_out = false;
         loop {
+            tokio::time::sleep(delay).await;
+
+            let Some(session) = self.load_session(&session_id).await else {
+                tracing::info!(%session_id, "bash self-resume backstop: session gone; nothing to do");
+                return;
+            };
+            if read_runtime_state(&session).waiting_for_bash.is_none() {
+                // The push (or another path) already resumed. This is the common
+                // case — the backstop yields silently after a single load.
+                return;
+            }
+
             let still_running =
                 bamboo_tools::tools::bash_runtime::running_shells_for_session(&session_id);
-            if still_running.is_empty() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                timed_out = true;
+            let timed_out = tokio::time::Instant::now() >= deadline;
+            if still_running.is_empty() || timed_out {
+                // The shell(s) finished but the loop is still suspended → the push
+                // was lost (pre-persist window / no sink), or the ceiling hit.
+                // Resume under the shared per-session lock so we never race the
+                // push or a concurrent child-completion resume.
+                let guard = session_resume_lock(&session_id);
+                let _held = guard.lock().await;
                 tracing::warn!(
-                    session_id = %session_id,
-                    "bash self-resume poll exceeded the wait ceiling; forcing resume"
+                    %session_id,
+                    shell_count = bash_ids.len(),
+                    timed_out,
+                    "bash self-resume backstop engaged (push lost or wait ceiling reached)"
                 );
-                break;
+                self.perform_bash_resume(
+                    &session_id,
+                    bash_completion_resume_message(&bash_ids, timed_out),
+                )
+                .await;
+                return;
             }
-            tokio::time::sleep(poll_interval).await;
-        }
 
-        // Clobber-retry loop (see the function doc). Bounded: the runner's
-        // finalize persist is one-shot, so once it has landed our retry's save
-        // is the last writer, the resume message sticks, and the resume fires.
+            delay = (delay * 2).min(max_delay);
+        }
+    }
+
+    /// Clear a session's `waiting_for_bash` state, append `resume_message`, and
+    /// drive the parent resume — the shared clear→append→resume used by BOTH the
+    /// event-driven push ([`Self::deliver_bash_completion`]) and the backstop poll
+    /// ([`Self::bash_self_resume`]).
+    ///
+    /// **The caller MUST hold the [`session_resume_lock`] for `session_id`** so the
+    /// load-check-clear-resume critical section is serialized against every other
+    /// resume source (no double resume). No-op when the persisted wait was already
+    /// cleared (another source handled it first).
+    ///
+    /// The clear→append→resume is a **bounded retry loop** that closes the
+    /// finalize-clobber strand. The suspending runner's `finalize_task_context`
+    /// runs a full `save_runtime_session` (same `merge_save_runtime`, which
+    /// overwrites the whole `messages` array) that can land AFTER our save,
+    /// reverting `waiting_for_bash=Some` and dropping our resume message, so
+    /// `has_pending_user_message` fails and `resume_parent` returns `Completed`
+    /// without spawning. We detect that (persisted wait still set after a
+    /// non-`Started` outcome) and re-clear/re-append/re-resume. It converges
+    /// because the runner's finalize persist is one-shot: once landed, our retry's
+    /// save is the last writer, the message sticks, and resume fires.
+    async fn perform_bash_resume(&self, session_id: &str, resume_message: Message) {
+        let retry_backoff = Duration::from_millis(200);
         const MAX_RESUME_ATTEMPTS: u8 = 5;
         for attempt in 0..MAX_RESUME_ATTEMPTS {
             if attempt > 0 {
-                tokio::time::sleep(poll_interval).await;
+                tokio::time::sleep(retry_backoff).await;
             }
 
-            let Some(mut session) = self.load_session(&session_id).await else {
-                tracing::warn!(%session_id, "bash self-resume: session not found; nothing to resume");
+            let Some(mut session) = self.load_session(session_id).await else {
+                tracing::warn!(%session_id, "bash resume: session not found; nothing to resume");
                 return;
             };
 
-            let mut runtime_state = read_runtime_state(&session);
-            if runtime_state.waiting_for_bash.is_none() {
+            if !apply_bash_resume_transition(&mut session, &resume_message) {
                 // Double-resume guard: the wait was already cleared by another
-                // path (a user-driven resume, or a racing duplicate poll task),
-                // or our own prior clear survived a clobber-retry. Do not append
-                // a duplicate message or request a redundant resume.
+                // source (the push, the backstop, or a user-driven resume). Do
+                // not append a duplicate message or request a redundant resume.
                 tracing::info!(
                     %session_id, attempt,
-                    "bash self-resume: persisted bash wait already cleared; nothing to resume"
+                    "bash resume: persisted bash wait already cleared; nothing to resume"
                 );
                 return;
             }
-
-            runtime_state.waiting_for_bash = None;
-            runtime_state.status = AgentStatusState::Idle;
-            runtime_state.suspension = None;
-            write_runtime_state(&mut session, &runtime_state);
-            session.metadata.remove("runtime.suspend_reason");
-            session.add_message(bash_completion_resume_message(&bash_ids, timed_out));
             session.updated_at = Utc::now();
             self.save_and_cache(&mut session).await;
             tracing::info!(
-                session_id = %session_id,
-                shell_count = bash_ids.len(),
-                timed_out, attempt,
-                "bash self-resume: cleared bash wait and appended resume message"
+                %session_id, attempt,
+                "bash resume: cleared bash wait and appended resume message"
             );
 
-            let outcome = self.resume_parent(session_id.clone()).await;
+            let outcome = self.resume_parent(session_id.to_string()).await;
             match outcome {
                 ResumeOutcome::Started { .. } => {
-                    tracing::info!(%session_id, attempt, "bash self-resume: resume fired");
+                    tracing::info!(%session_id, attempt, "bash resume: resume fired");
                     return;
                 }
                 ResumeOutcome::NotFound => {
-                    tracing::warn!(%session_id, "bash self-resume: session vanished during resume");
+                    tracing::warn!(%session_id, "bash resume: session vanished during resume");
                     return;
                 }
                 _ => {
@@ -925,13 +1003,10 @@ impl ChildCompletionCoordinator {
                     // Decide via the persisted bash wait: still set ⇒
                     // finalize-clobber ⇒ retry; cleared ⇒ the session is being
                     // handled (by us or a concurrent resume) ⇒ stop.
-                    let clobbered = match self.load_session(&session_id).await {
+                    let clobbered = match self.load_session(session_id).await {
                         Some(reloaded) => read_runtime_state(&reloaded).waiting_for_bash.is_some(),
                         None => {
-                            tracing::warn!(
-                                %session_id,
-                                "bash self-resume: session vanished after resume"
-                            );
+                            tracing::warn!(%session_id, "bash resume: session vanished after resume");
                             return;
                         }
                     };
@@ -939,14 +1014,14 @@ impl ChildCompletionCoordinator {
                         tracing::warn!(
                             %session_id, attempt,
                             outcome = outcome.as_str(),
-                            "bash self-resume: persisted wait still set after resume (finalize-clobber); retrying"
+                            "bash resume: persisted wait still set after resume (finalize-clobber); retrying"
                         );
                         continue;
                     }
                     tracing::info!(
                         %session_id, attempt,
                         outcome = outcome.as_str(),
-                        "bash self-resume: wait cleared and resume handled; stopping"
+                        "bash resume: wait cleared and resume handled; stopping"
                     );
                     return;
                 }
@@ -956,7 +1031,7 @@ impl ChildCompletionCoordinator {
         tracing::warn!(
             %session_id,
             attempts = MAX_RESUME_ATTEMPTS,
-            "bash self-resume: exhausted clobber-retry budget without confirming resume; giving up"
+            "bash resume: exhausted clobber-retry budget without confirming resume; giving up"
         );
     }
 }
@@ -966,6 +1041,172 @@ impl BashResumeHook for ChildCompletionCoordinator {
         let coordinator = Arc::new(self.clone());
         tokio::spawn(async move {
             coordinator.bash_self_resume(session_id, bash_ids).await;
+        });
+    }
+}
+
+/// Build the injected user-message body for a completed background shell — a
+/// concise notice plus a bounded output tail — so the model can act on the
+/// result without a mandatory `BashOutput` round-trip (issue #84 Phase 2b
+/// follow-up).
+fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
+    let exit = match info.exit_code {
+        Some(code) => code.to_string(),
+        None => "none (signal/killed)".to_string(),
+    };
+    let mut body = format!(
+        "Runtime notification: background shell `{}` (`{}`) finished — status {}, exit code {}.",
+        info.bash_id, info.command, info.status, exit
+    );
+    if info.output_tail.trim().is_empty() {
+        body.push_str(" It produced no captured output.");
+    } else {
+        body.push_str("\n\nOutput tail:\n");
+        body.push_str(&info.output_tail);
+    }
+    body.push_str(&format!(
+        "\n\nUse BashOutput with bash_id=\"{}\" for the full output, then continue the task.",
+        info.bash_id
+    ));
+    body
+}
+
+/// Loop-facing background-Bash completion delivery (issue #84 Phase 2b
+/// follow-up). Pushes a completed shell's result into its owning session's loop,
+/// mirroring how a sub-agent completion reaches its parent — but via the
+/// running-loop channel, which children never exercise (a parent waiting on
+/// children is always suspended when one completes; bash is the first completion
+/// source that can land on a *live, iterating* loop).
+///
+/// The push enqueues onto `pending_injected_messages`, the same round-boundary
+/// steering channel `send_message` uses. That covers every reachable loop state:
+/// an actively-looping session drains it at its next round
+/// (`merge_pending_injected_messages`); a session suspended on `waiting_for_bash`
+/// drains it when the durable end-of-turn poll backstop (`bash_resume_hook`)
+/// resumes it at round 0. A wired-sink session is never idle-with-a-running-shell
+/// (ending a turn with one suspends), so no separate idle-wake path is needed —
+/// keeping the push a pure latency optimization that never races the backstop.
+/// Enqueue a completed shell's summary as a pending injected message on the
+/// owning session. Race-safe: `update_runtime_config` loads the freshest session
+/// under the per-session lock and re-saves, so it can never revert a message the
+/// live loop appended concurrently — unlike `merge_save_runtime` (which writes
+/// the caller's whole `messages` snapshot verbatim). Free fn so it is unit-
+/// testable without constructing a full coordinator. Returns the saved session,
+/// or `None` if the owning session no longer exists.
+async fn enqueue_bash_completion_injection(
+    persistence: &LockedSessionStore,
+    info: &BashCompletionInfo,
+) -> std::io::Result<Option<Session>> {
+    let body = bash_completion_injection_body(info);
+    let queued = serde_json::json!({
+        "content": body,
+        "created_at": Utc::now(),
+    });
+    persistence
+        .update_runtime_config(&info.session_id, move |session| {
+            let mut pending = session.pending_injected_messages().unwrap_or_default();
+            pending.push(queued);
+            session.set_pending_injected_messages(pending);
+        })
+        .await
+}
+
+/// Build the hidden, compressible resume message for a completed background
+/// shell — the same rich notice body used for a live-loop injection
+/// ([`bash_completion_injection_body`]), but tagged as a resume message so it
+/// satisfies the `has_pending_user_message` gate that lets a suspended session
+/// spawn. This is what the **push** appends when it wakes a suspended loop, so
+/// the model gets the shell's status + output tail in one shot without a
+/// separate `BashOutput` round-trip.
+fn bash_resume_message_from_info(info: &BashCompletionInfo) -> Message {
+    let mut message = Message::user(bash_completion_injection_body(info));
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY: BASH_COMPLETION_RESUME_KIND,
+    }));
+    message.never_compress = false;
+    message
+}
+
+impl ChildCompletionCoordinator {
+    /// Loop-facing delivery of a completed background shell. Two paths, chosen
+    /// under the per-session resume lock so we never race the backstop poll or a
+    /// concurrent child-completion resume:
+    ///
+    /// - **Suspended loop** (the model ended its turn with the shell running, so
+    ///   `waiting_for_bash` is set) AND every waited shell has now finished →
+    ///   **resume the loop directly**, event-driven, appending the rich completion
+    ///   notice as the resume message. This is the push's whole point: no polling.
+    /// - Otherwise (a live/iterating loop, or a suspend still waiting on OTHER
+    ///   shells) → **enqueue** the notice as a pending injected message, drained at
+    ///   the next round boundary (a live loop) or folded into the eventual resume
+    ///   when the last shell finishes.
+    async fn deliver_bash_completion(&self, info: BashCompletionInfo) {
+        let guard = session_resume_lock(&info.session_id);
+        let _held = guard.lock().await;
+
+        let Some(session) = self.load_session(&info.session_id).await else {
+            tracing::warn!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                "background bash completion: owning session not found; nothing to notify"
+            );
+            return;
+        };
+
+        let waiting = read_runtime_state(&session).waiting_for_bash.is_some();
+        // The producer flips the shell's `running` flag false BEFORE firing this
+        // push, so a now-empty per-session registry means every shell the loop was
+        // waiting on has finished — safe to resume. If OTHER waited shells are
+        // still running, fall through to the enqueue path and let the last one (or
+        // the backstop) drive the resume.
+        let all_shells_done =
+            bamboo_tools::tools::bash_runtime::running_shells_for_session(&info.session_id)
+                .is_empty();
+
+        if bash_completion_should_resume(waiting, all_shells_done) {
+            tracing::info!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                status = %info.status,
+                "background bash completion: push-resuming suspended loop (event-driven)"
+            );
+            self.perform_bash_resume(&info.session_id, bash_resume_message_from_info(&info))
+                .await;
+            return;
+        }
+
+        match enqueue_bash_completion_injection(&self.persistence, &info).await {
+            Ok(Some(_)) => tracing::info!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                status = %info.status,
+                waiting,
+                "background bash completion queued for injection at the next round boundary"
+            ),
+            Ok(None) => tracing::warn!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                "background bash completion: owning session not found; nothing to notify"
+            ),
+            Err(error) => tracing::warn!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                %error,
+                "background bash completion: failed to queue injection"
+            ),
+        }
+    }
+}
+
+impl BashCompletionSink for ChildCompletionCoordinator {
+    fn on_bash_completed(&self, info: BashCompletionInfo) {
+        // Best-effort, off the shell's completion-poll task: hand the delivery to
+        // a detached task so the producer is never blocked (mirrors
+        // `arrange_bash_self_resume`).
+        let coordinator = Arc::new(self.clone());
+        tokio::spawn(async move {
+            coordinator.deliver_bash_completion(info).await;
         });
     }
 }
@@ -1291,5 +1532,204 @@ mod tests {
             &ResumeOutcome::AlreadyRunning { run_id: "r".into() },
             false
         ));
+    }
+
+    // ── bash completion injection body (Phase 2b follow-up) ──────────────
+
+    #[test]
+    fn injection_body_includes_status_exit_command_and_tail() {
+        let info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "abc123".into(),
+            command: "make build".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "BUILD OK".into(),
+        };
+        let body = bash_completion_injection_body(&info);
+        assert!(body.contains("abc123"), "body: {body}");
+        assert!(body.contains("make build"), "body: {body}");
+        assert!(body.contains("completed"), "body: {body}");
+        assert!(body.contains("exit code 0"), "body: {body}");
+        assert!(body.contains("BUILD OK"), "body: {body}");
+        // The model is pointed at BashOutput for the full log.
+        assert!(body.contains("BashOutput"), "body: {body}");
+        assert!(body.contains("bash_id=\"abc123\""), "body: {body}");
+    }
+
+    #[test]
+    fn injection_body_handles_no_output_and_signal_kill() {
+        let info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "xyz".into(),
+            command: "sleep 99".into(),
+            exit_code: None,
+            status: "killed".into(),
+            output_tail: String::new(),
+        };
+        let body = bash_completion_injection_body(&info);
+        assert!(body.contains("killed"), "body: {body}");
+        assert!(body.contains("none (signal/killed)"), "body: {body}");
+        assert!(body.contains("no captured output"), "body: {body}");
+        // No output tail section when there is nothing to show.
+        assert!(!body.contains("Output tail:"), "body: {body}");
+    }
+
+    async fn temp_store() -> (tempfile::TempDir, Arc<dyn Storage>, LockedSessionStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::v2::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("storage init"),
+        );
+        let persistence = LockedSessionStore::new(storage.clone());
+        (temp, storage, persistence)
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_pending_injection_and_preserves_messages() {
+        let (_temp, storage, persistence) = temp_store().await;
+
+        let mut session = Session::new("sess-enq", "test-model");
+        session.add_message(Message::user("do the build"));
+        storage.save_session(&session).await.unwrap();
+
+        let info = BashCompletionInfo {
+            session_id: "sess-enq".into(),
+            bash_id: "sh-1".into(),
+            command: "make".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "done".into(),
+        };
+        let saved = enqueue_bash_completion_injection(&persistence, &info)
+            .await
+            .expect("enqueue io ok")
+            .expect("session exists");
+
+        let pending = saved
+            .pending_injected_messages()
+            .expect("pending injection present");
+        assert_eq!(pending.len(), 1);
+        let content = pending[0].get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(content.contains("sh-1"), "content: {content}");
+        assert!(content.contains("make"), "content: {content}");
+        assert!(content.contains("done"), "content: {content}");
+        // The pre-existing conversation is untouched (no clobber).
+        assert_eq!(saved.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_none_for_missing_session() {
+        let (_temp, _storage, persistence) = temp_store().await;
+        let info = BashCompletionInfo {
+            session_id: "does-not-exist".into(),
+            bash_id: "x".into(),
+            command: "true".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: String::new(),
+        };
+        let result = enqueue_bash_completion_injection(&persistence, &info)
+            .await
+            .expect("io ok");
+        assert!(result.is_none(), "no session → nothing enqueued");
+    }
+
+    // ── push-driven resume: the state transition + decision the push applies ──
+
+    /// A session suspended on `waiting_for_bash`, given the rich completion
+    /// message, is transitioned to a resumable state: the wait is cleared, the
+    /// runtime is Idle, the suspend-reason marker is gone, and the resume message
+    /// is appended. This is exactly what the PUSH does to wake the loop
+    /// event-driven (vs the old backstop poll).
+    #[test]
+    fn apply_bash_resume_transition_clears_wait_and_appends_message() {
+        use bamboo_domain::session::runtime_state::WaitingForBashState;
+
+        let mut session = Session::new("sess-resume", "test-model");
+        session.add_message(Message::user("kick off the build"));
+        let mut rt = read_runtime_state(&session);
+        rt.status = AgentStatusState::Running;
+        rt.waiting_for_bash = Some(WaitingForBashState::for_bash(vec!["sh-1".into()], Utc::now()));
+        write_runtime_state(&mut session, &rt);
+        session.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_bash".to_string(),
+        );
+
+        let resume = bash_completion_resume_message(&["sh-1".to_string()], false);
+        let did = apply_bash_resume_transition(&mut session, &resume);
+
+        assert!(did, "a suspended session must transition");
+        let after = read_runtime_state(&session);
+        assert!(after.waiting_for_bash.is_none(), "bash wait must be cleared");
+        assert_eq!(after.status, AgentStatusState::Idle, "runtime must be Idle");
+        assert!(
+            !session.metadata.contains_key("runtime.suspend_reason"),
+            "suspend-reason marker must be removed"
+        );
+        assert_eq!(session.messages.len(), 2, "resume message must be appended");
+        assert!(matches!(
+            session.messages.last().map(|m| &m.role),
+            Some(Role::User)
+        ));
+    }
+
+    /// The double-resume guard: a session NOT waiting on bash is a no-op — no
+    /// message appended, nothing mutated. This is what makes the backstop poll
+    /// harmlessly yield once the push has already resumed (and vice versa).
+    #[test]
+    fn apply_bash_resume_transition_noops_when_not_waiting() {
+        let mut session = Session::new("sess-live", "test-model");
+        session.add_message(Message::user("hi"));
+
+        let resume = bash_completion_resume_message(&["sh-1".to_string()], false);
+        let did = apply_bash_resume_transition(&mut session, &resume);
+
+        assert!(!did, "a non-waiting session must not transition");
+        assert_eq!(session.messages.len(), 1, "no resume message appended");
+    }
+
+    /// The resume invariant: push-resume fires ONLY when the loop is suspended on
+    /// bash AND every waited shell has finished. A still-running sibling shell
+    /// keeps it on the enqueue path.
+    #[test]
+    fn bash_completion_should_resume_only_when_suspended_and_all_done() {
+        assert!(bash_completion_should_resume(true, true));
+        assert!(!bash_completion_should_resume(true, false)); // other shells still running
+        assert!(!bash_completion_should_resume(false, true)); // live loop, not suspended
+        assert!(!bash_completion_should_resume(false, false));
+    }
+
+    /// The push's resume message carries the shell's identity + status + output
+    /// tail (so the model needs no `BashOutput` round-trip) and is tagged as a
+    /// bash-completion resume so it satisfies the `has_pending_user_message` gate.
+    #[test]
+    fn bash_resume_message_from_info_carries_bashid_tail_and_kind() {
+        let info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "sh-42".into(),
+            command: "cargo test".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "test result: ok".into(),
+        };
+        let msg = bash_resume_message_from_info(&info);
+
+        assert!(matches!(msg.role, Role::User));
+        assert!(msg.content.contains("sh-42"), "content: {}", msg.content);
+        assert!(msg.content.contains("cargo test"), "content: {}", msg.content);
+        assert!(
+            msg.content.contains("test result: ok"),
+            "content: {}",
+            msg.content
+        );
+        assert!(msg.content.contains("BashOutput"), "content: {}", msg.content);
+        let meta = serde_json::to_string(&msg.metadata).unwrap();
+        assert!(
+            meta.contains(BASH_COMPLETION_RESUME_KIND),
+            "resume message must be tagged as a bash-completion resume: {meta}"
+        );
     }
 }

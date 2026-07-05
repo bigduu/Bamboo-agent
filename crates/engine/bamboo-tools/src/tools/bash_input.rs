@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -79,7 +79,11 @@ impl Tool for BashInputTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: BashInputArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid BashInput args: {}", e)))?;
 
@@ -124,7 +128,7 @@ impl Tool for BashInputTool {
             false
         };
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({
                 "bash_id": shell.id,
@@ -135,7 +139,7 @@ impl Tool for BashInputTool {
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -200,19 +204,25 @@ mod tests {
     async fn bash_input_feeds_interactive_shell_and_output_appears() {
         prime_test_command_environment();
         // `cat` echoes its stdin to stdout — perfect for round-trip verification.
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
         assert_eq!(shell.status(), "running");
 
         let tool = BashInputTool::new();
-        let result = tool
-            .execute(json!({
-                "bash_id": shell.id,
-                "input": "hello-from-bashinput"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "bash_id": shell.id,
+                    "input": "hello-from-bashinput"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("BashInput should succeed on interactive shell");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         // The echoed input must appear in the shell's captured output.
@@ -227,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn write_stdin_errors_on_non_interactive_shell() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false)
+        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
 
@@ -249,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn write_stdin_errors_on_exited_interactive_shell() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("true", None, None, None, true)
+        let shell = bash_runtime::spawn_background("true", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
@@ -287,7 +297,7 @@ mod tests {
     async fn non_interactive_stdin_reader_gets_eof_and_terminates() {
         prime_test_command_environment();
         // `cat` reads stdin; with Stdio::null() it receives immediate EOF and exits 0.
-        let shell = bash_runtime::spawn_background("cat", None, None, None, false)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
 
@@ -313,17 +323,21 @@ mod tests {
     async fn bash_input_errors_on_unknown_shell() {
         let tool = BashInputTool::new();
         let result = tool
-            .execute(json!({
-                "bash_id": "nonexistent-shell-id",
-                "input": "hello"
-            }))
+            .invoke(
+                json!({
+                    "bash_id": "nonexistent-shell-id",
+                    "input": "hello"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
         assert!(result.is_err(), "BashInput must error on unknown shell id");
         match result {
             Err(ToolError::Execution(msg)) => {
                 assert!(msg.contains("not found"), "unexpected error: {msg}");
             }
-            other => panic!("expected Execution error, got {other:?}"),
+            Err(other) => panic!("expected Execution error, got {other:?}"),
+            Ok(_) => panic!("expected Execution error, got Ok"),
         }
     }
 
@@ -332,16 +346,19 @@ mod tests {
     #[tokio::test]
     async fn bash_input_errors_on_non_interactive_shell_via_tool() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false)
+        let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
 
         let tool = BashInputTool::new();
         let result = tool
-            .execute(json!({
-                "bash_id": shell.id,
-                "input": "hello"
-            }))
+            .invoke(
+                json!({
+                    "bash_id": shell.id,
+                    "input": "hello"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -354,7 +371,8 @@ mod tests {
                     "error should mention interactive: {msg}"
                 );
             }
-            other => panic!("expected Execution error, got {other:?}"),
+            Err(other) => panic!("expected Execution error, got {other:?}"),
+            Ok(_) => panic!("expected Execution error, got Ok"),
         }
 
         let _ = shell.kill().await;
@@ -368,28 +386,37 @@ mod tests {
     #[tokio::test]
     async fn bash_input_append_newline_false_sends_utf8_bytes() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
         let tool = BashInputTool::new();
         // Send "utf8-payload" with no newline; cat won't produce a line until it
         // gets one, so send a second write WITH newline to flush it.
-        let result = tool
-            .execute(json!({
-                "bash_id": shell.id,
-                "input": "utf8-payload",
-                "append_newline": false
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "bash_id": shell.id,
+                    "input": "utf8-payload",
+                    "append_newline": false
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("utf-8 write should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         // Now send a newline so cat emits the buffered line.
-        tool.execute(json!({
-            "bash_id": shell.id,
-            "input": "",
-        }))
+        tool.invoke(
+            json!({
+                "bash_id": shell.id,
+                "input": "",
+            }),
+            ToolCtx::none("t"),
+        )
         .await
         .expect("newline write should succeed");
 
@@ -404,11 +431,14 @@ mod tests {
     async fn bash_input_rejects_empty_raw_input() {
         let tool = BashInputTool::new();
         let result = tool
-            .execute(json!({
-                "bash_id": "fake",
-                "input": "",
-                "append_newline": false
-            }))
+            .invoke(
+                json!({
+                    "bash_id": "fake",
+                    "input": "",
+                    "append_newline": false
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
@@ -420,19 +450,25 @@ mod tests {
     #[tokio::test]
     async fn bash_input_eof_closes_stdin_and_lets_consumer_terminate() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
         let tool = BashInputTool::new();
-        let result = tool
-            .execute(json!({
-                "bash_id": shell.id,
-                "input": "line-one",
-                "eof": true,
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "bash_id": shell.id,
+                    "input": "line-one",
+                    "eof": true,
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("eof write should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
         // We reported the line write and the close.
         assert!(
@@ -462,19 +498,25 @@ mod tests {
     #[tokio::test]
     async fn bash_input_eof_allows_empty_input() {
         prime_test_command_environment();
-        let shell = bash_runtime::spawn_background("cat", None, None, None, true)
+        let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
 
         let tool = BashInputTool::new();
-        let result = tool
-            .execute(json!({
-                "bash_id": shell.id,
-                "input": "",
-                "eof": true,
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "bash_id": shell.id,
+                    "input": "",
+                    "eof": true,
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("eof-only write should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         // With stdin closed, `cat` reaches EOF and exits — it must not hang.

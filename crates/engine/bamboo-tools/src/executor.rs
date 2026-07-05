@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_agent_core::{
     normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
-    ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
+    ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
 };
 use bamboo_domain::tool_names::{normalize_builtin_alias, resolve_alias};
 
@@ -249,6 +249,16 @@ impl ToolExecutor for BuiltinToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        self.execute_with_context_outcome(call, ctx)
+            .await
+            .map(ToolOutcome::into_tool_result)
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
         // Reuse the args the dispatching agent loop already parsed (for the
         // `ToolStart` event) when it threaded them through the context, instead
         // of re-parsing the raw JSON string here (issue #106, deferred B1 from
@@ -382,12 +392,15 @@ impl ToolExecutor for BuiltinToolExecutor {
                                     "options": ["Approve", "Deny"],
                                     "allow_custom": false,
                                 });
-                                return Ok(ToolResult {
+                                // Permission-gate synthesized question stays on
+                                // the Completed→sniff path for now (a later Phase B
+                                // step converts this to ToolOutcome::NeedsHuman).
+                                return Ok(ToolOutcome::Completed(ToolResult {
                                     success: true,
                                     result: payload.to_string(),
                                     display_preference: Some("request_permissions".to_string()),
                                     images: Vec::new(),
-                                });
+                                }));
                             }
 
                             // Non-interactive (no event sink to surface the prompt):
@@ -405,7 +418,15 @@ impl ToolExecutor for BuiltinToolExecutor {
             }
         }
 
-        tool.execute_with_context(args, ctx).await
+        // Rewritten dispatch: build the owned `ToolCtx` at this concrete seam and
+        // call the tool's single `invoke`. Unwrap the `ToolOutcome` back to a
+        // `ToolResult` so the surrounding dispatch/loop is unchanged for now:
+        // `Completed` is the result; `Running`'s synthetic ack IS a `ToolResult`
+        // (preserving background Bash's current behavior); `NeedsHuman` cannot yet
+        // be produced (no tool returns it in this phase). Phase B makes the outcome
+        // authoritative and removes this unwrap.
+        let tool_ctx = ctx.to_tool_ctx();
+        tool.invoke(args, tool_ctx).await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -415,7 +436,7 @@ impl ToolExecutor for BuiltinToolExecutor {
     fn tool_mutability(&self, tool_name: &str) -> crate::ToolMutability {
         self.registry
             .get(tool_name)
-            .map(|tool| tool.mutability())
+            .map(|tool| tool.classify(&serde_json::Value::Null).mutability)
             .unwrap_or_else(|| crate::classify_tool(tool_name))
     }
 
@@ -424,7 +445,7 @@ impl ToolExecutor for BuiltinToolExecutor {
         let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
         self.registry
             .get(&canonical)
-            .map(|tool| tool.call_mutability(&args))
+            .map(|tool| tool.classify(&args).mutability)
             .unwrap_or_else(|| self.tool_mutability(&canonical))
     }
 
@@ -432,7 +453,7 @@ impl ToolExecutor for BuiltinToolExecutor {
         let canonical = resolve_registered_tool_name(&self.registry, tool_name);
         self.registry
             .get(&canonical)
-            .map(|tool| tool.concurrency_safe())
+            .map(|tool| tool.classify(&serde_json::Value::Null).parallel_safe)
             .unwrap_or_else(|| self.tool_mutability(&canonical) == crate::ToolMutability::ReadOnly)
     }
 
@@ -441,23 +462,21 @@ impl ToolExecutor for BuiltinToolExecutor {
         let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
         self.registry
             .get(&canonical)
-            .map(|tool| tool.call_concurrency_safe(&args))
+            .map(|tool| tool.classify(&args).parallel_safe)
             .unwrap_or_else(|| self.tool_concurrency_safe(&canonical))
     }
 
     fn call_parallel_classification(&self, call: &ToolCall) -> (crate::ToolMutability, bool) {
-        // `call_mutability` and `call_concurrency_safe` each independently resolve
-        // the canonical tool name and parse the call's arguments. Computing both
-        // together here lets us do that work a single time, while returning the
-        // exact same `(mutability, concurrency_safe)` pair the two methods
-        // produce. Equivalent to calling both, but with one (not two) arg parses.
+        // One args-aware `classify` returns the (mutability, parallel_safe) pair
+        // with a single arg parse — the collapse of the former
+        // `call_mutability`/`call_concurrency_safe` pair.
         let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
         let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
         match self.registry.get(&canonical) {
-            Some(tool) => (
-                tool.call_mutability(&args),
-                tool.call_concurrency_safe(&args),
-            ),
+            Some(tool) => {
+                let class = tool.classify(&args);
+                (class.mutability, class.parallel_safe)
+            }
             None => (
                 self.tool_mutability(&canonical),
                 self.tool_concurrency_safe(&canonical),
@@ -548,6 +567,7 @@ mod tests {
     use super::*;
     use bamboo_agent_core::AgentEvent;
     use bamboo_agent_core::FunctionCall;
+    use bamboo_agent_core::ToolCtx;
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::tool_names::{normalize_tool_ref, BUILTIN_TOOL_NAMES};
     use serde_json::json;
@@ -1040,6 +1060,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
         let result = executor.execute_with_context(&call, ctx).await;
@@ -1069,6 +1090,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
         let result = executor.execute_with_context(&call, ctx).await;
@@ -1115,6 +1137,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -1152,6 +1175,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
@@ -1187,25 +1211,21 @@ mod tests {
                 json!({"type":"object","properties":{}})
             }
 
-            async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-                Ok(ToolResult {
-                    success: true,
-                    result: "ok".to_string(),
-                    display_preference: None,
-                    images: Vec::new(),
-                })
-            }
-
-            async fn execute_with_context(
+            async fn invoke(
                 &self,
-                args: serde_json::Value,
-                ctx: ToolExecutionContext<'_>,
-            ) -> Result<ToolResult, ToolError> {
+                _args: serde_json::Value,
+                ctx: ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
                 ctx.emit(AgentEvent::Token {
                     content: "stream".to_string(),
                 })
                 .await;
-                self.execute(args).await
+                Ok(ToolOutcome::Completed(ToolResult {
+                    success: true,
+                    result: "ok".to_string(),
+                    display_preference: None,
+                    images: Vec::new(),
+                }))
             }
         }
 
@@ -1227,6 +1247,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    bash_completion_sink: None,
                     pre_parsed_args: None,
                 },
             )
@@ -1271,13 +1292,17 @@ mod tests {
                 json!({"type":"object","properties":{}})
             }
 
-            async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-                Ok(ToolResult {
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: "custom-spawn-session".to_string(),
                     display_preference: None,
                     images: Vec::new(),
-                })
+                }))
             }
         }
 
@@ -1309,18 +1334,22 @@ mod tests {
         fn parameters_schema(&self) -> serde_json::Value {
             json!({"type":"object","properties":{"v":{"type":"string"}}})
         }
-        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
             let v = args
                 .get("v")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("<none>")
                 .to_string();
-            Ok(ToolResult {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: v,
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -1335,6 +1364,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: pre_parsed,
         }
     }

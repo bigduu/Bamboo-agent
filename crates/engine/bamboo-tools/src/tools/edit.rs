@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -546,16 +546,11 @@ impl Tool for EditTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Edit"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: EditArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Edit args: {}", e)))?;
 
@@ -567,7 +562,7 @@ impl Tool for EditTool {
             ));
         }
 
-        if let Some(session_id) = ctx.session_id {
+        if let Some(session_id) = ctx.session_id() {
             match read_tracker::read_state(session_id, file_path).await {
                 ReadState::Unread => {
                     return Err(ToolError::Execution(
@@ -671,12 +666,12 @@ impl Tool for EditTool {
         }
         content_diagnostics::attach_file_diagnostics(&mut payload, path, &updated);
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: payload.to_string(),
             display_preference: Some("Default".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -686,14 +681,20 @@ mod tests {
     use crate::tools::ReadTool;
     use serde_json::json;
 
+    async fn run(tool: &EditTool, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        match tool.invoke(args, ToolCtx::none("t")).await? {
+            ToolOutcome::Completed(r) => Ok(r),
+            _ => panic!("expected Completed"),
+        }
+    }
+
     #[tokio::test]
     async fn edit_requires_unique_match_without_replace_all() {
         let file = tempfile::NamedTempFile::new().unwrap();
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar"
@@ -709,8 +710,7 @@ mod tests {
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar",
@@ -730,8 +730,7 @@ mod tests {
         tokio::fs::write(file.path(), "a\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "aa",
                 "new_string": "bb",
@@ -757,8 +756,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar",
@@ -777,8 +775,7 @@ mod tests {
         tokio::fs::write(file.path(), "a\na\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "a",
                 "new_string": "b",
@@ -797,8 +794,7 @@ mod tests {
         tokio::fs::write(file.path(), "  \n  \n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "  ",
                 "new_string": "x",
@@ -823,60 +819,66 @@ mod tests {
         let read_tool = ReadTool::new();
 
         let denied = edit_tool
-            .execute_with_context(
+            .invoke(
                 json!({
                     "file_path": file.path(),
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                ToolExecutionContext {
-                    session_id: Some("session_1"),
-                    tool_call_id: call_id,
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from(call_id),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await;
         assert!(denied.is_err());
 
         let _ = read_tool
-            .execute_with_context(
+            .invoke(
                 json!({"file_path": file.path()}),
-                ToolExecutionContext {
-                    session_id: Some("session_1"),
-                    tool_call_id: call_id,
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from(call_id),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
 
         let allowed = edit_tool
-            .execute_with_context(
+            .invoke(
                 json!({
                     "file_path": file.path(),
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                ToolExecutionContext {
-                    session_id: Some("session_1"),
-                    tool_call_id: call_id,
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from(call_id),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(allowed) = allowed else {
+            panic!("expected Completed")
+        };
 
         assert!(allowed.success);
     }
@@ -887,8 +889,7 @@ mod tests {
         tokio::fs::write(file.path(), "hello").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "",
                 "new_string": "x",
@@ -907,8 +908,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "alpha\nbeta\n",
                 "new_string": "gamma\ndelta\n"
@@ -929,8 +929,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "baz",
@@ -952,8 +951,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "baz",
@@ -972,8 +970,7 @@ mod tests {
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar",
@@ -998,8 +995,7 @@ mod tests {
         .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "patch": "<<<<<<< SEARCH\nfn b() {\n    let v = 1;\n}\n=======\nfn b() {\n    let v = 2;\n}\n>>>>>>> REPLACE"
             }))
@@ -1020,8 +1016,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "patch": "<<<<<<< SEARCH\nfn b() {\n    let v = 1;\n}\n=======\nfn b() {\n    let v = 2;\n}\n>>>>>>> REPLACE"
             }))
@@ -1041,8 +1036,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "line_number": 2,
                 "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
@@ -1063,8 +1057,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "line_number": 2,
                 "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
@@ -1084,8 +1077,7 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
             }))
@@ -1114,8 +1106,7 @@ mod tests {
         let patch = format!("<<<<<<< SEARCH\n{old_block}\n=======\n{new_block}\n>>>>>>> REPLACE");
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "patch": patch
             }))
@@ -1132,8 +1123,7 @@ mod tests {
         tokio::fs::write(file.path(), "hello").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "hello",
                 "new_string": "world",
@@ -1152,8 +1142,7 @@ mod tests {
         tokio::fs::write(file.path(), "hello").await.unwrap();
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "old_string": "",
                 "new_string": "",
@@ -1175,8 +1164,7 @@ mod tests {
         let huge = "a".repeat(MAX_PATCH_BYTES + 1);
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "patch": huge
             }))
@@ -1197,8 +1185,7 @@ mod tests {
         }
 
         let tool = EditTool::new();
-        let result = tool
-            .execute(json!({
+        let result = run(&tool,json!({
                 "file_path": file.path(),
                 "patch": patch
             }))
@@ -1218,16 +1205,17 @@ mod tests {
 
         let read_tool = ReadTool::new();
         let _ = read_tool
-            .execute_with_context(
+            .invoke(
                 json!({ "file_path": file.path() }),
-                ToolExecutionContext {
-                    session_id: Some("session_edit_diag"),
-                    tool_call_id: "call_1",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session_edit_diag")),
+                    tool_call_id: std::sync::Arc::from("call_1"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
@@ -1235,24 +1223,28 @@ mod tests {
 
         let tool = EditTool::new();
         let result = tool
-            .execute_with_context(
+            .invoke(
                 json!({
                     "file_path": file.path(),
                     "old_string": r#"{"ok":true}"#,
                     "new_string": "{"
                 }),
-                ToolExecutionContext {
-                    session_id: Some("session_edit_diag"),
-                    tool_call_id: "call_2",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session_edit_diag")),
+                    tool_call_id: std::sync::Arc::from("call_2"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = result else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();

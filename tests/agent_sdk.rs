@@ -11,7 +11,7 @@ use bamboo_agent::agent::{
     builtin_tool_names, Agent, AgentBuilder, BuiltinTool, ExecuteRequestBuilder, ToolSpec,
 };
 
-use bamboo_agent_core::tools::{SharedTool, Tool, ToolError, ToolResult};
+use bamboo_agent_core::tools::{SharedTool, Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::AgentEvent;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -31,13 +31,17 @@ impl Tool for EchoTool {
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({ "type": "object", "properties": {} })
     }
-    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult {
+    async fn invoke(
+        &self,
+        _args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: "echo".to_string(),
             display_preference: None,
             images: Vec::new(),
-        })
+        }))
     }
 }
 

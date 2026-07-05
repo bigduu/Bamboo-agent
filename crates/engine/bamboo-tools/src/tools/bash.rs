@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
     preferred_bash_shell, render_command_line, trace_windows_command,
@@ -231,7 +231,7 @@ impl BashTool {
         timeout_ms: u64,
         promote_after_ms: Option<u64>,
         cwd: &Path,
-        ctx: ToolExecutionContext<'_>,
+        ctx: ToolCtx,
     ) -> Result<ToolResult, ToolError> {
         let shell = preferred_bash_shell();
         trace_windows_command(
@@ -410,9 +410,10 @@ impl BashTool {
                 stdout_lines,
                 stderr_lines,
                 command,
-                ctx.session_id.map(str::to_string),
+                ctx.session_id().map(str::to_string),
                 prepared_env.diagnostics.clone(),
                 ctx.cloned_sender(),
+                ctx.cloned_bash_completion_sink(),
             )
             .await
             .map_err(ToolError::Execution)?;
@@ -477,8 +478,11 @@ impl Tool for BashTool {
          synchronous (block until timeout), or true to force immediate background. \
          Set interactive to true to spawn in the background with a piped stdin so \
          input can be fed over time via BashInput (interactive implies background; \
-         use it only to answer an interactive prompt). Backgrounded commands are \
-         observed via BashOutput and the loop waits for them at turn end. Default \
+         use it only to answer an interactive prompt). A backgrounded command runs \
+         detached and does NOT block the loop: keep working, and when it finishes \
+         you are automatically notified with a message carrying its exit status and \
+         a tail of its output — you do NOT need to poll. Use BashOutput only when \
+         you want the full output before then; KillShell to stop it early. Default \
          timeout is 120000ms (max 600000ms); captured stdout/stderr are each \
          capped at 512KB."
     }
@@ -501,7 +505,7 @@ impl Tool for BashTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Controls execution mode. Omit (default) for auto: runs synchronously but auto-backgrounds if the command runs longer than ~10s. Set to false to force synchronous (block until timeout). Set to true to force immediate background (observe via BashOutput; the loop waits at turn end)."
+                    "description": "Controls execution mode. Omit (default) for auto: runs synchronously but auto-backgrounds if the command runs longer than ~10s. Set to false to force synchronous (block until timeout). Set to true to force immediate background: returns a bash_id at once and runs detached; you are notified with the result (exit status + output tail) when it finishes, so keep working instead of polling. BashOutput is available for the full log; KillShell stops it early."
                 },
                 "interactive": {
                     "type": "boolean",
@@ -517,16 +521,11 @@ impl Tool for BashTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Bash"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: BashArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Bash args: {}", e)))?;
 
@@ -539,7 +538,7 @@ impl Tool for BashTool {
 
         let _ = parsed.description;
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
-        let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
+        let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id());
         let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
 
         if parsed.interactive == Some(true) {
@@ -552,8 +551,9 @@ impl Tool for BashTool {
                 command,
                 Some(&cwd),
                 ctx.cloned_sender(),
-                ctx.session_id.map(str::to_string),
+                ctx.session_id().map(str::to_string),
                 true,
+                ctx.cloned_bash_completion_sink(),
             )
             .await
             .map_err(ToolError::Execution)?;
@@ -569,7 +569,7 @@ impl Tool for BashTool {
                 });
             }
 
-            return Ok(ToolResult {
+            return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: json!({
                     "bash_id": shell.id,
@@ -582,7 +582,7 @@ impl Tool for BashTool {
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
-            });
+            }));
         }
 
         match parsed.run_in_background {
@@ -592,8 +592,9 @@ impl Tool for BashTool {
                     command,
                     Some(&cwd),
                     ctx.cloned_sender(),
-                    ctx.session_id.map(str::to_string),
+                    ctx.session_id().map(str::to_string),
                     false,
+                    ctx.cloned_bash_completion_sink(),
                 )
                 .await
                 .map_err(ToolError::Execution)?;
@@ -609,7 +610,7 @@ impl Tool for BashTool {
                     });
                 }
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({
                         "bash_id": shell.id,
@@ -621,7 +622,7 @@ impl Tool for BashTool {
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
             Some(false) => {
                 // Force synchronous — pure foreground, no promotion (issue #84,
@@ -629,6 +630,7 @@ impl Tool for BashTool {
                 // exactly like the pre-2d behavior.
                 self.run_streaming_command(command, timeout_ms, None, &cwd, ctx)
                     .await
+                    .map(ToolOutcome::Completed)
             }
             None => {
                 // Auto-sync promotion (issue #84, phase 2d). Runs foreground but
@@ -645,6 +647,7 @@ impl Tool for BashTool {
                 };
                 self.run_streaming_command(command, timeout_ms, promote_after_ms, &cwd, ctx)
                     .await
+                    .map(ToolOutcome::Completed)
             }
         }
     }
@@ -654,7 +657,7 @@ impl Tool for BashTool {
 mod tests {
     use super::*;
     use bamboo_agent_core::tools::ToolExecutionSessionFlags;
-    use bamboo_agent_core::AgentEvent;
+    use bamboo_agent_core::{AgentEvent, ToolExecutionContext};
     use bamboo_infrastructure::process::{
         clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
         CommandEnvironmentDiagnostics, CommandEnvironmentSource, PythonDiscoveryDiagnostics,
@@ -724,8 +727,8 @@ mod tests {
         let tool = BashTool::new();
         let (tx, mut rx) = mpsc::channel(32);
 
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({
                     "command": mixed_output_command()
                 }),
@@ -736,11 +739,16 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    bash_completion_sink: None,
                     pre_parsed_args: None,
-                },
+                }
+                .to_tool_ctx(),
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
 
@@ -792,13 +800,19 @@ mod tests {
         prime_test_command_environment();
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({
-                "command": invalid_utf8_stderr_command()
-            }))
+            .invoke(
+                json!({
+                    "command": invalid_utf8_stderr_command()
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_ok(), "invalid UTF-8 stderr should not fail");
-        let payload: Value = serde_json::from_str(&result.unwrap().result).unwrap();
+        let ToolOutcome::Completed(result) = result.unwrap() else {
+            panic!("expected Completed")
+        };
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
         let stderr = payload["stderr"].as_str().unwrap_or_default();
         assert!(!stderr.is_empty());
     }
@@ -808,12 +822,18 @@ mod tests {
     async fn bash_foreground_failure_includes_full_python_tried_list() {
         prime_test_command_environment();
         let tool = BashTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "false"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "false"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(!result.success);
         let payload: Value = serde_json::from_str(&result.result).unwrap();
@@ -827,12 +847,18 @@ mod tests {
     async fn bash_foreground_sets_stdout_truncated_when_output_exceeds_cap() {
         prime_test_command_environment();
         let tool = BashTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "i=0; while [ $i -lt 70000 ]; do printf 'aaaaaaaaaa'; i=$((i+1)); done; printf '\\n'"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "i=0; while [ $i -lt 70000 ]; do printf 'aaaaaaaaaa'; i=$((i+1)); done; printf '\\n'"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["timed_out"], false);
@@ -844,14 +870,20 @@ mod tests {
     async fn bash_background_honors_explicit_timeout() {
         prime_test_command_environment();
         let tool = BashTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "sleep 2",
-                "run_in_background": true,
-                "timeout": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "sleep 2",
+                    "run_in_background": true,
+                    "timeout": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["environment"]["source"], "process_env");
         assert_eq!(
@@ -886,7 +918,7 @@ mod tests {
     async fn bash_background_emits_completion_event_with_exit_code() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -919,7 +951,7 @@ mod tests {
     async fn bash_background_emits_completion_event_for_failing_command() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -951,7 +983,7 @@ mod tests {
     async fn bash_background_emits_killed_when_shell_is_killed() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
         let expected_id = shell.id.clone();
@@ -984,7 +1016,7 @@ mod tests {
     #[tokio::test]
     async fn bash_background_without_sender_still_completes() {
         prime_test_command_environment();
-        let shell = super::bash_runtime::spawn_background("true", None, None, None, false)
+        let shell = super::bash_runtime::spawn_background("true", None, None, None, false, None)
             .await
             .expect("background shell should spawn");
 
@@ -1016,7 +1048,7 @@ mod tests {
         })
         .expect("prefill channel slot");
 
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false)
+        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
             .await
             .expect("background shell should spawn");
 
@@ -1065,12 +1097,19 @@ mod tests {
             ToolExecutionSessionFlags::default(),
             true,
             None,
+            None,
         );
 
-        let result = tool
-            .execute_with_context(json!({ "command": "true", "run_in_background": true }), ctx)
+        let out = tool
+            .invoke(
+                json!({ "command": "true", "run_in_background": true }),
+                ctx.to_tool_ctx(),
+            )
             .await
             .expect("background dispatch should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
@@ -1109,8 +1148,8 @@ mod tests {
         let session_id = format!("session_{}", uuid::Uuid::new_v4());
         super::workspace_state::set_workspace(&session_id, base.canonicalize().unwrap());
 
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({
                     "command": "pwd",
                     "workdir": "nested"
@@ -1122,11 +1161,16 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     can_async_resume: false,
+                    bash_completion_sink: None,
                     pre_parsed_args: None,
-                },
+                }
+                .to_tool_ctx(),
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         let expected =
@@ -1141,10 +1185,13 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
 
         let result = tool
-            .execute(json!({
-                "command": "echo hello",
-                "workdir": file.path()
-            }))
+            .invoke(
+                json!({
+                    "command": "echo hello",
+                    "workdir": file.path()
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(
@@ -1167,6 +1214,7 @@ mod tests {
             None,
             Some("sess-A".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn a1");
@@ -1176,6 +1224,7 @@ mod tests {
             None,
             Some("sess-A".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn a2");
@@ -1186,11 +1235,12 @@ mod tests {
             None,
             Some("sess-B".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn b");
         // An untagged (None) long-running shell.
-        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None, false)
+        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None, false, None)
             .await
             .expect("spawn untagged");
         // A sess-A shell that completes immediately — must be excluded once done.
@@ -1200,6 +1250,7 @@ mod tests {
             None,
             Some("sess-A".to_string()),
             false,
+            None,
         )
         .await
         .expect("spawn done");
@@ -1254,13 +1305,17 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             can_async_resume: false,
+            bash_completion_sink: None,
             pre_parsed_args: None,
         };
 
-        let result = tool
-            .execute_with_context(json!({ "command": "echo auto-fast-output" }), ctx)
+        let out = tool
+            .invoke(json!({ "command": "echo auto-fast-output" }), ctx.to_tool_ctx())
             .await
             .expect("auto fast command should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert!(
@@ -1296,6 +1351,7 @@ mod tests {
             // promotion directly via run_streaming_command(Some(200)).
             true,
             None,
+            None,
         );
         let cwd = super::workspace_state::workspace_or_process_cwd(Some(session_id));
 
@@ -1304,7 +1360,7 @@ mod tests {
         // on the production 10s default or the None dispatch arm's
         // `can_async_resume` gating.
         let result = tool
-            .run_streaming_command("sleep 10", 60000, Some(200), &cwd, ctx)
+            .run_streaming_command("sleep 10", 60000, Some(200), &cwd, ctx.to_tool_ctx())
             .await
             .expect("auto promote should succeed");
 
@@ -1353,14 +1409,20 @@ mod tests {
         prime_test_command_environment();
         let tool = BashTool::new();
 
-        let result = tool
-            .execute(json!({
-                "command": "sleep 10",
-                "run_in_background": false,
-                "timeout": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "sleep 10",
+                    "run_in_background": false,
+                    "timeout": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("force-sync should produce a timed-out result");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert!(
@@ -1384,13 +1446,19 @@ mod tests {
         prime_test_command_environment();
         let tool = BashTool::new();
 
-        let result = tool
-            .execute(json!({
-                "command": "sleep 10",
-                "timeout": 50
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "sleep 10",
+                    "timeout": 50
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("non-resume-capable auto path should produce a result");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert!(
@@ -1436,6 +1504,7 @@ mod tests {
             Some("session_seed_test".to_string()),
             test_environment_diagnostics(),
             None,
+            None,
         )
         .await
         .expect("adopt should succeed");
@@ -1452,5 +1521,159 @@ mod tests {
 
         let _ = session.kill().await;
         let _ = super::bash_runtime::remove_shell(&session.id);
+    }
+
+    // ── Phase 2b follow-up: loop-facing completion push (BashCompletionSink) ──
+
+    /// A `BashCompletionSink` that records every completion it receives, so a
+    /// test can assert the producer pushed the right info + output tail.
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        received: std::sync::Arc<std::sync::Mutex<Vec<bamboo_agent_core::BashCompletionInfo>>>,
+    }
+
+    impl bamboo_agent_core::BashCompletionSink for RecordingSink {
+        fn on_bash_completed(&self, info: bamboo_agent_core::BashCompletionInfo) {
+            self.received.lock().unwrap().push(info);
+        }
+    }
+
+    async fn wait_for_sink(
+        recorder: &RecordingSink,
+        what: &str,
+    ) -> bamboo_agent_core::BashCompletionInfo {
+        let started = Instant::now();
+        loop {
+            if let Some(info) = recorder.received.lock().unwrap().first().cloned() {
+                return info;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("completion sink was not called for {what}");
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn background_completion_pushes_to_sink_with_output_tail() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        let shell = super::bash_runtime::spawn_background(
+            "echo hello-sink",
+            None,
+            None,
+            Some("sess-sink".to_string()),
+            false,
+            Some(sink),
+        )
+        .await
+        .expect("spawn");
+
+        let info = wait_for_sink(&recorder, "echo").await;
+        assert_eq!(info.session_id, "sess-sink");
+        assert_eq!(info.bash_id, shell.id);
+        assert_eq!(info.status, "completed");
+        assert_eq!(info.exit_code, Some(0));
+        assert!(
+            info.output_tail.contains("hello-sink"),
+            "output tail should carry the command output, got: {:?}",
+            info.output_tail
+        );
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+
+    #[tokio::test]
+    async fn background_completion_carries_nonzero_exit_code() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        let shell = super::bash_runtime::spawn_background(
+            "exit 3",
+            None,
+            None,
+            Some("sess-exit".to_string()),
+            false,
+            Some(sink),
+        )
+        .await
+        .expect("spawn");
+
+        let info = wait_for_sink(&recorder, "exit 3").await;
+        assert_eq!(info.status, "completed");
+        assert_eq!(info.exit_code, Some(3));
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+
+    /// A killed background shell pushes to the sink with `status="killed"` — this
+    /// drives the event-driven completion task's `select!` kill branch (kill_notify
+    /// → start_kill → wait) all the way through to the loop-facing push, so the
+    /// owning loop is notified even when the shell was terminated rather than
+    /// exiting on its own.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn killed_background_shell_pushes_killed_to_sink() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        let shell = super::bash_runtime::spawn_background(
+            "sleep 30",
+            None,
+            None,
+            Some("sess-kill".to_string()),
+            false,
+            Some(sink),
+        )
+        .await
+        .expect("spawn");
+
+        shell.kill().await.expect("shell should be killable");
+
+        let info = wait_for_sink(&recorder, "killed sleep").await;
+        assert_eq!(info.session_id, "sess-kill");
+        assert_eq!(info.bash_id, shell.id);
+        assert_eq!(info.status, "killed");
+        assert_eq!(info.exit_code, None);
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+
+    #[tokio::test]
+    async fn untagged_shell_does_not_invoke_sink() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        // session_id = None → no owning loop to notify → the sink must not fire,
+        // even though it is wired.
+        let shell =
+            super::bash_runtime::spawn_background("true", None, None, None, false, Some(sink))
+                .await
+                .expect("spawn");
+
+        let started = Instant::now();
+        while shell.status() == "running" {
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("shell never completed");
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        // Give the poll task's post-exit emit path time to run.
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            recorder.received.lock().unwrap().is_empty(),
+            "an untagged (session-less) shell must not push a completion"
+        );
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
     }
 }

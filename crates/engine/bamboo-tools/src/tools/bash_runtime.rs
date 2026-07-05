@@ -1,4 +1,4 @@
-use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::{AgentEvent, BashCompletionInfo, BashCompletionSink};
 use bamboo_infrastructure::process::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
     preferred_bash_shell, trace_windows_command, CommandEnvironmentDiagnostics,
@@ -15,6 +15,7 @@ use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
@@ -23,6 +24,13 @@ use tracing::warn;
 /// can't balloon memory before it promotes (issue #84, phase 2d).
 pub(crate) const MAX_OUTPUT_LINES: usize = 20_000;
 const COMPLETED_SESSION_TTL_SECS: u64 = 300;
+/// Trailing captured lines carried on a background-Bash completion push so the
+/// model sees the result without a mandatory `BashOutput` round-trip (issue #84
+/// Phase 2b follow-up). The full output is still available via `BashOutput`.
+const COMPLETION_TAIL_LINES: usize = 50;
+/// Byte ceiling on that tail; the most recent bytes are kept (front-trimmed on a
+/// char boundary) so a chatty final line can't bloat the injected message.
+const COMPLETION_TAIL_MAX_BYTES: usize = 4096;
 /// Upper bound on a single `write_stdin` so a wedged consumer (full pipe
 /// buffer, child not draining) cannot pin the stdin mutex — and thus block any
 /// queued writer — indefinitely. A timeout surfaces a clear error instead.
@@ -37,7 +45,12 @@ pub struct ShellSession {
     /// per-session. `None` means the shell is untagged (e.g. spawned from tests).
     pub session_id: Option<String>,
     pub environment: CommandEnvironmentDiagnostics,
-    child: Arc<Mutex<Child>>,
+    /// Kill request for the still-running child. The child handle itself is owned
+    /// by the completion task, which awaits its exit via `child.wait()` (truly
+    /// event-driven — no polling). Because that task holds the handle across the
+    /// await, a kill cannot lock the handle without deadlocking; instead `kill()`
+    /// fires this `Notify` and the completion task's `select!` reaps the child.
+    kill_notify: Arc<Notify>,
     /// Retained stdin handle for an interactive shell (issue #89). `Some` only
     /// when the shell was spawned with `interactive: true` (a piped stdin);
     /// `None` for every non-interactive shell so the default EOF-on-read
@@ -89,13 +102,16 @@ impl ShellSession {
         (new_lines, next_cursor, dropped_lines)
     }
 
+    /// Request termination of the background shell. Flips `running` optimistically
+    /// so [`Self::status`] reflects the kill immediately, then signals the
+    /// completion task (the sole owner of the child handle) to `start_kill` and
+    /// reap. The real exit code + the completion event/push are recorded by that
+    /// task when the process is reaped. Never locks the child handle — see
+    /// [`ShellSession::kill_notify`].
+    #[allow(clippy::unused_async)] // async kept: callers `.await` it; symmetry with the other handle ops.
     pub async fn kill(&self) -> Result<(), String> {
-        let mut child = self.child.lock().await;
-        child
-            .kill()
-            .await
-            .map_err(|e| format!("Failed to kill shell '{}': {}", self.id, e))?;
         self.running.store(false, Ordering::Relaxed);
+        self.kill_notify.notify_one();
         Ok(())
     }
 
@@ -203,12 +219,14 @@ async fn pump_stream_lines<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_background(
     command: &str,
     cwd: Option<&Path>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
     session_id: Option<String>,
     interactive: bool,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
 ) -> Result<Arc<ShellSession>, String> {
     let shell = preferred_bash_shell();
     trace_windows_command(
@@ -263,13 +281,14 @@ pub async fn spawn_background(
     let base_index = Arc::new(Mutex::new(0usize));
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(Mutex::new(None));
+    let kill_notify = Arc::new(Notify::new());
 
     let session = Arc::new(ShellSession {
         id: shell_id.clone(),
         command: command.to_string(),
         session_id,
         environment: prepared_env.diagnostics.clone(),
-        child: Arc::new(Mutex::new(child)),
+        kill_notify: kill_notify.clone(),
         stdin: Arc::new(Mutex::new(stdin_handle)),
         output: output.clone(),
         base_index: base_index.clone(),
@@ -277,29 +296,34 @@ pub async fn spawn_background(
         exit_code: exit_code.clone(),
     });
 
-    {
+    let stdout_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
         tokio::spawn(async move {
             pump_stream_lines("stdout", stdout, output, base_index).await;
-        });
-    }
+        })
+    };
 
-    {
+    let stderr_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
         tokio::spawn(async move {
             pump_stream_lines("stderr", stderr, output, base_index).await;
-        });
-    }
+        })
+    };
 
     spawn_completion_poll(
-        session.child.clone(),
+        child,
+        kill_notify,
         shell_id.clone(),
         command.to_string(),
         running,
         exit_code,
+        output.clone(),
+        session.session_id.clone(),
         event_tx,
+        bash_completion_sink,
+        vec![stdout_pump, stderr_pump],
     );
 
     sessions().insert(shell_id, session.clone());
@@ -308,49 +332,57 @@ pub async fn spawn_background(
 
 /// Shared completion-poll task. Polls the child until it exits, then sets the
 /// exit code/running flags, emits a `BashCompleted` event (when a sender is
-/// wired), and GCs the shell from the registry after the TTL. Used by both
-/// [`spawn_background`] and [`adopt_running_child`] so the poll/emit logic is
-/// never duplicated (issue #84, phase 2d).
+/// wired), pushes a loop-facing completion into the owning session via
+/// `bash_completion_sink` (when wired and the shell is session-tagged), and GCs
+/// the shell from the registry after the TTL. Used by both [`spawn_background`]
+/// and [`adopt_running_child`] so the poll/emit logic is never duplicated
+/// (issue #84, phase 2d + Phase 2b follow-up).
+#[allow(clippy::too_many_arguments)]
 fn spawn_completion_poll(
-    child: Arc<Mutex<Child>>,
+    mut child: Child,
+    kill_notify: Arc<Notify>,
     shell_id: String,
     command: String,
     running: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    output: Arc<Mutex<Vec<String>>>,
+    session_id: Option<String>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
+    // Stdout/stderr pump task handles. Awaited (bounded) before reading the
+    // completion tail so it reflects the fully-drained output — observing exit
+    // can race the pumps that are still flushing the final lines.
+    pump_handles: Vec<tokio::task::JoinHandle<()>>,
 ) {
     let session_id_for_gc = shell_id.clone();
-    let bash_id_for_event = shell_id;
-    let command_for_event = command;
+    let bash_id_for_event = shell_id.clone();
+    let bash_id_for_sink = shell_id;
+    let command_for_event = command.clone();
+    let command_for_sink = command;
     tokio::spawn(async move {
-        let (status_str, exit_code_value) = loop {
-            let poll = {
-                let mut guard = child.lock().await;
-                guard.try_wait()
-            };
-            match poll {
-                Ok(Some(status)) => {
-                    let code = status.code();
-                    *exit_code.lock().await = code;
-                    running.store(false, Ordering::Relaxed);
-                    break (
-                        if code.is_none() {
-                            "killed"
-                        } else {
-                            "completed"
-                        },
-                        code,
-                    );
-                }
-                Ok(None) => {
-                    sleep(Duration::from_millis(100)).await;
-                }
-                Err(_) => {
-                    running.store(false, Ordering::Relaxed);
-                    break ("error", None);
-                }
+        // Event-driven exit detection: await the process directly (`child.wait()`
+        // is OS-notified via tokio's process driver — no polling). A kill request
+        // (`kill_notify`, fired by `ShellSession::kill`) races the natural exit via
+        // `select!`; whichever wins, we then reap and read the exit status. This
+        // task owns the child handle, so no lock is contended and no killer blocks.
+        let wait_result = tokio::select! {
+            result = child.wait() => result,
+            _ = kill_notify.notified() => {
+                let _ = child.start_kill();
+                child.wait().await
             }
         };
+        let (status_str, exit_code_value) = match wait_result {
+            Ok(status) => {
+                let code = status.code();
+                // `code.is_none()` ⇒ terminated by signal (our SIGKILL, or an
+                // external one) ⇒ "killed"; otherwise a normal exit ⇒ "completed".
+                (if code.is_none() { "killed" } else { "completed" }, code)
+            }
+            Err(_) => ("error", None),
+        };
+        *exit_code.lock().await = exit_code_value;
+        running.store(false, Ordering::Relaxed);
 
         // Phase 1 (issue #84): emit a completion signal so clients can react
         // to a long-running background command finishing. This is the ONLY
@@ -377,9 +409,50 @@ fn spawn_completion_poll(
             }
         }
 
+        // Loop-facing completion push (issue #84 Phase 2b follow-up): deliver the
+        // result into the owning session's agent loop the same way a sub-agent
+        // completion is delivered — pushed, not polled. Only when a sink is wired
+        // AND the shell is session-tagged (untagged shells, e.g. from tests, have
+        // no loop to notify). The sink hands off to a detached task, so this call
+        // is cheap. It is best-effort and idempotent with the durable end-of-turn
+        // suspend/poll backstop, which still runs.
+        if let (Some(sink), Some(session_id)) = (bash_completion_sink, session_id) {
+            // Wait (bounded) for the pumps to reach EOF so the tail is complete;
+            // the child's pipes close on exit, so this is the fast common case.
+            for handle in pump_handles {
+                let _ = timeout(Duration::from_secs(1), handle).await;
+            }
+            let output_tail = output_tail(&output).await;
+            sink.on_bash_completed(BashCompletionInfo {
+                session_id,
+                bash_id: bash_id_for_sink,
+                command: command_for_sink,
+                exit_code: exit_code_value,
+                status: status_str.to_string(),
+                output_tail,
+            });
+        }
+
         sleep(Duration::from_secs(COMPLETED_SESSION_TTL_SECS)).await;
         let _ = remove_shell(&session_id_for_gc);
     });
+}
+
+/// Join the last [`COMPLETION_TAIL_LINES`] captured lines into a byte-bounded
+/// tail for a completion push, keeping the most recent bytes (front-trimmed on a
+/// char boundary) when over [`COMPLETION_TAIL_MAX_BYTES`].
+async fn output_tail(output: &Arc<Mutex<Vec<String>>>) -> String {
+    let buffer = output.lock().await;
+    let start = buffer.len().saturating_sub(COMPLETION_TAIL_LINES);
+    let joined = buffer[start..].join("\n");
+    if joined.len() <= COMPLETION_TAIL_MAX_BYTES {
+        return joined;
+    }
+    let mut cut = joined.len() - COMPLETION_TAIL_MAX_BYTES;
+    while cut < joined.len() && !joined.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("…{}", &joined[cut..])
 }
 
 /// Adopt a child process that was spawned and partially drained by the
@@ -403,12 +476,14 @@ pub async fn adopt_running_child(
     session_id: Option<String>,
     environment: CommandEnvironmentDiagnostics,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
 ) -> Result<Arc<ShellSession>, String> {
     let shell_id = uuid::Uuid::new_v4().to_string();
     let output = Arc::new(Mutex::new(Vec::new()));
     let base_index = Arc::new(Mutex::new(0usize));
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(Mutex::new(None));
+    let kill_notify = Arc::new(Notify::new());
 
     // Seed the output buffer with already-captured lines so they are not lost
     // across the foreground→background hand-off. Lines captured by the
@@ -423,7 +498,7 @@ pub async fn adopt_running_child(
         command: command.to_string(),
         session_id,
         environment,
-        child: Arc::new(Mutex::new(child)),
+        kill_notify: kill_notify.clone(),
         // The foreground streamer always spawns with Stdio::null() (bash.rs), so
         // a promoted shell has no stdin pipe — None preserves EOF-on-read.
         stdin: Arc::new(Mutex::new(None)),
@@ -437,28 +512,33 @@ pub async fn adopt_running_child(
     // readers may still hold buffered data from the foreground phase — wrapping
     // them in a new BufReader (as pump_stream_lines does) reads through that
     // buffer first, so no data is lost or double-counted.
-    {
+    let stdout_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
         tokio::spawn(async move {
             pump_stream_lines("stdout", stdout_reader, output, base_index).await;
-        });
-    }
-    {
+        })
+    };
+    let stderr_pump = {
         let output = output.clone();
         let base_index = base_index.clone();
         tokio::spawn(async move {
             pump_stream_lines("stderr", stderr_reader, output, base_index).await;
-        });
-    }
+        })
+    };
 
     spawn_completion_poll(
-        session.child.clone(),
+        child,
+        kill_notify,
         shell_id.clone(),
         command.to_string(),
         running,
         exit_code,
+        output.clone(),
+        session.session_id.clone(),
         event_tx,
+        bash_completion_sink,
+        vec![stdout_pump, stderr_pump],
     );
 
     sessions().insert(shell_id, session.clone());

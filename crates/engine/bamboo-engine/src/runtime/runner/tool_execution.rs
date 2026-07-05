@@ -141,6 +141,7 @@ async fn execute_and_apply_single_tool_call(
                 tool_name
             );
             let outcome = per_call::ToolExecutionOutcome {
+                needs_human: None,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
@@ -197,6 +198,7 @@ async fn execute_and_apply_single_tool_call(
                     policy_error
                 );
                 per_call::ToolExecutionOutcome {
+                    needs_human: None,
                     result: Err(policy_error),
                     tool_duration: std::time::Duration::ZERO,
                 }
@@ -229,6 +231,7 @@ async fn execute_and_apply_single_tool_call(
                 message
             );
             per_call::ToolExecutionOutcome {
+                needs_human: None,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
             }
@@ -547,6 +550,7 @@ pub(crate) async fn execute_round_tool_calls(
                         .await
                         .unwrap_or_else(|_| {
                             per_call::ToolExecutionOutcome {
+                                needs_human: None,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
                                     tool_call.function.name, timeout
@@ -568,6 +572,7 @@ pub(crate) async fn execute_round_tool_calls(
                 batch
                     .iter()
                     .map(|_batch_call| per_call::ToolExecutionOutcome {
+                        needs_human: None,
                         result: Err(format!(
                             "Parallel batch timed out after {:?}",
                             batch_timeout

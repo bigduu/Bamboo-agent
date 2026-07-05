@@ -266,6 +266,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -296,6 +297,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -325,6 +327,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -374,6 +377,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -404,6 +408,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -430,6 +435,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -472,6 +478,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -500,6 +507,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -529,6 +537,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -578,6 +587,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -605,6 +615,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -631,6 +642,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -660,6 +672,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -703,6 +716,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -726,6 +740,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )
@@ -756,6 +771,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             },
         )

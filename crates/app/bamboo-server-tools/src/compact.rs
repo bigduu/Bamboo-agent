@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -42,7 +42,15 @@ impl Tool for CompactContextTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::MUTATING_SERIAL.promotable()
+    }
+
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: CompactContextArgs = serde_json::from_value(args.clone()).map_err(|e| {
             ToolError::Execution(format!("invalid arguments for compact_context: {e}"))
         })?;
@@ -54,7 +62,7 @@ impl Tool for CompactContextTool {
             .map(|i| format!(" with instructions: {i}"))
             .unwrap_or_default();
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: format!(
                 "Context compression requested{}. Compression will be applied before the next turn.",
@@ -62,15 +70,7 @@ impl Tool for CompactContextTool {
             ),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: serde_json::Value,
-        _ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        self.execute(args).await
+        }))
     }
 }
 
@@ -81,10 +81,13 @@ mod tests {
     #[tokio::test]
     async fn execute_without_instructions() {
         let tool = CompactContextTool;
-        let result = tool
-            .execute(serde_json::json!({}))
+        let out = tool
+            .invoke(serde_json::json!({}), ToolCtx::none("t"))
             .await
-            .expect("execute should succeed");
+            .expect("invoke should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert_eq!(
@@ -97,12 +100,18 @@ mod tests {
     #[tokio::test]
     async fn execute_with_instructions() {
         let tool = CompactContextTool;
-        let result = tool
-            .execute(serde_json::json!({
-                "instructions": "Preserve all function signatures"
-            }))
+        let out = tool
+            .invoke(
+                serde_json::json!({
+                    "instructions": "Preserve all function signatures"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
-            .expect("execute should succeed");
+            .expect("invoke should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(result
@@ -113,12 +122,18 @@ mod tests {
     #[tokio::test]
     async fn execute_with_empty_instructions() {
         let tool = CompactContextTool;
-        let result = tool
-            .execute(serde_json::json!({
-                "instructions": ""
-            }))
+        let out = tool
+            .invoke(
+                serde_json::json!({
+                    "instructions": ""
+                }),
+                ToolCtx::none("t"),
+            )
             .await
-            .expect("execute should succeed");
+            .expect("invoke should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(!result.result.contains("with instructions"));
@@ -127,12 +142,18 @@ mod tests {
     #[tokio::test]
     async fn execute_with_null_instructions() {
         let tool = CompactContextTool;
-        let result = tool
-            .execute(serde_json::json!({
-                "instructions": null
-            }))
+        let out = tool
+            .invoke(
+                serde_json::json!({
+                    "instructions": null
+                }),
+                ToolCtx::none("t"),
+            )
             .await
-            .expect("execute should succeed");
+            .expect("invoke should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(!result.result.contains("with instructions"));
@@ -141,25 +162,31 @@ mod tests {
     #[tokio::test]
     async fn execute_with_invalid_args_returns_error() {
         let tool = CompactContextTool;
-        let result = tool.execute(serde_json::json!("not an object")).await;
+        let result = tool
+            .invoke(serde_json::json!("not an object"), ToolCtx::none("t"))
+            .await;
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            ToolError::Execution(msg) => assert!(msg.contains("invalid arguments")),
-            other => panic!("expected Execution error, got: {other:?}"),
+        match result {
+            Err(ToolError::Execution(msg)) => assert!(msg.contains("invalid arguments")),
+            Err(other) => panic!("expected Execution error, got: {other:?}"),
+            Ok(_) => panic!("expected error"),
         }
     }
 
     #[tokio::test]
     async fn execute_with_context_delegates_to_execute() {
         let tool = CompactContextTool;
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 serde_json::json!({"instructions": "keep task status"}),
-                ToolExecutionContext::none("call_123"),
+                ToolCtx::none("call_123"),
             )
             .await
-            .expect("execute_with_context should succeed");
+            .expect("invoke should succeed");
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         assert!(result.success);
         assert!(result.result.contains("keep task status"));

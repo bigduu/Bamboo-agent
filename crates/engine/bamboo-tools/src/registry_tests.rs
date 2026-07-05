@@ -3,7 +3,9 @@
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use bamboo_agent_core::{RegistryError, Tool, ToolError, ToolRegistry, ToolResult};
+    use bamboo_agent_core::{
+        RegistryError, Tool, ToolCtx, ToolError, ToolOutcome, ToolRegistry, ToolResult,
+    };
     use serde_json::json;
 
     // Test tool implementations
@@ -54,18 +56,22 @@ mod tests {
             })
         }
 
-        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
             if self.should_fail {
                 return Err(ToolError::Execution("Intentional failure".to_string()));
             }
 
             let input = args["input"].as_str().unwrap_or("default");
-            Ok(ToolResult {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: format!("Processed: {}", input),
                 display_preference: Some("text".to_string()),
                 images: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -98,7 +104,11 @@ mod tests {
             })
         }
 
-        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
             let a = args["a"]
                 .as_f64()
                 .ok_or_else(|| ToolError::InvalidArguments("Missing or invalid 'a'".to_string()))?;
@@ -127,12 +137,12 @@ mod tests {
                 }
             };
 
-            Ok(ToolResult {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: result.to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -231,10 +241,13 @@ mod tests {
                 .unwrap();
 
             let tool = registry.get("processor").unwrap();
-            let result = tool.execute(json!({"input": "hello"})).await;
-
-            assert!(result.is_ok());
-            let tool_result = result.unwrap();
+            let out = tool
+                .invoke(json!({"input": "hello"}), ToolCtx::none("t"))
+                .await
+                .unwrap();
+            let ToolOutcome::Completed(tool_result) = out else {
+                panic!("expected Completed")
+            };
             assert!(tool_result.success);
             assert_eq!(tool_result.result, "Processed: hello");
         }
@@ -247,7 +260,7 @@ mod tests {
                 .unwrap();
 
             let tool = registry.get("failing_tool").unwrap();
-            let result = tool.execute(json!({})).await;
+            let result = tool.invoke(json!({}), ToolCtx::none("t")).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(ToolError::Execution(_))));
@@ -259,14 +272,20 @@ mod tests {
             registry.register(CalculatorTool).unwrap();
 
             let tool = registry.get("calculator").unwrap();
-            let result = tool
-                .execute(json!({
-                    "a": 10.0,
-                    "b": 5.0,
-                    "operation": "add"
-                }))
+            let out = tool
+                .invoke(
+                    json!({
+                        "a": 10.0,
+                        "b": 5.0,
+                        "operation": "add"
+                    }),
+                    ToolCtx::none("t"),
+                )
                 .await
                 .unwrap();
+            let ToolOutcome::Completed(result) = out else {
+                panic!("expected Completed")
+            };
 
             assert!(result.success);
             assert_eq!(result.result, "15");
@@ -279,11 +298,14 @@ mod tests {
 
             let tool = registry.get("calculator").unwrap();
             let result = tool
-                .execute(json!({
-                    "a": 10.0,
-                    "b": 0.0,
-                    "operation": "divide"
-                }))
+                .invoke(
+                    json!({
+                        "a": 10.0,
+                        "b": 0.0,
+                        "operation": "divide"
+                    }),
+                    ToolCtx::none("t"),
+                )
                 .await;
 
             assert!(result.is_err());
@@ -296,11 +318,14 @@ mod tests {
 
             let tool = registry.get("calculator").unwrap();
             let result = tool
-                .execute(json!({
-                    "a": "not a number",
-                    "b": 5.0,
-                    "operation": "add"
-                }))
+                .invoke(
+                    json!({
+                        "a": "not a number",
+                        "b": 5.0,
+                        "operation": "add"
+                    }),
+                    ToolCtx::none("t"),
+                )
                 .await;
 
             assert!(result.is_err());

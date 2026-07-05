@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_config::cluster_fabric::{Node, NodePlacement};
 use bamboo_config::Config;
 
@@ -246,25 +246,17 @@ impl Tool for ClusterTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
-            .await
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: Value,
-        _ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+    async fn invoke(&self, args: Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         let parsed: ClusterArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid cluster args: {e}")))?;
-        match parsed {
+        let result = match parsed {
             ClusterArgs::List => self.list().await,
             ClusterArgs::Describe { node } => self.describe(&node).await,
             ClusterArgs::Status { node } => self.status(&node).await,
             ClusterArgs::Deploy { node, echo } => self.deploy(&node, echo).await,
             ClusterArgs::Stop { node } => self.stop(&node).await,
-        }
+        }?;
+        Ok(ToolOutcome::Completed(result))
     }
 }
 

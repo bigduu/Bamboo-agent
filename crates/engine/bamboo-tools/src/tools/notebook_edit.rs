@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -121,7 +121,11 @@ impl Tool for NotebookEditTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: NotebookEditArgs = serde_json::from_value(args).map_err(|e| {
             ToolError::InvalidArguments(format!("Invalid NotebookEdit args: {}", e))
         })?;
@@ -222,12 +226,12 @@ impl Tool for NotebookEditTool {
             &updated,
         );
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: payload,
             display_preference: Some("Default".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -275,11 +279,14 @@ mod tests {
 
         let tool = NotebookEditTool::new();
         let result = tool
-            .execute(json!({
-                "notebook_path": file.path(),
-                "edit_mode": "replace",
-                "new_source": "updated"
-            }))
+            .invoke(
+                json!({
+                    "notebook_path": file.path(),
+                    "edit_mode": "replace",
+                    "new_source": "updated"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cell_id")));
@@ -292,11 +299,14 @@ mod tests {
 
         let tool = NotebookEditTool::new();
         let result = tool
-            .execute(json!({
-                "notebook_path": file.path(),
-                "edit_mode": "delete",
-                "new_source": ""
-            }))
+            .invoke(
+                json!({
+                    "notebook_path": file.path(),
+                    "edit_mode": "delete",
+                    "new_source": ""
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cell_id")));
@@ -308,15 +318,21 @@ mod tests {
         write_notebook(file.path()).await;
 
         let tool = NotebookEditTool::new();
-        let result = tool
-            .execute(json!({
-                "notebook_path": file.path(),
-                "edit_mode": "insert",
-                "cell_type": "markdown",
-                "new_source": "appended cell"
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "notebook_path": file.path(),
+                    "edit_mode": "insert",
+                    "cell_type": "markdown",
+                    "new_source": "appended cell"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         let updated: Value =
@@ -336,13 +352,16 @@ mod tests {
 
         let tool = NotebookEditTool::new();
         let result = tool
-            .execute(json!({
-                "notebook_path": file.path(),
-                "edit_mode": "insert",
-                "cell_id": "does-not-exist",
-                "cell_type": "code",
-                "new_source": "print('x')"
-            }))
+            .invoke(
+                json!({
+                    "notebook_path": file.path(),
+                    "edit_mode": "insert",
+                    "cell_id": "does-not-exist",
+                    "cell_type": "code",
+                    "new_source": "print('x')"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(matches!(result, Err(ToolError::Execution(msg)) if msg.contains("not found")));

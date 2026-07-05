@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use bamboo_agent_core::tools::{
-    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
-    ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
+    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolCtx, ToolError,
+    ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
 };
 use bamboo_tools::normalize_tool_ref;
 
@@ -50,9 +50,30 @@ impl ToolExecutor for OverlayToolExecutor {
                     warning
                 );
             }
-            return self.overlay.execute_with_context(args, ctx).await;
+            return self
+                .overlay
+                .invoke(args, ctx.to_tool_ctx())
+                .await
+                .map(|outcome| outcome.into_tool_result());
         }
         self.base.execute_with_context(call, ctx).await
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let name = normalize_tool_name(&call.function.name);
+        let is_overlay_call = name == self.overlay.name()
+            || normalize_tool_ref(name)
+                .as_deref()
+                .is_some_and(|normalized| normalized == self.overlay.name());
+        if is_overlay_call {
+            let (args, _) = parse_tool_args_best_effort(&call.function.arguments);
+            return self.overlay.invoke(args, ctx.to_tool_ctx()).await;
+        }
+        self.base.execute_with_context_outcome(call, ctx).await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -117,13 +138,17 @@ mod tests {
             json!({"type":"object","properties":{}})
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "overlay".to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 

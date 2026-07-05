@@ -24,18 +24,20 @@ async fn ask_agent_tool_queries_a_broker_agent() {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
     let result = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "target": "worker",
                 "question": "hi there",
                 "mode": "query"
             }),
-            ctx,
+            ctx.to_tool_ctx(),
         )
         .await
+        .map(|o| o.into_tool_result())
         .expect("ask_agent tool returns an answer");
 
     assert!(result.success);
@@ -55,12 +57,13 @@ async fn ask_agent_tool_rejects_unknown_mode() {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     };
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({ "target": "w", "question": "q", "mode": "bogus" }),
-            ctx,
+            ctx.to_tool_ctx(),
         )
         .await
         .expect_err("unknown mode is rejected");
@@ -122,18 +125,20 @@ async fn concurrent_asks_to_one_worker_are_each_answered_correctly() {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 can_async_resume: false,
+                bash_completion_sink: None,
                 pre_parsed_args: None,
             };
             let result = tool
-                .execute_with_context(
+                .invoke(
                     serde_json::json!({
                         "target": "worker",
                         "question": format!("q-{i}"),
                         "mode": "query"
                     }),
-                    ctx,
+                    ctx.to_tool_ctx(),
                 )
                 .await
+                .map(|o| o.into_tool_result())
                 .expect("concurrent ask returns an answer");
             let v: serde_json::Value = serde_json::from_str(&result.result).expect("json result");
             (i, v["answer"].as_str().unwrap_or_default().to_string())

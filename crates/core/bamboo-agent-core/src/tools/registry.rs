@@ -44,7 +44,10 @@ use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use thiserror::Error;
 
-use crate::tools::{FunctionSchema, ToolError, ToolExecutionContext, ToolResult, ToolSchema};
+use crate::tools::tool_runtime::{ToolClass, ToolCtx, ToolOutcome};
+use crate::tools::{FunctionSchema, ToolError, ToolSchema};
+#[cfg(test)]
+use crate::tools::ToolResult;
 
 /// Trait for implementing executable tools.
 ///
@@ -104,39 +107,29 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     /// JSON Schema for tool parameters.
     fn parameters_schema(&self) -> serde_json::Value;
-    /// Declares whether this tool is read-only or mutating for orchestration and
-    /// parallel scheduling decisions. Defaults to mutating to stay conservative.
-    fn mutability(&self) -> crate::tools::ToolMutability {
-        crate::tools::ToolMutability::Mutating
-    }
-    /// Args-aware mutability hook. Defaults to the static mutability declaration.
-    fn call_mutability(&self, _args: &serde_json::Value) -> crate::tools::ToolMutability {
-        self.mutability()
-    }
-    /// Declares whether this tool can safely run in parallel with other
-    /// read-only tools. Defaults to false so tools remain serialized unless
-    /// they opt in explicitly.
-    fn concurrency_safe(&self) -> bool {
-        false
-    }
-    /// Args-aware parallel-safety hook. Defaults to the static declaration.
-    fn call_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
-        self.concurrency_safe()
-    }
-    /// Execute the tool with given arguments.
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError>;
 
-    /// Execute the tool with a streaming-capable context.
+    /// Per-call scheduling + permission-gating class (args-aware). Folds the
+    /// former `mutability`/`call_mutability`/`concurrency_safe`/
+    /// `call_concurrency_safe` hooks into one value. Defaults to the conservative
+    /// [`ToolClass::MUTATING_SERIAL`] (mutating, serial, not promotable).
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::MUTATING_SERIAL
+    }
+
+    /// The sole execution entry: returns the call's per-call [`ToolOutcome`]
+    /// ([`Completed`](ToolOutcome::Completed) / [`Running`](ToolOutcome::Running)
+    /// / [`NeedsHuman`](ToolOutcome::NeedsHuman)), or a [`ToolError`] for
+    /// infrastructure / argument failures (preserved from the former `execute`).
     ///
-    /// Default implementation falls back to `execute()` for tools that don't
-    /// need streaming.
-    async fn execute_with_context(
+    /// Every tool is context-aware now — the former `execute` /
+    /// `execute_with_context` split is gone, and `ctx` is owned so an `invoke`
+    /// future can be moved into a detached drive task for latency-adaptive
+    /// promotion.
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        _ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        self.execute(args).await
-    }
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError>;
 
     /// Convert tool to LLM-compatible schema.
     ///
@@ -400,13 +393,17 @@ mod tests {
             })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "ok".to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 

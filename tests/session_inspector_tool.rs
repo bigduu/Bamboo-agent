@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bamboo_agent::agent::{Message, Session};
 use bamboo_agent::server::tools::SessionInspectorTool;
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolExecutionContext, ToolOutcome};
 use bamboo_agent_core::ConversationSummary;
 use bamboo_storage::SessionStoreV2;
 
@@ -20,6 +20,7 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     }
 }
@@ -32,9 +33,9 @@ async fn session_inspector_requires_session_id() {
 
     let tool = SessionInspectorTool::new(store.clone(), store.clone());
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({ "action": "list" }),
-            ToolExecutionContext::none("tool_call"),
+            ToolCtx::none("tool_call"),
         )
         .await
         .unwrap_err();
@@ -65,20 +66,23 @@ async fn session_inspector_list_and_read_messages_from_end() {
     let tool = SessionInspectorTool::new(store.clone(), store.clone());
 
     // List by title query.
-    let listed = tool
-        .execute_with_context(
+    let listed_out = tool
+        .invoke(
             serde_json::json!({ "action": "list", "query": "alpha", "limit": 10 }),
-            ctx_for_session("caller"),
+            ctx_for_session("caller").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(listed) = listed_out else {
+        panic!("expected Completed")
+    };
     let listed_v: serde_json::Value = serde_json::from_str(&listed.result).unwrap();
     assert_eq!(listed_v["total"].as_u64().unwrap(), 1);
     assert_eq!(listed_v["sessions"][0]["id"].as_str().unwrap(), "s1");
 
     // Read last 3 non-system messages (from_end).
-    let read = tool
-        .execute_with_context(
+    let read_out = tool
+        .invoke(
             serde_json::json!({
                 "action": "read_messages",
                 "session_id": "s1",
@@ -87,10 +91,13 @@ async fn session_inspector_list_and_read_messages_from_end() {
                 "include_system": false,
                 "truncate_chars": 50
             }),
-            ctx_for_session("caller"),
+            ctx_for_session("caller").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(read) = read_out else {
+        panic!("expected Completed")
+    };
     let read_v: serde_json::Value = serde_json::from_str(&read.result).unwrap();
     assert_eq!(read_v["slice_count"].as_u64().unwrap(), 3);
     // The last message should be assistant-9.
@@ -116,8 +123,8 @@ async fn session_inspector_search_tail_messages_finds_match() {
     store.save_session(&s).await.unwrap();
 
     let tool = SessionInspectorTool::new(store.clone(), store.clone());
-    let out = tool
-        .execute_with_context(
+    let out_outcome = tool
+        .invoke(
             serde_json::json!({
                 "action": "search",
                 "query": "needle",
@@ -125,10 +132,13 @@ async fn session_inspector_search_tail_messages_finds_match() {
                 "max_sessions": 10,
                 "tail_messages": 10
             }),
-            ctx_for_session("caller"),
+            ctx_for_session("caller").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(out) = out_outcome else {
+        panic!("expected Completed")
+    };
 
     let v: serde_json::Value = serde_json::from_str(&out.result).unwrap();
     assert!(
@@ -173,17 +183,20 @@ async fn session_inspector_read_compressed_cache_reads_sqlite_cached_rows() {
     store.save_session(&s).await.unwrap();
 
     let tool = SessionInspectorTool::new(store.clone(), store.clone());
-    let out = tool
-        .execute_with_context(
+    let out_outcome = tool
+        .invoke(
             serde_json::json!({
                 "action": "read_compressed_cache",
                 "session_id": "compressed-1",
                 "limit": 10
             }),
-            ctx_for_session("caller"),
+            ctx_for_session("caller").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(out) = out_outcome else {
+        panic!("expected Completed")
+    };
 
     let v: serde_json::Value = serde_json::from_str(&out.result).unwrap();
     assert_eq!(v["source"].as_str(), Some("sqlite_fts"));

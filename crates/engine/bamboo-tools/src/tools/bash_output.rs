@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
@@ -39,12 +39,8 @@ impl Tool for BashOutputTool {
         "Retrieve incremental output from a running or completed background Bash shell. Use the returned cursor to continue reading without replaying earlier lines."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +65,11 @@ impl Tool for BashOutputTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: BashOutputArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid BashOutput args: {}", e)))?;
 
@@ -93,7 +93,7 @@ impl Tool for BashOutputTool {
         let status = shell.status();
         let exit_code = shell.exit_code().await;
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: json!({
                 "bash_id": parsed.bash_id,
@@ -106,7 +106,7 @@ impl Tool for BashOutputTool {
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -144,13 +144,19 @@ mod tests {
 
     async fn spawn_background_shell_id() -> String {
         let bash = BashTool::new();
-        let result = bash
-            .execute(json!({
-                "command": background_command(),
-                "run_in_background": true
-            }))
+        let out = bash
+            .invoke(
+                json!({
+                    "command": background_command(),
+                    "run_in_background": true
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         payload["bash_id"].as_str().unwrap().to_string()
@@ -158,13 +164,19 @@ mod tests {
 
     async fn spawn_background_shell_id_for_command(command: String) -> String {
         let bash = BashTool::new();
-        let result = bash
-            .execute(json!({
-                "command": command,
-                "run_in_background": true
-            }))
+        let out = bash
+            .invoke(
+                json!({
+                    "command": command,
+                    "run_in_background": true
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         payload["bash_id"].as_str().unwrap().to_string()
@@ -187,20 +199,29 @@ mod tests {
         wait_until_completed(&shell_id).await;
 
         let output_tool = BashOutputTool::new();
-        let first = output_tool
-            .execute(json!({ "bash_id": shell_id }))
+        let first_out = output_tool
+            .invoke(json!({ "bash_id": shell_id }), ToolCtx::none("t"))
             .await
             .unwrap();
+        let ToolOutcome::Completed(first) = first_out else {
+            panic!("expected Completed")
+        };
         let first_payload: Value = serde_json::from_str(&first.result).unwrap();
         let first_output = first_payload["output"].as_str().unwrap_or_default();
         let next_cursor = first_payload["next_cursor"].as_u64().unwrap_or(0);
         assert!(first_output.contains("alpha"));
         assert!(first_output.contains("beta"));
 
-        let second = output_tool
-            .execute(json!({ "bash_id": shell_id, "cursor": next_cursor }))
+        let second_out = output_tool
+            .invoke(
+                json!({ "bash_id": shell_id, "cursor": next_cursor }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(second) = second_out else {
+            panic!("expected Completed")
+        };
         let second_payload: Value = serde_json::from_str(&second.result).unwrap();
         assert_eq!(second_payload["output"], "");
     }
@@ -211,13 +232,19 @@ mod tests {
         wait_until_completed(&shell_id).await;
 
         let output_tool = BashOutputTool::new();
-        let filtered = output_tool
-            .execute(json!({
-                "bash_id": shell_id,
-                "filter": "alpha"
-            }))
+        let filtered_out = output_tool
+            .invoke(
+                json!({
+                    "bash_id": shell_id,
+                    "filter": "alpha"
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(filtered) = filtered_out else {
+            panic!("expected Completed")
+        };
         let filtered_payload: Value = serde_json::from_str(&filtered.result).unwrap();
         let next_cursor = filtered_payload["next_cursor"].as_u64().unwrap_or(0);
         assert!(filtered_payload["output"]
@@ -229,10 +256,16 @@ mod tests {
             .unwrap_or_default()
             .contains("beta"));
 
-        let second = output_tool
-            .execute(json!({ "bash_id": shell_id, "cursor": next_cursor }))
+        let second_out = output_tool
+            .invoke(
+                json!({ "bash_id": shell_id, "cursor": next_cursor }),
+                ToolCtx::none("t"),
+            )
             .await
             .unwrap();
+        let ToolOutcome::Completed(second) = second_out else {
+            panic!("expected Completed")
+        };
         let second_payload: Value = serde_json::from_str(&second.result).unwrap();
         assert_eq!(second_payload["output"], "");
     }
@@ -244,10 +277,13 @@ mod tests {
         wait_until_completed(&shell_id).await;
 
         let output_tool = BashOutputTool::new();
-        let result = output_tool
-            .execute(json!({ "bash_id": shell_id }))
+        let out = output_tool
+            .invoke(json!({ "bash_id": shell_id }), ToolCtx::none("t"))
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         let output = payload["output"].as_str().unwrap_or_default();
         assert!(!output.is_empty());

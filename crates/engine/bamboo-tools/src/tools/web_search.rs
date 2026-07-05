@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use parking_lot::RwLock;
 use regex::Regex;
 use serde::Deserialize;
@@ -128,12 +128,8 @@ impl Tool for WebSearchTool {
         "Search DuckDuckGo and return up to 10 filtered results (title, url, domain, snippet) with optional allow/block domain filters."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::ReadOnly
-    }
-
-    fn concurrency_safe(&self) -> bool {
-        true
+    fn classify(&self, _args: &serde_json::Value) -> ToolClass {
+        ToolClass::READONLY_PARALLEL.promotable()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -165,16 +161,7 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("WebSearch"))
-            .await
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+    async fn invoke(&self, args: serde_json::Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         let parsed: WebSearchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid WebSearch args: {}", e)))?;
 
@@ -205,12 +192,12 @@ impl Tool for WebSearchTool {
         let cache_key = Self::cache_key(query, &allowed_domains, &blocked_domains);
         if let Some(cached) = Self::try_cache(&cache_key) {
             ctx.emit_tool_token("Using cached search results\n").await;
-            return Ok(ToolResult {
+            return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: cached.to_string(),
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
-            });
+            }));
         }
 
         ctx.emit_tool_token(format!("Searching: {}\n", query)).await;
@@ -361,12 +348,12 @@ impl Tool for WebSearchTool {
         let mut result_string = result_value.to_string();
         result_string.push_str("\n\nREMINDER: You MUST include a Sources section at the end of your response, listing all relevant URLs as markdown hyperlinks: [Title](URL)");
 
-        Ok(ToolResult {
+        Ok(ToolOutcome::Completed(ToolResult {
             success: true,
             result: result_string,
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
-        })
+        }))
     }
 }
 

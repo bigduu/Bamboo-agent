@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
-use bamboo_agent_core::tools::{FunctionCall, Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::{Message, Session};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use bamboo_tools::BuiltinToolExecutorBuilder;
@@ -80,18 +80,11 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
             })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-            // This tool is expected to be executed via `execute_with_context`.
-            Err(ToolError::Execution(
-                "spawn_session test tool must be executed with context".to_string(),
-            ))
-        }
-
-        async fn execute_with_context(
+        async fn invoke(
             &self,
             _args: serde_json::Value,
-            ctx: ToolExecutionContext<'_>,
-        ) -> Result<ToolResult, ToolError> {
+            ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
             let Some(session_id) = ctx.session_id else {
                 return Err(ToolError::Execution(
                     "missing session_id in tool context".to_string(),
@@ -100,12 +93,12 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
 
             *self.seen_session_id.lock().await = Some(session_id.to_string());
 
-            Ok(ToolResult {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "ok".to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -211,13 +204,17 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
             })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: "ok".to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 

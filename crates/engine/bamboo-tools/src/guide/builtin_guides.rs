@@ -177,8 +177,8 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "Bash" => Some(guide(
             "Bash",
             ToolCategory::CommandExecution,
-            "Run terminal commands (build/test/git/npm/docker/gh), optionally in background.",
-            "Do not use for file reads/edits/search when Read/Edit/Write/Glob/Grep can handle it; do not use shell echo/printf to communicate with the user.",
+            "Run terminal commands (build/test/git/npm/docker/gh), optionally in background — a backgrounded command runs detached and notifies you with its result when it finishes, so you can keep working.",
+            "Do not use for file reads/edits/search when Read/Edit/Write/Glob/Grep can handle it; do not use shell echo/printf to communicate with the user; do not sit polling BashOutput to wait for a background command — the completion notification comes to you.",
             &["BashOutput", "KillShell"],
             vec![example(
                 "Run tests",
@@ -208,13 +208,13 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "BashOutput" => Some(guide(
             "BashOutput",
             ToolCategory::CommandExecution,
-            "Read incremental output from a background shell.",
-            "Do not use without a bash_id from Bash.",
+            "Read the full/incremental output of a background shell on demand.",
+            "Do not poll a background shell to wait for it — you are notified automatically when it completes (with its exit status and an output tail). Use BashOutput only when you want its output BEFORE that notification arrives; needs a bash_id from Bash.",
             &["Bash", "KillShell"],
             vec![example(
-                "Poll output",
+                "Inspect output early",
                 json!({"bash_id":"abc"}),
-                "Use repeatedly until shell completes.",
+                "Use to check on a still-running shell; you don't need it just to learn a shell finished.",
             )],
         )),
         "KillShell" => Some(guide(

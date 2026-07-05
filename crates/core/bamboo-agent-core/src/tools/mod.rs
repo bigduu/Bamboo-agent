@@ -92,13 +92,20 @@
 
 pub mod accumulator;
 pub mod agentic;
+pub mod bash_completion;
 pub mod context;
 pub mod executor;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
+pub mod tool_runtime;
 pub mod types;
 
+pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
+pub use tool_runtime::{
+    AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
+    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
+};
 pub use accumulator::{
     finalize_tool_calls, update_partial_tool_call, PartialToolCall, ToolCallAccumulator,
 };

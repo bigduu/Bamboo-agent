@@ -23,7 +23,8 @@ use bamboo_agent::server::schedule_app::{
 use bamboo_agent::Config;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
-    Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
+    Tool, ToolCall, ToolCtx, ToolError, ToolExecutionContext, ToolExecutor, ToolOutcome,
+    ToolResult, ToolSchema,
 };
 use bamboo_agent_core::SessionKind;
 use bamboo_engine::{Agent, AgentBuilder};
@@ -97,6 +98,7 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
         available_tool_schemas: None,
         bypass_permissions: false,
         can_async_resume: false,
+        bash_completion_sink: None,
         pre_parsed_args: None,
     }
 }
@@ -209,9 +211,9 @@ async fn schedule_tasks_requires_session_id() {
     let tool = new_schedule_tasks_tool(schedule_store, manager, store, clean_config(dir.path()));
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({ "action": "list" }),
-            ToolExecutionContext::none("tool_call"),
+            ToolCtx::none("tool_call"),
         )
         .await
         .unwrap_err();
@@ -249,9 +251,9 @@ async fn schedule_tasks_rejects_child_sessions() {
     store.save_session(&child).await.unwrap();
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({ "action": "list" }),
-            ctx_for_session("child-session"),
+            ctx_for_session("child-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -287,26 +289,26 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
     store.save_session(&caller).await.unwrap();
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "action": "create",
                 "name": "   ",
                 "trigger": {"type": "interval", "every_seconds": 60}
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("name must be a non-empty string"));
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "action": "create",
                 "name": "bad",
                 "trigger": {"type": "interval", "every_seconds": 0}
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -315,14 +317,14 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
         .contains("trigger.every_seconds must be > 0"));
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "action": "create",
                 "name": "bad-auto",
                 "trigger": {"type": "interval", "every_seconds": 60},
                 "run_config": {"auto_execute": true}
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -358,13 +360,13 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
     store.save_session(&caller).await.unwrap();
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "action": "patch",
                 "schedule_id": "",
                 "enabled": true
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -373,13 +375,13 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
         .contains("schedule_id must be a non-empty string"));
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "action": "patch",
                 "schedule_id": "missing",
                 "trigger": {"type": "interval", "every_seconds": 0}
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -388,13 +390,13 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
         .contains("trigger.every_seconds must be > 0"));
 
     let err = tool
-        .execute_with_context(
+        .invoke(
             serde_json::json!({
                 "action": "patch",
                 "schedule_id": "missing",
                 "run_config": {"auto_execute": true}
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap_err();
@@ -434,8 +436,8 @@ async fn schedule_tasks_crud_and_list_sessions() {
     let now = Utc::now();
     let start_at = (now - ChronoDuration::days(1)).to_rfc3339();
     let end_at = (now + ChronoDuration::days(30)).to_rfc3339();
-    let created = tool
-        .execute_with_context(
+    let created_out = tool
+        .invoke(
             serde_json::json!({
                 "action": "create",
                 "name": "My Schedule",
@@ -448,10 +450,13 @@ async fn schedule_tasks_crud_and_list_sessions() {
                 "enabled": false,
                 "run_config": { "auto_execute": false }
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(created) = created_out else {
+        panic!("expected Completed")
+    };
     let created_v: serde_json::Value = serde_json::from_str(&created.result).unwrap();
     let schedule_id = created_v["schedule"]["id"].as_str().unwrap().to_string();
     assert!(!schedule_id.is_empty());
@@ -477,13 +482,16 @@ async fn schedule_tasks_crud_and_list_sessions() {
     );
 
     // List schedules should include it.
-    let listed = tool
-        .execute_with_context(
+    let listed_out = tool
+        .invoke(
             serde_json::json!({ "action": "list" }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(listed) = listed_out else {
+        panic!("expected Completed")
+    };
     let listed_v: serde_json::Value = serde_json::from_str(&listed.result).unwrap();
     assert!(
         listed_v["schedules"].as_array().unwrap().iter().any(|s| {
@@ -494,8 +502,8 @@ async fn schedule_tasks_crud_and_list_sessions() {
     );
 
     // Patch schedule.
-    let patched = tool
-        .execute_with_context(
+    let patched_out = tool
+        .invoke(
             serde_json::json!({
                 "action": "patch",
                 "schedule_id": schedule_id,
@@ -505,10 +513,13 @@ async fn schedule_tasks_crud_and_list_sessions() {
                 "misfire_policy": { "type": "skip" },
                 "overlap_policy": "queue_one"
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(patched) = patched_out else {
+        panic!("expected Completed")
+    };
     let patched_v: serde_json::Value = serde_json::from_str(&patched.result).unwrap();
     assert_eq!(patched_v["schedule"]["enabled"].as_bool(), Some(true));
     assert!(
@@ -542,16 +553,19 @@ async fn schedule_tasks_crud_and_list_sessions() {
     scheduled.add_message(Message::system("x".to_string()));
     store.save_session(&scheduled).await.unwrap();
 
-    let sessions = tool
-        .execute_with_context(
+    let sessions_out = tool
+        .invoke(
             serde_json::json!({
                 "action": "list_sessions",
                 "schedule_id": patched_v["schedule"]["id"]
             }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(sessions) = sessions_out else {
+        panic!("expected Completed")
+    };
     let sessions_v: serde_json::Value = serde_json::from_str(&sessions.result).unwrap();
     assert!(
         sessions_v["sessions"]
@@ -564,13 +578,16 @@ async fn schedule_tasks_crud_and_list_sessions() {
     );
 
     // Delete schedule.
-    let deleted = tool
-        .execute_with_context(
+    let deleted_out = tool
+        .invoke(
             serde_json::json!({ "action": "delete", "schedule_id": patched_v["schedule"]["id"] }),
-            ctx_for_session("root-session"),
+            ctx_for_session("root-session").to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(deleted) = deleted_out else {
+        panic!("expected Completed")
+    };
     assert!(
         serde_json::from_str::<serde_json::Value>(&deleted.result).unwrap()["success"]
             .as_bool()

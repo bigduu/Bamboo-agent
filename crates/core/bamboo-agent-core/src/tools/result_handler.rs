@@ -384,6 +384,9 @@ pub async fn execute_sub_actions(
             // never safely auto-promote a Bash command — keep it synchronous
             // (issue #84, phase 2d).
             false,
+            // Same reason: no engine loop to deliver a background-Bash
+            // completion push into, so no completion sink.
+            None,
             // This loop parses the `ToolStart` args with the stricter
             // `parse_tool_args` (not `parse_tool_args_best_effort`), which
             // differs on malformed input. Passing `None` lets the executor

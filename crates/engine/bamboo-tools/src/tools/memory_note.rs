@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::tools::session_memory::{
     execute_session_memory_action, parse_session_note_action, SESSION_NOTE_ACTION_NAMES,
 };
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome};
 use bamboo_memory::memory_store::MemoryStore;
 
 const TOOL_NAME: &str = "session_note";
@@ -59,11 +59,7 @@ impl Tool for SessionNoteTool {
         TOOL_DESCRIPTION
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::Mutating
-    }
-
-    fn call_mutability(&self, args: &serde_json::Value) -> crate::ToolMutability {
+    fn classify(&self, args: &serde_json::Value) -> ToolClass {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -71,13 +67,9 @@ impl Tool for SessionNoteTool {
             .trim()
             .to_ascii_lowercase();
         match action.as_str() {
-            "read" | "list_topics" => crate::ToolMutability::ReadOnly,
-            _ => crate::ToolMutability::Mutating,
+            "read" | "list_topics" => ToolClass::READONLY_PARALLEL,
+            _ => ToolClass::MUTATING_SERIAL,
         }
-    }
-
-    fn call_concurrency_safe(&self, args: &serde_json::Value) -> bool {
-        matches!(self.call_mutability(args), crate::ToolMutability::ReadOnly)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -102,18 +94,12 @@ impl Tool for SessionNoteTool {
         })
     }
 
-    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        Err(ToolError::Execution(format!(
-            "{TOOL_NAME} must be executed with ToolExecutionContext (session_id required)"
-        )))
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let Some(session_id) = ctx.session_id else {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let Some(session_id) = ctx.session_id() else {
             return Err(ToolError::Execution(
                 "missing session_id in tool context".to_string(),
             ));
@@ -124,7 +110,7 @@ impl Tool for SessionNoteTool {
         let topic = args.get("topic").and_then(|v| v.as_str());
         let content = args.get("content").and_then(|v| v.as_str());
 
-        execute_session_memory_action(
+        let result = execute_session_memory_action(
             &self.memory_store,
             session_id,
             action,
@@ -133,7 +119,8 @@ impl Tool for SessionNoteTool {
             None,
             SESSION_NOTE_ACTION_NAMES,
         )
-        .await
+        .await?;
+        Ok(ToolOutcome::Completed(result))
     }
 }
 
@@ -165,10 +152,7 @@ mod tests {
     async fn session_note_requires_session_context() {
         let tool = SessionNoteTool::new();
         let result = tool
-            .execute_with_context(
-                json!({"action": "read"}),
-                ToolExecutionContext::none("tool_call"),
-            )
+            .invoke(json!({"action": "read"}), ToolCtx::none("tool_call"))
             .await;
 
         assert!(matches!(
@@ -182,16 +166,17 @@ mod tests {
         let tool = SessionNoteTool::new();
 
         let unknown = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "unknown"}),
-                ToolExecutionContext {
-                    session_id: Some("session-1"),
-                    tool_call_id: "tool_call_unknown",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-1")),
+                    tool_call_id: std::sync::Arc::from("tool_call_unknown"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await;
@@ -201,16 +186,17 @@ mod tests {
         ));
 
         let missing_content = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "replace"}),
-                ToolExecutionContext {
-                    session_id: Some("session-1"),
-                    tool_call_id: "tool_call_replace",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-1")),
+                    tool_call_id: std::sync::Arc::from("tool_call_replace"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await;
@@ -226,39 +212,47 @@ mod tests {
         let tool = SessionNoteTool::with_memory_store(MemoryStore::new(dir.path()));
 
         let append = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "append", "topic": "backend", "content": "API finalized"}),
-                ToolExecutionContext {
-                    session_id: Some("session-1"),
-                    tool_call_id: "tool_call_append",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-1")),
+                    tool_call_id: std::sync::Arc::from("tool_call_append"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .expect("append should succeed");
+        let ToolOutcome::Completed(append) = append else {
+            panic!("expected Completed")
+        };
         let append_json: serde_json::Value = serde_json::from_str(&append.result).unwrap();
         assert_eq!(append_json["action"], "append");
         assert_eq!(append_json["length_chars"], "API finalized".chars().count());
 
         let read = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "read", "topic": "backend"}),
-                ToolExecutionContext {
-                    session_id: Some("session-1"),
-                    tool_call_id: "tool_call_read",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-1")),
+                    tool_call_id: std::sync::Arc::from("tool_call_read"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .expect("read should succeed");
+        let ToolOutcome::Completed(read) = read else {
+            panic!("expected Completed")
+        };
         let read_json: serde_json::Value = serde_json::from_str(&read.result).unwrap();
         assert_eq!(read_json["action"], "read");
         assert_eq!(read_json["content"], "API finalized");
@@ -266,39 +260,47 @@ mod tests {
         assert_eq!(read_json["body_truncated"], false);
 
         let list = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "list_topics"}),
-                ToolExecutionContext {
-                    session_id: Some("session-1"),
-                    tool_call_id: "tool_call_list",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-1")),
+                    tool_call_id: std::sync::Arc::from("tool_call_list"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .expect("list should succeed");
+        let ToolOutcome::Completed(list) = list else {
+            panic!("expected Completed")
+        };
         let list_json: serde_json::Value = serde_json::from_str(&list.result).unwrap();
         assert_eq!(list_json["topics"][0], "backend");
         assert_eq!(list_json["count"], 1);
 
         let clear = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "clear", "topic": "backend"}),
-                ToolExecutionContext {
-                    session_id: Some("session-1"),
-                    tool_call_id: "tool_call_clear",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-1")),
+                    tool_call_id: std::sync::Arc::from("tool_call_clear"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .expect("clear should succeed");
+        let ToolOutcome::Completed(clear) = clear else {
+            panic!("expected Completed")
+        };
         let clear_json: serde_json::Value = serde_json::from_str(&clear.result).unwrap();
         assert_eq!(clear_json["action"], "clear");
         assert_eq!(clear_json["deleted"], true);
@@ -310,66 +312,73 @@ mod tests {
         let tool = SessionNoteTool::with_memory_store(MemoryStore::new(dir.path()));
         let long_content = "x".repeat(32);
 
-        tool.execute_with_context(
+        tool.invoke(
             json!({"action": "replace", "topic": "default", "content": long_content}),
-            ToolExecutionContext {
-                session_id: Some("session-2"),
-                tool_call_id: "tool_call_replace_long",
+            ToolCtx {
+                session_id: Some(std::sync::Arc::from("session-2")),
+                tool_call_id: std::sync::Arc::from("tool_call_replace_long"),
                 event_tx: None,
-                available_tool_schemas: None,
+                available_tool_schemas: std::sync::Arc::from(Vec::new()),
                 bypass_permissions: false,
                 can_async_resume: false,
-                pre_parsed_args: None,
+                async_completion_sink: None,
+                bash_completion_sink: None,
             },
         )
         .await
         .expect("replace should succeed");
 
         let read = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "read", "topic": "default"}),
-                ToolExecutionContext {
-                    session_id: Some("session-2"),
-                    tool_call_id: "tool_call_read_long",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-2")),
+                    tool_call_id: std::sync::Arc::from("tool_call_read_long"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .expect("read should succeed");
+        let ToolOutcome::Completed(read) = read else {
+            panic!("expected Completed")
+        };
         let read_json: serde_json::Value = serde_json::from_str(&read.result).unwrap();
         assert_eq!(read_json["length_chars"], 32);
         assert_eq!(read_json["body_truncated"], false);
 
-        tool.execute_with_context(
+        tool.invoke(
             json!({"action": "replace", "topic": "limit", "content": "x".repeat(crate::tools::session_memory::MAX_SESSION_NOTE_CHARS - 1)}),
-            ToolExecutionContext {
-                session_id: Some("session-3"),
-                tool_call_id: "tool_call_replace_limit",
+            ToolCtx {
+                session_id: Some(std::sync::Arc::from("session-3")),
+                tool_call_id: std::sync::Arc::from("tool_call_replace_limit"),
                 event_tx: None,
-                available_tool_schemas: None,
+                available_tool_schemas: std::sync::Arc::from(Vec::new()),
                 bypass_permissions: false,
                 can_async_resume: false,
-                pre_parsed_args: None,
+                async_completion_sink: None,
+                bash_completion_sink: None,
             },
         )
         .await
         .expect("replace near limit should succeed");
 
         let append_err = tool
-            .execute_with_context(
+            .invoke(
                 json!({"action": "append", "topic": "limit", "content": "y"}),
-                ToolExecutionContext {
-                    session_id: Some("session-3"),
-                    tool_call_id: "tool_call_append_limit",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session-3")),
+                    tool_call_id: std::sync::Arc::from("tool_call_append_limit"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await

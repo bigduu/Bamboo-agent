@@ -205,6 +205,10 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         guardian_config: None,
         guardian_spawner: Some(args.state.guardian_spawner.clone()),
         bash_resume_hook: Some(args.state.bash_resume_hook.clone()),
+        // The completion coordinator also implements `BashCompletionSink`: a
+        // finished background shell pushes its result into this loop (injected at
+        // the next round boundary, issue #84 Phase 2b follow-up).
+        bash_completion_sink: Some(args.state.child_completion_coordinator.clone()),
         app_data_dir: args.app_data_dir,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),

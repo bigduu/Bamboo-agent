@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -35,25 +35,17 @@ impl Tool for WorkspaceTool {
         "Get or set the current session workspace directory. Call without 'path' to get the current workspace; call with 'path' to change it."
     }
 
-    fn mutability(&self) -> crate::ToolMutability {
-        crate::ToolMutability::Mutating
-    }
-
-    fn call_mutability(&self, args: &serde_json::Value) -> crate::ToolMutability {
+    fn classify(&self, args: &serde_json::Value) -> ToolClass {
         let has_path = args
             .get("path")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .is_some_and(|v| !v.is_empty());
         if has_path {
-            crate::ToolMutability::Mutating
+            ToolClass::MUTATING_SERIAL
         } else {
-            crate::ToolMutability::ReadOnly
+            ToolClass::READONLY_PARALLEL
         }
-    }
-
-    fn call_concurrency_safe(&self, args: &serde_json::Value) -> bool {
-        self.call_mutability(args) == crate::ToolMutability::ReadOnly
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,16 +61,11 @@ impl Tool for WorkspaceTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("Workspace"))
-            .await
-    }
-
-    async fn execute_with_context(
+    async fn invoke(
         &self,
         args: serde_json::Value,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -88,7 +75,7 @@ impl Tool for WorkspaceTool {
         match path_arg {
             // ── SET mode ──────────────────────────────────────────────
             Some(path) => {
-                let session_id = ctx.session_id.ok_or_else(|| {
+                let session_id = ctx.session_id().ok_or_else(|| {
                     ToolError::Execution(
                         "Workspace(set) requires a session_id in tool context".to_string(),
                     )
@@ -103,20 +90,20 @@ impl Tool for WorkspaceTool {
                 };
 
                 if !path_obj.exists() {
-                    return Ok(ToolResult {
+                    return Ok(ToolOutcome::Completed(ToolResult {
                         success: false,
                         result: format!("Path does not exist: {}", path_obj.display()),
                         display_preference: Some("error".to_string()),
                         images: Vec::new(),
-                    });
+                    }));
                 }
                 if !path_obj.is_dir() {
-                    return Ok(ToolResult {
+                    return Ok(ToolOutcome::Completed(ToolResult {
                         success: false,
                         result: format!("Path is not a directory: {}", path_obj.display()),
                         display_preference: Some("error".to_string()),
                         images: Vec::new(),
-                    });
+                    }));
                 }
 
                 let absolute_path = path_obj.canonicalize().map_err(|e| {
@@ -125,7 +112,7 @@ impl Tool for WorkspaceTool {
 
                 workspace_state::set_workspace(session_id, absolute_path.clone());
 
-                Ok(ToolResult {
+                Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
                     result: json!({
                         "session_id": session_id,
@@ -134,35 +121,35 @@ impl Tool for WorkspaceTool {
                     .to_string(),
                     display_preference: Some("json".to_string()),
                     images: Vec::new(),
-                })
+                }))
             }
 
             // ── GET mode ──────────────────────────────────────────────
             None => {
-                if let Some(session_id) = ctx.session_id {
+                if let Some(session_id) = ctx.session_id() {
                     if let Some(workspace) = workspace_state::get_workspace(session_id) {
-                        return Ok(ToolResult {
+                        return Ok(ToolOutcome::Completed(ToolResult {
                             success: true,
                             result: bamboo_config::paths::path_to_display_string(&workspace),
                             display_preference: None,
                             images: Vec::new(),
-                        });
+                        }));
                     }
                 }
 
                 match std::env::current_dir() {
-                    Ok(dir) => Ok(ToolResult {
+                    Ok(dir) => Ok(ToolOutcome::Completed(ToolResult {
                         success: true,
                         result: bamboo_config::paths::path_to_display_string(&dir),
                         display_preference: None,
                         images: Vec::new(),
-                    }),
-                    Err(error) => Ok(ToolResult {
+                    })),
+                    Err(error) => Ok(ToolOutcome::Completed(ToolResult {
                         success: false,
                         result: format!("Failed to get current directory: {error}"),
                         display_preference: Some("error".to_string()),
                         images: Vec::new(),
-                    }),
+                    })),
                 }
             }
         }
@@ -176,7 +163,13 @@ mod tests {
     #[tokio::test]
     async fn workspace_get_returns_non_empty_path() {
         let tool = WorkspaceTool::new();
-        let result = tool.execute(json!({})).await.unwrap();
+        let out = tool
+            .invoke(json!({}), ToolCtx::none("Workspace"))
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
         assert!(!result.result.trim().is_empty());
     }
@@ -190,21 +183,25 @@ mod tests {
         workspace_state::set_workspace(&session, workspace.clone());
 
         let tool = WorkspaceTool::new();
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({}),
-                ToolExecutionContext {
-                    session_id: Some(&session),
-                    tool_call_id: "call_1",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from(session.as_str())),
+                    tool_call_id: std::sync::Arc::from("call_1"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
         assert_eq!(
             result.result,
@@ -220,39 +217,47 @@ mod tests {
         let session = format!("session_{}", uuid::Uuid::new_v4());
 
         let tool = WorkspaceTool::new();
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({"path": workspace.to_string_lossy()}),
-                ToolExecutionContext {
-                    session_id: Some(&session),
-                    tool_call_id: "call_1",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from(session.as_str())),
+                    tool_call_id: std::sync::Arc::from("call_1"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(result.success);
 
         // Verify get mode now returns the new workspace
-        let get_result = tool
-            .execute_with_context(
+        let get_out = tool
+            .invoke(
                 json!({}),
-                ToolExecutionContext {
-                    session_id: Some(&session),
-                    tool_call_id: "call_2",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from(session.as_str())),
+                    tool_call_id: std::sync::Arc::from("call_2"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(get_result) = get_out else {
+            panic!("expected Completed")
+        };
         assert!(get_result.success);
         let expected = workspace.canonicalize().unwrap();
         assert_eq!(
@@ -264,21 +269,25 @@ mod tests {
     #[tokio::test]
     async fn workspace_set_rejects_missing_path() {
         let tool = WorkspaceTool::new();
-        let result = tool
-            .execute_with_context(
+        let out = tool
+            .invoke(
                 json!({"path": "/tmp/bamboo-no-such-workspace-xyz-99999"}),
-                ToolExecutionContext {
-                    session_id: Some("session_1"),
-                    tool_call_id: "call_1",
+                ToolCtx {
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from("call_1"),
                     event_tx: None,
-                    available_tool_schemas: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
                     bypass_permissions: false,
                     can_async_resume: false,
-                    pre_parsed_args: None,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
                 },
             )
             .await
             .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
         assert!(!result.success);
         assert!(result.result.contains("does not exist"));
     }
@@ -287,7 +296,7 @@ mod tests {
     async fn workspace_set_requires_session_context() {
         let tool = WorkspaceTool::new();
         let err = tool
-            .execute(json!({"path": "/"}))
+            .invoke(json!({"path": "/"}), ToolCtx::none("Workspace"))
             .await
             .expect_err("missing session should fail");
         assert!(matches!(err, ToolError::Execution(msg) if msg.contains("session_id")));

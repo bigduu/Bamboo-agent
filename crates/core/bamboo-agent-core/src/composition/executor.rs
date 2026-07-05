@@ -100,7 +100,10 @@ impl CompositionExecutor {
             .get(normalized)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", normalized)))?;
 
-        tool_impl.execute(args.clone()).await
+        Ok(tool_impl
+            .invoke(args.clone(), crate::tools::ToolCtx::none(normalized))
+            .await?
+            .into_tool_result())
     }
 
     async fn execute_sequence(
@@ -385,7 +388,7 @@ impl CompositionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::Tool;
+    use crate::tools::{Tool, ToolCtx, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -406,13 +409,17 @@ mod tests {
             json!({ "type": "object" })
         }
 
-        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: args.to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -436,13 +443,17 @@ mod tests {
             json!({ "type": "object" })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult {
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: self.success,
                 result: self.result.to_string(),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -464,7 +475,11 @@ mod tests {
             json!({ "type": "object" })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
             Err(ToolError::Execution(format!("{} failed", self.name)))
         }
     }
@@ -488,18 +503,22 @@ mod tests {
             json!({ "type": "object" })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until {
                 return Err(ToolError::Execution("transient failure".to_string()));
             }
 
-            Ok(ToolResult {
+            Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
                 result: format!("attempt-{attempt}"),
                 display_preference: None,
                 images: Vec::new(),
-            })
+            }))
         }
     }
 

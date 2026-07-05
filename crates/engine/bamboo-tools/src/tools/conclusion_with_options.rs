@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -168,7 +168,11 @@ impl Tool for ConclusionWithOptionsTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: ConclusionWithOptionsArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid conclusion_with_options args: {error}"))
         })?;
@@ -194,7 +198,19 @@ impl Tool for ConclusionWithOptionsTool {
 
         let allow_custom = parsed.allow_custom;
 
-        // Build the result payload that will be handled by the agent loop
+        // The structured pending question drives the loop's suspend directly
+        // (Phase B: no marker sniff). Built before the display payload, which
+        // consumes `question`/`options`.
+        let pending_question = bamboo_agent_core::PendingQuestion {
+            tool_call_id: ctx.tool_call_id.to_string(),
+            tool_name: self.name().to_string(),
+            question: question.clone(),
+            options: options.clone(),
+            allow_custom,
+            source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+        };
+
+        // Build the display payload (rich conclusion data for the transcript + UI)
         let result_payload = json!({
             "status": "awaiting_user_input",
             "type": "conclusion_with_options",
@@ -214,11 +230,14 @@ impl Tool for ConclusionWithOptionsTool {
             }
         });
 
-        Ok(ToolResult {
-            success: true,
-            result: result_payload.to_string(),
-            display_preference: Some("conclusion_with_options".to_string()),
-            images: Vec::new(),
+        Ok(ToolOutcome::NeedsHuman {
+            question: pending_question,
+            result: ToolResult {
+                success: true,
+                result: result_payload.to_string(),
+                display_preference: Some("conclusion_with_options".to_string()),
+                images: Vec::new(),
+            },
         })
     }
 }
@@ -246,14 +265,20 @@ mod tests {
     async fn test_execute_valid_input() {
         let tool = ConclusionWithOptionsTool::new();
 
-        let result = tool
-            .execute(json!({
-                "question": "Please select deployment environment",
-                "options": ["Development", "Testing", "Production"],
-                "conclusion": minimal_conclusion()
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "question": "Please select deployment environment",
+                    "options": ["Development", "Testing", "Production"],
+                    "conclusion": minimal_conclusion()
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("tool should execute successfully");
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
+        };
 
         assert!(result.success);
         assert_eq!(
@@ -280,11 +305,14 @@ mod tests {
         let tool = ConclusionWithOptionsTool::new();
 
         let result = tool
-            .execute(json!({
-                "question": "Please confirm?",
-                "options": ["Yes", "No"],
-                "conclusion": minimal_conclusion()
-            }))
+            .invoke(
+                json!({
+                    "question": "Please confirm?",
+                    "options": ["Yes", "No"],
+                    "conclusion": minimal_conclusion()
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_ok());
@@ -294,14 +322,20 @@ mod tests {
     async fn test_execute_with_too_few_options_uses_defaults() {
         let tool = ConclusionWithOptionsTool::new();
 
-        let result = tool
-            .execute(json!({
-                "question": "Please select?",
-                "options": ["Only one option"],
-                "conclusion": minimal_conclusion()
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "question": "Please select?",
+                    "options": ["Only one option"],
+                    "conclusion": minimal_conclusion()
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("tool should execute with fallback defaults");
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
+        };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(parsed["options"], json!(["OK", "Need changes"]));
@@ -311,13 +345,19 @@ mod tests {
     async fn test_execute_without_options_uses_defaults() {
         let tool = ConclusionWithOptionsTool::new();
 
-        let result = tool
-            .execute(json!({
-                "question": "Any other requests before I finish?",
-                "conclusion": minimal_conclusion()
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "question": "Any other requests before I finish?",
+                    "conclusion": minimal_conclusion()
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("tool should execute without options");
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
+        };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(parsed["options"], json!(["OK", "Need changes"]));
@@ -327,14 +367,20 @@ mod tests {
     async fn test_execute_truncates_options_to_six_items() {
         let tool = ConclusionWithOptionsTool::new();
 
-        let result = tool
-            .execute(json!({
-                "question": "Please pick one",
-                "options": ["1", "2", "3", "4", "5", "6", "7"],
-                "conclusion": minimal_conclusion()
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "question": "Please pick one",
+                    "options": ["1", "2", "3", "4", "5", "6", "7"],
+                    "conclusion": minimal_conclusion()
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("tool should execute and truncate options");
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
+        };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(parsed["options"], json!(["1", "2", "3", "4", "5", "6"]));
@@ -344,15 +390,21 @@ mod tests {
     async fn test_execute_with_allow_custom_false() {
         let tool = ConclusionWithOptionsTool::new();
 
-        let result = tool
-            .execute(json!({
-                "question": "Please confirm",
-                "options": ["Yes", "No", "Cancel"],
-                "allow_custom": false,
-                "conclusion": minimal_conclusion()
-            }))
+        let out = tool
+            .invoke(
+                json!({
+                    "question": "Please confirm",
+                    "options": ["Yes", "No", "Cancel"],
+                    "allow_custom": false,
+                    "conclusion": minimal_conclusion()
+                }),
+                ToolCtx::none("t"),
+            )
             .await
             .expect("tool should execute");
+        let ToolOutcome::NeedsHuman { result, .. } = out else {
+            panic!("expected NeedsHuman")
+        };
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert!(!parsed["allow_custom"].as_bool().unwrap());
@@ -363,9 +415,12 @@ mod tests {
         let tool = ConclusionWithOptionsTool::new();
 
         let result = tool
-            .execute(json!({
-                "question": "Please confirm"
-            }))
+            .invoke(
+                json!({
+                    "question": "Please confirm"
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_err());
@@ -382,13 +437,16 @@ mod tests {
         let tool = ConclusionWithOptionsTool::new();
 
         let result = tool
-            .execute(json!({
-                "question": "Please confirm",
-                "conclusion": {
-                    "summary": "Summary",
-                    "mermaid": { "graph": "   " }
-                }
-            }))
+            .invoke(
+                json!({
+                    "question": "Please confirm",
+                    "conclusion": {
+                        "summary": "Summary",
+                        "mermaid": { "graph": "   " }
+                    }
+                }),
+                ToolCtx::none("t"),
+            )
             .await;
 
         assert!(result.is_err());
