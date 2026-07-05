@@ -1611,6 +1611,41 @@ mod tests {
         let _ = super::bash_runtime::remove_shell(&shell.id);
     }
 
+    /// A killed background shell pushes to the sink with `status="killed"` — this
+    /// drives the event-driven completion task's `select!` kill branch (kill_notify
+    /// → start_kill → wait) all the way through to the loop-facing push, so the
+    /// owning loop is notified even when the shell was terminated rather than
+    /// exiting on its own.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn killed_background_shell_pushes_killed_to_sink() {
+        prime_test_command_environment();
+        let recorder = RecordingSink::default();
+        let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
+            std::sync::Arc::new(recorder.clone());
+
+        let shell = super::bash_runtime::spawn_background(
+            "sleep 30",
+            None,
+            None,
+            Some("sess-kill".to_string()),
+            false,
+            Some(sink),
+        )
+        .await
+        .expect("spawn");
+
+        shell.kill().await.expect("shell should be killable");
+
+        let info = wait_for_sink(&recorder, "killed sleep").await;
+        assert_eq!(info.session_id, "sess-kill");
+        assert_eq!(info.bash_id, shell.id);
+        assert_eq!(info.status, "killed");
+        assert_eq!(info.exit_code, None);
+
+        let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+
     #[tokio::test]
     async fn untagged_shell_does_not_invoke_sink() {
         prime_test_command_environment();

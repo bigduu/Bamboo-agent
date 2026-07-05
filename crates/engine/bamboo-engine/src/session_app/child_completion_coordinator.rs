@@ -838,6 +838,38 @@ fn bash_resume_should_retry(outcome: &ResumeOutcome, persisted_waiting_for_bash:
     }
 }
 
+/// Whether a background-shell completion push should **resume** the owning loop
+/// (vs merely enqueue an injection). Resume only when the loop is actually
+/// suspended on a bash wait AND every shell it was waiting on has now finished —
+/// resuming while other waited shells are still running would drop them back into
+/// a foreground turn prematurely. The last shell to finish (or the backstop)
+/// drives the resume; earlier ones enqueue their notice. Pure so the invariant is
+/// unit-testable in isolation.
+fn bash_completion_should_resume(loop_suspended_on_bash: bool, all_waited_shells_done: bool) -> bool {
+    loop_suspended_on_bash && all_waited_shells_done
+}
+
+/// Apply the bash-resume state transition to a loaded session **in place**: clear
+/// the `waiting_for_bash` wait, mark the runtime Idle, drop the suspension +
+/// `runtime.suspend_reason`, and append `resume_message`. Returns `false` (a
+/// no-op) when the session was not actually waiting on bash — the double-resume
+/// guard shared by the push and the backstop. Pure (no I/O) so both
+/// [`ChildCompletionCoordinator::perform_bash_resume`] and unit tests exercise the
+/// exact same transition.
+fn apply_bash_resume_transition(session: &mut Session, resume_message: &Message) -> bool {
+    let mut runtime_state = read_runtime_state(session);
+    if runtime_state.waiting_for_bash.is_none() {
+        return false;
+    }
+    runtime_state.waiting_for_bash = None;
+    runtime_state.status = AgentStatusState::Idle;
+    runtime_state.suspension = None;
+    write_runtime_state(session, &runtime_state);
+    session.metadata.remove("runtime.suspend_reason");
+    session.add_message(resume_message.clone());
+    true
+}
+
 /// Bash self-resume support (issue #84 Phase 2b; push follow-up).
 impl ChildCompletionCoordinator {
     /// **Backstop** for a session suspended on `waiting_for_bash`. The primary,
@@ -938,8 +970,7 @@ impl ChildCompletionCoordinator {
                 return;
             };
 
-            let mut runtime_state = read_runtime_state(&session);
-            if runtime_state.waiting_for_bash.is_none() {
+            if !apply_bash_resume_transition(&mut session, &resume_message) {
                 // Double-resume guard: the wait was already cleared by another
                 // source (the push, the backstop, or a user-driven resume). Do
                 // not append a duplicate message or request a redundant resume.
@@ -949,13 +980,6 @@ impl ChildCompletionCoordinator {
                 );
                 return;
             }
-
-            runtime_state.waiting_for_bash = None;
-            runtime_state.status = AgentStatusState::Idle;
-            runtime_state.suspension = None;
-            write_runtime_state(&mut session, &runtime_state);
-            session.metadata.remove("runtime.suspend_reason");
-            session.add_message(resume_message.clone());
             session.updated_at = Utc::now();
             self.save_and_cache(&mut session).await;
             tracing::info!(
@@ -1140,7 +1164,7 @@ impl ChildCompletionCoordinator {
             bamboo_tools::tools::bash_runtime::running_shells_for_session(&info.session_id)
                 .is_empty();
 
-        if waiting && all_shells_done {
+        if bash_completion_should_resume(waiting, all_shells_done) {
             tracing::info!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
@@ -1610,5 +1634,102 @@ mod tests {
             .await
             .expect("io ok");
         assert!(result.is_none(), "no session → nothing enqueued");
+    }
+
+    // ── push-driven resume: the state transition + decision the push applies ──
+
+    /// A session suspended on `waiting_for_bash`, given the rich completion
+    /// message, is transitioned to a resumable state: the wait is cleared, the
+    /// runtime is Idle, the suspend-reason marker is gone, and the resume message
+    /// is appended. This is exactly what the PUSH does to wake the loop
+    /// event-driven (vs the old backstop poll).
+    #[test]
+    fn apply_bash_resume_transition_clears_wait_and_appends_message() {
+        use bamboo_domain::session::runtime_state::WaitingForBashState;
+
+        let mut session = Session::new("sess-resume", "test-model");
+        session.add_message(Message::user("kick off the build"));
+        let mut rt = read_runtime_state(&session);
+        rt.status = AgentStatusState::Running;
+        rt.waiting_for_bash = Some(WaitingForBashState::for_bash(vec!["sh-1".into()], Utc::now()));
+        write_runtime_state(&mut session, &rt);
+        session.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_bash".to_string(),
+        );
+
+        let resume = bash_completion_resume_message(&["sh-1".to_string()], false);
+        let did = apply_bash_resume_transition(&mut session, &resume);
+
+        assert!(did, "a suspended session must transition");
+        let after = read_runtime_state(&session);
+        assert!(after.waiting_for_bash.is_none(), "bash wait must be cleared");
+        assert_eq!(after.status, AgentStatusState::Idle, "runtime must be Idle");
+        assert!(
+            !session.metadata.contains_key("runtime.suspend_reason"),
+            "suspend-reason marker must be removed"
+        );
+        assert_eq!(session.messages.len(), 2, "resume message must be appended");
+        assert!(matches!(
+            session.messages.last().map(|m| &m.role),
+            Some(Role::User)
+        ));
+    }
+
+    /// The double-resume guard: a session NOT waiting on bash is a no-op — no
+    /// message appended, nothing mutated. This is what makes the backstop poll
+    /// harmlessly yield once the push has already resumed (and vice versa).
+    #[test]
+    fn apply_bash_resume_transition_noops_when_not_waiting() {
+        let mut session = Session::new("sess-live", "test-model");
+        session.add_message(Message::user("hi"));
+
+        let resume = bash_completion_resume_message(&["sh-1".to_string()], false);
+        let did = apply_bash_resume_transition(&mut session, &resume);
+
+        assert!(!did, "a non-waiting session must not transition");
+        assert_eq!(session.messages.len(), 1, "no resume message appended");
+    }
+
+    /// The resume invariant: push-resume fires ONLY when the loop is suspended on
+    /// bash AND every waited shell has finished. A still-running sibling shell
+    /// keeps it on the enqueue path.
+    #[test]
+    fn bash_completion_should_resume_only_when_suspended_and_all_done() {
+        assert!(bash_completion_should_resume(true, true));
+        assert!(!bash_completion_should_resume(true, false)); // other shells still running
+        assert!(!bash_completion_should_resume(false, true)); // live loop, not suspended
+        assert!(!bash_completion_should_resume(false, false));
+    }
+
+    /// The push's resume message carries the shell's identity + status + output
+    /// tail (so the model needs no `BashOutput` round-trip) and is tagged as a
+    /// bash-completion resume so it satisfies the `has_pending_user_message` gate.
+    #[test]
+    fn bash_resume_message_from_info_carries_bashid_tail_and_kind() {
+        let info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "sh-42".into(),
+            command: "cargo test".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "test result: ok".into(),
+        };
+        let msg = bash_resume_message_from_info(&info);
+
+        assert!(matches!(msg.role, Role::User));
+        assert!(msg.content.contains("sh-42"), "content: {}", msg.content);
+        assert!(msg.content.contains("cargo test"), "content: {}", msg.content);
+        assert!(
+            msg.content.contains("test result: ok"),
+            "content: {}",
+            msg.content
+        );
+        assert!(msg.content.contains("BashOutput"), "content: {}", msg.content);
+        let meta = serde_json::to_string(&msg.metadata).unwrap();
+        assert!(
+            meta.contains(BASH_COMPLETION_RESUME_KIND),
+            "resume message must be tagged as a bash-completion resume: {meta}"
+        );
     }
 }
