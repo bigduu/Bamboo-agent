@@ -112,6 +112,8 @@ struct DocBag {
     tf: HashMap<String, f64>,
     /// Document length = sum of weighted term frequencies.
     dl: f64,
+    /// Optional dense embedding for the hybrid semantic term (L1). `None` today.
+    embedding: Option<Vec<f32>>,
 }
 
 /// BM25(F) scorer over one scope's lexical index. Corpus statistics (document
@@ -145,6 +147,7 @@ impl Bm25Corpus {
                     status: item.status,
                     tf: HashMap::new(),
                     dl: 0.0,
+                    embedding: None,
                 });
                 continue;
             }
@@ -173,6 +176,7 @@ impl Bm25Corpus {
                 status: item.status,
                 tf,
                 dl,
+                embedding: item.embedding.clone(),
             });
         }
 
@@ -180,17 +184,27 @@ impl Bm25Corpus {
         Bm25Corpus { docs, df, avgdl, n }
     }
 
-    /// BM25(F) score of `query_tokens` against the document at `index`, or `None`
-    /// if the doc is non-scorable or matches no query term. Stale docs are scaled
-    /// down so an equally-relevant Active doc ranks above them.
-    pub(super) fn score(&self, index: usize, query_tokens: &[String]) -> Option<f64> {
+    /// Hybrid score = BM25(F) `+ cosine_weight·cosine(query_vec, doc.embedding)`.
+    /// With `query_vec == None` (no embedder wired) the semantic term drops out and
+    /// this is pure BM25, byte-identical to L0 — the seam is inert. A doc recalls if
+    /// it matches lexically OR (when vectors are present) its cosine clears
+    /// [`super::embedding::SEMANTIC_FLOOR`], so paraphrase matches the lexical pass
+    /// would miss still surface. Stale docs are scaled down. `None` for a
+    /// non-scorable doc or no match.
+    pub(super) fn score_hybrid(
+        &self,
+        index: usize,
+        query_tokens: &[String],
+        query_vec: Option<&[f32]>,
+        cosine_weight: f64,
+    ) -> Option<f64> {
         let doc = self.docs.get(index)?;
         if !doc.scorable || self.n == 0 {
             return None;
         }
 
-        let mut score = 0.0;
-        let mut matched = false;
+        let mut bm25 = 0.0;
+        let mut lexical_matched = false;
         let mut seen = HashSet::new();
         for token in query_tokens {
             // A term repeated in the query must not double-count.
@@ -208,13 +222,22 @@ impl Bm25Corpus {
             // common term below zero).
             let idf = (((self.n as f64 - df as f64 + 0.5) / (df as f64 + 0.5)) + 1.0).ln();
             let denom = tf + K1 * (1.0 - B + B * (doc.dl / self.avgdl.max(f64::EPSILON)));
-            score += idf * (tf * (K1 + 1.0)) / denom.max(f64::EPSILON);
-            matched = true;
+            bm25 += idf * (tf * (K1 + 1.0)) / denom.max(f64::EPSILON);
+            lexical_matched = true;
         }
 
-        if !matched {
+        // Optional semantic term — inert when either vector is absent.
+        let cos = match (query_vec, doc.embedding.as_deref()) {
+            (Some(q), Some(d)) => super::embedding::cosine(q, d),
+            _ => 0.0,
+        };
+        let semantic_matched = cos >= super::embedding::SEMANTIC_FLOOR;
+
+        if !lexical_matched && !semantic_matched {
             return None;
         }
+
+        let mut score = bm25 + cosine_weight * cos;
         if matches!(doc.status, DurableMemoryStatus::Stale) {
             score *= STALE_MULTIPLIER;
         }
@@ -224,6 +247,12 @@ impl Bm25Corpus {
         // `sort_recall_candidates` still fires and the recalled block stays stable
         // across repeated calls (BM25's raw f64 rarely ties on its own).
         Some((score * 1000.0).round() / 1000.0)
+    }
+
+    /// Pure BM25(F) score (no semantic term) — the recall default until a
+    /// [`super::embedding::MemoryEmbedder`] backend is wired.
+    pub(super) fn score(&self, index: usize, query_tokens: &[String]) -> Option<f64> {
+        self.score_hybrid(index, query_tokens, None, 0.0)
     }
 }
 
@@ -258,6 +287,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             summary: String::new(),
             granularity: None,
+            embedding: None,
         }
     }
 
@@ -427,5 +457,57 @@ mod tests {
             "summary-only Chinese match"
         );
         assert!(corpus.score(1, &tokenize("多租户")).is_none());
+    }
+
+    #[test]
+    fn hybrid_surfaces_a_paraphrase_via_cosine_when_lexical_misses() {
+        // Two docs with NO lexical overlap with the query; "sem" has an embedding
+        // close to the query vector, "orth" is (near-)orthogonal.
+        let mut sem = item(
+            "sem",
+            DurableMemoryStatus::Active,
+            "guardian resume design",
+            &["guardian"],
+        );
+        sem.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let mut orth = item(
+            "orth",
+            DurableMemoryStatus::Active,
+            "cache prefix stability",
+            &["cache"],
+        );
+        orth.embedding = Some(vec![0.0, 1.0, 0.0]);
+        let corpus = Bm25Corpus::build(&[sem, orth]);
+
+        let q = tokenize("hibernation checkpoint"); // matches neither doc lexically
+        let qvec = [0.9_f32, 0.05, 0.0]; // ~parallel to sem, ~orthogonal to orth
+        let w = super::super::embedding::HYBRID_COSINE_WEIGHT;
+
+        // Pure BM25 (no query vector) finds nothing — the seam is inert.
+        assert!(corpus.score(0, &q).is_none());
+        // Hybrid surfaces the semantically-close doc, rejects the orthogonal one.
+        assert!(
+            corpus.score_hybrid(0, &q, Some(&qvec), w).is_some(),
+            "a cosine-close paraphrase must surface even with no lexical overlap"
+        );
+        assert!(
+            corpus.score_hybrid(1, &q, Some(&qvec), w).is_none(),
+            "an orthogonal-embedding doc stays below the semantic floor"
+        );
+    }
+
+    #[test]
+    fn hybrid_with_no_query_vector_equals_pure_bm25() {
+        let mut d = item(
+            "d",
+            DurableMemoryStatus::Active,
+            "guardian resume",
+            &["guardian"],
+        );
+        d.embedding = Some(vec![1.0, 0.0]); // present but unused without a query vector
+        let corpus = Bm25Corpus::build(&[d]);
+        let q = tokenize("guardian");
+        let w = super::super::embedding::HYBRID_COSINE_WEIGHT;
+        assert_eq!(corpus.score_hybrid(0, &q, None, w), corpus.score(0, &q));
     }
 }

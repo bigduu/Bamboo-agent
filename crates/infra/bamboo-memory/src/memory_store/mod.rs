@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod embedding;
 pub mod freshness;
 mod lexical_bm25;
 pub mod paths;
@@ -411,6 +412,12 @@ pub struct LexicalIndexItem {
     /// older `lexical.json` index files predate this field and deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granularity: Option<TemporalGranularity>,
+    /// Optional dense embedding (title+keywords+summary), populated at index-build
+    /// time WHEN a [`embedding::MemoryEmbedder`] backend is configured. Reserved by
+    /// L1: absent today (recall is pure BM25) so this seam is inert; when present,
+    /// recall adds a β·cosine term. Back-compat: older index files → `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
