@@ -36,7 +36,7 @@ parking_lot = "0.12"
 url = "2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 toml = "1.1"
-dirs = "5"
+dirs = "6"
 colored = "2"
 
 [dev-dependencies]
