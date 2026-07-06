@@ -222,20 +222,15 @@ pub fn extract_keywords(title: &str, content: &str, tags: &[String]) -> Vec<Stri
         }
     }
 
+    // CJK-aware tokenization (shared with recall's `lexical_bm25::tokenize`) so a
+    // bilingual (中文 + English) library stores Chinese keywords too. The old pass
+    // keyed on `is_ascii_alphanumeric`, dropping ALL CJK — Chinese docs got no
+    // keyword-boost and (since keywords feed the recall index) full-body Chinese
+    // content was never indexed beyond the 240-char summary. English tokens keep
+    // their prior lowercased form; each Chinese run contributes char bigrams. (#242)
     let combined = format!("{}\n{}", title, content);
-    let mut current = String::new();
-    for ch in combined.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
-            continue;
-        }
-        if current.len() >= 3 {
-            seen.insert(current.clone());
-        }
-        current.clear();
-    }
-    if current.len() >= 3 {
-        seen.insert(current);
+    for token in lexical_bm25::tokenize(&combined) {
+        seen.insert(token);
     }
 
     seen.into_iter().take(128).collect()
@@ -523,7 +518,11 @@ pub fn match_memory_query(
         return Some(1.0);
     };
 
-    let query_tokens = extract_keywords(query, "", &[]);
+    // CJK-aware tokenization (shared with recall) so a Chinese `search`/`query_scope`
+    // query matches (bigrams substring-match the Chinese-preserving title/body).
+    // The old ASCII-only pass yielded zero tokens for Chinese → matched everything
+    // unranked. (#242)
+    let query_tokens = lexical_bm25::tokenize(query);
     if query_tokens.is_empty() {
         return Some(1.0);
     }
