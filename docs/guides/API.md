@@ -30,7 +30,7 @@ Create a new chat session or add a message to an existing session.
 {
   "message": "Help me write a function",
   "session_id": "optional-session-id",
-  "model": "gpt-4o-mini",
+  "model": "claude-sonnet-4-6",
   "system_prompt": "You are a helpful assistant",
   "enhance_prompt": "Additional instructions",
   "workspace_path": "/path/to/workspace"
@@ -69,7 +69,7 @@ Start the agent execution loop for a session.
 
 ```json
 {
-  "model": "claude-3-opus"
+  "model": "claude-sonnet-4-6"
 }
 ```
 
@@ -134,6 +134,8 @@ eventSource.onmessage = (event) => {
   }
 };
 ```
+
+> **Other event transports.** Besides the per-session `GET /api/v1/events/{session_id}` feed above, there is an **account-wide, resumable** change feed `GET /api/v1/stream` (SSE) that multiplexes events across all sessions — resume with `?since=<seq>` or the `Last-Event-ID` header. There is also a **live WebSocket** transport at `/v2/stream` (per-device token auth) which is the primary transport used by the web/desktop clients; the SSE feeds remain available for simple/curl clients.
 
 ---
 
@@ -360,7 +362,7 @@ curl -X POST http://localhost:9562/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
     "message": "Help me write a Rust function",
-    "model": "gpt-4o-mini"
+    "model": "claude-sonnet-4-6"
   }'
 ```
 
@@ -371,7 +373,7 @@ Response includes `session_id` and `stream_url`.
 ```bash
 curl -X POST http://localhost:9562/api/v1/execute/{session_id} \
   -H "Content-Type: application/json" \
-  -d '{"model": "gpt-4o-mini"}'
+  -d '{"model": "claude-sonnet-4-6"}'
 ```
 
 Response includes `events_url`.

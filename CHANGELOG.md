@@ -2,8 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+Historical `0.x` releases followed [Semantic Versioning](https://semver.org/spec/v2.0.0.html);
+since then the project ships **date-versioned nightly releases** (see below).
+
+## [Unreleased] — nightly (date-versioned)
+
+Since `0.3.0` the project ships **date-versioned nightly releases** (e.g. `2026.7.x`)
+cut by the release train, rather than SemVer point releases. Changes between
+nightlies are tracked in the git history and merged PRs (the source of truth);
+the SemVer sections below are retained for the historical `0.x` releases.
 
 ## [0.3.0] - 2026-02-26
 
