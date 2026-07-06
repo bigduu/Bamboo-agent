@@ -527,8 +527,11 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
             force_first = false;
             run_gardener_passes(&ctx).await;
             last_run = Instant::now();
-            // Re-count after the pass so consolidations/splits are reflected in the
-            // baseline (dedup shrinks the count, split grows it).
+            // Re-baseline the count AFTER the pass so the gardener's own file writes
+            // don't re-trigger it. Superseded/archived sources are kept as tombstone
+            // files, so a split or a dedup-consolidation actually GROWS the topic-file
+            // count (a new canonical is written, sources retained); only a hard purge
+            // shrinks it. Re-baselining absorbs all of that.
             last_run_count = memory.count_all_memories().await.unwrap_or(current_count);
         }
     });

@@ -491,52 +491,10 @@ async fn run_auto_dream_once_for_scope(
         return Ok(None);
     }
 
-    // Resolve background model (and provider when using ProviderModelRef).
-    let provider_ref_enabled = config_snapshot.features.provider_model_ref;
-    let model_ref = if provider_ref_enabled {
-        config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.memory_background.as_ref())
-            .or_else(|| {
-                config_snapshot
-                    .defaults
-                    .as_ref()
-                    .and_then(|d| d.fast.as_ref())
-            })
-    } else {
-        None
-    };
-
-    let (bg_provider, model): (Arc<dyn LLMProvider>, String) = if let Some(ref mr) = model_ref {
-        let router = ProviderModelRouter::new(ctx.provider_registry.clone());
-        let routed = router.route(mr).map_err(|e| {
-            format!(
-                "[auto_dream] failed to route background model ref '{}': {}",
-                mr, e
-            )
-        })?;
-        tracing::debug!(
-            target: DREAM_TRACING_TARGET,
-            model_ref = %mr,
-            "Resolved background model via ProviderModelRef"
-        );
-        (routed, mr.model.clone())
-    } else {
-        let Some(model) = config_snapshot.get_memory_background_model() else {
-            tracing::warn!(
-                target: DREAM_TRACING_TARGET,
-                event = "run_skip",
-                reason = "no_background_model",
-                scope = scope_label,
-                project_key = project_key.unwrap_or(""),
-                "[auto_dream] skipped: no memory.background_model / provider.fast_model configured"
-            );
-            return Ok(None);
-        };
-        (ctx.provider.clone(), model)
-    };
-
+    // NOTE: the background model is resolved AFTER the candidate-session check
+    // below, so an idle default-on instance with no model configured returns
+    // quietly (no candidate sessions) instead of warning every tick. Mirrors the
+    // gardener, which checks its worklist before resolving a model.
     let now = Utc::now();
     let existing = read_existing_dream_for_scope(memory, scope, project_key).await?;
     let durable_memory_index =
@@ -573,12 +531,59 @@ async fn run_auto_dream_once_for_scope(
             reason = "no_candidate_sessions",
             scope = scope_label,
             project_key = project_key.unwrap_or(""),
-            model = model.as_str(),
             existing_dream_present = existing.is_some(),
             "Skipping Dream generation because there are no candidate sessions"
         );
         return Ok(None);
     }
+
+    // There IS work — now resolve the background model (and provider when using
+    // ProviderModelRef). Doing this after the session check keeps an idle default-on
+    // instance without a model quiet; a "no model" warn here means real work exists
+    // that we can't do.
+    let provider_ref_enabled = config_snapshot.features.provider_model_ref;
+    let model_ref = if provider_ref_enabled {
+        config_snapshot
+            .defaults
+            .as_ref()
+            .and_then(|d| d.memory_background.as_ref())
+            .or_else(|| {
+                config_snapshot
+                    .defaults
+                    .as_ref()
+                    .and_then(|d| d.fast.as_ref())
+            })
+    } else {
+        None
+    };
+    let (bg_provider, model): (Arc<dyn LLMProvider>, String) = if let Some(ref mr) = model_ref {
+        let router = ProviderModelRouter::new(ctx.provider_registry.clone());
+        let routed = router.route(mr).map_err(|e| {
+            format!(
+                "[auto_dream] failed to route background model ref '{}': {}",
+                mr, e
+            )
+        })?;
+        tracing::debug!(
+            target: DREAM_TRACING_TARGET,
+            model_ref = %mr,
+            "Resolved background model via ProviderModelRef"
+        );
+        (routed, mr.model.clone())
+    } else {
+        let Some(model) = config_snapshot.get_memory_background_model() else {
+            tracing::warn!(
+                target: DREAM_TRACING_TARGET,
+                event = "run_skip",
+                reason = "no_background_model",
+                scope = scope_label,
+                project_key = project_key.unwrap_or(""),
+                "[auto_dream] skipped: no memory.background_model / provider.fast_model configured"
+            );
+            return Ok(None);
+        };
+        (ctx.provider.clone(), model)
+    };
 
     // The notebook is a VIEW of durable memory (L3): rebuild it from the canonical
     // durable memory index whenever any durable memory exists — grounded in the
@@ -1709,9 +1714,12 @@ Model: gpt-5-mini
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
+        // auto_dream is ON by default (L4), so disable it explicitly to keep
+        // covering the disabled gate (not merely "no candidate sessions").
         let config = Arc::new(RwLock::new(Config {
             memory: Some(bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: false,
                 ..bamboo_config::MemoryConfig::default()
             }),
             ..Config::default()
