@@ -389,7 +389,24 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // a phantom "thinking" indicator after the reply is already done
             // (notably on a session's first turn). Same Ok/cancelled/error
             // mapping `status_from_execution_result` applies to the runner.
+            //
+            // A suspended run also returns `Ok(())` but is NOT terminal: it
+            // stamped `runtime.suspend_reason` (awaiting_clarification /
+            // waiting_for_children / waiting_for_bash / awaiting_parent_approval)
+            // and will resume later (which removes the reason — see respond.rs /
+            // child_completion_coordinator). Mark it "suspended" rather than
+            // "completed" so a session waiting on the user or on children isn't
+            // reported as finished (mirrors the child path in `sdk::spawn`).
+            let suspended_non_terminal = result.is_ok()
+                && session
+                    .metadata
+                    .get("runtime.suspend_reason")
+                    .is_some_and(|reason| !reason.trim().is_empty());
             match &result {
+                Ok(()) if suspended_non_terminal => {
+                    session.set_last_run_status("suspended");
+                    session.clear_last_run_error();
+                }
                 Ok(()) => {
                     session.set_last_run_status("completed");
                     session.clear_last_run_error();
