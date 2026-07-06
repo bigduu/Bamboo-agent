@@ -71,7 +71,7 @@ impl BrokerClient {
         let (mut sink, mut source) = ws.split();
 
         // Handshake: send Hello, wait for Welcome (or Error).
-        sink.send(Message::Text(
+        sink.send(Message::text(
             ClientFrame::Hello {
                 agent,
                 token: token.into(),
@@ -315,7 +315,7 @@ impl BrokerClient {
 
     async fn send(&mut self, frame: ClientFrame) -> BrokerResult<()> {
         self.sink
-            .send(Message::Text(frame.to_text()))
+            .send(Message::text(frame.to_text()))
             .await
             .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
     }
@@ -413,7 +413,7 @@ mod tests {
             // First text frame is the client's `Hello`; answer with `Welcome`.
             if let Some(Ok(Message::Text(_))) = source.next().await {
                 let _ = sink
-                    .send(Message::Text(BrokerFrame::Welcome.to_text()))
+                    .send(Message::text(BrokerFrame::Welcome.to_text()))
                     .await;
             }
             // Drain the `Deliver` (and anything else) but never reply with
@@ -473,7 +473,7 @@ mod tests {
             // First text frame is the client's `Hello`; answer with `Welcome`.
             if let Some(Ok(Message::Text(_))) = source.next().await {
                 let _ = sink
-                    .send(Message::Text(BrokerFrame::Welcome.to_text()))
+                    .send(Message::text(BrokerFrame::Welcome.to_text()))
                     .await;
             }
             // Close cleanly so the client reader's `Ok(Close)` / stream-end arm
@@ -542,7 +542,7 @@ mod tests {
             let (mut sink, mut source) = ws.split();
             if let Some(Ok(Message::Text(_))) = source.next().await {
                 let _ = sink
-                    .send(Message::Text(BrokerFrame::Welcome.to_text()))
+                    .send(Message::text(BrokerFrame::Welcome.to_text()))
                     .await;
             }
             while let Some(Ok(Message::Text(txt))) = source.next().await {
@@ -550,7 +550,7 @@ mod tests {
                     let id = message.id.clone();
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     let _ = sink
-                        .send(Message::Text(BrokerFrame::Delivered { id }.to_text()))
+                        .send(Message::text(BrokerFrame::Delivered { id }.to_text()))
                         .await;
                 }
             }

@@ -1259,7 +1259,7 @@ mod tests {
                         if let Message::Text(t) = msg {
                             if ClientFrame::from_text(&t).is_ok() {
                                 let _ = sink
-                                    .send(Message::Text(BrokerFrame::Welcome.to_text()))
+                                    .send(Message::text(BrokerFrame::Welcome.to_text()))
                                     .await;
                                 break;
                             }
@@ -1279,7 +1279,7 @@ mod tests {
                             _ => continue,
                         };
                         let _ = sink
-                            .send(Message::Text(
+                            .send(Message::text(
                                 BrokerFrame::Delivered {
                                     id: message.id.clone(),
                                 }
@@ -1288,7 +1288,7 @@ mod tests {
                             .await;
                         let reply = answer_mcp_request(message, &orch);
                         let _ = sink
-                            .send(Message::Text(
+                            .send(Message::text(
                                 BrokerFrame::Message { message: reply }.to_text(),
                             ))
                             .await;
