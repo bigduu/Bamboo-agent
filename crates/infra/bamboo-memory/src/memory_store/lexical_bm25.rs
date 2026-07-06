@@ -237,7 +237,12 @@ impl Bm25Corpus {
             return None;
         }
 
-        let mut score = bm25 + cosine_weight * cos;
+        // The semantic term only ever BOOSTS: clamp cosine to >= 0 so a future
+        // backend's negative/anti-correlated vector can never demote (or, with a
+        // large weight, sink) a strong lexical match. `cosine()` already maps
+        // empty/degenerate/non-finite inputs to 0.0, so this term is always a
+        // finite, non-negative addend.
+        let mut score = bm25 + cosine_weight * cos.max(0.0);
         if matches!(doc.status, DurableMemoryStatus::Stale) {
             score *= STALE_MULTIPLIER;
         }

@@ -31,8 +31,9 @@ pub const HYBRID_COSINE_WEIGHT: f64 = 1.0;
 /// recalls on lexical BM25 alone below this; the floor only gates cosine-only hits.
 pub const SEMANTIC_FLOOR: f64 = 0.25;
 
-/// Cosine similarity in [-1, 1]. Returns 0 for empty, mismatched-length, or
-/// degenerate (zero-norm) vectors, so a missing/absent embedding is a no-op.
+/// Cosine similarity in [-1, 1]. Returns 0 for empty, mismatched-length,
+/// degenerate (zero-norm), or non-finite (NaN/inf) vectors, so a missing/absent
+/// or malformed embedding is a no-op that can never leak NaN/inf into a score.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
@@ -48,9 +49,15 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     }
     let denom = na.sqrt() * nb.sqrt();
     if denom <= f64::EPSILON {
-        0.0
+        return 0.0;
+    }
+    let sim = dot / denom;
+    // Backends only SHOULD unit-normalize; a stray NaN/inf component would make
+    // `sim` non-finite. Clamp it out rather than trust the contract.
+    if sim.is_finite() {
+        sim
     } else {
-        dot / denom
+        0.0
     }
 }
 
@@ -69,5 +76,11 @@ mod tests {
         assert_eq!(cosine(&[], &[1.0]), 0.0);
         assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0);
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn cosine_non_finite_component_is_zero() {
+        assert_eq!(cosine(&[f32::NAN, 1.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine(&[f32::INFINITY, 0.0], &[1.0, 1.0]), 0.0);
     }
 }
