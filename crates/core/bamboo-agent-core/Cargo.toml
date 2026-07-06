@@ -11,7 +11,7 @@ bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = "1"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
