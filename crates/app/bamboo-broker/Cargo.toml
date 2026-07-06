@@ -19,7 +19,7 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "io-util", "rt", "rt-multi-thread", "sync", "macros", "net", "time"] }
 tokio-util = "0.7"
 tokio-tungstenite = "0.24"
-russh = "0.52"
+russh = { version = "0.60.3", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3.0"
 sha2 = "0.10.9"
 

@@ -153,19 +153,16 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Run security audit
-        # Ignored advisories (all transitive; no safe in-tree fix today):
+        # RUSTSEC-2026-0154 (russh) + RUSTSEC-2026-0153 (russh-cryptovec) are now
+        # FIXED by upgrading russh 0.52 -> 0.60.3 (ring backend, no aws-lc/cmake).
+        #
+        # Remaining ignore (transitive, no safe in-tree fix):
         #   RUSTSEC-2023-0071  rsa (Marvin timing sidechannel) — NO fixed release
-        #     exists upstream; pulled in transitively via russh's forked ssh-key.
-        #     bamboo's only RSA use is operator-initiated SSH deploy (low exposure).
-        #   RUSTSEC-2026-0154  russh 0.52 (unbounded 32-bit alloc) and
-        #   RUSTSEC-2026-0153  russh-cryptovec 0.52 — fixed in russh >= 0.60.3, but
-        #     that is a major (0.52 -> 0.60+) breaking bump of the SSH transport
-        #     (client/keys/channel APIs + russh-sftp compat) and needs live SSH-deploy
-        #     testing. Tracked for a proper upgrade in a follow-up issue.
+        #     exists in ANY rsa version (incl. the 0.10-rc pulled by russh 0.60);
+        #     transitive via russh's ssh-key RSA support. bamboo's only RSA use is
+        #     operator-initiated SSH deploy (low exposure).
         run: |
           cargo audit \
             --ignore RUSTSEC-2024-0384 \
             --ignore RUSTSEC-2025-0134 \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0154 \
-            --ignore RUSTSEC-2026-0153
+            --ignore RUSTSEC-2023-0071
