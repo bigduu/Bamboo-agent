@@ -239,7 +239,9 @@ pub struct MemoryConfig {
     /// archives the lowest-value overflow OUT of the recall index (memory redesign
     /// L5 — archive, never delete; reversible). 0 = unbounded (feature OFF, the
     /// default): consequential enough to be opt-in, since L4's dedup already curbs
-    /// most growth. `Reference`/`User`/`Feedback` memories are always exempt.
+    /// most growth. `Reference`/`User`/`Feedback` memories are always exempt — so
+    /// the effective floor is the count of exempt Active memories in a scope; set
+    /// this comfortably above that (a capacity below it is a no-op, not a purge).
     #[serde(default)]
     pub memory_active_capacity: usize,
     /// Hard cap on how many memories the capacity gardener archives per run, so a
@@ -3248,7 +3250,12 @@ mod tests {
         assert_eq!(MemoryConfig::default().memory_active_capacity, 0);
         assert_eq!(MemoryConfig::default().capacity_max_archivals_per_run, 50);
         let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
-        assert_eq!(parsed.memory.unwrap().memory_active_capacity, 0);
+        let memory = parsed.memory.unwrap();
+        assert_eq!(memory.memory_active_capacity, 0);
+        assert_eq!(
+            memory.capacity_max_archivals_per_run, 50,
+            "omitted field takes the serde default fn"
+        );
     }
 
     /// L4: the maintenance integrators are ON by default — both via

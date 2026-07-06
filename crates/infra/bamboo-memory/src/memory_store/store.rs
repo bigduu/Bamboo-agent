@@ -1965,10 +1965,26 @@ impl MemoryStore {
                     && doc.frontmatter.r#type == DurableMemoryType::Project
             })
             .collect();
+
+        // Unachievable-bound guard: only Project docs are evictable, so the lowest
+        // recallable count we can reach is the exempt (Reference/User/Feedback)
+        // scorable count. If that alone already exceeds `capacity`, archiving every
+        // Project memory still wouldn't meet the bound — so DON'T strip them all
+        // (pointless + destructive). Skip; the capacity is set below the exempt
+        // floor and the user should raise it.
+        let exempt_scorable = scorable - evictable.len();
+        if exempt_scorable > capacity {
+            return Ok(Vec::new());
+        }
+
+        // Lowest keep-value first; within a value tie, evict the OLDEST first (keep
+        // the newer restatement). `updated_at` is UTC rfc3339 → string order is
+        // chronological.
         evictable.sort_by(|a, b| {
             memory_value(a, now)
                 .partial_cmp(&memory_value(b, now))
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.frontmatter.updated_at.cmp(&b.frontmatter.updated_at))
         });
         let target = overflow.min(max_archivals).min(evictable.len());
         let archive_ids: std::collections::HashSet<String> = evictable
@@ -3638,6 +3654,59 @@ mod tests {
             assert_eq!(doc.frontmatter.r#type, DurableMemoryType::Project);
             assert_eq!(doc.frontmatter.status, DurableMemoryStatus::Archived);
         }
+    }
+
+    /// L5 guard: when exempt (Reference/User/Feedback) memories alone exceed the
+    /// capacity, the bound is unachievable by archiving only Project memories — so
+    /// the pass archives NOTHING rather than stripping every Project memory.
+    #[tokio::test]
+    async fn enforce_scope_capacity_skips_when_capacity_below_exempt_floor() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+        let write = |title: &'static str, r#type| {
+            let store = &store;
+            async move {
+                store
+                    .write_memory(
+                        MemoryScope::Project,
+                        pk,
+                        r#type,
+                        title,
+                        "body content for the memory",
+                        &[],
+                        Some("s"),
+                        "m",
+                        false,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        // 3 exempt (Reference) + 2 evictable (Project).
+        write("Ref one", DurableMemoryType::Reference).await;
+        write("Ref two", DurableMemoryType::Reference).await;
+        write("Ref three", DurableMemoryType::Reference).await;
+        write("Proj one", DurableMemoryType::Project).await;
+        write("Proj two", DurableMemoryType::Project).await;
+
+        // capacity=2 < 3 exempt → unachievable → archive nothing (don't strip Project).
+        let archived = store
+            .enforce_scope_capacity(MemoryScope::Project, pk, 2, 100)
+            .await
+            .unwrap();
+        assert!(
+            archived.is_empty(),
+            "must not strip Project memories chasing an unreachable bound"
+        );
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, pk)
+            .await
+            .unwrap();
+        assert!(docs
+            .iter()
+            .all(|d| d.frontmatter.status == DurableMemoryStatus::Active));
     }
 
     /// Many `MemoryStore` instances pointed at the SAME data dir (the real
