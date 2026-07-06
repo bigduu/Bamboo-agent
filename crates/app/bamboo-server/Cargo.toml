@@ -97,7 +97,7 @@ tokio-util = "0.7"
 bytes = "1"
 url = "2"
 hex = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 rand = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 actix-governor = "0.10.0"

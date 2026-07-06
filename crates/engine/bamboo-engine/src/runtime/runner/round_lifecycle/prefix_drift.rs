@@ -46,7 +46,7 @@ const LAST_SECTIONS_FILE: &str = "_last_sections.json";
 fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Per-section state persisted between rounds for cheap change detection.
