@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use bamboo_agent_core::tools::{
-    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolCtx, ToolError,
+    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
     ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
 };
 use bamboo_tools::normalize_tool_ref;
@@ -96,7 +96,7 @@ mod tests {
 
     use serde_json::json;
 
-    use bamboo_agent_core::tools::FunctionCall;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCtx};
 
     struct BaseExecutor;
 

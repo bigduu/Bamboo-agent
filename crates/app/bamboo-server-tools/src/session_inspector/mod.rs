@@ -3,7 +3,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome};
 use bamboo_storage::SessionStoreV2;
 
 mod args;

@@ -45,9 +45,9 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use thiserror::Error;
 
 use crate::tools::tool_runtime::{ToolClass, ToolCtx, ToolOutcome};
-use crate::tools::{FunctionSchema, ToolError, ToolSchema};
 #[cfg(test)]
 use crate::tools::ToolResult;
+use crate::tools::{FunctionSchema, ToolError, ToolSchema};
 
 /// Trait for implementing executable tools.
 ///
@@ -125,11 +125,8 @@ pub trait Tool: Send + Sync {
     /// `execute_with_context` split is gone, and `ctx` is owned so an `invoke`
     /// future can be moved into a detached drive task for latency-adaptive
     /// promotion.
-    async fn invoke(
-        &self,
-        args: serde_json::Value,
-        ctx: ToolCtx,
-    ) -> Result<ToolOutcome, ToolError>;
+    async fn invoke(&self, args: serde_json::Value, ctx: ToolCtx)
+        -> Result<ToolOutcome, ToolError>;
 
     /// Convert tool to LLM-compatible schema.
     ///

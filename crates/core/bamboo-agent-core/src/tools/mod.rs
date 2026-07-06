@@ -101,11 +101,6 @@ pub mod smart_code_review;
 pub mod tool_runtime;
 pub mod types;
 
-pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
-pub use tool_runtime::{
-    AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
-    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
-};
 pub use accumulator::{
     finalize_tool_calls, update_partial_tool_call, PartialToolCall, ToolCallAccumulator,
 };
@@ -113,6 +108,7 @@ pub use agentic::{
     convert_from_standard_result, convert_to_standard_result, AgenticContext, AgenticTool,
     AgenticToolExecutor, AgenticToolResult, Interaction, InteractionRole, ToolGoal,
 };
+pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
 pub use context::{ToolExecutionContext, ToolExecutionSessionFlags};
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use registry::{
@@ -124,6 +120,10 @@ pub use result_handler::{
     ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };
 pub use smart_code_review::SmartCodeReviewTool;
+pub use tool_runtime::{
+    AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
+    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
+};
 pub use types::{FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolResultImage, ToolSchema};
 
 /// Classification of a tool call for approval purposes.

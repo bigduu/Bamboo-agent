@@ -19,7 +19,9 @@ use bamboo_broker::{
     ask_agent, AgentDeployment, BrokerClient, Deployer, LocalProcessDeployer, RusshAuth,
     RusshDeployer, SshDeployer, UploadSpec, ORCHESTRATOR_ID,
 };
-use bamboo_config::cluster_fabric::{Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget};
+use bamboo_config::cluster_fabric::{
+    Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget,
+};
 use bamboo_config::{BrokerClientConfig, Config};
 use bamboo_subagent::{AgentRef, AskMode};
 
@@ -120,17 +122,24 @@ impl FabricDeployer {
     pub async fn deploy(&self, node_id: &str, echo: bool) -> FabricResult<NodeState> {
         let (mut node, broker) = {
             let cfg = self.config.read().await;
-            (self.node_snapshot(&cfg, node_id)?, cfg.subagents.broker.clone())
+            (
+                self.node_snapshot(&cfg, node_id)?,
+                cfg.subagents.broker.clone(),
+            )
         };
         if !node.enabled {
-            return Err(FabricError::BadRequest(format!("Node '{node_id}' is disabled")));
+            return Err(FabricError::BadRequest(format!(
+                "Node '{node_id}' is disabled"
+            )));
         }
-        let broker = broker.filter(|b| !b.endpoint.trim().is_empty()).ok_or_else(|| {
-            FabricError::BadRequest(
-                "No broker configured (subagents.broker) — a worker has nowhere to dial home"
-                    .to_string(),
-            )
-        })?;
+        let broker = broker
+            .filter(|b| !b.endpoint.trim().is_empty())
+            .ok_or_else(|| {
+                FabricError::BadRequest(
+                    "No broker configured (subagents.broker) — a worker has nowhere to dial home"
+                        .to_string(),
+                )
+            })?;
 
         // Zero-config default: if the operator didn't pin an artifact, ship our OWN
         // `bamboo` binary so a fresh remote node needs no manual install — but only
@@ -144,8 +153,7 @@ impl FabricDeployer {
                 FabricError::Internal(format!("preflight for '{node_id}' failed: {e}"))
             })?;
             if remote_matches_orchestrator(&uname) {
-                node.deploy.artifact_path =
-                    Some(self.bamboo_bin.to_string_lossy().into_owned());
+                node.deploy.artifact_path = Some(self.bamboo_bin.to_string_lossy().into_owned());
                 tracing::info!(
                     node = node_id,
                     %uname,
@@ -171,7 +179,14 @@ impl FabricDeployer {
         // the legacy argv+env self-resolve (spec_json is then ignored, harmless).
         let spec_json = {
             let cfg = self.config.read().await;
-            build_resident_spec(&node, &broker.endpoint, &broker.token, &cfg, echo, &worker_id)
+            build_resident_spec(
+                &node,
+                &broker.endpoint,
+                &broker.token,
+                &cfg,
+                echo,
+                &worker_id,
+            )
         };
 
         let deployment = AgentDeployment {
@@ -189,7 +204,12 @@ impl FabricDeployer {
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker
         // port before the new deploy requests the same forward.
-        if let Some(prev) = self.registry.lock().await.remove(&crate::registry_keys::node_key(node_id)) {
+        if let Some(prev) = self
+            .registry
+            .lock()
+            .await
+            .remove(&crate::registry_keys::node_key(node_id))
+        {
             prev.handle.shutdown().await;
         }
 
@@ -209,7 +229,9 @@ impl FabricDeployer {
                     outcome = "failed",
                     error = %e,
                 );
-                return Err(FabricError::Internal(format!("deploy node '{node_id}' failed: {e}")));
+                return Err(FabricError::Internal(format!(
+                    "deploy node '{node_id}' failed: {e}"
+                )));
             }
         };
         let pid = handle.pid();
@@ -286,7 +308,9 @@ impl FabricDeployer {
                 outcome = "verify_failed",
                 error = %e,
             );
-            return Err(FabricError::Internal(format!("deploy node '{node_id}': {msg}")));
+            return Err(FabricError::Internal(format!(
+                "deploy node '{node_id}': {msg}"
+            )));
         }
         tracing::info!(
             node = node_id,
@@ -313,10 +337,19 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             self.node_snapshot(&cfg, node_id)?;
         }
-        if let Some(d) = self.registry.lock().await.remove(&crate::registry_keys::node_key(node_id)) {
+        if let Some(d) = self
+            .registry
+            .lock()
+            .await
+            .remove(&crate::registry_keys::node_key(node_id))
+        {
             d.handle.shutdown().await;
         }
-        tracing::info!(audit = "cluster_fabric.stop", node = node_id, outcome = "stopped");
+        tracing::info!(
+            audit = "cluster_fabric.stop",
+            node = node_id,
+            outcome = "stopped"
+        );
         let state = NodeState {
             status: NodeStatus::Stopped,
             ..Default::default()
@@ -367,7 +400,8 @@ impl FabricDeployer {
 
     /// Health-check `node_id` with the production probe timeout.
     pub async fn health_check(&self, node_id: &str) -> FabricResult<NodeState> {
-        self.health_check_within(node_id, Self::HEALTH_PROBE_TIMEOUT).await
+        self.health_check_within(node_id, Self::HEALTH_PROBE_TIMEOUT)
+            .await
     }
 
     /// Probe a Running/Unreachable node's worker on the bus and reconcile its live
@@ -385,13 +419,22 @@ impl FabricDeployer {
     ) -> FabricResult<NodeState> {
         let (node, broker) = {
             let cfg = self.config.read().await;
-            (self.node_snapshot(&cfg, node_id)?, cfg.subagents.broker.clone())
+            (
+                self.node_snapshot(&cfg, node_id)?,
+                cfg.subagents.broker.clone(),
+            )
         };
         let current = node.state.clone().unwrap_or_default();
-        if !matches!(current.status, NodeStatus::Running | NodeStatus::Unreachable) {
+        if !matches!(
+            current.status,
+            NodeStatus::Running | NodeStatus::Unreachable
+        ) {
             return Ok(current); // only nodes that should be up are monitored
         }
-        let worker_id = current.worker_id.clone().unwrap_or_else(|| worker_id_for(&node));
+        let worker_id = current
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| worker_id_for(&node));
         let role = node
             .deploy
             .default_role
@@ -416,7 +459,9 @@ impl FabricDeployer {
         let new_error = if alive {
             None
         } else {
-            Some(format!("worker '{worker_id}' not present on the bus under role '{role}'"))
+            Some(format!(
+                "worker '{worker_id}' not present on the bus under role '{role}'"
+            ))
         };
 
         // Commit under the io + write lock, RE-CHECKING the live status. The probe
@@ -473,9 +518,9 @@ impl FabricDeployer {
             .nodes
             .iter()
             .filter(|n| {
-                n.state
-                    .as_ref()
-                    .is_some_and(|s| matches!(s.status, NodeStatus::Running | NodeStatus::Unreachable))
+                n.state.as_ref().is_some_and(|s| {
+                    matches!(s.status, NodeStatus::Running | NodeStatus::Unreachable)
+                })
             })
             .map(|n| n.id.clone())
             .collect()
@@ -586,7 +631,10 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             cfg.cluster_fabric.health_interval()?
         };
-        tracing::info!(interval_secs = interval.as_secs(), "cluster health monitor started");
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            "cluster health monitor started"
+        );
         Some(tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -708,8 +756,7 @@ fn build_resident_spec(
         BusEndpoint, ChildIdentity, ExecutorSpec, McpProxyConfig, ModelRefSpec, ProvisionSpec,
     };
 
-    let credentials =
-        bamboo_engine::external_agents::runtime::extract_provider_credentials(config);
+    let credentials = bamboo_engine::external_agents::runtime::extract_provider_credentials(config);
     if credentials.is_empty() && !echo {
         return None;
     }
@@ -988,11 +1035,14 @@ fn build_russh(node: &Node, target: &SshTarget) -> Result<RusshDeployer, String>
         remote_path: remote_artifact_path(node),
     });
 
-    Ok(
-        RusshDeployer::new(target.host.clone(), target.port, target.username.clone(), auth)
-            .with_fingerprint(target.host_key_fingerprint.clone())
-            .with_upload(upload),
+    Ok(RusshDeployer::new(
+        target.host.clone(),
+        target.port,
+        target.username.clone(),
+        auth,
     )
+    .with_fingerprint(target.host_key_fingerprint.clone())
+    .with_upload(upload))
 }
 
 #[cfg(test)]
@@ -1096,7 +1146,10 @@ mod presence_verify_tests {
             Duration::from_millis(400),
         )
         .await;
-        assert!(out.is_err(), "a worker under a different role must not count");
+        assert!(
+            out.is_err(),
+            "a worker under a different role must not count"
+        );
     }
 }
 
@@ -1216,7 +1269,11 @@ mod health_check_tests {
             .health_check_within("a", Duration::from_millis(400))
             .await
             .unwrap();
-        assert_eq!(st.status, NodeStatus::Stopped, "a stopped node is not probed");
+        assert_eq!(
+            st.status,
+            NodeStatus::Stopped,
+            "a stopped node is not probed"
+        );
         assert!(st.last_health.is_none(), "no probe → no heartbeat");
     }
 
@@ -1229,7 +1286,10 @@ mod health_check_tests {
         let d = deployer_with(vec![running_node("a", "node-a", "mon")], &endpoint);
         let probe = {
             let d = d.clone();
-            tokio::spawn(async move { d.health_check_within("a", Duration::from_millis(1500)).await })
+            tokio::spawn(async move {
+                d.health_check_within("a", Duration::from_millis(1500))
+                    .await
+            })
         };
         // Mid-probe, flip the node to Stopped as stop() would.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1241,10 +1301,24 @@ mod health_check_tests {
             });
         }
         let observed = probe.await.unwrap().unwrap();
-        assert_eq!(observed.status, NodeStatus::Stopped, "health_check yields to the stop");
+        assert_eq!(
+            observed.status,
+            NodeStatus::Stopped,
+            "health_check yields to the stop"
+        );
         let cfg = d.config.read().await;
-        let st = cfg.cluster_fabric.node("a").unwrap().state.as_ref().unwrap();
-        assert_eq!(st.status, NodeStatus::Stopped, "Stopped not overwritten to Unreachable");
+        let st = cfg
+            .cluster_fabric
+            .node("a")
+            .unwrap()
+            .state
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            st.status,
+            NodeStatus::Stopped,
+            "Stopped not overwritten to Unreachable"
+        );
     }
 }
 
@@ -1322,9 +1396,19 @@ mod recovery_tests {
         tokio::time::advance(Duration::from_secs(41)).await;
         assert_eq!(d.recovery_decision("a", &un).await, None);
         let cfg = d.config.read().await;
-        let st = cfg.cluster_fabric.node("a").unwrap().state.as_ref().unwrap();
+        let st = cfg
+            .cluster_fabric
+            .node("a")
+            .unwrap()
+            .state
+            .as_ref()
+            .unwrap();
         assert_eq!(st.status, NodeStatus::Failed);
-        assert!(st.last_error.as_deref().unwrap_or_default().contains("gave up"));
+        assert!(st
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("gave up"));
     }
 
     #[tokio::test]
@@ -1334,7 +1418,11 @@ mod recovery_tests {
         let (d, _dir) = deployer(vec![node]);
         let un = unreachable();
         assert_eq!(d.recovery_decision("a", &un).await, None);
-        assert_eq!(d.recovery_decision("a", &un).await, None, "opt-out never redeploys");
+        assert_eq!(
+            d.recovery_decision("a", &un).await,
+            None,
+            "opt-out never redeploys"
+        );
     }
 
     #[tokio::test]
@@ -1347,7 +1435,7 @@ mod recovery_tests {
         };
         assert_eq!(d.recovery_decision("a", &un).await, None); // miss 1
         assert_eq!(d.recovery_decision("a", &ok).await, None); // recovered → reset
-        // Debounce restarts from zero, so it takes another 2 misses.
+                                                               // Debounce restarts from zero, so it takes another 2 misses.
         assert_eq!(d.recovery_decision("a", &un).await, None);
         assert_eq!(d.recovery_decision("a", &un).await, Some(1));
     }

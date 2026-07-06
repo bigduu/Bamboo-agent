@@ -292,42 +292,42 @@ pub(super) async fn apply_tool_execution_outcome(
         true
     } else {
         match outcome.result {
-        Ok(result) => {
-            let r = execution_paths::handle_successful_tool_result(
-                execution_paths::SuccessPathContext {
-                    tool_call: ctx.tool_call,
-                    result: &result,
-                    event_tx: ctx.event_tx,
-                    metrics_collector: ctx.metrics_collector,
-                    session_id: ctx.session_id,
-                    round_id: ctx.round_id,
-                    round: ctx.round,
-                    session: ctx.session,
-                    tools: ctx.tools,
-                    config: ctx.config,
-                    task_context: ctx.task_context,
-                    state: ctx.state,
-                    tool_duration: outcome.tool_duration,
-                },
-            )
-            .await;
-            r
-        }
-        Err(error_message) => {
-            execution_paths::handle_tool_execution_error(
-                ctx.tool_call,
-                &error_message,
-                ctx.event_tx,
-                ctx.metrics_collector,
-                ctx.session_id,
-                ctx.round_id,
-                ctx.round,
-                ctx.session,
-                ctx.state,
-            )
-            .await;
-            false
-        }
+            Ok(result) => {
+                let r = execution_paths::handle_successful_tool_result(
+                    execution_paths::SuccessPathContext {
+                        tool_call: ctx.tool_call,
+                        result: &result,
+                        event_tx: ctx.event_tx,
+                        metrics_collector: ctx.metrics_collector,
+                        session_id: ctx.session_id,
+                        round_id: ctx.round_id,
+                        round: ctx.round,
+                        session: ctx.session,
+                        tools: ctx.tools,
+                        config: ctx.config,
+                        task_context: ctx.task_context,
+                        state: ctx.state,
+                        tool_duration: outcome.tool_duration,
+                    },
+                )
+                .await;
+                r
+            }
+            Err(error_message) => {
+                execution_paths::handle_tool_execution_error(
+                    ctx.tool_call,
+                    &error_message,
+                    ctx.event_tx,
+                    ctx.metrics_collector,
+                    ctx.session_id,
+                    ctx.round_id,
+                    ctx.round,
+                    ctx.session,
+                    ctx.state,
+                )
+                .await;
+                false
+            }
         }
     };
 

@@ -32,11 +32,19 @@ pub async fn deploy_node(
 }
 
 pub async fn stop_node(app_state: &AppState, node_id: &str) -> Result<NodeState, AppError> {
-    app_state.fabric_deployer.stop(node_id).await.map_err(map_err)
+    app_state
+        .fabric_deployer
+        .stop(node_id)
+        .await
+        .map_err(map_err)
 }
 
 pub async fn test_node(app_state: &AppState, node_id: &str) -> Result<String, AppError> {
-    app_state.fabric_deployer.test(node_id).await.map_err(map_err)
+    app_state
+        .fabric_deployer
+        .test(node_id)
+        .await
+        .map_err(map_err)
 }
 
 pub async fn read_logs(

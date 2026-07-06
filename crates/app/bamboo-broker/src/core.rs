@@ -112,7 +112,10 @@ impl BrokerCore {
     pub async fn cancel(&self, to: &str, correlation_id: &MsgId) -> bool {
         let subs = self.subscribers.lock().await;
         match subs.get(to) {
-            Some(sub) => sub.sink.send(PushItem::Cancel(correlation_id.clone())).is_ok(),
+            Some(sub) => sub
+                .sink
+                .send(PushItem::Cancel(correlation_id.clone()))
+                .is_ok(),
             None => false,
         }
     }
@@ -157,10 +160,8 @@ impl BrokerCore {
             if subs.contains_key(&id) {
                 continue; // a live subscriber owns it — keep.
             }
-            if Mailbox::at(&path).is_fully_empty() {
-                if std::fs::remove_dir_all(&path).is_ok() {
-                    purged += 1;
-                }
+            if Mailbox::at(&path).is_fully_empty() && std::fs::remove_dir_all(&path).is_ok() {
+                purged += 1;
             }
         }
         purged
@@ -370,13 +371,19 @@ mod tests {
         let mut explorers = c.connected_by_role("explorer").await;
         explorers.sort();
         assert_eq!(explorers, vec!["w1".to_string(), "w2".to_string()]);
-        assert_eq!(c.connected_by_role("reviewer").await, vec!["w3".to_string()]);
+        assert_eq!(
+            c.connected_by_role("reviewer").await,
+            vec!["w3".to_string()]
+        );
         assert!(c.connected_by_role("missing").await.is_empty());
         assert_eq!(c.connected().await.len(), 4, "all four are live");
 
         // Presence is connection-truth: unsubscribing drops it from the registry.
         c.unsubscribe("w1").await;
-        assert_eq!(c.connected_by_role("explorer").await, vec!["w2".to_string()]);
+        assert_eq!(
+            c.connected_by_role("explorer").await,
+            vec!["w2".to_string()]
+        );
     }
 
     #[tokio::test]

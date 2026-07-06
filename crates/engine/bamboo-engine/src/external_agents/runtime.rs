@@ -484,7 +484,12 @@ mod placement_resolver_tests {
 
     #[test]
     fn schedulable_placement_takes_host_label_from_node_by_default_role() {
-        let nodes = vec![ssh_node("n1", "mini", "mini.local", Some("mac-mini-monitor"))];
+        let nodes = vec![ssh_node(
+            "n1",
+            "mini",
+            "mini.local",
+            Some("mac-mini-monitor"),
+        )];
         let placements = vec![SchedulablePlacement {
             role: "mac-mini-monitor".into(),
             pool: "mac-mini-monitor".into(),
@@ -505,7 +510,10 @@ mod placement_resolver_tests {
             ..Default::default()
         }];
         let out = resolve_remote_placements(&placements, &nodes);
-        assert_eq!(out.get("explorer").unwrap().host_label.as_deref(), Some("mini"));
+        assert_eq!(
+            out.get("explorer").unwrap().host_label.as_deref(),
+            Some("mini")
+        );
     }
 
     #[test]

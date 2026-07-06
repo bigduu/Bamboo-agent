@@ -176,7 +176,11 @@ impl ClusterTool {
     async fn deploy(&self, node_id: &str, echo: bool) -> Result<ToolResult, ToolError> {
         // Delegate to the shared engine (one registry across HTTP + agent), which
         // resolves stored creds server-side and persists NodeState.
-        let state = self.deployer.deploy(node_id, echo).await.map_err(to_tool_error)?;
+        let state = self
+            .deployer
+            .deploy(node_id, echo)
+            .await
+            .map_err(to_tool_error)?;
         let worker_id = state.worker_id.clone().unwrap_or_default();
         Ok(tool_json(json!({
             "node": node_id,
@@ -433,7 +437,8 @@ mod tests {
         let _worker = join_worker(&endpoint, "node-n1", "general-purpose").await;
 
         // Unique data dir so the persisted config.json doesn't collide with peers.
-        let data_dir = std::env::temp_dir().join(format!("bamboo-clustertool-{}", std::process::id()));
+        let data_dir =
+            std::env::temp_dir().join(format!("bamboo-clustertool-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&data_dir);
         let deployer = Arc::new(crate::fabric_deploy::FabricDeployer::new(
             cfg.clone(),
@@ -449,7 +454,10 @@ mod tests {
         let out = parse(t.deploy("n1", false).await.unwrap());
         assert_eq!(out["worker_id"], "node-n1");
         assert_eq!(out["status"], "deployed");
-        assert!(registry.lock().await.contains_key(&key), "handle registered");
+        assert!(
+            registry.lock().await.contains_key(&key),
+            "handle registered"
+        );
 
         let stopped = parse(t.stop("n1").await.unwrap());
         assert_eq!(stopped["status"], "stopped");

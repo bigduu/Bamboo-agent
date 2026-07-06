@@ -184,15 +184,16 @@ pub(super) fn build_root_tools(
             // list/stop covers cluster-deployed workers too (and vice versa).
             let bamboo_bin =
                 std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
-            let with_deploy: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-                with_ask,
-                Arc::new(crate::tools::DeployAgentTool::new(
-                    b.endpoint,
-                    b.token,
-                    bamboo_bin,
-                    fabric_deployer.registry(),
-                )),
-            ));
+            let with_deploy: Arc<dyn ToolExecutor> =
+                Arc::new(crate::tools::OverlayToolExecutor::new(
+                    with_ask,
+                    Arc::new(crate::tools::DeployAgentTool::new(
+                        b.endpoint,
+                        b.token,
+                        bamboo_bin,
+                        fabric_deployer.registry(),
+                    )),
+                ));
             // `cluster`: progressive-disclosure inventory (list/describe/status)
             // + dispatch (deploy/stop) via the SAME shared deploy engine.
             Arc::new(crate::tools::OverlayToolExecutor::new(

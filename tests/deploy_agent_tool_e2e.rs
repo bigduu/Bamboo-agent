@@ -97,7 +97,10 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
 
     // 4. stop tears it down.
     let r = tool
-        .invoke(serde_json::json!({ "action": "stop", "id": "w1" }), ctx().to_tool_ctx())
+        .invoke(
+            serde_json::json!({ "action": "stop", "id": "w1" }),
+            ctx().to_tool_ctx(),
+        )
         .await
         .map(|o| o.into_tool_result())
         .expect("stop succeeds");

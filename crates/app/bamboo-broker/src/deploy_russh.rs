@@ -62,7 +62,12 @@ pub struct RusshDeployer {
 }
 
 impl RusshDeployer {
-    pub fn new(host: impl Into<String>, port: u16, username: impl Into<String>, auth: RusshAuth) -> Self {
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: RusshAuth,
+    ) -> Self {
         Self {
             host: host.into(),
             port,
@@ -103,10 +108,7 @@ impl RusshDeployer {
     /// Connect + host-key TOFU + authenticate, returning the live session.
     /// `broker_local` is only used to bridge reverse-tunnel connections (unused
     /// during preflight, where no `tcpip_forward` is requested).
-    async fn connect_and_auth(
-        &self,
-        broker_local: String,
-    ) -> BrokerResult<Handle<FabricHandler>> {
+    async fn connect_and_auth(&self, broker_local: String) -> BrokerResult<Handle<FabricHandler>> {
         let config = Arc::new(client::Config::default());
         let handler = FabricHandler {
             expected: self.expected_fingerprint.clone(),
@@ -115,7 +117,12 @@ impl RusshDeployer {
         };
         let mut session = client::connect(config, (self.host.as_str(), self.port), handler)
             .await
-            .map_err(|e| transport(format!("russh connect {}:{} failed: {e}", self.host, self.port)))?;
+            .map_err(|e| {
+                transport(format!(
+                    "russh connect {}:{} failed: {e}",
+                    self.host, self.port
+                ))
+            })?;
 
         let authed = match &self.auth {
             RusshAuth::Password(pw) => session
@@ -125,7 +132,12 @@ impl RusshDeployer {
                 .success(),
             RusshAuth::PrivateKey { pem, passphrase } => {
                 let key = parse_private_key(pem, passphrase.as_deref())?;
-                let hash = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+                let hash = session
+                    .best_supported_rsa_hash()
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
                 session
                     .authenticate_publickey(
                         &self.username,
@@ -144,7 +156,6 @@ impl RusshDeployer {
         }
         Ok(session)
     }
-
 }
 
 /// russh client handler: enforces host-key TOFU and bridges reverse-tunnel
@@ -257,7 +268,11 @@ impl Deployer for RusshDeployer {
         session
             .tcpip_forward("127.0.0.1", bport as u32)
             .await
-            .map_err(|e| transport(format!("reverse tunnel (tcpip_forward {bport}) failed: {e}")))?;
+            .map_err(|e| {
+                transport(format!(
+                    "reverse tunnel (tcpip_forward {bport}) failed: {e}"
+                ))
+            })?;
 
         // 4b. Upload the parent-built ProvisionSpec (if any) so the worker reads
         //     it via --spec-file instead of self-resolving from the remote's config.
@@ -276,8 +291,11 @@ impl Deployer for RusshDeployer {
         // 5. Launch the worker pointed at the tunnel mouth on the remote loopback.
         let mut tunneled = d.clone();
         tunneled.broker_endpoint = format!("ws://127.0.0.1:{bport}");
-        let remote_cmd =
-            build_launch_cmd(&tunneled, &self.bamboo_on_remote, remote_spec_path.as_deref());
+        let remote_cmd = build_launch_cmd(
+            &tunneled,
+            &self.bamboo_on_remote,
+            remote_spec_path.as_deref(),
+        );
         let channel = session
             .channel_open_session()
             .await
@@ -333,7 +351,11 @@ impl Deployer for RusshDeployer {
 }
 
 /// Build the remote launch command: `BAMBOO_BROKER_TOKEN=… <bamboo> broker-agent serve …`.
-fn build_launch_cmd(d: &AgentDeployment, bamboo_on_remote: &str, spec_file: Option<&str>) -> String {
+fn build_launch_cmd(
+    d: &AgentDeployment,
+    bamboo_on_remote: &str,
+    spec_file: Option<&str>,
+) -> String {
     let mut cmd = format!("BAMBOO_BROKER_TOKEN={}", sh_quote(&d.token));
     cmd.push(' ');
     cmd.push_str(&sh_quote(bamboo_on_remote));
@@ -398,7 +420,8 @@ fn parse_private_key(pem: &str, passphrase: Option<&str>) -> BrokerResult<Privat
     let key = PrivateKey::from_openssh(pem)
         .map_err(|e| transport(format!("invalid private key: {e}")))?;
     if key.is_encrypted() {
-        let pass = passphrase.ok_or_else(|| transport("private key is encrypted but no passphrase was provided"))?;
+        let pass = passphrase
+            .ok_or_else(|| transport("private key is encrypted but no passphrase was provided"))?;
         key.decrypt(pass)
             .map_err(|e| transport(format!("private key decrypt failed: {e}")))
     } else {
@@ -408,10 +431,7 @@ fn parse_private_key(pem: &str, passphrase: Option<&str>) -> BrokerResult<Privat
 
 /// SFTP-upload the binary if the remote copy is absent or differs (hash-skip),
 /// then `chmod +x`.
-async fn upload_if_needed(
-    session: &Handle<FabricHandler>,
-    spec: &UploadSpec,
-) -> BrokerResult<()> {
+async fn upload_if_needed(session: &Handle<FabricHandler>, spec: &UploadSpec) -> BrokerResult<()> {
     // Remote hash (Linux: sha256sum; macOS: shasum). Empty if absent.
     let remote_hash = exec_capture(
         session,
@@ -422,7 +442,11 @@ async fn upload_if_needed(
     )
     .await
     .unwrap_or_default();
-    let remote_hash = remote_hash.split_whitespace().next().unwrap_or("").to_string();
+    let remote_hash = remote_hash
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
 
     let bytes = tokio::fs::read(&spec.local_path)
         .await
@@ -555,7 +579,8 @@ mod tests {
         d.log_path = Some(".bamboo-deploy/node-abc.log".to_string());
         let cmd = build_launch_cmd(&d, ".bamboo-deploy/bamboo", None);
         assert!(
-            cmd.trim_end().ends_with("> '.bamboo-deploy/node-abc.log' 2>&1"),
+            cmd.trim_end()
+                .ends_with("> '.bamboo-deploy/node-abc.log' 2>&1"),
             "got: {cmd}"
         );
     }
@@ -563,20 +588,17 @@ mod tests {
     #[test]
     fn launch_cmd_appends_spec_file_when_set() {
         let cmd = build_launch_cmd(&dep(), ".bamboo-deploy/bamboo", Some("/tmp/spec.json"));
-        assert!(
-            cmd.contains("--spec-file '/tmp/spec.json'"),
-            "got: {cmd}"
-        );
+        assert!(cmd.contains("--spec-file '/tmp/spec.json'"), "got: {cmd}");
     }
 
     #[test]
     fn with_upload_points_remote_binary_at_uploaded_path() {
-        let d = RusshDeployer::new("h", 22, "u", RusshAuth::Password("p".into())).with_upload(Some(
-            UploadSpec {
+        let d = RusshDeployer::new("h", 22, "u", RusshAuth::Password("p".into())).with_upload(
+            Some(UploadSpec {
                 local_path: "/local/bamboo".into(),
                 remote_path: ".bamboo-deploy/bamboo".into(),
-            },
-        ));
+            }),
+        );
         assert_eq!(d.bamboo_on_remote, ".bamboo-deploy/bamboo");
     }
 

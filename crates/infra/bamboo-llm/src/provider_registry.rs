@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 use crate::provider::{LLMError, LLMProvider};
 use crate::provider_factory::create_provider_by_name;
 use bamboo_config::Config;
-use bamboo_domain::poison::PoisonRecover;
 use bamboo_config::ProviderInstanceConfig;
+use bamboo_domain::poison::PoisonRecover;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderMetadata {
@@ -97,10 +97,7 @@ impl ProviderRegistry {
         // permanent DoS on the critical path for every LLM call.
         *self.providers.write().recover_poison() = providers;
         *self.metadata.write().recover_poison() = metadata;
-        *self
-            .default_provider
-            .write()
-            .recover_poison() = default_provider;
+        *self.default_provider.write().recover_poison() = default_provider;
         Ok(())
     }
 
@@ -278,19 +275,11 @@ impl ProviderRegistry {
 
     /// Get a provider by name or instance id.
     pub fn get(&self, name: &str) -> Option<Arc<dyn LLMProvider>> {
-        self.providers
-            .read()
-            .recover_poison()
-            .get(name)
-            .cloned()
+        self.providers.read().recover_poison().get(name).cloned()
     }
 
     pub fn get_metadata(&self, name: &str) -> Option<ProviderMetadata> {
-        self.metadata
-            .read()
-            .recover_poison()
-            .get(name)
-            .cloned()
+        self.metadata.read().recover_poison().get(name).cloned()
     }
 
     pub fn provider_metadata(&self) -> Vec<ProviderMetadata> {
@@ -310,10 +299,7 @@ impl ProviderRegistry {
 
     /// The default provider name.
     pub fn default_provider_name(&self) -> String {
-        self.default_provider
-            .read()
-            .recover_poison()
-            .clone()
+        self.default_provider.read().recover_poison().clone()
     }
 
     /// All provider names that were successfully initialized.
@@ -328,18 +314,12 @@ impl ProviderRegistry {
 
     /// Number of initialized providers.
     pub fn len(&self) -> usize {
-        self.providers
-            .read()
-            .recover_poison()
-            .len()
+        self.providers.read().recover_poison().len()
     }
 
     /// Whether any providers are registered.
     pub fn is_empty(&self) -> bool {
-        self.providers
-            .read()
-            .recover_poison()
-            .is_empty()
+        self.providers.read().recover_poison().is_empty()
     }
 
     /// Insert or replace a provider at runtime (used by instance CRUD / tests).
@@ -348,37 +328,25 @@ impl ProviderRegistry {
             .write()
             .recover_poison()
             .insert(key.clone(), provider);
-        self.metadata
-            .write()
-            .recover_poison()
-            .insert(
-                key.clone(),
-                ProviderMetadata {
-                    id: key.clone(),
-                    provider_type: key.clone(),
-                    display_name: display_name_for_provider_type(&key),
-                },
-            );
+        self.metadata.write().recover_poison().insert(
+            key.clone(),
+            ProviderMetadata {
+                id: key.clone(),
+                provider_type: key.clone(),
+                display_name: display_name_for_provider_type(&key),
+            },
+        );
     }
 
     /// Remove a provider by key at runtime (used by instance CRUD / tests).
     pub fn remove(&self, key: &str) -> Option<Arc<dyn LLMProvider>> {
-        self.metadata
-            .write()
-            .recover_poison()
-            .remove(key);
-        self.providers
-            .write()
-            .recover_poison()
-            .remove(key)
+        self.metadata.write().recover_poison().remove(key);
+        self.providers.write().recover_poison().remove(key)
     }
 
     /// Update the default provider key.
     pub fn set_default(&self, key: String) {
-        *self
-            .default_provider
-            .write()
-            .recover_poison() = key;
+        *self.default_provider.write().recover_poison() = key;
     }
 }
 

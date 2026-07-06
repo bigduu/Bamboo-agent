@@ -96,7 +96,10 @@ impl Drop for LiveActorGuard {
 
 /// Register a live child's frame sender for the duration of its run.
 pub fn register(child_id: &str, tx: mpsc::UnboundedSender<ParentFrame>) -> LiveActorGuard {
-    map().lock().recover_poison().insert(child_id.to_string(), tx);
+    map()
+        .lock()
+        .recover_poison()
+        .insert(child_id.to_string(), tx);
     LiveActorGuard {
         child_id: child_id.to_string(),
     }

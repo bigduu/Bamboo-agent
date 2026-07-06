@@ -377,7 +377,14 @@ fn spawn_completion_poll(
                 let code = status.code();
                 // `code.is_none()` ⇒ terminated by signal (our SIGKILL, or an
                 // external one) ⇒ "killed"; otherwise a normal exit ⇒ "completed".
-                (if code.is_none() { "killed" } else { "completed" }, code)
+                (
+                    if code.is_none() {
+                        "killed"
+                    } else {
+                        "completed"
+                    },
+                    code,
+                )
             }
             Err(_) => ("error", None),
         };

@@ -16,10 +16,7 @@ pub(super) fn load_from_file(
     })?;
     let modified = metadata.modified().ok();
 
-    let cache = loader
-        .cache
-        .read()
-        .recover_poison();
+    let cache = loader.cache.read().recover_poison();
     if let Some(cached) = cache.get(path) {
         if cached.modified == modified {
             return Ok(cached.definition.clone());
@@ -35,10 +32,7 @@ pub(super) fn load_from_file(
     let definition = parse_definition(path, &content)?;
     loader.validate_with_path(path, &definition)?;
 
-    let mut cache = loader
-        .cache
-        .write()
-        .recover_poison();
+    let mut cache = loader.cache.write().recover_poison();
     cache.insert(
         path.to_path_buf(),
         CachedWorkflow {

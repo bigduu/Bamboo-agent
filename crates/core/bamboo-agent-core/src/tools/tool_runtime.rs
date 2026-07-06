@@ -294,10 +294,16 @@ mod tests {
     #[test]
     fn tool_class_defaults_and_builders() {
         assert_eq!(ToolClass::default(), ToolClass::MUTATING_SERIAL);
-        assert_eq!(ToolClass::MUTATING_SERIAL.mutability, ToolMutability::Mutating);
+        assert_eq!(
+            ToolClass::MUTATING_SERIAL.mutability,
+            ToolMutability::Mutating
+        );
         assert!(!ToolClass::MUTATING_SERIAL.parallel_safe);
         assert!(!ToolClass::MUTATING_SERIAL.promotable);
-        assert_eq!(ToolClass::READONLY_PARALLEL.mutability, ToolMutability::ReadOnly);
+        assert_eq!(
+            ToolClass::READONLY_PARALLEL.mutability,
+            ToolMutability::ReadOnly
+        );
         assert!(ToolClass::READONLY_PARALLEL.parallel_safe);
         assert!(ToolClass::READONLY_PARALLEL.promotable().promotable);
     }

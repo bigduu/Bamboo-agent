@@ -847,7 +847,10 @@ fn bash_resume_should_retry(outcome: &ResumeOutcome, persisted_waiting_for_bash:
 /// a foreground turn prematurely. The last shell to finish (or the backstop)
 /// drives the resume; earlier ones enqueue their notice. Pure so the invariant is
 /// unit-testable in isolation.
-fn bash_completion_should_resume(loop_suspended_on_bash: bool, all_waited_shells_done: bool) -> bool {
+fn bash_completion_should_resume(
+    loop_suspended_on_bash: bool,
+    all_waited_shells_done: bool,
+) -> bool {
     loop_suspended_on_bash && all_waited_shells_done
 }
 
@@ -1653,7 +1656,10 @@ mod tests {
         session.add_message(Message::user("kick off the build"));
         let mut rt = read_runtime_state(&session);
         rt.status = AgentStatusState::Running;
-        rt.waiting_for_bash = Some(WaitingForBashState::for_bash(vec!["sh-1".into()], Utc::now()));
+        rt.waiting_for_bash = Some(WaitingForBashState::for_bash(
+            vec!["sh-1".into()],
+            Utc::now(),
+        ));
         write_runtime_state(&mut session, &rt);
         session.metadata.insert(
             "runtime.suspend_reason".to_string(),
@@ -1665,7 +1671,10 @@ mod tests {
 
         assert!(did, "a suspended session must transition");
         let after = read_runtime_state(&session);
-        assert!(after.waiting_for_bash.is_none(), "bash wait must be cleared");
+        assert!(
+            after.waiting_for_bash.is_none(),
+            "bash wait must be cleared"
+        );
         assert_eq!(after.status, AgentStatusState::Idle, "runtime must be Idle");
         assert!(
             !session.metadata.contains_key("runtime.suspend_reason"),
@@ -1721,13 +1730,21 @@ mod tests {
 
         assert!(matches!(msg.role, Role::User));
         assert!(msg.content.contains("sh-42"), "content: {}", msg.content);
-        assert!(msg.content.contains("cargo test"), "content: {}", msg.content);
+        assert!(
+            msg.content.contains("cargo test"),
+            "content: {}",
+            msg.content
+        );
         assert!(
             msg.content.contains("test result: ok"),
             "content: {}",
             msg.content
         );
-        assert!(msg.content.contains("BashOutput"), "content: {}", msg.content);
+        assert!(
+            msg.content.contains("BashOutput"),
+            "content: {}",
+            msg.content
+        );
         let meta = serde_json::to_string(&msg.metadata).unwrap();
         assert!(
             meta.contains(BASH_COMPLETION_RESUME_KIND),
