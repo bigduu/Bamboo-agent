@@ -576,33 +576,6 @@ pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<St
     (!parts.is_empty()).then(|| parts.join("\n\n---\n\n"))
 }
 
-/// Normalize an existing dream notebook body for use as consolidation prompt context.
-///
-/// Returns `None` if normalization fails (logged as a warning).
-pub fn normalize_existing_dream_for_prompt(
-    existing_dream: Option<&str>,
-    model: &str,
-    session_count: usize,
-    max_summary_chars: usize,
-) -> Option<String> {
-    existing_dream.and_then(|dream| {
-        match normalize_dream_notebook_body(dream, max_summary_chars) {
-            Ok(body) => Some(body),
-            Err(error) => {
-                tracing::warn!(
-                    target: "bamboo.auto_dream",
-                    event = "existing_input_normalization_failed",
-                    model = model,
-                    session_count = session_count,
-                    "[auto_dream] failed to normalize existing Dream input; omitting prior Dream context: {}",
-                    error
-                );
-                None
-            }
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Config helpers
 // ---------------------------------------------------------------------------

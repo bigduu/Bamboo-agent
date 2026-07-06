@@ -775,26 +775,16 @@ mod tests {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
     }
 
-    #[derive(Debug, Clone)]
-    enum SequenceStep {
-        Response(String),
-        Fail(String),
-    }
-
     #[derive(Clone)]
     struct SequenceProvider {
-        steps: Arc<Mutex<Vec<SequenceStep>>>,
+        responses: Arc<Mutex<Vec<String>>>,
         prompts: Arc<Mutex<Vec<String>>>,
     }
 
     impl SequenceProvider {
         fn new(responses: Vec<String>) -> Self {
-            Self::from_steps(responses.into_iter().map(SequenceStep::Response).collect())
-        }
-
-        fn from_steps(steps: Vec<SequenceStep>) -> Self {
             Self {
-                steps: Arc::new(Mutex::new(steps)),
+                responses: Arc::new(Mutex::new(responses)),
                 prompts: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -816,14 +806,11 @@ mod tests {
             if let Some(prompt) = messages.last().map(|message| message.content.clone()) {
                 self.prompts.lock().expect("lock poisoned").push(prompt);
             }
-            let next = self.steps.lock().expect("lock poisoned").remove(0);
-            match next {
-                SequenceStep::Response(text) => Ok(Box::pin(stream::iter(vec![
-                    Ok(LLMChunk::Token(text)),
-                    Ok(LLMChunk::Done),
-                ]))),
-                SequenceStep::Fail(error) => Err(LLMError::Stream(error)),
-            }
+            let text = self.responses.lock().expect("lock poisoned").remove(0);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token(text)),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
 
