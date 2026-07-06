@@ -2,7 +2,7 @@ name: Claude Code Review
 
 # ── How this works ──────────────────────────────────────────────────────────
 # Two review modes, gated by `github.event.action`:
-#   1. opus + deep prompt    on `opened` and `ready_for_review` (first review)
+#   1. sonnet + deep prompt  on `opened` and `ready_for_review` (first review)
 #   2. sonnet + diff-aware   on `synchronize` and `reopened` (follow-up)
 #
 # Shared config rationale (applies to both steps):
@@ -44,9 +44,8 @@ on:
       - 'docs/**'
 
 # Cancel an in-flight review when the PR is pushed again. Without this, rapid
-# consecutive pushes each spawn a full review that runs to completion — and the
-# first-pass review uses opus, the most expensive model. Only the latest
-# commit's review is worth keeping.
+# consecutive pushes each spawn a full review that runs to completion. Only the
+# latest commit's review is worth keeping.
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -67,9 +66,9 @@ jobs:
           fetch-depth: 0
 
       # Initial review — runs once when the PR is opened or moves from draft
-      # to ready-for-review. Opus produces a comprehensive first-pass review
+      # to ready-for-review. Produces a comprehensive first-pass review
       # over the full diff.
-      - name: Initial PR review (opus, deep)
+      - name: Initial PR review (sonnet, deep)
         if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
         uses: anthropics/claude-code-action@v1
         with:
@@ -86,7 +85,7 @@ jobs:
               `gh pr comment ${{ github.event.number }} --body "..."`
             Summarize overall findings, risks, and a clear approve/request-changes
             recommendation. Do not finish without commenting.
-          claude_args: '--model opus --allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*)"'
+          claude_args: '--model sonnet --allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*)"'
           show_full_output: false
 
       # Follow-up review — runs on subsequent pushes (synchronize) and on
