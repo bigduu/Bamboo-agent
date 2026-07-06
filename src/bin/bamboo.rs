@@ -854,14 +854,16 @@ async fn main() {
             }
         }
 
-        Commands::Doctor { data_dir } => match bamboo_agent::setup_cli::run_doctor(data_dir).await {
-            Ok(true) => {}
-            Ok(false) => std::process::exit(1),
-            Err(e) => {
-                eprintln!("doctor failed: {e:#}");
-                std::process::exit(1);
+        Commands::Doctor { data_dir } => {
+            match bamboo_agent::setup_cli::run_doctor(data_dir).await {
+                Ok(true) => {}
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    eprintln!("doctor failed: {e:#}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
 
         Commands::Config {
             action,

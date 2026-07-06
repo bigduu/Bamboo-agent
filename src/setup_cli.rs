@@ -19,6 +19,11 @@ use bamboo_config::Config;
 /// intentionally excluded here — configure it via the web UI / `bamboo actor`.
 const KEYED_PROVIDERS: [&str; 3] = ["anthropic", "openai", "gemini"];
 
+/// All providers the config recognizes, for selecting the *default* provider.
+/// Broader than [`KEYED_PROVIDERS`]: `copilot` (OAuth) and `bodhi` (proxy) are
+/// valid default providers even though this CLI does not manage their keys.
+const KNOWN_PROVIDERS: [&str; 5] = ["anthropic", "openai", "gemini", "copilot", "bodhi"];
+
 /// A reasonable default chat model per provider, matching the ids referenced
 /// elsewhere in the repo (README / `docker/config.example.json`). Used only when
 /// the user does not pass an explicit model.
@@ -26,7 +31,7 @@ fn default_model_for(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("claude-sonnet-4-6"),
         "openai" => Some("gpt-4o-mini"),
-        "gemini" => Some("gemini-2.0-flash"),
+        "gemini" => Some("gemini-2.0-flash-exp"),
         _ => None,
     }
 }
@@ -53,10 +58,10 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
 
-    // Load existing (or default) config from the target dir. Non-publishing:
-    // this one-shot writer must not clobber the global env-var cache the server
-    // owns (#40).
-    let mut config = Config::from_data_dir_without_publish(Some(data_dir.clone()));
+    // Load existing (or default) config from the target dir. No env overrides
+    // (this one-shot writer immediately re-saves; applying `BAMBOO_*` here would
+    // bake transient env values into config.json) and no cache publish (#40).
+    let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
 
     // 1. Provider.
     let provider = match args.provider {
@@ -177,14 +182,21 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
         }
     }
 
-    // 3. Server reachability (informational — not running is normal).
+    // 3. Server reachability (informational — not running is normal). Probe the
+    // configured bind; a wildcard/empty bind is reached via loopback.
     let port = config.server.port;
-    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let bind = config.server.bind.trim();
+    let host = if bind.is_empty() || bind == "0.0.0.0" || bind == "::" {
+        "127.0.0.1"
+    } else {
+        bind
+    };
+    let url = format!("http://{host}:{port}/api/v1/health");
     if check_health(&url).await {
-        ok(&format!("server reachable at 127.0.0.1:{port}"));
+        ok(&format!("server reachable at {host}:{port}"));
     } else {
         info(&format!(
-            "server not running on 127.0.0.1:{port} (start it with `bamboo serve`)"
+            "server not running on {host}:{port} (start it with `bamboo serve`)"
         ));
     }
 
@@ -208,11 +220,13 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
 /// fields on the provider are preserved.
 pub fn run_config_set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
-    let mut config = Config::from_data_dir_without_publish(Some(data_dir.clone()));
+    let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
 
     let parts: Vec<&str> = key.split('.').collect();
     match parts.as_slice() {
-        ["provider"] => config.provider = normalize_provider(value)?,
+        // Selecting the default provider accepts any known provider (incl.
+        // copilot/bodhi), not just the keyed ones.
+        ["provider"] => config.provider = normalize_known_provider(value)?,
         ["providers", p, "api_key"] => {
             let p = normalize_provider(p)?;
             let v = value.trim();
@@ -223,7 +237,11 @@ pub fn run_config_set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Resu
         }
         ["providers", p, "model"] => {
             let p = normalize_provider(p)?;
-            set_provider_model(&mut config, &p, value)?;
+            let v = value.trim();
+            if v.is_empty() {
+                bail!("model must not be empty");
+            }
+            set_provider_model(&mut config, &p, v)?;
         }
         _ => bail!(
             "unsupported config key '{key}'. Supported keys:\n  \
@@ -247,7 +265,8 @@ pub fn run_config_set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Resu
 
 // ---- provider helpers ----
 
-/// Validate + canonicalize a provider name against the keyed-provider set.
+/// Validate + canonicalize a provider name against the keyed-provider set
+/// (providers this CLI can set an API key for).
 fn normalize_provider(provider: &str) -> Result<String> {
     let p = provider.trim().to_ascii_lowercase();
     if KEYED_PROVIDERS.contains(&p.as_str()) {
@@ -256,6 +275,20 @@ fn normalize_provider(provider: &str) -> Result<String> {
         bail!(
             "unsupported provider '{provider}' (supported: {})",
             KEYED_PROVIDERS.join(", ")
+        )
+    }
+}
+
+/// Validate + canonicalize a provider name against the full known-provider set
+/// (for selecting the default provider, which may be copilot/bodhi).
+fn normalize_known_provider(provider: &str) -> Result<String> {
+    let p = provider.trim().to_ascii_lowercase();
+    if KNOWN_PROVIDERS.contains(&p.as_str()) {
+        Ok(p)
+    } else {
+        bail!(
+            "unknown provider '{provider}' (known: {})",
+            KNOWN_PROVIDERS.join(", ")
         )
     }
 }
@@ -270,9 +303,27 @@ fn empty_provider<T: serde::de::DeserializeOwned>() -> T {
 
 fn set_provider_api_key(config: &mut Config, provider: &str, key: &str) -> Result<()> {
     match provider {
-        "anthropic" => config.providers.anthropic.get_or_insert_with(empty_provider).api_key = key.to_string(),
-        "openai" => config.providers.openai.get_or_insert_with(empty_provider).api_key = key.to_string(),
-        "gemini" => config.providers.gemini.get_or_insert_with(empty_provider).api_key = key.to_string(),
+        "anthropic" => {
+            config
+                .providers
+                .anthropic
+                .get_or_insert_with(empty_provider)
+                .api_key = key.to_string()
+        }
+        "openai" => {
+            config
+                .providers
+                .openai
+                .get_or_insert_with(empty_provider)
+                .api_key = key.to_string()
+        }
+        "gemini" => {
+            config
+                .providers
+                .gemini
+                .get_or_insert_with(empty_provider)
+                .api_key = key.to_string()
+        }
         _ => bail!("unsupported provider '{provider}'"),
     }
     Ok(())
@@ -281,9 +332,27 @@ fn set_provider_api_key(config: &mut Config, provider: &str, key: &str) -> Resul
 fn set_provider_model(config: &mut Config, provider: &str, model: &str) -> Result<()> {
     let model = Some(model.to_string());
     match provider {
-        "anthropic" => config.providers.anthropic.get_or_insert_with(empty_provider).model = model,
-        "openai" => config.providers.openai.get_or_insert_with(empty_provider).model = model,
-        "gemini" => config.providers.gemini.get_or_insert_with(empty_provider).model = model,
+        "anthropic" => {
+            config
+                .providers
+                .anthropic
+                .get_or_insert_with(empty_provider)
+                .model = model
+        }
+        "openai" => {
+            config
+                .providers
+                .openai
+                .get_or_insert_with(empty_provider)
+                .model = model
+        }
+        "gemini" => {
+            config
+                .providers
+                .gemini
+                .get_or_insert_with(empty_provider)
+                .model = model
+        }
         _ => bail!("unsupported provider '{provider}'"),
     }
     Ok(())
@@ -316,6 +385,13 @@ fn provider_credential_status(config: &Config, provider: &str) -> CredentialStat
             config
                 .providers
                 .gemini
+                .as_ref()
+                .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
+        ),
+        "bodhi" => key_status(
+            config
+                .providers
+                .bodhi
                 .as_ref()
                 .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
         ),
@@ -448,11 +524,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_provider_accepts_known_and_rejects_unknown() {
+    fn normalize_provider_accepts_keyed_and_rejects_unknown() {
         assert_eq!(normalize_provider("Anthropic").unwrap(), "anthropic");
         assert_eq!(normalize_provider("  openai ").unwrap(), "openai");
+        // copilot has no static key → not a keyed provider.
         assert!(normalize_provider("copilot").is_err());
         assert!(normalize_provider("nope").is_err());
+    }
+
+    #[test]
+    fn normalize_known_provider_accepts_oauth_and_proxy_providers() {
+        // Selecting the default provider accepts copilot/bodhi too.
+        assert_eq!(normalize_known_provider("Copilot").unwrap(), "copilot");
+        assert_eq!(normalize_known_provider("bodhi").unwrap(), "bodhi");
+        assert_eq!(normalize_known_provider("anthropic").unwrap(), "anthropic");
+        assert!(normalize_known_provider("nope").is_err());
     }
 
     #[test]

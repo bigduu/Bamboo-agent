@@ -118,7 +118,7 @@ Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill
 Configure a provider + API key without hand-editing JSON:
 
 ```bash
-# interactive — prompts for provider, API key, and model
+# interactive — prompts for provider + API key (uses a default model unless --model is given)
 bamboo init
 
 # or non-interactive (CI / scripting)
