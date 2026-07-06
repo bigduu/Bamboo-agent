@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 use bamboo_agent_core::workspace_state;
 
+use super::lexical_bm25;
 use super::{
     build_dream_view, build_memory_markdown_view, build_recent_markdown_view,
     build_stale_markdown_view, derive_summary, detect_entities, extract_keywords,
@@ -46,6 +47,34 @@ const MAX_DURABLE_MEMORY_BODY_CHARS: usize = 4000;
 /// merge/append paths write it and the blob prefilter counts it, so both always
 /// agree on what an "accretion" is.
 const MEMORY_SECTION_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Write-time upsert thresholds over IDF-weighted cosine similarity (L2), in
+/// [0, 1]. Deliberately precision-biased: `MERGE` is high because a merge is lossy
+/// (it grows a memory and can't be cheaply undone), so ONLY a near-identical
+/// restatement auto-merges at write time; a same-topic-but-reworded write stays a
+/// separate memory (linked), leaving any genuine consolidation to L3's
+/// model-gated, reversible pass. `RELATE` is lower because a link is cheap and
+/// reversible. A write whose top similarity is `>= MERGE` appends into that
+/// memory; `>= RELATE` (but below merge) creates a new atomic memory linked to the
+/// near-dups; below `RELATE` is a plain new memory. Calibrated against IDF-cosine
+/// samples: near-identical restatement ~0.96, same-fact-reworded ~0.49,
+/// topically-unrelated <0.1.
+const MERGE_SIMILARITY: f64 = 0.6;
+const RELATE_SIMILARITY: f64 = 0.3;
+/// Cap on `relations.related` links a single write adds, so a write into a dense
+/// cluster doesn't fan out to every neighbor.
+const MAX_RELATED_LINKS: usize = 3;
+
+/// How an incoming write relates to the scope's existing memories (L2 upsert).
+enum WriteSimilarity {
+    /// Strong duplicate — append the incoming content into this existing memory.
+    /// Boxed: a full document dwarfs the other variants.
+    Merge(Box<DurableMemoryDocument>),
+    /// Related but distinct — create a new atomic memory linked to these ids.
+    Relate(Vec<String>),
+    /// No meaningful similarity — create a plain new atomic memory.
+    None,
+}
 
 /// Projected body length (chars) after appending `content` to `body` with the
 /// Serialize `value` to pretty JSON bytes, mapping a serialization failure onto
@@ -651,69 +680,83 @@ impl MemoryStore {
         self.ensure_scope_dirs(scope, project_key).await?;
         let tags = normalize_tags(tags.iter().map(String::as_str));
 
+        // L2 write-time upsert: a strong dup appends into the existing memory; a
+        // related-but-distinct write becomes a new atomic memory linked to the near
+        // dups (reversible, lossless); everything else is a plain new memory.
+        let mut related_ids: Vec<String> = Vec::new();
         if allow_merge_if_similar {
-            if let Some(mut existing) = self
-                .find_similar_memory(scope, project_key, r#type, title, &tags)
+            match self
+                .find_similar_memory(scope, project_key, r#type, title, content, &tags)
                 .await?
-                // Structural guard: never grow a memory into a blob. If appending
-                // would exceed the body cap, skip the merge and fall through to
-                // create a new atomic memory instead.
-                .filter(|existing| {
-                    existing.body.contains(content)
+            {
+                WriteSimilarity::Merge(existing) => {
+                    let mut existing = *existing;
+                    // Structural guard: never grow a memory into a blob. If appending
+                    // would exceed the body cap, don't merge — fall through to a new
+                    // atomic memory and instead LINK it to the dup, rather than
+                    // silently orphaning it.
+                    let already_present = existing.body.contains(content);
+                    if already_present
                         || projected_merged_body_chars(&existing.body, content)
                             <= MAX_DURABLE_MEMORY_BODY_CHARS
-                })
-            {
-                if !existing.body.contains(content) {
-                    existing.body = format!(
-                        "{}{}{}",
-                        existing.body.trim_end(),
-                        MEMORY_SECTION_SEPARATOR,
-                        content
-                    );
+                    {
+                        if !already_present {
+                            existing.body = format!(
+                                "{}{}{}",
+                                existing.body.trim_end(),
+                                MEMORY_SECTION_SEPARATOR,
+                                content
+                            );
+                        }
+                        existing.frontmatter.updated_at = now_rfc3339();
+                        existing.frontmatter.updated_by = CreatedBy {
+                            kind: "memory_write".to_string(),
+                            id: None,
+                            actor: Some(actor.to_string()),
+                        };
+                        let mut merged_tags = existing.frontmatter.tags.clone();
+                        merged_tags.extend(tags.clone());
+                        existing.frontmatter.tags =
+                            normalize_tags(merged_tags.iter().map(String::as_str));
+                        existing.frontmatter.retrieval.keywords = extract_keywords(
+                            &existing.frontmatter.title,
+                            &existing.body,
+                            &existing.frontmatter.tags,
+                        );
+                        existing.frontmatter.retrieval.entities =
+                            detect_entities(&existing.frontmatter.title, &existing.body);
+                        self.write_document(&existing).await?;
+                        self.append_audit(
+                            scope,
+                            project_key,
+                            MERGE_AUDIT_LOG,
+                            AuditLogEntry {
+                                timestamp: now_rfc3339(),
+                                action: "merge".to_string(),
+                                scope,
+                                memory_id: Some(existing.frontmatter.id.clone()),
+                                session_id: session_id.map(|value| value.to_string()),
+                                topic: None,
+                                summary: format!(
+                                    "Merged new content into existing memory '{}'.",
+                                    existing.frontmatter.title
+                                ),
+                                metadata: Some(serde_json::json!({
+                                    "type": existing.frontmatter.r#type.as_str(),
+                                    "project_key": project_key,
+                                    "allow_merge_if_similar": true,
+                                })),
+                            },
+                        )
+                        .await?;
+                        self.refresh_scope_artifacts(scope, project_key).await?;
+                        return Ok(existing);
+                    }
+                    // Too big to merge without blobbing → link instead.
+                    related_ids = vec![existing.frontmatter.id.clone()];
                 }
-                existing.frontmatter.updated_at = now_rfc3339();
-                existing.frontmatter.updated_by = CreatedBy {
-                    kind: "memory_write".to_string(),
-                    id: None,
-                    actor: Some(actor.to_string()),
-                };
-                let mut merged_tags = existing.frontmatter.tags.clone();
-                merged_tags.extend(tags.clone());
-                existing.frontmatter.tags = normalize_tags(merged_tags.iter().map(String::as_str));
-                existing.frontmatter.retrieval.keywords = extract_keywords(
-                    &existing.frontmatter.title,
-                    &existing.body,
-                    &existing.frontmatter.tags,
-                );
-                existing.frontmatter.retrieval.entities =
-                    detect_entities(&existing.frontmatter.title, &existing.body);
-                self.write_document(&existing).await?;
-                self.append_audit(
-                    scope,
-                    project_key,
-                    MERGE_AUDIT_LOG,
-                    AuditLogEntry {
-                        timestamp: now_rfc3339(),
-                        action: "merge".to_string(),
-                        scope,
-                        memory_id: Some(existing.frontmatter.id.clone()),
-                        session_id: session_id.map(|value| value.to_string()),
-                        topic: None,
-                        summary: format!(
-                            "Merged new content into existing memory '{}'.",
-                            existing.frontmatter.title
-                        ),
-                        metadata: Some(serde_json::json!({
-                            "type": existing.frontmatter.r#type.as_str(),
-                            "project_key": project_key,
-                            "allow_merge_if_similar": true,
-                        })),
-                    },
-                )
-                .await?;
-                self.refresh_scope_artifacts(scope, project_key).await?;
-                return Ok(existing);
+                WriteSimilarity::Relate(ids) => related_ids = ids,
+                WriteSimilarity::None => {}
             }
         }
 
@@ -754,7 +797,10 @@ impl MemoryStore {
                     }]
                 })
                 .unwrap_or_default(),
-            relations: DurableMemoryRelations::default(),
+            relations: DurableMemoryRelations {
+                related: related_ids.clone(),
+                ..DurableMemoryRelations::default()
+            },
             tags: tags.clone(),
             retrieval: DurableMemoryRetrieval {
                 keywords: extract_keywords(title, content, &tags),
@@ -785,6 +831,7 @@ impl MemoryStore {
                     "type": r#type.as_str(),
                     "project_key": project_key,
                     "tags": tags,
+                    "related_to": related_ids,
                 })),
             },
         )
@@ -1802,54 +1849,97 @@ impl MemoryStore {
         Ok(docs)
     }
 
+    /// Classify how an incoming write relates to the scope's existing memories,
+    /// using IDF-weighted cosine over field-weighted token bags (L2). Retires the
+    /// old raw count-overlap gate: a common shared keyword no longer counts as much
+    /// as a rare one, so unrelated memories are not force-merged and genuine dups
+    /// (even reworded) are caught.
     async fn find_similar_memory(
         &self,
         scope: MemoryScope,
         project_key: Option<&str>,
         r#type: DurableMemoryType,
         title: &str,
+        content: &str,
         tags: &[String],
-    ) -> io::Result<Option<DurableMemoryDocument>> {
+    ) -> io::Result<WriteSimilarity> {
         let normalized_title = super::sanitize_component(title);
-        let title_keywords: std::collections::HashSet<String> =
-            extract_keywords(title, "", tags).into_iter().collect();
-        let title_entities: std::collections::HashSet<String> =
-            detect_entities(title, "").into_iter().collect();
-        let docs = self.list_memory_documents(scope, project_key).await?;
+        let docs: Vec<DurableMemoryDocument> = self
+            .list_memory_documents(scope, project_key)
+            .await?
+            .into_iter()
+            .filter(|doc| {
+                doc.frontmatter.status == DurableMemoryStatus::Active
+                    && doc.frontmatter.r#type == r#type
+            })
+            .collect();
 
-        let mut best_exact: Option<DurableMemoryDocument> = None;
-        let mut best_heuristic: Option<(usize, DurableMemoryDocument)> = None;
+        // Exact (normalized) title match is an unambiguous merge — keep the fast path.
+        if let Some(exact) = docs
+            .iter()
+            .find(|doc| super::sanitize_component(&doc.frontmatter.title) == normalized_title)
+        {
+            return Ok(WriteSimilarity::Merge(Box::new(exact.clone())));
+        }
+        if docs.is_empty() {
+            return Ok(WriteSimilarity::None);
+        }
 
-        for doc in docs.into_iter().filter(|doc| {
-            doc.frontmatter.status == DurableMemoryStatus::Active
-                && doc.frontmatter.r#type == r#type
-        }) {
-            let doc_normalized_title = super::sanitize_component(&doc.frontmatter.title);
-            if doc_normalized_title == normalized_title {
-                best_exact = Some(doc);
-                break;
-            }
+        // Build field bags for the incoming memory + every candidate, then score
+        // with IDF-weighted cosine over the whole compared set (so IDF is meaningful
+        // and every term has df >= 1).
+        let incoming_bag = lexical_bm25::field_weighted_bag(
+            title,
+            &extract_keywords(title, content, tags),
+            tags,
+            &detect_entities(title, content),
+            content,
+        );
+        let candidate_bags: Vec<std::collections::HashMap<String, f64>> = docs
+            .iter()
+            .map(|doc| {
+                lexical_bm25::field_weighted_bag(
+                    &doc.frontmatter.title,
+                    &doc.frontmatter.retrieval.keywords,
+                    &doc.frontmatter.tags,
+                    &doc.frontmatter.retrieval.entities,
+                    &doc.body,
+                )
+            })
+            .collect();
 
-            let doc_keywords: std::collections::HashSet<String> =
-                doc.frontmatter.retrieval.keywords.iter().cloned().collect();
-            let doc_entities: std::collections::HashSet<String> =
-                doc.frontmatter.retrieval.entities.iter().cloned().collect();
+        let mut all_bags: Vec<&std::collections::HashMap<String, f64>> =
+            Vec::with_capacity(candidate_bags.len() + 1);
+        all_bags.push(&incoming_bag);
+        all_bags.extend(candidate_bags.iter());
+        let corpus = lexical_bm25::SimilarityCorpus::build(&all_bags);
 
-            let keyword_overlap = title_keywords.intersection(&doc_keywords).count();
-            let entity_overlap = title_entities.intersection(&doc_entities).count();
-            let title_prefix_match = doc_normalized_title.starts_with(&normalized_title)
-                || normalized_title.starts_with(&doc_normalized_title);
-
-            let score = keyword_overlap + (entity_overlap * 2) + usize::from(title_prefix_match);
-            if score >= 4 {
-                match &best_heuristic {
-                    Some((best_score, _)) if *best_score >= score => {}
-                    _ => best_heuristic = Some((score, doc)),
+        let mut best_merge: Option<(f64, usize)> = None;
+        let mut related: Vec<(f64, String)> = Vec::new();
+        for (idx, bag) in candidate_bags.iter().enumerate() {
+            let sim = corpus.cosine(&incoming_bag, bag);
+            if sim >= MERGE_SIMILARITY {
+                match best_merge {
+                    Some((best, _)) if best >= sim => {}
+                    _ => best_merge = Some((sim, idx)),
                 }
+            } else if sim >= RELATE_SIMILARITY {
+                related.push((sim, docs[idx].frontmatter.id.clone()));
             }
         }
 
-        Ok(best_exact.or_else(|| best_heuristic.map(|(_, doc)| doc)))
+        if let Some((_, idx)) = best_merge {
+            return Ok(WriteSimilarity::Merge(Box::new(docs[idx].clone())));
+        }
+        if related.is_empty() {
+            return Ok(WriteSimilarity::None);
+        }
+        // Highest-similarity related first; cap the fan-out.
+        related.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        related.truncate(MAX_RELATED_LINKS);
+        Ok(WriteSimilarity::Relate(
+            related.into_iter().map(|(_, id)| id).collect(),
+        ))
     }
 
     fn combined_related_ids(doc: &DurableMemoryDocument) -> Vec<String> {
@@ -2979,8 +3069,11 @@ mod tests {
         assert!(fetched.body.contains("Merge freeze"));
     }
 
+    /// L2: a near-identical RESTATEMENT (different title wording, ~same body)
+    /// auto-merges into the existing memory. This is the only write-time merge —
+    /// it's the case where accreting is unambiguously not lossy.
     #[tokio::test]
-    async fn write_memory_merges_into_heuristically_similar_active_memory() {
+    async fn write_memory_merges_a_near_identical_restatement() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
 
@@ -2989,9 +3082,9 @@ mod tests {
                 MemoryScope::Project,
                 Some("proj-1"),
                 DurableMemoryType::Project,
-                "Release freeze begins next week",
-                "Merge freeze begins on Tuesday for mobile release cut.",
-                &["release".to_string(), "freeze".to_string()],
+                "Prod deploy uses blue-green with a 10 minute soak",
+                "Production deploys use a blue-green strategy with a ten minute soak window.",
+                &["deploy".to_string()],
                 Some("session-1"),
                 "main-model",
                 false,
@@ -3001,6 +3094,65 @@ mod tests {
             .unwrap();
 
         let merged = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Prod deploy uses blue-green with a 10 minute soak window",
+                "Production deploy uses blue-green with a 10 minute soak before cutover.",
+                &["deploy".to_string()],
+                Some("session-2"),
+                "main-model",
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            merged.frontmatter.id, original.frontmatter.id,
+            "a near-identical restatement should merge into the existing memory"
+        );
+        assert!(merged
+            .body
+            .contains("blue-green strategy with a ten minute soak window"));
+        assert!(merged
+            .body
+            .contains("blue-green with a 10 minute soak before cutover"));
+
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, Some("proj-1"))
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1, "restatement merges into one durable memory");
+    }
+
+    /// L2: a same-topic but REWORDED write (a probable-but-not-certain dup) does
+    /// NOT auto-merge — it stays a separate atomic memory, LINKED to the near-dup.
+    /// Merging is lossy and irreversible, so at write time we prefer a cheap,
+    /// reversible link and leave any real consolidation to L3's model-gated pass.
+    #[tokio::test]
+    async fn write_memory_relates_similar_but_distinct_memory_instead_of_merging() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let original = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Release freeze begins next week",
+                "Merge freeze begins on Tuesday for the mobile release cut.",
+                &["release".to_string(), "freeze".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let second = store
             .write_memory(
                 MemoryScope::Project,
                 Some("proj-1"),
@@ -3016,25 +3168,79 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(merged.frontmatter.id, original.frontmatter.id);
-        assert!(merged
-            .body
-            .contains("Merge freeze begins on Tuesday for mobile release cut."));
-        assert!(merged
-            .body
-            .contains("Stakeholders confirmed the mobile release freeze starts Tuesday."));
-        assert!(merged.frontmatter.tags.contains(&"mobile".to_string()));
-        assert!(merged.frontmatter.tags.contains(&"release".to_string()));
+        assert_ne!(
+            second.frontmatter.id, original.frontmatter.id,
+            "a reworded near-dup must NOT force-merge"
+        );
+        assert!(
+            second
+                .frontmatter
+                .relations
+                .related
+                .contains(&original.frontmatter.id),
+            "the new memory should link to the near-dup, got {:?}",
+            second.frontmatter.relations.related
+        );
 
         let docs = store
             .list_memory_documents(MemoryScope::Project, Some("proj-1"))
             .await
             .unwrap();
-        assert_eq!(
-            docs.len(),
-            1,
-            "heuristically similar writes should merge into one durable memory"
+        assert_eq!(docs.len(), 2, "reworded near-dup stays a separate memory");
+    }
+
+    /// L2 precision: two memories that share only a COMMON word (low IDF) are
+    /// neither merged nor linked — the old raw count-overlap gate could have
+    /// force-merged them. This is the corrupting false-merge the redesign kills.
+    #[tokio::test]
+    async fn write_memory_does_not_link_on_common_words_alone() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let first = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Kafka consumer lag alerting thresholds",
+                "Kafka consumer lag alerts page the team when we deploy a bad build.",
+                &["kafka".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let second = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Postgres autovacuum tuning knobs",
+                "Postgres autovacuum thresholds are tuned per table before we deploy.",
+                &["postgres".to_string()],
+                Some("session-2"),
+                "main-model",
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(second.frontmatter.id, first.frontmatter.id);
+        assert!(
+            second.frontmatter.relations.related.is_empty(),
+            "docs sharing only a common word must not be linked, got {:?}",
+            second.frontmatter.relations.related
         );
+
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, Some("proj-1"))
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2, "unrelated writes stay separate");
     }
 
     /// Many `MemoryStore` instances pointed at the SAME data dir (the real
