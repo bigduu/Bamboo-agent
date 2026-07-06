@@ -256,7 +256,7 @@ impl Deployer for RusshDeployer {
         let broker_local = format!("127.0.0.1:{bport}");
 
         // 1–2. Connect + host-key TOFU + authenticate.
-        let mut session = self.connect_and_auth(broker_local).await?;
+        let session = self.connect_and_auth(broker_local).await?;
 
         // 3. Upload the binary (hash-skip) + chmod +x.
         if let Some(spec) = &self.upload {
