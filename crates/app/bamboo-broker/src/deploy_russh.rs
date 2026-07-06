@@ -191,8 +191,12 @@ impl client::Handler for FabricHandler {
         _connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
+        // russh 0.62 requires the handler to explicitly accept (or reject) the
+        // forwarded channel; dropping the reply would auto-reject it.
+        reply.accept().await;
         // A worker on the remote dialed the tunnel mouth; splice it to the broker.
         let broker = self.broker_local.clone();
         tokio::spawn(async move {
