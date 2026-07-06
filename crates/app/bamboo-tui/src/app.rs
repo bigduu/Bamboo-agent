@@ -256,6 +256,9 @@ pub struct App {
     /// The agent's pending question (permission gate / clarification). When
     /// `Some`, a modal captures the answer and keystrokes route to it.
     pub pending_question: Option<ActiveQuestion>,
+    /// Sender into the main event loop, used to post results of background API
+    /// calls (so those calls never block the UI thread). Set in [`run`].
+    event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
     sse_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     sse_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
 }
@@ -277,6 +280,7 @@ impl App {
             help_visible: false,
             spinner_tick: 0,
             pending_question: None,
+            event_tx: None,
             sse_tx: None,
             sse_rx: None,
         }
@@ -294,6 +298,10 @@ impl App {
         }
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
+        // Keep a sender so background API tasks can post their results back.
+        self.event_tx = Some(event_tx.clone());
+        // Kick off the initial tab's data load without blocking startup.
+        self.load_tab_data();
 
         // Spawn crossterm event reader.
         let tx = event_tx.clone();
@@ -373,6 +381,86 @@ impl App {
             AppEvent::ApiError(msg) => {
                 self.status_message = format!("Error: {}", msg);
             }
+            AppEvent::SessionsLoaded(r) => {
+                self.sessions.loading = false;
+                match r {
+                    Ok(s) => {
+                        self.sessions.sessions = s;
+                        self.sessions.error = None;
+                    }
+                    Err(e) => self.sessions.error = Some(e),
+                }
+            }
+            AppEvent::McpServersLoaded(r) => {
+                self.mcp.loading = false;
+                match r {
+                    Ok(s) => {
+                        self.mcp.selected = self.mcp.selected.min(s.len().saturating_sub(1));
+                        self.mcp.servers = s;
+                        self.mcp.error = None;
+                    }
+                    Err(e) => self.mcp.error = Some(e),
+                }
+            }
+            AppEvent::McpToolsLoaded(r) => {
+                self.mcp.loading = false;
+                match r {
+                    Ok(t) => {
+                        self.mcp.tools = t;
+                        self.mcp.error = None;
+                    }
+                    Err(e) => self.mcp.error = Some(e),
+                }
+            }
+            AppEvent::SchedulesLoaded(r) => {
+                self.schedules.loading = false;
+                match r {
+                    Ok(s) => {
+                        self.schedules.selected =
+                            self.schedules.selected.min(s.len().saturating_sub(1));
+                        self.schedules.schedules = s;
+                        self.schedules.error = None;
+                    }
+                    Err(e) => self.schedules.error = Some(e),
+                }
+            }
+            AppEvent::SkillsLoaded(r) => {
+                self.skills.loading = false;
+                match r {
+                    Ok(s) => {
+                        self.skills.skills = s;
+                        self.skills.error = None;
+                    }
+                    Err(e) => self.skills.error = Some(e),
+                }
+            }
+            AppEvent::ConfigLoaded(r) => {
+                self.config.loading = false;
+                match r {
+                    Ok(c) => {
+                        self.config.config = Some(c);
+                        self.config.error = None;
+                    }
+                    Err(e) => self.config.error = Some(e),
+                }
+            }
+            AppEvent::ActionDone { status, reload_tab } => {
+                self.status_message = status;
+                if reload_tab {
+                    self.load_tab_data();
+                }
+            }
+            AppEvent::ChatStarted(r) => match r {
+                Ok(session_id) => {
+                    self.chat.session_id = Some(session_id.clone());
+                    self.status_message = "Streaming...".to_string();
+                    self.start_stream_and_execute(session_id);
+                }
+                Err(e) => {
+                    self.chat.streaming = false;
+                    self.status_message = format!("Error: {e}");
+                }
+            },
             _ => {}
         }
         Ok(())
@@ -408,7 +496,7 @@ impl App {
                     && (!self.chat.streaming || self.tab != Tab::Chat)
                 {
                     self.tab = Tab::from_index((digit - 1) as usize).unwrap_or(self.tab);
-                    self.load_tab_data().await?;
+                    self.load_tab_data();
                     return Ok(());
                 }
             }
@@ -417,11 +505,11 @@ impl App {
         match key.code {
             KeyCode::Tab => {
                 self.tab = self.tab.next();
-                self.load_tab_data().await?;
+                self.load_tab_data();
             }
             KeyCode::BackTab => {
                 self.tab = self.tab.prev();
-                self.load_tab_data().await?;
+                self.load_tab_data();
             }
             _ => {
                 self.handle_tab_key(key).await?;
@@ -554,66 +642,52 @@ impl App {
         Ok(())
     }
 
-    async fn load_tab_data(&mut self) -> Result<()> {
+    /// Load the current tab's data WITHOUT blocking the event loop: mark the
+    /// tab loading and spawn the fetch, which posts its result back as an
+    /// `AppEvent` handled in `handle_event`.
+    fn load_tab_data(&mut self) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
         match self.tab {
             Tab::Chat => {}
             Tab::Sessions => {
                 self.sessions.loading = true;
-                match self.client.list_sessions().await {
-                    Ok(s) => {
-                        self.sessions.sessions = s;
-                        self.sessions.error = None;
-                    }
-                    Err(e) => self.sessions.error = Some(e.to_string()),
-                }
-                self.sessions.loading = false;
+                tokio::spawn(async move {
+                    let r = client.list_sessions().await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::SessionsLoaded(r));
+                });
             }
             Tab::Mcp => {
                 self.mcp.loading = true;
-                match self.client.list_mcp_servers().await {
-                    Ok(s) => {
-                        self.mcp.servers = s;
-                        self.mcp.error = None;
-                    }
-                    Err(e) => self.mcp.error = Some(e.to_string()),
-                }
-                self.mcp.loading = false;
+                tokio::spawn(async move {
+                    let r = client.list_mcp_servers().await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::McpServersLoaded(r));
+                });
             }
             Tab::Schedules => {
                 self.schedules.loading = true;
-                match self.client.list_schedules().await {
-                    Ok(s) => {
-                        self.schedules.schedules = s;
-                        self.schedules.error = None;
-                    }
-                    Err(e) => self.schedules.error = Some(e.to_string()),
-                }
-                self.schedules.loading = false;
+                tokio::spawn(async move {
+                    let r = client.list_schedules().await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::SchedulesLoaded(r));
+                });
             }
             Tab::Skills => {
                 self.skills.loading = true;
-                match self.client.list_skills().await {
-                    Ok(s) => {
-                        self.skills.skills = s;
-                        self.skills.error = None;
-                    }
-                    Err(e) => self.skills.error = Some(e.to_string()),
-                }
-                self.skills.loading = false;
+                tokio::spawn(async move {
+                    let r = client.list_skills().await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::SkillsLoaded(r));
+                });
             }
             Tab::Config => {
                 self.config.loading = true;
-                match self.client.get_config().await {
-                    Ok(c) => {
-                        self.config.config = Some(c);
-                        self.config.error = None;
-                    }
-                    Err(e) => self.config.error = Some(e.to_string()),
-                }
-                self.config.loading = false;
+                tokio::spawn(async move {
+                    let r = client.get_config().await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::ConfigLoaded(r));
+                });
             }
         }
-        Ok(())
     }
 
     async fn handle_tab_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -661,7 +735,7 @@ impl App {
                 self.chat
                     .textarea
                     .set_placeholder_text("Type a message... (Enter to send)");
-                self.send_message(input).await?;
+                self.send_message(input);
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.chat.auto_scroll = false;
@@ -681,13 +755,21 @@ impl App {
         Ok(())
     }
 
-    async fn send_message(&mut self, message: String) -> Result<()> {
+    /// Send a chat message WITHOUT blocking the event loop: the user turn is
+    /// shown immediately (optimistic), and the `chat` POST runs on a task that
+    /// posts `ChatStarted` back — the handler then opens the SSE stream and
+    /// spawns `execute` once the session id is known.
+    fn send_message(&mut self, message: String) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
         let model = if self.chat.model.is_empty() {
             "default".to_string()
         } else {
             self.chat.model.clone()
         };
 
+        // Optimistic UI: show the user's turn and switch to streaming right away.
         self.chat.messages.push(ChatMessage {
             role: MessageRole::User,
             content: message.clone(),
@@ -696,38 +778,46 @@ impl App {
             timestamp: Utc::now(),
         });
         self.chat.auto_scroll = true;
+        self.chat.streaming = true;
+        self.chat.current_response.clear();
+        self.chat.current_tool_calls.clear();
+        self.chat.current_reasoning.clear();
+        self.status_message = "Sending...".to_string();
 
-        let req = ChatRequest {
-            message,
-            session_id: self.chat.session_id.clone(),
-            model: Some(model.clone()),
-        };
+        let client = self.client.clone();
+        let existing_session = self.chat.session_id.clone();
+        tokio::spawn(async move {
+            let req = ChatRequest {
+                message,
+                session_id: existing_session,
+                model: Some(model),
+            };
+            let result = client
+                .chat(req)
+                .await
+                .map(|resp| resp.session_id)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ChatStarted(result));
+        });
+    }
 
-        match self.client.chat(req).await {
-            Ok(resp) => {
-                self.chat.session_id = Some(resp.session_id.clone());
-                self.chat.streaming = true;
-                self.chat.current_response.clear();
-                self.chat.current_tool_calls.clear();
-                self.chat.current_reasoning.clear();
-                self.status_message = "Streaming...".to_string();
-
-                // Start SSE stream BEFORE execute so we don't miss early events.
-                let (sse_tx, sse_rx) = mpsc::unbounded_channel();
-                self.sse_tx = Some(sse_tx.clone());
-                self.sse_rx = Some(sse_rx);
-                let base_url = self.client.base_url.clone();
-                SseStream::start(&base_url, &resp.session_id, sse_tx)?;
-
-                // Now start agent execution.
-                let _ = self.client.execute(&resp.session_id, Some(&model)).await;
-            }
-            Err(e) => {
-                self.status_message = format!("Error: {}", e);
-            }
+    /// After `chat` returns a session id, open the SSE stream (before execute, so
+    /// no early event is missed) and spawn the agent run.
+    fn start_stream_and_execute(&mut self, session_id: String) {
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+        self.sse_tx = Some(sse_tx.clone());
+        self.sse_rx = Some(sse_rx);
+        let base_url = self.client.base_url.clone();
+        if let Err(e) = SseStream::start(&base_url, &session_id, sse_tx) {
+            self.status_message = format!("SSE start failed: {e}");
+            return;
         }
-
-        Ok(())
+        let client = self.client.clone();
+        let model = self.chat.model.clone();
+        tokio::spawn(async move {
+            let model = if model.is_empty() { None } else { Some(model) };
+            let _ = client.execute(&session_id, model.as_deref()).await;
+        });
     }
 
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
@@ -898,11 +988,11 @@ impl App {
                 if let Some(session) = self.sessions.sessions.get(self.sessions.selected) {
                     let id = session.id.clone();
                     self.client.delete_session(&id).await?;
-                    self.load_tab_data().await?;
+                    self.load_tab_data();
                 }
             }
             KeyCode::Char('r') => {
-                self.load_tab_data().await?;
+                self.load_tab_data();
             }
             _ => {}
         }
@@ -918,27 +1008,51 @@ impl App {
                 self.mcp.selected = self.mcp.selected.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if let Some(server) = self.mcp.servers.get(self.mcp.selected) {
+                if let (Some(server), Some(tx)) = (
+                    self.mcp.servers.get(self.mcp.selected),
+                    self.event_tx.clone(),
+                ) {
                     let id = server.id.clone();
                     let connected = server.connected.unwrap_or(false);
-                    if connected {
-                        self.client.disconnect_mcp(&id).await?;
-                    } else {
-                        self.client.connect_mcp(&id).await?;
-                    }
-                    self.load_tab_data().await?;
+                    let client = self.client.clone();
+                    self.mcp.loading = true;
+                    tokio::spawn(async move {
+                        let res = if connected {
+                            client.disconnect_mcp(&id).await
+                        } else {
+                            client.connect_mcp(&id).await
+                        };
+                        let status = match res {
+                            Ok(()) => if connected {
+                                "Disconnected"
+                            } else {
+                                "Connected"
+                            }
+                            .to_string(),
+                            Err(e) => format!("MCP action failed: {e}"),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            status,
+                            reload_tab: true,
+                        });
+                    });
                 }
             }
             KeyCode::Char('t') => {
-                if let Some(server) = self.mcp.servers.get(self.mcp.selected) {
-                    match self.client.get_mcp_tools(&server.id).await {
-                        Ok(tools) => self.mcp.tools = tools,
-                        Err(e) => self.mcp.error = Some(e.to_string()),
-                    }
+                if let (Some(server), Some(tx)) = (
+                    self.mcp.servers.get(self.mcp.selected),
+                    self.event_tx.clone(),
+                ) {
+                    let id = server.id.clone();
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let r = client.get_mcp_tools(&id).await.map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::McpToolsLoaded(r));
+                    });
                 }
             }
             KeyCode::Char('r') => {
-                self.load_tab_data().await?;
+                self.load_tab_data();
             }
             _ => {}
         }
@@ -958,7 +1072,7 @@ impl App {
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
                     let id = schedule.id.clone();
                     self.client.delete_schedule(&id).await?;
-                    self.load_tab_data().await?;
+                    self.load_tab_data();
                 }
             }
             KeyCode::Char('r') => {
@@ -1133,5 +1247,33 @@ mod question_tests {
         // an overflow marker indicates hidden options above.
         assert!(text.contains("opt25"), "selected option not in the window");
         assert!(text.contains("more"), "overflow marker missing");
+    }
+
+    #[tokio::test]
+    async fn loaded_event_applies_to_state_and_clears_loading() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.sessions.loading = true;
+        app.handle_event(AppEvent::SessionsLoaded(Ok(vec![SessionSummary {
+            id: "s1".into(),
+            title: None,
+            model: None,
+            created_at: None,
+            updated_at: None,
+            message_count: None,
+            status: None,
+        }])))
+        .await
+        .unwrap();
+        assert!(!app.sessions.loading, "loading flag must clear");
+        assert_eq!(app.sessions.sessions.len(), 1);
+        assert!(app.sessions.error.is_none());
+
+        // Error result surfaces on the tab and clears loading.
+        app.sessions.loading = true;
+        app.handle_event(AppEvent::SessionsLoaded(Err("boom".into())))
+            .await
+            .unwrap();
+        assert!(!app.sessions.loading);
+        assert_eq!(app.sessions.error.as_deref(), Some("boom"));
     }
 }

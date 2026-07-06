@@ -6,6 +6,7 @@ use reqwest::Client;
 
 use types::*;
 
+#[derive(Clone)]
 pub struct BambooClient {
     pub base_url: String,
     client: Client,
