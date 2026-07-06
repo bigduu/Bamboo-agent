@@ -2,11 +2,13 @@
 
 ## Supported Versions
 
-We release patches for security vulnerabilities. Currently supported versions:
+We release patches for security vulnerabilities. The project ships
+date-versioned nightly releases; the latest nightly is the supported line:
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| Version                     | Supported          |
+| --------------------------- | ------------------ |
+| latest nightly (`2026.x`)   | :white_check_mark: |
+| `0.x` (legacy SemVer)       | :x:                |
 
 ## Reporting a Vulnerability
 

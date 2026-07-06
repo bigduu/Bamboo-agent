@@ -153,24 +153,27 @@ bamboo serve
 
 ### 调用 agent loop
 
-服务启动后，跑通**完整 agent loop**（LLM 规划、调用工具、流式输出全过程）最简单的方式就是两次 HTTP 调用：用 `POST /api/v1/chat` 发起一轮，再用 SSE 事件流 `GET /api/v1/stream` 实时观察。
+服务启动后，跑通**完整 agent loop**（LLM 规划、调用工具、流式输出全过程）需要三次 HTTP 调用：用 `POST /api/v1/chat` 创建一轮，用 `POST /api/v1/execute/{session_id}` **启动 loop**，再用 SSE 事件流 `GET /api/v1/events/{session_id}` 实时观察。
 
 ```bash
-# 1. 发起一轮 agent 执行。它会针对 LLM 跑起 agent loop 并立即返回。
-#    返回：{ "session_id": "...", "stream_url": "...", "status": "streaming" }
-curl -s http://127.0.0.1:9562/api/v1/chat \
+# 1. 创建一轮。它只【持久化】这条消息并立即返回，此时【还没有】跑 loop。
+#    返回含 session id 与事件 URL：
+#    { "session_id": "...", "stream_url": "/api/v1/events/<id>", "status": "streaming" }
+SID=$(curl -s http://127.0.0.1:9562/api/v1/chat \
   -H 'Content-Type: application/json' \
-  -d '{
-        "message": "列出当前目录的文件，并告诉我这个项目是做什么的。",
-        "model": "claude-sonnet-4-6"
-      }'
+  -d '{"message":"列出当前目录的文件，并告诉我这个项目是做什么的。","model":"claude-sonnet-4-6"}' \
+  | jq -r .session_id)
 
-# 2. 实时观察 agent 工作（可断点续传的 SSE 事件流）。
-#    每个事件就是 loop 的一步：助手文本、工具调用、工具结果、token 用量、完成。
-curl -N http://127.0.0.1:9562/api/v1/stream
+# 2. 为该会话启动 agent loop。body 可为空（{}）——每个字段
+#    （model/provider/skill_mode/reasoning_effort 等）都是可选覆盖项。
+curl -s -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 3. 实时观察 loop（SSE）：助手文本、工具调用、工具结果、token 用量、完成，按发生顺序到达。
+curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
-只有 `message` 和 `model` 是必填项。常用可选项：`session_id`（续接同一会话）、`system_prompt`、`selected_skill_ids`、`workspace_path`、`provider`、`images`。`chat` 调用会立即返回、loop 在后台运行；助手的推理、工具调用与最终答案都从 `stream` 端点（SSE，支持 `?since=<seq>` 或 `Last-Event-ID` 头续传）按发生顺序到达。
+`POST /api/v1/chat` 只有 `message` 和 `model` 是必填项；常用可选项：`session_id`（续接同一会话）、`system_prompt`、`selected_skill_ids`、`workspace_path`、`provider`、`images`。注意 `chat` 只**持久化**这一轮——必须再 `POST /api/v1/execute/{session_id}` 才会真正跑 loop。除了单会话的 `GET /api/v1/events/{session_id}` 事件流,还有一个账户级、可断点续传的变更流 `GET /api/v1/stream`（SSE，支持 `?since=<seq>` 或 `Last-Event-ID` 头续传），它汇聚**所有**会话的事件——适合多会话同步。
 
 ### 作为 Rust SDK 直接调用（进程内）
 
@@ -208,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-> 不需要事件流？`agent.run(&mut session, input).await?` 会把这一轮跑到结束，答案就是 `session` 上的最后一条消息。需要对每次请求做精细覆盖（拆分 fast/background/summarization 模型、skill 选择、provider 句柄等）时，下沉一层到 `bamboo_engine` 的 `ExecuteRequest` / `ExecuteRequestBuilder` 加 `agent.execute(&mut session, req)`——这正是门面内部调用的同一条路径。
+> 不需要事件流？`agent.run(&mut session, input).await?` 会把这一轮跑到结束，答案就是 `session` 上的最后一条消息。需要对每次请求做精细覆盖（拆分 fast/background/summarization 模型、skill 选择、provider 句柄等）时，用 `ExecuteRequestBuilder` 构造一个 `ExecuteRequest`（两者都从 `bamboo_sdk::agent` 重导出）再调用 `agent.execute(&mut session, req)`——这正是 `run` / `run_stream` 内部调用的同一条 canonical 引擎路径。
 
 把门面 crate 加为依赖（path 或 git）：
 
@@ -220,7 +223,7 @@ dirs = "5"
 anyhow = "1"
 ```
 
-> 不想自己管理这些依赖？直接 `bamboo serve` 用上面的 HTTP API —— 它驱动的是完全相同的 loop。完整类型参考见 [`docs/guides/API.md`](./docs/guides/API.md)。
+> 不想自己管理这些依赖？直接 `bamboo serve` 用上面的 HTTP API —— 它驱动的是完全相同的 loop。完整 SDK 类型参考是 [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) 上的 rustdoc（已发布 crate 把门面重导出为 `bamboo_agent::agent`）；[`docs/guides/API.md`](./docs/guides/API.md) 覆盖 HTTP/SSE 接口。
 
 ### 示例配置
 

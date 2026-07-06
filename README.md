@@ -177,25 +177,28 @@ The admin commands (`health` / `status` / `sessions` / `stop`) are thin HTTP cli
 
 ### Call the agent loop
 
-Once the server is running, the simplest way to run the **full agent loop** — the LLM plans, calls tools, and streams its work — is two HTTP calls: kick off a turn with `POST /api/v1/chat`, then watch the live events on the SSE feed `GET /api/v1/stream`.
+Once the server is running, driving the **full agent loop** — the LLM plans, calls tools, and streams its work — is three HTTP calls: create the turn with `POST /api/v1/chat`, **start the loop** with `POST /api/v1/execute/{session_id}`, then watch the SSE feed `GET /api/v1/events/{session_id}`.
 
 ```bash
-# 1. Start an agent turn. This runs the agent loop against the LLM and returns immediately.
-#    Response: { "session_id": "...", "stream_url": "...", "status": "streaming" }
-curl -s http://127.0.0.1:9562/api/v1/chat \
+# 1. Create a turn. This PERSISTS the message and returns immediately — it does
+#    NOT run the loop yet. Response includes the session id and events URL:
+#    { "session_id": "...", "stream_url": "/api/v1/events/<id>", "status": "streaming" }
+SID=$(curl -s http://127.0.0.1:9562/api/v1/chat \
   -H 'Content-Type: application/json' \
-  -d '{
-        "message": "List the files in the current directory and tell me what this project does.",
-        "model": "claude-sonnet-4-6"
-      }'
+  -d '{"message":"List the files here and tell me what this project does.","model":"claude-sonnet-4-6"}' \
+  | jq -r .session_id)
 
-# 2. Watch the agent work in real time (resumable SSE event feed).
-#    Each event is one step of the loop: assistant text, tool calls, tool results,
-#    token usage, and completion.
-curl -N http://127.0.0.1:9562/api/v1/stream
+# 2. Start the agent loop for that session. The body may be empty ({}) — every
+#    field (model/provider/skill_mode/reasoning_effort/…) is an optional override.
+curl -s -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 3. Watch the loop in real time (SSE): assistant text, tool calls, tool results,
+#    token usage, and completion arrive as they happen.
+curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
-`message` and `model` are the only required fields. Useful optionals: `session_id` (continue a conversation), `system_prompt`, `selected_skill_ids`, `workspace_path`, `provider`, `images`. The `chat` call returns right away and the loop runs in the background; the `stream` endpoint (SSE, resumable via `?since=<seq>` or the `Last-Event-ID` header) is where the assistant's reasoning, tool calls, and final answer arrive as they happen.
+On `POST /api/v1/chat`, `message` and `model` are the only required fields; useful optionals are `session_id` (continue a conversation), `system_prompt`, `selected_skill_ids`, `workspace_path`, `provider`, `images`. Note that `chat` only **persists** the turn — you must then `POST /api/v1/execute/{session_id}` to actually run the loop. Besides the per-session `GET /api/v1/events/{session_id}` feed, there is an account-wide, resumable change feed `GET /api/v1/stream` (SSE, resumable via `?since=<seq>` or the `Last-Event-ID` header) that streams events across **all** sessions — handy for multi-session sync.
 
 ### Use it as a Rust SDK (in-process)
 
