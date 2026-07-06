@@ -85,10 +85,16 @@ impl AgentBuilder {
     /// Select the provider by name (`anthropic`, `openai`, `gemini`, `copilot`,
     /// `bodhi`) for [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir),
     /// overriding `config.json`'s `provider`. A following [`api_key`](Self::api_key)
-    /// applies to *this* provider. Ignored if you inject a whole
-    /// [`provider`](Self::provider) instead.
+    /// applies to *this* provider. The name is lower-cased (config matching is
+    /// case-sensitive).
+    ///
+    /// Note: this drives the *eager* provider creation inside
+    /// `with_defaults_for_data_dir` and can fail there (e.g. missing key). A later
+    /// [`provider`](Self::provider) injection replaces the created provider but
+    /// does NOT skip creation — so if you inject your own provider, either don't
+    /// set `provider_name`, or ensure the named provider can still be constructed.
     pub fn provider_name(mut self, provider: impl Into<String>) -> Self {
-        self.provider_name = Some(provider.into());
+        self.provider_name = Some(provider.into().trim().to_ascii_lowercase());
         self
     }
 
