@@ -34,7 +34,7 @@ globset = "0.4"
 base64 = "0.22"
 parking_lot = "0.12"
 url = "2"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 toml = "1.1"
 dirs = "6"
 colored = "2"
