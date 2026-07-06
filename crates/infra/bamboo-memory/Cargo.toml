@@ -24,7 +24,7 @@ tracing = "0.1"
 thiserror = "1"
 anyhow = "1"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 dashmap = "6"
 seahash = "4"
 
