@@ -3,7 +3,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::process::Command;
 #[cfg(not(any(test, feature = "test-utils")))]
@@ -90,7 +90,9 @@ fn get_encryption_key_uncached() -> Vec<u8> {
 
     // Last-resort fallback: generate a key and persist it so encryption remains stable
     // even if host identifiers are unavailable (e.g. sandboxed environments).
-    let key = rand::thread_rng().gen::<[u8; 32]>().to_vec();
+    let mut key_bytes = [0u8; 32];
+    rand::rng().fill(&mut key_bytes);
+    let key = key_bytes.to_vec();
     let _ = write_key_file(&key);
     key
 }
@@ -392,7 +394,8 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
     let cipher =
         Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
 
-    let nonce_bytes: [u8; 12] = rand::thread_rng().gen();
+    let mut nonce_bytes = [0u8; 12];
+    rand::rng().fill(&mut nonce_bytes);
     let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher

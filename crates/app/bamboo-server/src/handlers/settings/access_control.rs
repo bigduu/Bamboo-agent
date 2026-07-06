@@ -13,7 +13,7 @@ use actix_web::{
     web, HttpRequest, HttpResponse, ResponseError,
 };
 use chrono::{SecondsFormat, Utc};
-use rand::{Rng, RngCore};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -292,7 +292,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Generate `len` random bytes as a lowercase hex string.
 fn random_hex(len: usize) -> String {
     let mut bytes = vec![0_u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -640,7 +640,7 @@ pub async fn update_access_password(
     }
 
     let mut salt_bytes = [0_u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt_bytes);
+    rand::rng().fill(&mut salt_bytes);
     let salt_hex = hex::encode(salt_bytes);
     let password_hash = compute_password_hash(new_password, &salt_hex).ok_or_else(|| {
         AppError::InternalError(anyhow::anyhow!("failed to compute password hash"))
@@ -1107,7 +1107,7 @@ fn too_many_requests_response(retry_after_secs: u64) -> HttpResponse {
 /// avoid the modulo bias that would make a handful of low codes very slightly
 /// more probable. `thread_rng` is a CSPRNG, so codes are unpredictable.
 fn generate_pairing_code() -> String {
-    let n = rand::thread_rng().gen_range(0..1_000_000);
+    let n = rand::rng().random_range(0..1_000_000);
     format!("{n:06}")
 }
 
