@@ -267,6 +267,100 @@ fn add_field(tf: &mut HashMap<String, f64>, text: &str, weight: f64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Write-time similarity (L2): IDF-weighted cosine for dup detection.
+//
+// The prior write-path merge gate scored candidates by a RAW count of shared
+// keywords/entities (`keyword_overlap + entity_overlap*2 + title_prefix >= 4`),
+// which treats a common word the same as a rare one — so two memories that merely
+// share boilerplate terms could be force-merged (corrupting, lossy), while two
+// stating the same fact in different words could be missed. This replaces that
+// with an IDF-weighted cosine over the SAME field-weighted token bags recall uses,
+// so rare/specific shared terms drive the score and common ones are discounted.
+// Bounded [0, 1], symmetric, embedding-FREE.
+// ---------------------------------------------------------------------------
+
+/// A field-weighted term-frequency bag for one memory, using the same
+/// tokenization + field boosts (`title > keywords > tags > entities > summary`)
+/// as [`Bm25Corpus`], so write-time similarity and recall agree on what a memory's
+/// terms are. `summary` here is the full body/content at write time (both sides of
+/// a comparison are built the same way, so the bags stay symmetric).
+pub(super) fn field_weighted_bag(
+    title: &str,
+    keywords: &[String],
+    tags: &[String],
+    entities: &[String],
+    summary: &str,
+) -> HashMap<String, f64> {
+    let mut tf: HashMap<String, f64> = HashMap::new();
+    add_field(&mut tf, title, W_TITLE);
+    for kw in keywords {
+        add_field(&mut tf, kw, W_KEYWORD);
+    }
+    for tag in tags {
+        add_field(&mut tf, tag, W_TAG);
+    }
+    for ent in entities {
+        add_field(&mut tf, ent, W_ENTITY);
+    }
+    add_field(&mut tf, summary, W_SUMMARY);
+    tf
+}
+
+/// Document-frequency statistics over a set of bags, for IDF weighting.
+pub(super) struct SimilarityCorpus {
+    df: HashMap<String, usize>,
+    n: usize,
+}
+
+impl SimilarityCorpus {
+    /// Build DF over every compared bag (candidates AND the incoming memory), so
+    /// every term has `df >= 1` and the smoothed idf below is always finite.
+    pub(super) fn build(bags: &[&HashMap<String, f64>]) -> Self {
+        let mut df: HashMap<String, usize> = HashMap::new();
+        for bag in bags {
+            for term in bag.keys() {
+                *df.entry(term.clone()).or_insert(0) += 1;
+            }
+        }
+        SimilarityCorpus { df, n: bags.len() }
+    }
+
+    /// Smoothed inverse document frequency `ln(1 + n/df)`: strictly positive
+    /// (>= ln 2, since `df <= n`), monotonically higher for rarer terms, and — when
+    /// the compared set is tiny (every df == n) — flat, so similarity gracefully
+    /// degrades to a plain weighted-TF cosine instead of collapsing to zero.
+    fn idf(&self, term: &str) -> f64 {
+        let df = (*self.df.get(term).unwrap_or(&1)).max(1) as f64;
+        (1.0 + self.n as f64 / df).ln()
+    }
+
+    /// IDF-weighted cosine similarity between two field bags, in [0, 1].
+    pub(super) fn cosine(&self, a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
+        let mut dot = 0.0f64;
+        let mut norm_a = 0.0f64;
+        let mut norm_b = 0.0f64;
+        for (term, &wa) in a {
+            let idf = self.idf(term);
+            let va = wa * idf;
+            norm_a += va * va;
+            if let Some(&wb) = b.get(term) {
+                dot += va * (wb * idf);
+            }
+        }
+        for (term, &wb) in b {
+            let vb = wb * self.idf(term);
+            norm_b += vb * vb;
+        }
+        let denom = norm_a.sqrt() * norm_b.sqrt();
+        if denom <= f64::EPSILON {
+            0.0
+        } else {
+            (dot / denom).clamp(0.0, 1.0)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{DurableMemoryStatus, DurableMemoryType, LexicalIndexItem, MemoryScope};
@@ -294,6 +388,54 @@ mod tests {
             granularity: None,
             embedding: None,
         }
+    }
+
+    #[test]
+    fn similarity_discounts_common_terms_via_idf() {
+        use super::{field_weighted_bag, SimilarityCorpus};
+        let bag = |title: &str, body: &str| field_weighted_bag(title, &[], &[], &[], body);
+        // A near-identical restatement (only the tail word differs).
+        let d = bag(
+            "blue green deploy soak",
+            "production deploy blue green ten minute soak window",
+        );
+        let e = bag(
+            "blue green deploy soak window",
+            "production deploy blue green ten minute soak cutover",
+        );
+        // Two unrelated docs that share ONLY the term `deploy`, which is common
+        // across this corpus (all four docs use it) so IDF discounts it.
+        let f = bag(
+            "kafka consumer lag alerts",
+            "kafka consumer lag alerts fire when we deploy",
+        );
+        let g = bag(
+            "postgres autovacuum tuning",
+            "postgres autovacuum thresholds tuned per deploy",
+        );
+        let corpus = SimilarityCorpus::build(&[&d, &e, &f, &g]);
+        let near = corpus.cosine(&d, &e);
+        let common_only = corpus.cosine(&f, &g);
+        assert!(near > 0.6, "near-identical should score high, got {near}");
+        assert!(
+            common_only < 0.2,
+            "docs sharing only a common term should score low, got {common_only}"
+        );
+        assert!(near > common_only);
+    }
+
+    #[test]
+    fn similarity_is_symmetric_bounded_and_self_is_one() {
+        use super::{field_weighted_bag, SimilarityCorpus};
+        let a = field_weighted_bag("alpha beta", &[], &[], &[], "alpha beta gamma");
+        let b = field_weighted_bag("beta gamma", &[], &[], &[], "beta gamma delta");
+        let corpus = SimilarityCorpus::build(&[&a, &b]);
+        let ab = corpus.cosine(&a, &b);
+        assert!((ab - corpus.cosine(&b, &a)).abs() < 1e-9, "symmetric");
+        assert!((0.0..=1.0).contains(&ab), "bounded, got {ab}");
+        assert!((corpus.cosine(&a, &a) - 1.0).abs() < 1e-9, "self == 1.0");
+        // Empty bag → 0.0, no divide-by-zero.
+        assert_eq!(corpus.cosine(&a, &std::collections::HashMap::new()), 0.0);
     }
 
     #[test]
