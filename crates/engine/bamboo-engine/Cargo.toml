@@ -50,7 +50,7 @@ toml = "1.1"
 dirs = "5"
 libc = "0.2"
 rand = "0.10"
-sysinfo = "0.33"
+sysinfo = "0.39"
 bytes = "1"
 
 [target.'cfg(windows)'.dependencies]
