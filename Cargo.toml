@@ -203,7 +203,7 @@ sysinfo = "0.33"
 libc = "0.2"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 
 [target.'cfg(windows)'.dependencies]
 # Windows-only OCR via WinRT. Used by the `hooks.image_fallback.mode="ocr"` preflight hook.
