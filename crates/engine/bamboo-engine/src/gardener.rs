@@ -53,6 +53,12 @@ pub struct DedupGardenerRunResult {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapacityGardenerRunResult {
+    pub scopes_scanned: usize,
+    pub archived: usize,
+}
+
 async fn collect_model_json(
     provider: Arc<dyn LLMProvider>,
     model: &str,
@@ -431,6 +437,57 @@ async fn run_dedup_gardener_once_with_store(
     Ok(Some(result))
 }
 
+/// Capacity gardener (L5): bound each scope's RECALLABLE size by archiving the
+/// lowest-value overflow OUT of the recall index — never deletes (reversible), no
+/// LLM. Off unless `memory_active_capacity > 0`; `Reference`/`User`/`Feedback`
+/// memories are exempt. Runs last (after split + dedup), so it counts the
+/// post-consolidation library. `Ok(None)` when the feature is off.
+pub async fn run_capacity_gardener_once(
+    ctx: &AutoDreamContext,
+) -> Result<Option<CapacityGardenerRunResult>, String> {
+    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    run_capacity_gardener_once_with_store(ctx, &memory).await
+}
+
+async fn run_capacity_gardener_once_with_store(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+) -> Result<Option<CapacityGardenerRunResult>, String> {
+    let memory_cfg = ctx.config.read().await.memory.clone().unwrap_or_default();
+    let capacity = memory_cfg.memory_active_capacity;
+    if capacity == 0 {
+        return Ok(None);
+    }
+    let max_archivals = memory_cfg.capacity_max_archivals_per_run.max(1);
+
+    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
+    for key in memory.list_project_keys().await.unwrap_or_default() {
+        targets.push((MemoryScope::Project, Some(key)));
+    }
+
+    let mut result = CapacityGardenerRunResult::default();
+    for (scope, project_key) in &targets {
+        let archived = memory
+            .enforce_scope_capacity(*scope, project_key.as_deref(), capacity, max_archivals)
+            .await
+            .map_err(|error| format!("capacity enforcement failed: {error}"))?;
+        result.scopes_scanned += 1;
+        result.archived += archived.len();
+    }
+    if result.archived > 0 {
+        tracing::info!(
+            target: GARDENER_TRACING_TARGET,
+            event = "capacity_run_complete",
+            scopes_scanned = result.scopes_scanned,
+            archived = result.archived,
+            capacity = capacity,
+            "[capacity-gardener] archived {} memories over capacity",
+            result.archived
+        );
+    }
+    Ok(Some(result))
+}
+
 /// How often the gardener loop polls for the volume trigger. Kept short relative
 /// to the (typically daily) time interval so library growth is caught within
 /// minutes, not a full interval. Each poll is a cheap count + a config read; the
@@ -471,6 +528,15 @@ async fn run_gardener_passes(ctx: &AutoDreamContext) {
             target: GARDENER_TRACING_TARGET,
             event = "dedup_run_failed",
             "[dedup-gardener] run failed: {}",
+            error
+        );
+    }
+    // Capacity enforcement last, so it counts the post-consolidation library.
+    if let Err(error) = run_capacity_gardener_once(ctx).await {
+        tracing::warn!(
+            target: GARDENER_TRACING_TARGET,
+            event = "capacity_run_failed",
+            "[capacity-gardener] run failed: {}",
             error
         );
     }
@@ -816,5 +882,90 @@ mod tests {
             provider_registry,
         };
         assert_eq!(run_dedup_gardener_once(&ctx).await.unwrap(), None);
+    }
+
+    /// L5: the capacity gardener is off (Ok(None)) unless `memory_active_capacity`
+    /// is set, and when set it archives the over-capacity overflow.
+    #[tokio::test]
+    async fn capacity_gardener_off_until_capacity_set_then_archives_overflow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
+
+        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        for title in [
+            "Global fact a",
+            "Global fact b",
+            "Global fact c",
+            "Global fact d",
+        ] {
+            memory
+                .write_memory(
+                    MemoryScope::Global,
+                    None,
+                    DurableMemoryType::Project,
+                    title,
+                    "body content for the memory",
+                    &[],
+                    Some("s"),
+                    "m",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Off by default (capacity == 0) → Ok(None), archives nothing.
+        let off_config = Arc::new(RwLock::new(Config::default()));
+        let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
+        let ctx_off = AutoDreamContext {
+            session_store: session_store.clone(),
+            storage: storage.clone(),
+            provider: provider.clone(),
+            config: off_config,
+            provider_registry: provider_registry.clone(),
+        };
+        assert_eq!(
+            run_capacity_gardener_once_with_store(&ctx_off, &memory)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Capacity 2 → archive the 2 over-capacity memories.
+        let on_config = Arc::new(RwLock::new(Config {
+            memory: Some(bamboo_config::MemoryConfig {
+                memory_active_capacity: 2,
+                ..bamboo_config::MemoryConfig::default()
+            }),
+            ..Config::default()
+        }));
+        let ctx_on = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config: on_config,
+            provider_registry,
+        };
+        let result = run_capacity_gardener_once_with_store(&ctx_on, &memory)
+            .await
+            .unwrap()
+            .expect("capacity pass should run when enabled");
+        assert_eq!(result.archived, 2, "archived the over-capacity overflow");
+        assert_eq!(
+            memory
+                .count_scope_memories(MemoryScope::Global, None)
+                .await
+                .unwrap(),
+            4,
+            "archived docs are kept on disk, not deleted"
+        );
     }
 }

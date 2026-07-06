@@ -76,6 +76,31 @@ enum WriteSimilarity {
     None,
 }
 
+/// Heuristic "keep value" of a memory for capacity eviction (L5), higher = more
+/// worth keeping. Recency (from `updated_at`) × confidence, with a penalty for
+/// Stale. Access frequency is NOT yet a factor: recall doesn't write back
+/// `last_accessed_at` (doing so on the read path would force an index rebuild per
+/// recall in this file-store), so it is omitted; when a cheap access signal exists
+/// it multiplies in here. Deterministic — no model, no embedding.
+fn memory_value(doc: &DurableMemoryDocument, now: chrono::DateTime<chrono::Utc>) -> f64 {
+    let confidence = match doc.frontmatter.confidence.as_deref() {
+        Some("high") => 1.0,
+        Some("low") => 0.25,
+        _ => 0.5, // "medium" or unset
+    };
+    // Unparseable timestamp → treat as very old (low recency) so it evicts first.
+    let age_days = parse_rfc3339(&doc.frontmatter.updated_at)
+        .map(|ts| (now - ts).num_days().max(0) as f64)
+        .unwrap_or(3650.0);
+    let recency = 1.0 / (1.0 + age_days / 30.0);
+    let stale_penalty = if matches!(doc.frontmatter.status, DurableMemoryStatus::Stale) {
+        0.5
+    } else {
+        1.0
+    };
+    confidence * recency * stale_penalty
+}
+
 /// Projected body length (chars) after appending `content` to `body` with the
 /// Serialize `value` to pretty JSON bytes, mapping a serialization failure onto
 /// an `io::Error` so callers stay on `io::Result`. Shared by the single-file
@@ -1885,6 +1910,118 @@ impl MemoryStore {
         Ok(total)
     }
 
+    /// Bound a scope's RECALLABLE size to `capacity` by archiving the
+    /// lowest-[`memory_value`] memories OUT OF the recall index — capacity via
+    /// archive, NEVER delete (L5). Archived docs stay on disk (reversible; a later
+    /// pass or the user can restore them) but drop out of recall/scoring.
+    ///
+    /// Precision-biased and conservative:
+    /// - Only `Active`/`Stale` docs count toward `capacity` (already-archived /
+    ///   superseded don't).
+    /// - Only `Project` memories are evictable; `Reference` (curated), `User`
+    ///   (who the user is) and `Feedback` (their preferences) are EXEMPT — they are
+    ///   high-value identity/reference facts, never auto-archived.
+    /// - At most `max_archivals` are archived per call, so a big overflow is drained
+    ///   gradually across runs rather than in one burst.
+    /// - `capacity == 0` (or `max_archivals == 0`) is a no-op (feature off).
+    ///
+    /// Returns the archived ids. One index refresh for the whole batch.
+    pub async fn enforce_scope_capacity(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        capacity: usize,
+        max_archivals: usize,
+    ) -> io::Result<Vec<String>> {
+        if capacity == 0 || max_archivals == 0 {
+            return Ok(Vec::new());
+        }
+        let project_key = self.require_project_key(scope, project_key)?;
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
+
+        let mut docs = self.list_memory_documents(scope, project_key).await?;
+        let is_scorable = |status: DurableMemoryStatus| {
+            matches!(
+                status,
+                DurableMemoryStatus::Active | DurableMemoryStatus::Stale
+            )
+        };
+        let scorable = docs
+            .iter()
+            .filter(|doc| is_scorable(doc.frontmatter.status))
+            .count();
+        if scorable <= capacity {
+            return Ok(Vec::new());
+        }
+        let overflow = scorable - capacity;
+        let now = chrono::Utc::now();
+
+        // Rank evictable (scorable + Project) docs by ascending keep-value.
+        let mut evictable: Vec<&DurableMemoryDocument> = docs
+            .iter()
+            .filter(|doc| {
+                is_scorable(doc.frontmatter.status)
+                    && doc.frontmatter.r#type == DurableMemoryType::Project
+            })
+            .collect();
+        evictable.sort_by(|a, b| {
+            memory_value(a, now)
+                .partial_cmp(&memory_value(b, now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let target = overflow.min(max_archivals).min(evictable.len());
+        let archive_ids: std::collections::HashSet<String> = evictable
+            .iter()
+            .take(target)
+            .map(|doc| doc.frontmatter.id.clone())
+            .collect();
+        if archive_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut archived = Vec::with_capacity(archive_ids.len());
+        for doc in docs
+            .iter_mut()
+            .filter(|doc| archive_ids.contains(&doc.frontmatter.id))
+        {
+            let changed = self
+                .set_memory_status(
+                    doc,
+                    DurableMemoryStatus::Archived,
+                    "capacity_eviction",
+                    "gardener",
+                )
+                .await?;
+            if changed {
+                self.append_audit(
+                    scope,
+                    project_key,
+                    PURGE_AUDIT_LOG,
+                    AuditLogEntry {
+                        timestamp: now_rfc3339(),
+                        action: DurableMemoryStatus::Archived.as_str().to_string(),
+                        scope,
+                        memory_id: Some(doc.frontmatter.id.clone()),
+                        session_id: None,
+                        topic: None,
+                        summary: "Archived out of recall to enforce scope capacity.".to_string(),
+                        metadata: Some(serde_json::json!({
+                            "reason": "capacity_eviction",
+                            "capacity": capacity,
+                        })),
+                    },
+                )
+                .await?;
+                archived.push(doc.frontmatter.id.clone());
+            }
+        }
+        if !archived.is_empty() {
+            self.refresh_scope_artifacts(scope, project_key).await?;
+        }
+        Ok(archived)
+    }
+
     /// Classify how an incoming write relates to the scope's existing memories,
     /// using IDF-weighted cosine over field-weighted token bags (L2). Retires the
     /// old raw count-overlap gate: a common shared keyword no longer counts as much
@@ -3398,6 +3535,109 @@ mod tests {
             1
         );
         assert_eq!(store.count_all_memories().await.unwrap(), 4);
+    }
+
+    /// L5: capacity eviction archives the overflow OUT of recall (never deletes),
+    /// exempts non-Project types, and respects the per-run cap.
+    #[tokio::test]
+    async fn enforce_scope_capacity_archives_overflow_exempts_and_never_deletes() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+
+        let write = |title: &'static str, r#type| {
+            let store = &store;
+            async move {
+                store
+                    .write_memory(
+                        MemoryScope::Project,
+                        pk,
+                        r#type,
+                        title,
+                        "body content for the memory",
+                        &[],
+                        Some("s"),
+                        "m",
+                        false,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        for i in 0..6 {
+            write(
+                match i {
+                    0 => "Project fact zero",
+                    1 => "Project fact one",
+                    2 => "Project fact two",
+                    3 => "Project fact three",
+                    4 => "Project fact four",
+                    _ => "Project fact five",
+                },
+                DurableMemoryType::Project,
+            )
+            .await;
+        }
+        // A Reference memory in the same scope — high-value, must be EXEMPT.
+        write("Curated reference doc", DurableMemoryType::Reference).await;
+
+        let total_before = store
+            .count_scope_memories(MemoryScope::Project, pk)
+            .await
+            .unwrap();
+        assert_eq!(total_before, 7);
+
+        // capacity=0 is a no-op.
+        assert!(store
+            .enforce_scope_capacity(MemoryScope::Project, pk, 0, 100)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Per-run cap: overflow is 7-3=4, but max_archivals=2 → only 2 this run.
+        let first = store
+            .enforce_scope_capacity(MemoryScope::Project, pk, 3, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2, "per-run cap bounds archivals");
+
+        // Next run drains the rest down to capacity.
+        let second = store
+            .enforce_scope_capacity(MemoryScope::Project, pk, 3, 100)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2, "remaining overflow archived");
+
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, pk)
+            .await
+            .unwrap();
+        // Never deleted: all 7 files still present.
+        assert_eq!(docs.len(), 7, "archive must not delete");
+        let scorable = docs
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.frontmatter.status,
+                    DurableMemoryStatus::Active | DurableMemoryStatus::Stale
+                )
+            })
+            .count();
+        assert_eq!(scorable, 3, "recallable count bounded to capacity");
+        // The Reference doc is exempt: still Active.
+        let reference = docs
+            .iter()
+            .find(|d| d.frontmatter.r#type == DurableMemoryType::Reference)
+            .unwrap();
+        assert_eq!(reference.frontmatter.status, DurableMemoryStatus::Active);
+        // Everything archived is a Project memory.
+        for id in first.iter().chain(second.iter()) {
+            let doc = docs.iter().find(|d| &d.frontmatter.id == id).unwrap();
+            assert_eq!(doc.frontmatter.r#type, DurableMemoryType::Project);
+            assert_eq!(doc.frontmatter.status, DurableMemoryStatus::Archived);
+        }
     }
 
     /// Many `MemoryStore` instances pointed at the SAME data dir (the real
