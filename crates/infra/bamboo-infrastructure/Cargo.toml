@@ -20,7 +20,7 @@ tracing-appender = "0.2"
 chrono = { workspace = true }
 dashmap = "6"
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
-sysinfo = "0.33"
+sysinfo = "0.39"
 libc = "0.2"
 
 [dev-dependencies]
