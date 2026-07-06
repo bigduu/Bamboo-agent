@@ -258,6 +258,17 @@ mod tests {
         let config = Config {
             memory: Some(bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
+                // Disable the background maintenance tickers in tests. L4 made them
+                // default-ON, so with a background_model set the AppState builder
+                // spawns real auto_dream/gardener tasks whose first tick fires
+                // immediately and calls the mock provider — racing the endpoint's
+                // own dream call and draining the finite `SequenceProvider` queue,
+                // which flakily panics on `remove(0)`. These endpoint tests drive
+                // dream generation explicitly (the endpoint runs regardless of the
+                // flag), so the background tickers must stay quiet.
+                auto_dream_enabled: false,
+                gardener_enabled: false,
+                dedup_gardener_enabled: false,
                 ..bamboo_config::MemoryConfig::default()
             }),
             ..Config::default()
