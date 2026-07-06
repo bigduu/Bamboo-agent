@@ -164,6 +164,12 @@ pub struct HeadlessArgs {
     /// envelope. Nothing else is written to stdout (logs go to stderr), so
     /// the stream is pipe-safe.
     pub stream_json: bool,
+    /// Per-run reasoning effort override (`low`/`medium`/`high`/`xhigh`/`max`).
+    /// `None` keeps the active provider/config default.
+    pub reasoning_effort: Option<String>,
+    /// Per-run skill mode (e.g. `code`, `ask`). `None` keeps the session/config
+    /// default. Threads into `ExecuteRequest.skill_mode`.
+    pub skill_mode: Option<String>,
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
@@ -254,6 +260,30 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
 
     let model_ref = parse_model_ref(&args.model)?;
 
+    // Parse the optional reasoning-effort override once (applies to the initial
+    // execute and to any resume after a pending question).
+    let reasoning_effort = match args.reasoning_effort.as_deref() {
+        Some(raw) => Some(
+            bamboo_domain::reasoning::ReasoningEffort::parse(raw).ok_or_else(|| {
+                format!(
+                    "invalid --reasoning-effort '{raw}' (expected: low | medium | high | xhigh | max)"
+                )
+            })?,
+        ),
+        None => None,
+    };
+
+    // Validate the optional skill mode at the CLI boundary rather than letting the
+    // skill store silently drop a malformed value downstream.
+    if let Some(mode) = args.skill_mode.as_deref() {
+        let ok = !mode.is_empty() && mode.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !ok {
+            return Err(format!(
+                "invalid --skill-mode '{mode}' (expected non-empty [A-Za-z0-9-], e.g. `code` or `ask`)"
+            ));
+        }
+    }
+
     if args.stream_json {
         println!(
             "{}",
@@ -274,8 +304,8 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             model: None,
             provider: None,
             model_ref,
-            skill_mode: None,
-            reasoning_effort: None,
+            skill_mode: args.skill_mode.clone(),
+            reasoning_effort,
             client_sync: None,
             // #74: a headless `-p` run has no interactive approver. The handler
             // re-derives + persists this onto the root session each execute, so
@@ -387,7 +417,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
                 model: None,
                 provider: None,
                 model_ref: None,
-                reasoning_effort: None,
+                reasoning_effort,
             }),
         )
         .await;

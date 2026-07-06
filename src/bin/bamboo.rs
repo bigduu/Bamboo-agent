@@ -56,6 +56,21 @@ struct Cli {
     /// stalls at the first permission-gated tool such as Bash).
     #[arg(long = "permission-mode")]
     permission_mode: Option<String>,
+
+    /// With -p: reasoning effort override for this run. One of:
+    /// low | medium | high | xhigh | max. Defaults to the active provider/config value.
+    #[arg(long = "reasoning-effort")]
+    reasoning_effort: Option<String>,
+
+    /// With -p: per-run skill mode (e.g. `code`, `ask`); skill discovery then
+    /// prefers `skills-<mode>` directories. Defaults to the session/config value.
+    #[arg(long = "skill-mode")]
+    skill_mode: Option<String>,
+
+    /// Default log level when `RUST_LOG` is unset: error | warn | info | debug | trace.
+    /// `RUST_LOG` still takes precedence when set.
+    #[arg(long = "log-level", global = true)]
+    log_level: Option<String>,
 }
 
 /// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
@@ -198,6 +213,14 @@ enum Commands {
         /// Show sensitive values (API keys, etc.)
         #[arg(long)]
         show_secrets: bool,
+    },
+
+    /// Generate a shell completion script. Pipe it to your shell's completion dir,
+    /// e.g. `bamboo completions zsh > ~/.zfunc/_bamboo`.
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// Run as a sub-agent worker process (spawned by a parent bamboo server).
@@ -484,6 +507,30 @@ enum ActorCommands {
 async fn main() {
     let cli = Cli::parse();
 
+    // `--log-level` seeds `RUST_LOG` (only when unset) so every logging path —
+    // the fmt subscribers below AND `serve`'s file logging — honors it uniformly.
+    // An explicit `RUST_LOG` still wins. Validated to a plain level here (use
+    // `RUST_LOG` directly for target-scoped directives).
+    if let Some(level) = cli.log_level.as_deref() {
+        const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+        if !LEVELS.contains(&level.to_ascii_lowercase().as_str()) {
+            eprintln!(
+                "invalid --log-level '{level}' (expected: {})",
+                LEVELS.join(" | ")
+            );
+            std::process::exit(2);
+        }
+        if std::env::var_os("RUST_LOG").is_none() {
+            // SAFETY: consistent with the other env seeding in this file. We run
+            // before any logging subscriber is installed and while the tokio
+            // worker threads (already spawned by `#[tokio::main]`) are parked and
+            // read no env, so this write races nothing in practice.
+            unsafe {
+                std::env::set_var("RUST_LOG", level);
+            }
+        }
+    }
+
     // Initialize logging (file + stdout, with rotation).
     // Use debug level in debug builds, info in release.
     let debug = cfg!(debug_assertions);
@@ -514,6 +561,7 @@ async fn main() {
         | Some(Commands::Stop { .. })
         | Some(Commands::Init { .. })
         | Some(Commands::Doctor { .. })
+        | Some(Commands::Completions { .. })
         | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
             // bootstrap & streaming protocol and must stay clean. (`None` is
@@ -537,6 +585,24 @@ async fn main() {
                 use clap::CommandFactory;
                 let _ = Cli::command().print_help();
                 std::process::exit(2);
+            };
+
+            // `bamboo -p -` reads the prompt from stdin (pipe-friendly).
+            let prompt = if prompt == "-" {
+                use std::io::Read as _;
+                let mut buf = String::new();
+                if std::io::stdin().read_to_string(&mut buf).is_err() {
+                    eprintln!("failed to read prompt from stdin");
+                    std::process::exit(1);
+                }
+                let trimmed = buf.trim().to_string();
+                if trimmed.is_empty() {
+                    eprintln!("empty prompt on stdin");
+                    std::process::exit(1);
+                }
+                trimmed
+            } else {
+                prompt
             };
 
             // --echo stays a bare actor-chain smoke (no server, no key).
@@ -576,6 +642,8 @@ async fn main() {
                 data_dir: bamboo_home_dir,
                 stream_json: cli.stream_json,
                 permission_mode: cli.permission_mode,
+                reasoning_effort: cli.reasoning_effort,
+                skill_mode: cli.skill_mode,
             };
             if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");
@@ -672,6 +740,13 @@ async fn main() {
                 eprintln!("Failed to start server: {}", e);
                 std::process::exit(1);
             }
+        }
+
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
         Commands::SubagentWorker => {
