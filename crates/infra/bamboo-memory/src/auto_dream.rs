@@ -11,10 +11,16 @@ use serde::Deserialize;
 // Extraction types
 // ---------------------------------------------------------------------------
 
+/// How the Dream Notebook VIEW is (re)synthesized. The notebook is a derived
+/// view of durable memory, never a source of truth — so it is either bootstrapped
+/// from recent sessions (`Incremental`, before any durable memory exists) or
+/// grounded in the canonical durable memory index (`Rebuild`). The old `Refine`
+/// mode — rewriting the notebook from its own prior prose — was retired in L3: a
+/// self-referential narrative rewrite drifts from durable truth and silently
+/// over-merges. See `zenith/docs/memory-redesign.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DreamGenerationMode {
     Incremental,
-    Refine,
     Rebuild,
 }
 
@@ -499,38 +505,6 @@ pub fn build_consolidation_prompt(sessions: &[ConsolidationSessionInfo]) -> Stri
     prompt
 }
 
-pub fn build_consolidation_prompt_with_existing_dream(
-    existing_dream: Option<&str>,
-    sessions: &[ConsolidationSessionInfo],
-) -> String {
-    build_refine_consolidation_prompt(existing_dream, None, sessions)
-}
-
-pub fn build_refine_consolidation_prompt(
-    existing_dream: Option<&str>,
-    recent_durable_memory: Option<&str>,
-    sessions: &[ConsolidationSessionInfo],
-) -> String {
-    let mut prompt = build_consolidation_prompt_prefix();
-    prompt.push_str(
-        "When an existing Dream notebook is provided, start from it and preserve still-valid durable context while updating active threads based on recent sessions and recent durable memory updates. Remove obsolete items only when the recent evidence justifies it.\n\n",
-    );
-    append_markdown_reference_section(
-        &mut prompt,
-        "## Existing Dream notebook",
-        existing_dream,
-        "_(no existing Dream notebook supplied; fall back to synthesizing from recent sessions only)_",
-    );
-    append_markdown_reference_section(
-        &mut prompt,
-        "## Recent durable memory updates",
-        recent_durable_memory,
-        "_(no recent durable memory updates supplied)_",
-    );
-    append_consolidation_recent_sessions_section(&mut prompt, sessions);
-    prompt
-}
-
 pub fn build_rebuild_consolidation_prompt(
     durable_memory_index: Option<&str>,
     sessions: &[ConsolidationSessionInfo],
@@ -602,40 +576,9 @@ pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<St
     (!parts.is_empty()).then(|| parts.join("\n\n---\n\n"))
 }
 
-/// Normalize an existing dream notebook body for use as consolidation prompt context.
-///
-/// Returns `None` if normalization fails (logged as a warning).
-pub fn normalize_existing_dream_for_prompt(
-    existing_dream: Option<&str>,
-    model: &str,
-    session_count: usize,
-    max_summary_chars: usize,
-) -> Option<String> {
-    existing_dream.and_then(|dream| {
-        match normalize_dream_notebook_body(dream, max_summary_chars) {
-            Ok(body) => Some(body),
-            Err(error) => {
-                tracing::warn!(
-                    target: "bamboo.auto_dream",
-                    event = "existing_input_normalization_failed",
-                    model = model,
-                    session_count = session_count,
-                    "[auto_dream] failed to normalize existing Dream input; omitting prior Dream context: {}",
-                    error
-                );
-                None
-            }
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Config helpers
 // ---------------------------------------------------------------------------
-
-pub fn should_use_dream_refine_mode(memory_cfg: &bamboo_config::MemoryConfig) -> bool {
-    memory_cfg.dream_refine_mode
-}
 
 pub fn should_force_full_rebuild(
     last_full_rebuild_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -798,21 +741,6 @@ mod tests {
         assert!(prompt.contains("session-1"));
         assert!(prompt.contains("Important summary"));
         assert!(prompt.contains("## Current durable context"));
-    }
-
-    #[test]
-    fn refine_consolidation_prompt_includes_existing_dream() {
-        let prompt = build_refine_consolidation_prompt(
-            Some("## Current durable context\n- Existing durable thread"),
-            Some("# Recent Memory Updates\n\n- `mem-1` User prefers concise plans"),
-            &[sample_consolidation_session("session-2")],
-        );
-        assert!(prompt.contains("## Existing Dream notebook"));
-        assert!(prompt.contains("Existing durable thread"));
-        assert!(prompt.contains("## Recent durable memory updates"));
-        assert!(prompt.contains("User prefers concise plans"));
-        assert!(prompt.contains("start from it and preserve still-valid durable context"));
-        assert!(prompt.contains("session-2"));
     }
 
     #[test]

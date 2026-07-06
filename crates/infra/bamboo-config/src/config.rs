@@ -182,9 +182,12 @@ pub struct MemoryConfig {
         alias = "memory_project_first_dream"
     )]
     pub project_first_dream: bool,
-    /// Whether Dream generation should refine from the existing notebook when present.
-    ///
-    /// This rolls out cumulative/refining Dream synthesis behind an explicit opt-in flag.
+    /// DEPRECATED (memory redesign L3): the "Refine" Dream mode — rewriting the
+    /// notebook from its own prior prose — was retired because a self-referential
+    /// narrative rewrite drifts from durable truth and silently over-merges. The
+    /// notebook is now always a grounded VIEW of the durable memory index (Rebuild)
+    /// or a session bootstrap (Incremental). This field is IGNORED; it is retained
+    /// only so existing config files that set it still deserialize.
     #[serde(default, alias = "memory_dream_refine_mode")]
     pub dream_refine_mode: bool,
     /// Whether the background "gardener" may use the LLM to split/merge "blob" memories.

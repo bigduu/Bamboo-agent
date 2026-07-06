@@ -14,10 +14,9 @@ use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
 use bamboo_llm::{ProviderModelRouter, ProviderRegistry};
 use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
-    build_refine_consolidation_prompt, derive_session_outline, normalize_dream_notebook_body,
-    normalize_existing_dream_for_prompt, parse_candidate_scope, parse_candidate_type,
-    parse_extraction_candidates, parse_last_consolidated_at, parse_last_full_rebuild_at,
-    should_force_full_rebuild, should_use_dream_refine_mode, truncate_chars,
+    derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
+    parse_candidate_type, parse_extraction_candidates, parse_last_consolidated_at,
+    parse_last_full_rebuild_at, should_force_full_rebuild, truncate_chars,
     ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
 };
 use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
@@ -84,7 +83,6 @@ struct CandidateSessionContext {
 #[derive(Debug, Clone)]
 struct DreamSourceWindow {
     existing_dream: Option<String>,
-    recent_durable_memory: Option<String>,
     durable_memory_index: Option<String>,
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
 }
@@ -396,17 +394,6 @@ async fn read_existing_dream_for_scope(
     }
 }
 
-async fn read_recent_durable_memory_for_scope(
-    memory: &MemoryStore,
-    scope: MemoryScope,
-    project_key: Option<&str>,
-) -> Result<Option<String>, String> {
-    memory
-        .read_recent_view(scope, project_key)
-        .await
-        .map_err(|error| format!("failed to read recent durable memory view: {error}"))
-}
-
 async fn read_durable_memory_index_for_scope(
     memory: &MemoryStore,
     scope: MemoryScope,
@@ -452,83 +439,6 @@ async fn build_dream_notebook_body(
     generation_mode: DreamGenerationMode,
 ) -> Result<String, String> {
     match generation_mode {
-        DreamGenerationMode::Refine => {
-            tracing::info!(
-                target: DREAM_TRACING_TARGET,
-                event = "refine_attempt",
-                model = model,
-                session_count = source_window.sessions.len(),
-                existing_dream_present = source_window.existing_dream.is_some(),
-                recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
-                "Attempting refine-mode Dream synthesis"
-            );
-
-            let existing_dream_for_prompt = normalize_existing_dream_for_prompt(
-                source_window.existing_dream.as_deref(),
-                model,
-                source_window.sessions.len(),
-                DREAM_MAX_SUMMARY_CHARS,
-            );
-            let refine_prompt = build_refine_consolidation_prompt(
-                existing_dream_for_prompt.as_deref(),
-                source_window.recent_durable_memory.as_deref(),
-                &to_consolidation_sessions(&source_window.sessions),
-            );
-            match collect_stream_text(provider.clone(), model, refine_prompt).await {
-                Ok(raw_body) => {
-                    match normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS) {
-                        Ok(body) => {
-                            tracing::info!(
-                                target: DREAM_TRACING_TARGET,
-                                event = "refine_success",
-                                model = model,
-                                session_count = source_window.sessions.len(),
-                                notebook_body_chars = body.chars().count(),
-                                existing_dream_present = source_window.existing_dream.is_some(),
-                                recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
-                                "Refine-mode Dream synthesis succeeded"
-                            );
-                            Ok(body)
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                target: DREAM_TRACING_TARGET,
-                                event = "refine_output_normalization_failed",
-                                model = model,
-                                session_count = source_window.sessions.len(),
-                                existing_dream_present = source_window.existing_dream.is_some(),
-                                recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
-                                "[auto_dream] refine-mode Dream output normalization failed; falling back to incremental prompt: {}",
-                                error
-                            );
-                            let prompt = build_consolidation_prompt(&to_consolidation_sessions(
-                                &source_window.sessions,
-                            ));
-                            let raw_body =
-                                collect_stream_text(provider.clone(), model, prompt).await?;
-                            normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: DREAM_TRACING_TARGET,
-                        event = "refine_provider_failed",
-                        model = model,
-                        session_count = source_window.sessions.len(),
-                        existing_dream_present = source_window.existing_dream.is_some(),
-                        recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
-                        "[auto_dream] refine-mode Dream synthesis failed; falling back to incremental prompt: {}",
-                        error
-                    );
-                    let prompt = build_consolidation_prompt(&to_consolidation_sessions(
-                        &source_window.sessions,
-                    ));
-                    let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
-                    normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
-                }
-            }
-        }
         DreamGenerationMode::Rebuild => {
             tracing::info!(
                 target: DREAM_TRACING_TARGET,
@@ -629,8 +539,6 @@ async fn run_auto_dream_once_for_scope(
 
     let now = Utc::now();
     let existing = read_existing_dream_for_scope(memory, scope, project_key).await?;
-    let recent_durable_memory =
-        read_recent_durable_memory_for_scope(memory, scope, project_key).await?;
     let durable_memory_index =
         read_durable_memory_index_for_scope(memory, scope, project_key).await?;
     let last_full_rebuild_at = existing.as_deref().and_then(parse_last_full_rebuild_at);
@@ -672,10 +580,14 @@ async fn run_auto_dream_once_for_scope(
         return Ok(None);
     }
 
-    let generation_mode = if force_full_rebuild {
+    // The notebook is a VIEW of durable memory (L3): rebuild it from the canonical
+    // durable memory index whenever any durable memory exists — grounded in the
+    // source of truth — and only bootstrap from recent sessions when there is no
+    // durable memory to ground on yet. `force_full_rebuild` additionally widens the
+    // session window (see `since`) on the periodic pass. The retired `Refine` mode
+    // rewrote the notebook from its own prior prose, drifting from durable truth.
+    let generation_mode = if force_full_rebuild || durable_memory_index.is_some() {
         DreamGenerationMode::Rebuild
-    } else if should_use_dream_refine_mode(&memory_cfg) && existing.is_some() {
-        DreamGenerationMode::Refine
     } else {
         DreamGenerationMode::Incremental
     };
@@ -687,11 +599,10 @@ async fn run_auto_dream_once_for_scope(
         model = model.as_str(),
         session_count = sessions.len(),
         existing_dream_present = existing.is_some(),
-        recent_durable_memory_present = recent_durable_memory.is_some(),
         durable_memory_index_present = durable_memory_index.is_some(),
+        force_full_rebuild = force_full_rebuild,
         generation_mode = match generation_mode {
             DreamGenerationMode::Incremental => "incremental",
-            DreamGenerationMode::Refine => "refine",
             DreamGenerationMode::Rebuild => "rebuild",
         },
         require_auto_dream_enabled = require_auto_dream_enabled,
@@ -700,13 +611,16 @@ async fn run_auto_dream_once_for_scope(
 
     let source_window = DreamSourceWindow {
         existing_dream: existing,
-        recent_durable_memory,
         durable_memory_index,
         sessions,
     };
     let notebook_body =
         build_dream_notebook_body(&bg_provider, &model, &source_window, generation_mode).await?;
-    let last_full_rebuild_line = if matches!(generation_mode, DreamGenerationMode::Rebuild) {
+    // Stamp the periodic-rebuild marker ONLY on a forced pass. Every non-forced
+    // pass is now a Rebuild too (the notebook is always grounded in durable
+    // memory), so keying the marker off the mode would reset the timer every tick
+    // and the wide-window periodic sweep would never fire.
+    let last_full_rebuild_line = if force_full_rebuild {
         format!("Last full rebuild at: {}\n", now.to_rfc3339())
     } else if let Some(existing_rebuild_at) = last_full_rebuild_at {
         format!(
@@ -763,11 +677,9 @@ async fn run_auto_dream_once_for_scope(
         model = model.as_str(),
         session_count = source_window.sessions.len(),
         existing_dream_present = source_window.existing_dream.is_some(),
-        recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
         durable_memory_index_present = source_window.durable_memory_index.is_some(),
         generation_mode = match generation_mode {
             DreamGenerationMode::Incremental => "incremental",
-            DreamGenerationMode::Refine => "refine",
             DreamGenerationMode::Rebuild => "rebuild",
         },
         notebook_chars = notebook_chars,
@@ -863,26 +775,16 @@ mod tests {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
     }
 
-    #[derive(Debug, Clone)]
-    enum SequenceStep {
-        Response(String),
-        Fail(String),
-    }
-
     #[derive(Clone)]
     struct SequenceProvider {
-        steps: Arc<Mutex<Vec<SequenceStep>>>,
+        responses: Arc<Mutex<Vec<String>>>,
         prompts: Arc<Mutex<Vec<String>>>,
     }
 
     impl SequenceProvider {
         fn new(responses: Vec<String>) -> Self {
-            Self::from_steps(responses.into_iter().map(SequenceStep::Response).collect())
-        }
-
-        fn from_steps(steps: Vec<SequenceStep>) -> Self {
             Self {
-                steps: Arc::new(Mutex::new(steps)),
+                responses: Arc::new(Mutex::new(responses)),
                 prompts: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -904,14 +806,11 @@ mod tests {
             if let Some(prompt) = messages.last().map(|message| message.content.clone()) {
                 self.prompts.lock().expect("lock poisoned").push(prompt);
             }
-            let next = self.steps.lock().expect("lock poisoned").remove(0);
-            match next {
-                SequenceStep::Response(text) => Ok(Box::pin(stream::iter(vec![
-                    Ok(LLMChunk::Token(text)),
-                    Ok(LLMChunk::Done),
-                ]))),
-                SequenceStep::Fail(error) => Err(LLMError::Stream(error)),
-            }
+            let text = self.responses.lock().expect("lock poisoned").remove(0);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token(text)),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
 
@@ -1471,8 +1370,12 @@ mod tests {
         assert!(project_dream.contains("Manual project dream worked"));
     }
 
+    /// L3: even on a NON-forced pass, once durable memory exists the notebook is
+    /// (re)built grounded in the canonical durable memory index — NOT rewritten from
+    /// its own prior prose (the retired Refine mode). Also asserts a non-forced pass
+    /// does not stamp the periodic-rebuild marker, so the timer still advances.
     #[tokio::test]
-    async fn run_auto_dream_once_refine_mode_includes_existing_dream_in_prompt() {
+    async fn run_auto_dream_once_grounds_notebook_in_durable_index_not_prior_prose() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
@@ -1483,7 +1386,7 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider = SequenceProvider::new(vec![
-            "## Current durable context\n- Refined durable theme\n\n## Cross-session patterns\n- Keep continuity\n\n## Active threads to remember\n- Update the notebook\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
+            "## Current durable context\n- Grounded in durable memory\n\n## Cross-session patterns\n- Keep continuity\n\n## Active threads to remember\n- Refresh blockers\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
             "{\"candidates\":[]}".to_string(),
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
@@ -1491,114 +1394,36 @@ mod tests {
             memory: Some(bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                dream_refine_mode: true,
                 ..bamboo_config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let workspace = temp_dir.path().join("workspace-refine-mode");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-
-        let mut session = bamboo_agent_core::Session::new("session-refine-mode", "model");
-        session.title = "Refine mode test".to_string();
-        session.metadata.insert(
-            "workspace_path".to_string(),
-            workspace.to_string_lossy().to_string(),
-        );
-        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
-            "Recent session summary for refine mode.",
-            3,
-            120,
-        ));
-        session.add_message(Message::user("Update the dream with the latest thread."));
-        storage.save_session(&session).await.expect("save session");
-
-        let memory = MemoryStore::new(temp_dir.path());
-        memory
-            .write_dream_view(
-                "# Bamboo Dream Notebook\n\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Existing durable thread\n",
-            )
-            .await
-            .expect("write existing dream");
-        memory
-            .write_session_topic("session-refine-mode", "default", "Recent session note.")
-            .await
-            .expect("write session topic");
-
-        let context = AutoDreamContext {
-            session_store,
-            storage,
-            provider: provider_handle,
-            config,
-            provider_registry: test_registry(),
-        };
-
-        let result = run_auto_dream_once_with_store(&context, &memory)
-            .await
-            .expect("refine-mode auto dream should succeed")
-            .expect("dream output should be produced");
-        assert_eq!(result.session_count, 1);
-
-        let prompts = provider.recorded_prompts();
-        assert!(prompts.len() >= 2);
-        assert!(prompts[0].contains("## Existing Dream notebook"));
-        assert!(prompts[0].contains("Existing durable thread"));
-        assert!(prompts[0].contains("## Recent durable memory updates"));
-        assert!(prompts[0].contains("start from it and preserve still-valid durable context"));
-    }
-
-    #[tokio::test]
-    async fn run_auto_dream_once_refine_mode_includes_recent_durable_memory_in_prompt() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
-
-        let session_store = Arc::new(
-            SessionStoreV2::new(temp_dir.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let storage: Arc<dyn Storage> = session_store.clone();
-        let provider = SequenceProvider::new(vec![
-            "## Current durable context\n- Refined from durable memory\n\n## Cross-session patterns\n- Keep continuity\n\n## Active threads to remember\n- Update the notebook\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
-            "{\"candidates\":[]}".to_string(),
-        ]);
-        let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
-                background_model: Some("fast-model".to_string()),
-                auto_dream_enabled: true,
-                dream_refine_mode: true,
-                ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
-
-        let workspace = temp_dir.path().join("workspace-refine-recent-memory");
+        let workspace = temp_dir.path().join("workspace-grounded-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
         let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
 
-        let mut session = bamboo_agent_core::Session::new("session-refine-recent-memory", "model");
-        session.title = "Refine recent memory test".to_string();
+        let mut session = bamboo_agent_core::Session::new("session-grounded-mode", "model");
+        session.title = "Grounded mode test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
         session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
-            "Recent session summary for refine recent memory.",
+            "Recent session summary for grounded mode.",
             3,
             120,
         ));
-        session.add_message(Message::user(
-            "Update the dream with recent durable memory.",
-        ));
+        session.add_message(Message::user("Update the dream from durable memory."));
         storage.save_session(&session).await.expect("save session");
 
         let memory = MemoryStore::new(temp_dir.path());
+        // Existing notebook with only a "Last consolidated at" line (NO "Last full
+        // rebuild at") → force_full_rebuild is false, so this is a NON-forced pass.
         memory
             .write_project_dream_view(
                 &project_key,
-                "# Bamboo Dream Notebook\n\nProject key: project\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Existing durable thread\n",
+                "# Bamboo Dream Notebook\n\nProject key: project\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Stale prior notebook prose that must NOT drive the rebuild\n",
             )
             .await
             .expect("write existing project dream");
@@ -1607,16 +1432,16 @@ mod tests {
                 MemoryScope::Project,
                 Some(&project_key),
                 bamboo_memory::memory_store::DurableMemoryType::Project,
-                "Release freeze rule",
-                "The release freeze starts on Tuesday for mobile.",
-                &["release".to_string(), "freeze".to_string()],
-                Some("session-refine-recent-memory"),
+                "Canonical release decision",
+                "Release freeze starts Tuesday and all mobile changes require review.",
+                &["release".to_string(), "mobile".to_string()],
+                Some("session-grounded-mode"),
                 "main-model",
                 false,
                 None,
             )
             .await
-            .expect("write recent durable memory");
+            .expect("write project durable memory");
 
         let context = AutoDreamContext {
             session_store,
@@ -1626,16 +1451,35 @@ mod tests {
             provider_registry: test_registry(),
         };
 
-        let _ = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
+        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
             .await
-            .expect("refine recent-memory auto dream should succeed")
+            .expect("grounded auto dream should succeed")
             .expect("dream output should be produced");
+        assert_eq!(result.session_count, 1);
 
         let prompts = provider.recorded_prompts();
         assert!(prompts.len() >= 2);
-        assert!(prompts[0].contains("## Recent durable memory updates"));
-        assert!(prompts[0].contains("Release freeze rule"));
-        assert!(prompts[0].contains("Recent Memory Updates"));
+        // Grounded in the durable memory index, not the prior notebook prose.
+        assert!(prompts[0].contains("## Durable memory index"));
+        assert!(prompts[0].contains("Canonical release decision"));
+        assert!(prompts[0].contains("canonical durable memory plus recent session activity"));
+        assert!(
+            !prompts[0].contains("## Existing Dream notebook"),
+            "notebook must not be rewritten from its own prior prose (Refine retired)"
+        );
+        assert!(!prompts[0].contains("Stale prior notebook prose"));
+
+        // A non-forced pass does not stamp the periodic-rebuild marker.
+        let dream = memory
+            .read_project_dream_view(&project_key)
+            .await
+            .expect("read project dream")
+            .expect("project dream should exist");
+        assert!(dream.contains("Grounded in durable memory"));
+        assert!(
+            !dream.contains("Last full rebuild at:"),
+            "a non-forced pass must not stamp the full-rebuild marker"
+        );
     }
 
     #[tokio::test]
@@ -1658,7 +1502,6 @@ mod tests {
             memory: Some(bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                dream_refine_mode: true,
                 ..bamboo_config::MemoryConfig::default()
             }),
             ..Config::default()
@@ -1773,7 +1616,7 @@ Model: gpt-5-mini
     }
 
     #[tokio::test]
-    async fn run_auto_dream_once_refine_mode_normalizes_nested_notebook_output() {
+    async fn run_auto_dream_once_normalizes_nested_notebook_output() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
@@ -1792,7 +1635,6 @@ Model: gpt-5-mini
             memory: Some(bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                dream_refine_mode: true,
                 ..bamboo_config::MemoryConfig::default()
             }),
             ..Config::default()
@@ -1853,92 +1695,6 @@ Model: gpt-5-mini
         assert!(dream.contains("Refined durable theme"));
         assert!(!dream.contains("```md"));
         assert_eq!(dream.matches("# Bamboo Dream Notebook").count(), 1);
-    }
-
-    #[tokio::test]
-    async fn run_auto_dream_once_refine_mode_falls_back_to_legacy_prompt_on_failure() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
-
-        let session_store = Arc::new(
-            SessionStoreV2::new(temp_dir.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let storage: Arc<dyn Storage> = session_store.clone();
-        let provider = SequenceProvider::from_steps(vec![
-            SequenceStep::Fail("refine prompt failed".to_string()),
-            SequenceStep::Response(
-                "## Current durable context\n- Legacy fallback result\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
-            ),
-            SequenceStep::Response("{\"candidates\":[]}".to_string()),
-        ]);
-        let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
-                background_model: Some("fast-model".to_string()),
-                auto_dream_enabled: true,
-                dream_refine_mode: true,
-                ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
-
-        let workspace = temp_dir.path().join("workspace-refine-fallback");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-
-        let mut session = bamboo_agent_core::Session::new("session-refine-fallback", "model");
-        session.title = "Refine fallback test".to_string();
-        session.metadata.insert(
-            "workspace_path".to_string(),
-            workspace.to_string_lossy().to_string(),
-        );
-        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
-            "Recent summary for fallback mode.",
-            3,
-            120,
-        ));
-        session.add_message(Message::user("Please update the dream safely."));
-        storage.save_session(&session).await.expect("save session");
-
-        let memory = MemoryStore::new(temp_dir.path());
-        memory
-            .write_dream_view(
-                "# Bamboo Dream Notebook\n\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Existing durable thread\n",
-            )
-            .await
-            .expect("write existing dream");
-        memory
-            .write_session_topic("session-refine-fallback", "default", "Recent session note.")
-            .await
-            .expect("write session topic");
-
-        let context = AutoDreamContext {
-            session_store,
-            storage,
-            provider: provider_handle,
-            config,
-            provider_registry: test_registry(),
-        };
-
-        let result = run_auto_dream_once_with_store(&context, &memory)
-            .await
-            .expect("fallback auto dream should succeed")
-            .expect("dream output should be produced");
-        assert_eq!(result.session_count, 1);
-
-        let prompts = provider.recorded_prompts();
-        assert!(prompts.len() >= 3);
-        assert!(prompts[0].contains("## Existing Dream notebook"));
-        assert!(!prompts[1].contains("## Existing Dream notebook"));
-        assert!(prompts[1].contains("## Recent sessions"));
-
-        let dream = memory
-            .read_dream_view()
-            .await
-            .expect("read dream view")
-            .expect("dream should exist after fallback");
-        assert!(dream.contains("Legacy fallback result"));
     }
 
     #[tokio::test]
