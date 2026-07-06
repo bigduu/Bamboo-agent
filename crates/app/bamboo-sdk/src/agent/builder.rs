@@ -53,6 +53,10 @@ pub struct AgentBuilder {
     tools: Vec<Arc<dyn Tool>>,
     /// Primary model override applied to the session at `run` time.
     model: Option<String>,
+    /// Provider to select (e.g. `anthropic`, `openai`, `gemini`, `copilot`,
+    /// `bodhi`) in `with_defaults_for_data_dir`, overriding `config.json`'s
+    /// `provider`. `None` keeps the configured default.
+    provider_name: Option<String>,
     /// API key applied to the active provider's config before provider creation.
     api_key: Option<String>,
 }
@@ -65,6 +69,7 @@ impl AgentBuilder {
             system_prompt: None,
             tools: Vec::new(),
             model: None,
+            provider_name: None,
             api_key: None,
         }
     }
@@ -74,6 +79,16 @@ impl AgentBuilder {
     /// Set the primary model.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Select the provider by name (`anthropic`, `openai`, `gemini`, `copilot`,
+    /// `bodhi`) for [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir),
+    /// overriding `config.json`'s `provider`. A following [`api_key`](Self::api_key)
+    /// applies to *this* provider. Ignored if you inject a whole
+    /// [`provider`](Self::provider) instead.
+    pub fn provider_name(mut self, provider: impl Into<String>) -> Self {
+        self.provider_name = Some(provider.into());
         self
     }
 
@@ -175,6 +190,11 @@ impl AgentBuilder {
     pub async fn with_defaults_for_data_dir(mut self, data_dir: PathBuf) -> Result<Self, String> {
         // 1. Config.
         let mut config = Config::from_data_dir(Some(data_dir.clone()));
+        // Select the provider first, so `api_key` and provider creation both act
+        // on the chosen provider rather than config.json's default.
+        if let Some(provider) = self.provider_name.clone() {
+            config.provider = provider;
+        }
         if let Some(api_key) = self.api_key.clone() {
             apply_api_key(&mut config, &api_key);
         }
@@ -359,5 +379,31 @@ mod tests {
                 "expected a fabricated {provider} stanza carrying the api_key"
             );
         }
+    }
+
+    /// The contract `.provider_name()` relies on: selecting the provider (setting
+    /// `config.provider`) BEFORE `apply_api_key` routes the key onto the chosen
+    /// provider, not config.json's default. Regression guard for the ordering in
+    /// `with_defaults_for_data_dir`.
+    #[test]
+    fn provider_selection_before_api_key_routes_key_to_chosen_provider() {
+        let mut config = Config::default();
+        config.provider = "anthropic".to_string(); // config.json default
+        config.providers.openai = None;
+        config.providers.anthropic = None;
+
+        // Simulate `.provider_name("openai")` (set first), then `.api_key(...)`.
+        config.provider = "openai".to_string();
+        apply_api_key(&mut config, "sk-openai-xyz");
+
+        assert_eq!(
+            config.providers.openai.as_ref().map(|c| c.api_key.as_str()),
+            Some("sk-openai-xyz"),
+            "api_key must land on the selected provider (openai), not the default"
+        );
+        assert!(
+            config.providers.anthropic.is_none(),
+            "the default provider must not receive the key"
+        );
     }
 }

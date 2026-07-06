@@ -42,11 +42,13 @@ mod tools;
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
 pub use builder::AgentBuilder;
 pub use execute_request::ExecuteRequestBuilder;
+use tokio::sync::mpsc;
+
+// Re-exported so callers can name the token returned by the `*_cancellable` /
+// `*_with_cancel` run helpers without depending on `tokio-util` directly.
+pub use tokio_util::sync::CancellationToken;
 pub use tools::{
     builtin_tool_names, builtin_tool_specs, BuiltinTool, ToolSpec, CANONICAL_TOOL_NAMES,
 };
@@ -113,6 +115,11 @@ impl Agent {
     ///
     /// The configured instruction + model are applied to the session before
     /// execution; the tool set was fixed on the agent's executor at build time.
+    ///
+    /// NOTE: this variant **discards every [`AgentEvent`]** (tool calls, tokens,
+    /// intermediate errors) — you only get the final `Result`. To observe the
+    /// run, use [`run_stream`](Self::run_stream) instead. To cancel a blocking
+    /// run from another task, use [`run_with_cancel`](Self::run_with_cancel).
     pub async fn run(
         &self,
         session: &mut Session,
@@ -120,6 +127,19 @@ impl Agent {
     ) -> Result<(), AgentError> {
         session.add_message(Message::user(input.into()));
         self.run_session(session).await
+    }
+
+    /// Like [`run`](Self::run) but driven by a caller-owned
+    /// [`CancellationToken`]: cancelling the token from another task stops the
+    /// loop at the next check point. Events are still discarded (see `run`).
+    pub async fn run_with_cancel(
+        &self,
+        session: &mut Session,
+        input: impl Into<String>,
+        cancel_token: CancellationToken,
+    ) -> Result<(), AgentError> {
+        session.add_message(Message::user(input.into()));
+        self.run_session_with_cancel(session, cancel_token).await
     }
 
     /// Run the agent loop on `session` exactly as it stands — i.e. on a
@@ -137,8 +157,19 @@ impl Agent {
     /// agent.run_session(&mut session).await?; // no extra input appended
     /// ```
     pub async fn run_session(&self, session: &mut Session) -> Result<(), AgentError> {
+        self.run_session_with_cancel(session, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`run_session`](Self::run_session) but driven by a caller-owned
+    /// [`CancellationToken`], so a blocking run can be cancelled from another
+    /// task. Events are still discarded (see [`run`](Self::run)).
+    pub async fn run_session_with_cancel(
+        &self,
+        session: &mut Session,
+        cancel_token: CancellationToken,
+    ) -> Result<(), AgentError> {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
-        let cancel_token = CancellationToken::new();
 
         // Drain events so the bounded channel never blocks the loop.
         let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
@@ -164,11 +195,45 @@ impl Agent {
         self.run_stream_session(session)
     }
 
+    /// Like [`run_stream`](Self::run_stream), but also returns a
+    /// [`CancellationToken`] for the run: call `token.cancel()` to stop the loop
+    /// at the next check point. Dropping the receiver does NOT cancel the run, so
+    /// this is the way to interrupt a streaming agent.
+    pub fn run_stream_cancellable(
+        &self,
+        mut session: Session,
+        input: impl Into<String>,
+    ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
+        session.add_message(Message::user(input.into()));
+        self.run_stream_session_cancellable(session)
+    }
+
     /// Stream the run's [`AgentEvent`]s for a caller-provided message list,
     /// without appending a new turn (the last `User` message drives execution).
-    pub fn run_stream_session(&self, mut session: Session) -> mpsc::Receiver<AgentEvent> {
-        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
+    pub fn run_stream_session(&self, session: Session) -> mpsc::Receiver<AgentEvent> {
+        self.run_stream_session_with_cancel(session, CancellationToken::new())
+    }
+
+    /// Like [`run_stream_session`](Self::run_stream_session) but also returns the
+    /// run's [`CancellationToken`] so the caller can interrupt it.
+    pub fn run_stream_session_cancellable(
+        &self,
+        session: Session,
+    ) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
         let cancel_token = CancellationToken::new();
+        let rx = self.run_stream_session_with_cancel(session, cancel_token.clone());
+        (rx, cancel_token)
+    }
+
+    /// Stream a caller-provided message list under a caller-owned
+    /// [`CancellationToken`]. The shared entry point the other `run_stream*`
+    /// helpers funnel into.
+    pub fn run_stream_session_with_cancel(
+        &self,
+        mut session: Session,
+        cancel_token: CancellationToken,
+    ) -> mpsc::Receiver<AgentEvent> {
+        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
         let agent = self.clone();
 
         tokio::spawn(async move {
