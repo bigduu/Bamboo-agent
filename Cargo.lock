@@ -916,24 +916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bamboo-cli"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "bamboo-client-core",
- "clap",
- "colored",
- "eventsource-client",
- "futures",
- "launchdarkly-sdk-transport",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "bamboo-client-core"
 version = "0.0.0"
 dependencies = [
@@ -3276,11 +3258,9 @@ dependencies = [
  "headers",
  "http 1.4.2",
  "hyper",
- "hyper-rustls",
  "hyper-util",
  "pin-project-lite",
  "tokio",
- "tokio-rustls",
  "tower-service",
 ]
 
@@ -3294,7 +3274,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3690,7 +3669,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-http-proxy",
- "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
  "log",

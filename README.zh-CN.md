@@ -61,7 +61,7 @@ graph TD
   SRV --> INFRA
   TOOLS --> INFRA
   MEM --> INFRA
-  CLI2["bamboo-cli / bamboo-tui<br/>thin clients over HTTP"] -.-> SRV
+  CLI2["bamboo-tui<br/>thin client over HTTP"] -.-> SRV
 ```
 
 **Workspace 成员**（来自 `Cargo.toml`），按层级组织：
@@ -69,7 +69,7 @@ graph TD
 - **`crates/core/`** — `bamboo-domain`（纯领域类型）、`bamboo-agent-core`（核心抽象）
 - **`crates/infra/`** — `bamboo-config`、`bamboo-llm`、`bamboo-storage`、`bamboo-a2a`、`bamboo-infrastructure`、`bamboo-memory`、`bamboo-metrics`、`bamboo-notification`、`bamboo-skills`、`bamboo-mcp`、`bamboo-permission`、`bamboo-compression`、`bamboo-subagent`、`bamboo-analytics`（仅开发用）
 - **`crates/engine/`** — `bamboo-engine`、`bamboo-tools`
-- **`crates/app/`** — `bamboo-server`、`bamboo-server-tools`、`bamboo-sdk`、`bamboo-cli`、`bamboo-tui`、`bamboo-client-core`、`bamboo-broker`
+- **`crates/app/`** — `bamboo-server`、`bamboo-server-tools`、`bamboo-sdk`、`bamboo-tui`、`bamboo-client-core`、`bamboo-broker`
 
 …以及根二进制 `bamboo-agent`。
 

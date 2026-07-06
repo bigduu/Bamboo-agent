@@ -67,6 +67,10 @@ pub mod headless;
 /// provider + API key and self-diagnose without the web UI (server-less).
 pub mod setup_cli;
 
+/// The `bamboo skills list` / `mcp list` read CLI: inspect the configured skill
+/// and MCP surfaces offline (straight from `<data_dir>`), no running server.
+pub mod read_cli;
+
 // Server module is now a separate workspace crate
 pub use bamboo_server as server;
 

@@ -23,8 +23,10 @@ mod ui;
 #[command(about = "Terminal UI client for the Bamboo agent runtime")]
 #[command(version)]
 struct Cli {
-    /// Bamboo server URL
-    #[arg(long, default_value = "http://localhost:9562")]
+    /// Bamboo server URL. Defaults to the concrete loopback IPv4 (not
+    /// `localhost`, which resolves to `::1` first on dual-stack hosts while the
+    /// server default-binds `127.0.0.1` only → ECONNREFUSED).
+    #[arg(long, default_value = "http://127.0.0.1:9562")]
     server_url: String,
 
     /// Session ID to resume (optional)
