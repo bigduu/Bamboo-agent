@@ -1,12 +1,21 @@
+<div align="center">
+
 # Bamboo 🎋
 
-<p align="center">
-  <img src="./docs/assets/bamboo-agent-hero.svg" alt="Bamboo agent runtime overview" width="100%" />
-</p>
+<img src="./docs/assets/bamboo-agent-hero.svg" alt="Bamboo agent runtime overview" width="100%" />
 
-> 📖 For English, see **[README.md](./README.md)**
+### 本地优先的 AI agent 运行时，Rust 编写。
 
-> **Bamboo — Zenith 的本地优先 Rust 智能体运行时（执行引擎）**
+**持久记忆、22 个内置工具、skills、MCP、workflows、schedules —— 统一在一个 HTTP + SSE API 之后。**
+既能作为服务器运行，也能把同一套 agent loop 作为 Rust crate 嵌入。数据始终留在你自己机器上。
+
+[![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg?logo=rust)](https://crates.io/crates/bamboo-agent)
+[![docs.rs](https://img.shields.io/docsrs/bamboo-agent?logo=docsdotrs&label=docs.rs)](https://docs.rs/bamboo-agent)
+[![CI](https://img.shields.io/github/actions/workflow/status/bigduu/Bamboo-agent/ci.yml?branch=main&logo=github&label=CI)](https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml)
+[![License MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![English README](https://img.shields.io/badge/lang-English-blue)](./README.md)
+
+</div>
 
 ---
 
