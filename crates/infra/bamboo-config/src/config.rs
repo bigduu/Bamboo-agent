@@ -235,6 +235,19 @@ pub struct MemoryConfig {
     /// Hard cap on LLM-backed consolidations per dedup gardener run (cost ceiling).
     #[serde(default = "default_dedup_gardener_max_merges_per_run")]
     pub dedup_gardener_max_merges_per_run: usize,
+    /// Max RECALLABLE (Active/Stale) memories per scope before the capacity gardener
+    /// archives the lowest-value overflow OUT of the recall index (memory redesign
+    /// L5 — archive, never delete; reversible). 0 = unbounded (feature OFF, the
+    /// default): consequential enough to be opt-in, since L4's dedup already curbs
+    /// most growth. `Reference`/`User`/`Feedback` memories are always exempt — so
+    /// the effective floor is the count of exempt Active memories in a scope; set
+    /// this comfortably above that (a capacity below it is a no-op, not a purge).
+    #[serde(default)]
+    pub memory_active_capacity: usize,
+    /// Hard cap on how many memories the capacity gardener archives per run, so a
+    /// large overflow drains gradually instead of in one burst.
+    #[serde(default = "default_capacity_max_archivals_per_run")]
+    pub capacity_max_archivals_per_run: usize,
 }
 
 impl Default for MemoryConfig {
@@ -256,8 +269,14 @@ impl Default for MemoryConfig {
             dedup_gardener_enabled: default_true_dedup_gardener_enabled(),
             dedup_gardener_min_score: default_dedup_gardener_min_score(),
             dedup_gardener_max_merges_per_run: default_dedup_gardener_max_merges_per_run(),
+            memory_active_capacity: 0,
+            capacity_max_archivals_per_run: default_capacity_max_archivals_per_run(),
         }
     }
+}
+
+fn default_capacity_max_archivals_per_run() -> usize {
+    50
 }
 
 fn default_true_auto_dream_enabled() -> bool {
@@ -3197,6 +3216,8 @@ mod tests {
                 dedup_gardener_enabled: true,
                 dedup_gardener_min_score: 0.7,
                 dedup_gardener_max_merges_per_run: 3,
+                memory_active_capacity: 500,
+                capacity_max_archivals_per_run: 10,
             }),
             ..Config::default()
         };
@@ -3219,6 +3240,22 @@ mod tests {
         assert!(memory.dedup_gardener_enabled);
         assert_eq!(memory.dedup_gardener_min_score, 0.7);
         assert_eq!(memory.dedup_gardener_max_merges_per_run, 3);
+        assert_eq!(memory.memory_active_capacity, 500);
+        assert_eq!(memory.capacity_max_archivals_per_run, 10);
+    }
+
+    /// L5: capacity is OFF by default (0 = unbounded) — an opt-in feature.
+    #[test]
+    fn memory_active_capacity_defaults_off() {
+        assert_eq!(MemoryConfig::default().memory_active_capacity, 0);
+        assert_eq!(MemoryConfig::default().capacity_max_archivals_per_run, 50);
+        let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
+        let memory = parsed.memory.unwrap();
+        assert_eq!(memory.memory_active_capacity, 0);
+        assert_eq!(
+            memory.capacity_max_archivals_per_run, 50,
+            "omitted field takes the serde default fn"
+        );
     }
 
     /// L4: the maintenance integrators are ON by default — both via
