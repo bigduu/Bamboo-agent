@@ -57,7 +57,10 @@ impl BambooClient {
         Ok(())
     }
 
-    pub async fn respond(&self, session_id: &str, response: &str) -> Result<()> {
+    /// Submit an answer to a pending question. Returns the server's
+    /// `auto_resume_status` (`started` / `already_running` / `completed` /
+    /// `error: …`) so the caller knows whether a run is actually resuming.
+    pub async fn respond(&self, session_id: &str, response: &str) -> Result<String> {
         let resp = self
             .client
             .post(self.url(&format!("/api/v1/respond/{}", session_id)))
@@ -69,12 +72,22 @@ impl BambooClient {
         // The respond validator rejects an answer that doesn't match an option
         // (when custom input is not allowed) with a non-2xx status. Surface that
         // so the UI can keep the question open instead of silently swallowing it.
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
             anyhow::bail!("server rejected the answer ({status}): {}", body.trim());
         }
-        Ok(())
+        // Extract auto_resume_status; the run only actually resumes for
+        // `started` / `already_running`.
+        let auto_resume = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("auto_resume_status")
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        Ok(auto_resume)
     }
 
     pub async fn pending_question(&self, session_id: &str) -> Result<PendingQuestion> {

@@ -532,11 +532,19 @@ impl App {
             return Ok(());
         };
         match self.client.respond(&session_id, &answer).await {
-            Ok(()) => {
+            Ok(status) => {
                 self.pending_question = None;
-                self.status_message = format!("Answered: {answer} — resuming");
-                // The server resumes the loop; keep the spinner/streaming UI on.
-                self.chat.streaming = true;
+                // Only keep the spinner on if a run is actually running: the
+                // server returns 200 even when it did NOT resume (e.g. the
+                // session already `completed`), so a blind `streaming = true`
+                // would spin forever with no events behind it.
+                if matches!(status.as_str(), "started" | "already_running") {
+                    self.status_message = format!("Answered: {answer} — resuming");
+                    self.chat.streaming = true;
+                } else {
+                    self.status_message = format!("Answered: {answer} ({status})");
+                    self.finalize_streaming();
+                }
             }
             Err(e) => {
                 // Keep the modal open so the operator can pick a valid option.
@@ -853,6 +861,10 @@ impl App {
         self.status_message = "Ready".to_string();
         self.sse_tx = None;
         self.sse_rx = None;
+        // A run that ended (completed / cancelled / stopped) can no longer accept
+        // an answer, so drop any open question modal to avoid answering a dead
+        // session.
+        self.pending_question = None;
     }
 
     async fn stop_streaming(&mut self) -> Result<()> {
@@ -1095,5 +1107,31 @@ mod question_tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Run this command?"), "question text missing");
         assert!(text.contains("Approve"), "option label missing");
+    }
+
+    #[test]
+    fn many_options_window_keeps_selection_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let opts: Vec<String> = (1..=30).map(|n| format!("opt{n}")).collect();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_question = Some(ActiveQuestion {
+            question: "Pick one".to_string(),
+            options: opts,
+            selected: 24, // "25. opt25", deep in the list
+            custom: None,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+        // The selected option is visible even though it's far down the list, and
+        // an overflow marker indicates hidden options above.
+        assert!(text.contains("opt25"), "selected option not in the window");
+        assert!(text.contains("more"), "overflow marker missing");
     }
 }
