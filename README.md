@@ -113,6 +113,27 @@ Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill
 
 ## Quick Start & Development
 
+### First-run setup
+
+Configure a provider + API key without hand-editing JSON:
+
+```bash
+# interactive — prompts for provider, API key, and model
+bamboo init
+
+# or non-interactive (CI / scripting)
+bamboo init --non-interactive --provider anthropic --api-key "sk-ant-..."
+
+# verify the install (config present, provider keyed, server reachable)
+bamboo doctor
+
+# set/rotate a single value later
+bamboo config set providers.openai.api_key "sk-..."
+bamboo config set provider openai
+```
+
+`init` writes `~/.bamboo/config.json` (override with `--data-dir`) and stores the key **encrypted at rest**. `doctor` exits non-zero if a blocking problem is found, so it doubles as a readiness check.
+
 ### Run the server
 
 ```bash
@@ -132,7 +153,10 @@ Arguments supported by `bamboo serve` (all override the config file):
 | Command | What it does |
 |---|---|
 | `bamboo serve` | Start the HTTP/SSE server (above). |
+| `bamboo init` | First-run setup: write `config.json` with a provider + API key (interactive, or `--non-interactive` for CI). |
+| `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
 | `bamboo config [--path] [--show-secrets]` | Inspect the resolved configuration. |
+| `bamboo config set <key> <value>` | Set one value, e.g. `providers.anthropic.api_key`, `providers.<p>.model`, or `provider`. |
 | `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Optional `-s <session>` to continue, `-m provider:model` to pin the model, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
 | `bamboo actor run\|serve\|list\|call` | Drive the sub-agent actor fabric from the terminal (spawn + stream, run as a service, discover, or send a task). |
 | `bamboo broker serve` | Run the standalone sub-agent message broker (WebSocket bus over durable mailboxes). |
@@ -210,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-> **Precondition:** `with_defaults_for_data_dir` reads `~/.bamboo/config.json` (the same config `bamboo serve` uses) and needs the active provider configured with a non-empty `api_key` — otherwise provider creation returns an error (here surfaced by `.expect`). A fresh data dir with no `config.json` defaults to `anthropic` with no key and will fail; `copilot` is the only provider that authenticates keyless (cached OAuth). Set the key in the config file, or pass `.api_key("sk-…")` on the builder before `with_defaults_for_data_dir`.
+> **Precondition:** `with_defaults_for_data_dir` reads `~/.bamboo/config.json` (the same config `bamboo serve` uses) and needs the active provider configured with a non-empty `api_key` — otherwise provider creation returns an error (here surfaced by `.expect`). A fresh data dir with no `config.json` defaults to `anthropic` with no key and will fail; `copilot` is the only provider that authenticates keyless (cached OAuth). Fix it with `bamboo init` (or `bamboo config set providers.<p>.api_key …`), or pass `.api_key("sk-…")` on the builder before `with_defaults_for_data_dir`.
 
 > Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) build an `ExecuteRequest` with `ExecuteRequestBuilder` (both re-exported from `bamboo_sdk::agent`) and call `agent.execute(&mut session, req)` — the same canonical engine path `run` / `run_stream` funnel into.
 
@@ -228,7 +252,7 @@ anyhow = "1"
 
 ### Example configuration
 
-`${HOME}/.bamboo/config.json`:
+The easiest way to create this is `bamboo init` (see [First-run setup](#first-run-setup)), which writes it for you and encrypts the key. The equivalent file at `${HOME}/.bamboo/config.json`:
 
 ```json
 {

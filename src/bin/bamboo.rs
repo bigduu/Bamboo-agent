@@ -145,8 +145,52 @@ enum Commands {
         parent_pid: Option<u32>,
     },
 
-    /// Show Bamboo configuration
+    /// First-run setup: write `config.json` with a provider + API key.
+    ///
+    /// Interactive by default (prompts for anything not given as a flag). Pass
+    /// `--non-interactive` for CI/scripts (then `--provider` + `--api-key` are
+    /// required). The key is stored encrypted at rest.
+    Init {
+        /// Data directory holding config.json (defaults to ~/.bamboo).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Provider to configure: anthropic | openai | gemini. Prompted if omitted.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// API key. Prompted (visible) if omitted in interactive mode.
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Default chat model. A sensible provider default is used if omitted.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Overwrite an existing provider key without prompting.
+        #[arg(long)]
+        force: bool,
+
+        /// Never prompt; fail if a required value is missing (CI-safe).
+        #[arg(long)]
+        non_interactive: bool,
+    },
+
+    /// Diagnose the local install: config presence, provider credential, and
+    /// whether a server is reachable. Exits non-zero if a blocking problem is found.
+    Doctor {
+        /// Data directory holding config.json (defaults to ~/.bamboo).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// Show (or set) Bamboo configuration.
     Config {
+        /// Set a single config value, e.g.
+        /// `config set providers.anthropic.api_key sk-ant-...`.
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+
         /// Show config file path
         #[arg(short, long)]
         path: bool,
@@ -242,6 +286,23 @@ impl From<ConnArgs> for bamboo_agent::admin_cli::ConnArgs {
             data_dir: c.data_dir,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Set a single config value by dotted key. Supported keys:
+    ///   provider
+    ///   providers.<anthropic|openai|gemini>.api_key
+    ///   providers.<anthropic|openai|gemini>.model
+    Set {
+        /// Dotted config key, e.g. `providers.anthropic.api_key`.
+        key: String,
+        /// Value to store.
+        value: String,
+        /// Data directory holding config.json (defaults to ~/.bamboo).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -451,6 +512,8 @@ async fn main() {
         | Some(Commands::Status { .. })
         | Some(Commands::Sessions { .. })
         | Some(Commands::Stop { .. })
+        | Some(Commands::Init { .. })
+        | Some(Commands::Doctor { .. })
         | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
             // bootstrap & streaming protocol and must stay clean. (`None` is
@@ -769,8 +832,53 @@ async fn main() {
             }
         }
 
-        Commands::Config { path, show_secrets } => {
-            if path {
+        Commands::Init {
+            data_dir,
+            provider,
+            api_key,
+            model,
+            force,
+            non_interactive,
+        } => {
+            let res = bamboo_agent::setup_cli::run_init(bamboo_agent::setup_cli::InitArgs {
+                data_dir,
+                provider,
+                api_key,
+                model,
+                force,
+                non_interactive,
+            });
+            if let Err(e) = res {
+                eprintln!("init failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Doctor { data_dir } => match bamboo_agent::setup_cli::run_doctor(data_dir).await {
+            Ok(true) => {}
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("doctor failed: {e:#}");
+                std::process::exit(1);
+            }
+        },
+
+        Commands::Config {
+            action,
+            path,
+            show_secrets,
+        } => {
+            if let Some(ConfigAction::Set {
+                key,
+                value,
+                data_dir,
+            }) = action
+            {
+                if let Err(e) = bamboo_agent::setup_cli::run_config_set(&key, &value, data_dir) {
+                    eprintln!("config set failed: {e:#}");
+                    std::process::exit(1);
+                }
+            } else if path {
                 println!("{}", bamboo_config::paths::config_json_path().display());
             } else {
                 let mut config = Config::new();
