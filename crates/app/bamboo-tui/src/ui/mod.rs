@@ -31,4 +31,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.help_visible {
         layout::render_help(f);
     }
+
+    // Pending-question modal takes visual priority — it's the blocking interaction.
+    if app.pending_question.is_some() {
+        layout::render_question(f, app);
+    }
 }

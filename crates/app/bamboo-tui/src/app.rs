@@ -223,6 +223,20 @@ impl ConfigState {
     }
 }
 
+// ── Interactive question (permission gate / clarification) ──
+
+/// An agent question awaiting the operator's answer, driven by the modal.
+pub struct ActiveQuestion {
+    pub question: String,
+    /// Preset choices; empty means free-text only.
+    pub options: Vec<String>,
+    /// Highlighted option index (option-select mode).
+    pub selected: usize,
+    /// `Some(buf)` = free-text entry mode (typing into `buf`); `None` =
+    /// option-select mode. Starts `Some("")` when there are no options.
+    pub custom: Option<String>,
+}
+
 // ── Main App ──
 
 pub struct App {
@@ -239,6 +253,9 @@ pub struct App {
     pub connected: bool,
     pub help_visible: bool,
     pub spinner_tick: usize,
+    /// The agent's pending question (permission gate / clarification). When
+    /// `Some`, a modal captures the answer and keystrokes route to it.
+    pub pending_question: Option<ActiveQuestion>,
     sse_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     sse_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
 }
@@ -259,6 +276,7 @@ impl App {
             connected: false,
             help_visible: false,
             spinner_tick: 0,
+            pending_question: None,
             sse_tx: None,
             sse_rx: None,
         }
@@ -377,6 +395,12 @@ impl App {
             _ => {}
         }
 
+        // A pending agent question captures all input (Ctrl+C above still
+        // stops the run) until it is answered or dismissed.
+        if self.pending_question.is_some() {
+            return self.handle_question_key(key).await;
+        }
+
         if let KeyCode::Char(c) = key.code {
             if let Some(digit) = c.to_digit(10) {
                 if (1..=6).contains(&digit)
@@ -401,6 +425,122 @@ impl App {
             }
             _ => {
                 self.handle_tab_key(key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive the pending-question modal. Returns an answer to submit (if the
+    /// keystroke commits one) without holding a borrow across the async submit.
+    async fn handle_question_key(&mut self, key: KeyEvent) -> Result<()> {
+        enum QAction {
+            None,
+            Dismiss,
+            Submit(String),
+        }
+
+        let action = {
+            let Some(q) = self.pending_question.as_mut() else {
+                return Ok(());
+            };
+            if let Some(buf) = q.custom.as_mut() {
+                // Free-text entry mode.
+                match key.code {
+                    KeyCode::Enter => {
+                        let answer = buf.trim().to_string();
+                        if answer.is_empty() {
+                            QAction::None
+                        } else {
+                            QAction::Submit(answer)
+                        }
+                    }
+                    KeyCode::Esc => {
+                        // Back to option-select if there were options, else dismiss.
+                        if q.options.is_empty() {
+                            QAction::Dismiss
+                        } else {
+                            q.custom = None;
+                            QAction::None
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                        QAction::None
+                    }
+                    KeyCode::Char(c) => {
+                        buf.push(c);
+                        QAction::None
+                    }
+                    _ => QAction::None,
+                }
+            } else {
+                // Option-select mode.
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        q.selected = q.selected.saturating_sub(1);
+                        QAction::None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if q.selected + 1 < q.options.len() {
+                            q.selected += 1;
+                        }
+                        QAction::None
+                    }
+                    KeyCode::Char('c') => {
+                        // Switch to free-text entry (for allow-custom questions).
+                        q.custom = Some(String::new());
+                        QAction::None
+                    }
+                    KeyCode::Enter => q
+                        .options
+                        .get(q.selected)
+                        .cloned()
+                        .map(QAction::Submit)
+                        .unwrap_or(QAction::None),
+                    KeyCode::Char(d) if ('1'..='9').contains(&d) => {
+                        let idx = d as usize - '1' as usize;
+                        q.options
+                            .get(idx)
+                            .cloned()
+                            .map(QAction::Submit)
+                            .unwrap_or(QAction::None)
+                    }
+                    KeyCode::Esc => QAction::Dismiss,
+                    _ => QAction::None,
+                }
+            }
+        };
+
+        match action {
+            QAction::Submit(answer) => self.submit_answer(answer).await?,
+            QAction::Dismiss => {
+                self.pending_question = None;
+                self.status_message =
+                    "Question dismissed (still pending on the server — Ctrl+C stops the run)"
+                        .to_string();
+            }
+            QAction::None => {}
+        }
+        Ok(())
+    }
+
+    /// Submit an answer to the agent's pending question and resume the run.
+    async fn submit_answer(&mut self, answer: String) -> Result<()> {
+        let Some(session_id) = self.chat.session_id.clone() else {
+            self.status_message = "No active chat session to answer".to_string();
+            self.pending_question = None;
+            return Ok(());
+        };
+        match self.client.respond(&session_id, &answer).await {
+            Ok(()) => {
+                self.pending_question = None;
+                self.status_message = format!("Answered: {answer} — resuming");
+                // The server resumes the loop; keep the spinner/streaming UI on.
+                self.chat.streaming = true;
+            }
+            Err(e) => {
+                // Keep the modal open so the operator can pick a valid option.
+                self.status_message = format!("Answer rejected: {e}");
             }
         }
         Ok(())
@@ -637,11 +777,20 @@ impl App {
             AgentEvent::NeedClarification {
                 question, options, ..
             } => {
-                self.status_message = format!("Question: {}", question);
-                if let Some(opts) = options {
-                    self.status_message
-                        .push_str(&format!(" [{}]", opts.join(", ")));
-                }
+                let options = options.unwrap_or_default();
+                // No preset options ⇒ open straight into free-text entry.
+                let custom = if options.is_empty() {
+                    Some(String::new())
+                } else {
+                    None
+                };
+                self.status_message = format!("Question: {} (answer in the dialog)", question);
+                self.pending_question = Some(ActiveQuestion {
+                    question,
+                    options,
+                    selected: 0,
+                    custom,
+                });
             }
             AgentEvent::Complete { usage } => {
                 self.finalize_streaming();
@@ -842,5 +991,109 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn app_with_question(options: Vec<&str>) -> App {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let options: Vec<String> = options.into_iter().map(String::from).collect();
+        let custom = if options.is_empty() {
+            Some(String::new())
+        } else {
+            None
+        };
+        app.pending_question = Some(ActiveQuestion {
+            question: "Run this command?".to_string(),
+            options,
+            selected: 0,
+            custom,
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn option_navigation_and_custom_toggle() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+
+        // Down moves the selection, clamped; Up moves back, clamped at 0.
+        app.handle_question_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.pending_question.as_ref().unwrap().selected, 1);
+        app.handle_question_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.pending_question.as_ref().unwrap().selected, 1); // clamped
+        app.handle_question_key(key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.pending_question.as_ref().unwrap().selected, 0);
+
+        // `c` switches to free-text; typing fills the buffer; Esc returns to options.
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        assert!(app.pending_question.as_ref().unwrap().custom.is_some());
+        app.handle_question_key(key(KeyCode::Char('h')))
+            .await
+            .unwrap();
+        app.handle_question_key(key(KeyCode::Char('i')))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().custom.as_deref(),
+            Some("hi")
+        );
+        app.handle_question_key(key(KeyCode::Backspace))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().custom.as_deref(),
+            Some("h")
+        );
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_question.as_ref().unwrap().custom.is_none());
+    }
+
+    #[tokio::test]
+    async fn esc_in_option_mode_dismisses() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_question.is_none());
+    }
+
+    #[tokio::test]
+    async fn submitting_without_a_session_clears_the_question() {
+        // No chat session ⇒ submit short-circuits (no network) and clears the modal.
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        assert!(app.chat.session_id.is_none());
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.pending_question.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_options_opens_in_free_text_mode() {
+        let app = app_with_question(vec![]);
+        assert!(app.pending_question.as_ref().unwrap().custom.is_some());
+    }
+
+    #[test]
+    fn question_modal_renders_without_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = app_with_question(vec!["Approve", "Deny"]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+
+        // The rendered buffer should contain the question and an option label.
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Run this command?"), "question text missing");
+        assert!(text.contains("Approve"), "option label missing");
     }
 }

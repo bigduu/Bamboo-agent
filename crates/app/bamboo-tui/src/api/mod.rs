@@ -58,13 +58,22 @@ impl BambooClient {
     }
 
     pub async fn respond(&self, session_id: &str, response: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(self.url(&format!("/api/v1/respond/{}", session_id)))
             .json(&RespondRequest {
                 response: response.to_string(),
             })
             .send()
             .await?;
+        // The respond validator rejects an answer that doesn't match an option
+        // (when custom input is not allowed) with a non-2xx status. Surface that
+        // so the UI can keep the question open instead of silently swallowing it.
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("server rejected the answer ({status}): {}", body.trim());
+        }
         Ok(())
     }
 
