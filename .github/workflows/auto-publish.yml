@@ -64,7 +64,7 @@ jobs:
           git push origin "v$VERSION"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.check-version.outputs.new_version }}
           name: Release v${{ needs.check-version.outputs.new_version }}
