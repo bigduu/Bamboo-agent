@@ -48,7 +48,7 @@ actix-files = "0.6"
 # gives a non-actor WS upgrade (`actix_ws::handle`) returning an owned
 # `Session` + `MessageStream` we drive from a spawned task. 0.3 targets the
 # resolved actix-web 4 / actix-http 3 line.
-actix-ws = "0.3"
+actix-ws = "0.4"
 
 # v2 TLS termination (#181): load PEM cert/key and build a rustls ServerConfig.
 # Pin the `ring` crypto provider explicitly so the builder never relies on a
@@ -80,7 +80,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-cron = "0.15"
+cron = "0.17"
 regex = "1"
 futures = "0.3"
 thiserror = "1"
@@ -106,7 +106,7 @@ actix-governor = "0.10.0"
 tempfile = "3"
 wiremock = "0.6"
 tokio-test = "0.4"
-mockall = "0.13"
+mockall = "0.15"
 http = "1"
 actix-rt = "2"
 # v2-P1 (#187): live WS integration harness for `GET /v2/stream`. `awc` is
