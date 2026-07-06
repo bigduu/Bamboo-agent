@@ -1881,6 +1881,14 @@ impl MemoryStore {
         {
             return Ok(WriteSimilarity::Merge(Box::new(exact.clone())));
         }
+        // Exact whole-body duplicate: the same content recorded VERBATIM under a
+        // different title is an unambiguous dup regardless of similarity score.
+        // Merge into it (idempotent — the append path is a no-op when the body
+        // already holds the content), so verbatim re-writes never accumulate. This
+        // is precision-safe: only a full-body equality, not a substring, matches.
+        if let Some(dup) = docs.iter().find(|doc| doc.body.trim() == content) {
+            return Ok(WriteSimilarity::Merge(Box::new(dup.clone())));
+        }
         if docs.is_empty() {
             return Ok(WriteSimilarity::None);
         }
@@ -3241,6 +3249,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(docs.len(), 2, "unrelated writes stay separate");
+    }
+
+    /// L2 precision: the SAME content recorded verbatim under a very different
+    /// title is an unambiguous dup — it merges (idempotently) rather than
+    /// accumulating a second copy, even though the titles score far apart.
+    #[tokio::test]
+    async fn write_memory_dedups_exact_body_under_a_different_title() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let body = "The staging cluster autoscaler caps at 12 nodes during business hours.";
+
+        let original = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Staging autoscaler node cap",
+                body,
+                &[],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let again = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Totally unrelated sounding title about capacity limits somewhere",
+                body,
+                &[],
+                Some("session-2"),
+                "main-model",
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            again.frontmatter.id, original.frontmatter.id,
+            "verbatim duplicate content should merge idempotently"
+        );
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, Some("proj-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            docs.len(),
+            1,
+            "verbatim dup must not create a second memory"
+        );
+        // Idempotent: the body wasn't doubled.
+        assert_eq!(docs[0].body.matches(body).count(), 1);
     }
 
     /// Many `MemoryStore` instances pointed at the SAME data dir (the real
