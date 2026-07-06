@@ -1135,7 +1135,10 @@ fn envelope_ir_flatten_orders_runs_canonically() {
         title: "Tasks".to_string(),
         items: vec![TaskItem {
             id: "t1".to_string(),
-            description: "do it".to_string(),
+            // A distinctive marker: a plain phrase like "do it" collides with the
+            // system directives (which contain the substring "do it"), so
+            // `pos("do it")` would match the leading System run, not this tail.
+            description: "VOLATILE_TAIL_TASK".to_string(),
             status: TaskItemStatus::InProgress,
             ..TaskItem::default()
         }],
@@ -1187,7 +1190,7 @@ fn envelope_ir_flatten_orders_runs_canonically() {
     let guide = pos("NOVA_GUIDANCE_MARKER").expect("relocated tool guide present");
     let remainder = pos("PERSISTED OPERATOR NOTE").expect("system remainder present");
     let conversation = pos("u1").expect("conversation present");
-    let volatile = pos("do it").expect("task volatile tail present");
+    let volatile = pos("VOLATILE_TAIL_TASK").expect("task volatile tail present");
     assert!(
         0 < guide && guide < remainder,
         "stable prefix (guide) before the system remainder"
