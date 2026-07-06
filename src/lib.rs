@@ -63,6 +63,10 @@ pub mod admin_cli;
 /// The `bamboo -p` headless server mode: full AppState, one-shot, resumable.
 pub mod headless;
 
+/// The `bamboo init` / `doctor` / `config set` onboarding CLI: configure a
+/// provider + API key and self-diagnose without the web UI (server-less).
+pub mod setup_cli;
+
 // Server module is now a separate workspace crate
 pub use bamboo_server as server;
 

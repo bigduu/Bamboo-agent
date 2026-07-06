@@ -1400,7 +1400,7 @@ impl Config {
     /// not clobber the live cache). #40.
     ///
     /// * `data_dir` - Optional data directory path. If None, uses default (`BAMBOO_DATA_DIR` or `${HOME}/.bamboo`)
-    fn from_data_dir_impl(data_dir: Option<PathBuf>, publish: bool) -> Self {
+    fn from_data_dir_impl(data_dir: Option<PathBuf>, publish: bool, apply_env: bool) -> Self {
         // Determine data_dir early (needed to find config file)
         let data_dir = data_dir
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
@@ -1459,46 +1459,11 @@ impl Config {
         // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
         config.extra.remove("data_dir");
 
-        // Apply environment variable overrides (highest priority)
-        if let Ok(port) = std::env::var("BAMBOO_PORT") {
-            if let Ok(port) = port.parse() {
-                config.server.port = port;
-            }
-        }
-
-        if let Ok(bind) = std::env::var("BAMBOO_BIND") {
-            config.server.bind = bind;
-        }
-
-        // Note: BAMBOO_DATA_DIR already handled above
-        if let Ok(provider) = std::env::var("BAMBOO_PROVIDER") {
-            config.provider = provider;
-        }
-
-        if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
-            config.headless_auth = parse_bool_env(&headless);
-        }
-
-        if let Ok(project_prompt_injection) =
-            std::env::var("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION")
-        {
-            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
-            memory.project_prompt_injection = parse_bool_env(&project_prompt_injection);
-        }
-
-        if let Ok(relevant_recall) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL") {
-            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
-            memory.relevant_recall = parse_bool_env(&relevant_recall);
-        }
-
-        if let Ok(relevant_recall_rerank) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL_RERANK") {
-            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
-            memory.relevant_recall_rerank = parse_bool_env(&relevant_recall_rerank);
-        }
-
-        if let Ok(project_first_dream) = std::env::var("BAMBOO_MEMORY_PROJECT_FIRST_DREAM") {
-            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
-            memory.project_first_dream = parse_bool_env(&project_first_dream);
+        // Apply environment variable overrides (highest priority). Skipped by
+        // one-shot CLI writers (`bamboo init` / `config set`) so transient
+        // `BAMBOO_*` values are never baked into the persisted config.json.
+        if apply_env {
+            config.apply_env_overrides();
         }
 
         // Publish env vars to the global cache so Bash tools can inject them —
@@ -1511,20 +1476,76 @@ impl Config {
         config
     }
 
+    /// Apply `BAMBOO_*` environment overrides (highest priority) onto a loaded
+    /// config. Factored out so one-shot writers can skip it (see
+    /// [`Config::from_data_dir_without_env`]).
+    fn apply_env_overrides(&mut self) {
+        if let Ok(port) = std::env::var("BAMBOO_PORT") {
+            if let Ok(port) = port.parse() {
+                self.server.port = port;
+            }
+        }
+
+        if let Ok(bind) = std::env::var("BAMBOO_BIND") {
+            self.server.bind = bind;
+        }
+
+        // Note: BAMBOO_DATA_DIR already handled by the caller.
+        if let Ok(provider) = std::env::var("BAMBOO_PROVIDER") {
+            self.provider = provider;
+        }
+
+        if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
+            self.headless_auth = parse_bool_env(&headless);
+        }
+
+        if let Ok(project_prompt_injection) =
+            std::env::var("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION")
+        {
+            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
+            memory.project_prompt_injection = parse_bool_env(&project_prompt_injection);
+        }
+
+        if let Ok(relevant_recall) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL") {
+            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
+            memory.relevant_recall = parse_bool_env(&relevant_recall);
+        }
+
+        if let Ok(relevant_recall_rerank) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL_RERANK") {
+            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
+            memory.relevant_recall_rerank = parse_bool_env(&relevant_recall_rerank);
+        }
+
+        if let Ok(project_first_dream) = std::env::var("BAMBOO_MEMORY_PROJECT_FIRST_DREAM") {
+            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
+            memory.project_first_dream = parse_bool_env(&project_first_dream);
+        }
+    }
+
     /// Load config from disk AND publish its env vars to the process-global cache
     /// (so Bash tools inject them). For the context that OWNS that cache — the
     /// server bootstrap. Library / secondary readers that only need to read a
     /// value must use [`Config::from_data_dir_without_publish`] instead, or they
     /// will clobber the server's live cache with stale disk data (#38 / #40).
     pub fn from_data_dir(data_dir: Option<PathBuf>) -> Self {
-        Self::from_data_dir_impl(data_dir, true)
+        Self::from_data_dir_impl(data_dir, true, true)
     }
 
     /// Load config from disk WITHOUT publishing env vars to the global cache.
     /// For non-owning readers (e.g. permission storage) that just need a config
     /// value and must not clobber the live env-var cache. #40.
     pub fn from_data_dir_without_publish(data_dir: Option<PathBuf>) -> Self {
-        Self::from_data_dir_impl(data_dir, false)
+        Self::from_data_dir_impl(data_dir, false, true)
+    }
+
+    /// Load config from disk WITHOUT applying `BAMBOO_*` env-var overrides and
+    /// WITHOUT publishing to the global cache. For one-shot CLI writers
+    /// (`bamboo init` / `config set`) that immediately re-save: applying env
+    /// overrides here would bake transient values (port/bind/provider/memory
+    /// flags) permanently into config.json. Same corruption-recovery + default
+    /// fallback as the normal load.
+    pub fn from_data_dir_without_env(data_dir: Option<PathBuf>) -> Self {
+        Self::from_data_dir_impl(data_dir, false, false)
     }
 
     /// Deserialize config JSON and run the in-memory hydration + normalization
