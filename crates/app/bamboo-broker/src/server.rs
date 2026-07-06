@@ -189,7 +189,7 @@ async fn read_client_frame(source: &mut SplitStream<Ws>) -> BrokerResult<Option<
 }
 
 async fn send(sink: &mut SplitSink<Ws, Message>, frame: BrokerFrame) -> BrokerResult<()> {
-    sink.send(Message::Text(frame.to_text()))
+    sink.send(Message::text(frame.to_text()))
         .await
         .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
 }

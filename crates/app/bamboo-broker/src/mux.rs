@@ -169,7 +169,7 @@ impl MultiplexedClient {
         };
         {
             let mut sink = self.sink.lock().await;
-            sink.send(Message::Text(frame.to_text()))
+            sink.send(Message::text(frame.to_text()))
                 .await
                 .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))?;
         }
@@ -192,7 +192,7 @@ impl MultiplexedClient {
             correlation_id: correlation_id.clone(),
         };
         let mut sink = self.sink.lock().await;
-        sink.send(Message::Text(frame.to_text()))
+        sink.send(Message::text(frame.to_text()))
             .await
             .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
     }
