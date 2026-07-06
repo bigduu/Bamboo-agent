@@ -106,7 +106,7 @@ actix-governor = "0.10.0"
 tempfile = "3"
 wiremock = "0.6"
 tokio-test = "0.4"
-mockall = "0.13"
+mockall = "0.15"
 http = "1"
 actix-rt = "2"
 # v2-P1 (#187): live WS integration harness for `GET /v2/stream`. `awc` is
