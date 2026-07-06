@@ -407,7 +407,7 @@ fn build_prompt_fingerprint(
     hasher.update(workspace.unwrap_or_default().as_bytes());
     hasher.update([0u8]);
     hasher.update(env_context.unwrap_or_default().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn build_enhanced_system_prompt_with_profile(
