@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 anyhow = "1"
 tracing = "0.1"
 regex = "1"
-dirs = "5"
+dirs = "6"
 aes-gcm = "0.10"
 rand = "0.10"
 sha2 = "0.11"
