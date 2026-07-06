@@ -164,8 +164,8 @@ pub struct HeadlessArgs {
     /// envelope. Nothing else is written to stdout (logs go to stderr), so
     /// the stream is pipe-safe.
     pub stream_json: bool,
-    /// Per-run reasoning effort override (`low`/`medium`/`high`/`xhigh`). `None`
-    /// keeps the active provider/config default.
+    /// Per-run reasoning effort override (`low`/`medium`/`high`/`xhigh`/`max`).
+    /// `None` keeps the active provider/config default.
     pub reasoning_effort: Option<String>,
     /// Per-run skill mode (e.g. `code`, `ask`). `None` keeps the session/config
     /// default. Threads into `ExecuteRequest.skill_mode`.
@@ -266,12 +266,23 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         Some(raw) => Some(
             bamboo_domain::reasoning::ReasoningEffort::parse(raw).ok_or_else(|| {
                 format!(
-                    "invalid --reasoning-effort '{raw}' (expected: low | medium | high | xhigh)"
+                    "invalid --reasoning-effort '{raw}' (expected: low | medium | high | xhigh | max)"
                 )
             })?,
         ),
         None => None,
     };
+
+    // Validate the optional skill mode at the CLI boundary rather than letting the
+    // skill store silently drop a malformed value downstream.
+    if let Some(mode) = args.skill_mode.as_deref() {
+        let ok = !mode.is_empty() && mode.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !ok {
+            return Err(format!(
+                "invalid --skill-mode '{mode}' (expected non-empty [A-Za-z0-9-], e.g. `code` or `ask`)"
+            ));
+        }
+    }
 
     if args.stream_json {
         println!(

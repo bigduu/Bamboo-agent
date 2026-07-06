@@ -58,7 +58,7 @@ struct Cli {
     permission_mode: Option<String>,
 
     /// With -p: reasoning effort override for this run. One of:
-    /// low | medium | high | xhigh. Defaults to the active provider/config value.
+    /// low | medium | high | xhigh | max. Defaults to the active provider/config value.
     #[arg(long = "reasoning-effort")]
     reasoning_effort: Option<String>,
 
@@ -509,10 +509,22 @@ async fn main() {
 
     // `--log-level` seeds `RUST_LOG` (only when unset) so every logging path —
     // the fmt subscribers below AND `serve`'s file logging — honors it uniformly.
-    // An explicit `RUST_LOG` still wins.
+    // An explicit `RUST_LOG` still wins. Validated to a plain level here (use
+    // `RUST_LOG` directly for target-scoped directives).
     if let Some(level) = cli.log_level.as_deref() {
+        const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+        if !LEVELS.contains(&level.to_ascii_lowercase().as_str()) {
+            eprintln!(
+                "invalid --log-level '{level}' (expected: {})",
+                LEVELS.join(" | ")
+            );
+            std::process::exit(2);
+        }
         if std::env::var_os("RUST_LOG").is_none() {
-            // SAFETY: main thread, before any async runtime work or logging init.
+            // SAFETY: consistent with the other env seeding in this file. We run
+            // before any logging subscriber is installed and while the tokio
+            // worker threads (already spawned by `#[tokio::main]`) are parked and
+            // read no env, so this write races nothing in practice.
             unsafe {
                 std::env::set_var("RUST_LOG", level);
             }
