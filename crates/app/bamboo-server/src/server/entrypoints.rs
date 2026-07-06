@@ -10,7 +10,7 @@ use tracing::{error, info};
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
-use crate::config::{build_cors, build_rate_limiter, build_security_headers};
+use crate::config::{build_cors, build_rate_limiter, build_security_headers, is_loopback_bind};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use crate::services::frontend_package::{
     ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
@@ -293,6 +293,9 @@ pub async fn run_with_bind_and_static_tls(
     // once and shared (Clone) across workers; `Governor` is the outermost wrap so
     // a throttled request is rejected with 429 before any handler work.
     let rate_limiter = build_rate_limiter();
+    // Loopback/desktop binds skip the limiter (see is_loopback_bind): the local
+    // frontend bursts ~45 asset requests on load. Network binds stay throttled.
+    let apply_rate_limit = !is_loopback_bind(bind);
     let bind_for_cors = bind.to_string();
     let app_factory = move || {
         let mut app = App::new()
@@ -301,7 +304,10 @@ pub async fn run_with_bind_and_static_tls(
             .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024)) // 25MB JSON limit
             .app_data(web::PayloadConfig::new(30 * 1024 * 1024)) // 30MB payload limit
             .app_data(app_state.clone())
-            .wrap(Governor::new(&rate_limiter))
+            .wrap(actix_web::middleware::Condition::new(
+                apply_rate_limit,
+                Governor::new(&rate_limiter),
+            ))
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
             // Immutable long-cache for hashed `/assets/*` (Docker / `serve -s`

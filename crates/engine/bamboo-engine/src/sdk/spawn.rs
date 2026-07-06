@@ -311,8 +311,6 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             }
         };
 
-        finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
-
         // Merge any queued injected messages that the pipeline didn't pick up
         // (e.g. if the loop exited before the next turn boundary).
         crate::runtime::runner::state_bridge::merge_pending_injected_messages(
@@ -330,6 +328,14 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             session.clear_last_run_error();
         }
         let _ = agent.persistence().save_runtime_session(&mut session).await;
+        // Flip the runner registry to a terminal status (which makes session
+        // summaries report `is_running: false`) ONLY AFTER the final
+        // `last_run_status` is persisted above. Doing it earlier opens a window
+        // where the summary reports `{is_running: false, last_run_status: null}`,
+        // which the frontend's optimistic-race window reads as "still settling",
+        // leaving a phantom "thinking" indicator for a few seconds after the
+        // reply has already completed (notably on a session's first turn).
+        finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
         sessions_cache.insert(
             session_id_clone.clone(),
             Arc::new(parking_lot::RwLock::new(session)),

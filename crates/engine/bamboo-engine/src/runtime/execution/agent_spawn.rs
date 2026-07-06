@@ -381,13 +381,49 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 let _ = mpsc_tx.send(error_event).await;
             }
 
-            // Update runner status.
-            finalize_runner(&runners, &session_id, &result).await;
+            // Record the terminal run status on the session BEFORE persisting so
+            // the session summary reports a real `last_run_status`. Top-level
+            // sessions otherwise never set it, so summaries show
+            // `last_run_status: null`; the frontend then cannot confirm the run
+            // finished and falls back on a ~5s optimistic-settle window, leaving
+            // a phantom "thinking" indicator after the reply is already done
+            // (notably on a session's first turn). Same Ok/cancelled/error
+            // mapping `status_from_execution_result` applies to the runner.
+            //
+            // A suspended run also returns `Ok(())` but is NOT terminal: it
+            // stamped `runtime.suspend_reason` (awaiting_clarification /
+            // waiting_for_children / waiting_for_bash / awaiting_parent_approval)
+            // and will resume later (which removes the reason — see respond.rs /
+            // child_completion_coordinator). Mark it "suspended" rather than
+            // "completed" so a session waiting on the user or on children isn't
+            // reported as finished (mirrors the child path in `sdk::spawn`).
+            let suspended_non_terminal = result.is_ok()
+                && session
+                    .metadata
+                    .get("runtime.suspend_reason")
+                    .is_some_and(|reason| !reason.trim().is_empty());
+            match &result {
+                Ok(()) if suspended_non_terminal => {
+                    session.set_last_run_status("suspended");
+                    session.clear_last_run_error();
+                }
+                Ok(()) => {
+                    session.set_last_run_status("completed");
+                    session.clear_last_run_error();
+                }
+                Err(error) if error.is_cancelled() => {
+                    session.set_last_run_status("cancelled");
+                    session.set_last_run_error(error.to_string());
+                }
+                Err(error) => {
+                    session.set_last_run_status("error");
+                    session.set_last_run_error(error.to_string());
+                }
+            }
 
             // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs
-            // here — after the runner is finalized but before persistence — so
-            // any closing message the hook appends is saved with the session
-            // below.
+            // here — before persistence — so any closing message the hook
+            // appends is saved with the session below.
             if let Some(on_complete) = on_complete {
                 on_complete(SessionExecutionOutcome::from_result(&result), &mut session).await;
             }
@@ -398,6 +434,13 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             if let Err(error) = agent.persistence().save_runtime_session(&mut session).await {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
+
+            // Flip the runner registry to a terminal status (which makes session
+            // summaries report `is_running: false`) ONLY AFTER the run status is
+            // persisted above, so `is_running` and `last_run_status` become
+            // visible together and the frontend settles immediately instead of
+            // lingering in its optimistic-settle window.
+            finalize_runner(&runners, &session_id, &result).await;
 
             // Update memory cache.
             sessions_cache.insert(

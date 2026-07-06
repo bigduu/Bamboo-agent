@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Tab};
@@ -181,6 +181,78 @@ pub fn render_help(f: &mut Frame) {
             .border_style(Style::default().fg(colors::BRAND)),
     );
     f.render_widget(help, area);
+}
+
+/// Modal for an agent question (permission gate / clarification): the operator
+/// selects an option or types a free-text answer. Rendered over everything when
+/// `app.pending_question` is set.
+pub fn render_question(f: &mut Frame, app: &App) {
+    let Some(q) = &app.pending_question else {
+        return;
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " Agent needs your input",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+    for l in q.question.lines() {
+        lines.push(Line::raw(format!("  {l}")));
+    }
+    lines.push(Line::raw(""));
+
+    match &q.custom {
+        Some(buf) => {
+            lines.push(Line::raw("  Type your answer:"));
+            lines.push(Line::from(Span::styled(
+                format!("  > {buf}\u{258f}"),
+                Style::default().fg(colors::BRAND),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(if q.options.is_empty() {
+                "  Enter answer  ·  Esc dismiss"
+            } else {
+                "  Enter answer  ·  Esc back to options"
+            }));
+        }
+        None => {
+            for (i, opt) in q.options.iter().enumerate() {
+                let selected = i == q.selected;
+                let marker = if selected { "\u{203a}" } else { " " };
+                let style = if selected {
+                    Style::default()
+                        .fg(colors::BRAND)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {marker} {}. {opt}", i + 1),
+                    style,
+                )));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(
+                "  \u{2191}/\u{2193} select  ·  Enter answer  ·  1-9 quick  ·  c custom  ·  Esc dismiss",
+            ));
+        }
+    }
+
+    let height = (lines.len() as u16 + 2).min(f.area().height);
+    let area = centered_rect(60, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::BRAND))
+        .title(" Question ");
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
 }
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
