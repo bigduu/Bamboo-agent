@@ -23,10 +23,6 @@ updates:
       # a security-update attempt can only fail forever. bamboo's only RSA use is
       # operator-initiated SSH deploy (low exposure). Kept ignored in CI audit too.
       - dependency-name: "rsa"
-      # RUSTSEC-2026-0002 (lru, IterMut / Stacked Borrows — low-risk, TUI-only path):
-      # the fix (lru >= 0.16.3) is blocked on tui-textarea shipping ratatui 0.30.
-      # Tracked in issue #14; bump lru + ratatui together once unblocked.
-      - dependency-name: "lru"
 
   # ---- GitHub Actions used in the workflows ----
   - package-ecosystem: "github-actions"
