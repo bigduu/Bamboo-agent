@@ -35,7 +35,7 @@ base64 = "0.22"
 parking_lot = "0.12"
 url = "2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-toml = "0.8"
+toml = "1.1"
 dirs = "5"
 colored = "2"
 
