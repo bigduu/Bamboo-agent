@@ -75,6 +75,16 @@ pub fn build_rate_limiter() -> GovernorConfig<PeerIpKeyExtractor, NoOpMiddleware
     rate_limiter_config(per_second, burst)
 }
 
+/// True when `bind` is a loopback/desktop address, for which the per-IP DoS
+/// rate limiter ([`build_rate_limiter`], #13) is intentionally SKIPPED. The
+/// desktop sidecar serves the local frontend, which legitimately bursts ~45
+/// hashed `/assets/*` requests on load and would otherwise trip the 429 limit
+/// (`burst` default 20). Mirrors the loopback special-casing already used for
+/// CORS; network binds (`0.0.0.0`) are still throttled.
+pub fn is_loopback_bind(bind: &str) -> bool {
+    matches!(bind, "127.0.0.1" | "localhost" | "::1")
+}
+
 // Keep the default CSP reasonably strict while remaining compatible with the Lotus UI runtime.
 // Lotus + Ant Design inject runtime styles, so `style-src 'unsafe-inline'` is required for the
 // current frontend bundle. Keep scripts strict (no `unsafe-eval`) and allow operators to override
@@ -585,6 +595,18 @@ mod tests {
         // valid (no panic).
         let _ = rate_limiter_config(0, 0);
         let _ = rate_limiter_config(1000, 1);
+    }
+
+    #[test]
+    fn loopback_binds_skip_rate_limiter() {
+        // Desktop sidecar binds must be exempt (frontend bursts asset requests);
+        // network-exposed binds must stay throttled.
+        for b in ["127.0.0.1", "localhost", "::1"] {
+            assert!(is_loopback_bind(b), "{b} should be loopback (limiter skipped)");
+        }
+        for b in ["0.0.0.0", "192.168.1.10", "::"] {
+            assert!(!is_loopback_bind(b), "{b} should be throttled");
+        }
     }
 
     #[actix_web::test]

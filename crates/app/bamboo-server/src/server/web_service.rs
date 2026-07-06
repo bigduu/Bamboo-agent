@@ -8,7 +8,7 @@ use tracing::{error, info};
 use super::listeners::DEFAULT_WORKER_COUNT;
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
-use crate::config::{build_cors, build_rate_limiter, build_security_headers};
+use crate::config::{build_cors, build_rate_limiter, build_security_headers, is_loopback_bind};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use actix_governor::Governor;
 use bamboo_config::TlsConfig;
@@ -173,8 +173,12 @@ impl WebService {
         );
         // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
         self.app_state = Some(app_state.clone());
-        // Per-IP rate limiter for this network-exposed production server. #13
+        // Per-IP rate limiter for the network-exposed production server (#13).
+        // SKIPPED for loopback/desktop binds: the local frontend legitimately
+        // bursts ~45 hashed `/assets/*` requests on load and would otherwise be
+        // throttled to a 429 (chunk import fails / "Too many requests").
         let rate_limiter = build_rate_limiter();
+        let apply_rate_limit = !is_loopback_bind(bind);
         let bind_addr = bind.to_string();
         let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
@@ -184,7 +188,10 @@ impl WebService {
                 .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024))
                 .app_data(web::PayloadConfig::new(30 * 1024 * 1024))
                 .app_data(app_state.clone())
-                .wrap(Governor::new(&rate_limiter))
+                .wrap(actix_web::middleware::Condition::new(
+                    apply_rate_limit,
+                    Governor::new(&rate_limiter),
+                ))
                 .wrap(build_cors(&bind_addr, port))
                 .wrap(build_security_headers())
                 // Immutable long-cache for hashed `/assets/*` so a proxy/CDN
