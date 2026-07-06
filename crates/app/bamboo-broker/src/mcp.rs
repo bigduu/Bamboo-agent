@@ -1108,10 +1108,16 @@ mod tests {
             h.await.unwrap();
         }
         let elapsed = start.elapsed();
+        // Serial execution is unavoidably >= 4 * 200ms = 800ms, so any bound safely
+        // below 800ms proves the calls overlapped. Use 700ms (not a tight 500ms):
+        // overlapping calls take ~200ms + proxy/bus + scheduling overhead, which a
+        // loaded CI runner can push past 500ms — the gap to the 800ms serial floor
+        // is what matters, not a tight absolute time. Keeps the overlap assertion
+        // meaningful while removing the timing flake.
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_millis(700),
             "4 concurrent 200ms proxy calls must OVERLAP at the orchestrator \
-             (serial would be ~800ms); took {elapsed:?}"
+             (serial would be >= 800ms); took {elapsed:?}"
         );
     }
 
