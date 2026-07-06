@@ -89,7 +89,7 @@ parking_lot = "0.12"
 dashmap = "6"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 reqwest-middleware = { version = "0.4", features = ["json"] }
-reqwest-retry = "0.7"
+reqwest-retry = "0.9"
 reqwest-eventsource = "0.6"
 walkdir = "2"
 globset = "0.4"
