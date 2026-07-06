@@ -1,0 +1,128 @@
+name: Claude Code Review
+
+# ── How this works ──────────────────────────────────────────────────────────
+# Two review modes, gated by `github.event.action`:
+#   1. opus + deep prompt    on `opened` and `ready_for_review` (first review)
+#   2. sonnet + diff-aware   on `synchronize` and `reopened` (follow-up)
+#
+# Shared config rationale (applies to both steps):
+#   * claude_args: '--model … --allowedTools "Bash(gh pr comment:*),…"'
+#       Every Bash command the agent runs is gated by Claude Code's "ask
+#       before mutating" rule; in this non-interactive CI any command NOT in
+#       the allowlist is auto-denied, and the agent gives up without posting
+#       (the "silent-success-no-comment" failure). So the allowlist must cover
+#       EVERY command the prompt asks for, not just the final `gh pr comment`:
+#         - `gh pr comment`  — post the review (both steps)
+#         - `gh pr view` / `gh pr diff` — read PR metadata + the diff. The
+#             initial prompt no longer receives the diff pre-injected and the
+#             PR number is not otherwise discoverable, so without these the
+#             opus step can't even resolve which PR to comment on.
+#         - `git fetch` / `git log` / `git diff` — the follow-up step diffs
+#             against `github.event.before` to review only the delta.
+#       The prompts also pass the PR number explicitly (`#${{ github.event.number }}`)
+#       so the agent never has to guess it (the PR number ≠ the issue number a
+#       title may reference).
+#   * show_full_output: false
+#       This is a PUBLIC repo — CI logs are world-readable. Keep diff snippets
+#       out of the logs (the action's default). Flip to true only if this repo
+#       becomes private and you want observability into denials/tool-calls.
+#   * fetch-depth: 0
+#       Follow-up review diffs against `github.event.before`. Default
+#       depth=1 doesn't have the previous SHA and `git diff` would fail.
+#
+# NOTE (public repo): PRs from forks do NOT receive repository secrets by
+# GitHub policy, so CLAUDE_CODE_OAUTH_TOKEN is empty for fork PRs and the
+# review is skipped there. Reviews run for PRs from branches in this repo.
+# ────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    # Skip docs-only PRs — there's nothing for a code review to act on.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# Cancel an in-flight review when the PR is pushed again. Without this, rapid
+# consecutive pushes each spawn a full review that runs to completion — and the
+# first-pass review uses opus, the most expensive model. Only the latest
+# commit's review is worth keeping.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Initial review — runs once when the PR is opened or moves from draft
+      # to ready-for-review. Opus produces a comprehensive first-pass review
+      # over the full diff.
+      - name: Initial PR review (opus, deep)
+        if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Review pull request #${{ github.event.number }} for code quality, correctness, and security.
+
+            Gather context yourself (the diff is NOT pre-injected):
+              `gh pr view ${{ github.event.number }} --json title,body,headRefName,baseRefName`
+              `gh pr diff ${{ github.event.number }}`
+
+            Analyze the diff, then you MUST post your review as a single top-level
+            comment on the PR via:
+              `gh pr comment ${{ github.event.number }} --body "..."`
+            Summarize overall findings, risks, and a clear approve/request-changes
+            recommendation. Do not finish without commenting.
+          claude_args: '--model opus --allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*)"'
+          show_full_output: false
+
+      # Follow-up review — runs on subsequent pushes (synchronize) and on
+      # reopens. Sonnet on a diff-aware prompt: agent reads its own previous
+      # comment, diffs against `github.event.before`, and reviews only what's
+      # new instead of re-doing the full PR each time.
+      - name: Follow-up PR review (sonnet, focused on new changes)
+        if: github.event.action == 'synchronize' || github.event.action == 'reopened'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            This is a follow-up review on PR #${{ github.event.number }}. You have reviewed this PR before; your prior comments are on the PR.
+
+            Step 1 — find your previous review:
+              `gh pr view ${{ github.event.number }} --json comments --jq '[.comments[] | select(.author.login == "claude")] | last | .body'`
+            Read it so you know what was already flagged.
+
+            Step 2 — identify the new changes since that review. The previous head SHA is `${{ github.event.before }}` and the current head is `${{ github.event.pull_request.head.sha }}`. Use:
+              `git log --oneline ${{ github.event.before }}..HEAD`
+              `git diff ${{ github.event.before }}..HEAD`
+            If the diff is empty (e.g., reopen with no new commits), briefly acknowledge that and skip detailed review.
+
+            Step 3 — review ONLY the delta:
+              - Were the previous review's concerns addressed?
+              - Any NEW issues or regressions introduced by the new commits?
+              - Did the fixes introduce side effects?
+              Do NOT re-flag concerns from the previous review unless they are still present in the new code.
+
+            Step 4 — post a single top-level comment titled "Follow-up review (commits since ${{ github.event.before }})" via:
+              `gh pr comment ${{ github.event.number }} --body "..."`
+            Keep it focused on the delta — one or two short sections is fine. Include an updated approve/request-changes recommendation.
+
+            Do not finish without commenting.
+          claude_args: '--model sonnet --allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git fetch:*),Bash(git log:*),Bash(git diff:*)"'
+          show_full_output: false
+
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
