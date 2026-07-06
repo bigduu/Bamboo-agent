@@ -161,7 +161,11 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn invoke(&self, args: serde_json::Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: WebSearchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid WebSearch args: {}", e)))?;
 

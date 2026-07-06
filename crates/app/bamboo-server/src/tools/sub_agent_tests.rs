@@ -321,18 +321,18 @@ async fn create_without_subagent_type_defaults_to_worker_label() {
     let harness = build_test_harness().await;
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "No Label Child",
-                "responsibility": "Do work",
-                "prompt": "Do the work",
-                "workspace": "/tmp/ws"
-                // subagent_type intentionally omitted
-            }),
-            ctx_for(&harness.parent_session_id, "tc_no_label").to_tool_ctx(),
-        )
-        .await
-        .expect("create must succeed without subagent_type");
+        json!({
+            "action": "create",
+            "title": "No Label Child",
+            "responsibility": "Do work",
+            "prompt": "Do the work",
+            "workspace": "/tmp/ws"
+            // subagent_type intentionally omitted
+        }),
+        ctx_for(&harness.parent_session_id, "tc_no_label").to_tool_ctx(),
+    )
+    .await
+    .expect("create must succeed without subagent_type");
 
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
     assert_eq!(payload["subagent_type"].as_str(), Some("worker"));
@@ -395,19 +395,19 @@ async fn create_with_wait_true_suspends_and_registers_wait() {
     let harness = build_test_harness().await;
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Blocking Child",
-                "responsibility": "Do one thing",
-                "prompt": "Do it",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/ws",
-                "wait": true
-            }),
-            ctx_for(&harness.parent_session_id, "tc_create_wait").to_tool_ctx(),
-        )
-        .await
-        .expect("create should succeed");
+        json!({
+            "action": "create",
+            "title": "Blocking Child",
+            "responsibility": "Do one thing",
+            "prompt": "Do it",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/ws",
+            "wait": true
+        }),
+        ctx_for(&harness.parent_session_id, "tc_create_wait").to_tool_ctx(),
+    )
+    .await
+    .expect("create should succeed");
 
     assert_eq!(
         result.display_preference.as_deref(),
@@ -434,15 +434,15 @@ async fn wait_action_with_explicit_children_suspends_and_registers() {
     let harness = build_test_harness().await;
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "wait",
-                "child_session_ids": ["k1", "k2", "k3"],
-                "wait_for": "any"
-            }),
-            ctx_for(&harness.parent_session_id, "tc_wait").to_tool_ctx(),
-        )
-        .await
-        .expect("wait should succeed");
+        json!({
+            "action": "wait",
+            "child_session_ids": ["k1", "k2", "k3"],
+            "wait_for": "any"
+        }),
+        ctx_for(&harness.parent_session_id, "tc_wait").to_tool_ctx(),
+    )
+    .await
+    .expect("wait should succeed");
 
     assert_eq!(
         result.display_preference.as_deref(),
@@ -478,11 +478,11 @@ async fn wait_action_is_noop_when_no_active_children() {
     // children → must NOT suspend, and must NOT register an empty wait.
     let result = invoke_completed(
         &harness.tool,
-            json!({ "action": "wait" }),
-            ctx_for(&harness.parent_session_id, "tc_wait_noop").to_tool_ctx(),
-        )
-        .await
-        .expect("wait should succeed");
+        json!({ "action": "wait" }),
+        ctx_for(&harness.parent_session_id, "tc_wait_noop").to_tool_ctx(),
+    )
+    .await
+    .expect("wait should succeed");
 
     assert_ne!(
         result.display_preference.as_deref(),
@@ -517,18 +517,18 @@ async fn create_requires_session_id_in_tool_context() {
 
     let err = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "demo task",
-                "responsibility": "do something",
-                "prompt": "do something",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace"
-            }),
-            ToolCtx::none("tool_call"),
-        )
-        .await
-        .unwrap_err();
+        json!({
+            "action": "create",
+            "title": "demo task",
+            "responsibility": "do something",
+            "prompt": "do something",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace"
+        }),
+        ToolCtx::none("tool_call"),
+    )
+    .await
+    .unwrap_err();
 
     match err {
         ToolError::Execution(msg) => {
@@ -544,28 +544,28 @@ async fn create_emits_sub_agent_started_event_after_queueing() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Child A",
-                "responsibility": "Investigate one module",
-                "prompt": "Read module and summarize",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_1",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("SubAgent should enqueue a child session");
+        json!({
+            "action": "create",
+            "title": "Child A",
+            "responsibility": "Investigate one module",
+            "prompt": "Read module and summarize",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_1",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("SubAgent should enqueue a child session");
 
     let parsed_result: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -613,29 +613,29 @@ async fn create_uses_async_subagent_model_resolver() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Coder Child",
-                "responsibility": "Implement a focused change",
-                "prompt": "Patch one file",
-                "subagent_type": "coder",
-                "workspace": "/tmp/test-workspace",
-                "auto_run": false
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_async_resolver",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("SubAgent should create a child using async model resolver");
+        json!({
+            "action": "create",
+            "title": "Coder Child",
+            "responsibility": "Implement a focused change",
+            "prompt": "Patch one file",
+            "subagent_type": "coder",
+            "workspace": "/tmp/test-workspace",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_async_resolver",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("SubAgent should create a child using async model resolver");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -693,11 +693,11 @@ async fn resident_create_reuses_same_child_session() {
     // First resident create: spins up the essayist.
     let r1 = invoke_completed(
         &harness.tool,
-            create("Essay: 溪流", "Write ~150 words about 溪流."),
-            ctx("tc1").to_tool_ctx(),
-        )
-        .await
-        .expect("first resident create");
+        create("Essay: 溪流", "Write ~150 words about 溪流."),
+        ctx("tc1").to_tool_ctx(),
+    )
+    .await
+    .expect("first resident create");
     let p1: serde_json::Value = serde_json::from_str(&r1.result).unwrap();
     let id1 = p1["child_session_id"].as_str().unwrap().to_string();
     assert_eq!(p1["reused"], json!(false));
@@ -723,11 +723,11 @@ async fn resident_create_reuses_same_child_session() {
     // Second resident create with the SAME name: reuses the same session.
     let r2 = invoke_completed(
         &harness.tool,
-            create("Essay: 山峰", "Write ~150 words about 山峰."),
-            ctx("tc2").to_tool_ctx(),
-        )
-        .await
-        .expect("second resident create");
+        create("Essay: 山峰", "Write ~150 words about 山峰."),
+        ctx("tc2").to_tool_ctx(),
+    )
+    .await
+    .expect("second resident create");
     let p2: serde_json::Value = serde_json::from_str(&r2.result).unwrap();
     assert_eq!(
         p2["child_session_id"].as_str().unwrap(),
@@ -755,18 +755,18 @@ async fn resident_create_reuses_same_child_session() {
     // A one-shot create makes a DIFFERENT session.
     let r3 = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "OneShot",
-                "responsibility": "Independent task",
-                "prompt": "Do something unrelated.",
-                "workspace": "/tmp/test-workspace",
-                "auto_run": false
-            }),
-            ctx("tc3").to_tool_ctx(),
-        )
-        .await
-        .expect("oneshot create");
+        json!({
+            "action": "create",
+            "title": "OneShot",
+            "responsibility": "Independent task",
+            "prompt": "Do something unrelated.",
+            "workspace": "/tmp/test-workspace",
+            "auto_run": false
+        }),
+        ctx("tc3").to_tool_ctx(),
+    )
+    .await
+    .expect("oneshot create");
     let p3: serde_json::Value = serde_json::from_str(&r3.result).unwrap();
     assert_ne!(
         p3["child_session_id"].as_str().unwrap(),
@@ -781,27 +781,27 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "title": "Legacy Child",
-                "responsibility": "Test backward compat",
-                "prompt": "Do something",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_legacy",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("legacy SubAgent call without action should default to create");
+        json!({
+            "title": "Legacy Child",
+            "responsibility": "Test backward compat",
+            "prompt": "Do something",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_legacy",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("legacy SubAgent call without action should default to create");
 
     assert!(result.success);
     let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -818,26 +818,26 @@ async fn send_message_appends_follow_up_without_replacing_history() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "send_message",
-                "child_session_id": harness.child_session_id,
-                "message": "continue with the failing parser path",
-                "auto_run": false
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_send_message",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("send_message should succeed");
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": "continue with the failing parser path",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_send_message",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("send_message should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -874,25 +874,25 @@ async fn send_message_queues_on_running_child_without_interrupt() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "send_message",
-                "child_session_id": harness.child_session_id,
-                "message": "continue"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_running",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("send_message should queue message on running child");
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": "continue"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_running",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("send_message should queue message on running child");
 
     assert!(result.success);
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -942,27 +942,27 @@ async fn send_message_can_interrupt_running_child() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "send_message",
-                "child_session_id": harness.child_session_id,
-                "message": "continue from latest state",
-                "auto_run": false,
-                "interrupt_running": true
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_interrupt_running",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("send_message should interrupt running child");
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": "continue from latest state",
+            "auto_run": false,
+            "interrupt_running": true
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_interrupt_running",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("send_message should interrupt running child");
 
     waiter.await.expect("waiter task should finish");
 
@@ -997,25 +997,25 @@ async fn send_message_can_queue_child_immediately() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "send_message",
-                "child_session_id": harness.child_session_id,
-                "message": "retry with a narrower scope"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_queue",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("send_message should queue the child");
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": "retry with a narrower scope"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_queue",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("send_message should queue the child");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1085,24 +1085,24 @@ async fn cancel_stops_running_child() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "cancel",
-                "child_session_id": harness.child_session_id
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_cancel",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("cancel should succeed");
+        json!({
+            "action": "cancel",
+            "child_session_id": harness.child_session_id
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_cancel",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("cancel should succeed");
 
     waiter.await.expect("waiter should finish");
 
@@ -1118,21 +1118,21 @@ async fn list_returns_children() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({"action": "list"}),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_list",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("list should succeed");
+        json!({"action": "list"}),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_list",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("list should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1161,24 +1161,24 @@ async fn get_returns_runner_diagnostics() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "get",
-                "child_session_id": harness.child_session_id
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_get_diagnostics",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("get should succeed");
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_get_diagnostics",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("get should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1197,28 +1197,28 @@ async fn create_returns_duration_hint() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Test Child",
-                "responsibility": "Do something",
-                "prompt": "Do something useful",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_create_hint",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("create should succeed");
+        json!({
+            "action": "create",
+            "title": "Test Child",
+            "responsibility": "Do something",
+            "prompt": "Do something useful",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_create_hint",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("create should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1247,30 +1247,30 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Reasoning Child",
-                "responsibility": "Investigate hard problem",
-                "prompt": "Think carefully step by step",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace",
-                "auto_run": false,
-                "reasoning_effort": "high"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_create_with_effort",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("create should succeed");
+        json!({
+            "action": "create",
+            "title": "Reasoning Child",
+            "responsibility": "Investigate hard problem",
+            "prompt": "Think carefully step by step",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace",
+            "auto_run": false,
+            "reasoning_effort": "high"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_create_with_effort",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("create should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1303,29 +1303,29 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Default Child",
-                "responsibility": "Quick lookup",
-                "prompt": "Read a file and summarise",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace",
-                "auto_run": false
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_create_default_effort",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("create should succeed");
+        json!({
+            "action": "create",
+            "title": "Default Child",
+            "responsibility": "Quick lookup",
+            "prompt": "Read a file and summarise",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_create_default_effort",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("create should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1367,25 +1367,25 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
 
     let _ = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "update",
-                "child_session_id": harness.child_session_id,
-                "reasoning_effort": "max"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_update_effort",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("update should succeed");
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "reasoning_effort": "max"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_update_effort",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("update should succeed");
 
     let updated = harness
         .storage
@@ -1406,24 +1406,24 @@ async fn delete_removes_child() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "delete",
-                "child_session_id": harness.child_session_id
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_delete",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("delete should succeed");
+        json!({
+            "action": "delete",
+            "child_session_id": harness.child_session_id
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_delete",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("delete should succeed");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -1443,27 +1443,27 @@ async fn create_requires_workspace() {
 
     let err = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "No Workspace Child",
-                "responsibility": "Test workspace validation",
-                "prompt": "Do something",
-                "subagent_type": "general-purpose"
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_no_workspace",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .unwrap_err();
+        json!({
+            "action": "create",
+            "title": "No Workspace Child",
+            "responsibility": "Test workspace validation",
+            "prompt": "Do something",
+            "subagent_type": "general-purpose"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_no_workspace",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .unwrap_err();
 
     match err {
         ToolError::InvalidArguments(msg) => {
@@ -1482,29 +1482,29 @@ async fn create_sets_child_workspace() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({
-                "action": "create",
-                "title": "Workspace Child",
-                "responsibility": "Test workspace propagation",
-                "prompt": "Do something",
-                "subagent_type": "general-purpose",
-                "workspace": "/tmp/test-workspace",
-                "auto_run": false
-            }),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_workspace",
-                event_tx: None,
-                available_tool_schemas: None,
-                bypass_permissions: false,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            }
-            .to_tool_ctx(),
-        )
-        .await
-        .expect("create should succeed with workspace");
+        json!({
+            "action": "create",
+            "title": "Workspace Child",
+            "responsibility": "Test workspace propagation",
+            "prompt": "Do something",
+            "subagent_type": "general-purpose",
+            "workspace": "/tmp/test-workspace",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_workspace",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("create should succeed with workspace");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");

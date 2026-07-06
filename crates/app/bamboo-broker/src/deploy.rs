@@ -132,10 +132,7 @@ impl DeployedAgent {
     /// cleanup if any.
     pub async fn shutdown(self) {
         match self.inner {
-            DeployedInner::Process {
-                mut child,
-                cleanup,
-            } => {
+            DeployedInner::Process { mut child, cleanup } => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 if let Some(args) = cleanup {
@@ -832,7 +829,9 @@ mod tests {
             .with_port(Some(2222))
             .with_identity(Some("/keys/id_ed25519".into()));
         let a = s.argv(&dep(), None);
-        assert!(a.windows(2).any(|w| w == ["-p".to_string(), "2222".to_string()]));
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["-p".to_string(), "2222".to_string()]));
         assert!(a
             .windows(2)
             .any(|w| w == ["-i".to_string(), "/keys/id_ed25519".to_string()]));
@@ -876,7 +875,9 @@ mod tests {
         );
         let remote = s.argv(&d, None).last().unwrap().clone();
         assert!(
-            remote.trim_end().ends_with("> '.bamboo-deploy/node-x.log' 2>&1"),
+            remote
+                .trim_end()
+                .ends_with("> '.bamboo-deploy/node-x.log' 2>&1"),
             "got: {remote}"
         );
     }
@@ -884,7 +885,9 @@ mod tests {
     #[tokio::test]
     async fn tail_local_file_returns_last_lines() {
         let path = std::env::temp_dir().join("bamboo-tail-test.log");
-        tokio::fs::write(&path, "l1\nl2\nl3\nl4\nl5\n").await.unwrap();
+        tokio::fs::write(&path, "l1\nl2\nl3\nl4\nl5\n")
+            .await
+            .unwrap();
         let out = tail_local_file(path.to_str().unwrap(), 2).await.unwrap();
         assert_eq!(out, "l4\nl5");
         let _ = tokio::fs::remove_file(&path).await;

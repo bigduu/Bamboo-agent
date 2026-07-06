@@ -67,10 +67,7 @@ impl NotificationService {
     /// map is opportunistically pruned of entries older than the window.
     pub fn notify(&self, session_id: &str, event: &AgentEvent) -> Option<AgentEvent> {
         let classified = {
-            let prefs = self
-                .preferences
-                .read()
-                .recover_poison();
+            let prefs = self.preferences.read().recover_poison();
             policy::classify(session_id, event, &prefs)?
         };
 
@@ -101,10 +98,7 @@ impl NotificationService {
 
     /// Returns a snapshot clone of the current preferences.
     pub fn preferences(&self) -> NotificationPreferences {
-        self.preferences
-            .read()
-            .recover_poison()
-            .clone()
+        self.preferences.read().recover_poison().clone()
     }
 
     /// Replaces the current preferences and persists them to disk.
@@ -113,10 +107,7 @@ impl NotificationService {
     /// path; a write error is returned but the in-memory update still stands.
     pub fn set_preferences(&self, prefs: NotificationPreferences) -> std::io::Result<()> {
         {
-            let mut guard = self
-                .preferences
-                .write()
-                .recover_poison();
+            let mut guard = self.preferences.write().recover_poison();
             *guard = prefs.clone();
         }
         prefs.save(&self.prefs_path)

@@ -50,7 +50,12 @@ impl BrokerChildLink {
         })
     }
 
-    fn msg(&self, kind: InboxKind, body: serde_json::Value, correlation: Option<MsgId>) -> InboxMessage {
+    fn msg(
+        &self,
+        kind: InboxKind,
+        body: serde_json::Value,
+        correlation: Option<MsgId>,
+    ) -> InboxMessage {
         InboxMessage {
             id: MsgId::new(),
             from: self.me.clone(),
@@ -203,7 +208,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = serve_executor(
                 &worker_ep,
-                AgentRef { session_id: "child".into(), role: None },
+                AgentRef {
+                    session_id: "child".into(),
+                    role: None,
+                },
                 "t",
                 Arc::new(EchoExecutor),
             )
@@ -212,7 +220,10 @@ mod tests {
 
         let mut link = BrokerChildLink::connect(
             &endpoint,
-            AgentRef { session_id: "parent".into(), role: None },
+            AgentRef {
+                session_id: "parent".into(),
+                role: None,
+            },
             "t",
             "child",
         )
@@ -271,7 +282,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = serve_executor(
                 &ep,
-                AgentRef { session_id: "child".into(), role: None },
+                AgentRef {
+                    session_id: "child".into(),
+                    role: None,
+                },
                 "t",
                 exec,
             )
@@ -282,7 +296,10 @@ mod tests {
     async fn connect_parent(endpoint: &str) -> BrokerChildLink {
         BrokerChildLink::connect(
             endpoint,
-            AgentRef { session_id: "parent".into(), role: None },
+            AgentRef {
+                session_id: "parent".into(),
+                role: None,
+            },
             "t",
             "child",
         )
@@ -322,7 +339,9 @@ mod tests {
         ) -> bamboo_subagent::ChildOutcome {
             let approved = match events.host().cloned() {
                 Some(host) => host
-                    .approval_call(serde_json::json!({ "tool_name": "Bash", "resource": "rm -rf /" }))
+                    .approval_call(
+                        serde_json::json!({ "tool_name": "Bash", "resource": "rm -rf /" }),
+                    )
                     .await
                     .ok()
                     .and_then(|v| v.get("approved").and_then(|b| b.as_bool()))
@@ -361,9 +380,11 @@ mod tests {
                 other => panic!("expected ready event first, got {other:?}"),
             }
         }
-        link.send(ParentFrame::Message { text: "turn-left".into() })
-            .await
-            .unwrap();
+        link.send(ParentFrame::Message {
+            text: "turn-left".into(),
+        })
+        .await
+        .unwrap();
 
         let result = loop {
             match tokio::time::timeout(Duration::from_secs(5), link.next_frame())

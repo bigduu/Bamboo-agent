@@ -95,7 +95,10 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
             .unwrap_or(false)
             || broker.contains_key("token_encrypted")
         {
-            broker.insert("token".to_string(), Value::String("****...****".to_string()));
+            broker.insert(
+                "token".to_string(),
+                Value::String("****...****".to_string()),
+            );
         }
         broker.remove("token_encrypted");
     }

@@ -270,7 +270,8 @@ pub(super) async fn suspend_for_pending_question(
         options: pq.options.clone(),
         allow_custom: pq.allow_custom,
     };
-    emit_need_clarification_event(event_tx, &payload, &tool_call.id, &tool_call.function.name).await;
+    emit_need_clarification_event(event_tx, &payload, &tool_call.id, &tool_call.function.name)
+        .await;
 
     session.set_pending_question_with_source(
         pq.tool_call_id,

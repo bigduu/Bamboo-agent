@@ -918,9 +918,10 @@ mod tests {
     async fn bash_background_emits_completion_event_with_exit_code() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
-            .await
-            .expect("background shell should spawn");
+        let shell =
+            super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
+                .await
+                .expect("background shell should spawn");
         let expected_id = shell.id.clone();
 
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -951,9 +952,10 @@ mod tests {
     async fn bash_background_emits_completion_event_for_failing_command() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("false", None, Some(tx), None, false, None)
-            .await
-            .expect("background shell should spawn");
+        let shell =
+            super::bash_runtime::spawn_background("false", None, Some(tx), None, false, None)
+                .await
+                .expect("background shell should spawn");
         let expected_id = shell.id.clone();
 
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -983,9 +985,10 @@ mod tests {
     async fn bash_background_emits_killed_when_shell_is_killed() {
         prime_test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
-        let shell = super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false, None)
-            .await
-            .expect("background shell should spawn");
+        let shell =
+            super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false, None)
+                .await
+                .expect("background shell should spawn");
         let expected_id = shell.id.clone();
 
         shell.kill().await.expect("shell should be killable");
@@ -1048,9 +1051,10 @@ mod tests {
         })
         .expect("prefill channel slot");
 
-        let shell = super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
-            .await
-            .expect("background shell should spawn");
+        let shell =
+            super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
+                .await
+                .expect("background shell should spawn");
 
         // Wait past the 500ms bounded-send window so the dropped BashCompleted
         // has been observed and the poll task has moved on.
@@ -1240,9 +1244,10 @@ mod tests {
         .await
         .expect("spawn b");
         // An untagged (None) long-running shell.
-        let untagged = super::bash_runtime::spawn_background("sleep 30", None, None, None, false, None)
-            .await
-            .expect("spawn untagged");
+        let untagged =
+            super::bash_runtime::spawn_background("sleep 30", None, None, None, false, None)
+                .await
+                .expect("spawn untagged");
         // A sess-A shell that completes immediately — must be excluded once done.
         let done = super::bash_runtime::spawn_background(
             "true",
@@ -1310,7 +1315,10 @@ mod tests {
         };
 
         let out = tool
-            .invoke(json!({ "command": "echo auto-fast-output" }), ctx.to_tool_ctx())
+            .invoke(
+                json!({ "command": "echo auto-fast-output" }),
+                ctx.to_tool_ctx(),
+            )
             .await
             .expect("auto fast command should succeed");
         let ToolOutcome::Completed(result) = out else {

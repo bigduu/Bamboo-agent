@@ -388,7 +388,9 @@ impl ActorChildRunner {
                 let mut pool = self.pool.lock().await;
                 pool.get_mut(key).and_then(|bucket| bucket.pop())
             };
-            let Some(mut candidate) = candidate else { break };
+            let Some(mut candidate) = candidate else {
+                break;
+            };
             if candidate.worker.is_alive() {
                 return Ok(candidate);
             }
@@ -606,9 +608,15 @@ impl ActorChildRunner {
             &bus.token,
         )
         .await
-        .map_err(|e| AgentError::LLM(format!("schedulable role '{role}': bus connect failed: {e}")))?;
+        .map_err(|e| {
+            AgentError::LLM(format!(
+                "schedulable role '{role}': bus connect failed: {e}"
+            ))
+        })?;
         let candidates = q.list_connected(&pool).await.map_err(|e| {
-            AgentError::LLM(format!("schedulable role '{role}': bus presence query failed: {e}"))
+            AgentError::LLM(format!(
+                "schedulable role '{role}': bus presence query failed: {e}"
+            ))
         })?;
 
         if candidates.is_empty() {
@@ -724,216 +732,223 @@ impl ExternalChildRunner for ActorChildRunner {
         // no spawn fallback, so they never retry.
         let mut attempt = 0u8;
         let (result, actor) = loop {
-        let (actor, mut client) = match kind {
-            PlacementKind::Remote => {
-                // REMOTE branch: connect to a resident worker. No spawn, no pool
-                // touch, no drain. We do not own the worker, so a connect failure
-                // has NO respawn fallback — it is a clear, terminal error.
-                let placement = self
-                    .remote_placements
-                    .get(spec.identity.role.as_str())
-                    .ok_or_else(|| {
-                        AgentError::LLM(format!(
-                            "remote placement for role '{}' vanished before connect",
-                            spec.identity.role
-                        ))
-                    })?;
-                let endpoint = placement.endpoint.clone();
-                // Build the TLS trust: a pinned CA pins a self-signed worker cert;
-                // otherwise default webpki roots (or plaintext for `ws://`).
-                let trust_cfg = match placement.ca_cert_file.as_deref() {
-                    Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
-                        AgentError::LLM(format!("remote worker CA cert '{}': {e}", path.display()))
-                    })?),
-                    None => None,
-                };
-                let client = ChildClient::connect_with_auth_tls(
-                    &endpoint,
-                    placement.token.as_deref(),
-                    trust_cfg,
-                )
-                .await
-                .map_err(|e| {
-                    AgentError::LLM(format!("remote actor connect to '{endpoint}' failed: {e}"))
-                })?;
-                // Process-less handle so live-actor registration (in-band steering)
-                // works exactly as for a local worker; `kill()` is a no-op.
-                let record = AgentRecord {
-                    agent_id: job.child_session_id.clone(),
-                    role: spec.identity.role.clone(),
-                    labels: Vec::new(),
-                    endpoint: endpoint.clone(),
-                    pid: 0,
-                    version: String::new(),
-                    started_at: chrono::Utc::now(),
-                    lease_expires_at: chrono::Utc::now(),
-                };
-                let _ = endpoint;
-                let actor = PooledWorker {
-                    worker: SpawnedChild::remote(record),
-                    mailbox_id: job.child_session_id.clone(),
-                };
-                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
-                (actor, client)
-            }
-            PlacementKind::Schedulable => {
-                // SCHEDULABLE branch (#181): pick a LIVE worker of the pool role
-                // from the BUS (presence = connection-truth; no HTTP registry, no
-                // leases, no failover) and drive it by mailbox id. The pool worker
-                // stays connected and is reused next time. No spawn, no kill, NO
-                // local fallback — an empty pool is a terminal error (raised in
-                // resolve_schedulable_worker).
-                let bus = self.bus.as_ref().ok_or_else(|| {
-                    AgentError::LLM(
-                        "schedulable sub-agents require a mailbox bus (subagents.broker)"
-                            .to_string(),
+            let (actor, mut client) = match kind {
+                PlacementKind::Remote => {
+                    // REMOTE branch: connect to a resident worker. No spawn, no pool
+                    // touch, no drain. We do not own the worker, so a connect failure
+                    // has NO respawn fallback — it is a clear, terminal error.
+                    let placement = self
+                        .remote_placements
+                        .get(spec.identity.role.as_str())
+                        .ok_or_else(|| {
+                            AgentError::LLM(format!(
+                                "remote placement for role '{}' vanished before connect",
+                                spec.identity.role
+                            ))
+                        })?;
+                    let endpoint = placement.endpoint.clone();
+                    // Build the TLS trust: a pinned CA pins a self-signed worker cert;
+                    // otherwise default webpki roots (or plaintext for `ws://`).
+                    let trust_cfg = match placement.ca_cert_file.as_deref() {
+                        Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
+                            AgentError::LLM(format!(
+                                "remote worker CA cert '{}': {e}",
+                                path.display()
+                            ))
+                        })?),
+                        None => None,
+                    };
+                    let client = ChildClient::connect_with_auth_tls(
+                        &endpoint,
+                        placement.token.as_deref(),
+                        trust_cfg,
                     )
-                })?;
-                let mailbox_id = self
-                    .resolve_schedulable_worker(spec.identity.role.as_str())
-                    .await?;
-                let parent = bamboo_subagent::AgentRef {
-                    session_id: format!("p-{}", job.child_session_id),
-                    role: None,
-                };
-                let link = bamboo_broker::BrokerChildLink::connect(
-                    &bus.endpoint,
-                    parent,
-                    &bus.token,
-                    mailbox_id.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    AgentError::LLM(format!("schedulable link connect to '{mailbox_id}' failed: {e}"))
-                })?;
-                // Process-less handle — a bus-resident pool worker is never ours to
-                // kill (remote ⇒ dropped, not pooled, after the run).
-                let actor = PooledWorker {
-                    worker: SpawnedChild::remote(AgentRecord {
-                        agent_id: mailbox_id.clone(),
+                    .await
+                    .map_err(|e| {
+                        AgentError::LLM(format!("remote actor connect to '{endpoint}' failed: {e}"))
+                    })?;
+                    // Process-less handle so live-actor registration (in-band steering)
+                    // works exactly as for a local worker; `kill()` is a no-op.
+                    let record = AgentRecord {
+                        agent_id: job.child_session_id.clone(),
                         role: spec.identity.role.clone(),
                         labels: Vec::new(),
-                        endpoint: bus.endpoint.clone(),
+                        endpoint: endpoint.clone(),
                         pid: 0,
                         version: String::new(),
                         started_at: chrono::Utc::now(),
                         lease_expires_at: chrono::Utc::now(),
-                    }),
-                    mailbox_id,
-                };
-                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
-                (actor, client)
-            }
-            PlacementKind::Local => {
-                // LOCAL = the mailbox bus (the unified transport): check out a warm
-                // pooled worker (reuse a live parked one, else spawn fresh) and
-                // drive it by mailbox id — no listen socket, no file discovery, no
-                // respawn-on-connect-miss (the broker queues the Run until the
-                // worker handles it). The legacy direct-WS path was retired; the bus
-                // is required.
-                let bus = self.bus.as_ref().ok_or_else(|| {
-                    AgentError::LLM(
-                        "local sub-agents require a mailbox bus (subagents.broker); none is \
-                         configured and the bus could not be embedded"
-                            .to_string(),
+                    };
+                    let _ = endpoint;
+                    let actor = PooledWorker {
+                        worker: SpawnedChild::remote(record),
+                        mailbox_id: job.child_session_id.clone(),
+                    };
+                    let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
+                    (actor, client)
+                }
+                PlacementKind::Schedulable => {
+                    // SCHEDULABLE branch (#181): pick a LIVE worker of the pool role
+                    // from the BUS (presence = connection-truth; no HTTP registry, no
+                    // leases, no failover) and drive it by mailbox id. The pool worker
+                    // stays connected and is reused next time. No spawn, no kill, NO
+                    // local fallback — an empty pool is a terminal error (raised in
+                    // resolve_schedulable_worker).
+                    let bus = self.bus.as_ref().ok_or_else(|| {
+                        AgentError::LLM(
+                            "schedulable sub-agents require a mailbox bus (subagents.broker)"
+                                .to_string(),
+                        )
+                    })?;
+                    let mailbox_id = self
+                        .resolve_schedulable_worker(spec.identity.role.as_str())
+                        .await?;
+                    let parent = bamboo_subagent::AgentRef {
+                        session_id: format!("p-{}", job.child_session_id),
+                        role: None,
+                    };
+                    let link = bamboo_broker::BrokerChildLink::connect(
+                        &bus.endpoint,
+                        parent,
+                        &bus.token,
+                        mailbox_id.clone(),
                     )
-                })?;
-                let actor = self.acquire_bus_worker(&pool_key, &spec).await?;
-                let parent = bamboo_subagent::AgentRef {
-                    session_id: format!("p-{}", job.child_session_id),
-                    role: None,
-                };
-                let link = bamboo_broker::BrokerChildLink::connect(
-                    &bus.endpoint,
-                    parent,
-                    &bus.token,
-                    actor.mailbox_id.clone(),
-                )
-                .await
-                .map_err(|e| AgentError::LLM(format!("broker child link connect failed: {e}")))?;
-                let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
-                (actor, client)
-            }
-        };
-
-        if let Err(e) = client
-            .send(ParentFrame::Run(RunSpec {
-                // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
-                assignment: assignment.clone(),
-                reasoning_effort: None,
-                messages: messages.clone(),
-            }))
-            .await
-        {
-            if !remote {
-                actor.worker.kill().await;
-            }
-            return Err(AgentError::LLM(format!("actor run dispatch failed: {e}")));
-        }
-
-        // Register as a live actor so send_message (running, no interrupt) can
-        // steer this child in-band over the existing WS connection. The guard
-        // unregisters on every exit path.
-        let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
-        let live_guard = super::live::register(&job.child_session_id, live_tx);
-
-        let result = drive(
-            &mut *client,
-            &job.child_session_id,
-            self.approval_decider.as_ref(),
-            escalation.clone(),
-            &event_tx,
-            &cancel_token,
-            &mut live_rx,
-            // First-frame watchdog for EVERY placement: a wedged-but-connected
-            // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
-            // no first frame; without a deadline drive() blocks forever. Bounding it
-            // turns the "running-but-unresponsive" hang into a recoverable
-            // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
-            // on a fixed remote endpoint).
-            Some(WORKER_FIRST_FRAME_TIMEOUT),
-        )
-        .await;
-        // Unregister IMMEDIATELY: after drive returns nobody consumes live_rx,
-        // so a send_message landing in the close/park window below must see
-        // "not live" and take the durable-queue fallback instead of vanishing.
-        // (Even if one slipped in earlier, send_message also appends it to the
-        // durable transcript, so the next activation still rehydrates it.)
-        drop(live_guard);
-        // Close the parent link (dropping it closes our broker connection; the
-        // worker stays dialed-in + subscribed, ready for its next Run).
-        drop(client);
-
-        // No first frame ⇒ the worker is wedged. Recover ONCE before giving up:
-        //   - Local: reap the dead pooled worker + respawn.
-        //   - Schedulable: not ours to kill — drop it and re-select a live pool
-        //     member (a wedged worker must not fail the run when the pool has others).
-        //   - Remote: a FIXED endpoint has no alternative — fall through to a bounded
-        //     WorkerUnresponsive error (far better than the previous infinite hang).
-        if attempt == 0 && matches!(result, Err(AgentError::WorkerUnresponsive(_))) {
-            match kind {
+                    .await
+                    .map_err(|e| {
+                        AgentError::LLM(format!(
+                            "schedulable link connect to '{mailbox_id}' failed: {e}"
+                        ))
+                    })?;
+                    // Process-less handle — a bus-resident pool worker is never ours to
+                    // kill (remote ⇒ dropped, not pooled, after the run).
+                    let actor = PooledWorker {
+                        worker: SpawnedChild::remote(AgentRecord {
+                            agent_id: mailbox_id.clone(),
+                            role: spec.identity.role.clone(),
+                            labels: Vec::new(),
+                            endpoint: bus.endpoint.clone(),
+                            pid: 0,
+                            version: String::new(),
+                            started_at: chrono::Utc::now(),
+                            lease_expires_at: chrono::Utc::now(),
+                        }),
+                        mailbox_id,
+                    };
+                    let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
+                    (actor, client)
+                }
                 PlacementKind::Local => {
-                    tracing::warn!(
+                    // LOCAL = the mailbox bus (the unified transport): check out a warm
+                    // pooled worker (reuse a live parked one, else spawn fresh) and
+                    // drive it by mailbox id — no listen socket, no file discovery, no
+                    // respawn-on-connect-miss (the broker queues the Run until the
+                    // worker handles it). The legacy direct-WS path was retired; the bus
+                    // is required.
+                    let bus = self.bus.as_ref().ok_or_else(|| {
+                        AgentError::LLM(
+                            "local sub-agents require a mailbox bus (subagents.broker); none is \
+                         configured and the bus could not be embedded"
+                                .to_string(),
+                        )
+                    })?;
+                    let actor = self.acquire_bus_worker(&pool_key, &spec).await?;
+                    let parent = bamboo_subagent::AgentRef {
+                        session_id: format!("p-{}", job.child_session_id),
+                        role: None,
+                    };
+                    let link = bamboo_broker::BrokerChildLink::connect(
+                        &bus.endpoint,
+                        parent,
+                        &bus.token,
+                        actor.mailbox_id.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        AgentError::LLM(format!("broker child link connect failed: {e}"))
+                    })?;
+                    let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
+                    (actor, client)
+                }
+            };
+
+            if let Err(e) = client
+                .send(ParentFrame::Run(RunSpec {
+                    // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
+                    assignment: assignment.clone(),
+                    reasoning_effort: None,
+                    messages: messages.clone(),
+                }))
+                .await
+            {
+                if !remote {
+                    actor.worker.kill().await;
+                }
+                return Err(AgentError::LLM(format!("actor run dispatch failed: {e}")));
+            }
+
+            // Register as a live actor so send_message (running, no interrupt) can
+            // steer this child in-band over the existing WS connection. The guard
+            // unregisters on every exit path.
+            let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+            let live_guard = super::live::register(&job.child_session_id, live_tx);
+
+            let result = drive(
+                &mut *client,
+                &job.child_session_id,
+                self.approval_decider.as_ref(),
+                escalation.clone(),
+                &event_tx,
+                &cancel_token,
+                &mut live_rx,
+                // First-frame watchdog for EVERY placement: a wedged-but-connected
+                // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
+                // no first frame; without a deadline drive() blocks forever. Bounding it
+                // turns the "running-but-unresponsive" hang into a recoverable
+                // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
+                // on a fixed remote endpoint).
+                Some(WORKER_FIRST_FRAME_TIMEOUT),
+            )
+            .await;
+            // Unregister IMMEDIATELY: after drive returns nobody consumes live_rx,
+            // so a send_message landing in the close/park window below must see
+            // "not live" and take the durable-queue fallback instead of vanishing.
+            // (Even if one slipped in earlier, send_message also appends it to the
+            // durable transcript, so the next activation still rehydrates it.)
+            drop(live_guard);
+            // Close the parent link (dropping it closes our broker connection; the
+            // worker stays dialed-in + subscribed, ready for its next Run).
+            drop(client);
+
+            // No first frame ⇒ the worker is wedged. Recover ONCE before giving up:
+            //   - Local: reap the dead pooled worker + respawn.
+            //   - Schedulable: not ours to kill — drop it and re-select a live pool
+            //     member (a wedged worker must not fail the run when the pool has others).
+            //   - Remote: a FIXED endpoint has no alternative — fall through to a bounded
+            //     WorkerUnresponsive error (far better than the previous infinite hang).
+            if attempt == 0 && matches!(result, Err(AgentError::WorkerUnresponsive(_))) {
+                match kind {
+                    PlacementKind::Local => {
+                        tracing::warn!(
                         "actor child {} got no first frame; reaping the worker and respawning once",
                         job.child_session_id
                     );
-                    actor.worker.kill().await;
-                    attempt += 1;
-                    continue;
-                }
-                PlacementKind::Schedulable => {
-                    tracing::warn!(
+                        actor.worker.kill().await;
+                        attempt += 1;
+                        continue;
+                    }
+                    PlacementKind::Schedulable => {
+                        tracing::warn!(
                         "scheduled actor child {} got no first frame; re-selecting a pool worker",
                         job.child_session_id
                     );
-                    drop(actor);
-                    attempt += 1;
-                    continue;
+                        drop(actor);
+                        attempt += 1;
+                        continue;
+                    }
+                    PlacementKind::Remote => {}
                 }
-                PlacementKind::Remote => {}
             }
-        }
-        break (result, actor);
+            break (result, actor);
         };
 
         // Park the warm worker for reuse on a clean run, or kill it on
@@ -1396,9 +1411,7 @@ mod tests {
         async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
             Ok(())
         }
-        async fn next_frame(
-            &mut self,
-        ) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+        async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
             std::future::pending().await
         }
     }
@@ -1412,9 +1425,7 @@ mod tests {
         async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
             Ok(())
         }
-        async fn next_frame(
-            &mut self,
-        ) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+        async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
             if self.done {
                 std::future::pending().await
             } else {
@@ -1627,9 +1638,13 @@ mod tests {
         assert!(labeled.contains(r#""host":"mini""#), "{labeled}");
 
         // Schedulable → {kind:"remote", host:<node label, else pool>}.
-        let s =
-            placement_metadata(&Placement::Schedulable { pool: "explorers".into() }, Some("mini"))
-                .unwrap();
+        let s = placement_metadata(
+            &Placement::Schedulable {
+                pool: "explorers".into(),
+            },
+            Some("mini"),
+        )
+        .unwrap();
         assert!(s.contains(r#""kind":"remote""#), "{s}");
         assert!(s.contains(r#""host":"mini""#), "{s}");
 
@@ -1729,7 +1744,6 @@ mod tests {
 
     // ---- #181 (P2b): schedulable placement routing --------------------------
 
-
     /// A bogus-worker_bin runner carrying SCHEDULABLE placements (and optionally
     /// remote ones, to test precedence). A local spawn here would fail on
     /// `/bin/false`, so a passing schedulable test proves no subprocess spawned.
@@ -1751,8 +1765,14 @@ mod tests {
         .with_schedulable_placements(sched)
     }
 
-    fn sched_placement(pool: &str, _registry_url: impl Into<String>) -> ResolvedSchedulablePlacement {
-        ResolvedSchedulablePlacement { pool: pool.into(), host_label: None }
+    fn sched_placement(
+        pool: &str,
+        _registry_url: impl Into<String>,
+    ) -> ResolvedSchedulablePlacement {
+        ResolvedSchedulablePlacement {
+            pool: pool.into(),
+            host_label: None,
+        }
     }
 
     #[test]
@@ -1837,7 +1857,9 @@ mod tests {
         );
         let runner = bogus_runner(remote);
         let spec = runner.build_spec(&session_of_role("explorer", "go"), &job_for("c1"));
-        let stamp = runner.placement_stamp_for(&spec).expect("remote child is stamped");
+        let stamp = runner
+            .placement_stamp_for(&spec)
+            .expect("remote child is stamped");
         assert!(stamp.contains(r#""kind":"remote""#), "{stamp}");
         assert!(stamp.contains(r#""host":"mini""#), "{stamp}");
 
@@ -1854,11 +1876,10 @@ mod tests {
         );
         let r2 = bogus_runner(remote_nolabel);
         let spec2 = r2.build_spec(&session_of_role("explorer", "go"), &job_for("c1"));
-        assert!(
-            r2.placement_stamp_for(&spec2)
-                .unwrap()
-                .contains(r#""host":"169.254.230.101""#)
-        );
+        assert!(r2
+            .placement_stamp_for(&spec2)
+            .unwrap()
+            .contains(r#""host":"169.254.230.101""#));
 
         // Schedulable WITH a node label → {remote, <label>} (a node, not a pool name).
         let mut sched = HashMap::new();
@@ -1871,7 +1892,9 @@ mod tests {
         );
         let sr = bogus_sched_runner(HashMap::new(), sched);
         let spec3 = sr.build_spec(&session_of_role("mac-mini-monitor", "go"), &job_for("c1"));
-        let stamp3 = sr.placement_stamp_for(&spec3).expect("scheduled child is stamped");
+        let stamp3 = sr
+            .placement_stamp_for(&spec3)
+            .expect("scheduled child is stamped");
         assert!(stamp3.contains(r#""kind":"remote""#), "{stamp3}");
         assert!(stamp3.contains(r#""host":"mini""#), "{stamp3}");
 
@@ -1995,7 +2018,10 @@ mod tests {
         // when execute_external_child resolves it (serve_executor connects async).
         let mut probe = bamboo_broker::BrokerClient::connect(
             &endpoint,
-            bamboo_subagent::AgentRef { session_id: "probe".into(), role: None },
+            bamboo_subagent::AgentRef {
+                session_id: "probe".into(),
+                role: None,
+            },
             "t",
         )
         .await
@@ -2027,7 +2053,10 @@ mod tests {
             },
         );
         let runner = bogus_sched_runner(HashMap::new(), sched).with_bus(Some(
-            bamboo_subagent::BusEndpoint { endpoint: endpoint.clone(), token: "t".into() },
+            bamboo_subagent::BusEndpoint {
+                endpoint: endpoint.clone(),
+                token: "t".into(),
+            },
         ));
 
         let mut session = session_of_role("mac-mini-monitor", "hello scheduled");

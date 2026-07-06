@@ -1243,4 +1243,3 @@ async fn root_password_throttle_does_not_block_code_path() {
         "code path must be unaffected by the root-password throttle"
     );
 }
-

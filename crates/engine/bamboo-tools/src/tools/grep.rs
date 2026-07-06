@@ -514,12 +514,15 @@ mod tests {
             .unwrap();
 
         let tool = GrepTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "pattern": "needle",
                 "path": dir.path()
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         assert!(result.success);
         let lines = result_lines(&result);
@@ -536,15 +539,18 @@ mod tests {
             .unwrap();
 
         let tool = GrepTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "pattern": "needle",
                 "path": file,
                 "output_mode": "content",
                 "-C": 1,
                 "-n": true
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         let output = result.result;
         assert!(output.contains(":2:two"));
@@ -565,15 +571,18 @@ mod tests {
         tokio::fs::write(&file_txt, "foo\n").await.unwrap();
 
         let tool = GrepTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "pattern": "foo",
                 "path": dir.path(),
                 "output_mode": "count",
                 "type": "rust",
                 "head_limit": 1
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         let lines = non_partial_lines(&result);
         assert_eq!(lines.len(), 1);
@@ -593,15 +602,18 @@ mod tests {
             .unwrap();
 
         let tool = GrepTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "pattern": "hello\\s+world",
                 "path": dir.path(),
                 "glob": "**/one.rs",
                 "-i": true,
                 "multiline": true
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         let output = result.result;
         assert!(output.contains("one.rs"));
@@ -611,12 +623,15 @@ mod tests {
     #[tokio::test]
     async fn grep_content_mode_requires_scope_hint() {
         let tool = GrepTool::new();
-        let error = run(&tool,json!({
+        let error = run(
+            &tool,
+            json!({
                 "pattern": "needle",
                 "output_mode": "content"
-            }))
-            .await
-            .expect_err("content mode without scope should fail");
+            }),
+        )
+        .await
+        .expect_err("content mode without scope should fail");
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
         assert!(error.to_string().contains(SEARCH_SCOPE_TOO_BROAD_ERROR));
@@ -625,25 +640,31 @@ mod tests {
     #[tokio::test]
     async fn grep_multiline_requires_explicit_narrowed_path() {
         let tool = GrepTool::new();
-        let error = run(&tool,json!({
+        let error = run(
+            &tool,
+            json!({
                 "pattern": "a\\s+b",
                 "multiline": true
-            }))
-            .await
-            .expect_err("multiline without path should fail");
+            }),
+        )
+        .await
+        .expect_err("multiline without path should fail");
         assert!(matches!(error, ToolError::InvalidArguments(_)));
         assert!(error
             .to_string()
             .contains(MULTILINE_REQUIRES_NARROWED_PATH_ERROR));
 
         let cwd = std::env::current_dir().unwrap();
-        let error = run(&tool,json!({
+        let error = run(
+            &tool,
+            json!({
                 "pattern": "a\\s+b",
                 "multiline": true,
                 "path": cwd
-            }))
-            .await
-            .expect_err("multiline at workspace root should fail");
+            }),
+        )
+        .await
+        .expect_err("multiline at workspace root should fail");
         assert!(matches!(error, ToolError::InvalidArguments(_)));
         assert!(error
             .to_string()
@@ -659,12 +680,15 @@ mod tests {
         }
 
         let tool = GrepTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "pattern": "needle",
                 "path": dir.path()
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         let lines = non_partial_lines(&result);
         assert_eq!(lines.len(), 200);
@@ -682,12 +706,15 @@ mod tests {
         tokio::fs::write(&file, content).await.unwrap();
 
         let tool = GrepTool::new();
-        let error = run(&tool,json!({
+        let error = run(
+            &tool,
+            json!({
                 "pattern": "needle",
                 "path": file
-            }))
-            .await
-            .expect_err("should reject oversized results");
+            }),
+        )
+        .await
+        .expect_err("should reject oversized results");
 
         assert!(matches!(error, ToolError::Execution(_)));
         assert!(error.to_string().contains(RESULT_TOO_LARGE_ERROR));

@@ -608,7 +608,10 @@ pub struct Config {
     /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
     /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
     /// ⇒ empty. SSH secrets are encrypted at rest (see [`crate::cluster_fabric`]).
-    #[serde(default, skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty"
+    )]
     pub cluster_fabric: crate::cluster_fabric::ClusterFabricConfig,
 
     /// MCP server configuration.
@@ -2007,32 +2010,22 @@ impl Config {
     /// Update the global env vars cache (called on config load / reload).
     pub fn publish_env_vars(&self) {
         let map = self.env_vars_as_map();
-        let mut env_guard = env_vars_cache()
-            .write()
-            .recover_poison();
+        let mut env_guard = env_vars_cache().write().recover_poison();
         *env_guard = map;
 
         let prompt_safe = self.prompt_safe_env_vars();
-        let mut prompt_guard = prompt_safe_env_vars_cache()
-            .write()
-            .recover_poison();
+        let mut prompt_guard = prompt_safe_env_vars_cache().write().recover_poison();
         *prompt_guard = prompt_safe;
     }
 
     /// Read the current env vars snapshot (called by Bash tool at process spawn time).
     pub fn current_env_vars() -> HashMap<String, String> {
-        env_vars_cache()
-            .read()
-            .recover_poison()
-            .clone()
+        env_vars_cache().read().recover_poison().clone()
     }
 
     /// Read the current prompt-safe env var snapshot (names + metadata only; no secret values).
     pub fn current_prompt_safe_env_vars() -> Vec<PromptSafeEnvVarEntry> {
-        prompt_safe_env_vars_cache()
-            .read()
-            .recover_poison()
-            .clone()
+        prompt_safe_env_vars_cache().read().recover_poison().clone()
     }
 
     /// Create a default configuration without loading from file
@@ -3958,7 +3951,13 @@ mod tests {
         });
         config.refresh_broker_token_encrypted().unwrap();
         assert_eq!(
-            config.subagents.broker.as_ref().unwrap().token_encrypted.as_deref(),
+            config
+                .subagents
+                .broker
+                .as_ref()
+                .unwrap()
+                .token_encrypted
+                .as_deref(),
             Some("existing-cipher"),
         );
     }

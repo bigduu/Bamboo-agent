@@ -156,10 +156,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_status() {
         let tool = UpdateGoalTool::new();
-        assert!(tool
-            .invoke(json!({}), ToolCtx::none("t"))
-            .await
-            .is_err());
+        assert!(tool.invoke(json!({}), ToolCtx::none("t")).await.is_err());
     }
 
     #[test]

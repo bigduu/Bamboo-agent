@@ -215,7 +215,10 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             web::post().to(settings::set_default_provider_instance),
         )
         // ── Cluster Fabric: nodes & clusters ──────────────────────────
-        .route("/bamboo/settings/nodes", web::get().to(settings::list_nodes))
+        .route(
+            "/bamboo/settings/nodes",
+            web::get().to(settings::list_nodes),
+        )
         .route(
             "/bamboo/settings/nodes",
             web::post().to(settings::create_node),

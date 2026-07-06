@@ -586,9 +586,11 @@ impl Session {
     /// current model) before any reader — don't call this expecting model-freshness
     /// without a preceding same-round resolve. (#180)
     pub fn effective_token_budget(&self) -> Option<&TokenBudget> {
-        self.token_budget
-            .as_ref()
-            .or_else(|| self.resolved_token_budget.as_ref().map(|(_, budget)| budget))
+        self.token_budget.as_ref().or_else(|| {
+            self.resolved_token_budget
+                .as_ref()
+                .map(|(_, budget)| budget)
+        })
     }
 
     pub fn new(id: impl Into<String>, model: impl Into<String>) -> Self {

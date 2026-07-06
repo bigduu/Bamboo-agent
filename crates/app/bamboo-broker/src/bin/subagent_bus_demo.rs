@@ -15,7 +15,10 @@ async fn main() {
     let spec = ProvisionSpec::read_from_stdin()
         .await
         .expect("read ProvisionSpec from stdin");
-    let bus = spec.bus.as_ref().expect("spec.bus must be set for this worker");
+    let bus = spec
+        .bus
+        .as_ref()
+        .expect("spec.bus must be set for this worker");
     let me = AgentRef {
         session_id: spec.identity.child_id.clone(),
         role: Some(spec.identity.role.clone()),

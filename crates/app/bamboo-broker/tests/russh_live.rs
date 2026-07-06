@@ -66,16 +66,12 @@ async fn russh_deploys_through_reverse_tunnel() {
     tokio::fs::write(&local, script).await.expect("write probe");
 
     // 3. Deploy via russh (TOFU host key, password auth, SFTP upload, tunnel).
-    let deployer = RusshDeployer::new(
-        host,
-        port,
-        user,
-        RusshAuth::Password(pass),
-    )
-    .with_upload(Some(UploadSpec {
-        local_path: local.to_string_lossy().to_string(),
-        remote_path: "/home/deploy/bamboo-probe".to_string(),
-    }));
+    let deployer = RusshDeployer::new(host, port, user, RusshAuth::Password(pass)).with_upload(
+        Some(UploadSpec {
+            local_path: local.to_string_lossy().to_string(),
+            remote_path: "/home/deploy/bamboo-probe".to_string(),
+        }),
+    );
 
     let deployment = AgentDeployment {
         id: "node-russhtest".to_string(),
@@ -102,7 +98,9 @@ async fn russh_deploys_through_reverse_tunnel() {
     // 5. TOFU recorded a fingerprint.
     let fp = deployer.observed_fingerprint().await;
     assert!(
-        fp.as_deref().map(|s| s.starts_with("SHA256:")).unwrap_or(false),
+        fp.as_deref()
+            .map(|s| s.starts_with("SHA256:"))
+            .unwrap_or(false),
         "host-key fingerprint should be recorded, got: {fp:?}"
     );
 

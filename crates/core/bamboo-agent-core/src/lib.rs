@@ -24,15 +24,14 @@ pub use bamboo_domain::{
 };
 pub use storage::Storage;
 pub use tools::{
-    AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
-    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
-};
-pub use tools::{
-    BashCompletionInfo, BashCompletionSink,
     classify_tool, execute_tool_call, finalize_tool_calls, handle_tool_result_with_agentic_support,
     normalize_tool_name, parse_tool_args, parse_tool_args_best_effort, try_parse_agentic_result,
-    AgenticContext, AgenticTool, AgenticToolResult, FunctionCall, FunctionSchema, RegistryError,
-    SharedTool, SmartCodeReviewTool, Tool, ToolCall, ToolCallAccumulator, ToolError,
-    ToolExecutionContext, ToolExecutor, ToolGoal, ToolHandlingOutcome, ToolMutability,
-    ToolRegistry, ToolResult, ToolResultImage, ToolSchema,
+    AgenticContext, AgenticTool, AgenticToolResult, BashCompletionInfo, BashCompletionSink,
+    FunctionCall, FunctionSchema, RegistryError, SharedTool, SmartCodeReviewTool, Tool, ToolCall,
+    ToolCallAccumulator, ToolError, ToolExecutionContext, ToolExecutor, ToolGoal,
+    ToolHandlingOutcome, ToolMutability, ToolRegistry, ToolResult, ToolResultImage, ToolSchema,
+};
+pub use tools::{
+    AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
+    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
 };

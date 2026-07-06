@@ -694,12 +694,15 @@ mod tests {
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar"
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(result.is_err());
     }
@@ -710,14 +713,17 @@ mod tests {
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar",
                 "replace_all": true
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         assert!(result.success);
         let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
@@ -730,13 +736,16 @@ mod tests {
         tokio::fs::write(file.path(), "a\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "aa",
                 "new_string": "bb",
                 "replace_all": true
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(matches!(
             result,
@@ -756,13 +765,16 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar",
                 "replace_all": true
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("replace_all would modify"))
@@ -775,13 +787,16 @@ mod tests {
         tokio::fs::write(file.path(), "a\na\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "a",
                 "new_string": "b",
                 "replace_all": true
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("non-whitespace characters"))
@@ -794,13 +809,16 @@ mod tests {
         tokio::fs::write(file.path(), "  \n  \n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "  ",
                 "new_string": "x",
                 "replace_all": true
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("non-whitespace characters") || msg.contains("non-empty line"))
@@ -889,13 +907,16 @@ mod tests {
         tokio::fs::write(file.path(), "hello").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "",
                 "new_string": "x",
                 "replace_all": true
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
@@ -908,13 +929,16 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "alpha\nbeta\n",
                 "new_string": "gamma\ndelta\n"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         assert!(result.success);
         let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
@@ -929,14 +953,17 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "baz",
                 "line_number": 3
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
         assert!(result.success);
 
         let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
@@ -951,13 +978,16 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "baz",
                 "line_number": 2
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("did not match any old_string candidate"))
@@ -970,14 +1000,17 @@ mod tests {
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "foo",
                 "new_string": "bar",
                 "replace_all": true,
                 "line_number": 1
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("line_number cannot be combined"))
@@ -1036,13 +1069,16 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "line_number": 2,
                 "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
         assert!(result.success);
 
         let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
@@ -1057,12 +1093,15 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "line_number": 2,
                 "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("did not match any SEARCH candidate"))
@@ -1077,11 +1116,14 @@ mod tests {
             .unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("matched 2 times"))
@@ -1106,11 +1148,14 @@ mod tests {
         let patch = format!("<<<<<<< SEARCH\n{old_block}\n=======\n{new_block}\n>>>>>>> REPLACE");
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "patch": patch
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("exceeding the safe limit"))
@@ -1123,13 +1168,16 @@ mod tests {
         tokio::fs::write(file.path(), "hello").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "hello",
                 "new_string": "world",
                 "patch": "<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE"
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cannot be combined"))
@@ -1142,15 +1190,18 @@ mod tests {
         tokio::fs::write(file.path(), "hello").await.unwrap();
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "old_string": "",
                 "new_string": "",
                 "replace_all": false,
                 "patch": "<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
 
         assert!(result.success);
         let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
@@ -1164,11 +1215,14 @@ mod tests {
         let huge = "a".repeat(MAX_PATCH_BYTES + 1);
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "patch": huge
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("max size"))
@@ -1185,11 +1239,14 @@ mod tests {
         }
 
         let tool = EditTool::new();
-        let result = run(&tool,json!({
+        let result = run(
+            &tool,
+            json!({
                 "file_path": file.path(),
                 "patch": patch
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("max block count"))

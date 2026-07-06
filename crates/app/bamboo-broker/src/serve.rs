@@ -399,7 +399,9 @@ where
         }
         if let Ok(outcome) = outcome_rx.await {
             let body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
-            let _ = deliver.deliver(&parent_fwd, emit(InboxKind::Outcome, body)).await;
+            let _ = deliver
+                .deliver(&parent_fwd, emit(InboxKind::Outcome, body))
+                .await;
         }
     });
 
@@ -1120,7 +1122,10 @@ mod tests {
         let mut gpu = q.list_connected("gpu-pool").await.unwrap();
         gpu.sort();
         assert_eq!(gpu, vec!["w1".to_string(), "w2".to_string()]);
-        assert_eq!(q.list_connected("cpu-pool").await.unwrap(), vec!["w3".to_string()]);
+        assert_eq!(
+            q.list_connected("cpu-pool").await.unwrap(),
+            vec!["w3".to_string()]
+        );
         assert!(q.list_connected("none").await.unwrap().is_empty());
     }
 }

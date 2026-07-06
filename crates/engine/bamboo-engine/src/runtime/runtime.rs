@@ -505,10 +505,7 @@ impl ExecuteRequestBuilder {
 
     /// Set the late-bound bash completion sink (crate-visible; wired by the
     /// server so a completed background shell's result is pushed into the loop).
-    pub(crate) fn bash_completion_sink(
-        mut self,
-        v: Option<Arc<dyn BashCompletionSink>>,
-    ) -> Self {
+    pub(crate) fn bash_completion_sink(mut self, v: Option<Arc<dyn BashCompletionSink>>) -> Self {
         self.bash_completion_sink = v;
         self
     }

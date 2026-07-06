@@ -60,7 +60,11 @@ impl Tool for SleepTool {
         })
     }
 
-    async fn invoke(&self, args: serde_json::Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: SleepArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid sleep args: {e}")))?;
 
@@ -142,7 +146,9 @@ mod tests {
     #[tokio::test]
     async fn sleep_tool_rejects_negative_seconds() {
         let tool = SleepTool::new();
-        let result = tool.invoke(json!({"seconds": -1.0}), ToolCtx::none("t")).await;
+        let result = tool
+            .invoke(json!({"seconds": -1.0}), ToolCtx::none("t"))
+            .await;
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)));

@@ -114,19 +114,14 @@ fn default_true() -> bool {
 }
 
 /// Where a node lives. `remote = local + {ssh connect, upload, reverse tunnel}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodePlacement {
     /// localhost → `LocalProcessDeployer`; no ssh/upload/tunnel.
+    #[default]
     Local,
     /// remote → russh/system-ssh deployer + binary upload + reverse tunnel.
     Ssh(SshTarget),
-}
-
-impl Default for NodePlacement {
-    fn default() -> Self {
-        NodePlacement::Local
-    }
 }
 
 /// Trust posture for credential handling (RFC v2 §7).
@@ -279,7 +274,12 @@ impl Config {
                     password,
                     password_encrypted,
                 } => {
-                    hydrate_field(password, password_encrypted.as_deref(), &node.id, "password");
+                    hydrate_field(
+                        password,
+                        password_encrypted.as_deref(),
+                        &node.id,
+                        "password",
+                    );
                 }
                 SshAuth::PrivateKey {
                     private_key,
@@ -520,7 +520,10 @@ mod tests {
         let SshAuth::Password { password, .. } = &t.auth else {
             panic!("expected password auth");
         };
-        assert_eq!(password, "secret", "ciphertext preserved across empty refresh");
+        assert_eq!(
+            password, "secret",
+            "ciphertext preserved across empty refresh"
+        );
     }
 
     #[test]

@@ -673,10 +673,7 @@ impl PermissionConfig {
 
     /// Get the minimum risk level that requires confirmation.
     pub fn confirm_threshold(&self) -> RiskLevel {
-        *self
-            .confirm_threshold
-            .read()
-            .recover_poison()
+        *self.confirm_threshold.read().recover_poison()
     }
 
     /// Set the minimum risk level that requires confirmation.
@@ -685,10 +682,7 @@ impl PermissionConfig {
     /// explicit rule or session grant matches. For example, `High` means only
     /// high-risk operations (execute command, delete, git write, terminal) ask.
     pub fn set_confirm_threshold(&self, threshold: RiskLevel) {
-        *self
-            .confirm_threshold
-            .write()
-            .recover_poison() = threshold;
+        *self.confirm_threshold.write().recover_poison() = threshold;
     }
 
     /// Replace the "always ask" rules from a list of pattern strings (e.g.
@@ -955,19 +949,8 @@ impl PermissionConfig {
         merged.set_enabled(other.is_enabled());
 
         // "Always ask" rules: union of both, other's appended after self's.
-        let mut ask_rules = self
-            .ask_rules
-            .read()
-            .recover_poison()
-            .clone();
-        ask_rules.extend(
-            other
-                .ask_rules
-                .read()
-                .recover_poison()
-                .iter()
-                .cloned(),
-        );
+        let mut ask_rules = self.ask_rules.read().recover_poison().clone();
+        ask_rules.extend(other.ask_rules.read().recover_poison().iter().cloned());
         *merged.ask_rules.write().recover_poison() = ask_rules;
 
         merged

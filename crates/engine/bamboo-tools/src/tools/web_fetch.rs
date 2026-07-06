@@ -141,7 +141,11 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn invoke(&self, args: serde_json::Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let parsed: WebFetchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid WebFetch args: {}", e)))?;
         let url = parsed.url.trim();

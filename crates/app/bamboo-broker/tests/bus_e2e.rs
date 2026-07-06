@@ -92,7 +92,10 @@ async fn runner_style_child_run_over_the_bus_with_a_real_subprocess() {
         }
     }
 
-    assert!(events >= 1, "expected streamed events from the subprocess, got {events}");
+    assert!(
+        events >= 1,
+        "expected streamed events from the subprocess, got {events}"
+    );
     let (status, result) = terminal.expect("a terminal frame");
     assert_eq!(status, TerminalStatus::Completed);
     assert_eq!(result.as_deref(), Some("echo: ping pong"));
