@@ -1975,6 +1975,9 @@ impl MemoryStore {
                     created_at: doc.frontmatter.created_at.clone(),
                     summary: derive_summary(&doc.body, 240),
                     granularity: doc.frontmatter.granularity,
+                    // L1: populated at index-build time once a MemoryEmbedder backend
+                    // is wired; None today → recall stays pure BM25 (inert seam).
+                    embedding: None,
                 })
                 .collect(),
         };
