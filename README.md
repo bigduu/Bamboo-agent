@@ -157,7 +157,8 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
 | `bamboo config [--path] [--show-secrets]` | Inspect the resolved configuration. |
 | `bamboo config set <key> <value>` | Set one value, e.g. `providers.anthropic.api_key`, `providers.<p>.model`, or `provider`. |
-| `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Optional `-s <session>` to continue, `-m provider:model` to pin the model, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
+| `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Use `-p -` to read the prompt from stdin. Optional `-s <session>` to continue, `-m provider:model` to pin the model, `--reasoning-effort <low\|medium\|high\|xhigh>`, `--skill-mode <mode>`, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
+| `bamboo completions <shell>` | Print a shell completion script (`bash`/`zsh`/`fish`/`powershell`/`elvish`), e.g. `bamboo completions zsh > ~/.zfunc/_bamboo`. |
 | `bamboo actor run\|serve\|list\|call` | Drive the sub-agent actor fabric from the terminal (spawn + stream, run as a service, discover, or send a task). |
 | `bamboo broker serve` | Run the standalone sub-agent message broker (WebSocket bus over durable mailboxes). |
 | `bamboo broker-agent serve` | Run a broker-connected agent (local / Docker / remote) that answers Ask/Task for its mailbox. |
@@ -167,6 +168,8 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo stop <session_id>` | Stop a running session's agent loop. |
 
 The admin commands (`health` / `status` / `sessions` / `stop`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
+
+A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present).
 
 **Defaults** (verified against code):
 
