@@ -48,7 +48,7 @@ actix-files = "0.6"
 # gives a non-actor WS upgrade (`actix_ws::handle`) returning an owned
 # `Session` + `MessageStream` we drive from a spawned task. 0.3 targets the
 # resolved actix-web 4 / actix-http 3 line.
-actix-ws = "0.3"
+actix-ws = "0.4"
 
 # v2 TLS termination (#181): load PEM cert/key and build a rustls ServerConfig.
 # Pin the `ring` crypto provider explicitly so the builder never relies on a
