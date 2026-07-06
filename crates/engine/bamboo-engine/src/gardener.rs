@@ -11,7 +11,7 @@
 //! near-duplicates) is produced for free by `MemoryStore` scan methods.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -431,42 +431,108 @@ async fn run_dedup_gardener_once_with_store(
     Ok(Some(result))
 }
 
-/// Spawn the recurring gardener loop. No-op cost when disabled: each tick reads
-/// config and returns immediately if neither gardener pass is enabled.
+/// How often the gardener loop polls for the volume trigger. Kept short relative
+/// to the (typically daily) time interval so library growth is caught within
+/// minutes, not a full interval. Each poll is a cheap count + a config read; the
+/// actual passes only run when the time or volume condition fires.
+const GARDENER_VOLUME_POLL_SECS: u64 = 300;
+
+/// Decide whether the gardener maintenance pass should run on this poll: on the
+/// time interval, OR early once the library has grown by `volume_trigger` memories
+/// since the last run (L4). `volume_trigger == 0` disables the volume trigger
+/// (time-only). Pure so the trigger logic is unit-testable without wall-clock.
+fn should_run_gardener_pass(
+    elapsed_secs: u64,
+    interval_secs: u64,
+    current_count: usize,
+    last_run_count: usize,
+    volume_trigger: usize,
+) -> bool {
+    if elapsed_secs >= interval_secs {
+        return true;
+    }
+    volume_trigger > 0 && current_count.saturating_sub(last_run_count) >= volume_trigger
+}
+
+/// Run both gardener passes in order. Blob remediation first, then dedup: splitting
+/// a blob can expose fresh duplicates, and superseded blob sources drop out of the
+/// dedup scan.
+async fn run_gardener_passes(ctx: &AutoDreamContext) {
+    if let Err(error) = run_gardener_once(ctx).await {
+        tracing::warn!(
+            target: GARDENER_TRACING_TARGET,
+            event = "run_failed",
+            "[gardener] run failed: {}",
+            error
+        );
+    }
+    if let Err(error) = run_dedup_gardener_once(ctx).await {
+        tracing::warn!(
+            target: GARDENER_TRACING_TARGET,
+            event = "dedup_run_failed",
+            "[dedup-gardener] run failed: {}",
+            error
+        );
+    }
+}
+
+/// Spawn the recurring gardener loop. Time- AND volume-triggered (L4): it polls on
+/// a short cadence and runs the passes when either the configured interval elapsed
+/// or enough new memories accumulated since the last run. No-op cost when disabled:
+/// each pass reads config and returns immediately if its gardener is off, and the
+/// poll itself is just a cheap topic-file count.
 pub fn spawn_gardener_task(ctx: AutoDreamContext) {
     tokio::spawn(async move {
-        let interval_secs = ctx
-            .config
-            .read()
-            .await
-            .memory
-            .as_ref()
-            .map(|memory| memory.gardener_interval_secs)
-            .filter(|secs| *secs > 0)
-            // Fall back to the config default (single source of truth for "daily")
-            // when memory config is absent or the interval was set to 0.
-            .unwrap_or_else(|| bamboo_config::MemoryConfig::default().gardener_interval_secs);
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        let (interval_secs, volume_trigger) = {
+            let guard = ctx.config.read().await;
+            let memory = guard.memory.as_ref();
+            let interval_secs = memory
+                .map(|memory| memory.gardener_interval_secs)
+                .filter(|secs| *secs > 0)
+                // Fall back to the config default (single source of truth for
+                // "daily") when memory config is absent or the interval was 0.
+                .unwrap_or_else(|| bamboo_config::MemoryConfig::default().gardener_interval_secs);
+            let volume_trigger = memory
+                .map(|memory| memory.gardener_volume_trigger)
+                .unwrap_or_else(|| bamboo_config::MemoryConfig::default().gardener_volume_trigger);
+            (interval_secs, volume_trigger)
+        };
+        // Poll frequently enough to catch volume growth, but never longer than the
+        // time interval itself.
+        let poll_secs = GARDENER_VOLUME_POLL_SECS.min(interval_secs.max(1));
+
+        let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+        let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs));
+        let mut last_run = Instant::now();
+        let mut last_run_count = memory.count_all_memories().await.unwrap_or(0);
+        // Run once on startup (the first `interval` tick fired immediately before
+        // this change), then let the time/volume conditions drive it.
+        let mut force_first = true;
+
         loop {
             ticker.tick().await;
-            // Blob remediation first, then dedup: splitting a blob can expose fresh
-            // duplicates, and superseded blob sources drop out of the dedup scan.
-            if let Err(error) = run_gardener_once(&ctx).await {
-                tracing::warn!(
-                    target: GARDENER_TRACING_TARGET,
-                    event = "run_failed",
-                    "[gardener] run failed: {}",
-                    error
-                );
+            let current_count = memory.count_all_memories().await.unwrap_or(last_run_count);
+            let elapsed_secs = last_run.elapsed().as_secs();
+            if !force_first
+                && !should_run_gardener_pass(
+                    elapsed_secs,
+                    interval_secs,
+                    current_count,
+                    last_run_count,
+                    volume_trigger,
+                )
+            {
+                continue;
             }
-            if let Err(error) = run_dedup_gardener_once(&ctx).await {
-                tracing::warn!(
-                    target: GARDENER_TRACING_TARGET,
-                    event = "dedup_run_failed",
-                    "[dedup-gardener] run failed: {}",
-                    error
-                );
-            }
+            force_first = false;
+            run_gardener_passes(&ctx).await;
+            last_run = Instant::now();
+            // Re-baseline the count AFTER the pass so the gardener's own file writes
+            // don't re-trigger it. Superseded/archived sources are kept as tombstone
+            // files, so a split or a dedup-consolidation actually GROWS the topic-file
+            // count (a new canonical is written, sources retained); only a hard purge
+            // shrinks it. Re-baselining absorbs all of that.
+            last_run_count = memory.count_all_memories().await.unwrap_or(current_count);
         }
     });
 }
@@ -486,6 +552,24 @@ mod tests {
     use bamboo_llm::{LLMError, LLMStream, ProviderRegistry};
     use bamboo_memory::memory_store::DurableMemoryType;
     use bamboo_storage::SessionStoreV2;
+
+    #[test]
+    fn gardener_trigger_fires_on_time_or_volume() {
+        // Time trigger: elapsed >= interval fires regardless of growth.
+        assert!(should_run_gardener_pass(86_400, 86_400, 0, 0, 25));
+        assert!(should_run_gardener_pass(90_000, 86_400, 5, 5, 25));
+        // Not yet due and not enough growth → no run.
+        assert!(!should_run_gardener_pass(60, 86_400, 30, 20, 25));
+        // Volume trigger: grew by >= threshold before the interval → early run.
+        assert!(should_run_gardener_pass(60, 86_400, 45, 20, 25));
+        assert!(should_run_gardener_pass(60, 86_400, 25, 0, 25));
+        // Growth below the threshold → no run.
+        assert!(!should_run_gardener_pass(60, 86_400, 44, 20, 25));
+        // volume_trigger == 0 disables the volume trigger (time-only).
+        assert!(!should_run_gardener_pass(60, 86_400, 10_000, 0, 0));
+        // Count shrinking (e.g. after a dedup) never underflows into a trigger.
+        assert!(!should_run_gardener_pass(60, 86_400, 5, 100, 25));
+    }
 
     #[derive(Clone)]
     struct CannedProvider {
@@ -605,7 +689,15 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
-        let config = Arc::new(RwLock::new(Config::default()));
+        // Gardener is ON by default (L4), so disable it explicitly to test the
+        // disabled path.
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(bamboo_config::MemoryConfig {
+                gardener_enabled: false,
+                ..bamboo_config::MemoryConfig::default()
+            }),
+            ..Config::default()
+        }));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
         let ctx = AutoDreamContext {
             session_store,
@@ -707,7 +799,14 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
-        let config = Arc::new(RwLock::new(Config::default()));
+        // Dedup gardener is ON by default (L4); disable it explicitly here.
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(bamboo_config::MemoryConfig {
+                dedup_gardener_enabled: false,
+                ..bamboo_config::MemoryConfig::default()
+            }),
+            ..Config::default()
+        }));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
         let ctx = AutoDreamContext {
             session_store,

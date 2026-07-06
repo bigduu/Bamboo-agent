@@ -343,7 +343,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
 }
 
 #[tokio::test]
-async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
+async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
     let temp_dir = tempfile::tempdir().unwrap();
     bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
     let state = AppState::new(temp_dir.path().to_path_buf())
@@ -364,9 +364,9 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                     "action": "write",
                     "scope": "project",
                     "type": "project",
-                    "title": "Release freeze begins next week",
-                    "content": "Merge freeze begins on Tuesday for mobile release cut.",
-                    "tags": ["release", "freeze"],
+                    "title": "Prod deploy uses blue-green with a 10 minute soak",
+                    "content": "Production deploys use a blue-green strategy with a ten minute soak window.",
+                    "tags": ["deploy"],
                     "options": { "allow_merge_if_similar": false }
                 }),
             ),
@@ -395,9 +395,9 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                     "action": "write",
                     "scope": "project",
                     "type": "project",
-                    "title": "Mobile release freeze starts Tuesday",
-                    "content": "Stakeholders confirmed the mobile release freeze starts Tuesday.",
-                    "tags": ["mobile", "release"],
+                    "title": "Prod deploy uses blue-green with a 10 minute soak window",
+                    "content": "Production deploy uses blue-green with a 10 minute soak before cutover.",
+                    "tags": ["deploy"],
                     "options": { "allow_merge_if_similar": true }
                 }),
             ),

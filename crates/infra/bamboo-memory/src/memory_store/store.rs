@@ -1849,6 +1849,42 @@ impl MemoryStore {
         Ok(docs)
     }
 
+    /// Cheap count of durable-memory topic files in one scope — a readdir with no
+    /// parse (unlike [`Self::list_memory_documents`]). Counts every `.md` topic
+    /// regardless of status; it is a growth signal, not a recall count.
+    pub async fn count_scope_memories(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<usize> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let topic_dir = self.resolver.topic_dir(scope, project_key);
+        if !topic_dir.exists() {
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        let mut entries = fs::read_dir(topic_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().extension().is_some_and(|ext| ext == "md") {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Total durable-memory count across the global scope and every project scope
+    /// (cheap; no parse). Used by the volume-triggered maintenance pass (L4) to
+    /// detect library growth between time ticks.
+    pub async fn count_all_memories(&self) -> io::Result<usize> {
+        let mut total = self.count_scope_memories(MemoryScope::Global, None).await?;
+        for key in self.list_project_keys().await.unwrap_or_default() {
+            total += self
+                .count_scope_memories(MemoryScope::Project, Some(&key))
+                .await?;
+        }
+        Ok(total)
+    }
+
     /// Classify how an incoming write relates to the scope's existing memories,
     /// using IDF-weighted cosine over field-weighted token bags (L2). Retires the
     /// old raw count-overlap gate: a common shared keyword no longer counts as much
@@ -3307,6 +3343,61 @@ mod tests {
         );
         // Idempotent: the body wasn't doubled.
         assert_eq!(docs[0].body.matches(body).count(), 1);
+    }
+
+    /// L4: `count_all_memories` sums topic files across global + project scopes
+    /// cheaply, so the volume-triggered maintenance pass can detect growth.
+    #[tokio::test]
+    async fn count_all_memories_sums_across_scopes() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        assert_eq!(store.count_all_memories().await.unwrap(), 0);
+
+        let write = |scope, project_key: Option<&'static str>, title: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .write_memory(
+                        scope,
+                        project_key,
+                        if matches!(scope, MemoryScope::Global) {
+                            DurableMemoryType::Reference
+                        } else {
+                            DurableMemoryType::Project
+                        },
+                        title,
+                        "body content for the memory",
+                        &[],
+                        Some("s"),
+                        "m",
+                        false,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        write(MemoryScope::Global, None, "Global fact one").await;
+        write(MemoryScope::Global, None, "Global fact two").await;
+        write(MemoryScope::Project, Some("proj-a"), "Project A fact").await;
+        write(MemoryScope::Project, Some("proj-b"), "Project B fact").await;
+
+        assert_eq!(
+            store
+                .count_scope_memories(MemoryScope::Global, None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .count_scope_memories(MemoryScope::Project, Some("proj-a"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.count_all_memories().await.unwrap(), 4);
     }
 
     /// Many `MemoryStore` instances pointed at the SAME data dir (the real

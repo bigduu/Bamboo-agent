@@ -152,8 +152,11 @@ pub struct MemoryConfig {
     /// Falls back to the provider fast model when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model: Option<String>,
-    /// Whether lightweight automatic Dream-style consolidation should run in the background.
-    #[serde(default)]
+    /// Whether lightweight automatic Dream-style consolidation should run in the
+    /// background. Default ON (memory redesign L4): each tick no-ops when there is
+    /// no background model configured or no new candidate sessions, so it is free
+    /// until there is real work + a model. Set false to opt out.
+    #[serde(default = "default_true_auto_dream_enabled")]
     pub auto_dream_enabled: bool,
     /// Seconds between background auto-Dream ticks (default 30 minutes).
     /// Each tick still no-ops when there are no new candidate sessions, so raising
@@ -191,12 +194,25 @@ pub struct MemoryConfig {
     #[serde(default, alias = "memory_dream_refine_mode")]
     pub dream_refine_mode: bool,
     /// Whether the background "gardener" may use the LLM to split/merge "blob" memories.
-    /// Opt-in (default false) because it spends model tokens.
-    #[serde(default, alias = "memory_gardener_enabled")]
+    /// Default ON (memory redesign L4). The deterministic blob prefilter is cheap
+    /// and each run is bounded by `gardener_max_splits_per_run`; a run that finds
+    /// nothing, or finds work but has no background model, spends no tokens. Set
+    /// false to opt out.
+    #[serde(
+        default = "default_true_gardener_enabled",
+        alias = "memory_gardener_enabled"
+    )]
     pub gardener_enabled: bool,
-    /// Seconds between gardener runs (default daily — far slower than auto_dream).
+    /// Seconds between gardener time-triggered runs (default daily). A run may also
+    /// fire early when the library grows — see `gardener_volume_trigger`.
     #[serde(default = "default_gardener_interval_secs")]
     pub gardener_interval_secs: u64,
+    /// Run the gardener maintenance pass early (before the next time tick) once this
+    /// many new durable memories have accumulated since the last run, so pileup is
+    /// bounded by growth, not only by the clock (memory redesign L4). 0 disables the
+    /// volume trigger (time-only). Per-run caps still bound the work done.
+    #[serde(default = "default_gardener_volume_trigger")]
+    pub gardener_volume_trigger: usize,
     /// Hard cap on LLM-backed splits per gardener run (cost ceiling per run).
     #[serde(default = "default_gardener_max_splits_per_run")]
     pub gardener_max_splits_per_run: usize,
@@ -204,8 +220,13 @@ pub struct MemoryConfig {
     #[serde(default = "default_gardener_min_sections")]
     pub gardener_min_sections: usize,
     /// Whether the background dedup gardener may use the LLM to consolidate
-    /// near-duplicate memories. Opt-in (default false) because it spends tokens.
-    #[serde(default, alias = "memory_dedup_gardener_enabled")]
+    /// near-duplicate memories. Default ON (memory redesign L4); bounded by
+    /// `dedup_gardener_max_merges_per_run` and no-ops without a model. Set false to
+    /// opt out.
+    #[serde(
+        default = "default_true_dedup_gardener_enabled",
+        alias = "memory_dedup_gardener_enabled"
+    )]
     pub dedup_gardener_enabled: bool,
     /// Minimum content-keyword Jaccard (0.0–1.0) for two active memories to be
     /// flagged as dedup candidates by the deterministic prefilter.
@@ -220,22 +241,42 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             background_model: None,
-            auto_dream_enabled: false,
+            auto_dream_enabled: default_true_auto_dream_enabled(),
             auto_dream_interval_secs: default_auto_dream_interval_secs(),
             project_prompt_injection: default_true_memory_project_prompt_injection(),
             relevant_recall: default_true_memory_relevant_recall(),
             relevant_recall_rerank: false,
             project_first_dream: default_true_memory_project_first_dream(),
             dream_refine_mode: false,
-            gardener_enabled: false,
+            gardener_enabled: default_true_gardener_enabled(),
             gardener_interval_secs: default_gardener_interval_secs(),
+            gardener_volume_trigger: default_gardener_volume_trigger(),
             gardener_max_splits_per_run: default_gardener_max_splits_per_run(),
             gardener_min_sections: default_gardener_min_sections(),
-            dedup_gardener_enabled: false,
+            dedup_gardener_enabled: default_true_dedup_gardener_enabled(),
             dedup_gardener_min_score: default_dedup_gardener_min_score(),
             dedup_gardener_max_merges_per_run: default_dedup_gardener_max_merges_per_run(),
         }
     }
+}
+
+fn default_true_auto_dream_enabled() -> bool {
+    true
+}
+
+fn default_true_gardener_enabled() -> bool {
+    true
+}
+
+fn default_true_dedup_gardener_enabled() -> bool {
+    true
+}
+
+/// Fire the gardener maintenance pass early once ~this many new memories accumulate
+/// since the last run. Conservative: large enough to avoid thrashing on a few
+/// writes, small enough to bound pileup well under a full (daily) interval.
+fn default_gardener_volume_trigger() -> usize {
+    25
 }
 
 fn default_gardener_interval_secs() -> u64 {
@@ -3150,6 +3191,7 @@ mod tests {
                 dream_refine_mode: true,
                 gardener_enabled: true,
                 gardener_interval_secs: 3_600,
+                gardener_volume_trigger: 40,
                 gardener_max_splits_per_run: 4,
                 gardener_min_sections: 7,
                 dedup_gardener_enabled: true,
@@ -3171,11 +3213,41 @@ mod tests {
         assert!(memory.dream_refine_mode);
         assert!(memory.gardener_enabled);
         assert_eq!(memory.gardener_interval_secs, 3_600);
+        assert_eq!(memory.gardener_volume_trigger, 40);
         assert_eq!(memory.gardener_max_splits_per_run, 4);
         assert_eq!(memory.gardener_min_sections, 7);
         assert!(memory.dedup_gardener_enabled);
         assert_eq!(memory.dedup_gardener_min_score, 0.7);
         assert_eq!(memory.dedup_gardener_max_merges_per_run, 3);
+    }
+
+    /// L4: the maintenance integrators are ON by default — both via
+    /// `MemoryConfig::default()` AND when a config file omits the flags entirely
+    /// (serde `default = fn`, not the bare `#[serde(default)]` = `false`).
+    #[test]
+    fn memory_maintenance_integrators_default_on() {
+        let defaults = MemoryConfig::default();
+        assert!(defaults.auto_dream_enabled);
+        assert!(defaults.gardener_enabled);
+        assert!(defaults.dedup_gardener_enabled);
+        assert_eq!(defaults.gardener_volume_trigger, 25);
+
+        // A config that mentions `memory` but omits the flags must still be ON.
+        let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
+        let memory = parsed.memory.expect("memory present");
+        assert!(
+            memory.auto_dream_enabled,
+            "auto_dream on when field omitted"
+        );
+        assert!(memory.gardener_enabled, "gardener on when field omitted");
+        assert!(
+            memory.dedup_gardener_enabled,
+            "dedup gardener on when field omitted"
+        );
+        // An explicit opt-out is still honored.
+        let opted_out: Config =
+            serde_json::from_str(r#"{"memory":{"gardener_enabled":false}}"#).expect("parse");
+        assert!(!opted_out.memory.unwrap().gardener_enabled);
     }
 
     #[test]
