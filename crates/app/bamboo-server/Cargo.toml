@@ -98,7 +98,7 @@ bytes = "1"
 url = "2"
 hex = "0.4"
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 actix-governor = "0.10.0"
 
