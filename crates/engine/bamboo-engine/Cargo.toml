@@ -49,7 +49,7 @@ url = "2"
 toml = "1.1"
 dirs = "5"
 libc = "0.2"
-rand = "0.8"
+rand = "0.10"
 sysinfo = "0.33"
 bytes = "1"
 

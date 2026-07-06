@@ -192,7 +192,7 @@ aes-gcm = "0.10"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
-rand = "0.8"
+rand = "0.10"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
