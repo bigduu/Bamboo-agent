@@ -464,6 +464,33 @@ async fn build_dream_notebook_body(
     }
 }
 
+/// Decide the `Last full rebuild at:` marker line for the dream notebook.
+///
+/// Stamps `now` on a forced periodic pass, OR to BOOTSTRAP the marker on the
+/// first-ever grounded `Rebuild` when none exists yet — a fresh install never had
+/// `last_full_rebuild_at`, and `should_force_full_rebuild` returns false while it's
+/// `None`, so without the bootstrap the periodic wide-window sweep could never
+/// fire (#261). Once seeded, ordinary (non-forced) passes PRESERVE the existing
+/// marker so the 30-day timer isn't reset every tick; nothing is emitted while
+/// there's no marker to preserve and no durable memory to ground a Rebuild on.
+fn full_rebuild_marker_line(
+    force_full_rebuild: bool,
+    generation_mode: DreamGenerationMode,
+    last_full_rebuild_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    if force_full_rebuild
+        || (matches!(generation_mode, DreamGenerationMode::Rebuild)
+            && last_full_rebuild_at.is_none())
+    {
+        format!("Last full rebuild at: {}\n", now.to_rfc3339())
+    } else if let Some(existing_rebuild_at) = last_full_rebuild_at {
+        format!("Last full rebuild at: {}\n", existing_rebuild_at.to_rfc3339())
+    } else {
+        String::new()
+    }
+}
+
 async fn run_auto_dream_once_for_scope(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
@@ -621,20 +648,8 @@ async fn run_auto_dream_once_for_scope(
     };
     let notebook_body =
         build_dream_notebook_body(&bg_provider, &model, &source_window, generation_mode).await?;
-    // Stamp the periodic-rebuild marker ONLY on a forced pass. Every non-forced
-    // pass is now a Rebuild too (the notebook is always grounded in durable
-    // memory), so keying the marker off the mode would reset the timer every tick
-    // and the wide-window periodic sweep would never fire.
-    let last_full_rebuild_line = if force_full_rebuild {
-        format!("Last full rebuild at: {}\n", now.to_rfc3339())
-    } else if let Some(existing_rebuild_at) = last_full_rebuild_at {
-        format!(
-            "Last full rebuild at: {}\n",
-            existing_rebuild_at.to_rfc3339()
-        )
-    } else {
-        String::new()
-    };
+    let last_full_rebuild_line =
+        full_rebuild_marker_line(force_full_rebuild, generation_mode, last_full_rebuild_at, now);
     let final_note = match scope {
         MemoryScope::Global => format!(
             "# Bamboo Dream Notebook\n\nLast consolidated at: {}\n{}Sessions reviewed: {}\nModel: {}\n\n{}\n",
@@ -775,6 +790,58 @@ mod tests {
 
     use bamboo_agent_core::storage::Storage;
     use bamboo_llm::{LLMError, LLMStream};
+
+    #[test]
+    fn full_rebuild_marker_bootstraps_on_first_grounded_rebuild() {
+        let now = "2026-07-08T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        // #261: a fresh install (no prior marker) doing its first grounded Rebuild
+        // must SEED the marker with `now`, so the 30-day periodic cadence has a
+        // start point instead of never firing.
+        let line = full_rebuild_marker_line(false, DreamGenerationMode::Rebuild, None, now);
+        assert_eq!(line, format!("Last full rebuild at: {}\n", now.to_rfc3339()));
+    }
+
+    #[test]
+    fn full_rebuild_marker_preserves_existing_on_non_forced_pass() {
+        let now = "2026-07-08T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let existing = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        // Once seeded, an ordinary (non-forced) pass must PRESERVE the marker, not
+        // reset it to `now` — otherwise the timer would restart every tick and the
+        // periodic sweep would never come due.
+        let line = full_rebuild_marker_line(
+            false,
+            DreamGenerationMode::Rebuild,
+            Some(existing),
+            now,
+        );
+        assert_eq!(
+            line,
+            format!("Last full rebuild at: {}\n", existing.to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn full_rebuild_marker_stamps_now_on_forced_pass() {
+        let now = "2026-07-08T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let existing = "2026-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        // The periodic forced pass re-stamps `now`, advancing the cadence.
+        let line =
+            full_rebuild_marker_line(true, DreamGenerationMode::Rebuild, Some(existing), now);
+        assert_eq!(line, format!("Last full rebuild at: {}\n", now.to_rfc3339()));
+    }
+
+    #[test]
+    fn full_rebuild_marker_absent_when_incremental_and_no_prior_marker() {
+        let now = "2026-07-08T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        // No durable memory yet (Incremental bootstrap) and no prior marker: emit
+        // nothing — there's no grounded rebuild to anchor the cadence to.
+        let line = full_rebuild_marker_line(false, DreamGenerationMode::Incremental, None, now);
+        assert_eq!(line, String::new());
+    }
 
     fn test_registry() -> Arc<ProviderRegistry> {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
@@ -1474,7 +1541,9 @@ mod tests {
         );
         assert!(!prompts[0].contains("Stale prior notebook prose"));
 
-        // A non-forced pass does not stamp the periodic-rebuild marker.
+        // The first grounded Rebuild (no prior marker) BOOTSTRAPS the periodic
+        // full-rebuild marker so the 30-day cadence has a start point (#261); it
+        // is only SUBSEQUENT non-forced passes that preserve it without resetting.
         let dream = memory
             .read_project_dream_view(&project_key)
             .await
@@ -1482,8 +1551,8 @@ mod tests {
             .expect("project dream should exist");
         assert!(dream.contains("Grounded in durable memory"));
         assert!(
-            !dream.contains("Last full rebuild at:"),
-            "a non-forced pass must not stamp the full-rebuild marker"
+            dream.contains("Last full rebuild at:"),
+            "the first grounded Rebuild must bootstrap the full-rebuild marker (#261)"
         );
     }
 
