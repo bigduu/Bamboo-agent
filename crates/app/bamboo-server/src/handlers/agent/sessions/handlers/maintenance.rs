@@ -374,7 +374,8 @@ mod tests {
             .set_json(serde_json::json!({ "title": "Feed test" }))
             .to_request();
         let resp = test::call_service(&app, create).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        // POST /sessions now returns 201 Created (#251 finding 3).
+        assert_eq!(resp.status(), StatusCode::CREATED);
         let body: Value = test::read_body_json(resp).await;
         let session_id = body["session"]["id"]
             .as_str()
