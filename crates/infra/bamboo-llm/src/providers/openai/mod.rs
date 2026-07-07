@@ -697,15 +697,17 @@ mod tests {
 
         let chunk = parse_openai_compat_sse_data_strict(data).unwrap();
 
+        // The chat-completions path emits ToolCallsIndexed carrying the index. #236.
         match chunk {
-            LLMChunk::ToolCalls(calls) => {
+            LLMChunk::ToolCallsIndexed(calls) => {
                 assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].id, "call_abc123");
-                assert_eq!(calls[0].tool_type, "function");
-                assert_eq!(calls[0].function.name, "search");
-                assert_eq!(calls[0].function.arguments, r#"{"q":"test"}"#);
+                assert_eq!(calls[0].0, 0);
+                assert_eq!(calls[0].1.id, "call_abc123");
+                assert_eq!(calls[0].1.tool_type, "function");
+                assert_eq!(calls[0].1.function.name, "search");
+                assert_eq!(calls[0].1.function.arguments, r#"{"q":"test"}"#);
             }
-            _ => panic!("Expected ToolCalls chunk"),
+            _ => panic!("Expected ToolCallsIndexed chunk"),
         }
     }
 
@@ -810,13 +812,14 @@ mod tests {
         let chunk = parse_openai_compat_sse_data_strict(data).unwrap();
 
         match chunk {
-            LLMChunk::ToolCalls(calls) => {
-                assert_eq!(calls[0].id, "call_123");
-                assert_eq!(calls[0].function.name, "search");
+            LLMChunk::ToolCallsIndexed(calls) => {
+                assert_eq!(calls[0].0, 0);
+                assert_eq!(calls[0].1.id, "call_123");
+                assert_eq!(calls[0].1.function.name, "search");
                 // Arguments should be empty string when not provided
-                assert_eq!(calls[0].function.arguments, "");
+                assert_eq!(calls[0].1.function.arguments, "");
             }
-            _ => panic!("Expected ToolCalls chunk"),
+            _ => panic!("Expected ToolCallsIndexed chunk"),
         }
     }
 
@@ -827,12 +830,14 @@ mod tests {
         let chunk = parse_openai_compat_sse_data_strict(data).unwrap();
 
         match chunk {
-            LLMChunk::ToolCalls(calls) => {
+            LLMChunk::ToolCallsIndexed(calls) => {
                 assert_eq!(calls.len(), 2);
-                assert_eq!(calls[0].function.name, "search");
-                assert_eq!(calls[1].function.name, "lookup");
+                assert_eq!(calls[0].0, 0);
+                assert_eq!(calls[0].1.function.name, "search");
+                assert_eq!(calls[1].0, 1);
+                assert_eq!(calls[1].1.function.name, "lookup");
             }
-            _ => panic!("Expected ToolCalls chunk"),
+            _ => panic!("Expected ToolCallsIndexed chunk"),
         }
     }
 

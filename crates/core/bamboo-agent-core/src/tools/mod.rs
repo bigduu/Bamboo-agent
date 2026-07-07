@@ -102,7 +102,8 @@ pub mod tool_runtime;
 pub mod types;
 
 pub use accumulator::{
-    finalize_tool_calls, update_partial_tool_call, PartialToolCall, ToolCallAccumulator,
+    finalize_tool_calls, update_partial_tool_call, update_partial_tool_call_indexed,
+    PartialToolCall, ToolCallAccumulator,
 };
 pub use agentic::{
     convert_from_standard_result, convert_to_standard_result, AgenticContext, AgenticTool,

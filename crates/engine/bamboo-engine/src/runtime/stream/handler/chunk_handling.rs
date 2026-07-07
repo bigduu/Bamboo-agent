@@ -73,6 +73,15 @@ pub(super) async fn handle_chunk_result(
             state.extend_tool_calls(partial_calls);
             Ok(())
         }
+        Ok(LLMChunk::ToolCallsIndexed(partial_calls)) => {
+            tracing::trace!(
+                "[{}] Received {} indexed tool call parts",
+                session_id,
+                partial_calls.len()
+            );
+            state.extend_tool_calls_indexed(partial_calls);
+            Ok(())
+        }
         Ok(LLMChunk::Done) => {
             tracing::debug!("[{}] LLM stream completed", session_id);
             Ok(())

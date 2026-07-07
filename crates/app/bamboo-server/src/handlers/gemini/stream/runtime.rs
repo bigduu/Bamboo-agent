@@ -48,6 +48,18 @@ pub(super) fn build_gemini_event_stream(
                         }
                     }
                 }
+                // Indexed variant: drop indices, re-serialize the same way. #236.
+                Ok(LLMChunk::ToolCallsIndexed(tool_calls)) => {
+                    for (_, tool_call) in tool_calls {
+                        match sse::tool_call_chunk_bytes(tool_call) {
+                            Ok(bytes) => yield Ok::<_, ActixError>(bytes),
+                            Err(error) => {
+                                yield Err(error);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 Ok(LLMChunk::Done) => {
                     yield Ok::<_, ActixError>(sse::done_chunk_bytes());
                     break;

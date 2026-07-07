@@ -68,6 +68,10 @@ pub(super) async fn handle_non_streaming_response(
             // Keep parity with streaming behavior: expose reasoning narration as text.
             Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
             Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
+            // Indexed variant: drop indices, same behavior. #236.
+            Ok(bamboo_llm::types::LLMChunk::ToolCallsIndexed(calls)) => {
+                tool_calls.extend(calls.into_iter().map(|(_, call)| call))
+            }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}
