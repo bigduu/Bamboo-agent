@@ -190,19 +190,32 @@ impl BambooClient {
             .get(self.url("/api/v1/schedules"))
             .send()
             .await?;
-        let schedules = resp.json().await?;
-        Ok(schedules)
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list schedules failed ({status}): {body}");
+        }
+        let parsed: ListSchedulesResponse = resp.json().await?;
+        Ok(parsed
+            .schedules
+            .into_iter()
+            .map(Schedule::from_view)
+            .collect())
     }
 
-    pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<Schedule> {
+    pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<()> {
         let resp = self
             .client
             .post(self.url("/api/v1/schedules"))
             .json(&req)
             .send()
             .await?;
-        let schedule = resp.json().await?;
-        Ok(schedule)
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("create schedule failed ({status}): {body}");
+        }
+        Ok(())
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<()> {
