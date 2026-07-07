@@ -204,6 +204,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         // Clear any other legacy providers to isolate this test.
         config.providers.anthropic = None;
@@ -235,6 +236,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         // Clear other providers to isolate.
         config.providers.anthropic = None;
