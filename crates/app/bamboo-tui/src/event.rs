@@ -20,10 +20,11 @@ pub enum AppEvent {
     SchedulesLoaded(Loaded<Vec<Schedule>>),
     SkillsLoaded(Loaded<Vec<Skill>>),
     ConfigLoaded(Loaded<serde_json::Value>),
-    /// A background mutation finished; carries a status line and whether the
-    /// current tab's data should be reloaded.
+    /// A background mutation finished; the outcome is `Ok(success message)` or
+    /// `Err(failure message)` so the receiver can classify it (info vs error)
+    /// without sniffing the display text. `reload_tab` reloads the current tab.
     ActionDone {
-        status: String,
+        outcome: Loaded<String>,
         reload_tab: bool,
     },
     /// A chat turn was created + started; carries the new session id.

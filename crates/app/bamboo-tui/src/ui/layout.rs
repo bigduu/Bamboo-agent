@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Tab};
+use crate::app::{App, NoticeLevel, Tab};
 use crate::theme::{self, colors};
 
 pub struct AppLayout {
@@ -105,6 +105,17 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
     }
 
+    // Unseen warning/error badge (Ctrl+L to view the log).
+    if app.unseen_alerts > 0 {
+        spans.push(Span::styled(
+            format!(" ⚠ {} ", app.unseen_alerts),
+            Style::default()
+                .fg(colors::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
+    }
+
     // Connection indicator
     if app.connected {
         spans.push(Span::styled(" ● ", Style::default().fg(colors::SUCCESS)));
@@ -151,7 +162,7 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn render_help(f: &mut Frame) {
-    let area = centered_rect(50, 18, f.area());
+    let area = centered_rect(50, 21, f.area());
     let help_text = vec![
         Line::from(Span::styled(
             " Keybindings",
@@ -167,6 +178,7 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("  Ctrl+C      Quit / Stop streaming"),
         Line::raw("  Ctrl+S      Stop agent execution"),
         Line::raw("  Ctrl+X      Expand/collapse tool args & results"),
+        Line::raw("  Ctrl+L      Notification log"),
         Line::raw("  j/k         Scroll down/up"),
         Line::raw("  n           New schedule (Schedules)"),
         Line::raw("  e           Edit config (Config)"),
@@ -184,6 +196,60 @@ pub fn render_help(f: &mut Frame) {
             .border_style(Style::default().fg(colors::BRAND)),
     );
     f.render_widget(help, area);
+}
+
+/// Notification-log overlay (`Ctrl+L`): recent status messages newest-first,
+/// colored by level, so errors/warnings aren't lost when the status line is
+/// overwritten. Dismissed by any key.
+pub fn render_notifications(f: &mut Frame, app: &App) {
+    let screen = f.area();
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " Notifications",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+
+    if app.notifications.is_empty() {
+        lines.push(Line::raw("  (nothing yet)"));
+    } else {
+        // Newest first; cap to what a reasonably tall modal can show.
+        let max_rows = (screen.height.saturating_sub(6)).min(30) as usize;
+        for n in app.notifications.iter().rev().take(max_rows) {
+            let (tag, color) = match n.level {
+                NoticeLevel::Info => ("info", colors::INACTIVE),
+                NoticeLevel::Warn => ("warn", colors::WARNING),
+                NoticeLevel::Error => ("err ", colors::ERROR),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", n.at.format("%H:%M:%S")),
+                    Style::default().fg(colors::SUBTLE),
+                ),
+                Span::styled(format!("{tag}  "), Style::default().fg(color)),
+                Span::styled(n.text.clone(), Style::default().fg(color)),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("  Press any key to close"));
+
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(70, height, screen);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::BRAND))
+        .title(" Log ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Modal for an agent question (permission gate / clarification): the operator
