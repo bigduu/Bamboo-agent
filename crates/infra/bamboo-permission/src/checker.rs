@@ -1413,6 +1413,11 @@ mod tests {
             "cp evil ~/.ssh/authorized_keys", // implant an SSH key
             "mv ~/.bashrc /tmp/x",            // relocate a shell rc (source)
             "echo pwned > ~/.zshrc",          // redirect to a home rc file
+            // #155 review follow-ups:
+            "cp backdoor /etc/sudoers.d/zz", // /etc subtree (priv-esc), not just passwd
+            "cp payload /etc/cron.d/evil",   // /etc persistence vector
+            "cp evil /root/.ssh/authorized_keys", // absolute root-home form of the ~ case
+            "cp evil /home/alice/.ssh/authorized_keys", // absolute /home/<user> form
         ];
         for cmd in destructive {
             assert!(

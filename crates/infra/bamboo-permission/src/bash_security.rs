@@ -57,9 +57,10 @@ const PERMISSION_MODIFICATION_COMMANDS: &[&str] = &["chmod", "chown", "chgrp", "
 /// verdict that forced approval on ordinary commands even under bypass. Only
 /// block devices and system files that can brick/compromise the host belong here.
 const SENSITIVE_REDIRECT_PATHS: &[&str] = &[
-    "/etc/passwd",
-    "/etc/shadow",
-    "/etc/sudoers",
+    // All of /etc, not just passwd/shadow/sudoers: dropping a file into
+    // /etc/sudoers.d/, /etc/cron.d/, /etc/systemd/system/, /etc/profile.d/, … is
+    // an equally dangerous privilege-escalation / persistence vector. #155.
+    "/etc/",
     "/boot/",
     "/dev/sd",
     "/dev/hd",
@@ -114,10 +115,20 @@ fn is_sensitive_fs_path(path: &str) -> bool {
     {
         return true;
     }
+    // Home-relative forms (`~/…`, `$HOME/…`) AND their absolute equivalents
+    // (`/root/…`, `/home/<user>/…`) — agents in containers often run as root, so
+    // `/root/.ssh/authorized_keys` is the natural form of the `~/.ssh/…` example. #155.
     let home_rel = trimmed
         .strip_prefix("~/")
         .or_else(|| trimmed.strip_prefix("$HOME/"))
-        .or_else(|| trimmed.strip_prefix("${HOME}/"));
+        .or_else(|| trimmed.strip_prefix("${HOME}/"))
+        .or_else(|| trimmed.strip_prefix("/root/"))
+        .or_else(|| {
+            // `/home/<user>/…` — skip the username component.
+            trimmed
+                .strip_prefix("/home/")
+                .and_then(|rest| rest.split_once('/').map(|(_, r)| r))
+        });
     if let Some(rel) = home_rel {
         let rel_lower = rel.to_ascii_lowercase();
         return SENSITIVE_HOME_PREFIXES
