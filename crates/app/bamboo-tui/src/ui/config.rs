@@ -87,10 +87,11 @@ pub fn render_editor(f: &mut Frame, app: &App) {
     f.render_widget(&editor.textarea, inner);
 }
 
-/// Rect covering `pw`%×`ph`% of `r`, centered.
+/// Rect covering `pw`%×`ph`% of `r`, centered. Percentage math is done in u32
+/// so a very wide terminal (width ≥ 820) can't overflow the u16 multiply.
 fn centered(r: Rect, pw: u16, ph: u16) -> Rect {
-    let w = (r.width * pw / 100).min(r.width);
-    let h = (r.height * ph / 100).min(r.height);
+    let w = ((r.width as u32 * pw as u32 / 100) as u16).min(r.width);
+    let h = ((r.height as u32 * ph as u32 / 100) as u16).min(r.height);
     let x = r.x + r.width.saturating_sub(w) / 2;
     let y = r.y + r.height.saturating_sub(h) / 2;
     Rect::new(x, y, w, h)

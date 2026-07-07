@@ -344,7 +344,9 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
 }
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
+    // u32 math so a very wide terminal (width ≥ 820) can't overflow the u16
+    // multiply of `r.width * percent_x`.
+    let popup_width = (r.width as u32 * percent_x as u32 / 100) as u16;
     let x = (r.width.saturating_sub(popup_width)) / 2;
     let y = (r.height.saturating_sub(height)) / 2;
     Rect::new(
