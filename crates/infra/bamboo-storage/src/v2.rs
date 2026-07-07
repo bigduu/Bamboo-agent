@@ -8,7 +8,14 @@
 //!
 //! Notes:
 //! - This is a greenfield format (no migration). Old on-disk layouts are ignored.
-//! - Directory scanning is only used for dev-only index rebuild/recovery (not in hot paths).
+//! - The global index is a rebuildable cache, not the source of truth. Each
+//!   `session.json` is authoritative; the index only speeds up lookups. A
+//!   *missing* `sessions.json` starts an empty index; a *corrupt/unparseable*
+//!   one is backed up to `sessions.json.bak` and the index is rebuilt by
+//!   scanning `sessions/<root>/[children/<child>/]session.json` (see
+//!   [`SessionStoreV2::rebuild_index_from_disk`]) so a bad index is never
+//!   boot-fatal and never orphans intact sessions. Directory scanning is used
+//!   only for this recovery path, never in hot paths.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -214,6 +221,16 @@ pub struct SessionStoreV2 {
 }
 
 impl SessionStoreV2 {
+    /// Open (or create) the V2 session store rooted at `bamboo_home_dir`.
+    ///
+    /// Loading the global index (`sessions.json`) is fault-tolerant, because it
+    /// is only a cache over the authoritative per-session `session.json` files:
+    /// - **missing** → start with a fresh empty index (normal first boot);
+    /// - **valid** → use it as-is;
+    /// - **corrupt/unparseable** → back it up to `sessions.json.bak`, log an
+    ///   error, start empty, and rebuild the index from disk (see
+    ///   [`Self::rebuild_index_from_disk`]) so a single bad byte can never make
+    ///   the server refuse to boot or orphan intact sessions on disk.
     pub async fn new(bamboo_home_dir: PathBuf) -> io::Result<Self> {
         let sessions_dir = bamboo_home_dir.join("sessions");
         let index_path = bamboo_home_dir.join("sessions.json");
@@ -222,10 +239,37 @@ impl SessionStoreV2 {
         fs::create_dir_all(&sessions_dir).await?;
         search_index.init().await?;
 
+        // A corrupt index must not be boot-fatal: back it up and rebuild from
+        // the on-disk session tree after construction. Only a *corrupt* file
+        // triggers this; a *missing* one keeps the fresh-empty-index path.
+        let mut needs_rebuild = false;
         let index = if index_path.exists() {
             let raw = fs::read_to_string(&index_path).await?;
-            serde_json::from_str(&raw)
-                .map_err(|e| other_io_error(format!("invalid sessions.json: {e}")))?
+            match serde_json::from_str::<SessionsIndex>(&raw) {
+                Ok(index) => index,
+                Err(error) => {
+                    // Best-effort backup so the corrupt bytes are preserved for
+                    // forensics but no longer block the (about to be rebuilt)
+                    // index. If the backup rename fails we still rebuild — the
+                    // rebuild's fresh persist would overwrite the corrupt file
+                    // anyway, and the session.json files remain untouched.
+                    let backup_path = bamboo_home_dir.join("sessions.json.bak");
+                    match fs::rename(&index_path, &backup_path).await {
+                        Ok(()) => tracing::error!(
+                            "sessions.json is corrupt ({error}); backed up to {} and rebuilding \
+                             the index by scanning the session tree",
+                            backup_path.display()
+                        ),
+                        Err(rename_error) => tracing::error!(
+                            "sessions.json is corrupt ({error}); failed to back it up to {} \
+                             ({rename_error}); rebuilding the index from disk anyway",
+                            backup_path.display()
+                        ),
+                    }
+                    needs_rebuild = true;
+                    SessionsIndex::empty()
+                }
+            }
         } else {
             let index = SessionsIndex::empty();
             // Persist immediately so "index is mandatory" holds from boot.
@@ -248,7 +292,135 @@ impl SessionStoreV2 {
             write_lock: Mutex::new(()),
         };
 
+        if needs_rebuild {
+            storage.rebuild_index_from_disk().await?;
+        }
+
         Ok(storage)
+    }
+
+    /// Rebuild the global index by scanning the on-disk session tree.
+    ///
+    /// Called by [`Self::new`] after a corrupt `sessions.json` was backed up and
+    /// replaced with an empty index. The layout is deterministic:
+    /// - `sessions/<root_id>/session.json`
+    /// - `sessions/<root_id>/children/<child_id>/session.json`
+    ///
+    /// so every session is recoverable without the index. Each `session.json`
+    /// is deserialized and folded back in via [`Self::upsert_index_from_session`]
+    /// with the same `rel_path` [`Self::save_session`] would compute — derived
+    /// from the on-disk directory names (the physical location), which is what
+    /// `abs_path_from_rel` + load rely on. A single unreadable/corrupt
+    /// `session.json` is skipped with a warning so one bad file never aborts
+    /// recovery of the rest, then [`Self::rebuild_search_index`] is run so
+    /// full-text search works immediately after recovery.
+    async fn rebuild_index_from_disk(&self) -> io::Result<()> {
+        let mut recovered = 0usize;
+
+        let mut root_dirs = match fs::read_dir(&self.sessions_dir).await {
+            Ok(rd) => rd,
+            // No sessions directory at all — nothing to recover.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        while let Some(root_entry) = root_dirs.next_entry().await? {
+            if !root_entry
+                .file_type()
+                .await
+                .map(|t| t.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(root_id) = root_entry.file_name().into_string() else {
+                // Non-UTF-8 directory name cannot be a valid session id.
+                continue;
+            };
+
+            // Recover the root session (if its session.json is present + valid).
+            let root_json = root_entry.path().join("session.json");
+            if let Some(session) = Self::read_session_json_for_rebuild(&root_json, &root_id).await {
+                let rel_path = Self::root_rel_path(&root_id);
+                match self.upsert_index_from_session(&session, rel_path).await {
+                    Ok(()) => recovered += 1,
+                    Err(error) => {
+                        tracing::warn!("index rebuild: failed to index root {root_id}: {error}")
+                    }
+                }
+            }
+
+            // Recover its children (a flat `children/<child_id>/` layer).
+            let children_dir = root_entry.path().join("children");
+            let mut child_dirs = match fs::read_dir(&children_dir).await {
+                Ok(rd) => rd,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!("index rebuild: cannot read children of {root_id}: {error}");
+                    continue;
+                }
+            };
+            while let Some(child_entry) = child_dirs.next_entry().await? {
+                if !child_entry
+                    .file_type()
+                    .await
+                    .map(|t| t.is_dir())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Ok(child_id) = child_entry.file_name().into_string() else {
+                    continue;
+                };
+                let child_json = child_entry.path().join("session.json");
+                if let Some(session) =
+                    Self::read_session_json_for_rebuild(&child_json, &child_id).await
+                {
+                    let rel_path = Self::child_rel_path(&root_id, &child_id);
+                    match self.upsert_index_from_session(&session, rel_path).await {
+                        Ok(()) => recovered += 1,
+                        Err(error) => tracing::warn!(
+                            "index rebuild: failed to index child {child_id}: {error}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // Re-materialize sessions.json even when nothing was recovered (we may
+        // have renamed the only copy to sessions.json.bak), so the "index file
+        // always exists after boot" invariant holds.
+        self.update_index(|_| Ok(())).await?;
+
+        tracing::info!("index rebuild from disk complete: recovered {recovered} session(s)");
+
+        // Rebuild the FTS index from the freshly recovered sessions.
+        if let Err(error) = self.rebuild_search_index().await {
+            tracing::warn!("index rebuild: failed to rebuild search index: {error}");
+        }
+        Ok(())
+    }
+
+    /// Read + deserialize a `session.json` during index rebuild. A missing file
+    /// (a directory with no `session.json`) yields `None` silently; a corrupt or
+    /// otherwise unreadable one is skipped with a warning. Rebuild must never
+    /// hard-fail on one bad session — it recovers as much as possible.
+    async fn read_session_json_for_rebuild(path: &Path, id: &str) -> Option<Session> {
+        let raw = match fs::read_to_string(path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!("index rebuild: skipping unreadable session {id}: {error}");
+                return None;
+            }
+        };
+        match serde_json::from_str::<Session>(&raw) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                tracing::warn!("index rebuild: skipping corrupt session {id}: {error}");
+                None
+            }
+        }
     }
 
     pub fn search_index(&self) -> &SessionSearchIndex {
@@ -1367,6 +1539,88 @@ mod tests {
         let loaded = storage.load_session("sc-4").await?.unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_index_is_backed_up_and_rebuilt_from_disk() -> io::Result<()> {
+        // #342: a corrupt sessions.json must NOT be boot-fatal. On construction
+        // the store backs it up to sessions.json.bak, rebuilds the index by
+        // scanning the on-disk session tree, and every intact session.json (root
+        // AND child) becomes reachable again.
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+
+        // Persist a root and a child under it, then drop the store.
+        {
+            let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+            let root = Session::new("root-1", "m");
+            storage.save_session(&root).await?;
+            let child = Session::new_child_of("child-1", &root, "m", "c");
+            storage.save_session(&child).await?;
+        }
+
+        // Corrupt the global index (truncated / invalid JSON).
+        let index_path = bamboo_home.join("sessions.json");
+        tokio::fs::write(&index_path, b"{ not valid json").await?;
+
+        // (a) Re-opening on the same dir must SUCCEED, not hard-error.
+        let recovered = SessionStoreV2::new(bamboo_home.clone()).await?;
+
+        // (b) Both sessions are indexed again, with the correct rel_paths, so
+        // they actually resolve + load from disk.
+        assert_eq!(
+            recovered.resolve_rel_path("root-1").await.as_deref(),
+            Some("sessions/root-1"),
+            "root must be recovered with its on-disk rel_path"
+        );
+        assert_eq!(
+            recovered.resolve_rel_path("child-1").await.as_deref(),
+            Some("sessions/root-1/children/child-1"),
+            "child must be recovered with its on-disk rel_path"
+        );
+        assert!(
+            recovered.get_index_entry("root-1").await.is_some(),
+            "root index entry must exist after rebuild"
+        );
+        assert!(
+            recovered.load_session("root-1").await?.is_some(),
+            "recovered root must load from disk"
+        );
+        let loaded_child = recovered
+            .load_session("child-1")
+            .await?
+            .expect("recovered child must load from disk");
+        assert_eq!(loaded_child.parent_session_id.as_deref(), Some("root-1"));
+        assert_eq!(loaded_child.root_session_id, "root-1");
+
+        // (c) The corrupt index was preserved as sessions.json.bak, and a fresh
+        // valid sessions.json was re-materialized.
+        assert!(
+            bamboo_home.join("sessions.json.bak").exists(),
+            "corrupt sessions.json must be backed up to sessions.json.bak"
+        );
+        assert!(
+            index_path.exists(),
+            "a fresh sessions.json must be written after rebuild"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_index_starts_empty_and_does_not_back_up() -> io::Result<()> {
+        // A *missing* sessions.json keeps the fresh-empty-index behavior: no
+        // rebuild is triggered and no sessions.json.bak is produced.
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+
+        let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+        assert!(storage.list_index_entries().await.is_empty());
+        assert!(
+            !bamboo_home.join("sessions.json.bak").exists(),
+            "a missing index must not produce a .bak backup"
+        );
         Ok(())
     }
 
