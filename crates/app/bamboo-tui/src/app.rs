@@ -272,6 +272,13 @@ impl ScheduleForm {
     }
 }
 
+/// In-place editor for the raw config JSON (opened with `e` on the Config tab).
+/// The buffer is a multi-line `TextArea`; on save it must parse as JSON before
+/// it is PATCHed to the server.
+pub struct ConfigEditor {
+    pub textarea: TextArea<'static>,
+}
+
 // ── Main App ──
 
 pub struct App {
@@ -294,6 +301,9 @@ pub struct App {
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
+    /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
+    /// textarea captures all keystrokes.
+    pub config_editor: Option<ConfigEditor>,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -319,6 +329,7 @@ impl App {
             spinner_tick: 0,
             pending_question: None,
             schedule_form: None,
+            config_editor: None,
             event_tx: None,
             sse_tx: None,
             sse_rx: None,
@@ -560,6 +571,13 @@ impl App {
         if self.schedule_form.is_some() {
             self.handle_schedule_form_key(key);
             return Ok(());
+        }
+
+        // The config editor is a full multi-line text buffer, so it must claim
+        // every key (digits, Tab, Enter/newlines) before the global navigation
+        // below — same rationale as the schedule form.
+        if self.config_editor.is_some() {
+            return self.handle_config_editor_key(key);
         }
 
         if let KeyCode::Char(c) = key.code {
@@ -1292,8 +1310,69 @@ impl App {
             KeyCode::Up => {
                 self.config.scroll_offset = self.config.scroll_offset.saturating_sub(1);
             }
+            KeyCode::Char('e') => {
+                // Open the raw-JSON editor prefilled with the current config.
+                match &self.config.config {
+                    Some(val) => {
+                        let pretty =
+                            serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string());
+                        let lines: Vec<String> = pretty.lines().map(String::from).collect();
+                        self.config_editor = Some(ConfigEditor {
+                            textarea: TextArea::new(lines),
+                        });
+                    }
+                    None => {
+                        self.status_message = "No config loaded to edit".to_string();
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Drive the raw-JSON config editor modal. `Ctrl+S` validates the buffer as
+    /// JSON and, if valid, PATCHes it to the server off the event loop; `Esc`
+    /// cancels. Every other key edits the text buffer.
+    fn handle_config_editor_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.code == KeyCode::Esc {
+            self.config_editor = None;
+            self.status_message = "Edit cancelled".to_string();
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            let text = self
+                .config_editor
+                .as_ref()
+                .map(|e| e.textarea.lines().join("\n"))
+                .unwrap_or_default();
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(val) => {
+                    self.config_editor = None;
+                    self.status_message = "Saving config...".to_string();
+                    if let Some(tx) = self.event_tx.clone() {
+                        let client = self.client.clone();
+                        tokio::spawn(async move {
+                            let status = match client.set_config(&val).await {
+                                Ok(()) => "Config saved".to_string(),
+                                Err(e) => format!("Save failed: {e}"),
+                            };
+                            let _ = tx.send(AppEvent::ActionDone {
+                                status,
+                                reload_tab: true,
+                            });
+                        });
+                    }
+                }
+                Err(e) => {
+                    self.status_message = format!("Invalid JSON: {e}");
+                }
+            }
+            return Ok(());
+        }
+        if let Some(editor) = self.config_editor.as_mut() {
+            editor.textarea.input(key);
+        }
+        Ok(())
     }
 }
 
@@ -1524,6 +1603,44 @@ mod question_tests {
         app.handle_key(k(KeyCode::Tab)).await.unwrap();
         assert_eq!(app.tab, Tab::Schedules, "Tab must not switch tabs");
         assert_eq!(app.schedule_form.as_ref().unwrap().field, 1);
+    }
+
+    #[tokio::test]
+    async fn config_editor_opens_validates_and_cancels() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Config;
+
+        // `e` with no config loaded just posts a status, opens nothing.
+        app.handle_key(plain(KeyCode::Char('e'))).await.unwrap();
+        assert!(app.config_editor.is_none());
+
+        // With a config, `e` opens the editor prefilled.
+        app.config.config = Some(serde_json::json!({ "a": 1 }));
+        app.handle_key(plain(KeyCode::Char('e'))).await.unwrap();
+        assert!(app.config_editor.is_some());
+
+        // Corrupt the buffer (prepend a stray char) → Ctrl+S must NOT close it.
+        app.handle_key(plain(KeyCode::Char('x'))).await.unwrap();
+        app.handle_key(ctrl_s).await.unwrap();
+        assert!(
+            app.config_editor.is_some(),
+            "invalid JSON must keep the editor open"
+        );
+        assert!(app.status_message.contains("Invalid JSON"));
+
+        // Esc cancels.
+        app.handle_key(plain(KeyCode::Esc)).await.unwrap();
+        assert!(app.config_editor.is_none());
+
+        // A clean open + immediate Ctrl+S (buffer is valid) closes the editor.
+        app.handle_key(plain(KeyCode::Char('e'))).await.unwrap();
+        assert!(app.config_editor.is_some());
+        app.handle_key(ctrl_s).await.unwrap();
+        assert!(app.config_editor.is_none(), "valid JSON saves and closes");
     }
 
     #[tokio::test]

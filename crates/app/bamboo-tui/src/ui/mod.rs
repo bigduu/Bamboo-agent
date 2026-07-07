@@ -40,4 +40,8 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.schedule_form.is_some() {
         layout::render_schedule_form(f, app);
     }
+
+    if app.config_editor.is_some() {
+        config::render_editor(f, app);
+    }
 }
