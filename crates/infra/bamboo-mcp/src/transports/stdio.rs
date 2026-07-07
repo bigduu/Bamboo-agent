@@ -55,7 +55,14 @@ impl McpTransport for StdioTransport {
         cmd.args(&self.config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Kill the server process if this transport's `Child` is dropped
+            // without a graceful `disconnect()` — e.g. an error/timeout during
+            // the post-spawn handshake drops the transport on the error path.
+            // `tokio::process::Child` does NOT kill on drop by default, so
+            // without this a failed-handshake server is orphaned (one leak per
+            // retry under auto-reconnect).
+            .kill_on_drop(true);
 
         if let Some(cwd) = &self.config.cwd {
             cmd.current_dir(cwd);
@@ -455,5 +462,53 @@ mod tests {
         assert_eq!(received, vec!["line-a", "line-b", "line-c"]);
 
         let _ = transport.disconnect().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_child_is_killed_when_transport_dropped() {
+        // A transport dropped WITHOUT disconnect() (e.g. an error/timeout during
+        // the post-spawn handshake drops it on the error path) must not orphan
+        // the server process — kill_on_drop guarantees the child is killed.
+        let config = StdioConfig {
+            command: "sleep".to_string(),
+            args: vec!["30".to_string()],
+            ..create_test_config()
+        };
+        let mut transport = StdioTransport::new(config);
+        transport.connect().await.expect("connect spawns the child");
+        let pid = transport
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .expect("a running child has a pid");
+
+        // Drop without disconnect() — the failed-handshake path.
+        drop(transport);
+
+        // The child must disappear within a short window: SIGKILL on drop, then
+        // reaped by the tokio runtime. `kill -0` succeeds while the pid is
+        // live/zombie and fails (ESRCH) once reaped — poll until it fails.
+        let mut alive = true;
+        for _ in 0..50 {
+            let dead = tokio::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .map(|s| !s.success())
+                .unwrap_or(true);
+            if dead {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !alive,
+            "child pid {pid} must be killed when the transport is dropped"
+        );
     }
 }
