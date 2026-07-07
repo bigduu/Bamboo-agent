@@ -520,6 +520,48 @@ mod tests {
     }
 
     #[test]
+    fn separate_tool_blocks_each_flush_independently() {
+        // Two distinct tool blocks separated by an assistant turn: each block's
+        // image must be relayed by its OWN flush, at the right position.
+        let img = |data: &str| bamboo_domain::ToolResultImage {
+            mime_type: "image/png".to_string(),
+            data: data.to_string(),
+        };
+        let messages = vec![
+            Message::assistant("", Some(vec![tool_call("call_1", "shotA")])),
+            Message::tool_result_with_images("call_1", "a", true, vec![img("AAAA")]),
+            Message::assistant("here you go", None), // closes block 1
+            Message::assistant("", Some(vec![tool_call("call_2", "shotB")])),
+            Message::tool_result_with_images("call_2", "b", true, vec![img("BBBB")]),
+        ];
+
+        let out = super::messages_to_openai_compat_json(&messages);
+
+        // assistant, tool(A), user(relay A), assistant("here"), assistant(tool),
+        // tool(B), user(relay B).
+        assert_eq!(out.len(), 7);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[2]["role"], "user");
+        assert!(out[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+        assert_eq!(out[3]["role"], "assistant");
+        assert_eq!(out[3]["content"], "here you go");
+        assert_eq!(out[5]["role"], "tool");
+        assert_eq!(out[6]["role"], "user");
+        let last = out[6]["content"].as_array().unwrap();
+        assert!(last
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,BBBB"));
+        // The second block's relay must NOT carry the first block's image.
+        assert!(!last
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+    }
+
+    #[test]
     fn tools_to_openai_compat_json_serializes_shape() {
         let tools = vec![ToolSchema {
             schema_type: "function".to_string(),
