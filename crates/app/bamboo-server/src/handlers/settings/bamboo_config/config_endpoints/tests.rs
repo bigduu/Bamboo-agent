@@ -30,6 +30,7 @@ fn model_limits_file_path_appends_model_limits_json_filename() {
 async fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_auth() {
     let mut config = Config::default();
     config.providers.openai = Some(OpenAIConfig {
+        api_key_from_env: false,
         api_key: "sk-secret".to_string(),
         api_key_encrypted: None,
         base_url: None,

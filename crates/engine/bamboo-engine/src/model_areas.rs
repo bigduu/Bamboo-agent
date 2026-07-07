@@ -315,6 +315,7 @@ mod tests {
             defaults: None,
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,

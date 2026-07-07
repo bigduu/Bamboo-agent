@@ -645,6 +645,7 @@ mod tests {
             provider: "openai".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,
@@ -672,6 +673,7 @@ mod tests {
             provider: "openai".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,
@@ -741,6 +743,7 @@ mod tests {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,
@@ -767,6 +770,7 @@ mod tests {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,
@@ -800,6 +804,7 @@ mod tests {
             },
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,
@@ -832,6 +837,7 @@ mod tests {
             },
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,
@@ -887,6 +893,7 @@ mod tests {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
+                    api_key_from_env: false,
                     api_key: "test".to_string(),
                     api_key_encrypted: None,
                     base_url: None,

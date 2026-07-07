@@ -356,6 +356,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
     match instance.provider_type.as_str() {
         "openai" => {
             config.providers.openai = Some(bamboo_config::OpenAIConfig {
+                api_key_from_env: false,
                 api_key: instance.api_key.clone(),
                 api_key_encrypted: instance.api_key_encrypted.clone(),
                 base_url: instance.base_url.clone(),
@@ -370,6 +371,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
         }
         "anthropic" => {
             config.providers.anthropic = Some(bamboo_config::AnthropicConfig {
+                api_key_from_env: false,
                 api_key: instance.api_key.clone(),
                 api_key_encrypted: instance.api_key_encrypted.clone(),
                 base_url: instance.base_url.clone(),
@@ -384,6 +386,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
         }
         "gemini" => {
             config.providers.gemini = Some(bamboo_config::GeminiConfig {
+                api_key_from_env: false,
                 api_key: instance.api_key.clone(),
                 api_key_encrypted: instance.api_key_encrypted.clone(),
                 base_url: instance.base_url.clone(),
@@ -480,6 +483,7 @@ mod tests {
 
     fn test_openai_config() -> OpenAIConfig {
         OpenAIConfig {
+            api_key_from_env: false,
             api_key: "sk-test".to_string(),
             api_key_encrypted: None,
             base_url: None,
