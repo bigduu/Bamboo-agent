@@ -253,6 +253,9 @@ impl SessionStoreV2 {
                     // index. If the backup rename fails we still rebuild — the
                     // rebuild's fresh persist would overwrite the corrupt file
                     // anyway, and the session.json files remain untouched.
+                    // NOTE: `fs::rename` clobbers any pre-existing
+                    // `sessions.json.bak` (only the latest corruption is kept) —
+                    // an accepted tradeoff for the recovery path.
                     let backup_path = bamboo_home_dir.join("sessions.json.bak");
                     match fs::rename(&index_path, &backup_path).await {
                         Ok(()) => tracing::error!(
@@ -306,14 +309,20 @@ impl SessionStoreV2 {
     /// - `sessions/<root_id>/session.json`
     /// - `sessions/<root_id>/children/<child_id>/session.json`
     ///
-    /// so every session is recoverable without the index. Each `session.json`
-    /// is deserialized and folded back in via [`Self::upsert_index_from_session`]
-    /// with the same `rel_path` [`Self::save_session`] would compute — derived
-    /// from the on-disk directory names (the physical location), which is what
-    /// `abs_path_from_rel` + load rely on. A single unreadable/corrupt
-    /// `session.json` is skipped with a warning so one bad file never aborts
-    /// recovery of the rest, then [`Self::rebuild_search_index`] is run so
-    /// full-text search works immediately after recovery.
+    /// so every session is recoverable without the index. Each session is loaded
+    /// from its directory via [`Self::load_session_from_dir`] — which parses
+    /// `session.json` and **overlays the `runtime.json` sidecar exactly like
+    /// [`Storage::load_session`]**, so recovered index entries reflect the
+    /// freshest control-plane (a runtime-only save updates only the sidecar) and
+    /// agree with the FTS index that [`Self::rebuild_search_index`] builds via
+    /// `load_session`. The result is folded back in via
+    /// [`Self::upsert_index_from_session`] with the same `rel_path`
+    /// [`Self::save_session`] would compute — derived from the on-disk directory
+    /// names (the physical location), which is what `abs_path_from_rel` + load
+    /// rely on. A single unreadable/corrupt session is skipped with a warning,
+    /// and directory-level read errors are logged + tolerated (never
+    /// `?`-propagated) so one bad file/dir never re-introduces a boot-fatal
+    /// failure or aborts recovery of the rest.
     async fn rebuild_index_from_disk(&self) -> io::Result<()> {
         let mut recovered = 0usize;
 
@@ -324,7 +333,18 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
 
-        while let Some(root_entry) = root_dirs.next_entry().await? {
+        loop {
+            // Directory-iteration errors are tolerated, not `?`-propagated: an
+            // error here would abort the whole rebuild and make `new()` return
+            // Err — the exact boot-fatal failure this rebuild exists to prevent.
+            let root_entry = match root_dirs.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!("index rebuild: error scanning sessions dir: {error}");
+                    break;
+                }
+            };
             if !root_entry
                 .file_type()
                 .await
@@ -339,8 +359,7 @@ impl SessionStoreV2 {
             };
 
             // Recover the root session (if its session.json is present + valid).
-            let root_json = root_entry.path().join("session.json");
-            if let Some(session) = Self::read_session_json_for_rebuild(&root_json, &root_id).await {
+            if let Some(session) = Self::load_session_from_dir(&root_entry.path(), &root_id).await {
                 let rel_path = Self::root_rel_path(&root_id);
                 match self.upsert_index_from_session(&session, rel_path).await {
                     Ok(()) => recovered += 1,
@@ -360,7 +379,17 @@ impl SessionStoreV2 {
                     continue;
                 }
             };
-            while let Some(child_entry) = child_dirs.next_entry().await? {
+            loop {
+                let child_entry = match child_dirs.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            "index rebuild: error scanning children of {root_id}: {error}"
+                        );
+                        break;
+                    }
+                };
                 if !child_entry
                     .file_type()
                     .await
@@ -372,9 +401,8 @@ impl SessionStoreV2 {
                 let Ok(child_id) = child_entry.file_name().into_string() else {
                     continue;
                 };
-                let child_json = child_entry.path().join("session.json");
                 if let Some(session) =
-                    Self::read_session_json_for_rebuild(&child_json, &child_id).await
+                    Self::load_session_from_dir(&child_entry.path(), &child_id).await
                 {
                     let rel_path = Self::child_rel_path(&root_id, &child_id);
                     match self.upsert_index_from_session(&session, rel_path).await {
@@ -401,12 +429,17 @@ impl SessionStoreV2 {
         Ok(())
     }
 
-    /// Read + deserialize a `session.json` during index rebuild. A missing file
-    /// (a directory with no `session.json`) yields `None` silently; a corrupt or
-    /// otherwise unreadable one is skipped with a warning. Rebuild must never
-    /// hard-fail on one bad session — it recovers as much as possible.
-    async fn read_session_json_for_rebuild(path: &Path, id: &str) -> Option<Session> {
-        let raw = match fs::read_to_string(path).await {
+    /// Load a session from a known on-disk directory during index rebuild,
+    /// mirroring [`Storage::load_session`] but resolving the directory by scan
+    /// (the index is not yet populated during rebuild): parse `session.json`,
+    /// overlay the `runtime.json` sidecar via the shared
+    /// [`Self::read_runtime_sidecar_at`] + [`overlay_runtime_sidecar`] so the
+    /// freshest control-plane wins, then drop a stale Root token_budget. A
+    /// missing `session.json` yields `None` silently; a corrupt/unreadable one is
+    /// skipped with a warning; a sidecar read error degrades to "no sidecar"
+    /// rather than failing recovery. `id` is used only for log context.
+    async fn load_session_from_dir(abs_dir: &Path, id: &str) -> Option<Session> {
+        let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
             Err(error) => {
@@ -414,13 +447,24 @@ impl SessionStoreV2 {
                 return None;
             }
         };
-        match serde_json::from_str::<Session>(&raw) {
-            Ok(session) => Some(session),
+        let main: Session = match serde_json::from_str(&raw) {
+            Ok(session) => session,
             Err(error) => {
                 tracing::warn!("index rebuild: skipping corrupt session {id}: {error}");
-                None
+                return None;
             }
-        }
+        };
+        let sidecar =
+            match Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), id).await {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    tracing::warn!("index rebuild: cannot read runtime sidecar for {id}: {error}");
+                    None
+                }
+            };
+        let mut session = overlay_runtime_sidecar(main, sidecar);
+        session.clear_stale_root_token_budget();
+        Some(session)
     }
 
     pub fn search_index(&self) -> &SessionSearchIndex {
@@ -638,15 +682,24 @@ impl SessionStoreV2 {
 
     /// Read the runtime sidecar (a Session snapshot with empty `messages`), if it
     /// exists. Returns `None` when the session has no sidecar yet (e.g. legacy
-    /// sessions not yet migrated).
+    /// sessions not yet migrated). Path is resolved through the index.
     async fn read_runtime_sidecar(&self, session_id: &str) -> io::Result<Option<Session>> {
         let Some(path) = self.runtime_json_path(session_id).await? else {
             return Ok(None);
         };
+        Self::read_runtime_sidecar_at(&path, session_id).await
+    }
+
+    /// Read + deserialize a runtime sidecar (`runtime.json`) from a known path.
+    /// A missing file yields `None`; a corrupt one is ignored with a warning
+    /// (the authoritative copy still lives in `session.json`). Shared by
+    /// [`Self::read_runtime_sidecar`] (index-resolved path) and the index
+    /// rebuild (directory-scanned path) so both overlay the sidecar identically.
+    async fn read_runtime_sidecar_at(path: &Path, id: &str) -> io::Result<Option<Session>> {
         if !path.exists() {
             return Ok(None);
         }
-        let raw = fs::read_to_string(&path).await?;
+        let raw = fs::read_to_string(path).await?;
         match serde_json::from_str::<Session>(&raw) {
             Ok(mut side) => {
                 // The control-plane path (`load_runtime_control_plane`) returns
@@ -657,11 +710,7 @@ impl SessionStoreV2 {
             Err(error) => {
                 // A corrupt sidecar must never make a session unloadable — the
                 // authoritative copy still lives in session.json. Warn and ignore.
-                tracing::warn!(
-                    "ignoring corrupt runtime sidecar for {}: {}",
-                    session_id,
-                    error
-                );
+                tracing::warn!("ignoring corrupt runtime sidecar for {id}: {error}");
                 Ok(None)
             }
         }
@@ -1605,6 +1654,60 @@ mod tests {
             "a fresh sessions.json must be written after rebuild"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_overlays_runtime_sidecar_control_plane() -> io::Result<()> {
+        // #342 review: rebuild must overlay runtime.json (the freshest
+        // control-plane) on top of session.json, exactly like load_session.
+        // A runtime-only save updates ONLY the sidecar, so a session that
+        // completed that way must be recovered as "completed", not the stale
+        // "running" still baked into session.json.
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+
+        {
+            let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+
+            // Full save: session.json + sidecar both carry "running".
+            let mut root = Session::new("rb-overlay", "m");
+            root.metadata
+                .insert("last_run_status".into(), "running".into());
+            storage.save_session(&root).await?;
+
+            // Runtime-only save: bump ONLY the sidecar to "completed".
+            // session.json is left byte-identical (still "running").
+            let mut updated = root.clone();
+            updated
+                .metadata
+                .insert("last_run_status".into(), "completed".into());
+            storage.save_runtime_state(&updated).await?;
+
+            // Sanity: session.json on disk still carries the stale status.
+            let raw = read_session_json_raw(&storage, "rb-overlay").await;
+            assert!(
+                raw.contains("running"),
+                "session.json must still carry the pre-sidecar status"
+            );
+        }
+
+        // Corrupt the index, then reopen → triggers rebuild-from-disk.
+        tokio::fs::write(bamboo_home.join("sessions.json"), b"{ not valid json").await?;
+        let recovered = SessionStoreV2::new(bamboo_home.clone()).await?;
+
+        // The rebuilt index entry must reflect the SIDECAR's fresh "completed",
+        // NOT session.json's stale "running". Without the overlay fix the rebuild
+        // reads session.json only and this is "running", so the test fails.
+        let entry = recovered
+            .get_index_entry("rb-overlay")
+            .await
+            .expect("root recovered into rebuilt index");
+        assert_eq!(
+            entry.last_run_status.as_deref(),
+            Some("completed"),
+            "rebuild must overlay runtime.json control-plane, not the stale session.json"
+        );
         Ok(())
     }
 
