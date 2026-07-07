@@ -5,8 +5,21 @@ services:
       dockerfile: docker/Dockerfile
     image: bamboo-server:latest
     container_name: bamboo
+    # Publish to the HOST loopback only. A fresh instance has no password/device,
+    # so its auth gate is inert (open to every caller); binding the published
+    # port to 0.0.0.0 would expose an unauthenticated, tool-executing agent to
+    # the LAN. To expose it on the network, FIRST configure a password/device,
+    # then change this to "9562:9562" (or "<lan-ip>:9562:9562"). (#249)
     ports:
-      - "9562:9562"
+      - "127.0.0.1:9562:9562"
+    # Container isolation: no privilege escalation, drop all Linux capabilities
+    # (the agent needs none), and bound process/resource use so a compromise or
+    # runaway can't exhaust the host.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
     environment:
       - RUST_LOG=info
       - BAMBOO_DATA_DIR=/data
@@ -20,9 +33,12 @@ services:
       # - Wildcard subdomains: *.example.com
       - BAMBOO_CORS_ALLOW_ORIGINS=
     volumes:
-      # - bamboo-data:/data
-      # Optional: mount a config.json into the data dir (read-only)
-      - ~/.bamboo:/data
+      # Default to an isolated named volume rather than bind-mounting the host's
+      # entire ~/.bamboo (config, encryption key, all sessions) read-write into a
+      # network-reachable, tool-executing container. To share the host profile
+      # instead, comment this out and uncomment the bind mount below. (#249, #46)
+      - bamboo-data:/data
+      # - ~/.bamboo:/data
     restart: unless-stopped
 
 volumes:

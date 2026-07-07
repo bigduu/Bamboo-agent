@@ -297,7 +297,7 @@ cd docker && docker compose up -d --build
 curl http://localhost:9562/api/v1/health
 ```
 
-`docker-compose.yml` maps `9562:9562` and sets `BAMBOO_DATA_DIR=/data`, `BAMBOO_PORT=9562`, `BAMBOO_BIND=0.0.0.0`.
+`docker-compose.yml` publishes to the host loopback only (`127.0.0.1:9562:9562`), runs as a non-root user, drops all capabilities, and uses an isolated named volume. A fresh instance is unauthenticated (the auth gate is inert until you set a password/device), so **configure a credential before exposing the port to the network** (changing the publish to `9562:9562`). It also sets `BAMBOO_DATA_DIR=/data`, `BAMBOO_PORT=9562`, `BAMBOO_BIND=0.0.0.0` (in-container bind; exposure is controlled at the publish layer).
 
 ### Selected API routes
 

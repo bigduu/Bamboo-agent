@@ -263,7 +263,7 @@ cd docker && docker compose up -d --build
 curl http://localhost:9562/api/v1/health
 ```
 
-`docker-compose.yml` 映射 `9562:9562`，并设置 `BAMBOO_DATA_DIR=/data`、`BAMBOO_PORT=9562`、`BAMBOO_BIND=0.0.0.0`。
+`docker-compose.yml` 仅发布到主机回环地址（`127.0.0.1:9562:9562`），以非 root 用户运行，丢弃所有 capability，并使用独立的命名卷。新实例默认无鉴权（在设置密码/设备前鉴权闸门是失效的），因此**在把端口暴露到网络之前请先配置凭据**（把发布改为 `9562:9562`）。同时设置 `BAMBOO_DATA_DIR=/data`、`BAMBOO_PORT=9562`、`BAMBOO_BIND=0.0.0.0`（容器内绑定；暴露范围由发布层控制）。
 
 ### 常用 API 路由
 
