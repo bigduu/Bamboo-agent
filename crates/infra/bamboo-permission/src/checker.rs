@@ -561,6 +561,10 @@ fn command_can_chain_or_inject(analysis: &crate::bash_security::BashSecurityAnal
                 | VariableAsCommand
                 | RedirectToSensitivePath
                 | SensitivePathArgument
+                // ANSI-C quoting (`$'…'`) is static but can encode a sensitive
+                // path via escapes (`$'/etc/pass\x77d'`) that shell_unquote can't
+                // resolve, so fail closed rather than auto-approve it. #392.
+                | AnsiCString
                 | ParseFailed
                 | AnalysisBudgetExceeded
                 | UnknownNodeType(_)
@@ -1423,6 +1427,47 @@ mod tests {
             assert!(
                 !is_safe_edit_command(cmd),
                 "must NOT auto-approve a destructive argument: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_edit_rejects_quote_spliced_sensitive_paths() {
+        // #392: ordinary shell quote-splicing resolves to the same sensitive path
+        // at runtime but defeats a raw prefix match — must still NOT auto-approve.
+        let evasions = [
+            r"cp evil /etc/pass''wd",            // empty single-quote splice
+            r#"cp evil /etc/pass""wd"#,          // empty double-quote splice
+            r"cp evil /etc/'passwd'",            // quoted segment
+            r"cp /etc/'shadow' /tmp/x",          // quoted sensitive SOURCE
+            r"cp evil ~/.ss'h'/authorized_keys", // quoted home dotfile dir
+            r"cp evil '/etc/sudoers.d/zz'",      // fully-quoted /etc subtree
+            r"echo pwned > /etc/pass''wd",       // quoted redirect target
+            r"chmod -R 000 '/'",                 // quoted root for recursive chmod
+        ];
+        for cmd in evasions {
+            assert!(
+                !is_safe_edit_command(cmd),
+                "must NOT auto-approve a quote-spliced sensitive path: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_edit_rejects_ansi_c_quoted_paths() {
+        // #392: ANSI-C quoting (`$'…'`) is static but can hide a sensitive path
+        // behind escapes (`$'/etc/pass\x77d'`) that can't be statically resolved,
+        // so any ANSI-C quoting fails the gate closed (never auto-approves).
+        let evasions = [
+            r"cp evil $'/etc/passwd'",      // plain ANSI-C wrap
+            r"echo pwned > $'/etc/passwd'", // ANSI-C redirect target
+            r"cp evil $'/etc/pass\x77d'",   // hex-escaped 'w' -> /etc/passwd
+            r"chmod -R 000 $'/'",           // ANSI-C root
+        ];
+        for cmd in evasions {
+            assert!(
+                !is_safe_edit_command(cmd),
+                "must NOT auto-approve an ANSI-C quoted path: {cmd:?}"
             );
         }
     }

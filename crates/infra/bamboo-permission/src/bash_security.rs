@@ -102,12 +102,42 @@ const SENSITIVE_HOME_PREFIXES: &[&str] = &[
 /// check. #155.
 const FILE_MUTATING_COMMANDS: &[&str] = &["cp", "mv", "tee", "dd", "install", "rsync", "ln"];
 
+/// Best-effort static removal of shell quoting so a sensitive-path check isn't
+/// evaded by ordinary quote-splicing: `/etc/pass''wd`, `/etc/pass""wd`,
+/// `/etc/'passwd'`, `'/etc/passwd'`, `~/.ss"h"/authorized_keys` all resolve to
+/// the same path in bash/zsh but defeat a raw `starts_with`. Drops unescaped
+/// `'`/`"` (splicing adjacent segments) and unwraps `\`-escapes.
+///
+/// This deliberately does NOT resolve variable/command/glob expansions
+/// (`/etc/$X`, `/etc/$(...)`) — those are inherently dynamic and are covered by
+/// other analyzer gates (VariableAsCommand / substitution warnings) or fall
+/// through to prompting. Over-stripping only ever makes a path MORE likely to be
+/// flagged, which is the safe direction for an auto-approve gate. #392.
+fn shell_unquote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {}
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// True if `path` targets a sensitive filesystem location: an absolute system
 /// path from [`SENSITIVE_REDIRECT_PATHS`], or a sensitive dotfile/dir under the
-/// user's home (`~/…`, `$HOME/…`, `${HOME}/…`). Used for both redirect targets
-/// and destructive command arguments. #155.
+/// user's home (`~/…`, `$HOME/…`, `${HOME}/…`). Resolves shell quote-splicing
+/// first. Used for both redirect targets and destructive command arguments.
+/// #155, #392.
 fn is_sensitive_fs_path(path: &str) -> bool {
-    let trimmed = path.trim().trim_matches(|c| c == '"' || c == '\'');
+    let unquoted = shell_unquote(path.trim());
+    let trimmed = unquoted.trim();
     let lower = trimmed.to_ascii_lowercase();
     if SENSITIVE_REDIRECT_PATHS
         .iter()
@@ -215,10 +245,8 @@ fn check_sensitive_path_arguments(command_name: &str, args: &[String]) -> Vec<Ba
 /// modification is destructive (broader than [`is_sensitive_fs_path`], which
 /// targets specific files/dirs — a recursive chmod hits the whole subtree). #155.
 fn is_system_root_path(path: &str) -> bool {
-    let p = path
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim_end_matches('/');
+    let unquoted = shell_unquote(path.trim());
+    let p = unquoted.trim().trim_end_matches('/');
     // "/" trims to "" — the root itself.
     if p.is_empty() {
         return true;
@@ -625,6 +653,18 @@ fn walk_node_with_budget(
     let kind = node.kind();
     *node_count += 1;
 
+    // ANSI-C quoting (`$'…'`) is a security-relevant LEAF node: it's static but
+    // can encode a sensitive path via escapes (`$'/etc/pass\x77d'`) that can't be
+    // statically resolved. Flag it BEFORE the leaf-skip below, otherwise the
+    // warning is never emitted and the auto-approve gate can't fail closed. #392.
+    if kind == "ansi_c_string" {
+        warnings.push(BashWarning {
+            kind: BashWarningKind::AnsiCString,
+            detail: format!("ansi-c string: {}", truncate(&node_text(node, source), 40)),
+        });
+        return;
+    }
+
     // Skip safe leaf nodes
     if node.child_count() == 0 {
         return;
@@ -736,14 +776,6 @@ fn walk_node_with_budget(
             warnings.push(BashWarning {
                 kind: BashWarningKind::BraceExpansion,
                 detail: format!("brace expansion: {}", truncate(&text, 40)),
-            });
-        }
-
-        "ansi_c_string" => {
-            let text = node_text(node, source);
-            warnings.push(BashWarning {
-                kind: BashWarningKind::AnsiCString,
-                detail: format!("ansi-c string: {}", truncate(&text, 40)),
             });
         }
 
@@ -1484,7 +1516,14 @@ fn check_redirects_node(node: &tree_sitter::Node, source: &str, warnings: &mut V
                 let text = node_text(&child, source);
                 if kind == "file_descriptor" || kind == "redirect_operator" {
                     redirect_op = Some(text);
-                } else if kind == "word" || kind == "string" || kind == "raw_string" {
+                } else if kind == "word"
+                    || kind == "string"
+                    || kind == "raw_string"
+                    // A quote-spliced target (`> /etc/pass''wd`) parses as a
+                    // `concatenation`; capture its full text so shell_unquote can
+                    // resolve it, otherwise the redirect check misses it. #392.
+                    || kind == "concatenation"
+                {
                     target_path = Some(text);
                 }
             }
@@ -1719,6 +1758,34 @@ fn check_heredoc_expansions_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_unquote_resolves_spliced_paths() {
+        // #392: quote-splicing forms all resolve to the same literal.
+        assert_eq!(shell_unquote("/etc/pass''wd"), "/etc/passwd");
+        assert_eq!(shell_unquote(r#"/etc/pass""wd"#), "/etc/passwd");
+        assert_eq!(shell_unquote("/etc/'passwd'"), "/etc/passwd");
+        assert_eq!(shell_unquote("'/etc/passwd'"), "/etc/passwd");
+        assert_eq!(shell_unquote(r"/etc/pass\wd"), "/etc/passwd"); // backslash-escape unwrapped
+        assert_eq!(
+            shell_unquote("~/.ss'h'/authorized_keys"),
+            "~/.ssh/authorized_keys"
+        );
+        // Unquoted paths and dynamic ($VAR) segments are left intact.
+        assert_eq!(shell_unquote("/etc/passwd"), "/etc/passwd");
+        assert_eq!(shell_unquote("/etc/$X"), "/etc/$X");
+    }
+
+    #[test]
+    fn is_sensitive_fs_path_sees_through_quotes() {
+        // #392: the sensitive-path check must resolve quote-spliced evasions.
+        assert!(is_sensitive_fs_path("/etc/pass''wd"));
+        assert!(is_sensitive_fs_path("/etc/'sudoers.d'/zz"));
+        assert!(is_sensitive_fs_path("~/.ss'h'/authorized_keys"));
+        assert!(is_system_root_path("'/'"));
+        // A non-sensitive quoted path stays allowed.
+        assert!(!is_sensitive_fs_path("'build'/out.txt"));
+    }
 
     // ---- Redirect-to-/dev/null is benign, not a sensitive-path Deny ----
 
