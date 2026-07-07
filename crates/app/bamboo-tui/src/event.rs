@@ -1,6 +1,10 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::api::types::AgentEvent;
+use crate::api::types::{AgentEvent, McpServer, Schedule, SessionSummary, Skill, ToolInfo};
+
+/// Result of a background API call, delivered back to the event loop so the call
+/// never blocks the UI thread. `Err` carries a display string.
+type Loaded<T> = Result<T, String>;
 
 pub enum AppEvent {
     Key(KeyEvent),
@@ -8,4 +12,20 @@ pub enum AppEvent {
     Resize(u16, u16),
     SseEvent(AgentEvent),
     ApiError(String),
+
+    // ── Non-blocking API results (posted by spawned tasks) ──
+    SessionsLoaded(Loaded<Vec<SessionSummary>>),
+    McpServersLoaded(Loaded<Vec<McpServer>>),
+    McpToolsLoaded(Loaded<Vec<ToolInfo>>),
+    SchedulesLoaded(Loaded<Vec<Schedule>>),
+    SkillsLoaded(Loaded<Vec<Skill>>),
+    ConfigLoaded(Loaded<serde_json::Value>),
+    /// A background mutation finished; carries a status line and whether the
+    /// current tab's data should be reloaded.
+    ActionDone {
+        status: String,
+        reload_tab: bool,
+    },
+    /// A chat turn was created + started; carries the new session id.
+    ChatStarted(Loaded<String>),
 }
