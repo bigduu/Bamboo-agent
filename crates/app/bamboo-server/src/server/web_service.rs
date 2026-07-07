@@ -6,6 +6,13 @@ use tokio::sync::oneshot;
 use tracing::{error, info};
 
 use super::listeners::DEFAULT_WORKER_COUNT;
+
+/// Request body size limits, applied on EVERY serve path so the desktop/embedded
+/// server accepts the same payloads (e.g. an inline-image chat request) as the
+/// production server, instead of falling back to actix's ~2MB JSON / 256KB
+/// payload defaults and rejecting them with 413 (#252).
+pub(crate) const MAX_JSON_BODY_BYTES: usize = 25 * 1024 * 1024;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 30 * 1024 * 1024;
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{build_cors, build_rate_limiter, build_security_headers, is_loopback_bind};
@@ -85,6 +92,8 @@ impl WebService {
 
         let server = HttpServer::new(move || {
             App::new()
+                .app_data(web::JsonConfig::default().limit(MAX_JSON_BODY_BYTES))
+                .app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
                 .app_data(app_state.clone())
                 .wrap(build_cors(&bind_addr, port))
                 .configure(configure_routes) // No rate limiting for WebService
@@ -185,8 +194,8 @@ impl WebService {
 
         let server = HttpServer::new(move || {
             App::new()
-                .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024))
-                .app_data(web::PayloadConfig::new(30 * 1024 * 1024))
+                .app_data(web::JsonConfig::default().limit(MAX_JSON_BODY_BYTES))
+                .app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
                 .app_data(app_state.clone())
                 .wrap(actix_web::middleware::Condition::new(
                     apply_rate_limit,
