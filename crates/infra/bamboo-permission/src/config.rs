@@ -735,6 +735,16 @@ impl PermissionConfig {
             }
         }
 
+        // Built-in backstop: js_repl (and any future eval-style tool) executes
+        // arbitrary, non-statically-analyzable code — a Node program can shell
+        // out via `require('child_process')`, so it is every bit as dangerous as
+        // a super-dangerous shell command. It is not covered by the Bash command
+        // analysis above (the permission layer only sees "node"), so it must
+        // force a confirmation like one — INCLUDING under BypassPermissions.
+        if tool_name.eq_ignore_ascii_case("js_repl") {
+            return true;
+        }
+
         // Configured "always ask" rules.
         self.ask_rules
             .read()
@@ -1830,6 +1840,26 @@ mod integration_tests {
         // A benign command is not forced.
         assert!(!config
             .requires_forced_confirmation("Bash", &serde_json::json!({ "command": "ls -la" }),));
+    }
+
+    #[test]
+    fn forced_confirmation_js_repl_always_asks() {
+        let config = PermissionConfig::new();
+        // js_repl runs arbitrary code (it can shell out via `child_process`), so
+        // it must force a prompt even with no configured ask rules — the
+        // equivalent of a super-dangerous Bash command, including under
+        // BypassPermissions where non-forced tools are otherwise skipped.
+        assert!(config.requires_forced_confirmation(
+            "js_repl",
+            &serde_json::json!({ "code": "require('child_process').execSync('id')" }),
+        ));
+        // Case-insensitive, and even a benign-looking snippet forces — the code
+        // body is not statically analyzable at this layer.
+        assert!(config
+            .requires_forced_confirmation("JS_REPL", &serde_json::json!({ "code": "1 + 1" }),));
+        // A non-eval tool with no matching ask rule is still not forced.
+        assert!(!config
+            .requires_forced_confirmation("Read", &serde_json::json!({ "file_path": "/tmp/x" }),));
     }
 
     #[test]
