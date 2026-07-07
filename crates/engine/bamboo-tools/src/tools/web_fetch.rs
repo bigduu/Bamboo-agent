@@ -59,23 +59,56 @@ impl WebFetchTool {
         // 100.64.0.0/10 — CGNAT shared address space (Ipv4Addr::is_shared is
         // still unstable, so match the range directly).
         let is_shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+        // 0.0.0.0/8 — `is_unspecified()` only matches the exact 0.0.0.0, but the
+        // whole /8 is routed as loopback-equivalent on several OSes.
+        let is_this_network = octets[0] == 0;
         ipv4.is_loopback()
             || ipv4.is_private()
             || ipv4.is_link_local()
             || ipv4.is_multicast()
             || ipv4.is_unspecified()
             || is_shared
+            || is_this_network
+    }
+
+    /// The IPv4 address embedded in an IPv6 address, across the forms that carry
+    /// a routable v4 target: IPv4-mapped (`::ffff:a.b.c.d`), the deprecated
+    /// IPv4-compatible (`::a.b.c.d`), and NAT64 (`64:ff9b::/96`). Returns `None`
+    /// for `::` / `::1`, which the plain IPv6 checks already handle.
+    fn embedded_ipv4(ipv6: std::net::Ipv6Addr) -> Option<Ipv4Addr> {
+        if let Some(mapped) = ipv6.to_ipv4_mapped() {
+            return Some(mapped);
+        }
+        let seg = ipv6.segments();
+        let low = Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            (seg[6] & 0xff) as u8,
+            (seg[7] >> 8) as u8,
+            (seg[7] & 0xff) as u8,
+        );
+        // NAT64 well-known prefix 64:ff9b::/96.
+        if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|s| *s == 0) {
+            return Some(low);
+        }
+        // Deprecated IPv4-compatible ::a.b.c.d (high 96 bits zero), excluding
+        // :: (unspecified) and ::1 (loopback).
+        if seg[0..6].iter().all(|s| *s == 0) && !(seg[6] == 0 && (seg[7] == 0 || seg[7] == 1)) {
+            return Some(low);
+        }
+        None
     }
 
     fn is_disallowed_ip(ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => Self::is_disallowed_ipv4(ipv4),
             IpAddr::V6(ipv6) => {
-                // Canonicalize IPv4-mapped addresses (::ffff:a.b.c.d) and judge
-                // them by the IPv4 rules — otherwise ::ffff:127.0.0.1 etc. slip
-                // past the IPv6-only checks below.
-                if let Some(mapped) = ipv6.to_ipv4_mapped() {
-                    return Self::is_disallowed_ipv4(mapped);
+                // An embedded IPv4 target (mapped / compatible / NAT64) is judged
+                // by the IPv4 rules — otherwise ::ffff:127.0.0.1, ::169.254.169.254,
+                // 64:ff9b::169.254.169.254 etc. slip past the IPv6-only checks.
+                if let Some(v4) = Self::embedded_ipv4(ipv6) {
+                    if Self::is_disallowed_ipv4(v4) {
+                        return true;
+                    }
                 }
                 let segments = ipv6.segments();
                 let first = segments[0];
@@ -207,60 +240,68 @@ impl Tool for WebFetchTool {
         // Follow redirects manually: reqwest's auto-follow would re-resolve and
         // connect to the redirect target WITHOUT re-running the SSRF guard, so
         // `http://ok.example/ → 302 http://169.254.169.254/…` would leak. We
-        // validate-and-pin every hop instead.
-        let mut hop_count = 0usize;
-        let response = loop {
-            let scheme = current_url.scheme();
-            if scheme != "http" && scheme != "https" {
-                return Err(ToolError::InvalidArguments(
-                    "Only http/https URLs are allowed".to_string(),
-                ));
-            }
-
-            let (host, addrs) = Self::validate_and_resolve(&current_url).await?;
-
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                // Don't let reqwest silently follow to an unvalidated host.
-                .redirect(reqwest::redirect::Policy::none())
-                // Pin the connection to the exact addresses we just validated so
-                // the guard and the socket use the same IP (no rebind window).
-                .resolve_to_addrs(&host, &addrs)
-                .build()
-                .map_err(|e| ToolError::Execution(format!("Failed to build HTTP client: {}", e)))?;
-
-            let resp = client
-                .get(current_url.clone())
-                .send()
-                .await
-                .map_err(|e| ToolError::Execution(format!("Failed to fetch URL: {}", e)))?;
-
-            if resp.status().is_redirection() {
-                let location = resp
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|value| value.to_str().ok());
-                if let Some(location) = location {
-                    let next = current_url.join(location).map_err(|e| {
-                        ToolError::Execution(format!("Invalid redirect Location: {}", e))
-                    })?;
-                    // `hop_count` is tracked via the URL history length below.
-                    if current_url == next {
-                        break resp; // self-redirect; stop to avoid a loop
-                    }
-                    hop_count += 1;
-                    if hop_count > MAX_REDIRECTS {
-                        return Err(ToolError::Execution(format!(
-                            "Too many redirects (>{})",
-                            MAX_REDIRECTS
-                        )));
-                    }
-                    current_url = next;
-                    continue;
+        // validate-and-pin every hop instead. The WHOLE chain shares one 30s
+        // deadline so a server dribbling redirects can't stretch the request to
+        // MAX_REDIRECTS × 30s.
+        let fetch = async {
+            let mut hop_count = 0usize;
+            loop {
+                let scheme = current_url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(ToolError::InvalidArguments(
+                        "Only http/https URLs are allowed".to_string(),
+                    ));
                 }
+
+                let (host, addrs) = Self::validate_and_resolve(&current_url).await?;
+
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    // Don't let reqwest silently follow to an unvalidated host.
+                    .redirect(reqwest::redirect::Policy::none())
+                    // Pin the connection to the exact addresses we just validated
+                    // so the guard and the socket use the same IP (no rebind).
+                    .resolve_to_addrs(&host, &addrs)
+                    .build()
+                    .map_err(|e| {
+                        ToolError::Execution(format!("Failed to build HTTP client: {}", e))
+                    })?;
+
+                let resp = client
+                    .get(current_url.clone())
+                    .send()
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("Failed to fetch URL: {}", e)))?;
+
+                if resp.status().is_redirection() {
+                    let location = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|value| value.to_str().ok());
+                    if let Some(location) = location {
+                        let next = current_url.join(location).map_err(|e| {
+                            ToolError::Execution(format!("Invalid redirect Location: {}", e))
+                        })?;
+                        if current_url == next {
+                            return Ok(resp); // self-redirect; stop to avoid a loop
+                        }
+                        hop_count += 1;
+                        if hop_count > MAX_REDIRECTS {
+                            return Err(ToolError::Execution(format!(
+                                "Too many redirects (>{})",
+                                MAX_REDIRECTS
+                            )));
+                        }
+                        current_url = next;
+                        continue;
+                    }
+                }
+                return Ok(resp);
             }
-            break resp;
         };
+        let response = tokio::time::timeout(Duration::from_secs(30), fetch)
+            .await
+            .map_err(|_| ToolError::Execution("WebFetch timed out after 30s".to_string()))??;
 
         let status = response.status().as_u16();
         let mut stream = response.bytes_stream();
@@ -348,6 +389,20 @@ mod tests {
                 "expected {mapped} to be disallowed"
             );
         }
+        // Deprecated IPv4-compatible (::a.b.c.d) and NAT64 (64:ff9b::/96) forms
+        // also embed a routable v4 target and must be canonicalized.
+        for embedded in [
+            "::169.254.169.254",
+            "::127.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "64:ff9b::7f00:1", // 127.0.0.1
+        ] {
+            assert!(
+                WebFetchTool::is_disallowed_ip(embedded.parse().unwrap()),
+                "expected {embedded} to be disallowed"
+            );
+        }
+
         // CGNAT 100.64.0.0/10 shared space.
         assert!(WebFetchTool::is_disallowed_ip(
             "100.64.0.1".parse().unwrap()
@@ -355,6 +410,10 @@ mod tests {
         assert!(WebFetchTool::is_disallowed_ip(
             "100.127.255.255".parse().unwrap()
         ));
+
+        // 0.0.0.0/8 — not just the exact 0.0.0.0.
+        assert!(WebFetchTool::is_disallowed_ip("0.0.0.0".parse().unwrap()));
+        assert!(WebFetchTool::is_disallowed_ip("0.1.2.3".parse().unwrap()));
 
         // Boundaries just outside CGNAT and genuine public addresses stay allowed.
         assert!(!WebFetchTool::is_disallowed_ip(
