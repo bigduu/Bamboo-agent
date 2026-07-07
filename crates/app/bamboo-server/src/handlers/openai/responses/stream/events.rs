@@ -65,6 +65,25 @@ pub(super) fn event_to_sse_bytes<T: Serialize>(event: &ResponsesStreamEvent<T>) 
     ))
 }
 
+/// A `response.failed` SSE event carrying the upstream error.
+///
+/// Without this, a mid-stream upstream failure is reported to the client as a
+/// clean `[DONE]` (no `response.completed`, but also no failure signal), so an
+/// OpenAI-SDK client treats the TRUNCATED output as the final answer. Emitting
+/// `response.failed` before `[DONE]` lets the client distinguish a cut-off stream
+/// from a complete one — mirroring the Anthropic handler's `error` event and the
+/// chat endpoint's error chunk (#383). #355.
+pub(super) fn failed_sse_bytes(message: &str) -> Bytes {
+    let payload = serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "status": "failed",
+            "error": { "message": message, "type": "api_error" },
+        },
+    });
+    Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"))
+}
+
 pub(super) fn done_sse_bytes() -> Bytes {
     Bytes::from_static(b"data: [DONE]\n\n")
 }

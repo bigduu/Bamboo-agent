@@ -8,7 +8,8 @@ use bamboo_metrics::{ForwardStatus, MetricsCollector};
 
 use super::super::output::{build_completed_response, build_output_items};
 use super::events::{
-    completed_event, created_event, done_sse_bytes, event_to_sse_bytes, output_text_delta_event,
+    completed_event, created_event, done_sse_bytes, event_to_sse_bytes, failed_sse_bytes,
+    output_text_delta_event,
 };
 use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 
@@ -32,6 +33,7 @@ pub(super) fn spawn_stream_worker(args: StreamWorkerArgs) {
 
 async fn run_stream_worker(mut args: StreamWorkerArgs) {
     let mut had_error = false;
+    let mut error_message: Option<String> = None;
     let mut content = String::new();
     let mut tool_calls: Vec<bamboo_agent_core::tools::ToolCall> = Vec::new();
     let mut response_id: Option<String> = None;
@@ -116,6 +118,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
             Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {
                 had_error = true;
+                error_message = Some(error.to_string());
                 tracing::error!("Stream error: {}", error);
                 args.metrics.forward_completed(
                     args.forward_id.clone(),
@@ -131,6 +134,10 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
     }
 
     if had_error {
+        // Signal the failure so the client can tell a truncated stream from a
+        // completed one, instead of a clean `[DONE]` that looks like success. #355.
+        let message = error_message.as_deref().unwrap_or("upstream stream error");
+        let _ = args.tx.send(Ok(failed_sse_bytes(message))).await;
         let _ = args.tx.send(Ok(done_sse_bytes())).await;
         return;
     }
