@@ -182,8 +182,9 @@ impl BrokerCore {
         .await
         .unwrap_or_default();
 
-        // Phase 2: re-check each candidate under a brief lock (closing the
-        // delete-vs-subscribe race), then remove off-lock on the blocking pool.
+        // Phase 2: re-check subscription (brief lock, closing the
+        // delete-vs-subscribe race) AND emptiness (re-checked atomically with the
+        // remove, closing the deliver-vs-delete race), then remove off-lock.
         let mut purged = 0;
         for path in candidates {
             let id = path
@@ -193,10 +194,15 @@ impl BrokerCore {
             if self.subscribers.lock().await.contains_key(&id) {
                 continue; // subscribed since the snapshot — keep.
             }
-            let removed =
-                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&path).is_ok())
-                    .await
-                    .unwrap_or(false);
+            // Re-check emptiness and remove back-to-back in one blocking call (no
+            // await between them), so a message delivered to this mailbox since
+            // the Phase-1 scan is never silently deleted — matching the original
+            // synchronous `is_fully_empty` → `remove_dir_all`.
+            let removed = tokio::task::spawn_blocking(move || {
+                Mailbox::at(&path).is_fully_empty() && std::fs::remove_dir_all(&path).is_ok()
+            })
+            .await
+            .unwrap_or(false);
             if removed {
                 purged += 1;
             }
