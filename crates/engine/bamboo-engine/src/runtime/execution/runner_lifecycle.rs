@@ -32,6 +32,13 @@ pub struct RunnerReservation {
 ///
 /// Otherwise removes any stale runner and inserts a fresh one, returning
 /// the associated `CancellationToken` and the new `run_id`.
+///
+/// Unlike the server's `reserve_runner`, this does NOT re-assert `event_sender`
+/// into the `session_event_senders` map after the idle-eviction sweep (#346).
+/// It is only reached for spawn / schedule sessions, which are single-shot
+/// (sub-agents, guardians) or fresh-uuid-per-fire (scheduler) and thus never
+/// re-executed under the same id, so the evict-then-re-execute race the server
+/// path guards against is unreachable here.
 pub async fn try_reserve_runner(
     runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_id: &str,
