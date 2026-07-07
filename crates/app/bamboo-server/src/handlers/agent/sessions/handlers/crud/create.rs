@@ -65,7 +65,11 @@ pub async fn create_session(
     );
 
     match state.session_store.get_index_entry(&id).await {
-        Some(entry) => Ok(HttpResponse::Ok().json(CreateSessionResponse {
+        // 201 Created — a new resource was created. Aligns `POST /api/v1/sessions`
+        // with every other create endpoint (chat, mcp-add, prompt-presets,
+        // provider-instances, cluster-nodes), which already return 201. #251
+        // (finding 3).
+        Some(entry) => Ok(HttpResponse::Created().json(CreateSessionResponse {
             session: SessionSummary::from_entry(entry, false),
         })),
         None => Ok(HttpResponse::InternalServerError().json(serde_json::json!({
@@ -103,4 +107,53 @@ fn build_new_session(
     };
 
     crate_build(&input, &create_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{http::StatusCode, test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    async fn new_state() -> web::Data<AppState> {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        )
+    }
+
+    #[actix_web::test]
+    async fn create_session_returns_201_created() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({ "title": "New session" }))
+                .to_request(),
+        )
+        .await;
+
+        // 201 Created — aligns with the other create endpoints. #251 (finding 3).
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            body["session"]["id"].as_str().is_some(),
+            "response should carry the created session summary"
+        );
+    }
 }
