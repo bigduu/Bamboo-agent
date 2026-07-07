@@ -2043,6 +2043,11 @@ fn open_connection(path: &Path) -> MetricsResult<Connection> {
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
         PRAGMA synchronous = NORMAL;
+        -- Block-and-retry for up to 5s instead of failing a contended writer
+        -- immediately with SQLITE_BUSY (SQLite's default busy_timeout is 0).
+        -- Matters since prune_rounds_before holds the write lock across a
+        -- BEGIN IMMEDIATE transaction while live inserts may also write. #357.
+        PRAGMA busy_timeout = 5000;
         "#,
     )?;
     Ok(connection)
@@ -2590,6 +2595,18 @@ mod tests {
         ForwardMetricsFilter, ForwardStatus, MetricsDateFilter, RoundStatus, SessionMetricsFilter,
         SessionStatus, TokenUsage,
     };
+
+    #[test]
+    fn open_connection_sets_busy_timeout() {
+        // #357: a contended metrics writer must block-and-retry rather than fail
+        // immediately with SQLITE_BUSY (SQLite's default busy_timeout is 0).
+        let dir = tempdir().expect("temp dir");
+        let conn = super::open_connection(&dir.path().join("metrics.db")).expect("open");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("read busy_timeout");
+        assert_eq!(timeout, 5000);
+    }
 
     #[tokio::test]
     async fn storage_records_session_and_round_data_for_summary_queries() {
