@@ -13,7 +13,7 @@ use crate::api::BambooClient;
 use crate::event::AppEvent;
 use crate::ui;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Chat,
     Sessions,
@@ -551,6 +551,15 @@ impl App {
         // stops the run) until it is answered or dismissed.
         if self.pending_question.is_some() {
             return self.handle_question_key(key).await;
+        }
+
+        // The schedule-authoring modal likewise captures all input: Tab moves
+        // between fields and digits belong in cron expressions, so it must run
+        // before the global Tab/1-6 tab-switching below (which would otherwise
+        // swallow those keys and never reach the form).
+        if self.schedule_form.is_some() {
+            self.handle_schedule_form_key(key);
+            return Ok(());
         }
 
         if let KeyCode::Char(c) = key.code {
@@ -1163,10 +1172,8 @@ impl App {
     }
 
     async fn handle_schedules_key(&mut self, key: KeyEvent) -> Result<()> {
-        if self.schedule_form.is_some() {
-            self.handle_schedule_form_key(key);
-            return Ok(());
-        }
+        // Note: when `schedule_form` is open, `handle_key` routes every key
+        // straight to `handle_schedule_form_key` before reaching here.
         match key.code {
             KeyCode::Char('n') => {
                 self.schedule_form = Some(ScheduleForm::default());
@@ -1225,10 +1232,14 @@ impl App {
                 }
                 let req = CreateScheduleRequest {
                     name: form.name.trim().to_string(),
-                    cron: form.cron.trim().to_string(),
-                    prompt: form.prompt.trim().to_string(),
-                    model: None,
-                    workspace_path: None,
+                    trigger: ScheduleTriggerReq::Cron {
+                        expr: form.cron.trim().to_string(),
+                    },
+                    enabled: true,
+                    run_config: ScheduleRunConfigReq {
+                        task_message: Some(form.prompt.trim().to_string()),
+                        auto_execute: true,
+                    },
                 };
                 self.schedule_form = None;
                 if let Some(tx) = self.event_tx.clone() {
@@ -1489,6 +1500,30 @@ mod question_tests {
         // Esc cancels.
         app.handle_schedule_form_key(k(KeyCode::Esc));
         assert!(app.schedule_form.is_none());
+    }
+
+    /// Regression: while the form is open, `handle_key` must route Tab and the
+    /// 1-6 digit keys to the form instead of switching app tabs (cron
+    /// expressions are full of digits, Tab moves between fields).
+    #[tokio::test]
+    async fn schedule_form_captures_keys_through_handle_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        app.handle_key(k(KeyCode::Char('n'))).await.unwrap();
+        assert!(app.schedule_form.is_some(), "`n` opens the form");
+
+        // A digit must be typed into the focused field, not switch to tab N.
+        app.handle_key(k(KeyCode::Char('1'))).await.unwrap();
+        assert_eq!(app.tab, Tab::Schedules, "digit must not switch tabs");
+        assert_eq!(app.schedule_form.as_ref().unwrap().name, "1");
+
+        // Tab must advance the form field, not switch app tab.
+        app.handle_key(k(KeyCode::Tab)).await.unwrap();
+        assert_eq!(app.tab, Tab::Schedules, "Tab must not switch tabs");
+        assert_eq!(app.schedule_form.as_ref().unwrap().field, 1);
     }
 
     #[tokio::test]
