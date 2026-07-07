@@ -177,6 +177,17 @@ pub enum ScheduleRunStatus {
     Cancelled,
 }
 
+impl ScheduleRunStatus {
+    /// Whether the run has reached a final state (no further transitions). Used
+    /// to decide which run records are safe to prune from history.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failed | Self::Skipped | Self::Missed | Self::Cancelled
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleRunRecord {
     pub run_id: String,
