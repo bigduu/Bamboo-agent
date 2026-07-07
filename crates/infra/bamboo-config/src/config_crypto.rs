@@ -434,4 +434,38 @@ impl Config {
             broker.token = String::new();
         }
     }
+
+    /// Restore env-sourced provider `api_key`s that a serde round-trip dropped.
+    ///
+    /// `api_key` is `#[serde(skip_serializing)]`, so serializing `previous` and
+    /// deserializing it back — as the settings-PATCH merge in
+    /// `config_manager::build_merged_config` does — loses every provider's
+    /// plaintext key. `hydrate_provider_api_keys_from_encrypted` then restores
+    /// only keys that have a persisted ciphertext, which an env-injected key
+    /// never has (that's the #253 design). Without this, a PATCH to ANY provider
+    /// setting silently blanks the live env-sourced key of every OTHER provider
+    /// until the process restarts.
+    ///
+    /// Copies the key back from `previous` for each provider still flagged
+    /// env-sourced there whose key wasn't explicitly re-set by the patch (i.e. is
+    /// empty after the round-trip), so an explicit `api_key` in the patch still
+    /// wins. #373.
+    pub fn preserve_env_sourced_provider_keys(&mut self, previous: &Config) {
+        macro_rules! restore_env_key {
+            ($field:ident) => {
+                if let (Some(current), Some(prev)) = (
+                    self.providers.$field.as_mut(),
+                    previous.providers.$field.as_ref(),
+                ) {
+                    if prev.api_key_from_env && current.api_key.trim().is_empty() {
+                        current.api_key = prev.api_key.clone();
+                        current.api_key_from_env = true;
+                    }
+                }
+            };
+        }
+        restore_env_key!(openai);
+        restore_env_key!(anthropic);
+        restore_env_key!(gemini);
+    }
 }
