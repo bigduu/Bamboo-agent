@@ -1263,15 +1263,19 @@ pub fn parse_anthropic_sse_event(
             }
 
             let v: Value = serde_json::from_str(data)?;
+            // Tolerate benign shape deviations (common with Anthropic→OpenAI
+            // aggregators): skip the malformed event instead of returning a
+            // stream error, which would discard the whole already-streamed
+            // assistant turn. (#237)
             let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
-                return Err(LLMError::Stream(format!(
-                    "Anthropic content_block_start missing index: {data}"
-                )));
+                tracing::warn!("Anthropic content_block_start missing index; skipping: {data}");
+                return Ok(None);
             };
             let Some(content_block) = v.get("content_block") else {
-                return Err(LLMError::Stream(format!(
-                    "Anthropic content_block_start missing content_block: {data}"
-                )));
+                tracing::warn!(
+                    "Anthropic content_block_start missing content_block; skipping: {data}"
+                );
+                return Ok(None);
             };
 
             let block_type = content_block
@@ -1297,14 +1301,12 @@ pub fn parse_anthropic_sse_event(
             }
 
             let Some(id) = content_block.get("id").and_then(|s| s.as_str()) else {
-                return Err(LLMError::Stream(format!(
-                    "Anthropic tool_use content_block missing id: {data}"
-                )));
+                tracing::warn!("Anthropic tool_use content_block missing id; skipping: {data}");
+                return Ok(None);
             };
             let Some(name) = content_block.get("name").and_then(|s| s.as_str()) else {
-                return Err(LLMError::Stream(format!(
-                    "Anthropic tool_use content_block missing name: {data}"
-                )));
+                tracing::warn!("Anthropic tool_use content_block missing name; skipping: {data}");
+                return Ok(None);
             };
 
             let index = index as usize;
@@ -1351,10 +1353,14 @@ pub fn parse_anthropic_sse_event(
                     Ok(Some(LLMChunk::Token(text.to_string())))
                 }
                 "input_json_delta" => {
+                    // Skip (don't abort the turn) on benign deviations — e.g. an
+                    // aggregator streaming an input_json_delta for an index it
+                    // never announced via content_block_start. (#237)
                     let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
-                        return Err(LLMError::Stream(format!(
-                            "Anthropic input_json_delta missing index: {data}"
-                        )));
+                        tracing::warn!(
+                            "Anthropic input_json_delta missing index; skipping: {data}"
+                        );
+                        return Ok(None);
                     };
                     let partial = delta
                         .get("partial_json")
@@ -1363,9 +1369,10 @@ pub fn parse_anthropic_sse_event(
 
                     let index = index as usize;
                     let Some((id, name)) = state.tool_uses_by_index.get(&index) else {
-                        return Err(LLMError::Stream(format!(
-                            "Anthropic input_json_delta for unknown tool_use index {index}: {data}"
-                        )));
+                        tracing::warn!(
+                            "Anthropic input_json_delta for unannounced tool_use index {index}; skipping: {data}"
+                        );
+                        return Ok(None);
                     };
                     tracing::trace!(
                         "Anthropic tool_use input_json_delta: index={}, tool_call_id={}, tool_name={}, chunk_len={}",
@@ -2750,13 +2757,37 @@ mod anthropic_stream_parse {
     }
 
     #[test]
-    fn input_json_delta_without_prior_tool_start_returns_error() {
+    fn input_json_delta_without_prior_tool_start_is_skipped_not_aborted() {
+        // #237: an input_json_delta for an index never announced via
+        // content_block_start (common with Anthropic→OpenAI aggregators) must be
+        // SKIPPED, not turned into a stream error that discards the whole
+        // already-streamed assistant turn.
         let mut state = super::AnthropicStreamState::default();
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"test\"}"}}"#;
 
-        let result = super::parse_anthropic_sse_event(&mut state, "content_block_delta", data);
-        // Should return an error because there's no prior tool_use start for index 0
-        assert!(result.is_err());
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", data)
+            .expect("benign deviation must not abort the stream");
+        assert!(chunk.is_none(), "unannounced input_json_delta is skipped");
+    }
+
+    #[test]
+    fn malformed_content_block_start_events_are_skipped_not_aborted() {
+        // Missing index, missing content_block, and tool_use missing id/name all
+        // skip (Ok(None)) rather than erroring out the stream. (#237)
+        for data in [
+            r#"{"type":"content_block_start","content_block":{"type":"text"}}"#, // no index
+            r#"{"type":"content_block_start","index":0}"#,                       // no content_block
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"x"}}"#, // no id
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1"}}"#, // no name
+        ] {
+            let mut state = super::AnthropicStreamState::default();
+            let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_start", data)
+                .unwrap_or_else(|e| panic!("must not abort on: {data} (got {e:?})"));
+            assert!(
+                chunk.is_none(),
+                "malformed content_block_start skipped: {data}"
+            );
+        }
     }
 }
 
