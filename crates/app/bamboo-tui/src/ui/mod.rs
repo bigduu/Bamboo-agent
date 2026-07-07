@@ -32,6 +32,11 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_help(f);
     }
 
+    // Notification-log overlay
+    if app.notifications_visible {
+        layout::render_notifications(f, app);
+    }
+
     // Pending-question modal takes visual priority — it's the blocking interaction.
     if app.pending_question.is_some() {
         layout::render_question(f, app);

@@ -238,6 +238,25 @@ impl ConfigState {
     }
 }
 
+// ── Notifications ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One entry in the notification scrollback (viewed with `Ctrl+L`). Errors and
+/// warnings would otherwise be lost when the next status message overwrites the
+/// single status line.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub level: NoticeLevel,
+    pub text: String,
+    pub at: DateTime<Utc>,
+}
+
 // ── Interactive question (permission gate / clarification) ──
 
 /// An agent question awaiting the operator's answer, driven by the modal.
@@ -304,6 +323,14 @@ pub struct App {
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
+    /// Capped scrollback of past status messages so errors/warnings aren't lost
+    /// when the single status line is overwritten. Viewed with `Ctrl+L`.
+    pub notifications: Vec<Notification>,
+    /// Whether the notification-log overlay is open.
+    pub notifications_visible: bool,
+    /// Count of warn/error notifications since the log was last opened; shown as
+    /// a badge in the status bar.
+    pub unseen_alerts: usize,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -330,6 +357,9 @@ impl App {
             pending_question: None,
             schedule_form: None,
             config_editor: None,
+            notifications: Vec::new(),
+            notifications_visible: false,
+            unseen_alerts: 0,
             event_tx: None,
             sse_tx: None,
             sse_rx: None,
@@ -344,7 +374,7 @@ impl App {
         if self.connected {
             self.status_message = "Connected".to_string();
         } else {
-            self.status_message = "Cannot connect to server".to_string();
+            self.notify(NoticeLevel::Warn, "Cannot connect to server");
         }
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -394,7 +424,7 @@ impl App {
                 } => {
                     if let Some(event) = sse_event {
                         if let Err(e) = self.handle_sse_event(event) {
-                            self.status_message = format!("SSE error: {}", e);
+                            self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
                         }
                     }
                 }
@@ -412,7 +442,7 @@ impl App {
         };
         for event in events {
             if let Err(e) = self.handle_sse_event(event) {
-                self.status_message = format!("SSE error: {}", e);
+                self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
             }
         }
     }
@@ -425,11 +455,19 @@ impl App {
             }
         }
 
+        // The notification-log overlay is dismissed by any key.
+        if self.notifications_visible {
+            if let AppEvent::Key(_) = &event {
+                self.notifications_visible = false;
+                return Ok(());
+            }
+        }
+
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
             AppEvent::SseEvent(agent_event) => self.handle_sse_event(agent_event)?,
             AppEvent::ApiError(msg) => {
-                self.status_message = format!("Error: {}", msg);
+                self.notify(NoticeLevel::Error, format!("Error: {msg}"));
             }
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::SessionsLoaded(r) => {
@@ -496,7 +534,16 @@ impl App {
                 }
             }
             AppEvent::ActionDone { status, reload_tab } => {
-                self.status_message = status;
+                // Background-action results carry both successes ("Config saved")
+                // and failures ("Save failed: …"); log failures as errors so they
+                // survive in the notification history.
+                let lower = status.to_lowercase();
+                let level = if lower.contains("failed") || lower.contains("error") {
+                    NoticeLevel::Error
+                } else {
+                    NoticeLevel::Info
+                };
+                self.notify(level, status);
                 if reload_tab {
                     self.load_tab_data();
                 }
@@ -509,7 +556,7 @@ impl App {
                 }
                 Err(e) => {
                     self.chat.streaming = false;
-                    self.status_message = format!("Error: {e}");
+                    self.notify(NoticeLevel::Error, format!("Error: {e}"));
                 }
             },
             _ => {}
@@ -553,6 +600,11 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('?')) => {
                 self.help_visible = true;
+                return Ok(());
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+                self.notifications_visible = true;
+                self.unseen_alerts = 0;
                 return Ok(());
             }
             _ => {}
@@ -727,7 +779,7 @@ impl App {
             }
             Err(e) => {
                 // Keep the modal open so the operator can pick a valid option.
-                self.status_message = format!("Answer rejected: {e}");
+                self.notify(NoticeLevel::Error, format!("Answer rejected: {e}"));
             }
         }
         Ok(())
@@ -906,7 +958,7 @@ impl App {
         self.sse_rx = Some(sse_rx);
         let base_url = self.client.base_url.clone();
         if let Err(e) = SseStream::start(&base_url, &session_id, sse_tx) {
-            self.status_message = format!("SSE start failed: {e}");
+            self.notify(NoticeLevel::Error, format!("SSE start failed: {e}"));
             return;
         }
         let client = self.client.clone();
@@ -996,7 +1048,7 @@ impl App {
                 self.finalize_streaming();
             }
             AgentEvent::Error { message } => {
-                self.status_message = format!("Error: {}", message);
+                self.notify(NoticeLevel::Error, format!("Error: {message}"));
                 self.finalize_streaming();
             }
             AgentEvent::ToolToken { content, .. } => {
@@ -1302,6 +1354,27 @@ impl App {
         Ok(())
     }
 
+    /// Record a notification in the scrollback log and mirror it to the
+    /// transient status line. Warn/error entries bump the unseen-alert badge
+    /// until the log is opened. The log is capped so it can't grow unbounded.
+    fn notify(&mut self, level: NoticeLevel, text: impl Into<String>) {
+        let text = text.into();
+        if matches!(level, NoticeLevel::Warn | NoticeLevel::Error) {
+            self.unseen_alerts = self.unseen_alerts.saturating_add(1);
+        }
+        self.status_message = text.clone();
+        self.notifications.push(Notification {
+            level,
+            text,
+            at: Utc::now(),
+        });
+        const CAP: usize = 200;
+        if self.notifications.len() > CAP {
+            let excess = self.notifications.len() - CAP;
+            self.notifications.drain(0..excess);
+        }
+    }
+
     fn handle_config_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down => {
@@ -1364,7 +1437,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.status_message = format!("Invalid JSON: {e}");
+                    self.notify(NoticeLevel::Error, format!("Invalid JSON: {e}"));
                 }
             }
             return Ok(());
@@ -1641,6 +1714,51 @@ mod question_tests {
         assert!(app.config_editor.is_some());
         app.handle_key(ctrl_s).await.unwrap();
         assert!(app.config_editor.is_none(), "valid JSON saves and closes");
+    }
+
+    #[tokio::test]
+    async fn notifications_log_and_badge() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        // An error records to the log, mirrors to the status line, bumps badge.
+        app.notify(NoticeLevel::Error, "boom");
+        assert_eq!(app.notifications.len(), 1);
+        assert_eq!(app.status_message, "boom");
+        assert_eq!(app.unseen_alerts, 1);
+
+        // Info records but does not bump the alert badge.
+        app.notify(NoticeLevel::Info, "just fyi");
+        assert_eq!(app.unseen_alerts, 1);
+        assert_eq!(app.notifications.len(), 2);
+
+        // Ctrl+L opens the log and clears the badge.
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.notifications_visible);
+        assert_eq!(app.unseen_alerts, 0);
+
+        // Any key dismisses the overlay.
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+        )))
+        .await
+        .unwrap();
+        assert!(!app.notifications_visible);
+    }
+
+    #[test]
+    fn notifications_log_is_capped() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        for i in 0..250 {
+            app.notify(NoticeLevel::Info, format!("n{i}"));
+        }
+        assert_eq!(app.notifications.len(), 200, "log is capped at 200");
+        // Oldest entries are dropped; the newest is retained.
+        assert_eq!(app.notifications.last().unwrap().text, "n249");
+        assert_eq!(app.notifications.first().unwrap().text, "n50");
     }
 
     #[tokio::test]
