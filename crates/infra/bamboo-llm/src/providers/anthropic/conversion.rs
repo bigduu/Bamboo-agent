@@ -506,8 +506,16 @@ pub fn convert_messages_response(
 
     if let Some(tool_calls) = choice.message.tool_calls {
         for tool_call in tool_calls {
-            let input = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or(Value::String(tool_call.function.arguments));
+            // Anthropic requires `tool_use.input` to be a JSON object: empty
+            // arguments (a zero-argument tool call) → `{}`, and an unparseable
+            // payload → an object wrapper rather than a bare string (which the
+            // Messages API 400s on the next request).
+            let input = if tool_call.function.arguments.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&tool_call.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({ "_raw": tool_call.function.arguments }))
+            };
             content_blocks.push(AnthropicResponseContentBlock::ToolUse {
                 id: tool_call.id,
                 name: tool_call.function.name,

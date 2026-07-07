@@ -1006,18 +1006,27 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 
 fn tool_call_to_tool_use_block(tool_call: &bamboo_domain::ToolCall) -> Value {
     let raw_arguments = tool_call.function.arguments.trim();
-    let input: Value = match serde_json::from_str(raw_arguments) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            tracing::warn!(
-                "Anthropic tool_use conversion fallback to string input due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
-                tool_call.id,
-                tool_call.function.name,
-                raw_arguments.len(),
-                preview_for_log(raw_arguments, 180),
-                error
-            );
-            Value::String(tool_call.function.arguments.clone())
+    // Anthropic requires `tool_use.input` to be a JSON object. Empty arguments
+    // are a normal, reachable state (a zero-argument tool call) and must map to
+    // `{}`; an unparseable payload falls back to an object wrapper (never a bare
+    // string, which the Messages API rejects with 400 and then poisons every
+    // subsequent request in the session).
+    let input: Value = if raw_arguments.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(raw_arguments) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(
+                    "Anthropic tool_use conversion fallback to _raw object due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
+                    tool_call.id,
+                    tool_call.function.name,
+                    raw_arguments.len(),
+                    preview_for_log(raw_arguments, 180),
+                    error
+                );
+                json!({ "_raw": tool_call.function.arguments.clone() })
+            }
         }
     };
 
@@ -1740,6 +1749,50 @@ mod anthropic_request_building {
             out_ids.len(),
             "out_ids must stay parallel to the messages array"
         );
+    }
+
+    #[test]
+    fn tool_use_input_is_object_for_empty_and_invalid_arguments() {
+        // Anthropic requires `tool_use.input` to be a JSON object. A zero-argument
+        // tool call (arguments == "") and an unparseable payload must NOT emit a
+        // bare string input — that is a 400 `invalid_request_error` that then
+        // poisons every subsequent request in the session. Regression for the
+        // empty-args session-brick.
+        let empty = ToolCall {
+            id: "call_empty".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "get_time".to_string(),
+                arguments: String::new(),
+            },
+        };
+        let block = super::tool_call_to_tool_use_block(&empty);
+        assert_eq!(block["type"], "tool_use");
+        assert!(
+            block["input"].is_object(),
+            "empty arguments must produce an object input, got {}",
+            block["input"]
+        );
+        assert_eq!(
+            block["input"].as_object().unwrap().len(),
+            0,
+            "empty arguments must map to {{}}"
+        );
+
+        let invalid = ToolCall {
+            id: "call_bad".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: "not json".to_string(),
+            },
+        };
+        let block = super::tool_call_to_tool_use_block(&invalid);
+        assert!(
+            block["input"].is_object(),
+            "invalid arguments must fall back to an object input, not a bare string"
+        );
+        assert_eq!(block["input"]["_raw"], "not json");
     }
 
     #[test]
@@ -2774,7 +2827,7 @@ mod anthropic_request_building_edge_cases {
     }
 
     #[test]
-    fn tool_call_with_invalid_json_arguments_falls_back_to_string() {
+    fn tool_call_with_invalid_json_arguments_falls_back_to_object() {
         use bamboo_domain::{FunctionCall, ToolCall};
         let tool_call = ToolCall {
             id: "call_1".to_string(),
@@ -2789,8 +2842,12 @@ mod anthropic_request_building_edge_cases {
         let out =
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
-        // Invalid JSON should be kept as a string
-        assert_eq!(out["messages"][0]["content"][0]["input"], "not valid json");
+        // Invalid JSON must fall back to an OBJECT, not a bare string: Anthropic
+        // requires `tool_use.input` to be an object and 400s a string input,
+        // which would then poison every subsequent request in the session.
+        let input = &out["messages"][0]["content"][0]["input"];
+        assert!(input.is_object(), "input must be an object, got {input}");
+        assert_eq!(input["_raw"], "not valid json");
     }
 
     #[test]
