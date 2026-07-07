@@ -2619,7 +2619,10 @@ impl MemoryStore {
             .open(&path)
             .await?;
         file.write_all(line.as_bytes()).await?;
-        file.flush().await
+        // fsync the appended line so a returned Ok() means it's durable —
+        // `flush()` on a tokio File is a no-op, and the old atomic_write path
+        // did fsync. (Matches the store's #166 durability discipline.)
+        file.sync_all().await
     }
 
     async fn write_json_file<T: serde::Serialize>(
@@ -4672,10 +4675,14 @@ mod tests {
             .await
             .expect("read topic")
             .unwrap_or_default();
+        // Exact section match (entries are joined by "\n\n") — a substring check
+        // would let "entry-1" pass on the presence of "entry-10".
+        let sections: Vec<&str> = content.split("\n\n").map(str::trim).collect();
         for i in 0..WRITERS {
+            let expected = format!("entry-{i}");
             assert!(
-                content.contains(&format!("entry-{i}")),
-                "append entry-{i} was lost to a race"
+                sections.iter().any(|section| *section == expected),
+                "append {expected} was lost to a race (sections: {sections:?})"
             );
         }
     }
