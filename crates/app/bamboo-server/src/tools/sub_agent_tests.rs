@@ -299,6 +299,52 @@ async fn repeated_registration_of_same_child_is_idempotent() {
     assert_eq!(wait.child_session_ids, vec!["dup-child".to_string()]);
 }
 
+#[tokio::test]
+async fn parent_wait_slot_is_evicted_after_flush_drains() {
+    // Issue #346: the per-parent coalescing slot must not linger in
+    // `parent_wait_slots` after its pending queue drains, otherwise the map
+    // grows by one entry per parent-that-ever-spawned and never shrinks.
+    let harness = build_test_harness().await;
+    let adapter = harness.adapter.clone();
+    let parent_id = harness.parent_session_id.clone();
+
+    adapter
+        .register_parent_wait_for_child(&parent_id, "one-child", None)
+        .await
+        .unwrap();
+
+    assert!(
+        adapter.parent_wait_slots.is_empty(),
+        "coalescing slot must be evicted once the batch is persisted and pending drains"
+    );
+}
+
+#[tokio::test]
+async fn parent_wait_slots_drain_after_concurrent_registrations() {
+    let harness = build_test_harness().await;
+    let adapter = harness.adapter.clone();
+    let parent_id = harness.parent_session_id.clone();
+
+    let mut handles = Vec::new();
+    for i in 0..6 {
+        let adapter = adapter.clone();
+        let parent_id = parent_id.clone();
+        handles.push(tokio::spawn(async move {
+            adapter
+                .register_parent_wait_for_child(&parent_id, &format!("c-{i}"), None)
+                .await
+        }));
+    }
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    assert!(
+        adapter.parent_wait_slots.is_empty(),
+        "no coalescing slot should linger once all concurrent registrations drain"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Decoupled create + explicit SubAgent.wait
 // -----------------------------------------------------------------------

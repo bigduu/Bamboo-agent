@@ -53,6 +53,45 @@ pub struct LockedSessionStore {
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
+/// Self-cleaning guard returned by [`LockedSessionStore::acquire_lock`].
+///
+/// Holds the `OwnedMutexGuard` for the session's serialization mutex. On drop it
+/// releases the mutex **first** (so this guard's `Arc` clone is gone before the
+/// count is read) and then removes the map entry iff `Arc::strong_count == 1` —
+/// i.e. only the map's own reference remains, no other task holds or is waiting
+/// on this session's lock.
+///
+/// ## Race freedom
+///
+/// The strong-count check and the removal execute atomically under DashMap's
+/// per-shard lock via [`DashMap::remove_if`]. A waiter that clones the `Arc`
+/// (through `acquire_lock`'s `entry()`) does so under the same shard lock, so it
+/// either:
+/// - clones **before** our `remove_if` → `strong_count >= 2` → we skip removal,
+///   the waiter keeps a live, map-resident lock; or
+/// - clones **after** our `remove_if` → the entry is gone → it inserts a fresh
+///   `Arc<Mutex<()>>`; since our guard had already been released, the two tasks
+///   never overlapped and needed no mutual exclusion.
+///
+/// There is therefore no interleaving in which a waiter observes a lock that we
+/// then delete out from under it.
+pub struct SessionLockGuard {
+    /// `Option` so `Drop` can release the mutex before evaluating strong-count.
+    guard: Option<OwnedMutexGuard<()>>,
+    locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    session_id: String,
+}
+
+impl Drop for SessionLockGuard {
+    fn drop(&mut self) {
+        // Release the mutex (drops this guard's `Arc` clone) BEFORE reading the
+        // strong count, otherwise the count can never reach 1.
+        self.guard.take();
+        self.locks
+            .remove_if(&self.session_id, |_, arc| Arc::strong_count(arc) == 1);
+    }
+}
+
 impl LockedSessionStore {
     /// Wrap an existing storage backend.
     pub fn new(storage: Arc<dyn Storage>) -> Self {
@@ -71,13 +110,29 @@ impl LockedSessionStore {
     ///
     /// Only writes for the **same** session are serialised; writes for
     /// different sessions can proceed concurrently.
-    pub async fn acquire_lock(&self, session_id: &str) -> OwnedMutexGuard<()> {
+    ///
+    /// The returned [`SessionLockGuard`] is **self-cleaning**: when it drops it
+    /// releases the mutex and then removes the map entry iff no other holder
+    /// remains. Without this the `locks` map grew by one entry for every session
+    /// id ever written and never shrank (issue #346), so a long-lived server
+    /// leaked one `Arc<Mutex<()>>` per session-ever-persisted. See
+    /// [`SessionLockGuard`] for the race-freedom argument.
+    pub async fn acquire_lock(&self, session_id: &str) -> SessionLockGuard {
+        // `entry().or_insert_with().clone()` releases the DashMap shard lock at
+        // the end of THIS statement, before the `.await` below — never hold a
+        // shard lock across the async lock acquisition (it would deadlock the
+        // self-cleaning `remove_if` on drop, which also takes the shard lock).
         let lock = self
             .locks
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        lock.lock_owned().await
+        let guard = lock.lock_owned().await;
+        SessionLockGuard {
+            guard: Some(guard),
+            locks: self.locks.clone(),
+            session_id: session_id.to_string(),
+        }
     }
 
     /// Runtime-only save: persist the control-plane (`agent_runtime_state`,
@@ -674,5 +729,86 @@ mod tests {
         assert_eq!(after.title, "Committed");
         assert_eq!(after.metadata_version, 1);
         assert_eq!(after.title_version, 2);
+    }
+
+    // ── Self-cleaning per-session lock (issue #346) ─────────────────
+
+    #[tokio::test]
+    async fn acquire_lock_self_evicts_when_no_other_holder() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage);
+
+        {
+            let _guard = store.acquire_lock("solo").await;
+            assert_eq!(store.locks.len(), 1, "entry present while the lock is held");
+        }
+        // Dropping the guard runs the self-cleaning `remove_if`. Without the
+        // eviction logic this stays at 1 forever (the pre-#346 leak).
+        assert_eq!(
+            store.locks.len(),
+            0,
+            "lock entry must be evicted once released with no other holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_lock_many_distinct_ids_do_not_accumulate() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage);
+
+        // Serially acquire+release for 100 distinct session ids.
+        for i in 0..100 {
+            let _guard = store.acquire_lock(&format!("sess-{i}")).await;
+        }
+        assert_eq!(
+            store.locks.len(),
+            0,
+            "acquiring locks for many distinct ids must not grow the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_lock_concurrent_waiter_keeps_valid_lock_and_map_drains() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_temp, storage) = make_storage().await;
+        let store = Arc::new(LockedSessionStore::new(storage));
+
+        // Tracks concurrent holders of the SAME session lock; must never exceed 1.
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                let _guard = store.acquire_lock("contended").await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                // Hold briefly so the other tasks actually queue on the mutex.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Mutual exclusion must hold: a self-cleaning removal that raced (removed
+        // the entry a waiter had already cloned, letting a later task create and
+        // lock a *second* mutex for the same id) would show 2 concurrent holders.
+        // `remove_if`'s atomic strong-count check under the shard lock prevents it.
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "at most one holder of a given session lock at a time"
+        );
+        assert_eq!(
+            store.locks.len(),
+            0,
+            "after all holders release, the contended entry must be fully evicted"
+        );
     }
 }

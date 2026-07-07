@@ -1,7 +1,7 @@
 use super::init::{
     build_provider_handles, build_schedule_manager, build_spawn_scheduler, init_mcp_manager,
     init_metrics_service, init_schedule_store, init_skill_manager, init_storage,
-    load_permission_checker, spawn_runner_cleanup_task,
+    load_permission_checker, spawn_session_map_cleanup_task,
 };
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
@@ -184,7 +184,9 @@ impl AppState {
 
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        spawn_runner_cleanup_task(agent_runners.clone(), None);
+        // NOTE: the idle-eviction sweep for `agent_runners` is spawned below,
+        // once `session_event_senders` also exists, so it can drop both maps'
+        // entries for a completed session together (issue #346).
 
         let process_registry = Arc::new(ProcessRegistry::new());
         let (provider_lock, provider_handle) = build_provider_handles(provider);
@@ -233,6 +235,11 @@ impl AppState {
         // Long-lived session event senders map (UI subscriptions + background tasks).
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+
+        // Idle-evict completed runners together with their paired session event
+        // senders (issue #346). Spawned here (not next to `agent_runners`) so it
+        // owns handles to both maps.
+        spawn_session_map_cleanup_task(agent_runners.clone(), session_event_senders.clone(), None);
 
         // Account-scoped durable change feed. Opening the journal recovers the
         // max seq so the sequence counter stays monotonic across restarts.

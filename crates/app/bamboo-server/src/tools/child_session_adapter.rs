@@ -204,6 +204,23 @@ impl ChildSessionAdapter {
             }
             return Err(error);
         }
+
+        // 5. Self-clean: the slot exists only to coalesce a burst of sibling
+        //    registrations for THIS parent. Now that the batch is durably
+        //    persisted and nothing new is pending, drop the map entry so
+        //    `parent_wait_slots` does not retain one entry per parent-that-ever-
+        //    -spawned forever (issue #346). Still inside the flush barrier.
+        //
+        //    Race-freedom: `remove_if` re-checks `pending.is_empty()` under the
+        //    DashMap shard lock. A sibling that enqueued after our drain made
+        //    `pending` non-empty, so the predicate is false and we keep the slot;
+        //    that sibling (blocked on the barrier we still hold) will flush it and
+        //    run this same removal. A sibling that clones the slot Arc but has not
+        //    yet pushed keeps a live handle, so removing the map entry never loses
+        //    its child: whoever holds the barrier drains ALL pending on its Arc.
+        self.parent_wait_slots
+            .remove_if(parent_session_id, |_, slot| slot.pending.lock().is_empty());
+
         Ok(())
     }
 

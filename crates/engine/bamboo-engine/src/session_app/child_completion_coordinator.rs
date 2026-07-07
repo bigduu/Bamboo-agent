@@ -619,7 +619,13 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
     ) -> Option<RunnerReservation> {
-        try_reserve_runner(&self.agent_runners, session_id, event_sender).await
+        try_reserve_runner(
+            &self.agent_runners,
+            &self.session_event_senders,
+            session_id,
+            event_sender,
+        )
+        .await
     }
 
     async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String> {

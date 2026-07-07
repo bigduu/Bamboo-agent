@@ -218,39 +218,131 @@ pub async fn init_metrics_service(data_dir: &Path) -> Result<Arc<MetricsService>
     Ok(Arc::new(service))
 }
 
-/// Spawn a background task that cleans up completed agent runners after 5 minutes.
-pub fn spawn_runner_cleanup_task(
+/// Idle-eviction TTL for terminal runners / session senders, in seconds.
+///
+/// A completed runner is retained for at least this long after `completed_at`
+/// so a client that subscribes shortly after the run finishes still gets the
+/// cached `last_critical_events` / `last_budget_event` replay.
+pub(crate) const SESSION_MAP_IDLE_TTL_SECS: i64 = 300;
+
+/// Single idle-eviction pass over the per-session runner + event-sender maps.
+///
+/// Drops a `(agent_runners, session_event_senders)` pair together when the
+/// runner is terminal, older than `ttl_secs`, and its broadcast channel has **no
+/// live receivers**. Returns the number of runners evicted.
+///
+/// # Why `receiver_count() == 0` is required
+///
+/// A runner's `event_sender` is a clone of the session's long-lived sender (see
+/// `reserve_runner` / `try_reserve_runner`), so `receiver_count()` reflects
+/// every SSE/WS subscriber on the session stream. Evicting while a receiver is
+/// live would (a) yank the replay cache out from under a client that just
+/// subscribed after `Complete`, and (b) silently drop a terminal parent whose
+/// still-running children forward events into this stream (that parent keeps a
+/// live subscription). So we only reclaim genuinely-idle terminal sessions —
+/// exactly the ephemeral sub-agent / guardian / scheduled runs that never had a
+/// UI subscription and whose count therefore reaches zero.
+///
+/// Removing the map's `Sender` (the last clone once the terminal runner's own
+/// clone is dropped by the `retain`) closes the channel, which also lets any
+/// per-session notification relay task exit on `RecvError::Closed`.
+///
+/// This runs synchronously under both write guards held by the caller (no
+/// `.await` between the check and the removals), so a concurrent `reserve_runner`
+/// / `get_or_create_event_sender` (which need those same locks) cannot interleave.
+pub(crate) fn evict_idle_session_entries(
+    runners: &mut HashMap<String, AgentRunner>,
+    senders: &mut HashMap<String, broadcast::Sender<AgentEvent>>,
+    ttl_secs: i64,
+    now: chrono::DateTime<Utc>,
+    log_prefix: Option<&'static str>,
+) -> usize {
+    let mut evicted: Vec<String> = Vec::new();
+
+    runners.retain(|session_id, runner| {
+        let keep = match &runner.status {
+            AgentStatus::Running => true,
+            _ => {
+                let age =
+                    now.signed_duration_since(runner.completed_at.unwrap_or(runner.started_at));
+                let expired = age.num_seconds() >= ttl_secs;
+                let has_receivers = runner.event_sender.receiver_count() > 0;
+                // Keep unless it is BOTH past the TTL AND has no live receiver.
+                !expired || has_receivers
+            }
+        };
+        if !keep {
+            evicted.push(session_id.clone());
+            if let Some(prefix) = log_prefix {
+                tracing::debug!("[{}:{}] Evicting idle terminal runner", prefix, session_id);
+            } else {
+                tracing::debug!("[{}] Evicting idle terminal runner", session_id);
+            }
+        }
+        keep
+    });
+
+    // Drop the paired long-lived sender for each evicted runner, but only if it
+    // too has no live receiver (re-checked here; it is the same channel as the
+    // runner's `event_sender`, so this is normally a formality — a session sender
+    // can, however, outlive its runner, and we must never close a channel a
+    // client is actively reading).
+    for session_id in &evicted {
+        if senders
+            .get(session_id)
+            .is_some_and(|sender| sender.receiver_count() == 0)
+        {
+            senders.remove(session_id);
+        }
+    }
+
+    evicted.len()
+}
+
+/// Spawn a background task that idle-evicts completed agent runners **and their
+/// paired session event senders** after [`SESSION_MAP_IDLE_TTL_SECS`].
+///
+/// Fire-and-forget (runs for the process lifetime), matching the other
+/// background maintenance tickers. See [`evict_idle_session_entries`] for the
+/// eviction predicate and its race-freedom argument.
+pub fn spawn_session_map_cleanup_task(
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     log_prefix: Option<&'static str>,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
+            // Lock order: runners ⊃ senders. This matches `reserve_runner_core`
+            // (which nests senders inside the runners write lock to re-assert the
+            // sender) and is never inverted anywhere, so nesting is deadlock-free.
+            //
+            // Both write locks are intentionally held across the whole O(n) pass
+            // rather than snapshot-then-remove: the atomicity is load-bearing.
+            // `reserve_runner_core` inserts a `Running` runner AND re-asserts its
+            // sender under the runners lock; holding both here means a concurrent
+            // reservation cannot interleave between our runner-eviction and our
+            // sender-removal, so we can never drop a sender that a just-reserved
+            // run re-asserted. The pass is cheap (a receiver_count atomic load +
+            // timestamp math per entry) at the 60s cadence, so the widened window
+            // is acceptable.
             let mut runners_guard = runners.write().await;
+            let mut senders_guard = senders.write().await;
             let now = Utc::now();
+            let evicted = evict_idle_session_entries(
+                &mut runners_guard,
+                &mut senders_guard,
+                SESSION_MAP_IDLE_TTL_SECS,
+                now,
+                log_prefix,
+            );
+            drop(senders_guard);
+            drop(runners_guard);
 
-            runners_guard.retain(|session_id, runner| {
-                let should_keep = match &runner.status {
-                    AgentStatus::Running => true,
-                    _ => {
-                        let age = now.signed_duration_since(
-                            runner.completed_at.unwrap_or(runner.started_at),
-                        );
-                        age.num_seconds() < 300 // 5 minute TTL
-                    }
-                };
-
-                if !should_keep {
-                    if let Some(prefix) = log_prefix {
-                        tracing::debug!("[{}:{}] Cleaning up completed runner", prefix, session_id);
-                    } else {
-                        tracing::debug!("[{}] Cleaning up completed runner", session_id);
-                    }
-                }
-
-                should_keep
-            });
+            if evicted > 0 {
+                tracing::debug!("Idle-evicted {evicted} completed session runner(s)/sender(s)");
+            }
         }
     });
 }
@@ -331,4 +423,162 @@ pub fn build_schedule_manager(
         config,
         provider_registry,
     )))
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    const TTL: i64 = SESSION_MAP_IDLE_TTL_SECS;
+
+    /// A terminal (Completed) runner whose `event_sender` shares `tx`'s channel,
+    /// exactly as production sets it in `reserve_runner`.
+    fn terminal_runner(
+        tx: &broadcast::Sender<AgentEvent>,
+        completed_secs_ago: i64,
+        now: chrono::DateTime<Utc>,
+    ) -> AgentRunner {
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Completed;
+        runner.completed_at = Some(now - ChronoDuration::seconds(completed_secs_ago));
+        runner.event_sender = tx.clone();
+        runner
+    }
+
+    fn insert_pair(
+        runners: &mut HashMap<String, AgentRunner>,
+        senders: &mut HashMap<String, broadcast::Sender<AgentEvent>>,
+        id: &str,
+        runner: AgentRunner,
+        tx: broadcast::Sender<AgentEvent>,
+    ) {
+        runners.insert(id.to_string(), runner);
+        senders.insert(id.to_string(), tx);
+    }
+
+    #[test]
+    fn evicts_idle_terminal_pair_past_ttl_with_no_receivers() {
+        let now = Utc::now();
+        let (tx, _) = broadcast::channel::<AgentEvent>(16); // receiver dropped -> count 0
+        let mut runners = HashMap::new();
+        let mut senders = HashMap::new();
+        insert_pair(
+            &mut runners,
+            &mut senders,
+            "s1",
+            terminal_runner(&tx, TTL + 100, now),
+            tx.clone(),
+        );
+
+        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+
+        assert_eq!(evicted, 1);
+        assert!(runners.is_empty(), "terminal idle runner must be dropped");
+        assert!(
+            senders.is_empty(),
+            "paired session sender must be dropped together with the runner"
+        );
+    }
+
+    #[test]
+    fn retains_terminal_runner_with_live_receiver() {
+        let now = Utc::now();
+        let (tx, _) = broadcast::channel::<AgentEvent>(16);
+        // A client subscribed just after completion — its receiver is live.
+        let _live_rx = tx.subscribe();
+        assert_eq!(tx.receiver_count(), 1);
+
+        let mut runners = HashMap::new();
+        let mut senders = HashMap::new();
+        insert_pair(
+            &mut runners,
+            &mut senders,
+            "s1",
+            terminal_runner(&tx, TTL + 100, now),
+            tx.clone(),
+        );
+
+        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+
+        assert_eq!(evicted, 0, "must not evict while a receiver is live");
+        assert!(runners.contains_key("s1"));
+        assert!(senders.contains_key("s1"));
+    }
+
+    #[test]
+    fn retains_young_terminal_runner() {
+        let now = Utc::now();
+        let (tx, _) = broadcast::channel::<AgentEvent>(16);
+        let mut runners = HashMap::new();
+        let mut senders = HashMap::new();
+        // Completed only 60s ago — inside the replay window.
+        insert_pair(
+            &mut runners,
+            &mut senders,
+            "s1",
+            terminal_runner(&tx, 60, now),
+            tx.clone(),
+        );
+
+        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+
+        assert_eq!(
+            evicted, 0,
+            "must preserve the post-completion replay window"
+        );
+        assert!(runners.contains_key("s1"));
+        assert!(senders.contains_key("s1"));
+    }
+
+    #[test]
+    fn retains_running_runner_regardless_of_age() {
+        let now = Utc::now();
+        let (tx, _) = broadcast::channel::<AgentEvent>(16);
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        runner.started_at = now - ChronoDuration::seconds(TTL + 100_000);
+        runner.completed_at = None;
+        runner.event_sender = tx.clone();
+
+        let mut runners = HashMap::new();
+        let mut senders = HashMap::new();
+        insert_pair(&mut runners, &mut senders, "s1", runner, tx.clone());
+
+        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+
+        assert_eq!(evicted, 0, "a Running runner is never evicted");
+        assert!(runners.contains_key("s1"));
+        assert!(senders.contains_key("s1"));
+    }
+
+    #[test]
+    fn keeps_sender_if_it_has_receivers_even_when_runner_evicted() {
+        // Defensive edge: the runner qualifies for eviction, but the session
+        // sender independently has a live receiver (e.g. a subscriber that
+        // reused the channel). The sender must survive so we never close a
+        // channel a client is reading.
+        let now = Utc::now();
+        let (runner_tx, _) = broadcast::channel::<AgentEvent>(16);
+        // Distinct channel for the map entry, with a live receiver.
+        let (sender_tx, _) = broadcast::channel::<AgentEvent>(16);
+        let _live = sender_tx.subscribe();
+
+        let mut runners = HashMap::new();
+        let mut senders = HashMap::new();
+        runners.insert(
+            "s1".to_string(),
+            terminal_runner(&runner_tx, TTL + 100, now),
+        );
+        senders.insert("s1".to_string(), sender_tx.clone());
+
+        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+
+        assert_eq!(evicted, 1, "runner (no receivers) is evicted");
+        assert!(runners.is_empty());
+        assert!(
+            senders.contains_key("s1"),
+            "sender with a live receiver must be retained even when the runner is dropped"
+        );
+    }
 }
