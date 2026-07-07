@@ -3,7 +3,8 @@ use serde_json::Value;
 use super::super::output::{build_completed_response, build_output_items};
 use super::errors::map_provider_error;
 use super::events::{
-    completed_event, created_event, done_sse_bytes, event_to_sse_bytes, output_text_delta_event,
+    completed_event, created_event, done_sse_bytes, event_to_sse_bytes, failed_sse_bytes,
+    output_text_delta_event,
 };
 use crate::error::AppError;
 
@@ -25,6 +26,18 @@ fn decode_sse_event(bytes: bytes::Bytes) -> (String, Value) {
     let event_name = event.to_string();
     let json = serde_json::from_str::<Value>(data).expect("data should be valid json");
     (event_name, json)
+}
+
+#[test]
+fn failed_sse_bytes_signals_failure_with_error() {
+    // #355: a mid-stream upstream error must surface as a `response.failed` event
+    // (with the error), not a clean `[DONE]` the client reads as success.
+    let (event_name, payload) = decode_sse_event(failed_sse_bytes("upstream 503"));
+    assert_eq!(event_name, "response.failed");
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(payload["response"]["status"], "failed");
+    assert_eq!(payload["response"]["error"]["message"], "upstream 503");
+    assert_eq!(payload["response"]["error"]["type"], "api_error");
 }
 
 #[test]
