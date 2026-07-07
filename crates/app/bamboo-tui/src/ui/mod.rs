@@ -36,4 +36,8 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.pending_question.is_some() {
         layout::render_question(f, app);
     }
+
+    if app.schedule_form.is_some() {
+        layout::render_schedule_form(f, app);
+    }
 }

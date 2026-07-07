@@ -241,6 +241,26 @@ pub struct ActiveQuestion {
     pub custom: Option<String>,
 }
 
+/// In-progress "new schedule" form (opened with `n` on the Schedules tab).
+#[derive(Default)]
+pub struct ScheduleForm {
+    pub name: String,
+    pub cron: String,
+    pub prompt: String,
+    /// Focused field: 0 = name, 1 = cron, 2 = prompt.
+    pub field: usize,
+}
+
+impl ScheduleForm {
+    fn current_mut(&mut self) -> &mut String {
+        match self.field {
+            0 => &mut self.name,
+            1 => &mut self.cron,
+            _ => &mut self.prompt,
+        }
+    }
+}
+
 // ── Main App ──
 
 pub struct App {
@@ -260,6 +280,9 @@ pub struct App {
     /// The agent's pending question (permission gate / clarification). When
     /// `Some`, a modal captures the answer and keystrokes route to it.
     pub pending_question: Option<ActiveQuestion>,
+    /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
+    /// captures the fields.
+    pub schedule_form: Option<ScheduleForm>,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -284,6 +307,7 @@ impl App {
             help_visible: false,
             spinner_tick: 0,
             pending_question: None,
+            schedule_form: None,
             event_tx: None,
             sse_tx: None,
             sse_rx: None,
@@ -1095,7 +1119,14 @@ impl App {
     }
 
     async fn handle_schedules_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.schedule_form.is_some() {
+            self.handle_schedule_form_key(key);
+            return Ok(());
+        }
         match key.code {
+            KeyCode::Char('n') => {
+                self.schedule_form = Some(ScheduleForm::default());
+            }
             KeyCode::Down if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -1119,6 +1150,62 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Drive the new-schedule form modal. On Enter (all fields filled) it POSTs
+    /// create_schedule off the event loop and reloads the tab.
+    fn handle_schedule_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.schedule_form.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.schedule_form = None;
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                form.field = (form.field + 1) % 3;
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                form.field = (form.field + 2) % 3;
+            }
+            KeyCode::Backspace => {
+                form.current_mut().pop();
+            }
+            KeyCode::Enter => {
+                if form.name.trim().is_empty()
+                    || form.cron.trim().is_empty()
+                    || form.prompt.trim().is_empty()
+                {
+                    self.status_message = "Fill in name, cron, and prompt".to_string();
+                    return;
+                }
+                let req = CreateScheduleRequest {
+                    name: form.name.trim().to_string(),
+                    cron: form.cron.trim().to_string(),
+                    prompt: form.prompt.trim().to_string(),
+                    model: None,
+                    workspace_path: None,
+                };
+                self.schedule_form = None;
+                if let Some(tx) = self.event_tx.clone() {
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let status = match client.create_schedule(req).await {
+                            Ok(_) => "Schedule created".to_string(),
+                            Err(e) => format!("Create failed: {e}"),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            status,
+                            reload_tab: true,
+                        });
+                    });
+                }
+            }
+            KeyCode::Char(c) => {
+                form.current_mut().push(c);
+            }
+            _ => {}
+        }
     }
 
     async fn handle_skills_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1329,5 +1416,34 @@ mod question_tests {
         assert!(!app.chat.auto_scroll);
         app.handle_mouse(ev(MouseEventKind::ScrollDown));
         assert_eq!(app.chat.scroll_offset, 10);
+    }
+
+    #[test]
+    fn schedule_form_cycles_and_validates() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        fn k(c: KeyCode) -> KeyEvent {
+            KeyEvent::new(c, KeyModifiers::empty())
+        }
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.schedule_form = Some(ScheduleForm::default());
+
+        // Type into the name field, then Tab to cron.
+        app.handle_schedule_form_key(k(KeyCode::Char('h')));
+        app.handle_schedule_form_key(k(KeyCode::Char('i')));
+        assert_eq!(app.schedule_form.as_ref().unwrap().name, "hi");
+        app.handle_schedule_form_key(k(KeyCode::Tab));
+        assert_eq!(app.schedule_form.as_ref().unwrap().field, 1);
+
+        // Enter with empty cron/prompt does NOT submit (form stays open).
+        app.handle_schedule_form_key(k(KeyCode::Enter));
+        assert!(
+            app.schedule_form.is_some(),
+            "incomplete form must not submit"
+        );
+
+        // Esc cancels.
+        app.handle_schedule_form_key(k(KeyCode::Esc));
+        assert!(app.schedule_form.is_none());
     }
 }
