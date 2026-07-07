@@ -369,16 +369,15 @@ mod tests {
         .unwrap();
 
         // Wait for the worker's `ready` event (run started ⇒ steer inbox armed),
-        // THEN steer it.
-        loop {
-            match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
-                .await
-                .expect("a frame")
-                .expect("ok")
-            {
-                Some(ChildFrame::Event { .. }) => break,
-                other => panic!("expected ready event first, got {other:?}"),
-            }
+        // THEN steer it. (Single match, not a loop — the first frame is expected
+        // to be the ready Event; anything else is a test failure.)
+        match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
+            .await
+            .expect("a frame")
+            .expect("ok")
+        {
+            Some(ChildFrame::Event { .. }) => {}
+            other => panic!("expected ready event first, got {other:?}"),
         }
         link.send(ParentFrame::Message {
             text: "turn-left".into(),
