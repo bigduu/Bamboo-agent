@@ -5,7 +5,7 @@
 //! internal `bamboo_domain::Message` fields (like `id` / `created_at`).
 
 use bamboo_domain::ToolSchema;
-use bamboo_domain::{Message, Role};
+use bamboo_domain::{Message, MessagePart, Role};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -18,44 +18,88 @@ use bamboo_domain::ReasoningEffort;
 /// Convert internal [`Message`] values to an OpenAI-compatible JSON array.
 ///
 /// This intentionally omits internal fields like `id` and `created_at`.
+///
+/// A `role:tool` message can only carry string content on the Chat Completions
+/// API — there is no place for an image (e.g. an MCP screenshot) the way the
+/// Responses / Anthropic paths have. Rather than silently drop it (#412, sibling
+/// of #237 finding 6), we relay any tool-result images as a synthetic `role:user`
+/// message. The API also requires that all tool replies for a turn stay
+/// CONSECUTIVE before any other role, so the images are buffered and flushed as a
+/// single user message once the tool block ends (before the next non-tool
+/// message, or at the end) — never interleaved between two tool messages.
 pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|m| {
-            let role = match m.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-            };
+    fn flush_relayed_images(out: &mut Vec<Value>, pending: &mut Vec<Value>) {
+        if pending.is_empty() {
+            return;
+        }
+        let mut content = vec![json!({
+            "type": "text",
+            "text": "Image output from the preceding tool result(s).",
+        })];
+        content.append(pending);
+        out.push(json!({ "role": "user", "content": Value::Array(content) }));
+    }
 
-            // OpenAI-compatible APIs accept either a string content, or an array of
-            // typed parts for multimodal messages. We only emit parts when present
-            // and when the role supports user/assistant content.
-            let content_value = if matches!(m.role, Role::Tool) {
-                json!(m.content)
-            } else if let Some(parts) = m.content_parts.as_ref() {
-                json!(parts)
-            } else {
-                json!(m.content)
-            };
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut pending_tool_images: Vec<Value> = Vec::new();
 
-            let mut msg = json!({
-                "role": role,
-                "content": content_value,
-            });
+    for m in messages {
+        // A non-tool message closes any open tool block: relay buffered images
+        // first so they land AFTER the whole block, keeping tool replies contiguous.
+        if !matches!(m.role, Role::Tool) {
+            flush_relayed_images(&mut out, &mut pending_tool_images);
+        }
 
-            if let Some(tool_call_id) = &m.tool_call_id {
-                msg["tool_call_id"] = json!(tool_call_id);
+        let role = match m.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+
+        // OpenAI-compatible APIs accept either a string content, or an array of
+        // typed parts for multimodal messages. A `role:tool` message stays a
+        // string (its images are relayed separately, below).
+        let content_value = if matches!(m.role, Role::Tool) {
+            json!(m.content)
+        } else if let Some(parts) = m.content_parts.as_ref() {
+            json!(parts)
+        } else {
+            json!(m.content)
+        };
+
+        let mut msg = json!({
+            "role": role,
+            "content": content_value,
+        });
+
+        if let Some(tool_call_id) = &m.tool_call_id {
+            msg["tool_call_id"] = json!(tool_call_id);
+        }
+
+        if let Some(tool_calls) = &m.tool_calls {
+            msg["tool_calls"] = json!(tool_calls);
+        }
+
+        out.push(msg);
+
+        // Buffer this tool message's images (if any) to relay after the block.
+        if matches!(m.role, Role::Tool) {
+            if let Some(parts) = m.content_parts.as_ref() {
+                for part in parts {
+                    if matches!(part, MessagePart::ImageUrl { .. }) {
+                        // Reuse MessagePart's serde shape — identical to how user
+                        // multimodal images are emitted on this path.
+                        pending_tool_images.push(json!(part));
+                    }
+                }
             }
+        }
+    }
 
-            if let Some(tool_calls) = &m.tool_calls {
-                msg["tool_calls"] = json!(tool_calls);
-            }
-
-            msg
-        })
-        .collect()
+    // Relay any images from a trailing tool block.
+    flush_relayed_images(&mut out, &mut pending_tool_images);
+    out
 }
 
 /// Convert internal [`ToolSchema`] values to the OpenAI `tools` array JSON.
@@ -311,6 +355,17 @@ mod tests {
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
 
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn messages_to_openai_compat_json_omits_internal_fields() {
         let messages = vec![Message::user("Hello")];
@@ -355,6 +410,155 @@ mod tests {
 
         assert_eq!(out[1]["role"], "tool");
         assert_eq!(out[1]["tool_call_id"], "call_1");
+        // A text-only tool result adds no synthetic relay message.
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn tool_result_image_relayed_as_trailing_user_message() {
+        let messages = vec![
+            Message::assistant("", Some(vec![tool_call("call_1", "screenshot")])),
+            Message::tool_result_with_images(
+                "call_1",
+                "captured",
+                true,
+                vec![bamboo_domain::ToolResultImage {
+                    mime_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                }],
+            ),
+        ];
+
+        let out = super::messages_to_openai_compat_json(&messages);
+
+        // assistant, tool (string content), then a synthetic user message carrying
+        // the image the tool role can't hold.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["content"], "captured");
+        assert_eq!(out[2]["role"], "user");
+        let content = out[2]["content"].as_array().expect("array content");
+        assert!(content.iter().any(|p| p["type"] == "image_url"
+            && p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn parallel_tool_result_images_flush_after_block_keeping_tools_consecutive() {
+        // Two parallel tool results, each with an image. The Chat Completions API
+        // requires the tool replies to stay CONSECUTIVE; the relayed images must
+        // therefore land in ONE user message AFTER the whole tool block, never
+        // interleaved between the two tool messages (which would be a 400).
+        let messages = vec![
+            Message::assistant(
+                "",
+                Some(vec![
+                    tool_call("call_1", "shotA"),
+                    tool_call("call_2", "shotB"),
+                ]),
+            ),
+            Message::tool_result_with_images(
+                "call_1",
+                "a",
+                true,
+                vec![bamboo_domain::ToolResultImage {
+                    mime_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                }],
+            ),
+            Message::tool_result_with_images(
+                "call_2",
+                "b",
+                true,
+                vec![bamboo_domain::ToolResultImage {
+                    mime_type: "image/png".to_string(),
+                    data: "BBBB".to_string(),
+                }],
+            ),
+        ];
+
+        let out = super::messages_to_openai_compat_json(&messages);
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[1]["role"], "tool", "tool replies must stay consecutive");
+        assert_eq!(out[2]["role"], "tool", "no user message between the tools");
+        assert_eq!(out[3]["role"], "user");
+        let content = out[3]["content"].as_array().expect("array content");
+        assert!(content
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+        assert!(content
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,BBBB"));
+    }
+
+    #[test]
+    fn tool_result_images_flush_before_a_following_user_message() {
+        let messages = vec![
+            Message::assistant("", Some(vec![tool_call("call_1", "shot")])),
+            Message::tool_result_with_images(
+                "call_1",
+                "a",
+                true,
+                vec![bamboo_domain::ToolResultImage {
+                    mime_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                }],
+            ),
+            Message::user("thanks"),
+        ];
+
+        let out = super::messages_to_openai_compat_json(&messages);
+
+        // The relayed-image user message must be flushed BEFORE the real user turn.
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[2]["role"], "user");
+        assert!(out[2]["content"].is_array(), "relayed image message");
+        assert_eq!(out[3]["role"], "user");
+        assert_eq!(out[3]["content"], "thanks");
+    }
+
+    #[test]
+    fn separate_tool_blocks_each_flush_independently() {
+        // Two distinct tool blocks separated by an assistant turn: each block's
+        // image must be relayed by its OWN flush, at the right position.
+        let img = |data: &str| bamboo_domain::ToolResultImage {
+            mime_type: "image/png".to_string(),
+            data: data.to_string(),
+        };
+        let messages = vec![
+            Message::assistant("", Some(vec![tool_call("call_1", "shotA")])),
+            Message::tool_result_with_images("call_1", "a", true, vec![img("AAAA")]),
+            Message::assistant("here you go", None), // closes block 1
+            Message::assistant("", Some(vec![tool_call("call_2", "shotB")])),
+            Message::tool_result_with_images("call_2", "b", true, vec![img("BBBB")]),
+        ];
+
+        let out = super::messages_to_openai_compat_json(&messages);
+
+        // assistant, tool(A), user(relay A), assistant("here"), assistant(tool),
+        // tool(B), user(relay B).
+        assert_eq!(out.len(), 7);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[2]["role"], "user");
+        assert!(out[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+        assert_eq!(out[3]["role"], "assistant");
+        assert_eq!(out[3]["content"], "here you go");
+        assert_eq!(out[5]["role"], "tool");
+        assert_eq!(out[6]["role"], "user");
+        let last = out[6]["content"].as_array().unwrap();
+        assert!(last
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,BBBB"));
+        // The second block's relay must NOT carry the first block's image.
+        assert!(!last
+            .iter()
+            .any(|p| p["image_url"]["url"] == "data:image/png;base64,AAAA"));
     }
 
     #[test]
