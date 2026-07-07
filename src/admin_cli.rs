@@ -226,6 +226,59 @@ pub async fn stop(conn: ConnArgs, session_id: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `bamboo history <session-id>` — print a session's UI-visible message
+/// transcript (a thin read over `GET /api/v1/history/{id}`). Handy for reviewing
+/// what a headless `-p` run actually did, or an interactive session's log,
+/// without the web UI. Folded in from the retired `bamboo-cli history`.
+pub async fn history(conn: ConnArgs, session_id: &str) -> anyhow::Result<()> {
+    // Same path-segment guard as `stop`: ids are opaque tokens.
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains(['/', '\\', '?', '#', '%'])
+        || session_id.chars().any(char::is_whitespace)
+    {
+        anyhow::bail!("invalid session id: '{session_id}'");
+    }
+    let base = conn.api_base();
+    let url = format!("{base}/history/{session_id}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    if resp.status().as_u16() == 404 {
+        anyhow::bail!("session '{session_id}' not found");
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("GET {url} -> HTTP {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let messages = v.get("messages").and_then(|m| m.as_array());
+    let messages = match messages {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            println!("(no messages)");
+            return Ok(());
+        }
+    };
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let label = match role {
+            "user" => "user".cyan(),
+            "assistant" => "assistant".green(),
+            "system" => "system".dimmed(),
+            "tool" => "tool".yellow(),
+            other => other.normal(),
+        };
+        println!("{label}: {content}");
+    }
+    println!("\n{} message(s) in session {session_id}.", messages.len());
+    Ok(())
+}
+
 /// Count array entries whose `is_running` is true.
 fn count_running(sessions: &[serde_json::Value]) -> usize {
     sessions

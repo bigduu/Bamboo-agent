@@ -61,7 +61,7 @@ graph TD
   SRV --> INFRA
   TOOLS --> INFRA
   MEM --> INFRA
-  CLI2["bamboo-cli / bamboo-tui<br/>thin clients over HTTP"] -.-> SRV
+  CLI2["bamboo-tui<br/>thin client over HTTP"] -.-> SRV
 ```
 
 **Workspace members** (from `Cargo.toml`), organized by tier:
@@ -69,7 +69,7 @@ graph TD
 - **`crates/core/`** — `bamboo-domain` (pure domain types), `bamboo-agent-core` (core abstractions)
 - **`crates/infra/`** — `bamboo-config`, `bamboo-llm`, `bamboo-storage`, `bamboo-a2a`, `bamboo-infrastructure`, `bamboo-memory`, `bamboo-metrics`, `bamboo-notification`, `bamboo-skills`, `bamboo-mcp`, `bamboo-permission`, `bamboo-compression`, `bamboo-subagent`, `bamboo-analytics` (dev-only)
 - **`crates/engine/`** — `bamboo-engine`, `bamboo-tools`
-- **`crates/app/`** — `bamboo-server`, `bamboo-server-tools`, `bamboo-sdk`, `bamboo-cli`, `bamboo-tui`, `bamboo-client-core`, `bamboo-broker`
+- **`crates/app/`** — `bamboo-server`, `bamboo-server-tools`, `bamboo-sdk`, `bamboo-tui`, `bamboo-client-core`, `bamboo-broker`
 
 …plus the root `bamboo-agent` binary.
 
@@ -166,7 +166,7 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
 | `bamboo config [--path] [--show-secrets]` | Inspect the resolved configuration. |
 | `bamboo config set <key> <value>` | Set one value, e.g. `providers.anthropic.api_key`, `providers.<p>.model`, or `provider`. |
-| `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Use `-p -` to read the prompt from stdin. Optional `-s <session>` to continue, `-m provider:model` to pin the model, `--reasoning-effort <low\|medium\|high\|xhigh>`, `--skill-mode <mode>`, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
+| `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Use `-p -` to read the prompt from stdin. Optional `-s <session>` to continue, `-m provider:model` **or** a bare `-m <model>` (bound to `--provider`, else the configured default provider) to pin the model, `--provider <name>` to select a provider, `--reasoning-effort <low\|medium\|high\|xhigh>`, `--skill-mode <mode>`, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
 | `bamboo completions <shell>` | Print a shell completion script (`bash`/`zsh`/`fish`/`powershell`/`elvish`), e.g. `bamboo completions zsh > ~/.zfunc/_bamboo`. |
 | `bamboo actor run\|serve\|list\|call` | Drive the sub-agent actor fabric from the terminal (spawn + stream, run as a service, discover, or send a task). |
 | `bamboo broker serve` | Run the standalone sub-agent message broker (WebSocket bus over durable mailboxes). |
@@ -175,8 +175,11 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo status` | One-screen overview of a running server: address, health, session counts. |
 | `bamboo sessions` | List sessions on a running server (stop one with `bamboo stop <id>`). |
 | `bamboo stop <session_id>` | Stop a running session's agent loop. |
+| `bamboo history <session_id>` | Print a session's message transcript from a running server (review a headless `-p` run's log). |
+| `bamboo skills list` | List the skills the agent would load from `<data_dir>/skills` (offline; no server needed). |
+| `bamboo mcp list` | List the MCP servers configured in `config.json` (offline; live status via `bamboo status`). |
 
-The admin commands (`health` / `status` / `sessions` / `stop`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
+The admin commands (`health` / `status` / `sessions` / `stop` / `history`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`). (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
 A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present).
 

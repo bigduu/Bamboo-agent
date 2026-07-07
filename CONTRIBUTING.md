@@ -129,7 +129,6 @@ bamboo/
 │   └── bin/bamboo.rs       # CLI binary entry point
 ├── crates/
 │   ├── bamboo-agent-core/  # Agent runtime core, composition, storage, tools
-│   ├── bamboo-cli/         # CLI binary wrapper
 │   ├── bamboo-compression/ # Context compression and summarization
 │   ├── bamboo-domain/      # Domain types: sessions, tools, workflows, schedules, MCP
 │   ├── bamboo-engine/      # Agent engine: MCP, metrics, runtime, skills
@@ -147,7 +146,6 @@ bamboo/
 | Crate | Responsibility |
 |---|---|
 | `bamboo-agent-core` | Agent system composition, workspace state, core agent types |
-| `bamboo-cli` | CLI entry point and argument parsing |
 | `bamboo-compression` | Context compression, summarization, token limits |
 | `bamboo-domain` | Domain types for sessions, tools, workflows, schedules, MCP config |
 | `bamboo-engine` | Agent engine: MCP integration, metrics, runtime, skill execution |

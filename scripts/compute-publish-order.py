@@ -9,7 +9,7 @@ index. Computing the order here keeps it in lock-step with the workspace.
 
 Scope: ``bamboo-agent``'s transitive workspace-dependency closure (the published
 library and everything it pulls in), dependencies first. Standalone binaries
-outside that closure (bamboo-cli, bamboo-tui, bamboo-client-core) are not part
+outside that closure (bamboo-tui, bamboo-client-core) are not part
 of the published library and are intentionally excluded.
 
 Run from the workspace root (where the top-level Cargo.toml lives).

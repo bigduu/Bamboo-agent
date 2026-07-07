@@ -27,9 +27,18 @@ struct Cli {
     #[arg(short = 's', long)]
     session: Option<String>,
 
-    /// With -p: model as 'provider:model'. Defaults to the session/config default.
+    /// With -p: model as 'provider:model' OR a bare model id (bound to
+    /// --provider, else the configured default provider). Defaults to the
+    /// session/config default.
     #[arg(short = 'm', long)]
     model: Option<String>,
+
+    /// With -p: provider name (e.g. `anthropic`, `openai`, `gemini`). Combine
+    /// with a bare `-m <model>` to pin `provider:model`, or use alone to select
+    /// that provider (its configured default model). Conflicts with the
+    /// `provider:model` form of `-m` only when the providers differ.
+    #[arg(long)]
+    provider: Option<String>,
 
     /// With -p: working directory for a NEW session (defaults to the current dir).
     #[arg(long)]
@@ -281,6 +290,49 @@ enum Commands {
         #[command(flatten)]
         conn: ConnArgs,
     },
+
+    /// Print a session's message transcript from a running server
+    /// (GET /api/v1/history/{id}). Handy to review a headless `-p` run's log.
+    History {
+        /// Session id to show.
+        session_id: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Inspect the skill surface the agent would load (offline read of
+    /// `<data_dir>/skills`; no running server required).
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommands,
+    },
+
+    /// Inspect the MCP servers configured in `config.json` (offline read; live
+    /// connection status needs a running server via `bamboo status`).
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommands {
+    /// List discovered skills (id, name, description).
+    List {
+        /// Data directory holding config.json + skills/ (defaults to ~/.bamboo).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// List configured MCP servers (id, enabled, transport, name).
+    List {
+        /// Data directory holding config.json (defaults to ~/.bamboo).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// Connection options shared by the admin subcommands (`health` / `status` /
@@ -331,6 +383,11 @@ enum ConfigAction {
 #[derive(Subcommand)]
 enum BrokerCommands {
     /// Serve the broker on a WebSocket endpoint until terminated.
+    #[command(after_help = "EXAMPLES:\n  \
+        # Local-only broker (loopback), token from the env var\n  \
+        BAMBOO_BROKER_TOKEN=secret bamboo broker serve\n\n  \
+        # Accept remote / containerized workers on all interfaces\n  \
+        bamboo broker serve --bind 0.0.0.0:9600 --token secret")]
     Serve {
         /// Bind address. Use `0.0.0.0:9600` to accept connections from remote /
         /// containerized workers; `127.0.0.1:9600` for local-only.
@@ -352,6 +409,12 @@ enum BrokerCommands {
 #[derive(Subcommand)]
 enum BrokerAgentCommands {
     /// Connect to a broker and serve this agent's mailbox until terminated.
+    #[command(after_help = "EXAMPLES:\n  \
+        # Self-resolving worker: connect, answer Ask/Task for its mailbox\n  \
+        bamboo broker-agent serve --broker ws://broker-host:9600 --token secret \\\n    \
+        --id summarizer-1 --role summarizer --model anthropic:claude-sonnet-4\n\n  \
+        # Boot from a parent-provided ProvisionSpec (deploy path)\n  \
+        bamboo broker-agent serve --broker ws://host:9600 --token secret --id w1 --spec-stdin")]
     Serve {
         /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
         #[arg(long)]
@@ -404,6 +467,11 @@ enum BrokerAgentCommands {
 #[derive(Subcommand)]
 enum ActorCommands {
     /// Spawn an actor, give it a task, and stream its events live.
+    #[command(after_help = "EXAMPLES:\n  \
+        # Spawn an actor on a specific model and stream its events\n  \
+        bamboo actor run \"summarize ./notes.md\" -m anthropic:claude-sonnet-4\n\n  \
+        # No-key transport smoke test (echo executor)\n  \
+        bamboo actor run \"ping\" --echo")]
     Run {
         /// The task / prompt for the actor.
         prompt: String,
@@ -437,6 +505,12 @@ enum ActorCommands {
 
     /// Become a long-running service agent: announce into the local discovery
     /// fabric and serve calls until Ctrl-C (one isolated session per call).
+    #[command(after_help = "EXAMPLES:\n  \
+        # Announce a local service agent others can discover by role\n  \
+        bamboo actor serve --role summarizer\n\n  \
+        # Remotely reachable over wss:// with a bearer token\n  \
+        bamboo actor serve --role summarizer --bind 0.0.0.0:8443 \\\n    \
+        --tls --cert-file cert.pem --key-file key.pem --token secret")]
     Serve {
         /// Role to announce (how others find you), e.g. "summarizer".
         #[arg(long, default_value = "service")]
@@ -490,6 +564,9 @@ enum ActorCommands {
     List,
 
     /// Discover a service agent (by id, or first match by role) and send it a task.
+    #[command(after_help = "EXAMPLES:\n  \
+        # Send a task to a discovered service agent (by role or exact id)\n  \
+        bamboo actor call summarizer \"summarize ./notes.md\"")]
     Call {
         /// Agent id (exact) or role (first live match).
         agent: String,
@@ -559,6 +636,9 @@ async fn main() {
         | Some(Commands::Status { .. })
         | Some(Commands::Sessions { .. })
         | Some(Commands::Stop { .. })
+        | Some(Commands::History { .. })
+        | Some(Commands::Skills { .. })
+        | Some(Commands::Mcp { .. })
         | Some(Commands::Init { .. })
         | Some(Commands::Doctor { .. })
         | Some(Commands::Completions { .. })
@@ -644,6 +724,7 @@ async fn main() {
                 permission_mode: cli.permission_mode,
                 reasoning_effort: cli.reasoning_effort,
                 skill_mode: cli.skill_mode,
+                provider: cli.provider,
             };
             if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");
@@ -1001,6 +1082,29 @@ async fn main() {
 
         Commands::Stop { session_id, conn } => {
             if let Err(e) = bamboo_agent::admin_cli::stop(conn.into(), &session_id).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::History { session_id, conn } => {
+            if let Err(e) = bamboo_agent::admin_cli::history(conn.into(), &session_id).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Skills { command } => {
+            let SkillsCommands::List { data_dir } = command;
+            if let Err(e) = bamboo_agent::read_cli::skills_list(data_dir).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Mcp { command } => {
+            let McpCommands::List { data_dir } = command;
+            if let Err(e) = bamboo_agent::read_cli::mcp_list(data_dir).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }

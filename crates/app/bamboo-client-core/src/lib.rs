@@ -1,11 +1,11 @@
 //! Shared wire types for Bamboo client front-ends.
 //!
-//! Both `bamboo-cli` and `bamboo-tui` are standalone HTTP/SSE clients that talk
-//! to the Bamboo server over REST + Server-Sent Events. They previously each
-//! re-declared the same request/response/event structs; this crate is the
-//! single source of truth for those wire shapes. It depends only on `serde`
-//! (no workspace-internal crates) so the clients stay decoupled from the
-//! server's internal types.
+//! `bamboo-tui` (and other HTTP/SSE front-ends) talk to the Bamboo server over
+//! REST + Server-Sent Events. Rather than re-declaring the same
+//! request/response/event structs per client, this crate is the single source
+//! of truth for those wire shapes. It depends only on `serde` (no
+//! workspace-internal crates) so the clients stay decoupled from the server's
+//! internal types.
 
 use serde::{Deserialize, Serialize};
 

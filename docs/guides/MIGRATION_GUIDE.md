@@ -7,7 +7,6 @@ This guide helps you migrate from the old `agent-*` crates to the unified `bambo
 Bamboo is now organized as a Cargo workspace with the following crates under `crates/`:
 
 - `bamboo-agent-core` -- Agent runtime core, composition, storage, tools
-- `bamboo-cli` -- CLI binary wrapper
 - `bamboo-compression` -- Context compression and summarization
 - `bamboo-domain` -- Domain types: sessions, tools, workflows, schedules, MCP
 - `bamboo-engine` -- Agent engine: MCP, metrics, runtime, skills

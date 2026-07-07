@@ -170,6 +170,12 @@ pub struct HeadlessArgs {
     /// Per-run skill mode (e.g. `code`, `ask`). `None` keeps the session/config
     /// default. Threads into `ExecuteRequest.skill_mode`.
     pub skill_mode: Option<String>,
+    /// Per-run provider override (e.g. `anthropic`, `openai`). Combined with a
+    /// bare `--model <id>` to form a `provider:model` reference, or used alone to
+    /// select that provider (its configured default model). When `--model` is
+    /// itself `provider:model`, that provider wins and a conflicting `--provider`
+    /// errors. Threads into `ExecuteRequest.model_ref` / `.provider`.
+    pub provider: Option<String>,
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
@@ -238,6 +244,35 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     // OVERWRITTEN per execute by the handler, so a session first run headlessly
     // and later reopened interactively correctly resets to the human-present
     // posture instead of staying sticky-true.
+    // Resolve `-m`/`--provider` once, BEFORE the session is persisted below. A
+    // bare `-m <model>` (no colon, no `--provider`) binds to the configured
+    // default provider — the same grammar `actor run` uses. Applies to the
+    // initial execute and to any resume.
+    let default_provider = state.config.read().await.provider.clone();
+    let model_selection = resolve_model_selection(&args.model, &args.provider, &default_provider)?;
+
+    // Resolve the concrete provider+model ref to pin onto the session. For a
+    // bare/colon `-m` this is the parsed ref. For `--provider P` ALONE we resolve
+    // P's configured default model here so the pin is still concrete: the new
+    // cascade's `defaults.chat` fallback is a single GLOBAL ref, so passing only
+    // a provider would otherwise be ignored and the run would keep using the
+    // global default provider/model. If P has no configured model we leave the
+    // ref unset and fall back to the request's `provider` field (the legacy
+    // cascade resolves P's provider-aware default, or execute reports no model).
+    let session_model_ref: Option<bamboo_domain::ProviderModelRef> = match (
+        model_selection.model_ref.clone(),
+        model_selection.provider.as_deref(),
+    ) {
+        (Some(model_ref), _) => Some(model_ref),
+        (None, Some(provider)) => {
+            let config = state.config.read().await;
+            bamboo_engine::model_config_helper::get_default_model_for_provider(&config, provider)
+                .ok()
+                .map(|model| bamboo_domain::ProviderModelRef::new(provider, model))
+        }
+        (None, None) => None,
+    };
+
     {
         let mut session = state
             .storage
@@ -246,6 +281,18 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             .map_err(|e| format!("load session: {e}"))?
             .ok_or_else(|| "session vanished".to_string())?;
         session.add_message(Message::user(args.prompt.clone()));
+        // Pin the chosen model onto the SESSION, not just the request. The server
+        // has two model cascades gated on `features.provider_model_ref`; the
+        // legacy one (the default) ranks the request's model BELOW the provider's
+        // configured default model, so a request-only pin is silently outranked
+        // whenever that default is set. `session.model`/`model_ref` is the
+        // highest-priority source in BOTH cascades, so persisting it here is what
+        // actually makes `-m`/`--provider` win — via the engine's own persist
+        // helper (the same call the execute handler makes) so there is no forked
+        // model write.
+        if let Some(model_ref) = &session_model_ref {
+            bamboo_engine::session_app::provider_model::persist_model_ref(&mut session, model_ref);
+        }
         state
             .storage
             .save_session(&session)
@@ -257,8 +304,6 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     // Subscribe to the session's event stream BEFORE starting execution.
     let sender = state.get_session_event_sender(&session_id).await;
     let mut events = sender.subscribe();
-
-    let model_ref = parse_model_ref(&args.model)?;
 
     // Parse the optional reasoning-effort override once (applies to the initial
     // execute and to any resume after a pending question).
@@ -301,9 +346,9 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         data.clone(),
         web::Path::from(session_id.clone()),
         web::Json(ExecuteRequest {
-            model: None,
-            provider: None,
-            model_ref,
+            model: model_selection.model.clone(),
+            provider: model_selection.provider.clone(),
+            model_ref: model_selection.model_ref.clone(),
             skill_mode: args.skill_mode.clone(),
             reasoning_effort,
             client_sync: None,
@@ -414,9 +459,9 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             web::Path::from(session_id.clone()),
             web::Json(RespondRequest {
                 response,
-                model: None,
-                provider: None,
-                model_ref: None,
+                model: model_selection.model.clone(),
+                provider: model_selection.provider.clone(),
+                model_ref: model_selection.model_ref.clone(),
                 reasoning_effort,
             }),
         )
@@ -503,23 +548,103 @@ async fn tree_quiescent(state: &AppState, session_id: &str) -> bool {
     }
 }
 
-fn parse_model_ref(
+/// The model/provider selection for a headless run, resolved into the fields
+/// the execute handler consumes ([`ExecuteRequest::model`],
+/// [`ExecuteRequest::provider`], [`ExecuteRequest::model_ref`]).
+///
+/// Both `model` and `model_ref` are populated for a chosen model so the request
+/// is well-formed for either server cascade (`features.provider_model_ref`
+/// on/off) and so `model_ref.provider` drives auxiliary-model resolution. What
+/// actually makes the pin authoritative, though, is persisting `model_ref` onto
+/// the SESSION before execute (see `run`) — session model is ranked first in
+/// both cascades, whereas the request's `model` alone is outranked by the
+/// provider's configured default in the legacy (default) cascade.
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+struct ModelSelection {
+    /// Provider name to pass through when no concrete model was chosen. The
+    /// handler resolves that provider's configured default model.
+    provider: Option<String>,
+    /// Bare model id — the legacy cascade's final fallback.
+    model: Option<String>,
+    /// A fully-resolved provider+model reference — the new cascade's
+    /// highest-priority "request" source.
+    model_ref: Option<bamboo_domain::ProviderModelRef>,
+}
+
+/// Reconcile `-m`/`--provider` into a [`ModelSelection`].
+///
+/// One model grammar for the whole `bamboo` binary — the same
+/// bare-model-on-default-provider rule `actor run` already uses:
+/// - `-m provider:model`         → ref(provider, model)
+/// - `--provider P` + `-m model` → ref(P, model)
+/// - `-m model` (bare)           → ref(default_provider, model)
+/// - `--provider P` (no `-m`)    → provider = P; `run` then resolves P's
+///                                 configured default model and pins that ref
+/// - neither                     → all defaults flow from the session/config
+///
+/// A `provider:model` spec whose provider conflicts with `--provider` is an error.
+fn resolve_model_selection(
     model: &Option<String>,
-) -> Result<Option<bamboo_domain::ProviderModelRef>, String> {
-    let Some(spec) = model else { return Ok(None) };
-    let spec = spec.trim();
-    let Some((p, m)) = spec.split_once(':') else {
-        return Err(format!(
-            "-m '{spec}' must be 'provider:model' in server mode (see config defaults otherwise)"
-        ));
+    provider: &Option<String>,
+    default_provider: &str,
+) -> Result<ModelSelection, String> {
+    let cli_provider = provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+
+    // Split an explicit `provider:model` spec, if any.
+    let (spec_provider, bare_model) = match model {
+        Some(spec) => match spec.split_once(':') {
+            Some((p, m)) => {
+                let (p, m) = (p.trim(), m.trim());
+                if p.is_empty() || m.is_empty() {
+                    return Err(format!("-m '{spec}' must be 'provider:model'"));
+                }
+                (Some(p.to_string()), Some(m.to_string()))
+            }
+            None => (None, Some(spec.to_string())),
+        },
+        None => (None, None),
     };
-    if p.trim().is_empty() || m.trim().is_empty() {
-        return Err(format!("-m '{spec}' must be provider:model"));
-    }
-    Ok(Some(bamboo_domain::ProviderModelRef::new(
-        p.trim(),
-        m.trim(),
-    )))
+
+    // Reconcile the provider named inside `-m provider:model` against `--provider`.
+    let chosen_provider = match (spec_provider, cli_provider) {
+        (Some(a), Some(b)) if !a.eq_ignore_ascii_case(b) => {
+            return Err(format!(
+                "conflicting providers: -m specifies '{a}', --provider is '{b}' (drop one)"
+            ));
+        }
+        (Some(a), _) => Some(a),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    };
+
+    Ok(match (chosen_provider, bare_model) {
+        // A model id is present → resolve a concrete provider+model ref (new
+        // path) AND carry the bare model as the legacy-path fallback. A bare
+        // model with no provider binds to the configured default provider.
+        (provider, Some(model)) => {
+            let provider = provider.unwrap_or_else(|| default_provider.trim().to_string());
+            if provider.is_empty() {
+                return Err(format!(
+                    "-m '{model}': no provider given and no default provider is configured \
+                     (use `provider:model`, add `--provider`, or run `bamboo init`)"
+                ));
+            }
+            ModelSelection {
+                provider: None,
+                model: Some(model.clone()),
+                model_ref: Some(bamboo_domain::ProviderModelRef::new(provider, model)),
+            }
+        }
+        // Provider only → the handler picks that provider's default model.
+        (Some(provider), None) => ModelSelection {
+            provider: Some(provider),
+            model: None,
+            model_ref: None,
+        },
+        // Nothing specified → session/config defaults flow unchanged.
+        (None, None) => ModelSelection::default(),
+    })
 }
 
 /// Pretty-print one server event (typed `AgentEvent`, serialized form).
@@ -628,5 +753,86 @@ mod tests {
             }
             HeadlessPromptAction::Prompt => panic!("expected deterministic resolve"),
         }
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    fn model_ref(p: &str, m: &str) -> Option<bamboo_domain::ProviderModelRef> {
+        Some(bamboo_domain::ProviderModelRef::new(p, m))
+    }
+
+    /// `-m provider:model` resolves to that exact ref, provider inferred from it.
+    /// Both the ref (new cascade) and the bare model (legacy cascade) are set.
+    #[test]
+    fn model_selection_colon_form() {
+        let sel = resolve_model_selection(&some("openai:gpt-4o"), &None, "anthropic").unwrap();
+        assert_eq!(sel.model_ref, model_ref("openai", "gpt-4o"));
+        assert_eq!(sel.model, some("gpt-4o"));
+        assert_eq!(sel.provider, None);
+    }
+
+    /// A bare `-m <model>` binds to the configured DEFAULT provider (mirrors
+    /// `actor run`) so it reliably wins over the provider default.
+    #[test]
+    fn model_selection_bare_model_uses_default_provider() {
+        let sel = resolve_model_selection(&some("gpt-4o"), &None, "openai").unwrap();
+        assert_eq!(sel.model_ref, model_ref("openai", "gpt-4o"));
+        assert_eq!(sel.model, some("gpt-4o"));
+        assert_eq!(sel.provider, None);
+    }
+
+    /// `--provider P` + a bare `-m <model>` compose into `ref(P, model)`.
+    #[test]
+    fn model_selection_provider_flag_plus_bare_model() {
+        let sel = resolve_model_selection(&some("gpt-4o"), &some("openai"), "anthropic").unwrap();
+        assert_eq!(sel.model_ref, model_ref("openai", "gpt-4o"));
+    }
+
+    /// `--provider P` alone passes the provider through (no ref); the handler
+    /// picks that provider's default model.
+    #[test]
+    fn model_selection_provider_only() {
+        let sel = resolve_model_selection(&None, &some("gemini"), "anthropic").unwrap();
+        assert_eq!(sel.model_ref, None);
+        assert_eq!(sel.provider, some("gemini"));
+    }
+
+    /// Nothing specified → all defaults flow from the session/config downstream.
+    #[test]
+    fn model_selection_empty_is_default() {
+        let sel = resolve_model_selection(&None, &None, "anthropic").unwrap();
+        assert_eq!(sel, ModelSelection::default());
+    }
+
+    /// `-m provider:model` colliding with a different `--provider` is rejected.
+    #[test]
+    fn model_selection_conflicting_providers_error() {
+        let err = resolve_model_selection(&some("openai:gpt-4o"), &some("anthropic"), "anthropic")
+            .unwrap_err();
+        assert!(err.contains("conflicting providers"), "got: {err}");
+    }
+
+    /// A matching (case-insensitive) `--provider` alongside `provider:model` is fine.
+    #[test]
+    fn model_selection_matching_provider_ok() {
+        let sel = resolve_model_selection(&some("OpenAI:gpt-4o"), &some("openai"), "x").unwrap();
+        assert_eq!(sel.model_ref, model_ref("OpenAI", "gpt-4o"));
+    }
+
+    /// Malformed colon specs are rejected with a clear message.
+    #[test]
+    fn model_selection_malformed_colon_error() {
+        assert!(resolve_model_selection(&some("openai:"), &None, "x").is_err());
+        assert!(resolve_model_selection(&some(":gpt-4o"), &None, "x").is_err());
+    }
+
+    /// A bare model with neither `--provider` nor a configured default errors
+    /// actionably rather than silently constructing an empty-provider ref.
+    #[test]
+    fn model_selection_bare_model_no_default_errors() {
+        let err = resolve_model_selection(&some("gpt-4o"), &None, "   ").unwrap_err();
+        assert!(err.contains("no provider"), "got: {err}");
     }
 }
