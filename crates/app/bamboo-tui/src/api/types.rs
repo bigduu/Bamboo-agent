@@ -1,3 +1,10 @@
+//! HTTP wire types for the TUI client.
+//!
+//! These structs mirror the Bamboo server's REST responses. Some fields are
+//! deserialized for contract fidelity (and so the TUI is robust to responses
+//! that include them) but are not yet surfaced in the UI — hence the
+//! module-scoped `dead_code` allow. New *logic* dead code elsewhere in the
+//! crate still warns, since the blanket crate-level allow was removed.
 #![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
@@ -27,29 +34,6 @@ pub struct SessionSummary {
     pub message_count: Option<u32>,
     #[serde(default)]
     pub status: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-pub struct CreateSessionRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_path: Option<String>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct PendingQuestion {
-    pub has_pending_question: bool,
-    #[serde(default)]
-    pub question: Option<String>,
-    #[serde(default)]
-    pub options: Option<Vec<String>>,
-    #[serde(default)]
-    pub allow_custom: Option<bool>,
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -213,13 +197,4 @@ pub struct SkillDetail {
     pub prompt: Option<String>,
     #[serde(default)]
     pub tools: Option<Vec<String>>,
-}
-
-// ── Config ──
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct ModelInfo {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
 }

@@ -94,7 +94,6 @@ pub struct ChatMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCallDisplay>,
     pub reasoning: Option<String>,
-    pub timestamp: DateTime<Utc>,
 }
 
 pub struct ChatState {
@@ -103,7 +102,6 @@ pub struct ChatState {
     pub textarea: TextArea<'static>,
     pub scroll_offset: u16,
     pub auto_scroll: bool,
-    pub content_lines: u16,
     pub streaming: bool,
     pub current_response: String,
     pub current_tool_calls: Vec<ToolCallDisplay>,
@@ -128,7 +126,6 @@ impl ChatState {
             textarea,
             scroll_offset: 0,
             auto_scroll: true,
-            content_lines: 0,
             streaming: false,
             current_response: String::new(),
             current_tool_calls: Vec::new(),
@@ -395,7 +392,7 @@ impl App {
                     Ok(Event::Mouse(mouse)) if tx.send(AppEvent::Mouse(mouse)).is_err() => {
                         break;
                     }
-                    Ok(Event::Resize(w, h)) if tx.send(AppEvent::Resize(w, h)).is_err() => {
+                    Ok(Event::Resize(_, _)) if tx.send(AppEvent::Resize).is_err() => {
                         break;
                     }
                     _ => {}
@@ -465,10 +462,6 @@ impl App {
 
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
-            AppEvent::SseEvent(agent_event) => self.handle_sse_event(agent_event)?,
-            AppEvent::ApiError(msg) => {
-                self.notify(NoticeLevel::Error, format!("Error: {msg}"));
-            }
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::SessionsLoaded(r) => {
                 self.sessions.loading = false;
@@ -921,7 +914,6 @@ impl App {
             content: message.clone(),
             tool_calls: Vec::new(),
             reasoning: None,
-            timestamp: Utc::now(),
         });
         self.chat.auto_scroll = true;
         self.chat.streaming = true;
@@ -1123,7 +1115,6 @@ impl App {
                 } else {
                     Some(std::mem::take(&mut self.chat.current_reasoning))
                 },
-                timestamp: Utc::now(),
             });
         }
         self.status_message = "Ready".to_string();

@@ -91,16 +91,6 @@ impl BambooClient {
         Ok(auto_resume)
     }
 
-    pub async fn pending_question(&self, session_id: &str) -> Result<PendingQuestion> {
-        let resp = self
-            .client
-            .get(self.url(&format!("/api/v1/respond/{}/pending", session_id)))
-            .send()
-            .await?;
-        let pq = resp.json().await?;
-        Ok(pq)
-    }
-
     // ── Sessions ──
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -109,28 +99,9 @@ impl BambooClient {
         Ok(sessions)
     }
 
-    pub async fn create_session(&self, req: CreateSessionRequest) -> Result<serde_json::Value> {
-        let resp = self
-            .client
-            .post(self.url("/api/v1/sessions"))
-            .json(&req)
-            .send()
-            .await?;
-        let val = resp.json().await?;
-        Ok(val)
-    }
-
     pub async fn delete_session(&self, id: &str) -> Result<()> {
         self.client
             .delete(self.url(&format!("/api/v1/sessions/{}", id)))
-            .send()
-            .await?;
-        Ok(())
-    }
-
-    pub async fn clear_session(&self, id: &str) -> Result<()> {
-        self.client
-            .post(self.url(&format!("/api/v1/sessions/{}/clear", id)))
             .send()
             .await?;
         Ok(())
@@ -172,14 +143,6 @@ impl BambooClient {
             .await?;
         let tools = resp.json().await?;
         Ok(tools)
-    }
-
-    pub async fn delete_mcp_server(&self, id: &str) -> Result<()> {
-        self.client
-            .delete(self.url(&format!("/api/v1/mcp/servers/{}", id)))
-            .send()
-            .await?;
-        Ok(())
     }
 
     // ── Schedules ──
@@ -277,16 +240,6 @@ impl BambooClient {
             anyhow::bail!("set config failed ({status}): {body}");
         }
         Ok(())
-    }
-
-    pub async fn fetch_models(&self) -> Result<Vec<ModelInfo>> {
-        let resp = self
-            .client
-            .post(self.url("/v1/bamboo/settings/provider/models"))
-            .send()
-            .await?;
-        let models = resp.json().await?;
-        Ok(models)
     }
 
     // ── Health ──
