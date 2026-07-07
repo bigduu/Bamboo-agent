@@ -714,6 +714,9 @@ impl PermissionConfig {
     /// active permission mode (including `BypassPermissions`). True when:
     /// - the command is a built-in hard-dangerous shell command (a
     ///   `bash_security` `Deny` verdict), or
+    /// - the command is a super-dangerous archetype the verdict downgrades to
+    ///   `Allow`/`Safe` — privilege escalation, raw-device write, recursive
+    ///   force-delete of a protected root, or remote pipe-to-shell, or
     /// - it matches a configured "always ask" rule.
     pub fn requires_forced_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
         // Built-in backstop: hard-dangerous shell commands always ask.
@@ -722,6 +725,11 @@ impl PermissionConfig {
                 if crate::bash_security::analyze_command(command).verdict
                     == crate::bash_security::BashVerdict::Deny
                 {
+                    return true;
+                }
+                // Catastrophic archetypes that the verdict leaves as Allow/Safe
+                // (sudo, dd of=/dev/…, rm -rf /, curl … | sh) must still prompt.
+                if crate::bash_security::super_dangerous_reason(command).is_some() {
                     return true;
                 }
             }
