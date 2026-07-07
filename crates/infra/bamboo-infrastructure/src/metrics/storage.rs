@@ -1505,13 +1505,13 @@ impl MetricsStorage for SqliteMetricsStorage {
                     COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens
                 FROM forward_request_metrics
-                WHERE date(started_at) BETWEEN date(?1) AND date(?2)
+                WHERE started_at >= ?1 AND started_at < ?2
                 GROUP BY date_key
                 ORDER BY date_key ASC
                 "#,
             )?;
 
-            let mut rows = stmt.query(params![start_date.to_string(), end_date.to_string()])?;
+            let mut rows = stmt.query(params![start_date.to_string(), next_day_bound(end_date)])?;
             let mut result = Vec::new();
 
             while let Some(row) = rows.next()? {
@@ -1851,6 +1851,17 @@ impl MetricsStorage for SqliteMetricsStorage {
         let start_date = end_date - chrono::Duration::days(i64::from(span));
 
         self.with_connection(move |connection| {
+            let start_bound = start_date.to_string();
+            let end_bound = next_day_bound(end_date);
+
+            // Load the per-day model/tool breakdowns for the WHOLE range in one
+            // grouped query each, instead of two per result day (was 1 + 2N).
+            // Done before the main statement so their borrows of `connection`
+            // don't overlap the main `rows` iterator.
+            let mut model_by_day =
+                load_model_breakdown_by_day(connection, &start_bound, &end_bound)?;
+            let mut tool_by_day = load_tool_breakdown_by_day(connection, &start_bound, &end_bound)?;
+
             let mut stmt = connection.prepare(
                 r#"
                 SELECT
@@ -1863,19 +1874,19 @@ impl MetricsStorage for SqliteMetricsStorage {
                     COALESCE(SUM(tool_call_count), 0) AS total_tool_calls,
                     COALESCE(SUM(prompt_cached_tool_outputs), 0) AS prompt_cached_tool_outputs
                 FROM session_metrics
-                WHERE date(started_at) BETWEEN date(?1) AND date(?2)
+                WHERE started_at >= ?1 AND started_at < ?2
                 GROUP BY date_key
                 ORDER BY date_key ASC
                 "#,
             )?;
 
-            let mut rows = stmt.query(params![start_date.to_string(), end_date.to_string()])?;
+            let mut rows = stmt.query(params![start_bound, end_bound])?;
             let mut result = Vec::new();
 
             while let Some(row) = rows.next()? {
                 let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
-                let model_breakdown = load_daily_model_breakdown(connection, date)?;
-                let tool_breakdown = load_daily_tool_breakdown(connection, date)?;
+                let model_breakdown = model_by_day.remove(&date).unwrap_or_default();
+                let tool_breakdown = tool_by_day.remove(&date).unwrap_or_default();
 
                 result.push(DailyMetrics {
                     date,
@@ -1901,16 +1912,26 @@ impl MetricsStorage for SqliteMetricsStorage {
     async fn prune_rounds_before(&self, cutoff: DateTime<Utc>) -> MetricsResult<u64> {
         self.with_connection(move |connection| {
             let cutoff_str = format_timestamp(cutoff);
+
+            // Only sessions that actually lose rounds need re-aggregation; capture
+            // them BEFORE the delete instead of re-aggregating every session
+            // (which was nine correlated subqueries × all sessions per pass).
+            let affected_sessions: Vec<String> = {
+                let mut stmt = connection.prepare(
+                    "SELECT DISTINCT session_id FROM round_metrics WHERE started_at < ?1",
+                )?;
+                let ids = stmt
+                    .query_map(params![cutoff_str], |row| row.get(0))?
+                    .collect::<Result<Vec<String>, _>>()?;
+                ids
+            };
+
             let deleted = connection.execute(
                 "DELETE FROM round_metrics WHERE started_at < ?1",
                 params![cutoff_str],
             )?;
 
-            let mut stmt = connection.prepare("SELECT session_id FROM session_metrics")?;
-            let session_ids: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<String>, _>>()?;
-            for session_id in session_ids {
+            for session_id in affected_sessions {
                 refresh_session_aggregates(connection, &session_id, Utc::now())?;
             }
 
@@ -2087,6 +2108,14 @@ fn compute_duration_ms(
 ///
 /// Returns an empty string if no filters are applied, otherwise returns
 /// a WHERE clause starting with "WHERE ".
+/// Half-open upper bound for an inclusive end date: the start of the following
+/// day as a `YYYY-MM-DD` string. `started_at < next_day_bound(end)` keeps the
+/// whole end date while letting the query seek the index (no `date()` wrap).
+/// Saturates at `NaiveDate::MAX` (unreachable in practice).
+fn next_day_bound(end: NaiveDate) -> String {
+    end.succ_opt().unwrap_or(end).to_string()
+}
+
 fn build_session_where_clause(
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
@@ -2096,13 +2125,16 @@ fn build_session_where_clause(
     let mut conditions = Vec::new();
 
     if let Some(start) = start_date {
-        conditions.push("date(started_at) >= date(?)".to_string());
+        // Sargable: bare comparison on the RFC3339-lexicographic, indexed column
+        // seeks idx_session_started_at; a `date()` wrap would force a full scan.
+        conditions.push("started_at >= ?".to_string());
         params_vec.push(start.to_string());
     }
 
     if let Some(end) = end_date {
-        conditions.push("date(started_at) <= date(?)".to_string());
-        params_vec.push(end.to_string());
+        // Inclusive of the whole end date → half-open upper bound at the next day.
+        conditions.push("started_at < ?".to_string());
+        params_vec.push(next_day_bound(end));
     }
 
     if let Some(status) = required_status {
@@ -2144,13 +2176,14 @@ fn build_forward_where_clause(
     let mut conditions = Vec::new();
 
     if let Some(start) = start_date {
-        conditions.push("date(started_at) >= date(?)".to_string());
+        // Sargable range on the indexed RFC3339 column (see build_session_where_clause).
+        conditions.push("started_at >= ?".to_string());
         params_vec.push(start.to_string());
     }
 
     if let Some(end) = end_date {
-        conditions.push("date(started_at) <= date(?)".to_string());
-        params_vec.push(end.to_string());
+        conditions.push("started_at < ?".to_string());
+        params_vec.push(next_day_bound(end));
     }
 
     if let Some(ep) = endpoint {
@@ -2435,37 +2468,40 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
 /// let breakdown = load_daily_model_breakdown(&conn, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())?;
 /// // breakdown might be: {"gpt-4": TokenUsage{...}, "claude-3": TokenUsage{...}}
 /// ```
-fn load_daily_model_breakdown(
+fn load_model_breakdown_by_day(
     connection: &Connection,
-    date: NaiveDate,
-) -> MetricsResult<HashMap<String, TokenUsage>> {
+    start_bound: &str,
+    end_bound: &str,
+) -> MetricsResult<HashMap<NaiveDate, HashMap<String, TokenUsage>>> {
     let mut stmt = connection.prepare(
         r#"
-        SELECT model,
+        SELECT date(started_at) AS date_key,
+               model,
                COALESCE(SUM(prompt_tokens), 0),
                COALESCE(SUM(completion_tokens), 0),
                COALESCE(SUM(total_tokens), 0)
         FROM session_metrics
-        WHERE date(started_at) = date(?1)
-        GROUP BY model
+        WHERE started_at >= ?1 AND started_at < ?2
+        GROUP BY date_key, model
         "#,
     )?;
 
-    let mut rows = stmt.query(params![date.to_string()])?;
-    let mut breakdown = HashMap::new();
+    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut by_day: HashMap<NaiveDate, HashMap<String, TokenUsage>> = HashMap::new();
 
     while let Some(row) = rows.next()? {
-        breakdown.insert(
-            row.get::<_, String>(0)?,
+        let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+        by_day.entry(date).or_default().insert(
+            row.get::<_, String>(1)?,
             TokenUsage {
-                prompt_tokens: row.get::<_, i64>(1)? as u64,
-                completion_tokens: row.get::<_, i64>(2)? as u64,
-                total_tokens: row.get::<_, i64>(3)? as u64,
+                prompt_tokens: row.get::<_, i64>(2)? as u64,
+                completion_tokens: row.get::<_, i64>(3)? as u64,
+                total_tokens: row.get::<_, i64>(4)? as u64,
             },
         );
     }
 
-    Ok(breakdown)
+    Ok(by_day)
 }
 
 /// Loads tool call count breakdown for a specific date.
@@ -2488,27 +2524,32 @@ fn load_daily_model_breakdown(
 /// let breakdown = load_daily_tool_breakdown(&conn, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())?;
 /// // breakdown might be: {"read_file": 10, "write_file": 5, "execute_command": 3}
 /// ```
-fn load_daily_tool_breakdown(
+fn load_tool_breakdown_by_day(
     connection: &Connection,
-    date: NaiveDate,
-) -> MetricsResult<HashMap<String, u32>> {
+    start_bound: &str,
+    end_bound: &str,
+) -> MetricsResult<HashMap<NaiveDate, HashMap<String, u32>>> {
     let mut stmt = connection.prepare(
         r#"
-        SELECT tool_name, COUNT(*)
+        SELECT date(started_at) AS date_key, tool_name, COUNT(*)
         FROM tool_call_metrics
-        WHERE date(started_at) = date(?1)
-        GROUP BY tool_name
+        WHERE started_at >= ?1 AND started_at < ?2
+        GROUP BY date_key, tool_name
         "#,
     )?;
 
-    let mut rows = stmt.query(params![date.to_string()])?;
-    let mut breakdown = HashMap::new();
+    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut by_day: HashMap<NaiveDate, HashMap<String, u32>> = HashMap::new();
 
     while let Some(row) = rows.next()? {
-        breakdown.insert(row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32);
+        let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+        by_day
+            .entry(date)
+            .or_default()
+            .insert(row.get::<_, String>(1)?, row.get::<_, i64>(2)? as u32);
     }
 
-    Ok(breakdown)
+    Ok(by_day)
 }
 
 fn load_execute_sync_mismatch_breakdown(
@@ -2776,6 +2817,47 @@ mod tests {
         assert_eq!(
             row.tool_breakdown,
             HashMap::from([(String::from("write_file"), 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_metrics_end_date_is_inclusive_and_next_day_excluded() {
+        // Locks the sargable-range rewrite (#234): a session at the very end of
+        // the end date is kept; one at 00:00 the next day is excluded.
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+
+        let end_of_day = Utc
+            .with_ymd_and_hms(2026, 2, 10, 23, 59, 59)
+            .single()
+            .expect("valid datetime");
+        let next_day_midnight = Utc
+            .with_ymd_and_hms(2026, 2, 11, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        storage
+            .upsert_session_start("in-range", "gpt-4", end_of_day)
+            .await
+            .expect("session start");
+        storage
+            .upsert_session_start("out-of-range", "gpt-4", next_day_midnight)
+            .await
+            .expect("session start");
+
+        let daily = storage
+            .daily_metrics(
+                1,
+                Some(NaiveDate::from_ymd_opt(2026, 2, 10).expect("valid date")),
+            )
+            .await
+            .expect("daily metrics");
+
+        assert_eq!(daily.len(), 1, "only the end date should be in range");
+        assert_eq!(daily[0].date, NaiveDate::from_ymd_opt(2026, 2, 10).unwrap());
+        assert_eq!(
+            daily[0].total_sessions, 1,
+            "the 23:59:59 session is in range; the next-day 00:00 session is not"
         );
     }
 
