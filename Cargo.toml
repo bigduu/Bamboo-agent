@@ -180,7 +180,7 @@ dashmap = "6"
 parking_lot = "0.12"
 
 # HTTP client (for LLM providers)
-reqwest = { version = "0.13", features = ["json", "stream", "form", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
 reqwest-middleware = { version = "0.5", features = ["json", "form"] }
 reqwest-retry = "0.9"
 

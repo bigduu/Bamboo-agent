@@ -26,7 +26,7 @@ tui-textarea-2 = "0.12"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP (SSE is hand-rolled over reqwest's byte stream — no eventsource crate)
-reqwest = { version = "0.13", features = ["json", "stream", "form", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
