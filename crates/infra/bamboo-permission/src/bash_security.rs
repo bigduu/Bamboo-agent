@@ -102,10 +102,6 @@ const SENSITIVE_HOME_PREFIXES: &[&str] = &[
 /// check. #155.
 const FILE_MUTATING_COMMANDS: &[&str] = &["cp", "mv", "tee", "dd", "install", "rsync", "ln"];
 
-/// True if `path` targets a sensitive filesystem location: an absolute system
-/// path from [`SENSITIVE_REDIRECT_PATHS`], or a sensitive dotfile/dir under the
-/// user's home (`~/…`, `$HOME/…`, `${HOME}/…`). Used for both redirect targets
-/// and destructive command arguments. #155.
 /// Best-effort static removal of shell quoting so a sensitive-path check isn't
 /// evaded by ordinary quote-splicing: `/etc/pass''wd`, `/etc/pass""wd`,
 /// `/etc/'passwd'`, `'/etc/passwd'`, `~/.ss"h"/authorized_keys` all resolve to
@@ -134,6 +130,11 @@ fn shell_unquote(s: &str) -> String {
     out
 }
 
+/// True if `path` targets a sensitive filesystem location: an absolute system
+/// path from [`SENSITIVE_REDIRECT_PATHS`], or a sensitive dotfile/dir under the
+/// user's home (`~/…`, `$HOME/…`, `${HOME}/…`). Resolves shell quote-splicing
+/// first. Used for both redirect targets and destructive command arguments.
+/// #155, #392.
 fn is_sensitive_fs_path(path: &str) -> bool {
     let unquoted = shell_unquote(path.trim());
     let trimmed = unquoted.trim();
@@ -652,6 +653,18 @@ fn walk_node_with_budget(
     let kind = node.kind();
     *node_count += 1;
 
+    // ANSI-C quoting (`$'…'`) is a security-relevant LEAF node: it's static but
+    // can encode a sensitive path via escapes (`$'/etc/pass\x77d'`) that can't be
+    // statically resolved. Flag it BEFORE the leaf-skip below, otherwise the
+    // warning is never emitted and the auto-approve gate can't fail closed. #392.
+    if kind == "ansi_c_string" {
+        warnings.push(BashWarning {
+            kind: BashWarningKind::AnsiCString,
+            detail: format!("ansi-c string: {}", truncate(&node_text(node, source), 40)),
+        });
+        return;
+    }
+
     // Skip safe leaf nodes
     if node.child_count() == 0 {
         return;
@@ -763,14 +776,6 @@ fn walk_node_with_budget(
             warnings.push(BashWarning {
                 kind: BashWarningKind::BraceExpansion,
                 detail: format!("brace expansion: {}", truncate(&text, 40)),
-            });
-        }
-
-        "ansi_c_string" => {
-            let text = node_text(node, source);
-            warnings.push(BashWarning {
-                kind: BashWarningKind::AnsiCString,
-                detail: format!("ansi-c string: {}", truncate(&text, 40)),
             });
         }
 
