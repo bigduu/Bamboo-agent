@@ -1025,8 +1025,17 @@ fn shell_c_payload(args: &[String]) -> Option<String> {
     }
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        if arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c') {
-            return it.next().cloned();
+        // Only a genuine short-flag CLUSTER (e.g. `-lc`, `-ic`) — not a long
+        // single-dash option like `-rcfile` that merely contains `c` and would
+        // otherwise shadow the real `-lc` and consume the wrong operand.
+        if let Some(flags) = arg.strip_prefix('-') {
+            if !arg.starts_with("--")
+                && flags.len() <= 4
+                && flags.chars().all(|c| c.is_ascii_alphabetic())
+                && flags.contains('c')
+            {
+                return it.next().cloned();
+            }
         }
     }
     None
@@ -1114,22 +1123,30 @@ fn dangerous_token_scan(payload: &str) -> Option<&'static str> {
     {
         return Some("raw device write (dd of=/dev/…)");
     }
-    // Recursive-force delete targeting a protected root, the FS root, or home —
-    // matching the direct-invocation path (not *any* absolute path, so a payload
-    // deleting under /tmp isn't force-asked where the direct form wouldn't be).
+    // Recursive-force delete targeting a protected root, the FS root, home, or a
+    // glob/cwd wipe — mirroring the direct-invocation set in `targets_protected_root`
+    // (so `rm -rf /*` / `rm -rf *` are caught) but NOT *any* absolute path (a
+    // payload deleting under /tmp isn't force-asked where the direct form wouldn't).
     for flags in ["rm -rf ", "rm -fr ", "rm -r -f ", "rm -f -r "] {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(flags) {
-            let target = lower[from + pos + flags.len()..].trim_start();
-            let bare_root = target == "/"
-                || target
-                    .strip_prefix('/')
-                    .is_some_and(|r| r.starts_with([' ', '\'', '"', ')', ';']) || r.is_empty());
-            let home = target.starts_with('~') || target.starts_with("$home");
-            let protected = PROTECTED_DELETE_ROOTS
-                .iter()
-                .any(|root| target.starts_with(root));
-            if bare_root || home || protected {
+            let rest = lower[from + pos + flags.len()..].trim_start();
+            // First operand token (up to the next shell delimiter).
+            let tok: String = rest
+                .chars()
+                .take_while(|c| {
+                    !c.is_whitespace() && !matches!(c, '\'' | '"' | ')' | ';' | '&' | '|')
+                })
+                .collect();
+            let tok_norm = tok.trim_end_matches('/');
+            let dangerous = matches!(
+                tok.as_str(),
+                "/" | "/*" | "*" | "." | ".." | "~" | "~/" | "$home" | "$home/"
+            ) || PROTECTED_DELETE_ROOTS.iter().any(|root| {
+                let r = root.to_ascii_lowercase();
+                tok_norm == r || tok.starts_with(&format!("{r}/"))
+            });
+            if dangerous {
                 return Some("recursive force-delete of a protected path");
             }
             from += pos + flags.len();
@@ -2156,5 +2173,24 @@ mod tests {
         assert!(
             super_dangerous_reason(r#"cat l | xargs -I{} sh -c "dd of=/dev/sda if={}""#).is_some()
         );
+    }
+
+    #[test]
+    fn super_dangerous_token_scan_glob_and_cwd_parity() {
+        // Interpreter-payload parity with the direct path: /*, *, . are wipes.
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf /*')""#).is_some());
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf *')""#).is_some());
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf .')""#).is_some());
+        // /tmp is still not a protected root — parity with the direct form.
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf /tmp/x')""#).is_none());
+    }
+
+    #[test]
+    fn super_dangerous_clustered_flag_not_shadowed_by_long_option() {
+        // A single-dash long option containing `c` (`-rcfile`) must NOT be
+        // mistaken for a `-c` cluster and consume the wrong operand — the real
+        // `-lc` payload must still be found and unwrapped.
+        assert!(super_dangerous_reason(r#"bash -rcfile /dev/null -lc "sudo rm -rf /""#).is_some());
+        assert!(super_dangerous_reason(r#"bash -rcfile /dev/null -lc "ls""#).is_none());
     }
 }
