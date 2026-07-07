@@ -262,6 +262,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
 
     cfg.service(scope);
 
+    // Unversioned liveness/readiness probes (#251 finding 6). Registered at the
+    // root — OUTSIDE the `/api/v1` scope and its access-password middleware — so
+    // load balancers / Kubernetes can probe a stable, unauthenticated path. Both
+    // are on the public allow-list in `is_public_access_route`; registering them
+    // before the SPA static fallback means the fallback never shadows them.
+    cfg.route("/healthz", web::get().to(agent::health::healthz));
+    cfg.route("/readyz", web::get().to(agent::health::readyz));
+
     // v2-P1 (#181): the unified WebSocket multiplex. A single `GET /v2/stream`
     // WS replaces the two v1 SSE streams plus a `stop` control uplink. Behind
     // the SAME access-password middleware as `/api/v1`, so `local_bypass` keeps

@@ -447,6 +447,10 @@ fn is_public_access_route(path: &str) -> bool {
     matches!(
         path,
         "/api/v1/health"
+            // Unversioned liveness/readiness probes for load balancers / k8s —
+            // must be reachable without a credential. #251 (finding 6).
+            | "/healthz"
+            | "/readyz"
             | "/v1/bamboo/access/status"
             | "/v1/bamboo/access/verify"
             // v2-P2 (#181): a brand-new device has no credential yet, so the
@@ -1607,6 +1611,15 @@ mod tests {
         assert!(!is_public_access_route("/v2/pair/code"));
         assert!(!is_public_access_route("/v2/devices"));
         assert!(!is_public_access_route("/v2/devices/bamboo_x"));
+    }
+
+    #[test]
+    fn health_probes_are_public() {
+        // #251 (finding 6): unversioned liveness/readiness probes must be
+        // reachable by a load balancer without a credential.
+        assert!(is_public_access_route("/healthz"));
+        assert!(is_public_access_route("/readyz"));
+        assert!(is_public_access_route("/api/v1/health"));
     }
 
     // ── v2-P2 pairing codes + brute-force guard (#181, slice 2) ────────────
