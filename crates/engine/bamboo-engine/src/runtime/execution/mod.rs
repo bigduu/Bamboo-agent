@@ -28,7 +28,8 @@ pub use agent_spawn::{
 pub use child_completion::{ChildCompletion, ChildCompletionHandler};
 pub use event_forwarder::{create_event_forwarder, AccountFeedInbox};
 pub use runner_lifecycle::{
-    finalize_runner, status_from_execution_result, try_reserve_runner, RunnerReservation,
+    finalize_runner, reserve_runner_core, status_from_execution_result, try_reserve_runner,
+    ReserveOutcome, RunnerReservation,
 };
 pub use runner_state::{AgentRunner, AgentStatus};
 pub use session_events::{get_or_create_event_sender, SESSION_EVENT_CHANNEL_CAPACITY};

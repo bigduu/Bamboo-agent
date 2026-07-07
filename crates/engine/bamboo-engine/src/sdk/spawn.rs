@@ -147,8 +147,13 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         .await;
 
     // Insert runner status.
-    let Some(RunnerReservation { cancel_token, .. }) =
-        try_reserve_runner(&ctx.agent_runners, &job.child_session_id, &child_tx).await
+    let Some(RunnerReservation { cancel_token, .. }) = try_reserve_runner(
+        &ctx.agent_runners,
+        &ctx.session_event_senders,
+        &job.child_session_id,
+        &child_tx,
+    )
+    .await
     else {
         return Ok(());
     };

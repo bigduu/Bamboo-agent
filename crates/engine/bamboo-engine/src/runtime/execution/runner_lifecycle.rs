@@ -16,39 +16,55 @@ use bamboo_agent_core::{AgentError, AgentEvent};
 
 use super::runner_state::{AgentRunner, AgentStatus};
 
-/// Reservation result from `try_reserve_runner`.
+/// Reservation result from [`reserve_runner_core`] / [`try_reserve_runner`].
 #[derive(Debug, Clone)]
 pub struct RunnerReservation {
     pub cancel_token: CancellationToken,
     pub run_id: String,
 }
 
-/// Try to reserve a runner for the given session.
+/// Outcome of the shared reservation core.
+#[derive(Debug, Clone)]
+pub enum ReserveOutcome {
+    /// A fresh runner was reserved (any stale runner was replaced).
+    Reserved(RunnerReservation),
+    /// A `Running` runner already exists for this session; carries its `run_id`
+    /// so the caller can correlate subsequent SSE/WS events.
+    AlreadyRunning(String),
+}
+
+/// Shared runner-reservation core used by BOTH the server's `reserve_runner`
+/// and the engine's [`try_reserve_runner`], so the idle-eviction sender
+/// re-assert can never drift between the two paths again (#346).
 ///
-/// If a runner with `Running` status already exists, returns `None`
-/// (caller should skip execution). The `AlreadyRunning` case is surfaced
-/// by the caller via `ExecuteResponse` with the *existing* runner's `run_id`
-/// so the frontend can correlate subsequent SSE events.
+/// While holding the `runners` write lock it:
+/// 1. short-circuits with [`ReserveOutcome::AlreadyRunning`] if a `Running`
+///    runner already exists;
+/// 2. otherwise replaces any stale runner with a fresh `Running` one whose
+///    `event_sender` is `event_sender`;
+/// 3. **re-asserts `event_sender` into `senders`** (`entry().or_insert_with`),
+///    STILL holding the `runners` write lock.
 ///
-/// Otherwise removes any stale runner and inserts a fresh one, returning
-/// the associated `CancellationToken` and the new `run_id`.
-///
-/// Unlike the server's `reserve_runner`, this does NOT re-assert `event_sender`
-/// into the `session_event_senders` map after the idle-eviction sweep (#346).
-/// It is only reached for spawn / schedule sessions, which are single-shot
-/// (sub-agents, guardians) or fresh-uuid-per-fire (scheduler) and thus never
-/// re-executed under the same id, so the evict-then-re-execute race the server
-/// path guards against is unreachable here.
-pub async fn try_reserve_runner(
+/// Step 3 closes the idle-sweep TOCTOU: a caller obtains the sender via
+/// `get_or_create_event_sender` and then reserves, but the 60s idle sweep can
+/// evict that session's sender in between (it drops a terminal runner and its
+/// sender together under the same `runners` ⊃ `senders` lock order). Without the
+/// re-assert, a resumed / re-executed run would publish to a channel no longer
+/// registered in `senders`, and a later subscriber's `get_or_create_event_sender`
+/// would mint a *different* channel and silently miss every event of that run.
+/// Because both this re-assert and the sweep acquire `runners` first, they are
+/// mutually exclusive, and a freshly-inserted `Running` runner is never swept —
+/// so the re-asserted sender is durable for the run.
+pub async fn reserve_runner_core(
     runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     session_id: &str,
     event_sender: &broadcast::Sender<AgentEvent>,
-) -> Option<RunnerReservation> {
+) -> ReserveOutcome {
     let mut guard = runners.write().await;
     if let Some(runner) = guard.get(session_id) {
         if matches!(runner.status, AgentStatus::Running) {
-            tracing::debug!("[{}] Runner already running, skipping", session_id);
-            return None;
+            return ReserveOutcome::AlreadyRunning(runner.run_id.clone());
         }
     }
 
@@ -61,9 +77,46 @@ pub async fn try_reserve_runner(
         cancel_token: runner.cancel_token.clone(),
         run_id: runner.run_id.clone(),
     };
-
     guard.insert(session_id.to_string(), runner);
-    Some(reservation)
+
+    // (3) Re-assert the session sender under the held `runners` write lock. Same
+    // channel as `event_sender`, so a no-op in the common case; restores the map
+    // entry if the idle sweep removed it. Lock order (runners ⊃ senders) matches
+    // the sweep, so this cannot deadlock.
+    senders
+        .write()
+        .await
+        .entry(session_id.to_string())
+        .or_insert_with(|| event_sender.clone());
+
+    ReserveOutcome::Reserved(reservation)
+}
+
+/// Try to reserve a runner for the given session.
+///
+/// Returns `None` if a `Running` runner already exists (the caller skips
+/// execution and surfaces the existing `run_id` separately). Otherwise reserves
+/// a fresh runner AND re-asserts the session sender into `senders` — see
+/// [`reserve_runner_core`].
+///
+/// The re-assert is **required, not optional**: this function is reached by the
+/// resume paths (`/respond`, child-completion coordinator, gold auto-answer via
+/// `resume_session_execution`), which re-execute a long-lived session under the
+/// SAME id after a wait that easily exceeds the idle TTL — exactly the
+/// evict-then-re-execute race #346's sweep newly opens.
+pub async fn try_reserve_runner(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_id: &str,
+    event_sender: &broadcast::Sender<AgentEvent>,
+) -> Option<RunnerReservation> {
+    match reserve_runner_core(runners, senders, session_id, event_sender).await {
+        ReserveOutcome::Reserved(reservation) => Some(reservation),
+        ReserveOutcome::AlreadyRunning(_) => {
+            tracing::debug!("[{}] Runner already running, skipping", session_id);
+            None
+        }
+    }
 }
 
 /// Map an execution result to `AgentStatus`.
@@ -96,6 +149,10 @@ mod tests {
         Arc::new(RwLock::new(HashMap::new()))
     }
 
+    fn new_senders() -> Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
     fn new_broadcaster() -> broadcast::Sender<AgentEvent> {
         broadcast::channel(100).0
     }
@@ -103,8 +160,9 @@ mod tests {
     #[tokio::test]
     async fn try_reserve_runner_creates_runner_with_running_status() {
         let runners = new_runners();
+        let senders = new_senders();
         let tx = new_broadcaster();
-        let token = try_reserve_runner(&runners, "s1", &tx).await;
+        let token = try_reserve_runner(&runners, &senders, "s1", &tx).await;
         assert!(token.is_some());
 
         let guard = runners.read().await;
@@ -115,17 +173,19 @@ mod tests {
     #[tokio::test]
     async fn try_reserve_runner_returns_none_when_already_running() {
         let runners = new_runners();
+        let senders = new_senders();
         let tx = new_broadcaster();
-        let _ = try_reserve_runner(&runners, "s1", &tx).await;
-        let second = try_reserve_runner(&runners, "s1", &tx).await;
+        let _ = try_reserve_runner(&runners, &senders, "s1", &tx).await;
+        let second = try_reserve_runner(&runners, &senders, "s1", &tx).await;
         assert!(second.is_none());
     }
 
     #[tokio::test]
     async fn try_reserve_runner_replaces_completed_runner() {
         let runners = new_runners();
+        let senders = new_senders();
         let tx = new_broadcaster();
-        let _ = try_reserve_runner(&runners, "s1", &tx).await;
+        let _ = try_reserve_runner(&runners, &senders, "s1", &tx).await;
 
         {
             let mut guard = runners.write().await;
@@ -133,8 +193,56 @@ mod tests {
             runner.status = AgentStatus::Completed;
         }
 
-        let second = try_reserve_runner(&runners, "s1", &tx).await;
+        let second = try_reserve_runner(&runners, &senders, "s1", &tx).await;
         assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn try_reserve_runner_reasserts_evicted_sender_so_late_subscriber_receives() {
+        // Regression for #346: the resume path (`resume_session_execution`)
+        // obtains the session sender, then reserves — and the idle sweep can
+        // evict that sender in between. `try_reserve_runner` must re-assert it so
+        // the resumed run's channel stays registered and a late subscriber lands
+        // on the SAME channel the run publishes to.
+        use super::super::session_events::get_or_create_event_sender;
+        use bamboo_agent_core::AgentEvent;
+
+        let runners = new_runners();
+        let senders = new_senders();
+
+        // Resume ordering: obtain sender (inserts into the map) ...
+        let session_tx = get_or_create_event_sender(&senders, "s1").await;
+        // ... then the idle sweep evicts this session's sender before reservation.
+        senders.write().await.remove("s1");
+        assert!(senders.read().await.get("s1").is_none());
+
+        // Reserve with the clone obtained before the eviction.
+        let reservation = try_reserve_runner(&runners, &senders, "s1", &session_tx).await;
+        assert!(reservation.is_some(), "reservation must succeed");
+
+        // The sender MUST be re-asserted into the map. Without the fix it is
+        // absent here and the run's channel is orphaned.
+        assert!(
+            senders.read().await.get("s1").is_some(),
+            "reservation must re-assert the evicted session sender into the map"
+        );
+
+        // A late subscriber (SSE/WS handler: get_or_create then subscribe) must
+        // land on the SAME channel the run publishes to.
+        let subscriber_tx = get_or_create_event_sender(&senders, "s1").await;
+        let mut rx = subscriber_tx.subscribe();
+
+        // The resumed run publishes via its reserved channel (== session_tx).
+        let _ = session_tx.send(AgentEvent::SessionDeleted {
+            session_id: "s1".to_string(),
+        });
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            matches!(received, Ok(Ok(_))),
+            "late subscriber must receive events from the resumed run; without the \
+             re-assert, get_or_create mints a fresh channel and the event is lost"
+        );
     }
 
     #[test]

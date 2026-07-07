@@ -314,9 +314,19 @@ pub fn spawn_session_map_cleanup_task(
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
-            // Lock order: runners ⊃ senders. This matches `reserve_runner` (which
-            // nests senders inside the runners write lock) and is never inverted
-            // anywhere, so nesting here is deadlock-free.
+            // Lock order: runners ⊃ senders. This matches `reserve_runner_core`
+            // (which nests senders inside the runners write lock to re-assert the
+            // sender) and is never inverted anywhere, so nesting is deadlock-free.
+            //
+            // Both write locks are intentionally held across the whole O(n) pass
+            // rather than snapshot-then-remove: the atomicity is load-bearing.
+            // `reserve_runner_core` inserts a `Running` runner AND re-asserts its
+            // sender under the runners lock; holding both here means a concurrent
+            // reservation cannot interleave between our runner-eviction and our
+            // sender-removal, so we can never drop a sender that a just-reserved
+            // run re-asserted. The pass is cheap (a receiver_count atomic load +
+            // timestamp math per entry) at the 60s cadence, so the widened window
+            // is acceptable.
             let mut runners_guard = runners.write().await;
             let mut senders_guard = senders.write().await;
             let now = Utc::now();

@@ -317,8 +317,13 @@ async fn run_schedule_job(
     let session_tx = get_or_create_event_sender(&ctx.session_event_senders, &session_id).await;
 
     // Insert runner status (for cancellation/status introspection).
-    let Some(RunnerReservation { cancel_token, .. }) =
-        try_reserve_runner(&ctx.agent_runners, &session_id, &session_tx).await
+    let Some(RunnerReservation { cancel_token, .. }) = try_reserve_runner(
+        &ctx.agent_runners,
+        &ctx.session_event_senders,
+        &session_id,
+        &session_tx,
+    )
+    .await
     else {
         return Ok(ScheduleRunLifecycleResult::Terminal(
             ScheduleRunStatus::Skipped,
