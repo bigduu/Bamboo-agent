@@ -52,83 +52,8 @@ pub use workflows::{
     delete_workflow, get_workflow, list_workflows, save_workflow, SaveWorkflowRequest,
 };
 
-use actix_web::web;
-
-/// Configures settings-related routes.
-pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.route("/bamboo/workflows", web::get().to(list_workflows))
-        .route("/bamboo/workflows/{name}", web::get().to(get_workflow))
-        .route("/bamboo/workflows", web::post().to(save_workflow))
-        .route(
-            "/bamboo/workflows/{name}",
-            web::delete().to(delete_workflow),
-        )
-        .route("/bamboo/setup/status", web::get().to(get_setup_status))
-        .route(
-            "/bamboo/setup/complete",
-            web::post().to(mark_setup_complete),
-        )
-        .route(
-            "/bamboo/setup/incomplete",
-            web::post().to(mark_setup_incomplete),
-        )
-        .route("/bamboo/config", web::get().to(get_bamboo_config))
-        .route("/bamboo/config", web::post().to(set_bamboo_config))
-        .route("/bamboo/access/status", web::get().to(get_access_status))
-        .route(
-            "/bamboo/access/verify",
-            web::post().to(verify_access_password),
-        )
-        .route(
-            "/bamboo/access/password",
-            web::post().to(update_access_password),
-        )
-        .route(
-            "/bamboo/model-limits/defaults",
-            web::get().to(get_model_limit_defaults),
-        )
-        .route(
-            "/bamboo/config/validate",
-            web::post().to(validate_bamboo_config_patch),
-        )
-        .route("/bamboo/config/reset", web::post().to(reset_bamboo_config))
-        .route("/bamboo/proxy-auth", web::post().to(set_proxy_auth))
-        .route(
-            "/bamboo/proxy-auth/status",
-            web::get().to(get_proxy_auth_status),
-        )
-        .route(
-            "/bamboo/keyword-masking",
-            web::get().to(get_keyword_masking_config),
-        )
-        .route(
-            "/bamboo/keyword-masking",
-            web::post().to(update_keyword_masking_config),
-        )
-        .route(
-            "/bamboo/keyword-masking/validate",
-            web::post().to(validate_keyword_entries),
-        )
-        .route(
-            "/bamboo/settings/provider",
-            web::get().to(get_provider_config),
-        )
-        .route(
-            "/bamboo/settings/provider",
-            web::post().to(update_provider_config),
-        )
-        .route(
-            "/bamboo/settings/provider/models",
-            web::post().to(fetch_provider_models),
-        )
-        .route(
-            "/bamboo/settings/reload",
-            web::post().to(reload_provider_config),
-        )
-        .route("/bamboo/tools", web::get().to(get_bamboo_tools))
-        // ── Env vars ──────────────────────────────────────────────
-        .route("/bamboo/env-vars", web::get().to(list_env_vars))
-        .route("/bamboo/env-vars", web::post().to(upsert_env_var))
-        .route("/bamboo/env-vars/replace", web::post().to(replace_env_vars))
-        .route("/bamboo/env-vars/{name}", web::delete().to(delete_env_var));
-}
+// NOTE: the production `/bamboo/*` route map lives in `routes::bamboo_v1_routes`
+// (`routes/bamboo_v1.rs`). A second `config()` copy used to live here, but it had
+// drifted (29 routes vs. the 70 in production) and had no callers, so it was
+// removed to eliminate the drift hazard — a stale duplicate route map that tests
+// could pass against while diverging from what actually serves. #251 (finding 5).
