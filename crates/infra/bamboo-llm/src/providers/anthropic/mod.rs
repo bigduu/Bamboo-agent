@@ -113,20 +113,9 @@ impl AnthropicProvider {
     }
 
     fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        if !(status == 400 || status == 404 || status == 405 || status == 409 || status == 422) {
-            return false;
-        }
-
-        let b = body.to_ascii_lowercase();
-        let mentions_reasoning = b.contains("reasoning")
-            || b.contains("thinking")
-            || b.contains("budget_tokens")
-            || b.contains("unknown parameter");
-        let mentions_unsupported = b.contains("unsupported")
-            || b.contains("not supported")
-            || b.contains("unknown")
-            || b.contains("invalid");
-        mentions_reasoning && mentions_unsupported
+        // Shared, tightened heuristic (#237 finding 5). `budget_tokens` (Anthropic's
+        // thinking-budget param) is in the shared reasoning-token set.
+        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
     }
 }
 
