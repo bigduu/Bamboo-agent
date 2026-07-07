@@ -31,10 +31,10 @@ pub(crate) fn looks_like_reasoning_unsupported_error(
     // Union of every provider's reasoning/thinking parameter name. `thinking`
     // substring-covers Gemini's `thinkingBudget`/`thinkingConfig`; `budget_tokens`
     // is Anthropic's. A provider's error body won't contain another's token.
-    let mentions_reasoning = b.contains("reasoning")
-        || b.contains("reasoning_effort")
-        || b.contains("thinking")
-        || b.contains("budget_tokens");
+    // `reasoning` already substring-covers `reasoning_effort`; `thinking` covers
+    // Gemini's `thinkingBudget`/`thinkingConfig`; `budget_tokens` is Anthropic's.
+    let mentions_reasoning =
+        b.contains("reasoning") || b.contains("thinking") || b.contains("budget_tokens");
     let indicates_unsupported = b.contains("unsupported")
         || b.contains("not supported")
         || b.contains("does not support")
