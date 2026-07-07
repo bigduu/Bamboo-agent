@@ -251,6 +251,28 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     let default_provider = state.config.read().await.provider.clone();
     let model_selection = resolve_model_selection(&args.model, &args.provider, &default_provider)?;
 
+    // Resolve the concrete provider+model ref to pin onto the session. For a
+    // bare/colon `-m` this is the parsed ref. For `--provider P` ALONE we resolve
+    // P's configured default model here so the pin is still concrete: the new
+    // cascade's `defaults.chat` fallback is a single GLOBAL ref, so passing only
+    // a provider would otherwise be ignored and the run would keep using the
+    // global default provider/model. If P has no configured model we leave the
+    // ref unset and fall back to the request's `provider` field (the legacy
+    // cascade resolves P's provider-aware default, or execute reports no model).
+    let session_model_ref: Option<bamboo_domain::ProviderModelRef> = match (
+        model_selection.model_ref.clone(),
+        model_selection.provider.as_deref(),
+    ) {
+        (Some(model_ref), _) => Some(model_ref),
+        (None, Some(provider)) => {
+            let config = state.config.read().await;
+            bamboo_engine::model_config_helper::get_default_model_for_provider(&config, provider)
+                .ok()
+                .map(|model| bamboo_domain::ProviderModelRef::new(provider, model))
+        }
+        (None, None) => None,
+    };
+
     {
         let mut session = state
             .storage
@@ -262,12 +284,13 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         // Pin the chosen model onto the SESSION, not just the request. The server
         // has two model cascades gated on `features.provider_model_ref`; the
         // legacy one (the default) ranks the request's model BELOW the provider's
-        // configured default model, so a request-only `-m` pin is silently
-        // outranked whenever that default is set. `session.model`/`model_ref` is
-        // the highest-priority source in BOTH cascades, so persisting it here is
-        // what actually makes `-m` win — via the engine's own persist helper (the
-        // same call the execute handler makes) so there is no forked model write.
-        if let Some(model_ref) = &model_selection.model_ref {
+        // configured default model, so a request-only pin is silently outranked
+        // whenever that default is set. `session.model`/`model_ref` is the
+        // highest-priority source in BOTH cascades, so persisting it here is what
+        // actually makes `-m`/`--provider` win — via the engine's own persist
+        // helper (the same call the execute handler makes) so there is no forked
+        // model write.
+        if let Some(model_ref) = &session_model_ref {
             bamboo_engine::session_app::provider_model::persist_model_ref(&mut session, model_ref);
         }
         state
@@ -555,7 +578,8 @@ struct ModelSelection {
 /// - `-m provider:model`         → ref(provider, model)
 /// - `--provider P` + `-m model` → ref(P, model)
 /// - `-m model` (bare)           → ref(default_provider, model)
-/// - `--provider P` (no `-m`)    → provider = P (handler picks P's default model)
+/// - `--provider P` (no `-m`)    → provider = P; `run` then resolves P's
+///                                 configured default model and pins that ref
 /// - neither                     → all defaults flow from the session/config
 ///
 /// A `provider:model` spec whose provider conflicts with `--provider` is an error.
