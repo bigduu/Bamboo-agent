@@ -68,9 +68,16 @@ impl ClientIpKeyExtractor {
 
     fn client_ip_from_xff(&self, req: &ServiceRequest) -> Option<IpAddr> {
         let hops = self.trusted_hops.max(1);
-        let header_value = req.headers().get("x-forwarded-for")?.to_str().ok()?;
-        let entries: Vec<&str> = header_value
-            .split(',')
+        // Consider EVERY `X-Forwarded-For` header line, in order, not just the
+        // first: some proxies append a second header line rather than extending
+        // the comma-joined value, and reading only the first could let an
+        // attacker-supplied line win. Flatten all lines into one ordered list of
+        // entries (client-first ... nearest-proxy-last).
+        let entries: Vec<&str> = req
+            .headers()
+            .get_all("x-forwarded-for")
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|line| line.split(','))
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -908,6 +915,31 @@ mod tests {
         assert_eq!(
             ke.extract(&none).unwrap(),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_flattens_multiple_header_lines_in_order() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // A proxy chain that appends a SECOND header line rather than extending
+        // the comma-joined value: the entries must be treated as one ordered list
+        // (client-first ... proxy-last), so 1-hop still selects the true rightmost
+        // entry authored by the nearest proxy — not the first line's value.
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 1,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .append_header(("x-forwarded-for", "1.1.1.1"))
+            .append_header(("x-forwarded-for", "2.2.2.2"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))
         );
     }
 
