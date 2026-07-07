@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream", "form", "query"] }
 
 # SSE client
 eventsource-client = "0.17"

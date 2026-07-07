@@ -602,7 +602,10 @@ mod tests {
         // Desktop sidecar binds must be exempt (frontend bursts asset requests);
         // network-exposed binds must stay throttled.
         for b in ["127.0.0.1", "localhost", "::1"] {
-            assert!(is_loopback_bind(b), "{b} should be loopback (limiter skipped)");
+            assert!(
+                is_loopback_bind(b),
+                "{b} should be loopback (limiter skipped)"
+            );
         }
         for b in ["0.0.0.0", "192.168.1.10", "::"] {
             assert!(!is_loopback_bind(b), "{b} should be throttled");
