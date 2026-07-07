@@ -1482,7 +1482,18 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(&path).await?;
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "one line per appended record");
+        // Storage is a unique per-test TempDir and every path resolves off the
+        // instance `bamboo_home_dir` (not a process-global), so nothing outside
+        // this test can write here — exactly two sequential appends ⇒ two lines.
+        // If CI ever trips this again (#378), dump the file so the failure is
+        // diagnosable (extra line + its source, or a lost append) instead of an
+        // opaque count mismatch. Do NOT relax this to "records present": that
+        // would mask a real double-write / lost-write regression.
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per appended record; actual token-usage.jsonl = {contents:?}"
+        );
         assert!(lines[0].contains("\"round\":1"));
         assert!(lines[1].contains("\"round\":2"));
         // Each line is valid standalone JSON.
