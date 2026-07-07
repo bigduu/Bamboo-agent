@@ -3,7 +3,7 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::Message;
 use bamboo_llm::api::models::{
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamChunk, StreamChoice,
-    StreamDelta, StreamFunctionCall, StreamToolCall,
+    StreamDelta,
 };
 use bamboo_llm::protocol::FromProvider;
 use bamboo_llm::providers::anthropic::{
@@ -117,45 +117,26 @@ pub(super) fn convert_llm_chunk_to_openai(
             }],
             usage: None,
         }),
-        // Indexed tool-call chunks convert identically once indices are dropped;
-        // recurse with the flattened variant to reuse the block below. #236.
-        bamboo_llm::types::LLMChunk::ToolCallsIndexed(tool_calls) => convert_llm_chunk_to_openai(
-            bamboo_llm::types::LLMChunk::ToolCalls(
-                tool_calls.into_iter().map(|(_, call)| call).collect(),
+        // Preserve the provider's REAL tool-call index (see #379 / the shared
+        // helper) so a downstream client routes interleaved fragments correctly;
+        // `.enumerate()` over a single-fragment chunk always yields 0.
+        bamboo_llm::types::LLMChunk::ToolCallsIndexed(tool_calls) => Some(
+            crate::handlers::openai::helpers::stream_utils::tool_call_stream_chunk(
+                tool_calls, model,
             ),
-            model,
         ),
         bamboo_llm::types::LLMChunk::ToolCalls(tool_calls) => {
-            let stream_tool_calls: Vec<StreamToolCall> = tool_calls
+            // No per-fragment index carried → positional index is correct.
+            let indexed = tool_calls
                 .into_iter()
                 .enumerate()
-                .map(|(idx, tc)| StreamToolCall {
-                    index: idx as u32,
-                    id: Some(tc.id),
-                    tool_type: Some(tc.tool_type),
-                    function: Some(StreamFunctionCall {
-                        name: Some(tc.function.name),
-                        arguments: Some(tc.function.arguments),
-                    }),
-                })
+                .map(|(i, call)| (i as u32, call))
                 .collect();
-
-            Some(ChatCompletionStreamChunk {
-                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                object: Some("chat.completion.chunk".to_string()),
-                created: chrono::Utc::now().timestamp() as u64,
-                model: Some(model.to_string()),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: StreamDelta {
-                        role: None,
-                        content: None,
-                        tool_calls: Some(stream_tool_calls),
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-            })
+            Some(
+                crate::handlers::openai::helpers::stream_utils::tool_call_stream_chunk(
+                    indexed, model,
+                ),
+            )
         }
         bamboo_llm::types::LLMChunk::ReasoningToken(_) => None,
         bamboo_llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {

@@ -4,7 +4,7 @@ mod parallel_tool_calls;
 mod reasoning;
 mod responses_input;
 mod responses_options;
-mod stream_utils;
+pub(crate) mod stream_utils;
 
 pub(super) fn convert_messages(
     messages: Vec<bamboo_llm::api::models::ChatMessage>,
