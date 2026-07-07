@@ -82,11 +82,20 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                     out.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": m.content,
+                        "output": tool_output_value(m),
                     }));
                 } else {
-                    // Fallback: no call_id available — degrade to user message with prefix.
-                    let content = json!(format!("[tool_result]\n{}", m.content));
+                    // Fallback: no call_id available — degrade to user message with
+                    // prefix. Preserve any image parts as a typed content array so
+                    // they aren't dropped on this path either. (#237 finding 6)
+                    let prefixed = format!("[tool_result]\n{}", m.content);
+                    let content = if message_has_images(m) {
+                        let mut parts = vec![json!({"type": "input_text", "text": prefixed})];
+                        push_input_image_parts(m, &mut parts);
+                        json!(parts)
+                    } else {
+                        json!(prefixed)
+                    };
                     out.push(json!({
                         "type": "message",
                         "role": "user",
@@ -136,6 +145,59 @@ fn assistant_phase_for_responses_input(message: &Message) -> Option<&'static str
     }
 
     None
+}
+
+/// Whether a message carries any image content part.
+fn message_has_images(m: &Message) -> bool {
+    m.content_parts.as_ref().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::ImageUrl { .. }))
+    })
+}
+
+/// Append this message's `input_image` content parts to `parts`.
+fn push_input_image_parts(m: &Message, parts: &mut Vec<Value>) {
+    if let Some(content_parts) = m.content_parts.as_ref() {
+        for part in content_parts {
+            if let MessagePart::ImageUrl { image_url } = part {
+                parts.push(json!({"type": "input_image", "image_url": image_url.url}));
+            }
+        }
+    }
+}
+
+/// Build the `output` value for a `function_call_output` item.
+///
+/// When the tool result carries image parts (e.g. an MCP screenshot), the
+/// Responses API accepts an array of typed content parts (`input_text` /
+/// `input_image`) in place of a plain string, so the image reaches the model
+/// instead of being silently dropped. Text-only results stay a plain string.
+/// (#237 finding 6)
+///
+/// Note: for tool results the text lives in `m.content` while images live in
+/// `content_parts` (see `Message::tool_result_with_images`), so we build the
+/// array by hand rather than via `build_content_value` (which would emit only
+/// the image parts and drop the text).
+fn tool_output_value(m: &Message) -> Value {
+    if message_has_images(m) {
+        let mut parts = Vec::new();
+        if !m.content.trim().is_empty() {
+            parts.push(json!({"type": "input_text", "text": m.content}));
+        }
+        // Any text parts that happen to live in content_parts, then images.
+        if let Some(content_parts) = m.content_parts.as_ref() {
+            for part in content_parts {
+                if let MessagePart::Text { text } = part {
+                    parts.push(json!({"type": "input_text", "text": text}));
+                }
+            }
+        }
+        push_input_image_parts(m, &mut parts);
+        json!(parts)
+    } else {
+        json!(m.content)
+    }
 }
 
 /// Build the `content` value for a message item.
@@ -1760,6 +1822,80 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("[tool_result]"));
+    }
+
+    /// #237 finding 6: a tool result carrying an image (e.g. an MCP screenshot)
+    /// must reach the Responses API as a typed content array (`input_text` +
+    /// `input_image`), not have the image silently dropped.
+    #[test]
+    fn messages_to_responses_input_json_tool_result_preserves_images() {
+        let messages = vec![Message::tool_result_with_images(
+            "call_1",
+            "screenshot captured",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            }],
+        )];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function_call_output");
+        assert_eq!(out[0]["call_id"], "call_1");
+
+        let output = &out[0]["output"];
+        let arr = output.as_array().expect("output should be a typed array");
+        // The text result is preserved as an input_text part...
+        assert!(
+            arr.iter()
+                .any(|p| p["type"] == "input_text" && p["text"] == "screenshot captured"),
+            "text part missing: {output}"
+        );
+        // ...and the image is preserved as an input_image part.
+        assert!(
+            arr.iter().any(|p| p["type"] == "input_image"
+                && p["image_url"] == "data:image/png;base64,AAAA"),
+            "image part missing: {output}"
+        );
+    }
+
+    /// A text-only tool result stays a plain string output (unchanged).
+    #[test]
+    fn messages_to_responses_input_json_text_only_tool_result_stays_string() {
+        let messages = vec![Message::tool_result("call_9", "plain text result")];
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out[0]["type"], "function_call_output");
+        assert_eq!(out[0]["output"], "plain text result");
+    }
+
+    /// A tool result with an image but no call_id still preserves the image on
+    /// the degraded user-message fallback path.
+    #[test]
+    fn messages_to_responses_input_json_tool_result_image_fallback_preserves_image() {
+        let messages = vec![Message::tool_result_with_images(
+            "",
+            "orphan screenshot",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/png".to_string(),
+                data: "BBBB".to_string(),
+            }],
+        )];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "user");
+        let arr = out[0]["content"]
+            .as_array()
+            .expect("fallback content should be a typed array");
+        assert!(arr
+            .iter()
+            .any(|p| p["type"] == "input_text"
+                && p["text"].as_str().unwrap_or("").contains("[tool_result]")));
+        assert!(arr.iter().any(|p| p["type"] == "input_image"
+            && p["image_url"] == "data:image/png;base64,BBBB"));
     }
 
     #[test]
