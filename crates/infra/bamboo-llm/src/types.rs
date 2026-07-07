@@ -6,6 +6,17 @@ pub enum LLMChunk {
     Token(String),
     ReasoningToken(String),
     ToolCalls(Vec<ToolCall>),
+    /// Tool-call deltas that carry the provider's `index` field, so the engine
+    /// accumulator can route argument-only continuation fragments to the correct
+    /// call even when an upstream/aggregator interleaves fragments across indices.
+    ///
+    /// The chat-completions path (`parse_openai_compat_chunk`) emits this instead
+    /// of [`LLMChunk::ToolCalls`] because every OpenAI-compatible tool-call delta
+    /// carries an `index`. Providers whose wire format has no per-fragment index
+    /// (Gemini, the Responses API, etc.) keep using [`LLMChunk::ToolCalls`] and its
+    /// positional accumulation. `u32` is the tool-call index; the paired
+    /// [`ToolCall`] is the (possibly partial) delta. #236.
+    ToolCallsIndexed(Vec<(u32, ToolCall)>),
     /// Anthropic prompt cache token usage from `message_start` or `message_delta`.
     CacheUsage {
         cache_creation_input_tokens: u64,

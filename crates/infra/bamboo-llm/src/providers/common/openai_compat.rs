@@ -148,8 +148,9 @@ struct OpenAICompatDelta {
 
 #[derive(Debug, Deserialize)]
 struct OpenAICompatToolCallDelta {
-    #[allow(dead_code)]
-    index: usize,
+    /// The tool-call index, propagated into [`LLMChunk::ToolCallsIndexed`] so the
+    /// engine accumulator routes argument fragments to the right call. #236.
+    index: u32,
     id: Option<String>,
     #[serde(rename = "type")]
     tool_type: Option<String>,
@@ -177,31 +178,40 @@ pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
     };
 
     if let Some(tool_calls) = &choice.delta.tool_calls {
-        let calls: Vec<bamboo_domain::ToolCall> = tool_calls
+        // Carry each delta's `index` so the engine accumulator can route
+        // argument-only continuation fragments (which arrive with empty id/name)
+        // to the matching call. A positional heuristic corrupts arguments when an
+        // aggregator interleaves fragments across indices. #236.
+        let calls: Vec<(u32, bamboo_domain::ToolCall)> = tool_calls
             .iter()
-            .map(|tc| bamboo_domain::ToolCall {
-                id: tc.id.clone().unwrap_or_default(),
-                tool_type: tc
-                    .tool_type
-                    .clone()
-                    .unwrap_or_else(|| "function".to_string()),
-                function: bamboo_domain::FunctionCall {
-                    name: tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_default(),
-                    arguments: tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.arguments.clone())
-                        .unwrap_or_default(),
-                },
+            .map(|tc| {
+                (
+                    tc.index,
+                    bamboo_domain::ToolCall {
+                        id: tc.id.clone().unwrap_or_default(),
+                        tool_type: tc
+                            .tool_type
+                            .clone()
+                            .unwrap_or_else(|| "function".to_string()),
+                        function: bamboo_domain::FunctionCall {
+                            name: tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default(),
+                            arguments: tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.arguments.clone())
+                                .unwrap_or_default(),
+                        },
+                    },
+                )
             })
             .collect();
 
         if !calls.is_empty() {
-            return LLMChunk::ToolCalls(calls);
+            return LLMChunk::ToolCallsIndexed(calls);
         }
 
         return LLMChunk::Token(String::new());
@@ -465,20 +475,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_openai_compat_sse_data_strict_tool_calls_delta_yields_tool_calls() {
+    fn parse_openai_compat_sse_data_strict_tool_calls_delta_yields_indexed_tool_calls() {
         let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":\"test\"}"}}]}}]}"#;
 
         let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
 
+        // The chat-completions path emits ToolCallsIndexed so the engine can route
+        // continuation fragments by index. #236.
         match chunk {
-            LLMChunk::ToolCalls(calls) => {
+            LLMChunk::ToolCallsIndexed(calls) => {
                 assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].id, "call_1");
-                assert_eq!(calls[0].tool_type, "function");
-                assert_eq!(calls[0].function.name, "search");
-                assert_eq!(calls[0].function.arguments, r#"{"q":"test"}"#);
+                let (index, call) = &calls[0];
+                assert_eq!(*index, 0);
+                assert_eq!(call.id, "call_1");
+                assert_eq!(call.tool_type, "function");
+                assert_eq!(call.function.name, "search");
+                assert_eq!(call.function.arguments, r#"{"q":"test"}"#);
             }
-            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+            other => panic!("expected LLMChunk::ToolCallsIndexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_strict_propagates_second_tool_call_index() {
+        // Two tool calls in one delta: indices must be preserved distinctly so the
+        // engine routes each call's later argument fragments correctly. #236.
+        let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"a","arguments":""}},{"index":1,"id":"call_b","type":"function","function":{"name":"b","arguments":""}}]}}]}"#;
+
+        let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
+
+        match chunk {
+            LLMChunk::ToolCallsIndexed(calls) => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].0, 0);
+                assert_eq!(calls[0].1.id, "call_a");
+                assert_eq!(calls[1].0, 1);
+                assert_eq!(calls[1].1.id, "call_b");
+            }
+            other => panic!("expected LLMChunk::ToolCallsIndexed, got {other:?}"),
         }
     }
 

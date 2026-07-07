@@ -117,6 +117,14 @@ pub(super) fn convert_llm_chunk_to_openai(
             }],
             usage: None,
         }),
+        // Indexed tool-call chunks convert identically once indices are dropped;
+        // recurse with the flattened variant to reuse the block below. #236.
+        bamboo_llm::types::LLMChunk::ToolCallsIndexed(tool_calls) => convert_llm_chunk_to_openai(
+            bamboo_llm::types::LLMChunk::ToolCalls(
+                tool_calls.into_iter().map(|(_, call)| call).collect(),
+            ),
+            model,
+        ),
         bamboo_llm::types::LLMChunk::ToolCalls(tool_calls) => {
             let stream_tool_calls: Vec<StreamToolCall> = tool_calls
                 .into_iter()

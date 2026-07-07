@@ -56,6 +56,14 @@ pub struct PartialToolCall {
 
     /// Accumulated arguments string (grows with each update)
     pub arguments: String,
+
+    /// Provider-supplied tool-call index, when the streaming path carries one
+    /// (the OpenAI-compatible chat-completions path). When `Some`, continuation
+    /// fragments are routed to the matching call by index rather than by the
+    /// positional `last`-part heuristic, which corrupts arguments if an
+    /// aggregator interleaves fragments across indices. `None` for providers
+    /// whose wire format has no per-fragment index. #236.
+    pub index: Option<u32>,
 }
 
 /// Accumulator for reconstructing complete tool calls from streaming chunks
@@ -106,6 +114,25 @@ impl ToolCallAccumulator {
     {
         for call in calls {
             self.update(call);
+        }
+    }
+
+    /// Merge an index-tagged tool-call fragment, routing by provider index.
+    ///
+    /// Use this for streaming paths that carry a per-fragment `index` (the
+    /// OpenAI-compatible chat-completions path). See
+    /// [`update_partial_tool_call_indexed`] for why index routing is required. #236.
+    pub fn update_indexed(&mut self, index: u32, call: ToolCall) {
+        update_partial_tool_call_indexed(&mut self.parts, index, call);
+    }
+
+    /// Merge multiple `(index, call)` fragments, routing each by index. #236.
+    pub fn extend_indexed<I>(&mut self, calls: I)
+    where
+        I: IntoIterator<Item = (u32, ToolCall)>,
+    {
+        for (index, call) in calls {
+            self.update_indexed(index, call);
         }
     }
 
@@ -192,6 +219,7 @@ pub fn update_partial_tool_call(parts: &mut Vec<PartialToolCall>, call: ToolCall
                 tool_type: call.tool_type.clone(),
                 name: String::new(),
                 arguments: call.function.arguments.clone(),
+                index: None,
             });
         }
         return;
@@ -224,6 +252,45 @@ pub fn update_partial_tool_call(parts: &mut Vec<PartialToolCall>, call: ToolCall
             tool_type: call.tool_type.clone(),
             name: call.function.name.clone(),
             arguments: call.function.arguments.clone(),
+            index: None,
+        });
+    }
+}
+
+/// Merge an index-tagged streaming tool-call fragment, routing it to the part
+/// with the matching provider `index` (creating one if absent).
+///
+/// This is the correct accumulation strategy for the OpenAI-compatible
+/// chat-completions path, where a metadata delta `{index, id, name}` is followed
+/// by argument-only deltas `{index, arguments}` that must land on the same call.
+/// The positional [`update_partial_tool_call`] appends argument-only fragments to
+/// the LAST part, which corrupts arguments if an aggregator interleaves fragments
+/// across indices (e.g. emits index 0's metadata, index 1's metadata, then index
+/// 0's arguments). Routing by index is immune to interleaving. #236.
+pub fn update_partial_tool_call_indexed(
+    parts: &mut Vec<PartialToolCall>,
+    index: u32,
+    call: ToolCall,
+) {
+    if let Some(existing) = parts.iter_mut().find(|part| part.index == Some(index)) {
+        existing.arguments.push_str(&call.function.arguments);
+
+        if !call.id.is_empty() {
+            existing.id = call.id.clone();
+        }
+        if !call.function.name.is_empty() {
+            existing.name = call.function.name.clone();
+        }
+        if !call.tool_type.is_empty() {
+            existing.tool_type = call.tool_type.clone();
+        }
+    } else {
+        parts.push(PartialToolCall {
+            id: call.id.clone(),
+            tool_type: call.tool_type.clone(),
+            name: call.function.name.clone(),
+            arguments: call.function.arguments.clone(),
+            index: Some(index),
         });
     }
 }
@@ -351,5 +418,66 @@ mod tests {
         let calls = finalize_tool_calls(parts);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.arguments, "{\"a\":1}");
+    }
+
+    #[test]
+    fn indexed_routing_handles_interleaved_argument_fragments() {
+        // The corruption #236 fixes: an aggregator emits both calls' metadata,
+        // THEN each call's argument fragments — interleaved across indices. The
+        // positional heuristic (`update_partial_tool_call`) would append index 0's
+        // argument fragment to the last part (call #1). Index routing is immune.
+        let mut acc = ToolCallAccumulator::new();
+
+        // Metadata for both calls first.
+        acc.update_indexed(0, make_tool_call("call_0", "search", ""));
+        acc.update_indexed(1, make_tool_call("call_1", "write", ""));
+        // Now argument fragments, interleaved by index.
+        acc.update_indexed(0, make_tool_call("", "", "{\"q\":"));
+        acc.update_indexed(1, make_tool_call("", "", "{\"path\":"));
+        acc.update_indexed(0, make_tool_call("", "", "\"hi\"}"));
+        acc.update_indexed(1, make_tool_call("", "", "\"/tmp\"}"));
+
+        let calls = acc.finalize();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_0");
+        assert_eq!(calls[0].function.name, "search");
+        assert_eq!(calls[0].function.arguments, "{\"q\":\"hi\"}");
+        assert_eq!(calls[1].id, "call_1");
+        assert_eq!(calls[1].function.name, "write");
+        assert_eq!(calls[1].function.arguments, "{\"path\":\"/tmp\"}");
+    }
+
+    #[test]
+    fn positional_accumulation_corrupts_interleaved_fragments() {
+        // Documents the bug the indexed path avoids: with the positional heuristic,
+        // an argument fragment for call #0 that arrives AFTER call #1's metadata is
+        // appended to call #1 (the last part), corrupting both. This is why the
+        // OpenAI-compatible path must carry and route by index. #236.
+        let mut parts = Vec::new();
+        update_partial_tool_call(&mut parts, make_tool_call("call_0", "search", ""));
+        update_partial_tool_call(&mut parts, make_tool_call("call_1", "write", ""));
+        update_partial_tool_call(&mut parts, make_tool_call("", "", "ARGS_FOR_0"));
+
+        // The fragment landed on call #1, not call #0 — corruption.
+        assert_eq!(parts[0].arguments, "");
+        assert_eq!(parts[1].arguments, "ARGS_FOR_0");
+    }
+
+    #[test]
+    fn indexed_and_positional_paths_are_independent() {
+        // A positional (index: None) part and an indexed part coexist without an
+        // argument-only indexed fragment leaking onto the positional part.
+        let mut parts = Vec::new();
+        update_partial_tool_call(&mut parts, make_tool_call("pos", "p", "{}"));
+        update_partial_tool_call_indexed(&mut parts, 0, make_tool_call("idx", "i", "{\"a\":"));
+        update_partial_tool_call_indexed(&mut parts, 0, make_tool_call("", "", "1}"));
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].id, "pos");
+        assert_eq!(parts[0].arguments, "{}");
+        assert_eq!(parts[1].id, "idx");
+        assert_eq!(parts[1].index, Some(0));
+        assert_eq!(parts[1].arguments, "{\"a\":1}");
     }
 }

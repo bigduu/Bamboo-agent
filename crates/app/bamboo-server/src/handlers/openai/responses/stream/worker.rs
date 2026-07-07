@@ -102,6 +102,16 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 }
                 tool_calls.extend(calls)
             }
+            // Indexed variant: drop indices, same behavior. #236.
+            Ok(LLMChunk::ToolCallsIndexed(indexed)) => {
+                let active_response_id = response_id
+                    .clone()
+                    .unwrap_or_else(|| args.fallback_response_id.clone());
+                if !ensure_created_event(&mut args, &active_response_id, &mut created_sent).await {
+                    break;
+                }
+                tool_calls.extend(indexed.into_iter().map(|(_, call)| call))
+            }
             Ok(LLMChunk::Done) => break,
             Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {

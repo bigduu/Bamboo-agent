@@ -51,6 +51,15 @@ impl StreamAccumulationState {
         self.tool_calls.extend(partial_calls);
     }
 
+    /// Accumulate index-tagged tool-call fragments, routing each to its call by
+    /// provider index (the OpenAI-compatible chat-completions path). #236.
+    pub(super) fn extend_tool_calls_indexed(
+        &mut self,
+        partial_calls: Vec<(u32, bamboo_agent_core::tools::ToolCall)>,
+    ) {
+        self.tool_calls.extend_indexed(partial_calls);
+    }
+
     pub(super) fn record_usage(&mut self, output_tokens: u64, thinking_tokens: u64) {
         self.output_tokens = output_tokens;
         self.thinking_tokens = thinking_tokens;

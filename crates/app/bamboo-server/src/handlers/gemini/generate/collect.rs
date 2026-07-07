@@ -23,6 +23,10 @@ where
             LLMChunk::Done => break,
             // Keep the last tool call batch, matching the original behavior.
             LLMChunk::ToolCalls(calls) => collected.tool_calls = Some(calls),
+            // Indexed variant: drop indices, same behavior. #236.
+            LLMChunk::ToolCallsIndexed(calls) => {
+                collected.tool_calls = Some(calls.into_iter().map(|(_, call)| call).collect())
+            }
             LLMChunk::CacheUsage { .. } | LLMChunk::UsageSummary { .. } => {}
         }
     }
