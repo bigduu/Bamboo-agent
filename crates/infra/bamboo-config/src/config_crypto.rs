@@ -146,55 +146,56 @@ impl Config {
         if let Some(openai) = self.providers.openai.as_mut() {
             if !openai.api_key_from_env {
                 let api_key = openai.api_key.trim();
-                openai.api_key_encrypted = if api_key.is_empty() {
-                    None
-                } else {
-                    Some(
+                // Only (re)encrypt when we actually hold a plaintext key. When the
+                // plaintext is empty because the stored ciphertext failed to
+                // decrypt at hydration (config.json moved across machines, a
+                // machine-id change, the ephemeral fallback key), DON'T null the
+                // ciphertext — that would permanently drop a working key the user
+                // never touched on the next unrelated save. #268.
+                if !api_key.is_empty() {
+                    openai.api_key_encrypted = Some(
                         crate::encryption::encrypt(api_key)
                             .context("Failed to encrypt OpenAI api_key")?,
-                    )
-                };
+                    );
+                }
             }
         }
 
         if let Some(anthropic) = self.providers.anthropic.as_mut() {
             if !anthropic.api_key_from_env {
                 let api_key = anthropic.api_key.trim();
-                anthropic.api_key_encrypted = if api_key.is_empty() {
-                    None
-                } else {
-                    Some(
+                // Empty plaintext → preserve existing ciphertext (see OpenAI above). #268.
+                if !api_key.is_empty() {
+                    anthropic.api_key_encrypted = Some(
                         crate::encryption::encrypt(api_key)
                             .context("Failed to encrypt Anthropic api_key")?,
-                    )
-                };
+                    );
+                }
             }
         }
 
         if let Some(gemini) = self.providers.gemini.as_mut() {
             if !gemini.api_key_from_env {
                 let api_key = gemini.api_key.trim();
-                gemini.api_key_encrypted = if api_key.is_empty() {
-                    None
-                } else {
-                    Some(
+                // Empty plaintext → preserve existing ciphertext (see OpenAI above). #268.
+                if !api_key.is_empty() {
+                    gemini.api_key_encrypted = Some(
                         crate::encryption::encrypt(api_key)
                             .context("Failed to encrypt Gemini api_key")?,
-                    )
-                };
+                    );
+                }
             }
         }
 
         if let Some(bodhi) = self.providers.bodhi.as_mut() {
             let api_key = bodhi.api_key.trim();
-            bodhi.api_key_encrypted = if api_key.is_empty() {
-                None
-            } else {
-                Some(
+            // Empty plaintext → preserve existing ciphertext (see OpenAI above). #268.
+            if !api_key.is_empty() {
+                bodhi.api_key_encrypted = Some(
                     crate::encryption::encrypt(api_key)
                         .context("Failed to encrypt Bodhi api_key")?,
-                )
-            };
+                );
+            }
         }
 
         Ok(())
@@ -224,14 +225,13 @@ impl Config {
     pub fn refresh_provider_instance_api_keys_encrypted(&mut self) -> Result<()> {
         for (id, instance) in self.provider_instances.iter_mut() {
             let api_key = instance.api_key.trim();
-            instance.api_key_encrypted = if api_key.is_empty() {
-                None
-            } else {
-                Some(crate::encryption::encrypt(api_key).context(format!(
-                    "Failed to encrypt api_key for provider instance '{}'",
-                    id
-                ))?)
-            };
+            // Empty plaintext → preserve existing ciphertext (see
+            // refresh_provider_api_keys_encrypted). #268.
+            if !api_key.is_empty() {
+                instance.api_key_encrypted = Some(crate::encryption::encrypt(api_key).context(
+                    format!("Failed to encrypt api_key for provider instance '{}'", id),
+                )?);
+            }
         }
         Ok(())
     }
