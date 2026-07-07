@@ -46,6 +46,10 @@
 //! - `BAMBOO_BIND`: Override server bind address
 //! - `BAMBOO_PROVIDER`: Override default provider
 //! - `BAMBOO_HEADLESS`: Enable headless authentication mode
+//! - `BAMBOO_OPENAI_API_KEY` / `BAMBOO_ANTHROPIC_API_KEY` / `BAMBOO_GEMINI_API_KEY`:
+//!   Supply a provider's API key from the environment (in-memory only, never
+//!   persisted) — for 12-factor / secret-manager / CI deploys without a
+//!   plaintext key in config.json.
 
 use anyhow::{Context, Result};
 use bamboo_domain::poison::PoisonRecover;
@@ -904,7 +908,7 @@ fn default_true_hooks() -> bool {
 ///   "model": "gpt-4"
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAIConfig {
     /// OpenAI API key (plaintext, in-memory only).
     ///
@@ -960,7 +964,7 @@ pub struct OpenAIConfig {
 ///   "max_tokens": 4096
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     /// Anthropic API key (plaintext, in-memory only).
     ///
@@ -1009,7 +1013,7 @@ pub struct AnthropicConfig {
 ///   "model": "gemini-2.0-flash-exp"
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GeminiConfig {
     /// Google AI API key (plaintext, in-memory only).
     ///
@@ -1519,6 +1523,36 @@ impl Config {
         if let Ok(project_first_dream) = std::env::var("BAMBOO_MEMORY_PROJECT_FIRST_DREAM") {
             let memory = self.memory.get_or_insert_with(MemoryConfig::default);
             memory.project_first_dream = parse_bool_env(&project_first_dream);
+        }
+
+        // Per-provider API keys from the environment (highest priority). Lets a
+        // 12-factor / secret-manager / --env-file / k8s-Secret deploy supply the
+        // key at runtime instead of baking a plaintext `api_key` into a mounted
+        // config.json. The key lives in memory only — `api_key` is
+        // `#[serde(skip_serializing)]`, so it is never written back to disk. (#253)
+        if let Ok(key) = std::env::var("BAMBOO_OPENAI_API_KEY") {
+            if !key.is_empty() {
+                self.providers
+                    .openai
+                    .get_or_insert_with(OpenAIConfig::default)
+                    .api_key = key;
+            }
+        }
+        if let Ok(key) = std::env::var("BAMBOO_ANTHROPIC_API_KEY") {
+            if !key.is_empty() {
+                self.providers
+                    .anthropic
+                    .get_or_insert_with(AnthropicConfig::default)
+                    .api_key = key;
+            }
+        }
+        if let Ok(key) = std::env::var("BAMBOO_GEMINI_API_KEY") {
+            if !key.is_empty() {
+                self.providers
+                    .gemini
+                    .get_or_insert_with(GeminiConfig::default)
+                    .api_key = key;
+            }
         }
     }
 
@@ -3320,6 +3354,46 @@ mod tests {
         assert!(!memory.relevant_recall);
         assert!(memory.relevant_recall_rerank);
         assert!(!memory.project_first_dream);
+    }
+
+    #[test]
+    fn provider_api_keys_injected_from_env_and_never_persisted() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
+        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", "sk-ant-from-env");
+        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", "sk-oai-from-env");
+
+        // No config.json on disk → the providers are created from the env keys
+        // alone (#253: deploy without a plaintext api_key in a mounted file).
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
+        assert_eq!(
+            config
+                .providers
+                .anthropic
+                .as_ref()
+                .expect("anthropic created from env")
+                .api_key,
+            "sk-ant-from-env"
+        );
+        assert_eq!(
+            config
+                .providers
+                .openai
+                .as_ref()
+                .expect("openai created from env")
+                .api_key,
+            "sk-oai-from-env"
+        );
+        // An unset provider is not fabricated.
+        assert!(config.providers.gemini.is_none());
+
+        // The plaintext key is never serialized back to disk (`skip_serializing`).
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            !json.contains("sk-ant-from-env") && !json.contains("sk-oai-from-env"),
+            "env-injected api_key must never be persisted as plaintext"
+        );
     }
 
     #[test]
