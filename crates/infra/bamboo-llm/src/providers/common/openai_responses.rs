@@ -354,6 +354,13 @@ struct AccFnCall {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// True when `arguments` was seeded from an `output_item.added` snapshot
+    /// rather than built from `function_call_arguments.delta` events. Checked
+    /// when the first delta arrives: if the seed is a complete JSON object the
+    /// delta stream restates it from scratch, so the seed is dropped to avoid
+    /// `snapshot + deltas` duplication; if it's a partial prefix the deltas
+    /// continue it and the seed is kept. (#237 finding 4)
+    seeded_from_snapshot: bool,
 }
 
 /// Parser that converts Responses SSE events into [`LLMChunk`]s.
@@ -490,6 +497,7 @@ impl ResponsesSseParser {
         if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
             if !args.is_empty() && entry.arguments.is_empty() {
                 entry.arguments = args.to_string();
+                entry.seeded_from_snapshot = true;
             }
         }
     }
@@ -1216,6 +1224,26 @@ impl ResponsesSseParser {
                     return Ok(None);
                 }
                 let entry = self.ensure_fn_call(item_id);
+                if entry.seeded_from_snapshot {
+                    entry.seeded_from_snapshot = false;
+                    // The seed came from an `output_item.added` snapshot. Two
+                    // upstream shapes are indistinguishable until now:
+                    //   (A) a PARTIAL prefix (e.g. `{"q":"`) that the deltas
+                    //       continue — keep the seed and append; and
+                    //   (B) a COMPLETE snapshot that the deltas restate from
+                    //       scratch — appending would yield `snapshot + deltas`
+                    //       (malformed/duplicated).
+                    // A complete, parseable JSON OBJECT in the seed signals (B),
+                    // so drop it before appending; otherwise keep it. Tool-call
+                    // arguments are always objects, so a bare scalar/partial that
+                    // merely parses (e.g. a lone number) is treated as a prefix.
+                    // (#237 f.4)
+                    if serde_json::from_str::<serde_json::Value>(&entry.arguments)
+                        .is_ok_and(|v| v.is_object())
+                    {
+                        entry.arguments.clear();
+                    }
+                }
                 entry.arguments.push_str(delta);
                 Ok(None)
             }
@@ -1918,6 +1946,84 @@ mod tests {
             )
             .unwrap();
         assert!(out.is_none());
+    }
+
+    /// #237 finding 4: an aggregator that puts a non-empty `arguments` snapshot
+    /// in `output_item.added` AND also streams `function_call_arguments.delta`
+    /// must not yield `snapshot + deltas`. The delta stream is authoritative, so
+    /// the seed is dropped on the first delta.
+    #[test]
+    fn parser_snapshot_plus_deltas_does_not_duplicate_tool_args() {
+        let mut p = ResponsesSseParser::new();
+
+        // added carries a full snapshot...
+        p.handle_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"search","arguments":"{\"q\":\"hello\"}"}}"#,
+        )
+        .unwrap();
+
+        // ...and the same args are ALSO streamed as deltas (from scratch).
+        p.handle_event(
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"q\":\""}"#,
+        )
+        .unwrap();
+        p.handle_event(
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"hello\"}"}"#,
+        )
+        .unwrap();
+
+        // done WITHOUT arguments, so it can't mask a duplication by overwriting.
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"search"}}"#,
+            )
+            .unwrap();
+
+        match out {
+            Some(LLMChunk::ToolCalls(calls)) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function.arguments, r#"{"q":"hello"}"#);
+            }
+            other => panic!("expected a single tool call, got {other:?}"),
+        }
+    }
+
+    /// The normal delta-streaming path (empty `added` snapshot) is unaffected:
+    /// deltas accumulate as before.
+    #[test]
+    fn parser_empty_snapshot_then_deltas_accumulates_normally() {
+        let mut p = ResponsesSseParser::new();
+        p.handle_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","item":{"id":"item_2","type":"function_call","call_id":"call_2","name":"search","arguments":""}}"#,
+        )
+        .unwrap();
+        p.handle_event(
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"{\"a\":"}"#,
+        )
+        .unwrap();
+        p.handle_event(
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"1}"}"#,
+        )
+        .unwrap();
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"item_2","type":"function_call","call_id":"call_2","name":"search"}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::ToolCalls(calls)) => {
+                assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+            }
+            other => panic!("expected a single tool call, got {other:?}"),
+        }
     }
 
     #[test]
