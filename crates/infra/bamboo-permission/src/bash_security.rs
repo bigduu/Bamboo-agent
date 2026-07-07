@@ -968,9 +968,11 @@ fn command_archetype(name: &str, args: &[String], exec_context: bool) -> Option<
 /// `-e`, and `find -exec` / `xargs <cmd>`.
 fn check_indirection(name: &str, args: &[String], depth: usize) -> Option<&'static str> {
     // Shell interpreter running inline code: re-parse the payload as bash.
-    // Handles `-c payload` and clustered login forms like `bash -lc payload`.
+    // Handles `-c payload`, clustered forms (`bash -lc payload`, `bash -vxeic
+    // payload`), and fused (`bash -cfoo`). Conservatively checks every candidate
+    // payload rather than guessing which one bash's arg parser picks.
     if SHELL_COMMANDS.contains(&name) {
-        if let Some(payload) = shell_c_payload(args) {
+        for payload in shell_c_payloads(args) {
             if let Some(reason) = super_dangerous_reason_inner(&unquote(&payload), depth + 1) {
                 return Some(reason);
             }
@@ -1016,20 +1018,42 @@ fn check_indirection(name: &str, args: &[String], depth: usize) -> Option<&'stat
     None
 }
 
-/// The inline-code payload for a shell interpreter: `-c payload`, `-c=payload`,
-/// or a clustered short-option form that includes `c` (`bash -lc payload`,
-/// `bash -ic payload`), where the payload is the following operand.
-fn shell_c_payload(args: &[String]) -> Option<String> {
-    if let Some(v) = flag_value(args, "-c") {
-        return Some(v);
-    }
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        if arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c') {
-            return it.next().cloned();
+/// All candidate inline-code payloads for a shell interpreter's `-c`, across the
+/// forms bash accepts: `-c payload`, fused `-cpayload`, and clustered short
+/// options that include `c` (`-lc`, `-ic`, `-vxeic`, …). Bash's exact rule for
+/// which operand becomes the command is finicky (fused remainder after `c` vs
+/// the next argv, and whether an intervening flag consumed it), and getting it
+/// wrong in a *security* backstop must fail toward asking — so we return every
+/// plausible payload and the caller checks them all. `--long` options are
+/// excluded; a bare short cluster is never a `--` option.
+fn shell_c_payloads(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "-c" {
+            if let Some(next) = args.get(i + 1) {
+                out.push(next.clone());
+            }
+            continue;
+        }
+        let Some(cluster) = arg.strip_prefix('-') else {
+            continue;
+        };
+        if arg.starts_with("--") || !cluster.contains('c') {
+            continue;
+        }
+        // Fused remainder after `c` (e.g. `-cfoo` / `-rcfile` → `foo`/`file`)…
+        if let Some(cpos) = cluster.find('c') {
+            let fused = &cluster[cpos + 1..];
+            if !fused.is_empty() {
+                out.push(fused.to_string());
+            }
+        }
+        // …and the next argv (e.g. `-lc "cmd"` / `-vxeic "cmd"`).
+        if let Some(next) = args.get(i + 1) {
+            out.push(next.clone());
         }
     }
-    None
+    out
 }
 
 /// Value following `flag` (as `-c val`) or fused (`--eval=val`), if present.
@@ -1114,22 +1138,34 @@ fn dangerous_token_scan(payload: &str) -> Option<&'static str> {
     {
         return Some("raw device write (dd of=/dev/…)");
     }
-    // Recursive-force delete targeting a protected root, the FS root, or home —
-    // matching the direct-invocation path (not *any* absolute path, so a payload
-    // deleting under /tmp isn't force-asked where the direct form wouldn't be).
+    // Recursive-force delete targeting a protected root, the FS root, home, or a
+    // glob/cwd wipe — mirroring the direct-invocation set in `targets_protected_root`
+    // (so `rm -rf /*` / `rm -rf *` are caught) but NOT *any* absolute path (a
+    // payload deleting under /tmp isn't force-asked where the direct form wouldn't).
     for flags in ["rm -rf ", "rm -fr ", "rm -r -f ", "rm -f -r "] {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(flags) {
-            let target = lower[from + pos + flags.len()..].trim_start();
-            let bare_root = target == "/"
-                || target
-                    .strip_prefix('/')
-                    .is_some_and(|r| r.starts_with([' ', '\'', '"', ')', ';']) || r.is_empty());
-            let home = target.starts_with('~') || target.starts_with("$home");
-            let protected = PROTECTED_DELETE_ROOTS
-                .iter()
-                .any(|root| target.starts_with(root));
-            if bare_root || home || protected {
+            // Skip whitespace and any leading quote(s) the payload re-added
+            // around the path (e.g. `rm -rf '/'`).
+            let rest = lower[from + pos + flags.len()..]
+                .trim_start()
+                .trim_start_matches(['\'', '"']);
+            // First operand token (up to the next shell delimiter).
+            let tok: String = rest
+                .chars()
+                .take_while(|c| {
+                    !c.is_whitespace() && !matches!(c, '\'' | '"' | ')' | ';' | '&' | '|')
+                })
+                .collect();
+            let tok_norm = tok.trim_end_matches('/');
+            let dangerous = matches!(
+                tok.as_str(),
+                "/" | "/*" | "*" | "." | ".." | "~" | "~/" | "$home" | "$home/"
+            ) || PROTECTED_DELETE_ROOTS.iter().any(|root| {
+                let r = root.to_ascii_lowercase();
+                tok_norm == r || tok.starts_with(&format!("{r}/"))
+            });
+            if dangerous {
                 return Some("recursive force-delete of a protected path");
             }
             from += pos + flags.len();
@@ -2156,5 +2192,30 @@ mod tests {
         assert!(
             super_dangerous_reason(r#"cat l | xargs -I{} sh -c "dd of=/dev/sda if={}""#).is_some()
         );
+    }
+
+    #[test]
+    fn super_dangerous_token_scan_glob_and_cwd_parity() {
+        // Interpreter-payload parity with the direct path: /*, *, . are wipes.
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf /*')""#).is_some());
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf *')""#).is_some());
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf .')""#).is_some());
+        // Re-quoted operand (path wrapped in its own quotes) must still be seen.
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf '/'')""#).is_some());
+        // /tmp is still not a protected root — parity with the direct form.
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf /tmp/x')""#).is_none());
+    }
+
+    #[test]
+    fn super_dangerous_long_clusters_and_fused_c() {
+        // A long, valid short-flag cluster ending in `c` takes the next argv as
+        // the command — must be caught (not skipped by any length cap).
+        assert!(super_dangerous_reason(r#"bash -vxeic "sudo rm -rf /""#).is_some());
+        // A cluster whose real `-c` payload (via any candidate) is dangerous is
+        // caught even alongside other single-dash tokens.
+        assert!(super_dangerous_reason(r#"bash -rcfile /dev/null -lc "sudo rm -rf /""#).is_some());
+        // Benign clustered payloads stay quiet.
+        assert!(super_dangerous_reason(r#"bash -vxeic "ls -la""#).is_none());
+        assert!(super_dangerous_reason(r#"bash -rcfile /dev/null -lc "ls""#).is_none());
     }
 }
