@@ -104,6 +104,39 @@ pub trait ToolExecutor: Send + Sync {
             .map(ToolOutcome::Completed)
     }
 
+    /// Permission gate for a tool call, exposed on the executor trait so the
+    /// check is part of the executor *chain*.
+    ///
+    /// An overlay/wrapping executor runs its own tool directly (it does NOT route
+    /// that call through the inner executor's `execute` path), so before this
+    /// method existed the inner executor's permission check was silently skipped
+    /// for those tools (issue #341). By putting the check on the trait, a wrapper
+    /// can call the inner executor's real check before invoking its own tool.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — the call is permitted; the caller proceeds to run the tool.
+    /// - `Ok(Some(outcome))` — the permission layer intercepts the call and THIS
+    ///   [`ToolOutcome`] is the tool call's result *without* the tool running. It
+    ///   carries the interactive "awaiting approval" pause the built-in executor
+    ///   synthesizes for a human event sink (a `Completed` result tagged
+    ///   `display_preference = "request_permissions"` that the engine turns into a
+    ///   clarification pause). Returning it here — rather than collapsing it to an
+    ///   `Err` — is what preserves the built-in path's exact pause-and-ask
+    ///   behavior when the check is routed through this method.
+    /// - `Err(_)` — the call is denied / fails closed.
+    ///
+    /// The default returns `Ok(None)` (no gate), so executors that enforce no
+    /// permissions are unaffected. The built-in executor overrides this with the
+    /// real check; overlay/wrapping executors delegate to their inner executor's
+    /// implementation so the gate can't be dropped by stacking a wrapper.
+    async fn check_permissions_for(
+        &self,
+        _call: &ToolCall,
+        _ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>> {
+        Ok(None)
+    }
+
     /// Lists all available tools and their schemas
     ///
     /// Returns schemas for all tools that can be executed via this executor

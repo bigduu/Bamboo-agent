@@ -98,7 +98,13 @@ pub fn check_permissions(
             );
             let write_resource = match action.as_str() {
                 "session_append" | "session_replace" | "session_clear" => Some(session_memory_dir),
-                "write" | "merge" | "purge" | "rebuild" => Some(durable_memory_dir),
+                // Keep in lockstep with `MemoryTool::classify` (bamboo-server-tools),
+                // which treats every non-read action — including `split` and
+                // `consolidate` — as mutating. Omitting those two let destructive
+                // durable-memory edits skip the WriteFile gate (issue #341).
+                "write" | "merge" | "split" | "consolidate" | "purge" | "rebuild" => {
+                    Some(durable_memory_dir)
+                }
                 _ => None,
             };
             if let Some(resource) = write_resource {
@@ -311,6 +317,49 @@ mod tests {
         assert_eq!(write.len(), 1);
         assert_eq!(write[0].permission_type, PermissionType::WriteFile);
         assert!(write[0].resource.contains("/memory/v1/scopes"));
+    }
+
+    #[test]
+    fn check_permissions_memory_mutating_actions_all_gated() {
+        // Every mutating durable-memory action must produce a WriteFile context so
+        // it hits the permission gate. `split` and `consolidate` were previously
+        // omitted (issue #341) even though `MemoryTool::classify` treats them as
+        // mutating, so a `memory(*)` ask-rule / Default-mode prompt never fired for
+        // them. Guards the full set stays in lockstep with the tool's classifier.
+        for action in ["write", "merge", "split", "consolidate", "purge", "rebuild"] {
+            let contexts = check_permissions("memory", &json!({"action": action}))
+                .unwrap_or_else(|_| panic!("memory action {action} should classify"))
+                .unwrap_or_else(|| panic!("memory action {action} must require a WriteFile gate"));
+            assert_eq!(contexts.len(), 1, "action {action}");
+            assert_eq!(
+                contexts[0].permission_type,
+                PermissionType::WriteFile,
+                "action {action} must be WriteFile"
+            );
+            assert!(
+                contexts[0].resource.contains("/memory/v1/scopes"),
+                "action {action} must scope to durable memory"
+            );
+        }
+
+        // Read-only actions stay ungated.
+        for action in [
+            "session_read",
+            "session_list_topics",
+            "query",
+            "get",
+            "find_duplicates",
+            "inspect",
+            "scan_blobs",
+            "scan_duplicates",
+        ] {
+            assert!(
+                check_permissions("memory", &json!({"action": action}))
+                    .unwrap()
+                    .is_none(),
+                "read-only memory action {action} must not be gated"
+            );
+        }
     }
 
     #[test]
