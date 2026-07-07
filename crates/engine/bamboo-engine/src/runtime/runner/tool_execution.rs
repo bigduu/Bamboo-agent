@@ -348,7 +348,14 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
 
     detect_manual_compression_request(session);
 
-    if super::round_lifecycle::maybe_apply_mid_turn_context_compression(
+    // Mid-turn compression is a best-effort optimization (it shrinks the LLM
+    // context between tool results). A transient failure of its summarization
+    // LLM call must NOT propagate as a turn error: doing so retried the WHOLE
+    // turn, which re-appended the assistant message, re-billed the LLM, and
+    // orphaned the tool calls that hadn't run yet (issue #238). Log and skip
+    // compression for this round instead; if the un-compressed context later
+    // overflows, that surfaces as its own (legitimate) error.
+    match super::round_lifecycle::maybe_apply_mid_turn_context_compression(
         session,
         config,
         llm,
@@ -357,12 +364,22 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
         model_name,
         tool_schemas,
     )
-    .await?
+    .await
     {
-        tracing::debug!(
-            "[{}] Applied mid-turn host context compression after single tool result",
-            session_id
-        );
+        Ok(true) => {
+            tracing::debug!(
+                "[{}] Applied mid-turn host context compression after single tool result",
+                session_id
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                "[{}] mid-turn context compression failed ({error}); skipping compression \
+                 for this round (turn continues, not retried)",
+                session_id
+            );
+        }
     }
     Ok(())
 }
@@ -721,10 +738,14 @@ pub(crate) async fn execute_round_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::{scheduling_mode_for_tool_call, ToolSchedulingMode};
-    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutor};
+    use crate::runtime::config::AgentLoopConfig;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutor, ToolSchema};
+    use bamboo_agent_core::Session;
+    use bamboo_llm::LLMProvider;
     use bamboo_tools::BuiltinToolExecutor;
     use serde_json::json;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn tool_call(name: &str) -> ToolCall {
         tool_call_with_args(name, json!({}))
@@ -1364,6 +1385,140 @@ mod tests {
         assert_eq!(
             session.force_manual_compression.as_deref(),
             Some("preserve error traces")
+        );
+    }
+
+    /// An LLM provider whose every call fails — used to drive the mid-turn
+    /// compression summarization into its error path.
+    struct FailingLlmProvider {
+        called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_llm::LLMProvider for FailingLlmProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<bamboo_llm::provider::LLMStream> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(bamboo_llm::LLMError::Api(
+                "transient compression failure".to_string(),
+            ))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            tools: &[ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            _options: Option<&bamboo_llm::provider::LLMRequestOptions>,
+        ) -> bamboo_llm::provider::Result<bamboo_llm::provider::LLMStream> {
+            // The summarizer calls this variant; fail it too.
+            self.chat_stream(messages, tools, max_output_tokens, model)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compression_failure_is_swallowed_not_propagated() {
+        // #238: a transient failure of the mid-turn compression summarization
+        // call must be swallowed (log + skip), NOT propagated — propagating it
+        // routed through the whole-turn retry, re-appending the assistant
+        // message and re-billing the LLM.
+        use bamboo_agent_core::{Message, TokenBudgetUsage};
+        use bamboo_compression::{BudgetStrategy, TokenBudget};
+
+        let mut session = Session::new("sid-238", "main-model");
+        session.token_budget = Some(TokenBudget {
+            max_context_tokens: 1200,
+            max_output_tokens: 200,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: 50,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
+        });
+        session.messages.push(Message::system("System prompt"));
+        for index in 0..12 {
+            session.messages.push(Message::user(format!(
+                "User message {} {}",
+                index,
+                "alpha beta gamma delta epsilon zeta ".repeat(8)
+            )));
+            session.messages.push(Message::assistant(
+                format!(
+                    "Assistant response {} {}",
+                    index,
+                    "analysis plan files checks and next steps ".repeat(8)
+                ),
+                None,
+            ));
+        }
+        session.token_usage = Some(TokenBudgetUsage {
+            system_tokens: 100,
+            summary_tokens: 0,
+            window_tokens: 900,
+            total_tokens: 1000,
+            max_context_tokens: 1200,
+            budget_limit: 1200,
+            truncation_occurred: true,
+            segments_removed: 8,
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+            thinking_tokens: 0,
+            cache_read_input_tokens: 0,
+        });
+
+        // Force the mid-turn summarization to run (as a manual compact_context
+        // request would) so the failing provider is definitely exercised.
+        session.force_manual_compression = Some("compress now".to_string());
+
+        let config = AgentLoopConfig {
+            model_name: Some("main-model".to_string()),
+            // A summarization/background model must be configured or the LLM
+            // summarization pass is skipped entirely (never reaching the failure).
+            background_model_name: Some("main-model".to_string()),
+            ..Default::default()
+        };
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let llm: Arc<dyn LLMProvider> = Arc::new(FailingLlmProvider {
+            called: std::sync::Arc::clone(&called),
+        });
+        let (tx, _rx) = mpsc::channel(16);
+
+        let result = super::maybe_apply_mid_turn_context_compression_after_tool(
+            &mut session,
+            &config,
+            &llm,
+            &tx,
+            "sid-238",
+            Some("main-model"),
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            "the compression summarization call should have been attempted (test setup must trigger compression)"
+        );
+        assert!(
+            result.is_ok(),
+            "mid-turn compression failure must be swallowed, not propagated as a turn error: {result:?}"
         );
     }
 }
