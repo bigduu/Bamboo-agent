@@ -79,10 +79,46 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 // Emit tool result as a structured function_call_output item.
                 let call_id = m.tool_call_id.as_deref().unwrap_or("");
                 if !call_id.is_empty() {
+                    // A tool result may carry images (e.g. an MCP screenshot) in
+                    // content_parts; emit the text AND those images as a typed
+                    // content array so the images reach the model instead of
+                    // being dropped — the Anthropic path already preserves them.
+                    // Text-only results stay a plain string. (#237)
+                    let tool_has_images = m.content_parts.as_ref().is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|p| matches!(p, MessagePart::ImageUrl { .. }))
+                    });
+                    let output = if tool_has_images {
+                        // `content_parts` holds the images; the textual result is
+                        // in `m.content`. Emit both (text first) so neither is lost.
+                        let mut parts: Vec<Value> = Vec::new();
+                        if !m.content.trim().is_empty() {
+                            parts.push(json!({"type": "input_text", "text": m.content}));
+                        }
+                        if let Some(content_parts) = m.content_parts.as_ref() {
+                            for part in content_parts {
+                                match part {
+                                    MessagePart::Text { text } => {
+                                        parts.push(json!({"type": "input_text", "text": text}));
+                                    }
+                                    MessagePart::ImageUrl { image_url } => {
+                                        parts.push(json!({
+                                            "type": "input_image",
+                                            "image_url": image_url.url
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        json!(parts)
+                    } else {
+                        json!(m.content)
+                    };
                     out.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": m.content,
+                        "output": output,
                     }));
                 } else {
                     // Fallback: no call_id available — degrade to user message with prefix.
@@ -2460,5 +2496,50 @@ mod tests {
         // ...but the correlation id and tool name are preserved.
         assert_eq!(function_call["call_id"], "call_1");
         assert_eq!(function_call["name"], "search");
+    }
+
+    #[test]
+    fn tool_result_images_are_preserved_as_typed_output_content() {
+        // #237: a tool result carrying an image (e.g. an MCP screenshot) must
+        // reach the model on the Responses path, not be dropped to text only.
+        let msg = bamboo_domain::Message::tool_result_with_images(
+            "call_1",
+            "screenshot captured",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            }],
+        );
+
+        let out = messages_to_responses_input_json(&[msg]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function_call_output");
+        assert_eq!(out[0]["call_id"], "call_1");
+
+        let content = out[0]["output"]
+            .as_array()
+            .expect("output is a typed content array when the result has images");
+        assert!(
+            content
+                .iter()
+                .any(|p| p["type"] == "input_text" && p["text"] == "screenshot captured"),
+            "text part preserved"
+        );
+        assert!(
+            content.iter().any(|p| p["type"] == "input_image"),
+            "the image part is preserved, not dropped"
+        );
+    }
+
+    #[test]
+    fn text_only_tool_result_stays_a_plain_string_output() {
+        let msg = bamboo_domain::Message::tool_result("call_2", "plain text result");
+        let out = messages_to_responses_input_json(&[msg]);
+        assert_eq!(out[0]["type"], "function_call_output");
+        assert_eq!(
+            out[0]["output"], "plain text result",
+            "text-only results stay a plain string (unchanged behavior)"
+        );
     }
 }
