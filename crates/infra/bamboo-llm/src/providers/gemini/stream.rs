@@ -223,73 +223,86 @@ pub fn parse_gemini_sse_event(
         return Ok(take_gemini_final_usage(state, &value));
     }
 
-    // Process the first part (Gemini typically sends one part per chunk)
-    let part = &parts[0];
+    // Process EVERY part. A single Gemini chunk can carry multiple parts —
+    // notably parallel `functionCall`s, or a thought part alongside text — so
+    // reading only `parts[0]` silently drops the rest (e.g. all-but-one of a
+    // set of parallel tool calls). Text parts emit tokens in order; all function
+    // calls in the chunk are collected into a single `ToolCalls` chunk.
+    let mut chunks = Vec::new();
+    let mut tool_calls = Vec::new();
 
-    // Best-effort thinking signal detection.
-    let is_thinking_part = part
-        .get("thought")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-        || part.get("thoughtSignature").is_some()
-        || part.get("thinking").is_some();
+    for part in parts {
+        // Best-effort thinking signal detection (per part).
+        let is_thinking_part = part
+            .get("thought")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || part.get("thoughtSignature").is_some()
+            || part.get("thinking").is_some();
 
-    if is_thinking_part {
-        state.observed_thinking_signal = true;
-        state.thinking_parts_count = state.thinking_parts_count.saturating_add(1);
-        let text_len = part
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(str::len)
-            .unwrap_or(0);
-        state.thinking_text_chars = state.thinking_text_chars.saturating_add(text_len);
-    }
-
-    // Check for text content
-    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-        if !text.is_empty() {
-            if is_thinking_part {
-                return Ok(vec![LLMChunk::ReasoningToken(text.to_string())]);
-            }
-            return Ok(vec![LLMChunk::Token(text.to_string())]);
+        if is_thinking_part {
+            state.observed_thinking_signal = true;
+            state.thinking_parts_count = state.thinking_parts_count.saturating_add(1);
+            let text_len = part
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or(0);
+            state.thinking_text_chars = state.thinking_text_chars.saturating_add(text_len);
         }
-        return Ok(Vec::new());
-    }
 
-    // Check for function call (tool call)
-    if let Some(function_call) = part.get("functionCall") {
-        let name = function_call
-            .get("name")
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| {
-                LLMError::Stream(format!(
-                    "Missing function name in Gemini response: {}",
-                    data
-                ))
+        // Text content.
+        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+            if !text.is_empty() {
+                chunks.push(if is_thinking_part {
+                    LLMChunk::ReasoningToken(text.to_string())
+                } else {
+                    LLMChunk::Token(text.to_string())
+                });
+            }
+            continue;
+        }
+
+        // Function call (tool call).
+        if let Some(function_call) = part.get("functionCall") {
+            let name = function_call
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| {
+                    LLMError::Stream(format!(
+                        "Missing function name in Gemini response: {}",
+                        data
+                    ))
+                })?;
+
+            let args = function_call
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+            let args_str = serde_json::to_string(&args).map_err(|e| {
+                LLMError::Stream(format!("Failed to serialize function args: {}", e))
             })?;
 
-        let args = function_call
-            .get("args")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            tool_calls.push(ToolCall {
+                id: state.generate_tool_id(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: args_str,
+                },
+            });
+            continue;
+        }
 
-        let args_str = serde_json::to_string(&args)
-            .map_err(|e| LLMError::Stream(format!("Failed to serialize function args: {}", e)))?;
-
-        let tool_id = state.generate_tool_id();
-
-        return Ok(vec![LLMChunk::ToolCalls(vec![ToolCall {
-            id: tool_id,
-            tool_type: "function".to_string(),
-            function: FunctionCall {
-                name: name.to_string(),
-                arguments: args_str,
-            },
-        }])]);
+        // Unknown part type, skip it.
     }
 
-    // Unknown part type, skip it
-    Ok(Vec::new())
+    if !tool_calls.is_empty() {
+        chunks.push(LLMChunk::ToolCalls(tool_calls));
+    }
+
+    Ok(chunks)
 }
 
 #[cfg(test)]
@@ -324,6 +337,53 @@ mod tests {
         }
         assert!(state.observed_thinking_signal);
         assert_eq!(state.thinking_parts_count, 1);
+    }
+
+    #[test]
+    fn parse_multiple_function_calls_in_one_chunk() {
+        // Parallel tool calls: a single chunk with two functionCall parts must
+        // yield BOTH, not just parts[0]. Regression for the parts[0]-only bug.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}}},{"functionCall":{"name":"get_time","args":{"tz":"UTC"}}}],"role":"model"}}]}"#;
+
+        let chunks = parse_gemini_sse_event(&mut state, "", data).unwrap();
+        let tool_calls: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| match c {
+                LLMChunk::ToolCalls(tcs) => tcs.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 2, "both parallel tool calls must survive");
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[1].function.name, "get_time");
+        assert_ne!(
+            tool_calls[0].id, tool_calls[1].id,
+            "tool ids must be distinct"
+        );
+    }
+
+    #[test]
+    fn parse_multipart_text_and_function_call() {
+        // A chunk carrying both a text part and a functionCall part must emit
+        // both, not silently drop the trailing part.
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[{"content":{"parts":[{"text":"Let me check"},{"functionCall":{"name":"search","args":{"q":"rust"}}}],"role":"model"}}]}"#;
+
+        let chunks = parse_gemini_sse_event(&mut state, "", data).unwrap();
+        let has_token = chunks
+            .iter()
+            .any(|c| matches!(c, LLMChunk::Token(t) if t.as_str() == "Let me check"));
+        let tool_calls: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| match c {
+                LLMChunk::ToolCalls(tcs) => tcs.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(has_token, "the text part must survive");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "search");
     }
 
     #[test]

@@ -1147,6 +1147,7 @@ mod tests {
         config.providers = ProviderConfigs {
             openai: Some(OpenAIConfig {
                 api_key: "sk-cli-secret".to_string(),
+                api_key_from_env: false,
                 api_key_encrypted: None,
                 base_url: Some("https://api.openai.com/v1".to_string()),
                 model: Some("gpt-4o".to_string()),

@@ -269,6 +269,7 @@ mod comprehensive_config_tests {
         original.provider = "anthropic".to_string();
         original.providers.anthropic = Some(bamboo_config::AnthropicConfig {
             api_key: String::new(),
+            api_key_from_env: false,
             api_key_encrypted: None,
             base_url: None,
             model: Some("claude-3".to_string()),
