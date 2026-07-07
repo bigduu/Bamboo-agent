@@ -3229,6 +3229,58 @@ mod tests {
     }
 
     #[test]
+    fn preserve_env_sourced_provider_keys_restores_only_dropped_env_keys() {
+        // #373: the settings-PATCH serde round-trip drops every provider's
+        // skip_serializing api_key; an env-sourced key (no ciphertext) can't be
+        // re-hydrated, so it must be copied back from the live `current` config —
+        // but an explicitly re-set key and non-env keys must NOT be touched.
+        let openai = |api_key: &str, from_env: bool| OpenAIConfig {
+            api_key: api_key.to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: BTreeMap::new(),
+            api_key_from_env: from_env,
+        };
+
+        // Env-sourced key dropped by the round-trip → restored.
+        let mut current = Config::default();
+        current.providers.openai = Some(openai("sk-env", true));
+        let mut merged = Config::default();
+        merged.providers.openai = Some(openai("", false)); // post-round-trip
+        merged.preserve_env_sourced_provider_keys(&current);
+        let got = merged.providers.openai.as_ref().unwrap();
+        assert_eq!(got.api_key, "sk-env", "env-sourced key restored");
+        assert!(got.api_key_from_env, "env flag restored");
+
+        // A key explicitly re-set by the patch is NOT overridden.
+        let mut merged = Config::default();
+        merged.providers.openai = Some(openai("sk-explicit", false));
+        merged.preserve_env_sourced_provider_keys(&current);
+        assert_eq!(
+            merged.providers.openai.as_ref().unwrap().api_key,
+            "sk-explicit",
+            "explicit patch key must win"
+        );
+
+        // A non-env key in current is NOT restored here (that's ciphertext hydration's job).
+        let mut current_plain = Config::default();
+        current_plain.providers.openai = Some(openai("sk-plain", false));
+        let mut merged = Config::default();
+        merged.providers.openai = Some(openai("", false));
+        merged.preserve_env_sourced_provider_keys(&current_plain);
+        assert!(
+            merged.providers.openai.as_ref().unwrap().api_key.is_empty(),
+            "non-env key must not be restored by this path"
+        );
+    }
+
+    #[test]
     fn refresh_preserves_ciphertext_when_plaintext_empty() {
         // #268: a provider whose stored ciphertext failed to decrypt at hydration
         // has an empty in-memory api_key. An unrelated later save must NOT null its

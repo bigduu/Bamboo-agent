@@ -140,6 +140,11 @@ pub fn build_merged_config(
     new_config.hydrate_provider_instance_api_keys_from_encrypted();
     new_config.hydrate_mcp_secrets_from_encrypted();
     new_config.hydrate_env_vars_from_encrypted();
+    // The serde round-trip above drops every provider's `#[serde(skip_serializing)]`
+    // `api_key`; hydration only restores ciphertext-backed keys, so an env-sourced
+    // key (no ciphertext, #253) would be silently blanked by any settings PATCH.
+    // Copy env-sourced keys back from the live `current` config. #373.
+    new_config.preserve_env_sourced_provider_keys(current);
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
 
