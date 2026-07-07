@@ -81,6 +81,14 @@ pub struct ToolCallDisplay {
 }
 
 #[derive(Debug, Clone)]
+pub struct SubAgentDisplay {
+    pub child_session_id: String,
+    pub title: Option<String>,
+    /// "running" | "completed" | "cancelled" | "error" | "skipped".
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
@@ -106,6 +114,8 @@ pub struct ChatState {
     /// When true, tool-call arguments and results render in full instead
     /// of truncated. Toggled with `x` on the Chat tab.
     pub expand_tools: bool,
+    /// Sub-agents spawned by the current run (child lifecycle).
+    pub sub_agents: Vec<SubAgentDisplay>,
 }
 
 impl ChatState {
@@ -127,6 +137,7 @@ impl ChatState {
             token_usage: None,
             plan_mode: false,
             expand_tools: false,
+            sub_agents: Vec::new(),
         }
     }
 }
@@ -988,6 +999,38 @@ impl App {
             AgentEvent::PlanFileUpdated { file_path, .. } => {
                 self.status_message = format!("Plan updated: {}", file_path);
             }
+            AgentEvent::SubAgentStarted {
+                child_session_id,
+                title,
+            } => {
+                if !self
+                    .chat
+                    .sub_agents
+                    .iter()
+                    .any(|s| s.child_session_id == child_session_id)
+                {
+                    self.chat.sub_agents.push(SubAgentDisplay {
+                        child_session_id,
+                        title,
+                        status: "running".to_string(),
+                    });
+                }
+            }
+            AgentEvent::SubAgentHeartbeat { .. } => {}
+            AgentEvent::SubAgentCompleted {
+                child_session_id,
+                status,
+                ..
+            } => {
+                if let Some(sa) = self
+                    .chat
+                    .sub_agents
+                    .iter_mut()
+                    .find(|s| s.child_session_id == child_session_id)
+                {
+                    sa.status = status;
+                }
+            }
         }
         Ok(())
     }
@@ -1010,6 +1053,7 @@ impl App {
         self.status_message = "Ready".to_string();
         self.sse_tx = None;
         self.sse_rx = None;
+        self.chat.sub_agents.clear();
         // A run that ended (completed / cancelled / stopped) can no longer accept
         // an answer, so drop any open question modal to avoid answering a dead
         // session.
@@ -1445,5 +1489,34 @@ mod question_tests {
         // Esc cancels.
         app.handle_schedule_form_key(k(KeyCode::Esc));
         assert!(app.schedule_form.is_none());
+    }
+
+    #[tokio::test]
+    async fn subagent_lifecycle_tracks_children() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "c1".into(),
+            title: Some("research".into()),
+        })
+        .unwrap();
+        assert_eq!(app.chat.sub_agents.len(), 1);
+        assert_eq!(app.chat.sub_agents[0].status, "running");
+
+        // Duplicate start is ignored.
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "c1".into(),
+            title: None,
+        })
+        .unwrap();
+        assert_eq!(app.chat.sub_agents.len(), 1);
+
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "c1".into(),
+            status: "completed".into(),
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(app.chat.sub_agents[0].status, "completed");
     }
 }

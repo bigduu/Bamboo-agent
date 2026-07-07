@@ -192,6 +192,32 @@ fn build_message_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             push_tool_detail(&mut lines, tc, app.chat.expand_tools);
         }
 
+        // Sub-agents spawned by this run.
+        if !app.chat.sub_agents.is_empty() {
+            for sa in &app.chat.sub_agents {
+                let (icon, style) = match sa.status.as_str() {
+                    "running" => {
+                        let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
+                        (
+                            theme::BRAILLE_SPINNER[tick],
+                            Style::default().fg(colors::TOOL_RUNNING),
+                        )
+                    }
+                    "completed" => ("✓", Style::default().fg(colors::TOOL_DONE)),
+                    "error" | "cancelled" => ("✗", Style::default().fg(colors::TOOL_ERROR)),
+                    _ => ("·", Style::default().fg(colors::INACTIVE)),
+                };
+                let label = sa.title.clone().unwrap_or_else(|| {
+                    let short: String = sa.child_session_id.chars().take(8).collect();
+                    format!("sub-agent {short}")
+                });
+                lines.push(Line::from(Span::styled(
+                    format!(" {icon} ▸ {label} ({})", sa.status),
+                    style,
+                )));
+            }
+        }
+
         // Streaming thinking
         if !app.chat.current_reasoning.is_empty() {
             let sep_len: usize = 40;

@@ -130,6 +130,25 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+
+    // ── Sub-agent lifecycle (forwarded from the parent session's stream) ──
+    // Minimal projections of the server's SubAgent* events; extra server fields
+    // (parent_session_id, timestamp, the nested `event`) are ignored on decode.
+    SubAgentStarted {
+        child_session_id: String,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    SubAgentHeartbeat {
+        child_session_id: String,
+    },
+    SubAgentCompleted {
+        child_session_id: String,
+        /// "completed" | "cancelled" | "error" | "skipped"
+        status: String,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone)]
