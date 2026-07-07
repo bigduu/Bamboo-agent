@@ -533,17 +533,14 @@ impl App {
                     Err(e) => self.config.error = Some(e),
                 }
             }
-            AppEvent::ActionDone { status, reload_tab } => {
-                // Background-action results carry both successes ("Config saved")
-                // and failures ("Save failed: …"); log failures as errors so they
-                // survive in the notification history.
-                let lower = status.to_lowercase();
-                let level = if lower.contains("failed") || lower.contains("error") {
-                    NoticeLevel::Error
-                } else {
-                    NoticeLevel::Info
-                };
-                self.notify(level, status);
+            AppEvent::ActionDone {
+                outcome,
+                reload_tab,
+            } => {
+                match outcome {
+                    Ok(msg) => self.notify(NoticeLevel::Info, msg),
+                    Err(msg) => self.notify(NoticeLevel::Error, msg),
+                }
                 if reload_tab {
                     self.load_tab_data();
                 }
@@ -758,7 +755,7 @@ impl App {
     /// Submit an answer to the agent's pending question and resume the run.
     async fn submit_answer(&mut self, answer: String) -> Result<()> {
         let Some(session_id) = self.chat.session_id.clone() else {
-            self.status_message = "No active chat session to answer".to_string();
+            self.notify(NoticeLevel::Warn, "No active chat session to answer");
             self.pending_question = None;
             return Ok(());
         };
@@ -1204,17 +1201,16 @@ impl App {
                         } else {
                             client.connect_mcp(&id).await
                         };
-                        let status = match res {
-                            Ok(()) => if connected {
-                                "Disconnected"
+                        let outcome = match res {
+                            Ok(()) => Ok(if connected {
+                                "Disconnected".to_string()
                             } else {
-                                "Connected"
-                            }
-                            .to_string(),
-                            Err(e) => format!("MCP action failed: {e}"),
+                                "Connected".to_string()
+                            }),
+                            Err(e) => Err(format!("MCP action failed: {e}")),
                         };
                         let _ = tx.send(AppEvent::ActionDone {
-                            status,
+                            outcome,
                             reload_tab: true,
                         });
                     });
@@ -1258,14 +1254,21 @@ impl App {
             KeyCode::Char('d') => {
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
                     let id = schedule.id.clone();
-                    self.client.delete_schedule(&id).await?;
-                    self.load_tab_data();
+                    // Don't `?`-propagate: a failed delete must surface in the
+                    // log, not tear down the whole TUI event loop.
+                    match self.client.delete_schedule(&id).await {
+                        Ok(()) => self.load_tab_data(),
+                        Err(e) => self.notify(NoticeLevel::Error, format!("Delete failed: {e}")),
+                    }
                 }
             }
             KeyCode::Char('r') => {
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
-                    self.client.run_schedule_now(&schedule.id).await?;
-                    self.status_message = "Schedule triggered".to_string();
+                    let id = schedule.id.clone();
+                    match self.client.run_schedule_now(&id).await {
+                        Ok(()) => self.notify(NoticeLevel::Info, "Schedule triggered"),
+                        Err(e) => self.notify(NoticeLevel::Error, format!("Run failed: {e}")),
+                    }
                 }
             }
             _ => {}
@@ -1315,12 +1318,12 @@ impl App {
                 if let Some(tx) = self.event_tx.clone() {
                     let client = self.client.clone();
                     tokio::spawn(async move {
-                        let status = match client.create_schedule(req).await {
-                            Ok(_) => "Schedule created".to_string(),
-                            Err(e) => format!("Create failed: {e}"),
+                        let outcome = match client.create_schedule(req).await {
+                            Ok(()) => Ok("Schedule created".to_string()),
+                            Err(e) => Err(format!("Create failed: {e}")),
                         };
                         let _ = tx.send(AppEvent::ActionDone {
-                            status,
+                            outcome,
                             reload_tab: true,
                         });
                     });
@@ -1395,7 +1398,7 @@ impl App {
                         });
                     }
                     None => {
-                        self.status_message = "No config loaded to edit".to_string();
+                        self.notify(NoticeLevel::Warn, "No config loaded to edit");
                     }
                 }
             }
@@ -1425,12 +1428,12 @@ impl App {
                     if let Some(tx) = self.event_tx.clone() {
                         let client = self.client.clone();
                         tokio::spawn(async move {
-                            let status = match client.set_config(&val).await {
-                                Ok(()) => "Config saved".to_string(),
-                                Err(e) => format!("Save failed: {e}"),
+                            let outcome = match client.set_config(&val).await {
+                                Ok(()) => Ok("Config saved".to_string()),
+                                Err(e) => Err(format!("Save failed: {e}")),
                             };
                             let _ = tx.send(AppEvent::ActionDone {
-                                status,
+                                outcome,
                                 reload_tab: true,
                             });
                         });
