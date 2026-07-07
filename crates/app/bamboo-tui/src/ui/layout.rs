@@ -286,6 +286,61 @@ pub fn render_question(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+/// Modal form for creating a new schedule (opened with `n` on the Schedules tab).
+pub fn render_schedule_form(f: &mut Frame, app: &App) {
+    let Some(form) = &app.schedule_form else {
+        return;
+    };
+    let fields = [
+        ("Name", &form.name),
+        ("Cron", &form.cron),
+        ("Prompt", &form.prompt),
+    ];
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " New schedule",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+    for (i, (label, val)) in fields.iter().enumerate() {
+        let focused = i == form.field;
+        let cursor = if focused { "\u{258f}" } else { "" };
+        let style = if focused {
+            Style::default().fg(colors::BRAND)
+        } else {
+            Style::default().fg(colors::INACTIVE)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {label:<7}: "),
+                Style::default().fg(colors::SUBTLE),
+            ),
+            Span::styled(format!("{val}{cursor}"), style),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        "  Tab / \u{2191}\u{2193} field  \u{b7}  Enter create  \u{b7}  Esc cancel",
+    ));
+
+    let height = (lines.len() as u16 + 2).min(f.area().height);
+    let area = centered_rect(60, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::BRAND))
+        .title(" Schedule ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let popup_width = r.width * percent_x / 100;
     let x = (r.width.saturating_sub(popup_width)) / 2;
