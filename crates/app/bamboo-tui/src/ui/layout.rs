@@ -191,7 +191,10 @@ pub fn render_question(f: &mut Frame, app: &App) {
         return;
     };
 
-    let mut lines: Vec<Line> = vec![
+    let screen = f.area();
+    // Header: title + blank + (wrapped) question + blank. Cap the question to a
+    // few lines so a very long prompt can't push the options/footer off-screen.
+    let mut header: Vec<Line> = vec![
         Line::from(Span::styled(
             " Agent needs your input",
             Style::default()
@@ -200,27 +203,49 @@ pub fn render_question(f: &mut Frame, app: &App) {
         )),
         Line::raw(""),
     ];
-    for l in q.question.lines() {
-        lines.push(Line::raw(format!("  {l}")));
+    const MAX_QUESTION_LINES: usize = 6;
+    for l in q.question.lines().take(MAX_QUESTION_LINES) {
+        header.push(Line::raw(format!("  {l}")));
     }
-    lines.push(Line::raw(""));
+    if q.question.lines().count() > MAX_QUESTION_LINES {
+        header.push(Line::raw("  …"));
+    }
+    header.push(Line::raw(""));
 
+    let mut body: Vec<Line> = Vec::new();
     match &q.custom {
         Some(buf) => {
-            lines.push(Line::raw("  Type your answer:"));
-            lines.push(Line::from(Span::styled(
+            body.push(Line::raw("  Type your answer:"));
+            body.push(Line::from(Span::styled(
                 format!("  > {buf}\u{258f}"),
                 Style::default().fg(colors::BRAND),
             )));
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(if q.options.is_empty() {
+            body.push(Line::raw(""));
+            body.push(Line::raw(if q.options.is_empty() {
                 "  Enter answer  ·  Esc dismiss"
             } else {
                 "  Enter answer  ·  Esc back to options"
             }));
         }
         None => {
-            for (i, opt) in q.options.iter().enumerate() {
+            // Window the option list around the selection so it stays visible and
+            // the modal never overflows the screen, no matter how many options.
+            let max_h = screen.height.min(22);
+            // rows available for options = modal height - borders(2) - header - footer(1)
+            let budget = (max_h as usize).saturating_sub(2 + header.len() + 1).max(1);
+            let total = q.options.len();
+            let start = if total <= budget {
+                0
+            } else {
+                q.selected
+                    .saturating_sub(budget / 2)
+                    .min(total.saturating_sub(budget))
+            };
+            let end = (start + budget).min(total);
+            if start > 0 {
+                body.push(Line::raw(format!("  \u{2191} {start} more")));
+            }
+            for i in start..end {
                 let selected = i == q.selected;
                 let marker = if selected { "\u{203a}" } else { " " };
                 let style = if selected {
@@ -230,20 +255,25 @@ pub fn render_question(f: &mut Frame, app: &App) {
                 } else {
                     Style::default()
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("  {marker} {}. {opt}", i + 1),
+                body.push(Line::from(Span::styled(
+                    format!("  {marker} {}. {}", i + 1, q.options[i]),
                     style,
                 )));
             }
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(
+            if end < total {
+                body.push(Line::raw(format!("  \u{2193} {} more", total - end)));
+            }
+            body.push(Line::raw(""));
+            body.push(Line::raw(
                 "  \u{2191}/\u{2193} select  ·  Enter answer  ·  1-9 quick  ·  c custom  ·  Esc dismiss",
             ));
         }
     }
 
-    let height = (lines.len() as u16 + 2).min(f.area().height);
-    let area = centered_rect(60, height, f.area());
+    let mut lines = header;
+    lines.extend(body);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(60, height, screen);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
