@@ -17,6 +17,50 @@ fn is_skill_tool_chain_message(message: &Message) -> bool {
         })
     })
 }
+
+/// The `tool_call_id`s a message participates in: the ids of the tool calls an
+/// assistant message initiates, plus the id of the call a `tool` result answers.
+/// Two messages belong to the same tool chain iff these overlap.
+fn tool_chain_call_ids(message: &Message) -> impl Iterator<Item = String> + '_ {
+    message
+        .tool_calls
+        .iter()
+        .flatten()
+        .map(|call| call.id.clone())
+        .chain(message.tool_call_id.clone())
+}
+
+/// Close the compressed (`messages_to_summarize`) set over tool chains: repeatedly
+/// move any message still in `messages_to_keep` that shares a `tool_call_id` with
+/// an already-compressed message into the summarize set. This keeps an assistant
+/// `tool_calls` message and its matching `tool` result(s) on the same side — a
+/// split leaves an orphan `tool_result` (or a `tool_use` with no result) in the
+/// active set, which providers reject with a 400 that then poisons every
+/// subsequent request in the session (#340). Protected messages are left in place
+/// (skill chains are already fully protected upstream, so are never partially
+/// compressed; protected user messages carry no `tool_call_id`).
+fn close_compressed_set_over_tool_chains(
+    messages_to_keep: &mut Vec<Message>,
+    messages_to_summarize: &mut Vec<Message>,
+    protected_user_ids: &HashSet<String>,
+    never_compress_ids: &[String],
+) {
+    loop {
+        let compressed_call_ids: HashSet<String> = messages_to_summarize
+            .iter()
+            .flat_map(tool_chain_call_ids)
+            .collect();
+        let split_index = messages_to_keep.iter().position(|message| {
+            !protected_user_ids.contains(message.id.as_str())
+                && !never_compress_ids.contains(&message.id)
+                && tool_chain_call_ids(message).any(|id| compressed_call_ids.contains(&id))
+        });
+        match split_index {
+            Some(index) => messages_to_summarize.push(messages_to_keep.remove(index)),
+            None => break,
+        }
+    }
+}
 use chrono::Utc;
 use std::collections::HashSet;
 
@@ -380,6 +424,23 @@ fn build_compression_plan_with_summary_internal(
         let moved = messages_to_keep.remove(remove_index);
         messages_to_summarize.push(moved);
     }
+
+    // Tool-chain atomicity. The one-at-a-time eviction above can split a generic
+    // (non-skill) tool chain — compressing an assistant `tool_calls` message
+    // while keeping its `tool` result active, or vice versa. That leaves an
+    // orphan `tool_result` (or a `tool_use` with no result) in the active set,
+    // which providers reject with a 400 that then poisons EVERY subsequent
+    // request in the session. Close the compressed set over tool chains: keep
+    // moving any kept message that shares a `tool_call_id` with an
+    // already-compressed message into the summarize set until none remain.
+    // (Skill chains are fully protected above, so are never partially
+    // compressed; protected user messages carry no `tool_call_id`.)
+    close_compressed_set_over_tool_chains(
+        &mut messages_to_keep,
+        &mut messages_to_summarize,
+        &protected_user_ids,
+        &never_compress_ids,
+    );
 
     if messages_to_summarize.is_empty() {
         tracing::debug!(
@@ -1273,6 +1334,173 @@ mod tests {
                 msg.id
             );
         }
+    }
+
+    #[test]
+    fn generic_tool_chain_is_never_split_by_forced_compression() {
+        // A generic (non-skill) tool_use and its tool_result must never be split
+        // across the compression boundary — a split orphans one of them in the
+        // active set and the provider 400s, poisoning the session. #340.
+        let budget = TokenBudget {
+            max_context_tokens: 1200,
+            max_output_tokens: 100,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: 20,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
+        };
+        let mut session = Session::new("generic-chain-test", "gpt-4o-mini");
+        session.token_budget = Some(budget.clone());
+        session.add_message(Message::system("system"));
+
+        // A generic tool chain (search + its result) placed early so it is an
+        // eviction candidate; the large result makes it a prime compression target.
+        let mut call = Message::assistant(String::new(), None);
+        call.tool_calls = Some(vec![ToolCall {
+            id: "tc-gen".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"rust"}"#.to_string(),
+            },
+        }]);
+        session.add_message(call);
+        let mut result = Message::tool_result("tc-gen", &"search result payload ".repeat(20));
+        result.tool_success = Some(true);
+        session.add_message(result);
+
+        // Filler to push usage over budget and force eviction.
+        for i in 0..8 {
+            session.add_message(Message::user(format!(
+                "U{i}: {}",
+                "alpha beta gamma delta ".repeat(8)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{i}: {}", "analysis steps plan ".repeat(8)),
+                None,
+            ));
+        }
+
+        let plan = build_forced_compression_plan_with_summary(
+            &session,
+            "gpt-4o-mini",
+            Some(&budget),
+            "summary".to_string(),
+            CompressionTriggerType::Auto,
+        )
+        .expect("plan should build");
+
+        let compressed: HashSet<&str> = plan
+            .compressed_message_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let assistant_id = session
+            .messages
+            .iter()
+            .find(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|c| c.iter().any(|tc| tc.id == "tc-gen"))
+            })
+            .map(|m| m.id.as_str())
+            .expect("assistant tool_use message present");
+        let result_id = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("tc-gen"))
+            .map(|m| m.id.as_str())
+            .expect("tool_result message present");
+
+        // The tool_use and its tool_result must land on the SAME side.
+        assert_eq!(
+            compressed.contains(assistant_id),
+            compressed.contains(result_id),
+            "generic tool_use ({assistant_id}) and its tool_result ({result_id}) must not be split"
+        );
+    }
+
+    fn tool_use_message(call_id: &str) -> Message {
+        let mut assistant = Message::assistant(String::new(), None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: call_id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        assistant
+    }
+
+    #[test]
+    fn close_compressed_set_over_tool_chains_reunites_a_split_chain() {
+        // Pre-split state: the assistant tool_use is compressed while its
+        // tool_result was left in the keep (active) set — an orphan. #340.
+        let assistant = tool_use_message("tc-1");
+        let result = Message::tool_result("tc-1", "result payload");
+        let assistant_id = assistant.id.clone();
+        let result_id = result.id.clone();
+
+        let mut messages_to_keep = vec![result];
+        let mut messages_to_summarize = vec![assistant];
+
+        close_compressed_set_over_tool_chains(
+            &mut messages_to_keep,
+            &mut messages_to_summarize,
+            &HashSet::new(),
+            &[],
+        );
+
+        // The orphan tool_result must be pulled into the compressed set.
+        assert!(
+            messages_to_keep.is_empty(),
+            "orphaned tool_result must be moved into the compressed set"
+        );
+        let summarized: HashSet<&str> = messages_to_summarize
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(summarized.contains(assistant_id.as_str()));
+        assert!(summarized.contains(result_id.as_str()));
+    }
+
+    #[test]
+    fn close_compressed_set_over_tool_chains_respects_protected_messages() {
+        // A protected (never-compress) chain member must NOT be force-compressed.
+        let assistant = tool_use_message("tc-2");
+        let result = Message::tool_result("tc-2", "result");
+        let result_id = result.id.clone();
+
+        let mut messages_to_keep = vec![result];
+        let mut messages_to_summarize = vec![assistant];
+        let never_compress_ids = vec![result_id.clone()];
+
+        close_compressed_set_over_tool_chains(
+            &mut messages_to_keep,
+            &mut messages_to_summarize,
+            &HashSet::new(),
+            &never_compress_ids,
+        );
+
+        assert_eq!(
+            messages_to_keep.len(),
+            1,
+            "protected result must stay in keep"
+        );
+        assert_eq!(messages_to_keep[0].id, result_id);
     }
 
     #[test]
