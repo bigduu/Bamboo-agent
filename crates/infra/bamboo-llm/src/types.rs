@@ -36,26 +36,6 @@ pub enum LLMChunk {
     Done,
 }
 
-impl LLMChunk {
-    /// Collapse [`LLMChunk::ToolCallsIndexed`] into [`LLMChunk::ToolCalls`],
-    /// dropping the per-call indices.
-    ///
-    /// The indexed variant exists so the engine's streaming accumulator can route
-    /// argument fragments by index (#236). Consumers that only need the flattened
-    /// tool calls — the bamboo-server proxy handlers that re-serialize chunks to a
-    /// downstream client, and any collector that does its own or no accumulation —
-    /// call this to treat both variants uniformly. The engine accumulator handles
-    /// the indexed variant directly and does NOT use this.
-    pub fn normalize_tool_calls(self) -> Self {
-        match self {
-            LLMChunk::ToolCallsIndexed(calls) => {
-                LLMChunk::ToolCalls(calls.into_iter().map(|(_, call)| call).collect())
-            }
-            other => other,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,34 +56,6 @@ mod tests {
             LLMChunk::ReasoningToken(s) => assert_eq!(s, "Thinking..."),
             _ => panic!("Expected ReasoningToken variant"),
         }
-    }
-
-    #[test]
-    fn normalize_tool_calls_flattens_indexed_variant() {
-        let tc = |id: &str| ToolCall {
-            id: id.to_string(),
-            tool_type: "function".to_string(),
-            function: bamboo_domain::FunctionCall {
-                name: "f".to_string(),
-                arguments: String::new(),
-            },
-        };
-        let chunk = LLMChunk::ToolCallsIndexed(vec![(1, tc("b")), (0, tc("a"))]);
-        match chunk.normalize_tool_calls() {
-            // Order is preserved (indices only dropped), not re-sorted.
-            LLMChunk::ToolCalls(calls) => {
-                assert_eq!(calls.len(), 2);
-                assert_eq!(calls[0].id, "b");
-                assert_eq!(calls[1].id, "a");
-            }
-            other => panic!("expected ToolCalls, got {other:?}"),
-        }
-
-        // Non-tool-call chunks pass through untouched.
-        assert!(matches!(
-            LLMChunk::Token("x".to_string()).normalize_tool_calls(),
-            LLMChunk::Token(_)
-        ));
     }
 
     #[test]
