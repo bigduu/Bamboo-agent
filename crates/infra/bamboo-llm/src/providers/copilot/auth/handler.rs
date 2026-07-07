@@ -56,6 +56,7 @@ use anyhow::anyhow;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::{
     fs::{read_to_string, File},
@@ -247,6 +248,75 @@ mod tests {
             anyhow::Error::msg("Copilot token request failed: HTTP 503 - service unavailable");
         assert!(!CopilotAuthHandler::should_discard_access_token(&err_503));
     }
+
+    fn count_tmp_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count()
+    }
+
+    /// The atomic write must leave the cache readable and drop no temp litter.
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let dir = tempdir().expect("tempdir");
+        let handler = CopilotAuthHandler::new(test_http_client(), dir.path().to_path_buf(), false);
+        let token_path = dir.path().join(".copilot_token.json");
+
+        handler
+            .write_cached_copilot_config(&token_path, &sample_config(1))
+            .expect("write cache");
+
+        assert!(handler.read_cached_copilot_config(&token_path).is_some());
+        assert_eq!(count_tmp_files(dir.path()), 0, "no .tmp files should remain");
+    }
+
+    /// Concurrent writers (the #237 401-burst scenario) must never leave the
+    /// cache torn: unique temp names + atomic rename mean the final file always
+    /// parses cleanly and no temp files are orphaned.
+    #[test]
+    fn concurrent_writes_never_corrupt_cache() {
+        let dir = tempdir().expect("tempdir");
+        let handler = Arc::new(CopilotAuthHandler::new(
+            test_http_client(),
+            dir.path().to_path_buf(),
+            false,
+        ));
+        let token_path = dir.path().join(".copilot_token.json");
+
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| {
+                let handler = Arc::clone(&handler);
+                let token_path = token_path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        handler
+                            .write_cached_copilot_config(&token_path, &sample_config(i))
+                            .expect("write cache");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        // Final file must parse (never a partial write).
+        assert!(
+            handler.read_cached_copilot_config(&token_path).is_some(),
+            "cache must be a complete, parseable file after concurrent writes"
+        );
+        assert_eq!(
+            count_tmp_files(dir.path()),
+            0,
+            "no orphaned .tmp files after concurrent writes"
+        );
+    }
 }
 
 /// API endpoint configuration for Copilot services.
@@ -336,9 +406,18 @@ impl AccessTokenResponse {
 // across the entire application. This prevents race conditions where multiple
 // concurrent requests could trigger separate authentication flows.
 //
-// The lock is acquired in `CopilotAuthHandler::get_chat_token` before
-// attempting silent authentication or starting a new device flow.
+// The lock is acquired by every public token entry point — `get_chat_token`,
+// `try_get_chat_token_silent`, and `force_refresh_chat_token` — before touching
+// the upstream exchange or the `.copilot_token.json` cache. Without this, a 401
+// burst let N concurrent `force_refresh_chat_token` calls each run a fresh
+// GitHub token exchange (thundering herd) and each racingly rewrite the cache
+// file (#237). The internal `*_locked` helpers assume the lock is already held.
 static CHAT_TOKEN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+// Monotonic sequence used only to give each atomic cache write a unique temp
+// filename (combined with the process id), so overlapping writers never share a
+// temp path.
+static CACHE_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Handler for GitHub Copilot authentication.
 ///
@@ -537,8 +616,9 @@ impl CopilotAuthHandler {
         // Acquire global lock to ensure sequential execution
         let _guard = CHAT_TOKEN_LOCK.lock().await;
 
-        // Try silent authentication first
-        if let Some(token) = self.try_get_chat_token_silent().await? {
+        // Try silent authentication first (lock already held; use the inner
+        // helper to avoid re-locking the non-reentrant mutex).
+        if let Some(token) = self.try_get_chat_token_silent_locked().await? {
             return Ok(token);
         }
 
@@ -613,8 +693,37 @@ impl CopilotAuthHandler {
         copilot_config: &CopilotConfig,
     ) -> anyhow::Result<()> {
         let serialized = serde_json::to_string(copilot_config)?;
-        let mut file = File::create(token_path)?;
-        file.write_all(serialized.as_bytes())?;
+
+        // Atomic write: serialize into a uniquely-named temp file in the same
+        // directory, flush it, then rename over the target. A concurrent reader
+        // then always observes either the old or the new COMPLETE file, never a
+        // torn/partial one. The previous `File::create` truncated-then-wrote in
+        // place, so a reader could parse a half-written file, fail, and trigger a
+        // spurious re-exchange. (#237)
+        let dir = token_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let tmp_path = dir.join(format!(
+            ".copilot_token.{}.{}.tmp",
+            std::process::id(),
+            CACHE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let write_tmp = || -> std::io::Result<()> {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(serialized.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write_tmp() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, token_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -866,6 +975,15 @@ impl CopilotAuthHandler {
     /// # }
     /// ```
     pub async fn try_get_chat_token_silent(&self) -> anyhow::Result<Option<String>> {
+        // Serialize with every other token operation so a silent exchange can't
+        // race a concurrent refresh's cache write (#237).
+        let _guard = CHAT_TOKEN_LOCK.lock().await;
+        self.try_get_chat_token_silent_locked().await
+    }
+
+    /// Lock-free core of [`Self::try_get_chat_token_silent`]. The caller MUST
+    /// already hold `CHAT_TOKEN_LOCK`.
+    async fn try_get_chat_token_silent_locked(&self) -> anyhow::Result<Option<String>> {
         let copilot_token_path = self.app_data_dir.join(".copilot_token.json");
 
         // Check cached copilot token
@@ -916,6 +1034,31 @@ impl CopilotAuthHandler {
     /// - `Ok(Some(token))` if the refresh succeeded
     /// - `Ok(None)` if no cached access token exists
     pub async fn force_refresh_chat_token(&self) -> anyhow::Result<Option<String>> {
+        let copilot_token_path = self.app_data_dir.join(".copilot_token.json");
+
+        // Snapshot the cached token BEFORE contending for the lock, so that after
+        // we acquire it we can tell whether another caller already refreshed the
+        // token while we waited. On a 401 burst this collapses N upstream
+        // exchanges into one. (#237)
+        let pre_token = self
+            .read_cached_copilot_config(&copilot_token_path)
+            .map(|c| c.token);
+
+        // Serialize the exchange + cache write. Without this, concurrent callers
+        // each hit GitHub and each rewrite the cache file simultaneously.
+        let _guard = CHAT_TOKEN_LOCK.lock().await;
+
+        // Double-checked: if the cached token changed while we were blocked and
+        // is now valid, another caller already performed the refresh — reuse it
+        // instead of exchanging again. We only reuse a token that DIFFERS from
+        // the one we saw pre-lock, so we never hand back the rejected token that
+        // prompted this refresh.
+        if let Some(cached) = self.read_cached_copilot_config(&copilot_token_path) {
+            if self.is_copilot_token_valid(&cached) && Some(&cached.token) != pre_token.as_ref() {
+                return Ok(Some(cached.token));
+            }
+        }
+
         let token_path = self.app_data_dir.join(".token");
         let Some(access_token_str) = Self::read_access_token(&token_path) else {
             return Ok(None);
@@ -924,7 +1067,6 @@ impl CopilotAuthHandler {
         let access_token = AccessTokenResponse::from_token(access_token_str);
         match self.get_copilot_token(access_token).await {
             Ok(copilot_config) => {
-                let copilot_token_path = self.app_data_dir.join(".copilot_token.json");
                 self.write_cached_copilot_config(&copilot_token_path, &copilot_config)?;
                 Ok(Some(copilot_config.token))
             }
