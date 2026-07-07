@@ -139,40 +139,50 @@ impl Config {
     }
 
     pub fn refresh_provider_api_keys_encrypted(&mut self) -> Result<()> {
+        // Env-injected keys (`api_key_from_env`) are runtime-only: leave
+        // `api_key_encrypted` untouched so they're never baked into config.json
+        // on save (which would otherwise persist the secret even after the env
+        // var is removed). (#253)
         if let Some(openai) = self.providers.openai.as_mut() {
-            let api_key = openai.api_key.trim();
-            openai.api_key_encrypted = if api_key.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::encryption::encrypt(api_key)
-                        .context("Failed to encrypt OpenAI api_key")?,
-                )
-            };
+            if !openai.api_key_from_env {
+                let api_key = openai.api_key.trim();
+                openai.api_key_encrypted = if api_key.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::encryption::encrypt(api_key)
+                            .context("Failed to encrypt OpenAI api_key")?,
+                    )
+                };
+            }
         }
 
         if let Some(anthropic) = self.providers.anthropic.as_mut() {
-            let api_key = anthropic.api_key.trim();
-            anthropic.api_key_encrypted = if api_key.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::encryption::encrypt(api_key)
-                        .context("Failed to encrypt Anthropic api_key")?,
-                )
-            };
+            if !anthropic.api_key_from_env {
+                let api_key = anthropic.api_key.trim();
+                anthropic.api_key_encrypted = if api_key.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::encryption::encrypt(api_key)
+                            .context("Failed to encrypt Anthropic api_key")?,
+                    )
+                };
+            }
         }
 
         if let Some(gemini) = self.providers.gemini.as_mut() {
-            let api_key = gemini.api_key.trim();
-            gemini.api_key_encrypted = if api_key.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::encryption::encrypt(api_key)
-                        .context("Failed to encrypt Gemini api_key")?,
-                )
-            };
+            if !gemini.api_key_from_env {
+                let api_key = gemini.api_key.trim();
+                gemini.api_key_encrypted = if api_key.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::encryption::encrypt(api_key)
+                            .context("Failed to encrypt Gemini api_key")?,
+                    )
+                };
+            }
         }
 
         if let Some(bodhi) = self.providers.bodhi.as_mut() {

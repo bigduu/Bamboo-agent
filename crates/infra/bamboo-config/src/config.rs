@@ -46,6 +46,10 @@
 //! - `BAMBOO_BIND`: Override server bind address
 //! - `BAMBOO_PROVIDER`: Override default provider
 //! - `BAMBOO_HEADLESS`: Enable headless authentication mode
+//! - `BAMBOO_OPENAI_API_KEY` / `BAMBOO_ANTHROPIC_API_KEY` / `BAMBOO_GEMINI_API_KEY`:
+//!   Supply a provider's API key from the environment (in-memory only, never
+//!   persisted) — for 12-factor / secret-manager / CI deploys without a
+//!   plaintext key in config.json.
 
 use anyhow::{Context, Result};
 use bamboo_domain::poison::PoisonRecover;
@@ -904,7 +908,7 @@ fn default_true_hooks() -> bool {
 ///   "model": "gpt-4"
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAIConfig {
     /// OpenAI API key (plaintext, in-memory only).
     ///
@@ -914,6 +918,12 @@ pub struct OpenAIConfig {
     /// Encrypted OpenAI API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
+    /// Such keys are runtime-only and MUST NOT be re-encrypted into
+    /// `api_key_encrypted` on save (that would bake the secret into
+    /// config.json). Not (de)serialized. (#253)
+    #[serde(skip)]
+    pub api_key_from_env: bool,
     /// Custom API base URL (for Azure or self-hosted deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -960,7 +970,7 @@ pub struct OpenAIConfig {
 ///   "max_tokens": 4096
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     /// Anthropic API key (plaintext, in-memory only).
     ///
@@ -970,6 +980,12 @@ pub struct AnthropicConfig {
     /// Encrypted Anthropic API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
+    /// Such keys are runtime-only and MUST NOT be re-encrypted into
+    /// `api_key_encrypted` on save (that would bake the secret into
+    /// config.json). Not (de)serialized. (#253)
+    #[serde(skip)]
+    pub api_key_from_env: bool,
     /// Custom API base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -1009,7 +1025,7 @@ pub struct AnthropicConfig {
 ///   "model": "gemini-2.0-flash-exp"
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GeminiConfig {
     /// Google AI API key (plaintext, in-memory only).
     ///
@@ -1019,6 +1035,12 @@ pub struct GeminiConfig {
     /// Encrypted Google AI API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
+    /// Such keys are runtime-only and MUST NOT be re-encrypted into
+    /// `api_key_encrypted` on save (that would bake the secret into
+    /// config.json). Not (de)serialized. (#253)
+    #[serde(skip)]
+    pub api_key_from_env: bool,
     /// Custom API base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -1519,6 +1541,46 @@ impl Config {
         if let Ok(project_first_dream) = std::env::var("BAMBOO_MEMORY_PROJECT_FIRST_DREAM") {
             let memory = self.memory.get_or_insert_with(MemoryConfig::default);
             memory.project_first_dream = parse_bool_env(&project_first_dream);
+        }
+
+        // Per-provider API keys from the environment (highest priority). Lets a
+        // 12-factor / secret-manager / --env-file / k8s-Secret deploy supply the
+        // key at runtime instead of baking a plaintext `api_key` into a mounted
+        // config.json. The `api_key_from_env` flag keeps `refresh_provider_api_keys_encrypted`
+        // from re-encrypting these keys into `api_key_encrypted` on a later save,
+        // so an env key is never persisted to disk. (#253)
+        if let Ok(key) = std::env::var("BAMBOO_OPENAI_API_KEY") {
+            let key = key.trim();
+            if !key.is_empty() {
+                let openai = self
+                    .providers
+                    .openai
+                    .get_or_insert_with(OpenAIConfig::default);
+                openai.api_key = key.to_string();
+                openai.api_key_from_env = true;
+            }
+        }
+        if let Ok(key) = std::env::var("BAMBOO_ANTHROPIC_API_KEY") {
+            let key = key.trim();
+            if !key.is_empty() {
+                let anthropic = self
+                    .providers
+                    .anthropic
+                    .get_or_insert_with(AnthropicConfig::default);
+                anthropic.api_key = key.to_string();
+                anthropic.api_key_from_env = true;
+            }
+        }
+        if let Ok(key) = std::env::var("BAMBOO_GEMINI_API_KEY") {
+            let key = key.trim();
+            if !key.is_empty() {
+                let gemini = self
+                    .providers
+                    .gemini
+                    .get_or_insert_with(GeminiConfig::default);
+                gemini.api_key = key.to_string();
+                gemini.api_key_from_env = true;
+            }
         }
     }
 
@@ -3153,6 +3215,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: BTreeMap::new(),
+            api_key_from_env: false,
         });
         config.memory = Some(MemoryConfig {
             background_model: Some("memory-fast".to_string()),
@@ -3181,6 +3244,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: BTreeMap::new(),
+            api_key_from_env: false,
         });
 
         assert_eq!(
@@ -3205,6 +3269,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: BTreeMap::new(),
+            api_key_from_env: false,
         });
 
         assert!(config.get_memory_background_model().is_none());
@@ -3320,6 +3385,79 @@ mod tests {
         assert!(!memory.relevant_recall);
         assert!(memory.relevant_recall_rerank);
         assert!(!memory.project_first_dream);
+    }
+
+    #[test]
+    fn provider_api_keys_injected_from_env_and_never_persisted() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
+        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", "sk-ant-from-env");
+        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", "sk-oai-from-env");
+
+        // No config.json on disk → the providers are created from the env keys
+        // alone (#253: deploy without a plaintext api_key in a mounted file).
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
+        assert_eq!(
+            config
+                .providers
+                .anthropic
+                .as_ref()
+                .expect("anthropic created from env")
+                .api_key,
+            "sk-ant-from-env"
+        );
+        assert_eq!(
+            config
+                .providers
+                .openai
+                .as_ref()
+                .expect("openai created from env")
+                .api_key,
+            "sk-oai-from-env"
+        );
+        // An unset provider is not fabricated.
+        assert!(config.providers.gemini.is_none());
+
+        // The real "never persisted" guarantee: saving the config must NOT bake
+        // the env key into config.json — not as plaintext AND not re-encrypted
+        // into `api_key_encrypted` (which save's `refresh_provider_api_keys_encrypted`
+        // would otherwise do). This is what actually happens on the server when
+        // any unrelated setting is saved / on a fabric-reconcile boot.
+        config
+            .save_to_dir(temp_home.path.clone())
+            .expect("save config");
+        let on_disk = std::fs::read_to_string(temp_home.path.join("config.json"))
+            .expect("read persisted config.json");
+        assert!(
+            !on_disk.contains("sk-ant-from-env") && !on_disk.contains("sk-oai-from-env"),
+            "env key must not be persisted as plaintext"
+        );
+        let disk_json: serde_json::Value = serde_json::from_str(&on_disk).expect("parse");
+        assert!(
+            disk_json["providers"]["anthropic"]
+                .get("api_key_encrypted")
+                .is_none(),
+            "env-sourced anthropic key must not be re-encrypted into config.json"
+        );
+        assert!(
+            disk_json["providers"]["openai"]
+                .get("api_key_encrypted")
+                .is_none(),
+            "env-sourced openai key must not be re-encrypted into config.json"
+        );
+
+        // And once the env vars are gone, a reload from that same dir has no key
+        // (nothing was persisted).
+        drop(_anthropic);
+        drop(_openai);
+        let reloaded = Config::from_data_dir(Some(temp_home.path.clone()));
+        assert!(reloaded
+            .providers
+            .anthropic
+            .as_ref()
+            .map(|a| a.api_key.is_empty())
+            .unwrap_or(true));
     }
 
     #[test]
@@ -3620,6 +3758,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
 
         config
@@ -4066,6 +4205,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         config.features.provider_model_ref = true;
         config.defaults = Some(DefaultsConfig {
@@ -4101,6 +4241,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         config.features.provider_model_ref = false;
         config.defaults = Some(DefaultsConfig {
@@ -4136,6 +4277,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         config.features.provider_model_ref = true;
         config.defaults = Some(DefaultsConfig {
@@ -4177,6 +4319,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         config.features.provider_model_ref = false;
         config.defaults = Some(DefaultsConfig {
@@ -4244,6 +4387,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         config.features.provider_model_ref = true;
         config.defaults = Some(DefaultsConfig {
@@ -4317,6 +4461,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             extra: Default::default(),
+            api_key_from_env: false,
         });
         config.features.provider_model_ref = false;
         config.defaults = Some(DefaultsConfig {
