@@ -741,70 +741,15 @@ fn refresh_auxiliary_models_for_round(state: &mut LoopRunState, config: &AgentLo
 
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_no_tool_calls(
-    content: String,
-    reasoning: Option<String>,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    round_usage: MetricsTokenUsage,
-    session: &mut Session,
-    event_tx: &mpsc::Sender<AgentEvent>,
+/// Record the terminal `Complete` round metrics for a no-tool-calls turn. Shared
+/// by the gold-continue and the completion branches of [`handle_no_tool_calls`].
+fn record_no_tool_calls_round_completed(
     metrics_collector: Option<&MetricsCollector>,
     round_id: &str,
     session_id: &str,
-    config: &AgentLoopConfig,
-    task_context: &Option<TaskLoopContext>,
-    eval_model: &str,
-    iteration: u32,
-    llm: Arc<dyn LLMProvider>,
-) -> TurnOutcome {
-    session.add_message(Message::assistant_with_reasoning(content, None, reasoning));
-
-    // Terminal goal gate: when an autonomous goal is active, decide whether to
-    // keep working toward it INSTEAD of completing. The agent self-reports
-    // completion via `update_goal`, and a side-channel Gold double-check
-    // verifies the objective before the run actually stops. Running this inside
-    // the loop means the run emits a single terminal `Complete` only when the
-    // goal is truly done — keeping `is_running` accurate and the SSE stream open.
-    let decision = evaluate_gold_terminal(
-        session,
-        task_context,
-        config,
-        eval_model,
-        config.reasoning_effort,
-        session_id,
-        iteration,
-        llm,
-        event_tx,
-    )
-    .await;
-
-    let outcome = match decision {
-        GoldTerminalDecision::Continue { continuation_count } => {
-            tracing::info!(
-                "[{}] Goal terminal gate: continuing toward goal (continuation {})",
-                session_id,
-                continuation_count
-            );
-            TurnOutcome {
-                should_break: false,
-                sent_complete: false,
-            }
-        }
-        GoldTerminalDecision::Stop => {
-            let _ = event_tx
-                .send(AgentEvent::Complete {
-                    usage: to_event_token_usage(prompt_tokens, completion_tokens),
-                })
-                .await;
-            TurnOutcome {
-                should_break: true,
-                sent_complete: true,
-            }
-        }
-    };
-
+    session: &Session,
+    round_usage: MetricsTokenUsage,
+) {
     crate::runtime::runner::metrics_lifecycle::record_round_completed(
         metrics_collector,
         round_id,
@@ -825,8 +770,136 @@ async fn handle_no_tool_calls(
             .unwrap_or(0),
         None,
     );
+}
 
-    outcome
+/// Handle a terminal round where the model emitted NO tool calls.
+///
+/// Gate ordering (issue #343): the goal-continuation (Gold) gate is evaluated
+/// FIRST, before the guardian review gate.
+///
+/// * When an autonomous goal loop is active and the objective is not yet met, the
+///   Gold gate injects a hidden continuation and the run keeps working WITHOUT
+///   touching the guardian — so a premature terminal never spends a bounded
+///   guardian review (spawn + durable suspend/resume + LLM cost) reviewing an
+///   INCOMPLETE state the goal loop already knows is not done.
+/// * Only once Gold decides to STOP (the goal is met, or no goal loop is
+///   configured) does the guardian review gate run, so the reviewer always sees
+///   the genuinely-final state. When the guardian approves (or is inactive / out
+///   of budget) the run emits its single terminal `Complete`.
+///
+/// Preserved cases: with no goal loop configured Gold is a trivial `Stop`, so the
+/// guardian runs exactly as before; with no guardian configured the goal loop
+/// runs exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn handle_no_tool_calls(
+    content: String,
+    reasoning: Option<String>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    round_usage: MetricsTokenUsage,
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    metrics_collector: Option<&MetricsCollector>,
+    round_id: &str,
+    session_id: &str,
+    config: &AgentLoopConfig,
+    task_context: &Option<TaskLoopContext>,
+    eval_model: &str,
+    iteration: u32,
+    llm: Arc<dyn LLMProvider>,
+) -> TurnOutcome {
+    // The Gold judge reads the recent transcript, so when the goal loop is active
+    // the assistant's final turn must be in the session BEFORE the gate runs
+    // (matching the pre-#343 add-before-gold order). When no goal loop is active
+    // the gate is a trivial `Stop` that reads nothing; in that case defer adding
+    // the message until the run actually completes, so a guardian suspend on the
+    // Stop path does NOT persist a message the resumed turn re-emits — preserving
+    // the exact pre-#343 no-goal guardian behavior (the guardian ran before the
+    // assistant message was appended).
+    let add_message_before_gold = config.goal_loop_active();
+    let mut deferred_assistant_message =
+        Some(Message::assistant_with_reasoning(content, None, reasoning));
+    if add_message_before_gold {
+        if let Some(message) = deferred_assistant_message.take() {
+            session.add_message(message);
+        }
+    }
+
+    // Terminal goal gate FIRST (issue #343): when an autonomous goal is active,
+    // decide whether to keep working toward it INSTEAD of completing. The agent
+    // self-reports completion via `update_goal`, and a side-channel Gold
+    // double-check verifies the objective before the run actually stops. Running
+    // this inside the loop means the run emits a single terminal `Complete` only
+    // when the goal is truly done — keeping `is_running` accurate and the SSE
+    // stream open.
+    let decision = evaluate_gold_terminal(
+        session,
+        task_context,
+        config,
+        eval_model,
+        config.reasoning_effort,
+        session_id,
+        iteration,
+        llm,
+        event_tx,
+    )
+    .await;
+
+    if let GoldTerminalDecision::Continue { continuation_count } = decision {
+        tracing::info!(
+            "[{}] Goal terminal gate: continuing toward goal (continuation {})",
+            session_id,
+            continuation_count
+        );
+        record_no_tool_calls_round_completed(
+            metrics_collector,
+            round_id,
+            session_id,
+            session,
+            round_usage,
+        );
+        return TurnOutcome {
+            should_break: false,
+            sent_complete: false,
+        };
+    }
+
+    // Gold decided STOP: the goal is met, or no goal loop is configured. Only now
+    // review the genuinely-final state. Adversarial guardian review: before
+    // completing, spawn a read-only reviewer child to verify the work and suspend
+    // until its verdict returns. `maybe_spawn_guardian_review` returns `Some` when
+    // it engages a review (spawn + suspend); it is inert unless a guardian config
+    // + spawner are wired (`config.guardian_active()`).
+    if let Some(review) =
+        maybe_spawn_guardian_review(session, config, task_context, runtime_state, iteration).await
+    {
+        // Suspended on the guardian verdict. In the no-goal case the assistant
+        // message was intentionally not appended yet (the resumed turn re-emits
+        // it), so nothing to roll back here.
+        return review;
+    }
+
+    // Guardian approved, inactive, or out of budget → complete the run.
+    if let Some(message) = deferred_assistant_message.take() {
+        session.add_message(message);
+    }
+    let _ = event_tx
+        .send(AgentEvent::Complete {
+            usage: to_event_token_usage(prompt_tokens, completion_tokens),
+        })
+        .await;
+    record_no_tool_calls_round_completed(
+        metrics_collector,
+        round_id,
+        session_id,
+        session,
+        round_usage,
+    );
+    TurnOutcome {
+        should_break: true,
+        sent_complete: true,
+    }
 }
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
@@ -1303,22 +1376,12 @@ pub(super) async fn run_pipeline(
                     turn_outcome = Some(suspend);
                     break;
                 }
-                // Adversarial guardian review: before completing, spawn a
-                // read-only reviewer child to verify the work and suspend until
-                // its verdict returns. Inert unless a guardian config + spawner
-                // are wired (`config.guardian_active()`).
-                if let Some(review) = maybe_spawn_guardian_review(
-                    session,
-                    config,
-                    &state.task_context,
-                    &mut state.runtime_state,
-                    turn_counter + 1,
-                )
-                .await
-                {
-                    turn_outcome = Some(review);
-                    break;
-                }
+                // Terminal handling for a no-tool-calls round. The Gold
+                // goal-continuation gate is evaluated FIRST inside
+                // `handle_no_tool_calls`; the adversarial guardian review gate
+                // only runs once Gold decides to STOP, so a premature terminal
+                // (goal not met) loops on a continuation without spending a
+                // guardian review on incomplete work (issue #343).
                 let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                     .then_some(stream_output.reasoning_content);
                 let eval_model = state
@@ -1334,6 +1397,7 @@ pub(super) async fn run_pipeline(
                         llm_output.completion_tokens,
                         llm_output.round_usage,
                         session,
+                        &mut state.runtime_state,
                         event_tx,
                         state.metrics_collector.as_ref(),
                         &round_id,
@@ -2016,6 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn no_tool_calls_does_not_complete_when_gold_continues() {
         let mut session = Session::new("session-1", "model");
+        let mut runtime_state = AgentRuntimeState::new("session-1".to_string());
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
         let outcome = super::handle_no_tool_calls(
@@ -2025,6 +2090,7 @@ mod tests {
             5,
             round_usage(),
             &mut session,
+            &mut runtime_state,
             &tx,
             None,
             "round-1",
@@ -2073,6 +2139,7 @@ mod tests {
     #[tokio::test]
     async fn no_tool_calls_completes_when_gold_achieved() {
         let mut session = Session::new("session-1", "model");
+        let mut runtime_state = AgentRuntimeState::new("session-1".to_string());
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
         let outcome = super::handle_no_tool_calls(
@@ -2082,6 +2149,7 @@ mod tests {
             5,
             round_usage(),
             &mut session,
+            &mut runtime_state,
             &tx,
             None,
             "round-1",
@@ -2129,6 +2197,7 @@ mod tests {
     async fn e2e_goal_loop_continue_then_declare_then_complete() {
         let mut session = Session::new("session-e2e", "model");
         let config = gold_continue_config();
+        let mut runtime_state = AgentRuntimeState::new("session-e2e".to_string());
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
         // --- Round 1: premature finish, undeclared, judge says continue ---
@@ -2139,6 +2208,7 @@ mod tests {
             5,
             round_usage(),
             &mut session,
+            &mut runtime_state,
             &tx,
             None,
             "round-1",
@@ -2180,6 +2250,7 @@ mod tests {
             5,
             round_usage(),
             &mut session,
+            &mut runtime_state,
             &tx,
             None,
             "round-2",
@@ -2221,6 +2292,7 @@ mod tests {
     async fn e2e_goal_loop_double_check_vetoes_premature_complete() {
         let mut session = Session::new("session-e2e2", "model");
         let config = gold_continue_config();
+        let mut runtime_state = AgentRuntimeState::new("session-e2e2".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
 
         // Agent prematurely declares completion.
@@ -2235,6 +2307,7 @@ mod tests {
             5,
             round_usage(),
             &mut session,
+            &mut runtime_state,
             &tx,
             None,
             "round-1",
@@ -2259,6 +2332,151 @@ mod tests {
             "stale declaration cleared on veto"
         );
         assert_eq!(st.continuation_count, 1);
+    }
+
+    // ---- Gold-then-guardian gate ordering (issue #343) ----
+
+    /// An `AgentLoopConfig` with BOTH the autonomous goal loop and the guardian
+    /// review gate active — the overlap issue #343 reorders.
+    fn guardian_and_gold_config(max_reviews: u32) -> crate::runtime::config::AgentLoopConfig {
+        let spawner: Arc<dyn GuardianSpawner> = Arc::new(MockGuardianSpawner {
+            child_id: "guardian-child".to_string(),
+        });
+        crate::runtime::config::AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("finish the task".to_string()),
+                max_auto_continuations: 3,
+                ..crate::runtime::config::GoldConfig::default()
+            }),
+            guardian_config: Some(GuardianConfig {
+                enabled: true,
+                model_name: Some("guardian-test-model".to_string()),
+                max_reviews,
+            }),
+            guardian_spawner: Some(spawner),
+            ..crate::runtime::config::AgentLoopConfig::default()
+        }
+    }
+
+    /// THE ordering fix (issue #343): with BOTH a guardian and an autonomous goal
+    /// loop configured, a premature terminal — the model stops emitting tool calls
+    /// but the goal is NOT met, so Gold decides CONTINUE — must inject a
+    /// continuation and keep working WITHOUT spawning a guardian review of the
+    /// incomplete state. Before the fix the guardian gate ran first and would have
+    /// spawned a review + suspended here, burning its bounded budget (and a
+    /// suspend/resume cycle) on work the goal loop already knew was unfinished —
+    /// and, once approved, would never re-review the truly-final state.
+    #[tokio::test]
+    async fn gold_continue_skips_guardian_review() {
+        let mut session = Session::new("s343-continue", "model");
+        let config = guardian_and_gold_config(2);
+        let mut runtime_state = AgentRuntimeState::new("s343-continue".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = super::handle_no_tool_calls(
+            "tentative — I think that's everything".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-1",
+            "s343-continue",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "continue",
+                confidence: "high",
+            }),
+        )
+        .await;
+
+        // The run keeps working: no break, no terminal Complete.
+        assert!(!outcome.should_break);
+        assert!(!outcome.sent_complete);
+
+        // The guardian was NOT engaged: no suspend and no review budget charged.
+        assert!(
+            runtime_state.waiting_for_children.is_none(),
+            "a premature terminal must NOT suspend on a guardian review",
+        );
+        assert!(
+            read_guardian_state(&session).is_none(),
+            "no guardian review budget may be spent before the goal is met",
+        );
+
+        // A hidden continuation was injected after the assistant message.
+        assert_eq!(session.messages.len(), 2);
+        let last = session.messages.last().unwrap();
+        assert_eq!(
+            last.metadata
+                .as_ref()
+                .and_then(|m| m.get("runtime_kind"))
+                .and_then(|v| v.as_str()),
+            Some("goal_continue"),
+        );
+    }
+
+    /// Counterpart to [`gold_continue_skips_guardian_review`]: once Gold decides
+    /// STOP (the goal is met), the guardian reviews the genuinely-final state —
+    /// spawning a reviewer child and suspending the run on its verdict rather than
+    /// completing outright.
+    #[tokio::test]
+    async fn gold_stop_reaches_guardian_review_on_final_state() {
+        let mut session = Session::new("s343-stop", "model");
+        let config = guardian_and_gold_config(2);
+        // The agent declared completion; the double-check confirms "achieved", so
+        // the goal gate decides STOP.
+        let mut goal = ensure_goal_state(&session, "finish the task");
+        goal.declare(GoalDeclaredStatus::Complete, 1);
+        write_goal_state(&mut session, goal);
+        let mut runtime_state = AgentRuntimeState::new("s343-stop".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = super::handle_no_tool_calls(
+            "Done — shipped and verified.".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-1",
+            "s343-stop",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "achieved",
+                confidence: "high",
+            }),
+        )
+        .await;
+
+        // The guardian engaged: the run suspended on the reviewer verdict instead
+        // of emitting a terminal Complete.
+        assert!(outcome.should_break);
+        assert!(
+            !outcome.sent_complete,
+            "Gold STOP must reach the guardian and suspend, not complete outright",
+        );
+        assert!(
+            runtime_state.waiting_for_children.is_some(),
+            "the guardian must review the final state and suspend on its verdict",
+        );
+        let guardian = read_guardian_state(&session).expect("guardian state persisted");
+        assert_eq!(guardian.phase, GuardianPhase::Pending);
+        assert_eq!(guardian.review_count, 1);
     }
 
     /// Full-loop e2e through `run_pipeline`, exercising the REAL wiring:
@@ -2854,6 +3072,7 @@ mod tests {
     #[tokio::test]
     async fn handle_no_tool_calls_emits_complete_and_appends_assistant_message() {
         let mut session = Session::new("session-1", "model");
+        let mut runtime_state = AgentRuntimeState::new("session-1".to_string());
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
 
         let outcome = super::handle_no_tool_calls(
@@ -2867,6 +3086,7 @@ mod tests {
                 total_tokens: 18,
             },
             &mut session,
+            &mut runtime_state,
             &tx,
             None,
             "round-1",
