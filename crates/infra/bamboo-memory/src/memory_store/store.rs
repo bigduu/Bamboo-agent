@@ -178,11 +178,12 @@ impl MemoryStore {
     /// scope are serialized — the scope index/artifacts can never be left
     /// half-written or inconsistent (the #32 corruption).
     ///
-    /// NOTE: the five resolve-then-lock methods (archive/split/consolidate/
-    /// contradict/merge) read the target document BEFORE acquiring the lock, so two
-    /// concurrent edits to the SAME memory id can still lose one update (the second
-    /// writes back its pre-lock snapshot). Index consistency is unaffected; a
-    /// re-read-under-lock would close that same-doc window — tracked as a follow-up.
+    /// The five resolve-then-lock methods (archive/split/consolidate/contradict/
+    /// merge) resolve the target document once to find its scope, then RE-READ it
+    /// under the lock before mutating (#235), so two concurrent edits to the SAME
+    /// memory id can't lose an update: the second edit sees the first's committed
+    /// state rather than a stale pre-lock snapshot. See the
+    /// `concurrent_same_memory_edits_do_not_lose_updates` regression test.
     ///
     /// The registry holds one `Arc<Mutex<()>>` per distinct scope root forever
     /// (never evicted), which is negligible: a scope root is global / sessions /
@@ -4173,6 +4174,85 @@ mod tests {
             .unwrap()
             .expect("active doc exists");
         assert_eq!(active_doc.frontmatter.status, DurableMemoryStatus::Active);
+    }
+
+    /// #176 (#32 nit): the resolve-then-lock methods re-read the target under the
+    /// scope lock (#235), so two concurrent edits to the SAME memory id both
+    /// survive. Here two `mark_memory_contradicted` calls each append a DIFFERENT
+    /// source to `relations.contradicted_by`; without the re-read the second would
+    /// write back its pre-lock snapshot (list without the first's entry) and lose
+    /// one append. With it, both entries are present.
+    #[tokio::test]
+    async fn concurrent_same_memory_edits_do_not_lose_updates() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        // Helper to create a Project-scoped memory and return its id.
+        async fn make(store: &MemoryStore, title: &str) -> String {
+            store
+                .write_memory(
+                    MemoryScope::Project,
+                    Some("proj-1"),
+                    DurableMemoryType::Reference,
+                    title,
+                    "Body.",
+                    &[],
+                    Some("s1"),
+                    "main-model",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap()
+                .frontmatter
+                .id
+        }
+
+        // Target X, and two sources A and B (mark_memory_contradicted only records
+        // sources that exist in scope).
+        let target = make(&store, "Target fact").await;
+        let source_a = make(&store, "Contradicting fact A").await;
+        let source_b = make(&store, "Contradicting fact B").await;
+
+        // Two concurrent contradictions of the SAME target with DIFFERENT sources.
+        // They serialize on the scope lock; the re-read-under-lock is what keeps
+        // the second append from clobbering the first.
+        let (r1, r2) = tokio::join!(
+            store.mark_memory_contradicted(
+                &target,
+                Some("proj-1"),
+                std::slice::from_ref(&source_a),
+                Some("conflicts A"),
+                Some("s1"),
+                "main-model",
+            ),
+            store.mark_memory_contradicted(
+                &target,
+                Some("proj-1"),
+                std::slice::from_ref(&source_b),
+                Some("conflicts B"),
+                Some("s1"),
+                "main-model",
+            ),
+        );
+        r1.unwrap().expect("first contradiction applied");
+        r2.unwrap().expect("second contradiction applied");
+
+        // BOTH appends must survive regardless of which committed first.
+        let final_doc = store
+            .get_memory(&target, Some("proj-1"))
+            .await
+            .unwrap()
+            .expect("target exists");
+        let contradicted = &final_doc.frontmatter.relations.contradicted_by;
+        assert!(
+            contradicted.contains(&source_a),
+            "source A append lost (contradicted_by = {contradicted:?})"
+        );
+        assert!(
+            contradicted.contains(&source_b),
+            "source B append lost (contradicted_by = {contradicted:?})"
+        );
     }
 
     #[tokio::test]
