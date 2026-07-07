@@ -151,7 +151,7 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn render_help(f: &mut Frame) {
-    let area = centered_rect(50, 16, f.area());
+    let area = centered_rect(50, 18, f.area());
     let help_text = vec![
         Line::from(Span::styled(
             " Keybindings",
@@ -168,6 +168,8 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("  Ctrl+S      Stop agent execution"),
         Line::raw("  Ctrl+X      Expand/collapse tool args & results"),
         Line::raw("  j/k         Scroll down/up"),
+        Line::raw("  n           New schedule (Schedules)"),
+        Line::raw("  e           Edit config (Config)"),
         Line::raw("  d           Delete (with context)"),
         Line::raw("  r           Refresh / Run schedule"),
         Line::raw("  t           Refresh MCP tools"),

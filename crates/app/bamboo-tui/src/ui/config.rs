@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -62,9 +62,36 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let config = Paragraph::new(lines)
         .block(Block::default().title(Span::styled(
-            " Config (j/k to scroll)",
+            " Config (j/k scroll · e edit)",
             Style::default().fg(colors::BRAND),
         )))
         .wrap(Wrap { trim: false });
     f.render_widget(config, area);
+}
+
+/// Modal raw-JSON editor, rendered over everything when `app.config_editor` is
+/// set. `Ctrl+S` saves (after JSON validation), `Esc` cancels.
+pub fn render_editor(f: &mut Frame, app: &App) {
+    let Some(editor) = &app.config_editor else {
+        return;
+    };
+    let screen = f.area();
+    let area = centered(screen, 80, 80);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::BRAND))
+        .title(" Edit config · Ctrl+S save · Esc cancel ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(&editor.textarea, inner);
+}
+
+/// Rect covering `pw`%×`ph`% of `r`, centered.
+fn centered(r: Rect, pw: u16, ph: u16) -> Rect {
+    let w = (r.width * pw / 100).min(r.width);
+    let h = (r.height * ph / 100).min(r.height);
+    let x = r.x + r.width.saturating_sub(w) / 2;
+    let y = r.y + r.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
 }

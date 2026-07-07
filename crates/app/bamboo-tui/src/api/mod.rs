@@ -265,11 +265,17 @@ impl BambooClient {
     }
 
     pub async fn set_config(&self, config: &serde_json::Value) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(self.url("/v1/bamboo/config"))
             .json(config)
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("set config failed ({status}): {body}");
+        }
         Ok(())
     }
 
