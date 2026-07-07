@@ -968,9 +968,11 @@ fn command_archetype(name: &str, args: &[String], exec_context: bool) -> Option<
 /// `-e`, and `find -exec` / `xargs <cmd>`.
 fn check_indirection(name: &str, args: &[String], depth: usize) -> Option<&'static str> {
     // Shell interpreter running inline code: re-parse the payload as bash.
-    // Handles `-c payload` and clustered login forms like `bash -lc payload`.
+    // Handles `-c payload`, clustered forms (`bash -lc payload`, `bash -vxeic
+    // payload`), and fused (`bash -cfoo`). Conservatively checks every candidate
+    // payload rather than guessing which one bash's arg parser picks.
     if SHELL_COMMANDS.contains(&name) {
-        if let Some(payload) = shell_c_payload(args) {
+        for payload in shell_c_payloads(args) {
             if let Some(reason) = super_dangerous_reason_inner(&unquote(&payload), depth + 1) {
                 return Some(reason);
             }
@@ -1016,29 +1018,42 @@ fn check_indirection(name: &str, args: &[String], depth: usize) -> Option<&'stat
     None
 }
 
-/// The inline-code payload for a shell interpreter: `-c payload`, `-c=payload`,
-/// or a clustered short-option form that includes `c` (`bash -lc payload`,
-/// `bash -ic payload`), where the payload is the following operand.
-fn shell_c_payload(args: &[String]) -> Option<String> {
-    if let Some(v) = flag_value(args, "-c") {
-        return Some(v);
-    }
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        // Only a genuine short-flag CLUSTER (e.g. `-lc`, `-ic`) — not a long
-        // single-dash option like `-rcfile` that merely contains `c` and would
-        // otherwise shadow the real `-lc` and consume the wrong operand.
-        if let Some(flags) = arg.strip_prefix('-') {
-            if !arg.starts_with("--")
-                && flags.len() <= 4
-                && flags.chars().all(|c| c.is_ascii_alphabetic())
-                && flags.contains('c')
-            {
-                return it.next().cloned();
+/// All candidate inline-code payloads for a shell interpreter's `-c`, across the
+/// forms bash accepts: `-c payload`, fused `-cpayload`, and clustered short
+/// options that include `c` (`-lc`, `-ic`, `-vxeic`, …). Bash's exact rule for
+/// which operand becomes the command is finicky (fused remainder after `c` vs
+/// the next argv, and whether an intervening flag consumed it), and getting it
+/// wrong in a *security* backstop must fail toward asking — so we return every
+/// plausible payload and the caller checks them all. `--long` options are
+/// excluded; a bare short cluster is never a `--` option.
+fn shell_c_payloads(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "-c" {
+            if let Some(next) = args.get(i + 1) {
+                out.push(next.clone());
+            }
+            continue;
+        }
+        let Some(cluster) = arg.strip_prefix('-') else {
+            continue;
+        };
+        if arg.starts_with("--") || !cluster.contains('c') {
+            continue;
+        }
+        // Fused remainder after `c` (e.g. `-cfoo` / `-rcfile` → `foo`/`file`)…
+        if let Some(cpos) = cluster.find('c') {
+            let fused = &cluster[cpos + 1..];
+            if !fused.is_empty() {
+                out.push(fused.to_string());
             }
         }
+        // …and the next argv (e.g. `-lc "cmd"` / `-vxeic "cmd"`).
+        if let Some(next) = args.get(i + 1) {
+            out.push(next.clone());
+        }
     }
-    None
+    out
 }
 
 /// Value following `flag` (as `-c val`) or fused (`--eval=val`), if present.
@@ -1130,7 +1145,11 @@ fn dangerous_token_scan(payload: &str) -> Option<&'static str> {
     for flags in ["rm -rf ", "rm -fr ", "rm -r -f ", "rm -f -r "] {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(flags) {
-            let rest = lower[from + pos + flags.len()..].trim_start();
+            // Skip whitespace and any leading quote(s) the payload re-added
+            // around the path (e.g. `rm -rf '/'`).
+            let rest = lower[from + pos + flags.len()..]
+                .trim_start()
+                .trim_start_matches(['\'', '"']);
             // First operand token (up to the next shell delimiter).
             let tok: String = rest
                 .chars()
@@ -2181,16 +2200,22 @@ mod tests {
         assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf /*')""#).is_some());
         assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf *')""#).is_some());
         assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf .')""#).is_some());
+        // Re-quoted operand (path wrapped in its own quotes) must still be seen.
+        assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf '/'')""#).is_some());
         // /tmp is still not a protected root — parity with the direct form.
         assert!(super_dangerous_reason(r#"python3 -c "os.system('rm -rf /tmp/x')""#).is_none());
     }
 
     #[test]
-    fn super_dangerous_clustered_flag_not_shadowed_by_long_option() {
-        // A single-dash long option containing `c` (`-rcfile`) must NOT be
-        // mistaken for a `-c` cluster and consume the wrong operand — the real
-        // `-lc` payload must still be found and unwrapped.
+    fn super_dangerous_long_clusters_and_fused_c() {
+        // A long, valid short-flag cluster ending in `c` takes the next argv as
+        // the command — must be caught (not skipped by any length cap).
+        assert!(super_dangerous_reason(r#"bash -vxeic "sudo rm -rf /""#).is_some());
+        // A cluster whose real `-c` payload (via any candidate) is dangerous is
+        // caught even alongside other single-dash tokens.
         assert!(super_dangerous_reason(r#"bash -rcfile /dev/null -lc "sudo rm -rf /""#).is_some());
+        // Benign clustered payloads stay quiet.
+        assert!(super_dangerous_reason(r#"bash -vxeic "ls -la""#).is_none());
         assert!(super_dangerous_reason(r#"bash -rcfile /dev/null -lc "ls""#).is_none());
     }
 }
