@@ -12,7 +12,6 @@ fn config_with_openai_key() -> Config {
     Config {
         providers: ProviderConfigs {
             openai: Some(OpenAIConfig {
-                api_key_from_env: false,
                 api_key: String::new(),
                 api_key_from_env: false,
                 api_key_encrypted: Some("enc-key".to_string()),

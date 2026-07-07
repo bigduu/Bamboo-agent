@@ -22,7 +22,6 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
         provider: "openai".to_string(),
         providers: ProviderConfigs {
             openai: Some(OpenAIConfig {
-                api_key_from_env: false,
                 api_key: "sk-test".to_string(),
                 api_key_from_env: false,
                 api_key_encrypted: None,
