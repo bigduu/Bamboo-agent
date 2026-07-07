@@ -452,6 +452,106 @@ mod tests {
         }
     }
 
+    // Echo transport: replies to each request with a response carrying the SAME
+    // JSON-RPC id after a delay, simulating a real stdio server that multiplexes
+    // concurrent requests over one pipe and may reply out of order. #148.
+    struct EchoTransport {
+        connected: bool,
+        message_rx: TokioMutex<Option<mpsc::Receiver<String>>>,
+        response_tx: mpsc::Sender<String>,
+        delay_ms: u64,
+    }
+
+    impl EchoTransport {
+        fn new(delay_ms: u64) -> Self {
+            let (tx, rx) = mpsc::channel(100);
+            Self {
+                connected: false,
+                message_rx: TokioMutex::new(Some(rx)),
+                response_tx: tx,
+                delay_ms,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for EchoTransport {
+        async fn connect(&mut self) -> Result<()> {
+            self.connected = true;
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            self.connected = false;
+            Ok(())
+        }
+        async fn send(&self, message: String) -> Result<()> {
+            let req: serde_json::Value = serde_json::from_str(&message).expect("valid request");
+            let id = req["id"].clone();
+            let tx = self.response_tx.clone();
+            let delay = self.delay_ms;
+            // Reply out-of-band (spawned) and delayed so the test only passes if
+            // responses are matched by id, not by arrival order.
+            tokio::spawn(async move {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "echoed_id": id },
+                });
+                let _ = tx.send(resp.to_string()).await;
+            });
+            Ok(())
+        }
+        async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
+            self.message_rx.lock().await.take()
+        }
+        async fn receive(&self) -> Result<Option<String>> {
+            Err(McpError::Disconnected)
+        }
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_server_requests_correlate_by_id() {
+        // #148: serve_mcp_proxy (post-#144) issues N CONCURRENT call_tool to the
+        // SAME stdio server. Verify the client correlates each response to its own
+        // request by JSON-RPC id — even when replies arrive out of order — rather
+        // than reading "the next line". A crossed id would mis-route or time out;
+        // the stdin Mutex (transports/stdio.rs) also keeps concurrent writes from
+        // interleaving on the wire.
+        let mut client = McpProtocolClient::new(Box::new(EchoTransport::new(30)));
+        client.connect().await.expect("connect");
+        let client = Arc::new(client);
+
+        let mut handles = Vec::new();
+        for i in 0..16u64 {
+            let c = Arc::clone(&client);
+            handles.push(tokio::spawn(async move {
+                c.send_request("tools/call", Some(serde_json::json!({ "n": i })), 2000)
+                    .await
+                    .expect("concurrent request should succeed")
+            }));
+        }
+        for handle in handles {
+            let resp = handle.await.expect("task join");
+            // The echoed id in the result MUST equal this response's own request id.
+            let echoed = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("echoed_id"))
+                .and_then(|v| v.as_u64());
+            assert_eq!(
+                echoed,
+                Some(resp.id),
+                "each concurrent response must carry its OWN request id"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_client_new() {
         let transport = Box::new(MockTransport::new());
