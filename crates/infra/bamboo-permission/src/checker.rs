@@ -542,9 +542,9 @@ pub fn is_safe_edit_command(command: &str) -> bool {
 /// analyzer treats those as benign structural nodes; that is the operator gate,
 /// this is the injection gate.) Single-command properties the safe list already
 /// blesses (e.g. `PermissionModification` for `chmod`) are intentionally absent so
-/// plain invocations still auto-approve; this gate does NOT claim to block every
-/// destructive single command (a destructive ARGUMENT like `cp /dev/null x` is out
-/// of scope — see #155). #10.
+/// plain invocations still auto-approve. Destructive ARGUMENTS to a safe-listed
+/// file command (`cp /dev/null /etc/passwd`, `cp /etc/passwd /tmp/x`, `chmod -R
+/// 000 /`) are now caught too, via the `SensitivePathArgument` warning. #10, #155.
 fn command_can_chain_or_inject(analysis: &crate::bash_security::BashSecurityAnalysis) -> bool {
     use crate::bash_security::BashWarningKind::*;
     analysis.warnings.iter().any(|w| {
@@ -560,6 +560,7 @@ fn command_can_chain_or_inject(analysis: &crate::bash_security::BashSecurityAnal
                 | ZshDangerous
                 | VariableAsCommand
                 | RedirectToSensitivePath
+                | SensitivePathArgument
                 | ParseFailed
                 | AnalysisBudgetExceeded
                 | UnknownNodeType(_)
@@ -1395,6 +1396,38 @@ mod tests {
     }
 
     #[test]
+    fn safe_edit_rejects_destructive_arguments() {
+        // #155: a SINGLE safe-listed file command can be destructive via its
+        // ARGUMENTS (no operator, no `>` redirect) — these must NOT auto-approve.
+        let destructive = [
+            "cp /dev/null /etc/passwd",       // truncate a system file (dest arg)
+            "cp /etc/passwd /tmp/exfil",      // read-exfil a sensitive source
+            "cp /etc/shadow .",               // exfil shadow into cwd
+            "mv important /etc/sudoers",      // clobber a sensitive dest
+            "tee /etc/passwd",                // overwrite via tee arg
+            "dd if=/dev/zero of=/etc/passwd", // dd of= operand
+            "dd if=/etc/shadow of=/tmp/x",    // dd if= exfil
+            "chmod -R 000 /",                 // recursive chmod on root
+            "chmod -R 777 /etc",              // recursive chmod on a sensitive dir
+            "chown -R nobody /",              // recursive chown on root
+            "cp evil ~/.ssh/authorized_keys", // implant an SSH key
+            "mv ~/.bashrc /tmp/x",            // relocate a shell rc (source)
+            "echo pwned > ~/.zshrc",          // redirect to a home rc file
+            // #155 review follow-ups:
+            "cp backdoor /etc/sudoers.d/zz", // /etc subtree (priv-esc), not just passwd
+            "cp payload /etc/cron.d/evil",   // /etc persistence vector
+            "cp evil /root/.ssh/authorized_keys", // absolute root-home form of the ~ case
+            "cp evil /home/alice/.ssh/authorized_keys", // absolute /home/<user> form
+        ];
+        for cmd in destructive {
+            assert!(
+                !is_safe_edit_command(cmd),
+                "must NOT auto-approve a destructive argument: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
     fn safe_edit_still_approves_plain_safe_commands() {
         // Plain single-command invocations of the safe list must STILL auto-approve.
         let safe = [
@@ -1408,8 +1441,12 @@ mod tests {
             "touch file.txt",
             "echo hello",
             "cp a.txt b.txt",
+            "cp src/foo.rs dst/foo.rs",
+            "mv old.txt new.txt",
             "ls -la",
             "chmod 644 file.txt", // PermissionModification is NOT in the reject set
+            "chmod +x scripts/run", // non-recursive, non-sensitive
+            "chmod -R 755 build/", // recursive but NOT a sensitive path → still safe
             "time cargo build",   // wrapper-stripped, then prefix-matched
         ];
         for cmd in safe {

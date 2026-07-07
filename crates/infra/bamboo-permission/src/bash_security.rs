@@ -57,9 +57,10 @@ const PERMISSION_MODIFICATION_COMMANDS: &[&str] = &["chmod", "chown", "chgrp", "
 /// verdict that forced approval on ordinary commands even under bypass. Only
 /// block devices and system files that can brick/compromise the host belong here.
 const SENSITIVE_REDIRECT_PATHS: &[&str] = &[
-    "/etc/passwd",
-    "/etc/shadow",
-    "/etc/sudoers",
+    // All of /etc, not just passwd/shadow/sudoers: dropping a file into
+    // /etc/sudoers.d/, /etc/cron.d/, /etc/systemd/system/, /etc/profile.d/, … is
+    // an equally dangerous privilege-escalation / persistence vector. #155.
+    "/etc/",
     "/boot/",
     "/dev/sd",
     "/dev/hd",
@@ -79,6 +80,170 @@ const SENSITIVE_REDIRECT_PATHS: &[&str] = &[
     "/usr/lib/",
     "/usr/lib64/",
 ];
+
+/// Sensitive paths under the user's home dir (matched after a `~/`, `$HOME/`, or
+/// `${HOME}/` prefix): shell startup files (arbitrary code on next shell) and
+/// credential stores. Kept narrow to avoid over-blocking ordinary edits. #155.
+const SENSITIVE_HOME_PREFIXES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".ssh/",
+    ".aws/",
+    ".gnupg/",
+    ".netrc",
+];
+
+/// File-mutating commands that write/relocate by ARGUMENT (not via a shell
+/// redirect), so a sensitive path passed as an argument bypasses the redirect
+/// check. #155.
+const FILE_MUTATING_COMMANDS: &[&str] = &["cp", "mv", "tee", "dd", "install", "rsync", "ln"];
+
+/// True if `path` targets a sensitive filesystem location: an absolute system
+/// path from [`SENSITIVE_REDIRECT_PATHS`], or a sensitive dotfile/dir under the
+/// user's home (`~/…`, `$HOME/…`, `${HOME}/…`). Used for both redirect targets
+/// and destructive command arguments. #155.
+fn is_sensitive_fs_path(path: &str) -> bool {
+    let trimmed = path.trim().trim_matches(|c| c == '"' || c == '\'');
+    let lower = trimmed.to_ascii_lowercase();
+    if SENSITIVE_REDIRECT_PATHS
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
+        return true;
+    }
+    // Home-relative forms (`~/…`, `$HOME/…`) AND their absolute equivalents
+    // (`/root/…`, `/home/<user>/…`) — agents in containers often run as root, so
+    // `/root/.ssh/authorized_keys` is the natural form of the `~/.ssh/…` example. #155.
+    let home_rel = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("$HOME/"))
+        .or_else(|| trimmed.strip_prefix("${HOME}/"))
+        .or_else(|| trimmed.strip_prefix("/root/"))
+        .or_else(|| {
+            // `/home/<user>/…` — skip the username component.
+            trimmed
+                .strip_prefix("/home/")
+                .and_then(|rest| rest.split_once('/').map(|(_, r)| r))
+        });
+    if let Some(rel) = home_rel {
+        let rel_lower = rel.to_ascii_lowercase();
+        return SENSITIVE_HOME_PREFIXES
+            .iter()
+            .any(|p| rel_lower.starts_with(p));
+    }
+    false
+}
+
+/// Flag a file-mutating command that touches a sensitive path via an ARGUMENT
+/// (destination overwrite OR sensitive source read-exfil), and a recursive
+/// `chmod`/`chown` on a sensitive path or `/`.
+///
+/// These pass the redirect and injection gates — one command node, no `>`
+/// redirect, no operator/substitution — yet are destructive (`cp /dev/null
+/// /etc/passwd`, `cp /etc/passwd /tmp/x`, `chmod -R 000 /`), so without this they
+/// auto-approve in AcceptEdits. Plain `cp a b` / `chmod +x f` are unaffected. #155.
+fn check_sensitive_path_arguments(command_name: &str, args: &[String]) -> Vec<BashWarning> {
+    let mut warnings = Vec::new();
+    // The command may be an absolute path (`/bin/cp`); key on the basename.
+    let name = command_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command_name);
+
+    // dd carries its operands as `if=…` / `of=…`; the rest use positional paths.
+    let as_path = |arg: &str| -> Option<String> {
+        let arg = arg.trim();
+        if let Some(v) = arg.strip_prefix("if=").or_else(|| arg.strip_prefix("of=")) {
+            Some(v.to_string())
+        } else if arg.starts_with('-') {
+            None // a flag, not a path
+        } else {
+            Some(arg.to_string())
+        }
+    };
+
+    if FILE_MUTATING_COMMANDS.contains(&name) {
+        for arg in args {
+            if let Some(path) = as_path(arg) {
+                if is_sensitive_fs_path(&path) {
+                    warnings.push(BashWarning {
+                        kind: BashWarningKind::SensitivePathArgument,
+                        detail: format!("`{name}` touches sensitive path argument: {path}"),
+                    });
+                }
+            }
+        }
+    }
+
+    // Recursive chmod/chown on `/` or a system directory. Plain `chmod`/`chown`
+    // stay auto-approved (PermissionModification is excluded from the gate); the
+    // recursive-root variant (`chmod -R 000 /`, `chmod -R 777 /etc`) must not ride
+    // along. A recursive chmod/chown on a NON-system path (`chmod -R 755 build/`)
+    // is still fine. #155.
+    if matches!(name, "chmod" | "chown") {
+        let recursive = args.iter().any(|a| {
+            let a = a.trim();
+            a == "-R"
+                || a == "--recursive"
+                // clustered short flags like `-Rf`
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))
+        });
+        if recursive {
+            for arg in args {
+                let arg = arg.trim();
+                if arg.starts_with('-') {
+                    continue;
+                }
+                if is_system_root_path(arg) {
+                    warnings.push(BashWarning {
+                        kind: BashWarningKind::SensitivePathArgument,
+                        detail: format!("recursive `{name}` on system path: {arg}"),
+                    });
+                }
+            }
+        }
+    }
+
+    warnings
+}
+
+/// True if `path` is `/` or a top-level system directory whose recursive
+/// modification is destructive (broader than [`is_sensitive_fs_path`], which
+/// targets specific files/dirs — a recursive chmod hits the whole subtree). #155.
+fn is_system_root_path(path: &str) -> bool {
+    let p = path
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim_end_matches('/');
+    // "/" trims to "" — the root itself.
+    if p.is_empty() {
+        return true;
+    }
+    matches!(
+        p,
+        "/etc"
+            | "/usr"
+            | "/usr/bin"
+            | "/usr/local"
+            | "/usr/local/bin"
+            | "/usr/lib"
+            | "/bin"
+            | "/sbin"
+            | "/var"
+            | "/boot"
+            | "/lib"
+            | "/lib64"
+            | "/opt"
+            | "/root"
+            | "/sys"
+            | "/proc"
+            | "/dev"
+    ) || is_sensitive_fs_path(path)
+}
 
 /// Commands that can execute code via suspicious arguments.
 const CODE_EXECUTION_COMMANDS: &[&str] = &["python", "python3", "perl", "ruby", "node", "nodejs"];
@@ -178,6 +343,11 @@ pub enum BashWarningKind {
     SuspiciousArguments,
     /// Redirect to a sensitive system path
     RedirectToSensitivePath,
+    /// A file-mutating command (cp/mv/tee/dd/…) touches a sensitive path via an
+    /// ARGUMENT (destination overwrite or sensitive source read-exfil), or a
+    /// recursive chmod/chown on a sensitive path or `/`. Distinct from a shell
+    /// redirect — these bypass the redirect check. #155.
+    SensitivePathArgument,
     /// Analysis budget (time or node count) exceeded
     AnalysisBudgetExceeded,
     /// Network-related command
@@ -351,6 +521,7 @@ pub fn analyze_command(command: &str) -> BashSecurityAnalysis {
         warnings.extend(check_network_commands(&name_lower));
         warnings.extend(check_privilege_escalation(&name_lower));
         warnings.extend(check_permission_modification(&name_lower, &args));
+        warnings.extend(check_sensitive_path_arguments(&name_lower, &args));
     }
 
     warnings.extend(check_heredoc_expansions(&tree, command));
@@ -805,6 +976,9 @@ fn determine_verdict(warnings: &[BashWarning]) -> BashVerdict {
     let has_redirect_sensitive = warnings
         .iter()
         .any(|w| w.kind == BashWarningKind::RedirectToSensitivePath);
+    let has_sensitive_path_arg = warnings
+        .iter()
+        .any(|w| w.kind == BashWarningKind::SensitivePathArgument);
     let has_variable_as_command = warnings
         .iter()
         .any(|w| w.kind == BashWarningKind::VariableAsCommand);
@@ -817,6 +991,7 @@ fn determine_verdict(warnings: &[BashWarning]) -> BashVerdict {
         || has_unknown
         || has_budget_exceeded
         || has_redirect_sensitive
+        || has_sensitive_path_arg
         || has_variable_as_command
     {
         return BashVerdict::Deny;
@@ -1316,11 +1491,9 @@ fn check_redirects_node(node: &tree_sitter::Node, source: &str, warnings: &mut V
         }
 
         if let Some(path) = target_path {
-            let path_lower = path.to_ascii_lowercase();
-            let is_sensitive = SENSITIVE_REDIRECT_PATHS
-                .iter()
-                .any(|p| path_lower.starts_with(*p));
-            if is_sensitive {
+            // Shared with the command-argument check so a redirect to a home
+            // dotfile (`> ~/.bashrc`) is caught too, not just system paths. #155.
+            if is_sensitive_fs_path(&path) {
                 let op = redirect_op.as_deref().unwrap_or(">");
                 let is_overwrite = op.contains('>') && !op.contains(">>");
                 let detail = if is_overwrite {
