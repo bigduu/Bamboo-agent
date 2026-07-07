@@ -5,11 +5,14 @@ services:
       dockerfile: docker/Dockerfile
     image: bamboo-server:latest
     container_name: bamboo
-    # Publish to the HOST loopback only. A fresh instance has no password/device,
-    # so its auth gate is inert (open to every caller); binding the published
-    # port to 0.0.0.0 would expose an unauthenticated, tool-executing agent to
-    # the LAN. To expose it on the network, FIRST configure a password/device,
-    # then change this to "9562:9562" (or "<lan-ip>:9562:9562"). (#249)
+    # Publish to the HOST loopback only. Do NOT widen this to 0.0.0.0 / a LAN IP
+    # to expose the agent directly: a fresh instance has no credential (auth gate
+    # inert), AND even once a password/device is set the server treats every
+    # private-range (RFC1918) peer as trusted-local and skips the password check
+    # by design — so any host on the same subnet would drive the tool-executing
+    # agent unauthenticated. To reach it from other machines, keep this loopback
+    # binding and put an authenticating reverse proxy in front on a trusted
+    # network. (#249)
     ports:
       - "127.0.0.1:9562:9562"
     # Container isolation: no privilege escalation, drop all Linux capabilities

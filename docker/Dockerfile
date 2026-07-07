@@ -53,9 +53,11 @@ ENV BAMBOO_DATA_DIR=/data
 ENV BAMBOO_PORT=9562
 # The server binds 0.0.0.0 INSIDE the container so a published port can reach
 # it; restrict *exposure* at the compose publish layer (127.0.0.1) rather than
-# here — see docker-compose.yml. Do not publish to the network without first
-# configuring a password/device (the auth gate is inert until a credential
-# exists).
+# here — see docker-compose.yml. Do not publish to the network directly: a fresh
+# instance is unauthenticated, and the server treats every private-LAN peer as
+# trusted-local (skipping the password check by design), so LAN exposure is
+# unauthenticated even with a password set — front it with an authenticating
+# reverse proxy instead.
 ENV BAMBOO_BIND=0.0.0.0
 
 EXPOSE 9562

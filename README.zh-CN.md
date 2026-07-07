@@ -263,7 +263,7 @@ cd docker && docker compose up -d --build
 curl http://localhost:9562/api/v1/health
 ```
 
-`docker-compose.yml` 仅发布到主机回环地址（`127.0.0.1:9562:9562`），以非 root 用户运行，丢弃所有 capability，并使用独立的命名卷。新实例默认无鉴权（在设置密码/设备前鉴权闸门是失效的），因此**在把端口暴露到网络之前请先配置凭据**（把发布改为 `9562:9562`）。同时设置 `BAMBOO_DATA_DIR=/data`、`BAMBOO_PORT=9562`、`BAMBOO_BIND=0.0.0.0`（容器内绑定；暴露范围由发布层控制）。
+`docker-compose.yml` 仅发布到主机回环地址（`127.0.0.1:9562:9562`），以非 root 用户运行，丢弃所有 capability，并使用独立的命名卷。**请勿把发布放宽以直接把 agent 暴露到网络：** 新实例默认无鉴权，而且服务端按设计会把所有私网（RFC1918）来源视为可信本地、跳过密码校验——因此即使设置了密码，局域网暴露仍然是无鉴权的。要从其他机器访问，请保留回环发布，并在可信网络中用带鉴权的反向代理置于其前。同时设置 `BAMBOO_DATA_DIR=/data`、`BAMBOO_PORT=9562`、`BAMBOO_BIND=0.0.0.0`（容器内绑定；暴露范围由发布层控制）。
 
 ### 常用 API 路由
 
