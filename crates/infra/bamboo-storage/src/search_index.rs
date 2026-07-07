@@ -12,8 +12,28 @@ const PURGE_OLDER_THAN_DAYS: i64 = 10;
 const VACUUM_MIN_DB_BYTES: u64 = 256 * 1024 * 1024;
 const VACUUM_MIN_PURGED_ROWS: usize = 500;
 
+/// How long a contended writer waits for the lock before giving up with
+/// `SQLITE_BUSY`. SQLite's default is `0` (fail immediately); a non-zero
+/// `busy_timeout` makes writers block-and-retry, which matters here because
+/// `upsert_session_db` holds the write lock across a `BEGIN IMMEDIATE`
+/// transaction while a concurrent indexer/pruner may also be writing. #357.
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
+
 fn to_io_error(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
+}
+
+/// Open the search-index SQLite database with a `busy_timeout` set.
+///
+/// `busy_timeout` is a **per-connection** setting (not persisted in the DB
+/// file), so every connection opener must go through this rather than calling
+/// `Connection::open` directly. #357.
+fn open_db(db_path: &Path) -> std::io::Result<Connection> {
+    let conn =
+        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    conn.busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+        .map_err(|e| to_io_error(format!("sqlite busy_timeout failed: {e}")))?;
+    Ok(conn)
 }
 
 #[derive(Debug, Clone)]
@@ -153,8 +173,7 @@ fn init_db(db_path: &Path) -> std::io::Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| to_io_error(format!("sqlite pragma journal_mode failed: {e}")))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -221,8 +240,7 @@ fn upsert_session_db(db_path: &Path, session: &Session) -> std::io::Result<()> {
         return delete_session_db(db_path, &session.id);
     }
 
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
     conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
         .map_err(|e| to_io_error(format!("sqlite begin transaction failed: {e}")))?;
 
@@ -334,8 +352,7 @@ fn upsert_session_db(db_path: &Path, session: &Session) -> std::io::Result<()> {
 }
 
 fn delete_session_db(db_path: &Path, session_id: &str) -> std::io::Result<()> {
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
     conn.execute(
         "DELETE FROM sessions_search WHERE session_id = ?1",
         params![session_id],
@@ -360,8 +377,7 @@ fn delete_session_db(db_path: &Path, session_id: &str) -> std::io::Result<()> {
 }
 
 fn prune_stale_sessions_db(db_path: &Path) -> std::io::Result<usize> {
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
     let cutoff = (Utc::now() - Duration::days(PURGE_OLDER_THAN_DAYS)).to_rfc3339();
     let mut stmt = conn
         .prepare("SELECT session_id FROM sessions_search WHERE updated_at < ?1")
@@ -389,8 +405,7 @@ fn maybe_vacuum_db(db_path: &Path, purged_rows: usize) -> std::io::Result<bool> 
         return Ok(false);
     }
 
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
     conn.execute_batch("VACUUM;")
         .map_err(|e| to_io_error(format!("sqlite vacuum failed: {e}")))?;
     Ok(true)
@@ -401,8 +416,7 @@ fn search_db(
     query: &str,
     limit: usize,
 ) -> std::io::Result<Vec<SessionSearchMatch>> {
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
     let fts_query = build_fts_query(query);
     let mut matches = Vec::new();
 
@@ -577,8 +591,7 @@ fn read_compressed_cache_db(
     limit: usize,
     truncate_chars_limit: usize,
 ) -> std::io::Result<SessionCompressedCacheSnapshot> {
-    let conn =
-        Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
+    let conn = open_db(db_path)?;
 
     let summary = conn
         .query_row(
@@ -702,6 +715,18 @@ mod tests {
             None,
         ));
         session
+    }
+
+    #[test]
+    fn open_db_sets_busy_timeout() {
+        // #357: every connection must carry a non-zero busy_timeout so a contended
+        // writer blocks-and-retries instead of failing immediately with SQLITE_BUSY.
+        let temp = TempDir::new().expect("tempdir");
+        let conn = open_db(&temp.path().join("search.db")).expect("open");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("read busy_timeout");
+        assert_eq!(timeout, SQLITE_BUSY_TIMEOUT_MS as i64);
     }
 
     #[tokio::test]
