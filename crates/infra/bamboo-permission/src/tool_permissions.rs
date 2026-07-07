@@ -217,19 +217,36 @@ pub fn check_permissions(
             }
         }
         "SubAgent" => {
-            let action = required_string_arg(args, "action")?
+            // Legacy calls omit `action` and mean `create`; the tool defaults it
+            // that way INSIDE `invoke`, which runs AFTER this gate — so default it
+            // here too rather than hard-failing on a missing field (that would
+            // abort a legacy call before it reaches the tool). #395.
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("create")
                 .trim()
                 .to_ascii_lowercase();
-            // create spawns a full independent agent run (its own compute + full
-            // toolset); wait/list/list_models are passive/read.
-            if action == "create" {
-                Ok(Some(vec![PermissionContext::new(
+            match action.as_str() {
+                // Spawn / run / drive a child agent = independent compute + full toolset.
+                "create" | "run" | "send_message" => Ok(Some(vec![PermissionContext::new(
                     PermissionType::ExecuteCommand,
-                    "SubAgent create",
-                    "Spawn a sub-agent (child) session",
-                )]))
-            } else {
-                Ok(None)
+                    format!("SubAgent {action}"),
+                    format!("SubAgent {action}: spawn/run a child agent session"),
+                )])),
+                // Mutate an already-created child session.
+                "update" | "cancel" => Ok(Some(vec![PermissionContext::new(
+                    PermissionType::WriteFile,
+                    format!("SubAgent {action}"),
+                    format!("SubAgent {action}: modify a child session"),
+                )])),
+                "delete" => Ok(Some(vec![PermissionContext::new(
+                    PermissionType::DeleteOperation,
+                    "SubAgent delete",
+                    "SubAgent delete: remove a child session",
+                )])),
+                // wait / list / get / list_models → passive or read-only.
+                _ => Ok(None),
             }
         }
         "scheduler" => {
@@ -346,6 +363,13 @@ mod tests {
             ("cluster", json!({"action": "deploy", "node": "n1"})),
             ("cluster", json!({"action": "stop", "node": "n1"})),
             ("SubAgent", json!({"action": "create", "prompt": "x"})),
+            ("SubAgent", json!({"action": "run", "session_id": "c1"})),
+            (
+                "SubAgent",
+                json!({"action": "send_message", "session_id": "c1"}),
+            ),
+            // Legacy call with no `action` defaults to create (back-compat).
+            ("SubAgent", json!({"prompt": "x"})),
             (
                 "scheduler",
                 json!({"action": "run_now", "schedule_id": "s1"}),
@@ -372,6 +396,19 @@ mod tests {
     }
 
     #[test]
+    fn subagent_mutations_gate() {
+        // update/cancel modify an active child → WriteFile; delete → DeleteOperation.
+        for action in ["update", "cancel"] {
+            let args = json!({"action": action, "session_id": "c1"});
+            let contexts = check_permissions("SubAgent", &args).unwrap().unwrap();
+            assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+        }
+        let del = json!({"action": "delete", "session_id": "c1"});
+        let contexts = check_permissions("SubAgent", &del).unwrap().unwrap();
+        assert_eq!(contexts[0].permission_type, PermissionType::DeleteOperation);
+    }
+
+    #[test]
     fn overlay_read_actions_stay_ungated() {
         // Read-only actions must NOT produce a permission context (Ok(None)).
         for (tool, args) in [
@@ -380,6 +417,8 @@ mod tests {
             ("cluster", json!({"action": "status", "node": "n1"})),
             ("SubAgent", json!({"action": "list"})),
             ("SubAgent", json!({"action": "wait"})),
+            ("SubAgent", json!({"action": "get", "session_id": "c1"})),
+            ("SubAgent", json!({"action": "list_models"})),
             ("scheduler", json!({"action": "list"})),
             (
                 "scheduler",
