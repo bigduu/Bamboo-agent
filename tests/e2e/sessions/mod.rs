@@ -7,6 +7,7 @@ mod patch_message_safety;
 fn openai_config_with(model: &str, reasoning_effort: Option<ReasoningEffort>) -> OpenAIConfig {
     OpenAIConfig {
         api_key: "sk-test".to_string(),
+        api_key_from_env: false,
         api_key_encrypted: None,
         base_url: None,
         model: Some(model.to_string()),
