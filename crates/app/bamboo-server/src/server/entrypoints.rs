@@ -111,6 +111,12 @@ pub async fn run_with_tls(
 
     let app_factory = move || {
         let mut app = App::new()
+            // Same body limits as the production/static path so a desktop chat
+            // request with an inline image isn't rejected with 413 (#252).
+            .app_data(web::JsonConfig::default().limit(super::web_service::MAX_JSON_BODY_BYTES))
+            .app_data(web::PayloadConfig::new(
+                super::web_service::MAX_PAYLOAD_BYTES,
+            ))
             .app_data(app_state.clone())
             .wrap(build_cors("127.0.0.1", port))
             // Immutable long-cache for hashed `/assets/*` (parity with the web
@@ -299,10 +305,12 @@ pub async fn run_with_bind_and_static_tls(
     let bind_for_cors = bind.to_string();
     let app_factory = move || {
         let mut app = App::new()
-            // Request size limits to prevent DoS
-            // Chat requests may include base64 images; keep limits high enough for local usage.
-            .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024)) // 25MB JSON limit
-            .app_data(web::PayloadConfig::new(30 * 1024 * 1024)) // 30MB payload limit
+            // Request size limits to prevent DoS. Chat requests may include
+            // base64 images; shared with every serve path (#252).
+            .app_data(web::JsonConfig::default().limit(super::web_service::MAX_JSON_BODY_BYTES))
+            .app_data(web::PayloadConfig::new(
+                super::web_service::MAX_PAYLOAD_BYTES,
+            ))
             .app_data(app_state.clone())
             .wrap(actix_web::middleware::Condition::new(
                 apply_rate_limit,
