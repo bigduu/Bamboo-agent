@@ -762,8 +762,7 @@ mod tests {
     /// `--provider P` + a bare `-m <model>` compose into `ref(P, model)`.
     #[test]
     fn model_selection_provider_flag_plus_bare_model() {
-        let sel =
-            resolve_model_selection(&some("gpt-4o"), &some("openai"), "anthropic").unwrap();
+        let sel = resolve_model_selection(&some("gpt-4o"), &some("openai"), "anthropic").unwrap();
         assert_eq!(sel.model_ref, model_ref("openai", "gpt-4o"));
     }
 
