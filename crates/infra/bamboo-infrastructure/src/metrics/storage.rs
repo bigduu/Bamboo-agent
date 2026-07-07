@@ -1913,29 +1913,47 @@ impl MetricsStorage for SqliteMetricsStorage {
         self.with_connection(move |connection| {
             let cutoff_str = format_timestamp(cutoff);
 
-            // Only sessions that actually lose rounds need re-aggregation; capture
-            // them BEFORE the delete instead of re-aggregating every session
-            // (which was nine correlated subqueries × all sessions per pass).
-            let affected_sessions: Vec<String> = {
-                let mut stmt = connection.prepare(
-                    "SELECT DISTINCT session_id FROM round_metrics WHERE started_at < ?1",
+            // Capture-then-delete must be atomic w.r.t. other writers: without a
+            // write lock, a round with `started_at < cutoff` inserted between the
+            // SELECT and the DELETE (backfill/replay/clock skew) would be deleted
+            // yet miss re-aggregation, leaving session_metrics overcounting. Wrap
+            // the whole select→delete→refresh in a single IMMEDIATE transaction.
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let outcome = (|| -> MetricsResult<u64> {
+                // Only sessions that actually lose rounds need re-aggregation
+                // (was nine correlated subqueries × ALL sessions per pass).
+                let affected_sessions: Vec<String> = {
+                    let mut stmt = connection.prepare(
+                        "SELECT DISTINCT session_id FROM round_metrics WHERE started_at < ?1",
+                    )?;
+                    let ids = stmt
+                        .query_map(params![cutoff_str], |row| row.get(0))?
+                        .collect::<Result<Vec<String>, _>>()?;
+                    ids
+                };
+
+                let deleted = connection.execute(
+                    "DELETE FROM round_metrics WHERE started_at < ?1",
+                    params![cutoff_str],
                 )?;
-                let ids = stmt
-                    .query_map(params![cutoff_str], |row| row.get(0))?
-                    .collect::<Result<Vec<String>, _>>()?;
-                ids
-            };
 
-            let deleted = connection.execute(
-                "DELETE FROM round_metrics WHERE started_at < ?1",
-                params![cutoff_str],
-            )?;
+                for session_id in affected_sessions {
+                    refresh_session_aggregates(connection, &session_id, Utc::now())?;
+                }
 
-            for session_id in affected_sessions {
-                refresh_session_aggregates(connection, &session_id, Utc::now())?;
+                Ok(deleted as u64)
+            })();
+
+            match outcome {
+                Ok(deleted) => {
+                    connection.execute_batch("COMMIT")?;
+                    Ok(deleted)
+                }
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
             }
-
-            Ok(deleted as u64)
         })
         .await
     }
@@ -2448,26 +2466,19 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
     Ok(tools)
 }
 
-/// Loads model-level token usage breakdown for a specific date.
-///
-/// Retrieves aggregated token usage grouped by AI model for all
-/// sessions that started on the specified date.
+/// Loads per-model token-usage breakdown for a whole date range in ONE grouped
+/// query (`GROUP BY date_key, model`), returning it keyed by day so callers can
+/// look up each day without a per-day query (avoids the daily-metrics N+1).
 ///
 /// # Arguments
 ///
 /// * `connection` - Database connection to use
-/// * `date` - Date to get model breakdown for
+/// * `start_bound` / `end_bound` - Half-open `started_at` range (`>= start_bound
+///   AND < end_bound`), the same sargable bounds used by the caller.
 ///
 /// # Returns
 ///
-/// A HashMap mapping model names to their total token usage.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let breakdown = load_daily_model_breakdown(&conn, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())?;
-/// // breakdown might be: {"gpt-4": TokenUsage{...}, "claude-3": TokenUsage{...}}
-/// ```
+/// `date -> (model -> total token usage)` for every day with sessions in range.
 fn load_model_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
@@ -2504,26 +2515,18 @@ fn load_model_breakdown_by_day(
     Ok(by_day)
 }
 
-/// Loads tool call count breakdown for a specific date.
-///
-/// Retrieves the count of tool invocations grouped by tool name
-/// for all tool calls that occurred on the specified date.
+/// Loads per-tool invocation counts for a whole date range in ONE grouped query
+/// (`GROUP BY date_key, tool_name`), keyed by day — the tool-call analogue of
+/// [`load_model_breakdown_by_day`], used to avoid the daily-metrics N+1.
 ///
 /// # Arguments
 ///
 /// * `connection` - Database connection to use
-/// * `date` - Date to get tool breakdown for
+/// * `start_bound` / `end_bound` - Half-open `started_at` range.
 ///
 /// # Returns
 ///
-/// A HashMap mapping tool names to their invocation counts.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let breakdown = load_daily_tool_breakdown(&conn, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())?;
-/// // breakdown might be: {"read_file": 10, "write_file": 5, "execute_command": 3}
-/// ```
+/// `date -> (tool name -> invocation count)` for every day with tool calls in range.
 fn load_tool_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
@@ -2817,6 +2820,67 @@ mod tests {
         assert_eq!(
             row.tool_breakdown,
             HashMap::from([(String::from("write_file"), 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_old_rounds_and_refreshes_affected_session_aggregate() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 2, 10, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let old = day - chrono::Duration::days(40);
+
+        storage
+            .upsert_session_start("s", "gpt-4", day)
+            .await
+            .expect("session start");
+        // One old round (will be pruned) and one recent round (retained).
+        for (rid, ts) in [("r-old", old), ("r-new", day)] {
+            storage
+                .insert_round_start(rid, "s", "gpt-4", ts)
+                .await
+                .expect("round start");
+            storage
+                .complete_round(
+                    rid,
+                    ts,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    },
+                    0,
+                    0,
+                    None,
+                )
+                .await
+                .expect("round complete");
+        }
+
+        let deleted = storage
+            .prune_rounds_before(day - chrono::Duration::days(30))
+            .await
+            .expect("prune");
+        assert_eq!(deleted, 1, "only the 40-day-old round is pruned");
+
+        // The affected session's aggregate is recomputed from the remaining round.
+        let daily = storage
+            .daily_metrics(
+                1,
+                Some(NaiveDate::from_ymd_opt(2026, 2, 10).expect("valid date")),
+            )
+            .await
+            .expect("daily metrics");
+        assert_eq!(daily.len(), 1);
+        assert_eq!(
+            daily[0].total_rounds, 1,
+            "session round aggregate refreshed to exclude the pruned round"
         );
     }
 
