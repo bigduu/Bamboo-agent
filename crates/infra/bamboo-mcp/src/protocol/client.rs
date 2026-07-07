@@ -459,17 +459,19 @@ mod tests {
         connected: bool,
         message_rx: TokioMutex<Option<mpsc::Receiver<String>>>,
         response_tx: mpsc::Sender<String>,
-        delay_ms: u64,
+        /// Base reply delay; the per-request delay is `base - n*5` (see `send`),
+        /// so it must exceed `max_n * 5` to stay positive.
+        base_delay_ms: u64,
     }
 
     impl EchoTransport {
-        fn new(delay_ms: u64) -> Self {
+        fn new(base_delay_ms: u64) -> Self {
             let (tx, rx) = mpsc::channel(100);
             Self {
                 connected: false,
                 message_rx: TokioMutex::new(Some(rx)),
                 response_tx: tx,
-                delay_ms,
+                base_delay_ms,
             }
         }
     }
@@ -488,9 +490,13 @@ mod tests {
             let req: serde_json::Value = serde_json::from_str(&message).expect("valid request");
             let id = req["id"].clone();
             let tx = self.response_tx.clone();
-            let delay = self.delay_ms;
-            // Reply out-of-band (spawned) and delayed so the test only passes if
-            // responses are matched by id, not by arrival order.
+            // Reply time is INVERTED vs. submission order: a higher `n` gets a
+            // shorter delay, so the LAST-issued request's response arrives FIRST.
+            // This forces a deterministically reversed arrival order, so a
+            // (hypothetical, buggy) match-by-arrival-order implementation would
+            // fail here — not just pass by coincidence of scheduling. #148.
+            let n = req["params"]["n"].as_u64().unwrap_or(0);
+            let delay = self.base_delay_ms.saturating_sub(n * 5);
             tokio::spawn(async move {
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -522,8 +528,9 @@ mod tests {
         // request by JSON-RPC id — even when replies arrive out of order — rather
         // than reading "the next line". A crossed id would mis-route or time out;
         // the stdin Mutex (transports/stdio.rs) also keeps concurrent writes from
-        // interleaving on the wire.
-        let mut client = McpProtocolClient::new(Box::new(EchoTransport::new(30)));
+        // interleaving on the wire. Base 100ms − n*5 keeps all 16 delays positive
+        // (100..25) while reversing arrival order (see EchoTransport::send).
+        let mut client = McpProtocolClient::new(Box::new(EchoTransport::new(100)));
         client.connect().await.expect("connect");
         let client = Arc::new(client);
 
