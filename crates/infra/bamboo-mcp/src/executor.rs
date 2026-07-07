@@ -256,6 +256,24 @@ impl ToolExecutor for CompositeToolExecutor {
         self.mcp.execute_with_context_outcome(call, ctx).await
     }
 
+    /// Delegate the permission gate to the built-in executor, which is where the
+    /// real `PermissionChecker` lives (issue #341). This MUST be overridden (not
+    /// left to the trait default) because in the live server the overlay chain
+    /// (`memory`, `SubAgent`, `scheduler`, …) is stacked ON TOP OF this composite:
+    /// each overlay calls `base.check_permissions_for` before invoking its tool,
+    /// and that chain bottoms out here. Falling back to the default `Ok(None)`
+    /// would silently skip the gate for every overlay tool in production. MCP
+    /// tools carry no gate, and the built-in check returns `Ok(None)` for any
+    /// name it doesn't classify, so delegating solely to `builtin` is correct for
+    /// both surfaces.
+    async fn check_permissions_for(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
+        self.builtin.check_permissions_for(call, ctx).await
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.builtin.list_tools();
         tools.extend(self.mcp.list_tools());
@@ -392,6 +410,42 @@ mod tests {
         assert!(
             matches!(outcome, ToolOutcome::NeedsHuman { .. }),
             "composite must preserve the builtin NeedsHuman outcome, got {outcome:?}"
+        );
+    }
+
+    /// A builtin stub whose permission gate always denies, to prove the composite
+    /// delegates `check_permissions_for` to its builtin instead of the trait
+    /// default (`Ok(None)`) — the default would silently skip the gate for the
+    /// overlay chain stacked over the composite in production (issue #341).
+    struct GateDenyingBuiltin;
+
+    #[async_trait]
+    impl ToolExecutor for GateDenyingBuiltin {
+        async fn execute(&self, _call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+            Err(ToolError::NotFound("stub".into()))
+        }
+        async fn check_permissions_for(
+            &self,
+            _call: &ToolCall,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
+            Err(ToolError::Execution("denied-by-builtin-gate".into()))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_delegates_permission_gate_to_builtin() {
+        let composite =
+            CompositeToolExecutor::new(Arc::new(GateDenyingBuiltin), Arc::new(GuidanceStub(None)));
+        let call = create_test_tool_call("memory", r#"{"action":"purge"}"#);
+        let ctx = ToolExecutionContext::none("test-id");
+        let result = composite.check_permissions_for(&call, &ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref m)) if m.contains("denied-by-builtin-gate")),
+            "composite must delegate the gate to its builtin, got: {result:?}"
         );
     }
 

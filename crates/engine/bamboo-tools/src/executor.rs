@@ -300,122 +300,14 @@ impl ToolExecutor for BuiltinToolExecutor {
             .get(&tool_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", tool_name)))?;
 
-        if let Some(permission_checker) = &self.permission_checker {
-            if let Some(contexts) =
-                check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
-            {
-                // "Always ask" rules (configured patterns + built-in dangerous
-                // commands) force a confirmation even under bypass. Everything
-                // else is skipped when this session is in "bypass permissions"
-                // mode (scoped per-session via its runtime state).
-                let force_ask = permission_checker.requires_forced_confirmation(&tool_name, &args);
-                for context in contexts {
-                    if ctx.bypass_permissions && !force_ask {
-                        continue;
-                    }
-                    let resource = context.resource.clone();
-                    // Forced confirmations route through `check_or_request_forced`
-                    // so the active mode/bypass cannot suppress the prompt.
-                    let decision = if force_ask {
-                        permission_checker.check_or_request_forced(context).await
-                    } else {
-                        permission_checker.check_or_request(context).await
-                    };
-                    match decision {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Err(ToolError::Execution(format!(
-                                "Permission denied for: {}",
-                                resource
-                            )));
-                        }
-                        Err(PermissionError::ConfirmationRequired {
-                            permission_type,
-                            resource: _,
-                        }) => {
-                            // Phase 2 (cross-process): a subagent worker installs a
-                            // task-local `ApprovalProxy` for the duration of its run.
-                            // When present, forward the decision to the worker's host
-                            // (parent) and block this tool inline for the reply —
-                            // approve proceeds (treated like a granted context), deny
-                            // fails closed. Checked BEFORE the interactive sink below
-                            // so a worker (which also has an `event_tx`) proxies to its
-                            // parent instead of trying to prompt a human itself. The
-                            // proxy is unset on every non-worker path, so the behavior
-                            // there is unchanged.
-                            if let Some(proxy) = crate::approval::current_approval_proxy() {
-                                let approved = proxy
-                                    .request_approval(crate::approval::ApprovalAsk {
-                                        tool_name: tool_name.clone(),
-                                        permission: permission_type.description().to_string(),
-                                        resource: resource.clone(),
-                                    })
-                                    .await;
-                                if approved {
-                                    // Treat as a granted context: check any remaining
-                                    // contexts, then fall through to execution.
-                                    continue;
-                                }
-                                return Err(ToolError::Execution(format!(
-                                    "Permission denied by host for: {}",
-                                    resource
-                                )));
-                            }
-
-                            // Interactive sessions pause for approval by reusing the
-                            // same pending-question pipeline as `request_permissions`:
-                            // synthesize an "awaiting_permission_approval" result that
-                            // the engine recognizes (via display_preference) and turns
-                            // into a NeedClarification pause. On approval the respond
-                            // handler records a session grant so the re-attempt passes.
-                            if let Some(tx) = ctx.event_tx {
-                                // Keep emitting the structured approval event for observers.
-                                let _ = tx
-                                    .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
-                                        tool_call_id: call.id.clone(),
-                                        tool_name: tool_name.clone(),
-                                        parameters: args.clone(),
-                                    })
-                                    .await;
-
-                                let question = format!(
-                                    "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
-                                    tool_name,
-                                    permission_type.description(),
-                                    resource
-                                );
-                                let payload = serde_json::json!({
-                                    "status": "awaiting_permission_approval",
-                                    "question": question,
-                                    "permission_type": permission_type,
-                                    "resource": resource,
-                                    "options": ["Approve", "Deny"],
-                                    "allow_custom": false,
-                                });
-                                // Permission-gate synthesized question stays on
-                                // the Completed→sniff path for now (a later Phase B
-                                // step converts this to ToolOutcome::NeedsHuman).
-                                return Ok(ToolOutcome::Completed(ToolResult {
-                                    success: true,
-                                    result: payload.to_string(),
-                                    display_preference: Some("request_permissions".to_string()),
-                                    images: Vec::new(),
-                                }));
-                            }
-
-                            // Non-interactive (no event sink to surface the prompt):
-                            // fail closed rather than silently proceeding.
-                            return Err(ToolError::Execution(format!(
-                                "Permission approval required for: {}",
-                                resource
-                            )));
-                        }
-                        Err(other) => {
-                            return Err(permission_error_to_tool_error(other));
-                        }
-                    }
-                }
-            }
+        // Permission gate. Factored onto the `ToolExecutor` trait
+        // (`check_permissions_for`) so overlay/wrapping executors can run the
+        // exact same check before invoking their own tools (issue #341). Kept
+        // AFTER the registry lookup so a `NotFound` still takes precedence,
+        // exactly as before. `Some(outcome)` is the interactive approval pause
+        // synthesized for a human sink; `Err` is deny / fail-closed.
+        if let Some(outcome) = self.check_permissions_for(call, &ctx).await? {
+            return Ok(outcome);
         }
 
         // Rewritten dispatch: build the owned `ToolCtx` at this concrete seam and
@@ -427,6 +319,172 @@ impl ToolExecutor for BuiltinToolExecutor {
         // authoritative and removes this unwrap.
         let tool_ctx = ctx.to_tool_ctx();
         tool.invoke(args, tool_ctx).await
+    }
+
+    /// The real permission gate for built-in tools, extracted from the execute
+    /// path so it is reusable by wrapping executors (issue #341). The behavior is
+    /// byte-for-byte the same block that used to run inline in
+    /// `execute_with_context_outcome`:
+    ///
+    /// - resolves the SAME `tool_name` + `args` the execute path runs with (so
+    ///   the check sees exactly what the tool will run with);
+    /// - "always ask" rules (`requires_forced_confirmation`) force a confirmation
+    ///   even under bypass; everything else is skipped when the session is in
+    ///   bypass-permissions mode;
+    /// - forced confirmations route through `check_or_request_forced` so the
+    ///   active mode/bypass can't suppress the prompt;
+    /// - a `ConfirmationRequired` first tries the cross-process `ApprovalProxy`
+    ///   (a subagent worker forwarding to its host), then the interactive human
+    ///   sink (returning the synthesized approval pause as `Ok(Some(..))`), then
+    ///   fails closed;
+    /// - deny fails closed.
+    ///
+    /// The only mechanical difference from the old inline block: the interactive
+    /// pause is returned as `Ok(Some(outcome))` and a clean pass returns
+    /// `Ok(None)`, so the caller decides whether to run the tool. The fallback
+    /// arg-parse warning is intentionally NOT re-logged here — the execute path
+    /// already logs it once for this call.
+    async fn check_permissions_for(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let Some(permission_checker) = &self.permission_checker else {
+            return Ok(None);
+        };
+
+        // Mirror the head of `execute_with_context_outcome`: reuse the pre-parsed
+        // args when threaded, apply the legacy-arg normalization, then resolve the
+        // registered/alias tool name. This is what makes the gate see the exact
+        // `tool_name`/`args` the tool will actually run with.
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        let raw_tool_name = normalize_tool_name(&call.function.name);
+        if let Some(args_obj) = args.as_object_mut() {
+            normalize_legacy_builtin_args(raw_tool_name, args_obj);
+        }
+        let tool_name = resolve_registered_tool_name(&self.registry, raw_tool_name);
+
+        if let Some(contexts) =
+            check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
+        {
+            // "Always ask" rules (configured patterns + built-in dangerous
+            // commands) force a confirmation even under bypass. Everything
+            // else is skipped when this session is in "bypass permissions"
+            // mode (scoped per-session via its runtime state).
+            let force_ask = permission_checker.requires_forced_confirmation(&tool_name, &args);
+            for context in contexts {
+                if ctx.bypass_permissions && !force_ask {
+                    continue;
+                }
+                let resource = context.resource.clone();
+                // Forced confirmations route through `check_or_request_forced`
+                // so the active mode/bypass cannot suppress the prompt.
+                let decision = if force_ask {
+                    permission_checker.check_or_request_forced(context).await
+                } else {
+                    permission_checker.check_or_request(context).await
+                };
+                match decision {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(ToolError::Execution(format!(
+                            "Permission denied for: {}",
+                            resource
+                        )));
+                    }
+                    Err(PermissionError::ConfirmationRequired {
+                        permission_type,
+                        resource: _,
+                    }) => {
+                        // Phase 2 (cross-process): a subagent worker installs a
+                        // task-local `ApprovalProxy` for the duration of its run.
+                        // When present, forward the decision to the worker's host
+                        // (parent) and block this tool inline for the reply —
+                        // approve proceeds (treated like a granted context), deny
+                        // fails closed. Checked BEFORE the interactive sink below
+                        // so a worker (which also has an `event_tx`) proxies to its
+                        // parent instead of trying to prompt a human itself. The
+                        // proxy is unset on every non-worker path, so the behavior
+                        // there is unchanged.
+                        if let Some(proxy) = crate::approval::current_approval_proxy() {
+                            let approved = proxy
+                                .request_approval(crate::approval::ApprovalAsk {
+                                    tool_name: tool_name.clone(),
+                                    permission: permission_type.description().to_string(),
+                                    resource: resource.clone(),
+                                })
+                                .await;
+                            if approved {
+                                // Treat as a granted context: check any remaining
+                                // contexts, then fall through to execution.
+                                continue;
+                            }
+                            return Err(ToolError::Execution(format!(
+                                "Permission denied by host for: {}",
+                                resource
+                            )));
+                        }
+
+                        // Interactive sessions pause for approval by reusing the
+                        // same pending-question pipeline as `request_permissions`:
+                        // synthesize an "awaiting_permission_approval" result that
+                        // the engine recognizes (via display_preference) and turns
+                        // into a NeedClarification pause. On approval the respond
+                        // handler records a session grant so the re-attempt passes.
+                        if let Some(tx) = ctx.event_tx {
+                            // Keep emitting the structured approval event for observers.
+                            let _ = tx
+                                .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
+                                    tool_call_id: call.id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    parameters: args.clone(),
+                                })
+                                .await;
+
+                            let question = format!(
+                                "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
+                                tool_name,
+                                permission_type.description(),
+                                resource
+                            );
+                            let payload = serde_json::json!({
+                                "status": "awaiting_permission_approval",
+                                "question": question,
+                                "permission_type": permission_type,
+                                "resource": resource,
+                                "options": ["Approve", "Deny"],
+                                "allow_custom": false,
+                            });
+                            // Permission-gate synthesized question stays on
+                            // the Completed→sniff path for now (a later Phase B
+                            // step converts this to ToolOutcome::NeedsHuman).
+                            return Ok(Some(ToolOutcome::Completed(ToolResult {
+                                success: true,
+                                result: payload.to_string(),
+                                display_preference: Some("request_permissions".to_string()),
+                                images: Vec::new(),
+                            })));
+                        }
+
+                        // Non-interactive (no event sink to surface the prompt):
+                        // fail closed rather than silently proceeding.
+                        return Err(ToolError::Execution(format!(
+                            "Permission approval required for: {}",
+                            resource
+                        )));
+                    }
+                    Err(other) => {
+                        return Err(permission_error_to_tool_error(other));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -1100,6 +1158,69 @@ mod tests {
             "forced ask rule should block under bypass: {result:?}"
         );
         assert!(fs::metadata("/etc/forced.conf").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn interactive_gate_returns_synthesized_approval_pause() {
+        // With an event sink present, a forced-ask rule that yields
+        // `ConfirmationRequired` must resolve to the synthesized "awaiting
+        // approval" PAUSE result (a `Completed` result tagged
+        // `display_preference = "request_permissions"`) — NOT an error — so the
+        // engine turns it into a clarification pause. This locks in the
+        // interactive-sink path that the `check_permissions_for` extraction must
+        // preserve as `Ok(Some(outcome))` rather than collapse to an `Err`.
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_ask_rules(["Write(/etc/**)".to_string()]);
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": "/etc/gated.conf", "content": "x"}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-interactive"),
+            tool_call_id: &call.id,
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = executor
+            .execute_with_context(&call, ctx)
+            .await
+            .expect("interactive gate should pause (Ok), not error");
+
+        assert_eq!(
+            result.display_preference.as_deref(),
+            Some("request_permissions"),
+            "interactive gate must return the request_permissions pause result"
+        );
+        assert!(result.result.contains("awaiting_permission_approval"));
+        assert!(fs::metadata("/etc/gated.conf").await.is_err());
+
+        let ev = rx.recv().await.expect("approval event should be emitted");
+        assert!(
+            matches!(ev, AgentEvent::ToolApprovalRequested { tool_name, .. } if tool_name == "Write")
+        );
+    }
+
+    #[tokio::test]
+    async fn check_permissions_for_returns_none_when_permitted() {
+        // A tool with no matching gate (Read, no checker rule) passes the gate:
+        // `check_permissions_for` returns `Ok(None)` so the caller runs the tool.
+        let executor = make_executor(None);
+        let call = make_tool_call("Read", json!({"file_path": "/tmp/whatever"}));
+        let ctx = ToolExecutionContext::none(&call.id);
+        let decision = executor
+            .check_permissions_for(&call, &ctx)
+            .await
+            .expect("no checker means no gate");
+        assert!(decision.is_none(), "no checker must yield Ok(None)");
     }
 
     // ---- Phase 2: cross-process approval proxy ----------------------------
