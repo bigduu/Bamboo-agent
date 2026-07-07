@@ -506,8 +506,9 @@ pub fn convert_messages_response(
 
     if let Some(tool_calls) = choice.message.tool_calls {
         for tool_call in tool_calls {
-            let input = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or(Value::String(tool_call.function.arguments));
+            // Anthropic requires `tool_use.input` to be a JSON object; delegate
+            // to the shared helper (empty → `{}`, non-object/invalid → `_raw`).
+            let input = super::tool_arguments_to_input(&tool_call.function.arguments);
             content_blocks.push(AnthropicResponseContentBlock::ToolUse {
                 id: tool_call.id,
                 name: tool_call.function.name,
@@ -660,5 +661,70 @@ pub fn format_model_display_name(model_id: &str) -> String {
             .replace("gpt-3.5", "GPT-3.5")
     } else {
         model_id.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response_with_tool_args(arguments: &str) -> ChatCompletionResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "resp_1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "get_time", "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("valid ChatCompletionResponse fixture")
+    }
+
+    fn tool_use_input(resp: &AnthropicMessagesResponse) -> serde_json::Value {
+        let json = serde_json::to_value(resp).expect("response is serializable");
+        json["content"]
+            .as_array()
+            .and_then(|blocks| blocks.iter().find(|b| b["type"] == "tool_use").cloned())
+            .map(|b| b["input"].clone())
+            .expect("response must contain a tool_use block")
+    }
+
+    #[test]
+    fn convert_messages_response_tool_use_input_is_always_object() {
+        // The response-conversion path must also produce an OBJECT `tool_use.input`
+        // for empty and non-object arguments (it delegates to the shared
+        // `tool_arguments_to_input`). A bare string/scalar input 400s Anthropic.
+        // (`AnthropicConversionError` is not `Debug`, so unwrap via `match`.)
+        let convert = |args: &str| match convert_messages_response(
+            response_with_tool_args(args),
+            "claude-test",
+        ) {
+            Ok(out) => out,
+            Err(_) => panic!("conversion should succeed for args={args:?}"),
+        };
+
+        let input = tool_use_input(&convert(""));
+        assert!(
+            input.is_object(),
+            "empty args must yield an object, got {input}"
+        );
+        assert_eq!(input.as_object().unwrap().len(), 0, "empty args -> {{}}");
+
+        for (args, raw) in [("[1,2]", "[1,2]"), ("oops", "oops")] {
+            let input = tool_use_input(&convert(args));
+            assert!(
+                input.is_object(),
+                "args={args:?} must yield an object, got {input}"
+            );
+            assert_eq!(input["_raw"], raw);
+        }
     }
 }
