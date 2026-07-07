@@ -166,6 +166,7 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("  Enter       Send message / Select item"),
         Line::raw("  Ctrl+C      Quit / Stop streaming"),
         Line::raw("  Ctrl+S      Stop agent execution"),
+        Line::raw("  Ctrl+X      Expand/collapse tool args & results"),
         Line::raw("  j/k         Scroll down/up"),
         Line::raw("  d           Delete (with context)"),
         Line::raw("  r           Refresh / Run schedule"),

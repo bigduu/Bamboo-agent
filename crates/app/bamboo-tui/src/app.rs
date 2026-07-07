@@ -103,6 +103,9 @@ pub struct ChatState {
     pub model: String,
     pub token_usage: Option<TokenUsage>,
     pub plan_mode: bool,
+    /// When true, tool-call arguments and results render in full instead
+    /// of truncated. Toggled with `x` on the Chat tab.
+    pub expand_tools: bool,
 }
 
 impl ChatState {
@@ -123,6 +126,7 @@ impl ChatState {
             model: String::new(),
             token_usage: None,
             plan_mode: false,
+            expand_tools: false,
         }
     }
 }
@@ -708,6 +712,9 @@ impl App {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.stop_streaming().await?;
                 }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.chat.expand_tools = !self.chat.expand_tools;
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.chat.auto_scroll = false;
                     self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(3);
@@ -747,6 +754,9 @@ impl App {
             }
             KeyCode::Char('G') => {
                 self.chat.auto_scroll = true;
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.chat.expand_tools = !self.chat.expand_tools;
             }
             _ => {
                 self.chat.textarea.input(key);
