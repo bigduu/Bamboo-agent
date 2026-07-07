@@ -142,25 +142,68 @@ impl BrokerCore {
     /// (`p-<child>`) behind, and a killed pool worker's mailbox lingers — all
     /// empty after their acks. An empty, unsubscribed mailbox holds no work and
     /// is re-created on the next deliver/subscribe, so deleting it is lossless.
-    /// Returns the count purged. Holds the subscriber lock across the sweep so a
-    /// concurrent subscribe can't be raced into deletion.
+    /// Returns the count purged.
+    ///
+    /// The subscriber lock is held only BRIEFLY (to snapshot ids, and to re-check
+    /// each candidate before removal) — never across the filesystem sweep. Every
+    /// deliver/subscribe/cancel also takes that lock, so holding it across the
+    /// blocking `read_dir`/`is_fully_empty`/`remove_dir_all` would stall all bus
+    /// routing for the whole sweep; the fs work also runs on `spawn_blocking` so
+    /// it never blocks a tokio worker thread. See #344.
     pub async fn gc_empty_mailboxes(&self) -> usize {
         let root = self.root.join("mailboxes");
-        let subs = self.subscribers.lock().await;
+
+        // Snapshot the currently-subscribed ids under a brief lock, then release.
+        let subscribed: std::collections::HashSet<String> =
+            self.subscribers.lock().await.keys().cloned().collect();
+
+        // Phase 1 (off-lock, off-worker): find empty, unsubscribed candidate dirs.
+        let scan_root = root.clone();
+        let candidates: Vec<std::path::PathBuf> = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&scan_root) else {
+                return out;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if subscribed.contains(&id) {
+                    continue; // a live subscriber owns it — keep.
+                }
+                if Mailbox::at(&path).is_fully_empty() {
+                    out.push(path);
+                }
+            }
+            out
+        })
+        .await
+        .unwrap_or_default();
+
+        // Phase 2: re-check subscription (brief lock, closing the
+        // delete-vs-subscribe race) AND emptiness (re-checked atomically with the
+        // remove, closing the deliver-vs-delete race), then remove off-lock.
         let mut purged = 0;
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return 0;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
+        for path in candidates {
+            let id = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if self.subscribers.lock().await.contains_key(&id) {
+                continue; // subscribed since the snapshot — keep.
             }
-            let id = entry.file_name().to_string_lossy().into_owned();
-            if subs.contains_key(&id) {
-                continue; // a live subscriber owns it — keep.
-            }
-            if Mailbox::at(&path).is_fully_empty() && std::fs::remove_dir_all(&path).is_ok() {
+            // Re-check emptiness and remove back-to-back in one blocking call (no
+            // await between them), so a message delivered to this mailbox since
+            // the Phase-1 scan is never silently deleted — matching the original
+            // synchronous `is_fully_empty` → `remove_dir_all`.
+            let removed = tokio::task::spawn_blocking(move || {
+                Mailbox::at(&path).is_fully_empty() && std::fs::remove_dir_all(&path).is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            if removed {
                 purged += 1;
             }
         }
