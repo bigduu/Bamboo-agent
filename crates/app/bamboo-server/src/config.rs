@@ -21,12 +21,13 @@
 
 use actix_cors::Cors;
 use actix_governor::governor::middleware::NoOpMiddleware;
-use actix_governor::{GovernorConfig, GovernorConfigBuilder, PeerIpKeyExtractor};
+use actix_governor::{GovernorConfig, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError};
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::header;
 use actix_web::middleware::{DefaultHeaders, Next};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use tracing::info;
 use tracing::warn;
 
@@ -36,10 +37,103 @@ const DEFAULT_RATE_LIMIT_PER_SECOND: u64 = 10;
 /// Default per-IP burst allowance. Overridable via `BAMBOO_RATE_LIMIT_BURST`.
 const DEFAULT_RATE_LIMIT_BURST: u32 = 20;
 
+/// Rate-limiter key extractor. Defaults to the TCP peer IP (non-spoofable), but
+/// can be switched to an OPT-IN `X-Forwarded-For` mode for reverse-proxy
+/// deployments where the peer IP is always the proxy (which would otherwise
+/// collapse the per-IP limit to global). #169.
+///
+/// SECURITY: XFF mode is only safe behind a trusted proxy — a directly-reachable
+/// server trusting XFF lets any client spoof its key and bypass the limiter. It
+/// is therefore off unless `BAMBOO_RATE_LIMIT_TRUST_XFF` is set, and it fails
+/// CLOSED to the peer IP whenever the header is absent, unparseable, or shorter
+/// than the configured trusted-hop count (so a rogue/short XFF can't inject a key).
+#[derive(Clone, Debug)]
+pub struct ClientIpKeyExtractor {
+    trust_xff: bool,
+    /// Number of trusted proxies between us and the client. The real client is
+    /// the `trusted_hops`-th entry from the RIGHT of `X-Forwarded-For` (each proxy
+    /// appends the peer it saw as the request travels outward-to-inward).
+    trusted_hops: usize,
+}
+
+impl ClientIpKeyExtractor {
+    /// The default, non-spoofable peer-IP extractor.
+    #[cfg(test)]
+    fn peer_ip() -> Self {
+        Self {
+            trust_xff: false,
+            trusted_hops: 1,
+        }
+    }
+
+    fn client_ip_from_xff(&self, req: &ServiceRequest) -> Option<IpAddr> {
+        let hops = self.trusted_hops.max(1);
+        let header_value = req.headers().get("x-forwarded-for")?.to_str().ok()?;
+        let entries: Vec<&str> = header_value
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Fail closed: a header with fewer entries than the trusted hop count is
+        // not the shape a trusted proxy chain produces, so don't trust it.
+        if entries.len() < hops {
+            return None;
+        }
+        parse_forwarded_ip(entries[entries.len() - hops])
+    }
+}
+
+impl KeyExtractor for ClientIpKeyExtractor {
+    type Key = IpAddr;
+    type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
+
+    fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
+        if self.trust_xff {
+            if let Some(client) = self.client_ip_from_xff(req) {
+                return Ok(mask_ipv6_prefix(client));
+            }
+            // else: fall through to the peer IP (fail closed).
+        }
+        let ip = req.peer_addr().map(|socket| socket.ip()).ok_or_else(|| {
+            SimpleKeyExtractionError::new("Could not extract peer IP address from request")
+        })?;
+        Ok(mask_ipv6_prefix(ip))
+    }
+}
+
+/// Rate-limit IPv6 clients per /56 prefix rather than per address (customers are
+/// often handed a whole prefix), mirroring `PeerIpKeyExtractor`. IPv4 is unchanged.
+fn mask_ipv6_prefix(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[7..16].fill(0);
+            IpAddr::V6(octets.into())
+        }
+        v4 => v4,
+    }
+}
+
+/// Parse one `X-Forwarded-For` entry into an IP, tolerating a `host:port` or
+/// bracketed-IPv6 form some proxies emit.
+fn parse_forwarded_ip(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        return Some(sa.ip());
+    }
+    // Bracketed IPv6 without a port, e.g. "[::1]".
+    let unbracketed = s.strip_prefix('[').and_then(|x| x.strip_suffix(']'))?;
+    unbracketed.parse::<IpAddr>().ok()
+}
+
 fn rate_limiter_config(
     per_second: u64,
     burst: u32,
-) -> GovernorConfig<PeerIpKeyExtractor, NoOpMiddleware> {
+    key_extractor: ClientIpKeyExtractor,
+) -> GovernorConfig<ClientIpKeyExtractor, NoOpMiddleware> {
     // One cell replenishes every `1000 / per_second` ms (>=1), allowing `per_second`
     // sustained req/s with a `burst` bucket. Clamp to >=1 so a bad env value can't
     // produce a zero period/burst (which finish() would reject).
@@ -47,6 +141,7 @@ fn rate_limiter_config(
     GovernorConfigBuilder::default()
         .milliseconds_per_request(ms_per_request)
         .burst_size(burst.max(1))
+        .key_extractor(key_extractor)
         .finish()
         .expect("rate limiter config is valid (non-zero period and burst)")
 }
@@ -57,13 +152,13 @@ fn rate_limiter_config(
 /// (default 20) burst, returning 429 Too Many Requests when exceeded. Desktop
 /// (localhost) mode does not apply it. #13.
 ///
-/// LIMITATION: keys on the TCP PEER IP. Behind a reverse proxy every client shares
-/// the proxy's IP, so the limit becomes effectively GLOBAL (still a real DoS
-/// backstop, but not per-client). Honoring `X-Forwarded-For` would require an
-/// opt-in trusted-proxy mode (XFF is spoofable when not behind a trusted proxy),
-/// tracked separately. The default (peer IP) is the safe, non-spoofable choice for
-/// the direct-exposure (Docker `0.0.0.0`) threat model #13 targets.
-pub fn build_rate_limiter() -> GovernorConfig<PeerIpKeyExtractor, NoOpMiddleware> {
+/// Keys on the TCP PEER IP by default (non-spoofable). Behind a reverse proxy
+/// every client shares the proxy's IP, collapsing the per-IP limit to global; set
+/// `BAMBOO_RATE_LIMIT_TRUST_XFF=1` to key on `X-Forwarded-For` instead (with
+/// `BAMBOO_RATE_LIMIT_TRUSTED_HOPS`, default one hop). #169. XFF mode is OPT-IN
+/// because trusting the header when NOT behind a trusted proxy lets any client
+/// spoof its rate-limit key; see [`ClientIpKeyExtractor`].
+pub fn build_rate_limiter() -> GovernorConfig<ClientIpKeyExtractor, NoOpMiddleware> {
     let per_second = std::env::var("BAMBOO_RATE_LIMIT_PER_SECOND")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -72,7 +167,36 @@ pub fn build_rate_limiter() -> GovernorConfig<PeerIpKeyExtractor, NoOpMiddleware
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(DEFAULT_RATE_LIMIT_BURST);
-    rate_limiter_config(per_second, burst)
+
+    let trust_xff = std::env::var("BAMBOO_RATE_LIMIT_TRUST_XFF")
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    let trusted_hops = std::env::var("BAMBOO_RATE_LIMIT_TRUSTED_HOPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1);
+
+    if trust_xff {
+        warn!(
+            "Rate limiter is trusting X-Forwarded-For (trusted_hops={trusted_hops}). \
+             Only enable this when the server is reachable exclusively through a trusted \
+             reverse proxy — otherwise clients can spoof their rate-limit key."
+        );
+    }
+
+    rate_limiter_config(
+        per_second,
+        burst,
+        ClientIpKeyExtractor {
+            trust_xff,
+            trusted_hops,
+        },
+    )
 }
 
 /// True when `bind` is a loopback/desktop address, for which the per-IP DoS
@@ -593,8 +717,8 @@ mod tests {
     fn rate_limiter_config_clamps_degenerate_values() {
         // 0 per_second / 0 burst would make finish() reject; the clamps keep it
         // valid (no panic).
-        let _ = rate_limiter_config(0, 0);
-        let _ = rate_limiter_config(1000, 1);
+        let _ = rate_limiter_config(0, 0, ClientIpKeyExtractor::peer_ip());
+        let _ = rate_limiter_config(1000, 1, ClientIpKeyExtractor::peer_ip());
     }
 
     #[test]
@@ -661,7 +785,7 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // burst=2: the first two requests from an IP pass, the rest are throttled.
-        let conf = rate_limiter_config(1, 2);
+        let conf = rate_limiter_config(1, 2, ClientIpKeyExtractor::peer_ip());
         let app = test::init_service(
             App::new()
                 .wrap(Governor::new(&conf))
@@ -694,6 +818,136 @@ mod tests {
             test::call_service(&app, req).await.status(),
             StatusCode::OK,
             "a different IP gets its own fresh bucket (per-IP, not global)"
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_default_ignores_xff_and_uses_peer_ip() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // Default (trust_xff = false): a client-supplied XFF must be ignored so it
+        // can't spoof its rate-limit key on a directly-exposed server.
+        let ke = ClientIpKeyExtractor::peer_ip();
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 5000);
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "1.2.3.4"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_uses_rightmost_at_one_hop_not_client_prefix() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // trusted_hops = 1: only the entry OUR proxy appended (rightmost) is
+        // trusted; a client prepending a fake IP can't change the key.
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 1,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000); // proxy
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "1.1.1.1, 2.2.2.2"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_two_hops_takes_second_from_right() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 2,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "1.1.1.1, 2.2.2.2, 3.3.3.3"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_fails_closed_to_peer_when_header_too_short_or_absent() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 2,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+
+        // Fewer entries than trusted hops → not a trusted-proxy shape → peer IP.
+        let short = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "9.9.9.9"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&short).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+
+        // No XFF at all → peer IP.
+        let none = test::TestRequest::get().peer_addr(peer).to_srv_request();
+        assert_eq!(
+            ke.extract(&none).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn parse_forwarded_ip_handles_bare_port_and_bracketed_forms() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        assert_eq!(
+            parse_forwarded_ip("1.2.3.4"),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
+        assert_eq!(
+            parse_forwarded_ip("1.2.3.4:5678"),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
+        assert_eq!(
+            parse_forwarded_ip("[::1]:9000"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_forwarded_ip("[::1]"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(parse_forwarded_ip("not-an-ip"), None);
+    }
+
+    #[test]
+    fn mask_ipv6_prefix_zeroes_lower_bytes_and_leaves_ipv4() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(mask_ipv6_prefix(v4), v4);
+
+        let v6 = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6,
+        ));
+        // /56: first 7 bytes preserved, remaining 9 zeroed.
+        assert_eq!(
+            mask_ipv6_prefix(v6),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0))
         );
     }
 
