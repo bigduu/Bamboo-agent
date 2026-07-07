@@ -178,6 +178,88 @@ pub fn check_permissions(
                 format!("Execute JavaScript: {}", preview),
             )]))
         }
+        // ── Server/overlay tools (#395) ────────────────────────────────────
+        // #393 wired these through the permission gate, but without a
+        // classification here `check_permissions` returned `Ok(None)` → no
+        // context → ungated in EVERY mode (Default never prompts, user
+        // `deploy_agent(*)` ask-rules never fire). Classify the compute-spinning
+        // and schedule-mutating actions so they actually reach the gate; read
+        // actions stay ungated.
+        "deploy_agent" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            // deploy/stop spin up or tear down local/Docker/SSH workers.
+            if matches!(action.as_str(), "deploy" | "stop") {
+                Ok(Some(vec![PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    format!("deploy_agent {action}"),
+                    format!("deploy_agent {action}: spin up/stop a worker process"),
+                )]))
+            } else {
+                Ok(None) // list → read-only
+            }
+        }
+        "cluster" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            // deploy/stop a worker onto a managed node; list/describe/status read.
+            if matches!(action.as_str(), "deploy" | "stop") {
+                let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("");
+                Ok(Some(vec![PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    format!("cluster {action} {node}").trim_end().to_string(),
+                    format!("cluster {action} on node '{node}'"),
+                )]))
+            } else {
+                Ok(None)
+            }
+        }
+        "SubAgent" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            // create spawns a full independent agent run (its own compute + full
+            // toolset); wait/list/list_models are passive/read.
+            if action == "create" {
+                Ok(Some(vec![PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    "SubAgent create",
+                    "Spawn a sub-agent (child) session",
+                )]))
+            } else {
+                Ok(None)
+            }
+        }
+        "scheduler" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            let schedule_id = args.get("schedule_id").and_then(|v| v.as_str());
+            match action.as_str() {
+                // Immediately mints + executes a fresh session → like a command.
+                "run_now" => Ok(Some(vec![PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    format!("scheduler run_now {}", schedule_id.unwrap_or(""))
+                        .trim_end()
+                        .to_string(),
+                    "scheduler run_now: execute a schedule immediately".to_string(),
+                )])),
+                // Create/modify/remove a schedule that later auto-executes sessions.
+                "create" | "patch" | "delete" => Ok(Some(vec![PermissionContext::new(
+                    PermissionType::WriteFile,
+                    format!("scheduler {action} {}", schedule_id.unwrap_or(""))
+                        .trim_end()
+                        .to_string(),
+                    format!("scheduler {action}: modify an auto-executing schedule"),
+                )])),
+                _ => Ok(None), // list / list_sessions → read-only
+            }
+        }
+        // Read-only: session_inspector (list / get_meta / read_messages) and the
+        // session_history viewer never mutate or spin up compute. #395.
+        "session_inspector" | "session_history" => Ok(None),
         _ => Ok(None),
     }
 }
@@ -248,6 +330,71 @@ mod tests {
         let contexts = check_permissions("Write", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+    }
+
+    // ── Server/overlay tool classification (#395) ──────────────────────────
+    #[test]
+    fn overlay_tools_gate_compute_spinning_actions() {
+        // deploy_agent / cluster deploy+stop and SubAgent create spin up compute →
+        // ExecuteCommand; scheduler run_now executes immediately → ExecuteCommand.
+        for (tool, args) in [
+            (
+                "deploy_agent",
+                json!({"action": "deploy", "role": "worker"}),
+            ),
+            ("deploy_agent", json!({"action": "stop"})),
+            ("cluster", json!({"action": "deploy", "node": "n1"})),
+            ("cluster", json!({"action": "stop", "node": "n1"})),
+            ("SubAgent", json!({"action": "create", "prompt": "x"})),
+            (
+                "scheduler",
+                json!({"action": "run_now", "schedule_id": "s1"}),
+            ),
+        ] {
+            let contexts = check_permissions(tool, &args)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{tool} {args} must be gated, not ungated"));
+            assert_eq!(
+                contexts[0].permission_type,
+                PermissionType::ExecuteCommand,
+                "{tool} {args} should gate as ExecuteCommand"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_mutations_gate_as_writefile() {
+        for action in ["create", "patch", "delete"] {
+            let args = json!({"action": action, "schedule_id": "s1", "name": "n"});
+            let contexts = check_permissions("scheduler", &args).unwrap().unwrap();
+            assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+        }
+    }
+
+    #[test]
+    fn overlay_read_actions_stay_ungated() {
+        // Read-only actions must NOT produce a permission context (Ok(None)).
+        for (tool, args) in [
+            ("deploy_agent", json!({"action": "list"})),
+            ("cluster", json!({"action": "list"})),
+            ("cluster", json!({"action": "status", "node": "n1"})),
+            ("SubAgent", json!({"action": "list"})),
+            ("SubAgent", json!({"action": "wait"})),
+            ("scheduler", json!({"action": "list"})),
+            (
+                "scheduler",
+                json!({"action": "list_sessions", "schedule_id": "s1"}),
+            ),
+            (
+                "session_inspector",
+                json!({"action": "read_messages", "session_id": "x"}),
+            ),
+        ] {
+            assert!(
+                check_permissions(tool, &args).unwrap().is_none(),
+                "{tool} {args} should stay ungated"
+            );
+        }
     }
 
     #[test]
