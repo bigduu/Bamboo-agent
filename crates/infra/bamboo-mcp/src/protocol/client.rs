@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{trace, warn};
@@ -13,7 +13,7 @@ use crate::types::{McpCallResult, McpTool};
 /// the SAME inbound message-handler loop as JSON-RPC responses, so a *blocking*
 /// send here would wedge that loop — and stall all response delivery — once the
 /// buffer fills. Sends into it are therefore non-blocking (drop-on-full); see
-/// [`McpProtocolClient::handle_message`].
+/// `handle_message` (private).
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 100;
 
 /// Transport trait for MCP communication
@@ -60,6 +60,10 @@ pub struct McpProtocolClient {
     message_handler: Option<tokio::task::JoinHandle<()>>,
     notification_tx: mpsc::Sender<JsonRpcNotification>,
     notification_rx: Arc<RwLock<mpsc::Receiver<JsonRpcNotification>>>,
+    /// Whether the notification queue is currently in a full/dropping episode.
+    /// Gates the drop `warn!` to once per episode instead of once per dropped
+    /// notification, so a chatty server can't produce continuous warn spam. #366.
+    notification_queue_full: Arc<AtomicBool>,
 }
 
 impl McpProtocolClient {
@@ -72,6 +76,7 @@ impl McpProtocolClient {
             message_handler: None,
             notification_tx,
             notification_rx: Arc::new(RwLock::new(notification_rx)),
+            notification_queue_full: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -117,6 +122,7 @@ impl McpProtocolClient {
     fn start_message_handler(&mut self, mut receiver: mpsc::Receiver<String>) {
         let pending_requests = self.pending_requests.clone();
         let notification_tx = self.notification_tx.clone();
+        let notification_queue_full = self.notification_queue_full.clone();
 
         let handler = tokio::spawn(async move {
             // Await the next message from the channel. When the channel closes
@@ -125,8 +131,13 @@ impl McpProtocolClient {
             while let Some(message) = receiver.recv().await {
                 // Raw inbound wire messages can be extremely noisy and may contain secrets.
                 trace!("Received message (bytes={})", message.len());
-                if let Err(e) =
-                    Self::handle_message(&message, &pending_requests, &notification_tx).await
+                if let Err(e) = Self::handle_message(
+                    &message,
+                    &pending_requests,
+                    &notification_tx,
+                    &notification_queue_full,
+                )
+                .await
                 {
                     warn!("Failed to handle message: {}", e);
                 }
@@ -141,6 +152,7 @@ impl McpProtocolClient {
         message: &str,
         pending_requests: &RwLock<std::collections::HashMap<u64, PendingRequest>>,
         notification_tx: &mpsc::Sender<JsonRpcNotification>,
+        notification_queue_full: &AtomicBool,
     ) -> Result<()> {
         // Try to parse as response
         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(message) {
@@ -171,11 +183,22 @@ impl McpProtocolClient {
             // every in-flight call and, under auto-reconnect, causing a recycle
             // storm. Drop the notification rather than ever stall responses.
             match notification_tx.try_send(notification) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(dropped)) => warn!(
-                    "MCP notification queue full (cap={}); dropped notification (method={})",
-                    NOTIFICATION_CHANNEL_CAPACITY, dropped.method
-                ),
+                Ok(()) => {
+                    // Queue accepted again → end the drop episode so the next
+                    // saturation logs once more. #366.
+                    notification_queue_full.store(false, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Full(dropped)) => {
+                    // Log once per full/dropping episode, not once per dropped
+                    // notification — a chatty server would otherwise emit
+                    // continuous warn-level spam (and feed alerting). #366.
+                    if !notification_queue_full.swap(true, Ordering::Relaxed) {
+                        warn!(
+                            "MCP notification queue full (cap={}); dropping notifications until it drains (first dropped method={})",
+                            NOTIFICATION_CHANNEL_CAPACITY, dropped.method
+                        );
+                    }
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     trace!("MCP notification receiver dropped; ignoring notification")
                 }
@@ -553,6 +576,8 @@ mod tests {
             .try_send(fill)
             .expect("first notification fills the cap-1 queue");
 
+        let queue_full = AtomicBool::new(false);
+
         // A pending request awaiting its JSON-RPC response.
         let pending: RwLock<HashMap<u64, PendingRequest>> = RwLock::new(HashMap::new());
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -567,16 +592,23 @@ mod tests {
         let notif_json = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            McpProtocolClient::handle_message(notif_json, &pending, &notif_tx),
+            McpProtocolClient::handle_message(notif_json, &pending, &notif_tx, &queue_full),
         )
         .await
         .expect("handle_message must not block on a full notification queue")
         .expect("handle_message returns Ok");
 
+        // The drop `warn!` fires once per episode: the queue is still full, so a
+        // second dropped notification must NOT re-flag (episode already open). #366.
+        assert!(
+            queue_full.load(Ordering::Relaxed),
+            "queue-full episode should be flagged after the first drop"
+        );
+
         // 2) A JSON-RPC response must still be dispatched to its pending request,
         //    even though the notification queue is saturated.
         let resp_json = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
-        McpProtocolClient::handle_message(resp_json, &pending, &notif_tx)
+        McpProtocolClient::handle_message(resp_json, &pending, &notif_tx, &queue_full)
             .await
             .expect("handle_message returns Ok");
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
