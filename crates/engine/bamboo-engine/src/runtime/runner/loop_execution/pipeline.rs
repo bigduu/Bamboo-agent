@@ -527,8 +527,18 @@ async fn poll_completed_task_evaluation(state: &mut LoopRunState) {
     };
 
     match in_flight.join_handle.await {
-        Ok(result) => {
+        Ok(Some(result)) => {
             state.task_evaluation.completed = Some(result);
+        }
+        Ok(None) => {
+            // The run was cancelled while this task evaluation was in flight; the
+            // eval future was dropped before completing, so there is no outcome
+            // to apply.
+            tracing::debug!(
+                "[{}] Async task evaluation cancelled for round {}",
+                state.session_id,
+                in_flight.request.round_number
+            );
         }
         Err(error) => {
             tracing::warn!(
@@ -551,8 +561,15 @@ async fn drain_in_flight_task_evaluation(state: &mut LoopRunState) {
     };
 
     match in_flight.join_handle.await {
-        Ok(result) => {
+        Ok(Some(result)) => {
             state.task_evaluation.completed = Some(result);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "[{}] Async task evaluation cancelled while draining round {}",
+                state.session_id,
+                in_flight.request.round_number
+            );
         }
         Err(error) => {
             tracing::warn!(
@@ -651,18 +668,26 @@ fn spawn_task_evaluation_request(
     event_tx: &mpsc::Sender<AgentEvent>,
     request: crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
 ) {
     let task_round = request.round_number;
     let session_id = state.session_id.clone();
     let event_tx = event_tx.clone();
     let request_for_spawn = request.clone();
+    // Thread the run's cancel token into the detached eval so a cancelled run
+    // drops the in-flight LLM request future at the first await point (`None`)
+    // instead of running the evaluation — and its late `TaskListUpdated` event —
+    // to completion (issue #347). `biased` checks cancellation first.
     let join_handle = tokio::spawn(async move {
-        crate::runtime::runner::task_lifecycle::execute_async_task_evaluation(
-            request_for_spawn,
-            llm,
-            event_tx,
-        )
-        .await
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => None,
+            result = crate::runtime::runner::task_lifecycle::execute_async_task_evaluation(
+                request_for_spawn,
+                llm,
+                event_tx,
+            ) => Some(result),
+        }
     });
 
     tracing::debug!(
@@ -677,6 +702,25 @@ fn spawn_task_evaluation_request(
     });
 }
 
+/// Abort any in-flight async Gold/Task evaluation and clear its slot.
+///
+/// Called on EVERY early return from [`run_pipeline`] (cancellation,
+/// terminal-error, no-outcome, overflow-recovery failure). The happy path
+/// instead *drains* (awaits + applies) these handles after the loop; the early
+/// returns skip that drain, so without an explicit abort the `JoinHandle` would
+/// simply be dropped — which DETACHES (not aborts) the tokio task, letting a
+/// cancelled run keep executing a full LLM request to completion and fire a late
+/// event onto the ended stream (issue #347). `abort()` drops the eval future at
+/// its next await point, stopping the spend.
+fn abort_in_flight_evaluations(state: &mut LoopRunState) {
+    if let Some(in_flight) = state.task_evaluation.in_flight.take() {
+        in_flight.join_handle.abort();
+    }
+    if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
+        in_flight.join_handle.abort();
+    }
+}
+
 fn spawn_task_evaluation_if_needed(
     turn: usize,
     session: &Session,
@@ -684,6 +728,7 @@ fn spawn_task_evaluation_if_needed(
     config: &AgentLoopConfig,
     state: &mut LoopRunState,
     llm: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
 ) -> Result<(), AgentError> {
     // Gate: evaluate only when the Task tool structurally rewrote the list this
     // turn. The flag is set in `maybe_handle_taskwrite`, so an evaluation fires
@@ -728,7 +773,7 @@ fn spawn_task_evaluation_if_needed(
         return Ok(());
     }
 
-    spawn_task_evaluation_request(state, event_tx, request, llm);
+    spawn_task_evaluation_request(state, event_tx, request, llm, cancel_token);
     Ok(())
 }
 
@@ -1124,7 +1169,13 @@ pub(super) async fn run_pipeline(
                     .fast_model_provider
                     .clone()
                     .unwrap_or_else(|| llm.clone());
-                spawn_task_evaluation_request(state, event_tx, request, eval_provider);
+                spawn_task_evaluation_request(
+                    state,
+                    event_tx,
+                    request,
+                    eval_provider,
+                    cancel_token.clone(),
+                );
             }
         }
         poll_completed_gold_evaluation(state).await;
@@ -1137,6 +1188,7 @@ pub(super) async fn run_pipeline(
                 .fast_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
+            cancel_token.clone(),
         );
 
         state.runtime_state.round.current_round = turn_counter;
@@ -1202,6 +1254,12 @@ pub(super) async fn run_pipeline(
                 &state.session_id,
                 session.messages.len() as u32,
             );
+            // Abort any in-flight Gold/Task eval before returning: this early exit
+            // skips the post-loop drain, so without this the handle would be
+            // dropped (detached, not aborted) and the eval would keep running its
+            // LLM request to completion — wasted spend + a late event onto the
+            // already-ended stream (issue #347).
+            abort_in_flight_evaluations(state);
             return Err(AgentError::Cancelled);
         }
 
@@ -1263,7 +1321,7 @@ pub(super) async fn run_pipeline(
                             error,
                         );
                         let recovered =
-                            crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
+                            match crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
                                 session,
                                 config,
                                 &state.model_name,
@@ -1271,7 +1329,17 @@ pub(super) async fn run_pipeline(
                                 &llm,
                                 Some(event_tx),
                             )
-                            .await?;
+                            .await
+                            {
+                                Ok(recovered) => recovered,
+                                Err(error) => {
+                                    // Early exit before the post-loop drain — abort
+                                    // any in-flight eval so it does not detach and
+                                    // keep spending (issue #347).
+                                    abort_in_flight_evaluations(state);
+                                    return Err(error);
+                                }
+                            };
                         if recovered {
                             state
                                 .overflow_recovery
@@ -1480,6 +1548,9 @@ pub(super) async fn run_pipeline(
                 session.messages.len() as u32,
                 &error,
             );
+            // Early exit before the post-loop drain — abort in-flight evals so a
+            // terminal error does not leave an eval detached and spending (#347).
+            abort_in_flight_evaluations(state);
             return Err(error);
         }
 
@@ -1496,6 +1567,8 @@ pub(super) async fn run_pipeline(
                 session.messages.len() as u32,
                 &error,
             );
+            // Early exit before the post-loop drain — abort in-flight evals (#347).
+            abort_in_flight_evaluations(state);
             return Err(error);
         };
 
@@ -1680,6 +1753,7 @@ pub(super) async fn run_pipeline(
                 .fast_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
+            cancel_token.clone(),
         ) {
             tracing::warn!(
                 "[{}] Failed to spawn async task evaluation after round {}: {}",
@@ -1699,6 +1773,7 @@ pub(super) async fn run_pipeline(
                 .fast_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
+            cancel_token.clone(),
         ) {
             tracing::warn!(
                 "[{}] Failed to spawn async Gold evaluation after round {}: {}",
@@ -1778,7 +1853,13 @@ pub(super) async fn run_pipeline(
                 .fast_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone());
-            spawn_task_evaluation_request(state, event_tx, request, eval_provider);
+            spawn_task_evaluation_request(
+                state,
+                event_tx,
+                request,
+                eval_provider,
+                cancel_token.clone(),
+            );
             drain_in_flight_task_evaluation(state).await;
             apply_completed_task_evaluation(session, event_tx, config, state).await;
         }
@@ -3862,6 +3943,296 @@ mod tests {
                     && m.content.contains("tool-result-123")),
             "expected a tool-result message, got {} message(s)",
             session.messages.len()
+        );
+    }
+
+    // ── Async Gold/Task eval cancel + abort-on-early-exit (issue #347) ────
+    //
+    // The runner spawns Gold/Task evaluations as detached tokio tasks and only
+    // *drains* (awaits + applies) them on the normal post-loop path. On an early
+    // return (cancellation / terminal-error / no-outcome) it used to simply drop
+    // the `JoinHandle` — which DETACHES (not aborts) the task, so a run the user
+    // cancelled kept running a full LLM eval request to completion (wasted spend)
+    // and could fire a late event onto the already-ended stream. The fix threads
+    // the run's cancel token into the spawned eval (a `select!` that resolves to
+    // `None` on cancel) AND aborts any in-flight handle at every early return.
+
+    /// What the scripted main agent does on its SECOND round, once the Gold
+    /// evaluation spawned after round 1 is genuinely in flight.
+    #[derive(Clone, Copy)]
+    enum SecondRoundBehavior {
+        /// Block forever so the runner parks in its cancel-aware LLM stream; the
+        /// test then fires `cancel` against a live in-flight eval.
+        BlockForever,
+        /// Return a non-retryable terminal error so `run_pipeline` takes the
+        /// terminal-error early return WITHOUT the cancel token being cancelled —
+        /// isolating the `abort_in_flight_evaluations` mechanism (the `select!`
+        /// on the cancel token cannot fire here).
+        TerminalError,
+    }
+
+    /// Round 1 emits a tool call so a tool round runs and, with the Gold loop
+    /// enabled, a PostRound Gold evaluation is spawned at the end of the round.
+    /// The Gold evaluation flips `gold_started`, then BLOCKS on `release`
+    /// (simulating a slow LLM request) and sets `gold_completed` + signals
+    /// `finished` ONLY if it is allowed to run past the block — so an aborted /
+    /// cancelled eval leaves `gold_completed` false and never signals `finished`.
+    struct EvalAbortProbeProvider {
+        main_calls: std::sync::atomic::AtomicUsize,
+        gold_started: Arc<AtomicBool>,
+        gold_completed: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
+        second_round: SecondRoundBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for EvalAbortProbeProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            // The runner dispatches via `chat_stream_ir`, whose default delegates
+            // to `chat_stream_with_options`; this plain method is unused here.
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            options: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let purpose = options
+                .and_then(|o| o.request_purpose.as_deref())
+                .unwrap_or("agent_loop");
+
+            if purpose == "gold_evaluation" {
+                // Genuinely in-flight LLM eval: flag start, then block. On cancel
+                // the spawn's `select!` drops this future; on a terminal-error
+                // early exit `abort_in_flight_evaluations` aborts the task. Either
+                // way the code below `release` never runs.
+                self.gold_started.store(true, Ordering::SeqCst);
+                self.release.notified().await;
+                self.gold_completed.store(true, Ordering::SeqCst);
+                self.finished.notify_one();
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "gold-eval-async".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_agent_core::tools::FunctionCall {
+                        name: "report_gold_evaluation".to_string(),
+                        arguments:
+                            r#"{"decision":"achieved","confidence":"high","reasoning":"done"}"#
+                                .to_string(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+
+            let n = self
+                .main_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Round 1: a tool call → a tool round → PostRound Gold eval spawns.
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "noop-1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_agent_core::tools::FunctionCall {
+                        name: "noop".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+
+            // Round 2+: wait until the Gold eval is genuinely in flight so the
+            // early-exit races a LIVE eval (not an unspawned task), then act.
+            for _ in 0..2000 {
+                if self.gold_started.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            match self.second_round {
+                SecondRoundBehavior::BlockForever => Ok(Box::pin(stream::pending())),
+                SecondRoundBehavior::TerminalError => Err(LLMError::Auth(
+                    "terminal error injected to exercise #347 abort".to_string(),
+                )),
+            }
+        }
+    }
+
+    fn eval_abort_config() -> AgentLoopConfig {
+        use crate::runtime::config::PromptMemoryFlags;
+        AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("ship it".to_string()),
+                max_auto_continuations: 3,
+                ..crate::runtime::config::GoldConfig::default()
+            }),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+            },
+            model_name: Some("model".to_string()),
+            max_rounds: 5,
+            ..AgentLoopConfig::default()
+        }
+    }
+
+    /// A run the user CANCELS with a Gold evaluation in flight must not run that
+    /// eval's LLM request to completion. Drives the real `run_pipeline`: the eval
+    /// blocks mid-request, the run is cancelled, and after the pipeline returns
+    /// `Cancelled` the eval is released — it must NOT complete (its future was
+    /// dropped at the cancel point), so `finished` never fires.
+    #[tokio::test]
+    async fn cancelled_run_does_not_complete_in_flight_gold_eval() {
+        let gold_started = Arc::new(AtomicBool::new(false));
+        let gold_completed = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let llm: Arc<dyn LLMProvider> = Arc::new(EvalAbortProbeProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+            gold_started: gold_started.clone(),
+            gold_completed: gold_completed.clone(),
+            release: release.clone(),
+            finished: finished.clone(),
+            second_round: SecondRoundBehavior::BlockForever,
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = eval_abort_config();
+        let mut session = Session::new("session-eval-cancel", "model");
+        let mut state = e2e_loop_state("session-eval-cancel");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        // Driver: cancel only once the Gold eval is genuinely in flight.
+        let driver_started = gold_started.clone();
+        let driver_token = cancel.clone();
+        let driver = tokio::spawn(async move {
+            for _ in 0..2000 {
+                if driver_started.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            driver_token.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state),
+        )
+        .await
+        .expect("run_pipeline did not return within 5s after cancel");
+        let _ = driver.await;
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "cancelled run must return Cancelled, got {result:?}"
+        );
+        assert!(
+            gold_started.load(Ordering::SeqCst),
+            "the Gold eval must have been genuinely in flight (else nothing was tested)"
+        );
+        assert!(
+            state.gold_evaluation.in_flight.is_none(),
+            "the in-flight Gold eval slot must be cleared on the cancel early-exit"
+        );
+
+        // Release the eval; a dropped/aborted future can never reach completion,
+        // so `finished` must NOT fire.
+        release.notify_one();
+        let finished_within =
+            tokio::time::timeout(Duration::from_millis(500), finished.notified()).await;
+        assert!(
+            finished_within.is_err(),
+            "cancelled Gold eval kept running to completion (spend not stopped)"
+        );
+        assert!(
+            !gold_completed.load(Ordering::SeqCst),
+            "cancelled Gold eval must not complete its LLM request"
+        );
+    }
+
+    /// A run that hits a TERMINAL ERROR with a Gold evaluation in flight must
+    /// ABORT that eval on the early return — the cancel token is NOT cancelled
+    /// here, so this isolates `abort_in_flight_evaluations` (the `select!` on the
+    /// token cannot help). Removing the abort call makes this test fail: the
+    /// detached eval would wake on `release` and complete, firing `finished`.
+    #[tokio::test]
+    async fn terminal_error_aborts_in_flight_gold_eval() {
+        let gold_started = Arc::new(AtomicBool::new(false));
+        let gold_completed = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let llm: Arc<dyn LLMProvider> = Arc::new(EvalAbortProbeProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+            gold_started: gold_started.clone(),
+            gold_completed: gold_completed.clone(),
+            release: release.clone(),
+            finished: finished.clone(),
+            second_round: SecondRoundBehavior::TerminalError,
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = eval_abort_config();
+        let mut session = Session::new("session-eval-terminal", "model");
+        let mut state = e2e_loop_state("session-eval-terminal");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        // Never cancelled: the terminal error, not a cancel, drives the early exit.
+        let cancel = CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state),
+        )
+        .await
+        .expect("run_pipeline did not return within 5s");
+
+        assert!(
+            matches!(result, Err(AgentError::LLM(_))),
+            "the injected terminal error must surface as Err(LLM), got {result:?}"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "this test must NOT rely on cancellation — it isolates the abort path"
+        );
+        assert!(
+            gold_started.load(Ordering::SeqCst),
+            "the Gold eval must have been genuinely in flight (else nothing was tested)"
+        );
+        assert!(
+            state.gold_evaluation.in_flight.is_none(),
+            "the in-flight Gold eval slot must be aborted+cleared on the terminal early-exit"
+        );
+
+        // Release the (aborted) eval and confirm it does NOT complete. Without the
+        // abort, the detached eval would wake here and fire `finished`.
+        release.notify_one();
+        let finished_within =
+            tokio::time::timeout(Duration::from_millis(500), finished.notified()).await;
+        assert!(
+            finished_within.is_err(),
+            "in-flight Gold eval was detached, not aborted, on the terminal early-exit (#347)"
+        );
+        assert!(
+            !gold_completed.load(Ordering::SeqCst),
+            "aborted Gold eval must not complete its LLM request"
         );
     }
 }

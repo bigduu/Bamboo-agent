@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::goal_state::{
@@ -314,8 +315,18 @@ pub(super) async fn poll_completed_gold_evaluation(state: &mut LoopRunState) {
     };
 
     match in_flight.join_handle.await {
-        Ok(result) => {
+        Ok(Some(result)) => {
             state.gold_evaluation.completed = Some(result);
+        }
+        Ok(None) => {
+            // The run was cancelled while this Gold evaluation was in flight; the
+            // eval future was dropped before completing, so there is no outcome
+            // to apply.
+            tracing::debug!(
+                "[{}] Async Gold evaluation cancelled for round {}",
+                state.session_id,
+                in_flight.request.round_number
+            );
         }
         Err(error) => {
             tracing::warn!(
@@ -338,8 +349,15 @@ pub(super) async fn drain_in_flight_gold_evaluation(state: &mut LoopRunState) {
     };
 
     match in_flight.join_handle.await {
-        Ok(result) => {
+        Ok(Some(result)) => {
             state.gold_evaluation.completed = Some(result);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "[{}] Async Gold evaluation cancelled while draining round {}",
+                state.session_id,
+                in_flight.request.round_number
+            );
         }
         Err(error) => {
             tracing::warn!(
@@ -410,13 +428,24 @@ fn spawn_gold_evaluation_request(
     event_tx: &mpsc::Sender<AgentEvent>,
     request: AsyncGoldEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
 ) {
     let gold_round = request.round_number;
     let session_id = state.session_id.clone();
     let event_tx = event_tx.clone();
     let request_for_spawn = request.clone();
+    // Thread the run's cancel token into the detached eval. A cancel makes the
+    // `select!` resolve to `None` at the first await point, dropping the in-flight
+    // LLM request future so a cancelled run stops the wasted spend instead of
+    // running the evaluation to completion (issue #347). `biased` checks
+    // cancellation first so an already-cancelled run never even starts consuming
+    // the eval stream.
     let join_handle = tokio::spawn(async move {
-        execute_async_gold_evaluation(request_for_spawn, llm, event_tx).await
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => None,
+            result = execute_async_gold_evaluation(request_for_spawn, llm, event_tx) => Some(result),
+        }
     });
 
     tracing::debug!(
@@ -435,6 +464,7 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
     state: &mut LoopRunState,
     event_tx: &mpsc::Sender<AgentEvent>,
     llm: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
 ) {
     if state.gold_evaluation.in_flight.is_some() {
         return;
@@ -444,7 +474,7 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
         return;
     };
 
-    spawn_gold_evaluation_request(state, event_tx, request, llm);
+    spawn_gold_evaluation_request(state, event_tx, request, llm, cancel_token);
 }
 
 pub(super) fn spawn_gold_evaluation_if_needed(
@@ -454,6 +484,7 @@ pub(super) fn spawn_gold_evaluation_if_needed(
     config: &AgentLoopConfig,
     state: &mut LoopRunState,
     llm: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
 ) -> Result<(), AgentError> {
     let Some(gold_config) = config.gold_config.as_ref() else {
         return Ok(());
@@ -491,7 +522,7 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         return Ok(());
     }
 
-    spawn_gold_evaluation_request(state, event_tx, request, llm);
+    spawn_gold_evaluation_request(state, event_tx, request, llm, cancel_token);
     Ok(())
 }
 
