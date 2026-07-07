@@ -275,6 +275,48 @@ impl SchedulesIndex {
     }
 }
 
+/// Per-schedule cap on retained *terminal* run records. In-flight runs
+/// (Queued/Running) are always kept; only completed history is bounded. Chosen
+/// so a 60s schedule retains ~3.3h of history while keeping the persisted
+/// `schedules.json` (and every rewrite of it) bounded rather than O(total
+/// history) — see issue #233.
+const MAX_TERMINAL_RUN_RECORDS_PER_SCHEDULE: usize = 200;
+
+/// Drop the oldest terminal run records once a schedule exceeds
+/// [`MAX_TERMINAL_RUN_RECORDS_PER_SCHEDULE`], keeping the most recent by
+/// completion time. Non-terminal runs are never pruned. O(n) in the current
+/// record count; called only at run-insert points, where the count is already
+/// bounded by this same cap.
+fn prune_run_records(run_records: &mut HashMap<String, ScheduleRunRecord>) {
+    // Collect the run_ids to evict without holding a borrow across the removal.
+    let mut evict: Vec<String> = Vec::new();
+    {
+        let mut terminal_by_schedule: HashMap<&str, Vec<&ScheduleRunRecord>> = HashMap::new();
+        for record in run_records.values() {
+            if record.status.is_terminal() {
+                terminal_by_schedule
+                    .entry(record.schedule_id.as_str())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        for records in terminal_by_schedule.values_mut() {
+            if records.len() <= MAX_TERMINAL_RUN_RECORDS_PER_SCHEDULE {
+                continue;
+            }
+            // Newest first by completion time (falling back to the scheduled
+            // time for records without a completed_at).
+            records.sort_by_key(|r| std::cmp::Reverse(r.completed_at.unwrap_or(r.scheduled_for)));
+            for stale in records.iter().skip(MAX_TERMINAL_RUN_RECORDS_PER_SCHEDULE) {
+                evict.push(stale.run_id.clone());
+            }
+        }
+    }
+    for run_id in evict {
+        run_records.remove(&run_id);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScheduleDefinitionChanges {
     pub trigger: Option<ScheduleTrigger>,
@@ -1044,6 +1086,7 @@ impl ScheduleStore {
                     });
                 }
             }
+            prune_run_records(run_records);
             Ok(out)
         })
         .await
@@ -1154,6 +1197,7 @@ impl ScheduleStore {
             let record = make_queued_run_record(&entry.id, now, now, false);
             let run_id = record.run_id.clone();
             index.run_records.insert(run_id.clone(), record);
+            prune_run_records(&mut index.run_records);
             Ok(Some(ClaimedScheduleRun {
                 run_id,
                 schedule_id: entry.id,
@@ -1172,6 +1216,76 @@ impl ScheduleStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn run_record(
+        run_id: &str,
+        schedule_id: &str,
+        status: ScheduleRunStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> ScheduleRunRecord {
+        let base = Utc::now();
+        ScheduleRunRecord {
+            run_id: run_id.to_string(),
+            schedule_id: schedule_id.to_string(),
+            scheduled_for: base,
+            claimed_at: base,
+            started_at: None,
+            completed_at,
+            status,
+            outcome_reason: None,
+            session_id: None,
+            dispatch_lag_ms: None,
+            execution_duration_ms: None,
+            was_catch_up: false,
+        }
+    }
+
+    #[test]
+    fn prune_caps_terminal_records_keeps_newest_and_all_in_flight() {
+        let mut records: HashMap<String, ScheduleRunRecord> = HashMap::new();
+        let base = Utc::now();
+
+        // MAX + 50 terminal records for schedule "s1", completion times ordered.
+        let total_terminal = MAX_TERMINAL_RUN_RECORDS_PER_SCHEDULE + 50;
+        for i in 0..total_terminal {
+            let id = format!("s1-term-{i}");
+            let completed = base + Duration::seconds(i as i64);
+            records.insert(
+                id.clone(),
+                run_record(&id, "s1", ScheduleRunStatus::Success, Some(completed)),
+            );
+        }
+        // In-flight runs must survive regardless of count.
+        records.insert(
+            "s1-queued".into(),
+            run_record("s1-queued", "s1", ScheduleRunStatus::Queued, None),
+        );
+        records.insert(
+            "s1-running".into(),
+            run_record("s1-running", "s1", ScheduleRunStatus::Running, None),
+        );
+        // A different schedule under the cap is untouched.
+        records.insert(
+            "s2-term-0".into(),
+            run_record("s2-term-0", "s2", ScheduleRunStatus::Failed, Some(base)),
+        );
+
+        prune_run_records(&mut records);
+
+        let s1_terminal = records
+            .values()
+            .filter(|r| r.schedule_id == "s1" && r.status.is_terminal())
+            .count();
+        assert_eq!(s1_terminal, MAX_TERMINAL_RUN_RECORDS_PER_SCHEDULE);
+        // Non-terminal runs kept.
+        assert!(records.contains_key("s1-queued"));
+        assert!(records.contains_key("s1-running"));
+        // The newest terminal record is retained; the oldest is evicted.
+        assert!(records.contains_key(&format!("s1-term-{}", total_terminal - 1)));
+        assert!(!records.contains_key("s1-term-0"));
+        // Other schedules untouched.
+        assert!(records.contains_key("s2-term-0"));
+    }
 
     #[tokio::test]
     async fn store_backfills_legacy_interval_trigger_on_load() {
