@@ -476,7 +476,12 @@ impl SessionStoreV2 {
         }
         let raw = fs::read_to_string(&path).await?;
         match serde_json::from_str::<Session>(&raw) {
-            Ok(side) => Ok(Some(side)),
+            Ok(mut side) => {
+                // The control-plane path (`load_runtime_control_plane`) returns
+                // this directly, so migrate a stale Root token_budget here too (#230).
+                side.clear_stale_root_token_budget();
+                Ok(Some(side))
+            }
             Err(error) => {
                 // A corrupt sidecar must never make a session unloadable — the
                 // authoritative copy still lives in session.json. Warn and ignore.
@@ -1056,7 +1061,10 @@ impl Storage for SessionStoreV2 {
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
         let sidecar = self.read_runtime_sidecar(session_id).await?;
-        Ok(Some(overlay_runtime_sidecar(session, sidecar)))
+        let mut session = overlay_runtime_sidecar(session, sidecar);
+        // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
+        session.clear_stale_root_token_budget();
+        Ok(Some(session))
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
@@ -1162,6 +1170,38 @@ mod tests {
         assert!(!sessions_dir.exists());
         let _storage = SessionStoreV2::new(bamboo_home).await?;
         assert!(sessions_dir.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_token_budget_cleared_on_load_child_preserved() -> io::Result<()> {
+        // #230: a Root persisted with a token_budget (pre-#180 stale cache) loads
+        // with token_budget == None so it re-resolves; a Child's assigned
+        // sub-budget survives the reload.
+        let (storage, _dir) = create_temp_storage().await?;
+
+        let mut root = Session::new("root-1", "m");
+        root.token_budget = Some(bamboo_domain::TokenBudget::for_model(1000));
+        storage.save_session(&root).await?;
+        let loaded = storage.load_session("root-1").await?.expect("root present");
+        assert!(
+            loaded.token_budget.is_none(),
+            "stale Root token_budget must be cleared on load"
+        );
+
+        let parent = Session::new("root-1", "m");
+        let mut child = Session::new_child_of("child-1", &parent, "m", "c");
+        child.token_budget = Some(bamboo_domain::TokenBudget::for_model(500));
+        storage.save_session(&child).await?;
+        let loaded_child = storage
+            .load_session("child-1")
+            .await?
+            .expect("child present");
+        assert!(
+            loaded_child.token_budget.is_some(),
+            "Child assigned sub-budget must be preserved on load"
+        );
 
         Ok(())
     }

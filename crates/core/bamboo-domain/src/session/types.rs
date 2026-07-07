@@ -576,6 +576,22 @@ pub enum SessionKind {
 }
 
 impl Session {
+    /// Load-boundary migration: a persisted `Root` session's `token_budget` can
+    /// only be a stale pre-#180 resolved-budget cache — genuine budgets flow
+    /// through `config.token_budget`, and only a `Child` persists an assigned
+    /// sub-budget. Clear it so `resolve_token_budget` re-resolves from the
+    /// current `model_limits.json` instead of short-circuiting on the stale
+    /// value forever.
+    ///
+    /// MUST be called only on freshly disk-loaded sessions — never inside
+    /// `resolve_token_budget`, which can't tell a stale disk cache from a
+    /// legitimate in-memory budget injection (tests, child sub-budgets). (#230)
+    pub fn clear_stale_root_token_budget(&mut self) {
+        if self.kind == SessionKind::Root {
+            self.token_budget = None;
+        }
+    }
+
     /// The effective token budget: a genuine/child override (`token_budget`) if
     /// set, otherwise the per-process resolved-budget cache
     /// (`resolved_token_budget`). Both are `None` until the first resolution.
@@ -1417,6 +1433,29 @@ mod tests {
         assert_eq!(child.parent_session_id.as_deref(), Some("root-1"));
         assert_eq!(child.root_session_id, "root-1");
         assert_eq!(child.spawn_depth, 1);
+    }
+
+    #[test]
+    fn clear_stale_root_token_budget_clears_root_keeps_child() {
+        // #230: a Root's persisted token_budget is a stale pre-#180 cache → clear
+        // it on load so it re-resolves. A Child's is a genuine assigned sub-budget
+        // → keep it.
+        let mut root = Session::new("root-1", "m");
+        root.token_budget = Some(crate::TokenBudget::for_model(1000));
+        root.clear_stale_root_token_budget();
+        assert!(
+            root.token_budget.is_none(),
+            "Root token_budget cleared on load"
+        );
+
+        let parent = Session::new("root-1", "m");
+        let mut child = Session::new_child_of("child-1", &parent, "m", "c");
+        child.token_budget = Some(crate::TokenBudget::for_model(500));
+        child.clear_stale_root_token_budget();
+        assert!(
+            child.token_budget.is_some(),
+            "Child assigned sub-budget preserved on load"
+        );
     }
 
     #[test]

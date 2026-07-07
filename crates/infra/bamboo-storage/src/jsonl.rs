@@ -87,7 +87,9 @@ impl JsonlStorage {
             return Ok(None);
         }
         let content = fs::read_to_string(path).await?;
-        let session = serde_json::from_str(&content)?;
+        let mut session: Session = serde_json::from_str(&content)?;
+        // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
+        session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
 
