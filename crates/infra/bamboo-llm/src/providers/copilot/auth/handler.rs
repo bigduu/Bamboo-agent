@@ -1390,6 +1390,11 @@ mod retry_tests {
             _extensions: &mut http::Extensions,
             _next: Next<'_>,
         ) -> MiddlewareResult<reqwest::Response> {
+            // Yield once so concurrent callers (e.g. the dedup test) get a chance
+            // to interleave instead of each running to completion within a single
+            // poll. Harmless for the sequential tests.
+            tokio::task::yield_now().await;
+
             assert_eq!(
                 req.method(),
                 &self.expected_method,
@@ -1584,6 +1589,93 @@ mod retry_tests {
         let result = handler.get_copilot_token(access_token).await;
         assert!(result.is_err());
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A full Copilot token-exchange success reply, valid for one hour.
+    fn copilot_token_reply(token: &str) -> MockReply {
+        MockReply::json(
+            200,
+            serde_json::json!({
+                "token": token,
+                "expires_at": (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600),
+                "annotations_enabled": true,
+                "chat_enabled": true,
+                "chat_jetbrains_enabled": false,
+                "code_quote_enabled": true,
+                "code_review_enabled": false,
+                "codesearch": false,
+                "copilotignore_enabled": true,
+                "endpoints": { "api": "https://api.githubcopilot.com" },
+                "individual": true,
+                "prompt_8k": true,
+                "public_suggestions": "disabled",
+                "refresh_in": 300,
+                "sku": "copilot_individual",
+                "snippy_load_test_enabled": false,
+                "telemetry": "disabled",
+                "tracking_id": "test-tracking-id",
+                "vsc_electron_fetcher_v2": true,
+                "xcode": false,
+                "xcode_chat": false
+            }),
+        )
+    }
+
+    /// #237 finding 2 headline: a burst of concurrent `force_refresh_chat_token`
+    /// calls (the 401-retry paths in `copilot/mod.rs`) must collapse into a
+    /// single upstream token exchange, not one per caller.
+    ///
+    /// Deterministic under the current-thread test runtime: every caller reads
+    /// the seeded pre-lock token before the first exchange's `.await` resolves,
+    /// so all but the first take the double-checked dedup fast-path.
+    #[tokio::test]
+    async fn force_refresh_collapses_concurrent_calls_to_one_exchange() {
+        use futures::future::join_all;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        // Queue more replies than callers: if dedup regressed, the extra
+        // exchanges would be served here and the count assertion below would
+        // catch it (rather than panicking on an empty queue).
+        let mock = MockResponder::new(
+            Method::GET,
+            "/copilot_internal/v2/token",
+            request_count.clone(),
+            (0..8).map(|_| copilot_token_reply("refreshed-token")).collect(),
+        );
+        let client = create_test_client_with_retry(mock);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let handler = CopilotAuthHandler::new(client, temp_dir.path().to_path_buf(), true)
+            .with_github_api_base_url("http://mock.local");
+
+        // A cached GitHub access token lets force_refresh perform the exchange.
+        std::fs::write(temp_dir.path().join(".token"), "gh-access-token").expect("write .token");
+        // Seed a still-unexpired-but-rejected Copilot token so every caller
+        // snapshots the same pre-lock value.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut seeded = sample_config(now + 3600);
+        seeded.token = "old-rejected-token".to_string();
+        handler
+            .write_cached_copilot_config(&temp_dir.path().join(".copilot_token.json"), &seeded)
+            .expect("seed cache");
+
+        let results = join_all((0..8).map(|_| handler.force_refresh_chat_token())).await;
+
+        for r in &results {
+            let token = r
+                .as_ref()
+                .expect("force_refresh ok")
+                .as_ref()
+                .expect("some token");
+            assert_eq!(token, "refreshed-token");
+        }
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "concurrent force-refresh must collapse to a single upstream exchange"
+        );
     }
 
     /// Test device code endpoint retry.
