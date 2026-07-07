@@ -297,7 +297,7 @@ cd docker && docker compose up -d --build
 curl http://localhost:9562/api/v1/health
 ```
 
-`docker-compose.yml` maps `9562:9562` and sets `BAMBOO_DATA_DIR=/data`, `BAMBOO_PORT=9562`, `BAMBOO_BIND=0.0.0.0`.
+`docker-compose.yml` publishes to the host loopback only (`127.0.0.1:9562:9562`), runs as a non-root user, drops all capabilities, and uses an isolated named volume. **Do not widen the publish to expose the agent directly on a network:** a fresh instance is unauthenticated, and the server treats every private-LAN (RFC1918) peer as trusted-local and skips the password check by design — so LAN exposure is unauthenticated even after you set a password. To reach it from other machines, keep the loopback publish and front it with an authenticating reverse proxy on a trusted network. It also sets `BAMBOO_DATA_DIR=/data`, `BAMBOO_PORT=9562`, `BAMBOO_BIND=0.0.0.0` (in-container bind; exposure is controlled at the publish layer).
 
 ### Selected API routes
 
