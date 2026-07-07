@@ -11,6 +11,48 @@ pub(super) fn now_unix_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// Build a chat-completion tool-call chunk carrying deltas at the GIVEN indices.
+///
+/// The `index` must be the provider's own tool-call index (from
+/// `LLMChunk::ToolCallsIndexed`), or the positional index for providers that
+/// don't carry one. A downstream OpenAI-compatible client keys argument-fragment
+/// reassembly on this index, so re-deriving it per chunk via `.enumerate()`
+/// yields 0 for a single-fragment chunk and corrupts interleaved multi-tool-call
+/// streams. #379.
+pub(crate) fn tool_call_stream_chunk(
+    indexed: Vec<(u32, bamboo_agent_core::tools::ToolCall)>,
+    model: &str,
+) -> ChatCompletionStreamChunk {
+    let stream_tool_calls: Vec<StreamToolCall> = indexed
+        .into_iter()
+        .map(|(index, tool_call)| StreamToolCall {
+            index,
+            id: Some(tool_call.id),
+            tool_type: Some(tool_call.tool_type),
+            function: Some(StreamFunctionCall {
+                name: Some(tool_call.function.name),
+                arguments: Some(tool_call.function.arguments),
+            }),
+        })
+        .collect();
+    ChatCompletionStreamChunk {
+        id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        object: Some("chat.completion.chunk".to_string()),
+        created: chrono::Utc::now().timestamp() as u64,
+        model: Some(model.to_string()),
+        choices: vec![StreamChoice {
+            index: 0,
+            delta: StreamDelta {
+                role: None,
+                content: None,
+                tool_calls: Some(stream_tool_calls),
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    }
+}
+
 pub(super) fn convert_chunk_to_openai(
     chunk: bamboo_llm::types::LLMChunk,
     model: &str,
@@ -33,45 +75,22 @@ pub(super) fn convert_chunk_to_openai(
             }],
             usage: None,
         }),
-        // Indexed tool-call chunks convert identically once indices are dropped;
-        // recurse with the flattened variant to reuse the block below. #236.
-        bamboo_llm::types::LLMChunk::ToolCallsIndexed(tool_calls) => convert_chunk_to_openai(
-            bamboo_llm::types::LLMChunk::ToolCalls(
-                tool_calls.into_iter().map(|(_, call)| call).collect(),
-            ),
-            model,
-        ),
+        // Preserve the provider's REAL tool-call index so a downstream client can
+        // route interleaved argument fragments to the right call. Re-deriving it
+        // via `.enumerate()` over a single-fragment chunk always yields 0 and
+        // silently corrupts multi-tool-call streams. #379.
+        bamboo_llm::types::LLMChunk::ToolCallsIndexed(tool_calls) => {
+            Some(tool_call_stream_chunk(tool_calls, model))
+        }
         bamboo_llm::types::LLMChunk::ToolCalls(tool_calls) => {
-            let stream_tool_calls: Vec<StreamToolCall> = tool_calls
+            // No per-fragment index carried (Gemini / Responses API) → the
+            // positional index within the chunk is the correct value.
+            let indexed = tool_calls
                 .into_iter()
                 .enumerate()
-                .map(|(index, tool_call)| StreamToolCall {
-                    index: index as u32,
-                    id: Some(tool_call.id),
-                    tool_type: Some(tool_call.tool_type),
-                    function: Some(StreamFunctionCall {
-                        name: Some(tool_call.function.name),
-                        arguments: Some(tool_call.function.arguments),
-                    }),
-                })
+                .map(|(i, call)| (i as u32, call))
                 .collect();
-
-            Some(ChatCompletionStreamChunk {
-                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                object: Some("chat.completion.chunk".to_string()),
-                created: chrono::Utc::now().timestamp() as u64,
-                model: Some(model.to_string()),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: StreamDelta {
-                        role: None,
-                        content: None,
-                        tool_calls: Some(stream_tool_calls),
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-            })
+            Some(tool_call_stream_chunk(indexed, model))
         }
         bamboo_llm::types::LLMChunk::ReasoningToken(_) => None,
         bamboo_llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
@@ -131,6 +150,39 @@ mod tests {
         assert!(chunk.choices[0].delta.tool_calls.is_none());
         assert!(chunk.choices[0].finish_reason.is_none());
         assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn indexed_tool_calls_preserve_provider_index() {
+        // #379: a `ToolCallsIndexed` chunk must re-serialize with the PROVIDER's
+        // real index, not a per-chunk positional `.enumerate()` (which yields 0
+        // for a single-fragment chunk and corrupts multi-call streams downstream).
+        let chunk = convert_chunk_to_openai(
+            LLMChunk::ToolCallsIndexed(vec![
+                (3, tool_call("call_a", "a", "{}")),
+                (7, tool_call("call_b", "b", "{}")),
+            ]),
+            "gpt-5",
+        )
+        .expect("indexed tool-calls chunk should convert");
+
+        let stream_calls = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(stream_calls[0].index, 3, "real provider index preserved");
+        assert_eq!(stream_calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(stream_calls[1].index, 7, "second index preserved, not 1");
+        assert_eq!(stream_calls[1].id.as_deref(), Some("call_b"));
+
+        // A single-fragment indexed chunk for call #1 must NOT collapse to 0.
+        let single = convert_chunk_to_openai(
+            LLMChunk::ToolCallsIndexed(vec![(1, tool_call("c", "c", ""))]),
+            "gpt-5",
+        )
+        .unwrap();
+        assert_eq!(
+            single.choices[0].delta.tool_calls.as_ref().unwrap()[0].index,
+            1,
+            "single-fragment index must stay 1, not enumerate to 0"
+        );
     }
 
     #[test]
