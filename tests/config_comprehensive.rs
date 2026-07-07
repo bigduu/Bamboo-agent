@@ -268,6 +268,7 @@ mod comprehensive_config_tests {
         let mut original = Config::from_data_dir(Some(temp.path.clone()));
         original.provider = "anthropic".to_string();
         original.providers.anthropic = Some(bamboo_config::AnthropicConfig {
+            api_key_from_env: false,
             api_key: String::new(),
             api_key_from_env: false,
             api_key_encrypted: None,

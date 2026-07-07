@@ -25,6 +25,7 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
         provider: "openai".to_string(),
         providers: ProviderConfigs {
             openai: Some(OpenAIConfig {
+                api_key_from_env: false,
                 api_key: "sk-test".to_string(),
                 api_key_from_env: false,
                 api_key_encrypted: None,
