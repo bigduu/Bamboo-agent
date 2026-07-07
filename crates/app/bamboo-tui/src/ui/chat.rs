@@ -4,9 +4,60 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, MessageRole};
+use crate::app::{App, MessageRole, ToolCallDisplay};
 use crate::components::markdown;
 use crate::theme::{self, colors};
+
+/// Render a tool call's arguments, result, and error under its name line.
+/// Truncated by default (args → one preview line, result → 3 lines); `expand`
+/// (Ctrl+X on the Chat tab) shows everything.
+fn push_tool_detail(lines: &mut Vec<Line<'static>>, tc: &ToolCallDisplay, expand: bool) {
+    // Arguments.
+    let args = tc.arguments.trim();
+    if !args.is_empty() && args != "null" && args != "{}" {
+        if expand {
+            for aline in args.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("   args: {aline}"),
+                    Style::default().fg(colors::SUBTLE),
+                )));
+            }
+        } else {
+            let preview: String = args.chars().take(88).collect();
+            let ellipsis = if args.chars().count() > 88 { "…" } else { "" };
+            lines.push(Line::from(Span::styled(
+                format!("   args: {preview}{ellipsis}"),
+                Style::default().fg(colors::SUBTLE),
+            )));
+        }
+    }
+
+    // Result.
+    if let Some(result) = &tc.result {
+        let max = if expand { usize::MAX } else { 3 };
+        for rline in result.lines().take(max) {
+            lines.push(Line::from(Span::styled(
+                format!("   {rline}"),
+                Style::default().fg(colors::INACTIVE),
+            )));
+        }
+        let total = result.lines().count();
+        if !expand && total > 3 {
+            lines.push(Line::from(Span::styled(
+                format!("   … ({} more — Ctrl+X to expand)", total - 3),
+                Style::default().fg(colors::SUBTLE),
+            )));
+        }
+    }
+
+    // Error.
+    if let Some(err) = &tc.error {
+        lines.push(Line::from(Span::styled(
+            format!("   Error: {err}"),
+            Style::default().fg(colors::TOOL_ERROR),
+        )));
+    }
+}
 
 pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
     let lines = build_message_lines(app, content.width);
@@ -77,27 +128,7 @@ fn build_message_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                         format!(" {} {}", icon, tc.tool_name),
                         style,
                     )));
-                    if let Some(result) = &tc.result {
-                        for rline in result.lines().take(3) {
-                            lines.push(Line::from(Span::styled(
-                                format!("   {}", rline),
-                                Style::default().fg(colors::INACTIVE),
-                            )));
-                        }
-                        let total = result.lines().count();
-                        if total > 3 {
-                            lines.push(Line::from(Span::styled(
-                                format!("   ... ({} more lines)", total - 3),
-                                Style::default().fg(colors::SUBTLE),
-                            )));
-                        }
-                    }
-                    if let Some(err) = &tc.error {
-                        lines.push(Line::from(Span::styled(
-                            format!("   Error: {}", err),
-                            Style::default().fg(colors::TOOL_ERROR),
-                        )));
-                    }
+                    push_tool_detail(&mut lines, tc, app.chat.expand_tools);
                 }
 
                 // Reasoning / thinking block
@@ -158,6 +189,7 @@ fn build_message_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 format!(" {} {}", icon, tc.tool_name),
                 style,
             )));
+            push_tool_detail(&mut lines, tc, app.chat.expand_tools);
         }
 
         // Streaming thinking
@@ -190,4 +222,41 @@ fn build_message_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tc(args: &str, result: Option<&str>) -> ToolCallDisplay {
+        ToolCallDisplay {
+            tool_name: "Read".into(),
+            arguments: args.into(),
+            result: result.map(String::from),
+            error: None,
+            phase: "complete".into(),
+        }
+    }
+
+    #[test]
+    fn tool_detail_truncates_then_expands() {
+        let t = tc("{\"path\":\"x\"}", Some("l1\nl2\nl3\nl4\nl5"));
+
+        let mut lines: Vec<Line> = Vec::new();
+        push_tool_detail(&mut lines, &t, false);
+        // args(1) + 3 result lines + "N more" marker(1) = 5
+        assert_eq!(lines.len(), 5);
+
+        let mut lines: Vec<Line> = Vec::new();
+        push_tool_detail(&mut lines, &t, true);
+        // args(1) + all 5 result lines = 6
+        assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn empty_args_and_no_result_render_nothing() {
+        let mut lines: Vec<Line> = Vec::new();
+        push_tool_detail(&mut lines, &tc("{}", None), false);
+        assert!(lines.is_empty());
+    }
 }
