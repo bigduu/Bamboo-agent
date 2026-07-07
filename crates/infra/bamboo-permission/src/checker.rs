@@ -1428,6 +1428,28 @@ mod tests {
     }
 
     #[test]
+    fn safe_edit_rejects_quote_spliced_sensitive_paths() {
+        // #392: ordinary shell quote-splicing resolves to the same sensitive path
+        // at runtime but defeats a raw prefix match — must still NOT auto-approve.
+        let evasions = [
+            r"cp evil /etc/pass''wd",            // empty single-quote splice
+            r#"cp evil /etc/pass""wd"#,          // empty double-quote splice
+            r"cp evil /etc/'passwd'",            // quoted segment
+            r"cp /etc/'shadow' /tmp/x",          // quoted sensitive SOURCE
+            r"cp evil ~/.ss'h'/authorized_keys", // quoted home dotfile dir
+            r"cp evil '/etc/sudoers.d/zz'",      // fully-quoted /etc subtree
+            r"echo pwned > /etc/pass''wd",       // quoted redirect target
+            r"chmod -R 000 '/'",                 // quoted root for recursive chmod
+        ];
+        for cmd in evasions {
+            assert!(
+                !is_safe_edit_command(cmd),
+                "must NOT auto-approve a quote-spliced sensitive path: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
     fn safe_edit_still_approves_plain_safe_commands() {
         // Plain single-command invocations of the safe list must STILL auto-approve.
         let safe = [
