@@ -9,6 +9,13 @@ use crate::error::{McpError, Result};
 use crate::protocol::models::*;
 use crate::types::{McpCallResult, McpTool};
 
+/// Capacity of the server-notification queue. Notifications are dispatched off
+/// the SAME inbound message-handler loop as JSON-RPC responses, so a *blocking*
+/// send here would wedge that loop — and stall all response delivery — once the
+/// buffer fills. Sends into it are therefore non-blocking (drop-on-full); see
+/// [`McpProtocolClient::handle_message`].
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 100;
+
 /// Transport trait for MCP communication
 #[async_trait]
 pub trait McpTransport: Send + Sync {
@@ -57,7 +64,7 @@ pub struct McpProtocolClient {
 
 impl McpProtocolClient {
     pub fn new(transport: Box<dyn McpTransport>) -> Self {
-        let (notification_tx, notification_rx) = mpsc::channel(100);
+        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         Self {
             transport: Arc::new(RwLock::new(transport)),
             next_id: AtomicU64::new(1),
@@ -158,7 +165,21 @@ impl McpProtocolClient {
                 "MCP JSON-RPC notification received (method={})",
                 notification.method
             );
-            let _ = notification_tx.send(notification).await;
+            // Non-blocking: this handler loop ALSO matches JSON-RPC responses to
+            // their pending requests, so a blocking `send().await` would wedge
+            // response delivery once the (undrained) queue fills — timing out
+            // every in-flight call and, under auto-reconnect, causing a recycle
+            // storm. Drop the notification rather than ever stall responses.
+            match notification_tx.try_send(notification) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(dropped)) => warn!(
+                    "MCP notification queue full (cap={}); dropped notification (method={})",
+                    NOTIFICATION_CHANNEL_CAPACITY, dropped.method
+                ),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    trace!("MCP notification receiver dropped; ignoring notification")
+                }
+            }
             return Ok(());
         }
 
@@ -515,6 +536,56 @@ mod tests {
         let result = rx2.blocking_recv().unwrap().unwrap();
         assert_eq!(result.id, 1);
         assert!(result.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn full_notification_queue_does_not_block_response_dispatch() {
+        use std::collections::HashMap;
+
+        // A deliberately tiny notification queue, filled to capacity — mirrors a
+        // chatty server whose notifications outrun the (undrained) queue.
+        let (notif_tx, _notif_rx) = mpsc::channel::<JsonRpcNotification>(1);
+        let fill: JsonRpcNotification = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#,
+        )
+        .unwrap();
+        notif_tx
+            .try_send(fill)
+            .expect("first notification fills the cap-1 queue");
+
+        // A pending request awaiting its JSON-RPC response.
+        let pending: RwLock<HashMap<u64, PendingRequest>> = RwLock::new(HashMap::new());
+        let (resp_tx, resp_rx) = oneshot::channel();
+        pending
+            .write()
+            .await
+            .insert(7, PendingRequest { sender: resp_tx });
+
+        // 1) Handling ANOTHER notification while the queue is full must return
+        //    promptly. The old blocking `send().await` would hang here forever,
+        //    wedging the shared handler loop (and all response delivery with it).
+        let notif_json = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            McpProtocolClient::handle_message(notif_json, &pending, &notif_tx),
+        )
+        .await
+        .expect("handle_message must not block on a full notification queue")
+        .expect("handle_message returns Ok");
+
+        // 2) A JSON-RPC response must still be dispatched to its pending request,
+        //    even though the notification queue is saturated.
+        let resp_json = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        McpProtocolClient::handle_message(resp_json, &pending, &notif_tx)
+            .await
+            .expect("handle_message returns Ok");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
+            .await
+            .expect("response must be delivered despite a full notification queue");
+        assert!(
+            delivered.is_ok(),
+            "the pending request should receive its response"
+        );
     }
 
     /// Verifies that the channel-based handler delivers N messages in order
