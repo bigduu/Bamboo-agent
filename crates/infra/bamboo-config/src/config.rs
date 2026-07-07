@@ -3229,6 +3229,80 @@ mod tests {
     }
 
     #[test]
+    fn refresh_preserves_ciphertext_when_plaintext_empty() {
+        // #268: a provider whose stored ciphertext failed to decrypt at hydration
+        // has an empty in-memory api_key. An unrelated later save must NOT null its
+        // ciphertext — that would permanently drop a key the user never touched.
+        let openai = |api_key: &str, enc: Option<&str>| OpenAIConfig {
+            api_key: api_key.to_string(),
+            api_key_encrypted: enc.map(str::to_string),
+            base_url: None,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: BTreeMap::new(),
+            api_key_from_env: false,
+        };
+
+        // Empty plaintext + existing ciphertext → ciphertext preserved (the bug).
+        let mut config = Config::default();
+        config.providers.openai = Some(openai("", Some("preexisting-ciphertext")));
+        config
+            .refresh_provider_api_keys_encrypted()
+            .expect("refresh");
+        assert_eq!(
+            config
+                .providers
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key_encrypted
+                .as_deref(),
+            Some("preexisting-ciphertext"),
+            "existing ciphertext must be preserved when plaintext is empty"
+        );
+
+        // Empty plaintext + no ciphertext → stays None (nothing to preserve).
+        let mut config = Config::default();
+        config.providers.openai = Some(openai("", None));
+        config
+            .refresh_provider_api_keys_encrypted()
+            .expect("refresh");
+        assert!(
+            config
+                .providers
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key_encrypted
+                .is_none(),
+            "no key + no ciphertext should stay None"
+        );
+
+        // Non-empty plaintext → (re)encrypted to a fresh, non-empty ciphertext.
+        let mut config = Config::default();
+        config.providers.openai = Some(openai("sk-live", Some("stale-ciphertext")));
+        config
+            .refresh_provider_api_keys_encrypted()
+            .expect("refresh");
+        let enc = config
+            .providers
+            .openai
+            .as_ref()
+            .unwrap()
+            .api_key_encrypted
+            .clone()
+            .expect("ciphertext present");
+        assert!(
+            !enc.is_empty() && enc != "stale-ciphertext",
+            "plaintext re-encrypted"
+        );
+    }
+
+    #[test]
     fn get_memory_background_model_falls_back_to_provider_fast_model() {
         let mut config = Config::default();
         config.features.provider_model_ref = false;
