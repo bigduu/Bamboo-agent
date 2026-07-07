@@ -160,9 +160,15 @@ pub fn check_permissions(
             } else {
                 preview
             };
+            // Key the grant on the CODE, not a constant `"node"`: session grants
+            // are recorded per-resource, so a constant resource means the first
+            // approved js_repl call silently grants ANY future code for the
+            // session-grant window (defeating the js_repl force-ask backstop).
+            // Mirror Bash's `SECURITY: {command}` so a grant only ever covers a
+            // re-run of the exact same code.
             Ok(Some(vec![PermissionContext::new(
                 PermissionType::ExecuteCommand,
-                "node",
+                format!("SECURITY: js_repl {code}"),
                 format!("Execute JavaScript: {}", preview),
             )]))
         }
@@ -334,10 +340,39 @@ mod tests {
         let contexts = check_permissions("js_repl", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
-        assert_eq!(contexts[0].resource, "node");
+        // Resource is keyed on the code (not a constant `"node"`) so a session
+        // grant only ever covers a re-run of the same code.
+        assert_eq!(
+            contexts[0].resource,
+            "SECURITY: js_repl console.log('hello')"
+        );
         assert!(contexts[0]
             .operation_description
             .contains("console.log('hello')"));
+    }
+
+    #[test]
+    fn check_permissions_js_repl_resource_is_per_code() {
+        // Different code must produce different resources, so approving one
+        // js_repl call cannot session-grant a *different* (e.g. malicious) one —
+        // this is what makes the js_repl force-ask backstop actually hold across
+        // repeated calls in a session.
+        let benign = check_permissions("js_repl", &json!({"code": "1 + 1"}))
+            .unwrap()
+            .unwrap();
+        let malicious = check_permissions(
+            "js_repl",
+            &json!({"code": "require('child_process').execSync('id')"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(benign[0].resource, malicious[0].resource);
+
+        // ...while the SAME code yields the SAME resource (a re-run is grantable).
+        let benign_again = check_permissions("js_repl", &json!({"code": "1 + 1"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(benign[0].resource, benign_again[0].resource);
     }
 
     #[test]
