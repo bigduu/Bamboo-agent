@@ -1,5 +1,7 @@
 use actix_web::{web, HttpResponse};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
+use cron::Schedule as CronSchedule;
 
 use crate::app_state::AppState;
 use crate::handlers::agent::schedules::types::{CreateScheduleRequest, PatchScheduleRequest};
@@ -67,9 +69,18 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             validate_hms(*hour, *minute, *second)
         }
         ScheduleTrigger::Cron { expr } => {
-            if expr.trim().is_empty() {
+            let expr = expr.trim();
+            if expr.is_empty() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
                     "error": "trigger.expr is required"
+                })));
+            }
+            // Parse with the same `cron::Schedule` the trigger engine uses, so an
+            // invalid expression fails here with a 400 instead of deep in the
+            // store (compute_initial_next_run_at) where it surfaces as a 500.
+            if expr.parse::<CronSchedule>().is_err() {
+                return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": format!("trigger.expr is not a valid cron expression: {expr}")
                 })));
             }
             Ok(())
@@ -107,6 +118,13 @@ pub(super) fn validate_trigger_api_fields(
         if timezone.is_empty() {
             return Err(HttpResponse::BadRequest().json(serde_json::json!({
                 "error": "timezone must not be empty when provided"
+            })));
+        }
+        // Same `chrono_tz::Tz` parse the trigger engine uses (parse_timezone);
+        // reject a bogus zone with a 400 rather than a later 500.
+        if timezone.parse::<Tz>().is_err() {
+            return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("timezone is not a valid IANA timezone: {timezone}")
             })));
         }
     }
@@ -480,5 +498,58 @@ mod tests {
         )
         .expect_err("blank timezone should be rejected");
         assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_schedule_trigger_rejects_invalid_cron_expr() {
+        let response = validate_schedule_trigger(&ScheduleTrigger::Cron {
+            expr: "not a cron expression".to_string(),
+        })
+        .expect_err("a non-empty but unparseable cron expr must be a 400, not a later 500");
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_schedule_trigger_accepts_valid_cron_expr() {
+        // 6-field cron (sec min hour day-of-month month day-of-week): noon daily.
+        validate_schedule_trigger(&ScheduleTrigger::Cron {
+            expr: "0 0 12 * * *".to_string(),
+        })
+        .expect("a valid cron expr should pass validation");
+    }
+
+    #[test]
+    fn validate_trigger_api_fields_rejects_invalid_timezone() {
+        let response = validate_trigger_api_fields(
+            Some(&ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 0,
+                second: 0,
+            }),
+            Some("Mars/Phobos"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("a bogus IANA timezone must be a 400, not a later 500");
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_trigger_api_fields_accepts_valid_timezone() {
+        validate_trigger_api_fields(
+            Some(&ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 0,
+                second: 0,
+            }),
+            Some("America/New_York"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a valid trigger + IANA timezone should pass validation");
     }
 }
