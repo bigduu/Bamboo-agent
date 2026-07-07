@@ -464,6 +464,15 @@ impl LLMProvider for OpenAIProvider {
 
                     return Ok(stream);
                 }
+
+                // The no-reasoning retry itself failed — surface ITS status/body,
+                // not the stale original "reasoning unsupported" 400 (which would
+                // mask the real failure, e.g. a 500/429 on the retry). (#237)
+                let fallback_status = fallback.status();
+                let fallback_text = fallback.text().await.unwrap_or_default();
+                return Err(LLMError::Api(format!(
+                    "HTTP {fallback_status}: {fallback_text} (after retrying without reasoning_effort)"
+                )));
             }
 
             if Self::looks_like_responses_only_error(status, &text) {
