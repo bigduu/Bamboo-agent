@@ -192,7 +192,12 @@ impl MemoryStore {
     /// it while calling another lock-acquiring public method, so there is no lock
     /// nesting and deadlock is structurally impossible.
     fn scope_lock(&self, scope: MemoryScope, project_key: Option<&str>) -> Arc<Mutex<()>> {
-        let key = self.resolver.scope_root(scope, project_key);
+        self.path_lock(self.resolver.scope_root(scope, project_key))
+    }
+
+    /// Shared per-path mutex from the global registry — the serialization
+    /// primitive behind [`scope_lock`] and per-session-topic locking.
+    fn path_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {
         scope_locks()
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -246,6 +251,11 @@ impl MemoryStore {
         topic: &str,
         content: &str,
     ) -> io::Result<PathBuf> {
+        // Serialize the read-modify-write so two concurrent appends to the same
+        // (session, topic) can't both read the old value and clobber each other
+        // (#235). Keyed on the topic path (stable across both callers).
+        let lock = self.path_lock(self.session_topic_path(session_id, topic)?);
+        let _guard = lock.lock().await;
         let existing = self.read_session_topic(session_id, topic).await?;
         let next = match existing {
             Some(prev) if !prev.trim().is_empty() => format!("{}\n\n{}", prev.trim_end(), content),
@@ -880,6 +890,13 @@ impl MemoryStore {
             doc.frontmatter.project_key.as_deref(),
         );
         let _guard = lock.lock().await;
+        // Re-read under the lock so the mutation is applied to the latest
+        // committed state, not a pre-lock snapshot another writer may have
+        // superseded in the meantime (#235).
+        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+            return Ok(None);
+        };
+        doc = fresh;
         let changed = self
             .set_memory_status(&mut doc, mode, "memory_purge", "main-model")
             .await?;
@@ -956,6 +973,11 @@ impl MemoryStore {
         let project_key = project_key_owned.as_deref();
         let lock = self.scope_lock(scope, project_key);
         let _guard = lock.lock().await;
+        // Re-read under the lock to avoid splitting a stale pre-lock snapshot (#235).
+        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+            return Ok(None);
+        };
+        source = fresh;
         let source_id = source.frontmatter.id.clone();
         let source_type = source.frontmatter.r#type;
         let source_confidence = source.frontmatter.confidence.clone();
@@ -1363,6 +1385,20 @@ impl MemoryStore {
         let project_key = project_key_owned.as_deref();
         let lock = self.scope_lock(scope, project_key);
         let _guard = lock.lock().await;
+        // Re-read every source under the lock: the supersede writes below persist
+        // each source doc, so operating on pre-lock snapshots would clobber a
+        // concurrent mutation to any of them (#235). ids/scope are stable.
+        let mut fresh_sources = Vec::with_capacity(sources.len());
+        for source in &sources {
+            let Some(doc) = self
+                .get_memory(&source.frontmatter.id, preferred_project_key)
+                .await?
+            else {
+                return Ok(None);
+            };
+            fresh_sources.push(doc);
+        }
+        sources = fresh_sources;
         let superseded_ids: Vec<String> = sources
             .iter()
             .map(|doc| doc.frontmatter.id.clone())
@@ -1556,6 +1592,11 @@ impl MemoryStore {
             target.frontmatter.project_key.as_deref(),
         );
         let _guard = lock.lock().await;
+        // Re-read under the lock so a concurrent mutation isn't clobbered (#235).
+        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+            return Ok(None);
+        };
+        target = fresh;
 
         let requested_ids: Vec<String> = contradicted_by_ids
             .iter()
@@ -1677,6 +1718,11 @@ impl MemoryStore {
             doc.frontmatter.project_key.as_deref(),
         );
         let _guard = lock.lock().await;
+        // Re-read under the lock so the merge isn't applied to a stale snapshot (#235).
+        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+            return Ok(None);
+        };
+        doc = fresh;
 
         let content = content.trim();
         if content.is_empty() {
@@ -2556,20 +2602,24 @@ impl MemoryStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let line = serde_json::to_string(&entry).map_err(|error| {
+        let mut line = serde_json::to_string(&entry).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("failed to serialize audit log: {error}"),
             )
         })?;
-        let mut existing = if path.exists() {
-            fs::read_to_string(&path).await?
-        } else {
-            String::new()
-        };
-        existing.push_str(&line);
-        existing.push('\n');
-        crate::atomic_fs::atomic_write(&path, existing.as_bytes()).await
+        line.push('\n');
+        // Append the single new line instead of reading + rewriting the whole
+        // (append-only, unbounded) log on every mutation — the old read→push→
+        // rewrite was O(history) per write and O(history²) cumulative (#235).
+        use tokio::io::AsyncWriteExt;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await
     }
 
     async fn write_json_file<T: serde::Serialize>(
@@ -4592,5 +4642,41 @@ mod tests {
             .expect("read global dream")
             .expect("global dream should exist");
         assert!(global.contains("Global dream remains intact"));
+    }
+
+    #[tokio::test]
+    async fn append_session_topic_serializes_concurrent_appends() {
+        // Without the per-topic lock, concurrent read-modify-write appends drop
+        // each other's updates; with it, every entry survives (#235).
+        let dir = tempdir().unwrap();
+        const WRITERS: usize = 16;
+
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let path = dir.path().to_path_buf();
+            handles.push(tokio::spawn(async move {
+                let store = MemoryStore::new(&path);
+                store
+                    .append_session_topic("sess-concurrent", "topic", &format!("entry-{i}"))
+                    .await
+                    .expect("append succeeds");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("writer task joins");
+        }
+
+        let store = MemoryStore::new(dir.path());
+        let content = store
+            .read_session_topic("sess-concurrent", "topic")
+            .await
+            .expect("read topic")
+            .unwrap_or_default();
+        for i in 0..WRITERS {
+            assert!(
+                content.contains(&format!("entry-{i}")),
+                "append entry-{i} was lost to a race"
+            );
+        }
     }
 }
