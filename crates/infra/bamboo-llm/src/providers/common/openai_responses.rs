@@ -1233,9 +1233,14 @@ impl ResponsesSseParser {
                     //   (B) a COMPLETE snapshot that the deltas restate from
                     //       scratch — appending would yield `snapshot + deltas`
                     //       (malformed/duplicated).
-                    // A complete, parseable JSON object in the seed signals (B),
-                    // so drop it before appending; otherwise keep it. (#237 f.4)
-                    if serde_json::from_str::<serde_json::Value>(&entry.arguments).is_ok() {
+                    // A complete, parseable JSON OBJECT in the seed signals (B),
+                    // so drop it before appending; otherwise keep it. Tool-call
+                    // arguments are always objects, so a bare scalar/partial that
+                    // merely parses (e.g. a lone number) is treated as a prefix.
+                    // (#237 f.4)
+                    if serde_json::from_str::<serde_json::Value>(&entry.arguments)
+                        .is_ok_and(|v| v.is_object())
+                    {
                         entry.arguments.clear();
                     }
                 }
