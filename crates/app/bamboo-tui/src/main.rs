@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};

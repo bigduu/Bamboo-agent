@@ -1,6 +1,6 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::api::types::{AgentEvent, McpServer, Schedule, SessionSummary, Skill, ToolInfo};
+use crate::api::types::{McpServer, Schedule, SessionSummary, Skill, ToolInfo};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -9,9 +9,9 @@ type Loaded<T> = Result<T, String>;
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    Resize(u16, u16),
-    SseEvent(AgentEvent),
-    ApiError(String),
+    /// Terminal resized; the next loop iteration redraws at the new size (the
+    /// dimensions themselves aren't needed — ratatui re-measures on draw).
+    Resize,
 
     // ── Non-blocking API results (posted by spawned tasks) ──
     SessionsLoaded(Loaded<Vec<SessionSummary>>),
