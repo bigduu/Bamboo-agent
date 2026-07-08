@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{trace, warn};
 
 use crate::error::{McpError, Result};
@@ -13,7 +13,14 @@ use crate::types::{McpCallResult, McpTool};
 /// the SAME inbound message-handler loop as JSON-RPC responses, so a *blocking*
 /// send here would wedge that loop — and stall all response delivery — once the
 /// buffer fills. Sends into it are therefore non-blocking (drop-on-full); see
-/// `handle_message` (private).
+/// the `handle_message` private method.
+///
+/// The RECEIVE side is drained by a dedicated consumer that takes the receiver
+/// via [`take_notification_receiver`](McpProtocolClient::take_notification_receiver)
+/// and awaits `recv()` on it (the manager's per-connection drain task). So in
+/// steady state the queue is continuously emptied; the drop-on-full behavior is
+/// only a safety valve for a burst that momentarily outruns the consumer, never
+/// the normal path. #366.
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 100;
 
 /// Transport trait for MCP communication
@@ -59,7 +66,13 @@ pub struct McpProtocolClient {
     pending_requests: Arc<RwLock<std::collections::HashMap<u64, PendingRequest>>>,
     message_handler: Option<tokio::task::JoinHandle<()>>,
     notification_tx: mpsc::Sender<JsonRpcNotification>,
-    notification_rx: Arc<RwLock<mpsc::Receiver<JsonRpcNotification>>>,
+    /// Receiver half of the server-notification queue. Wrapped in
+    /// `Mutex<Option<..>>` so a single production consumer can take ownership via
+    /// [`take_notification_receiver`](Self::take_notification_receiver) and drain
+    /// it with `recv().await` (no client lock held across the await), while unit
+    /// tests can still poll it in place via
+    /// [`try_receive_notification`](Self::try_receive_notification). #366.
+    notification_rx: Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>,
     /// Whether the notification queue is currently in a full/dropping episode.
     /// Gates the drop `warn!` to once per episode instead of once per dropped
     /// notification, so a chatty server can't produce continuous warn spam. #366.
@@ -75,7 +88,7 @@ impl McpProtocolClient {
             pending_requests: Arc::new(RwLock::new(std::collections::HashMap::new())),
             message_handler: None,
             notification_tx,
-            notification_rx: Arc::new(RwLock::new(notification_rx)),
+            notification_rx: Mutex::new(Some(notification_rx)),
             notification_queue_full: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -192,7 +205,7 @@ impl McpProtocolClient {
                     // Log once per full/dropping episode, not once per dropped
                     // notification — a chatty server would otherwise emit
                     // continuous warn-level spam (and feed alerting). #366.
-                    if !notification_queue_full.swap(true, Ordering::Relaxed) {
+                    if Self::note_dropped_notification(notification_queue_full) {
                         warn!(
                             "MCP notification queue full (cap={}); dropping notifications until it drains (first dropped method={})",
                             NOTIFICATION_CHANNEL_CAPACITY, dropped.method
@@ -207,6 +220,20 @@ impl McpProtocolClient {
         }
 
         Err(McpError::Protocol("Unknown message type".to_string()))
+    }
+
+    /// Records that a notification was dropped because the queue was full, and
+    /// returns whether this drop OPENS a new full/dropping episode — i.e. whether
+    /// the caller should emit the drop `warn!`.
+    ///
+    /// The first drop of an episode returns `true` (log once); every subsequent
+    /// drop while the queue stays full returns `false` (stay quiet), so a chatty
+    /// server can't produce continuous warn spam. The episode ends when a
+    /// notification is next accepted (`handle_message` clears the flag), after
+    /// which the next saturation logs again. Extracted so the once-per-episode
+    /// cadence is unit-testable without a tracing subscriber. #366.
+    fn note_dropped_notification(queue_full: &AtomicBool) -> bool {
+        !queue_full.swap(true, Ordering::Relaxed)
     }
 
     async fn send_request(
@@ -350,9 +377,28 @@ impl McpProtocolClient {
         Ok(())
     }
 
+    /// Non-blocking poll of the next buffered server notification. Retained for
+    /// unit tests; production drains via [`take_notification_receiver`] instead.
+    /// Returns `None` if the queue is empty or the receiver was already taken.
+    ///
+    /// [`take_notification_receiver`]: Self::take_notification_receiver
     pub async fn try_receive_notification(&self) -> Option<JsonRpcNotification> {
-        let mut rx = self.notification_rx.write().await;
-        rx.try_recv().ok()
+        let mut guard = self.notification_rx.lock().await;
+        guard.as_mut()?.try_recv().ok()
+    }
+
+    /// Takes ownership of the server-notification receiver so a dedicated consumer
+    /// can drain the queue by awaiting `recv()` on it directly — no client lock
+    /// held across the await, and the queue is actually emptied instead of
+    /// silently filling to capacity and dropping every later notification.
+    ///
+    /// Called once per connection by the manager's drain task (see
+    /// [`McpServerManager`](crate::McpServerManager)). Returns `None` if the
+    /// receiver was already taken. When the client is dropped or disconnected all
+    /// notification senders close, so the consumer's `recv()` yields `None` and it
+    /// exits cleanly. #366.
+    pub async fn take_notification_receiver(&self) -> Option<mpsc::Receiver<JsonRpcNotification>> {
+        self.notification_rx.lock().await.take()
     }
 
     pub async fn is_connected(&self) -> bool {
@@ -771,5 +817,97 @@ mod tests {
         }
 
         let _ = client.disconnect().await;
+    }
+
+    /// #366: with a real consumer, the notification queue is emptied — even after
+    /// it saturates and over-capacity notifications are dropped (non-blocking).
+    /// Before the fix the queue had NO production consumer, so it filled to
+    /// capacity and every later notification was dropped forever.
+    #[tokio::test]
+    async fn drain_consumer_empties_saturated_notification_channel() {
+        use std::collections::HashMap;
+
+        let (tx, mut rx) = mpsc::channel::<JsonRpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
+        let pending: RwLock<HashMap<u64, PendingRequest>> = RwLock::new(HashMap::new());
+        let queue_full = AtomicBool::new(false);
+
+        // Fill exactly to capacity via the production send path — all accepted.
+        for i in 0..NOTIFICATION_CHANNEL_CAPACITY {
+            let json = format!(r#"{{"jsonrpc":"2.0","method":"notifications/message/{i}"}}"#);
+            McpProtocolClient::handle_message(&json, &pending, &tx, &queue_full)
+                .await
+                .expect("handle_message returns Ok");
+        }
+        assert!(
+            !queue_full.load(Ordering::Relaxed),
+            "filling to exactly capacity should not open a drop episode"
+        );
+
+        // Over-fill: extra notifications DROP (non-blocking) rather than block —
+        // the #363 invariant. A blocking send would hang here forever.
+        for i in 0..10 {
+            let json = format!(r#"{{"jsonrpc":"2.0","method":"notifications/overflow/{i}"}}"#);
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                McpProtocolClient::handle_message(&json, &pending, &tx, &queue_full),
+            )
+            .await
+            .expect("over-capacity send must not block")
+            .expect("handle_message returns Ok");
+        }
+        assert!(
+            queue_full.load(Ordering::Relaxed),
+            "over-filling should open a drop episode"
+        );
+
+        // Now run the consumer (as the manager's drain task does). It must fully
+        // empty the channel. Close the sender so `recv()` ends once drained.
+        drop(tx);
+        let mut drained = 0usize;
+        while rx.recv().await.is_some() {
+            drained += 1;
+        }
+        assert_eq!(
+            drained, NOTIFICATION_CHANNEL_CAPACITY,
+            "the consumer must empty every buffered notification"
+        );
+    }
+
+    /// #366: the drop `warn!` fires once per full/dropping EPISODE, not once per
+    /// dropped notification. `note_dropped_notification` is the gate: it returns
+    /// `true` only for the drop that OPENS an episode. With the old per-drop
+    /// behavior (an unconditional `warn!`) every drop would log; this asserts the
+    /// 2nd/3rd drops in an episode are suppressed and a fresh episode logs again.
+    #[test]
+    fn drop_warn_fires_once_per_saturation_episode() {
+        let queue_full = AtomicBool::new(false);
+
+        // First drop of an episode -> should log.
+        assert!(
+            McpProtocolClient::note_dropped_notification(&queue_full),
+            "first drop opens the episode and should log"
+        );
+        // Repeats within the SAME episode -> suppressed.
+        assert!(
+            !McpProtocolClient::note_dropped_notification(&queue_full),
+            "a second drop in the same episode must not log"
+        );
+        assert!(
+            !McpProtocolClient::note_dropped_notification(&queue_full),
+            "further drops in the same episode must not log"
+        );
+
+        // The episode ends when the queue drains (a notification is accepted).
+        queue_full.store(false, Ordering::Relaxed);
+
+        // A later saturation opens a NEW episode -> logs once more.
+        assert!(
+            McpProtocolClient::note_dropped_notification(&queue_full),
+            "a new saturation episode should log again"
+        );
+        assert!(
+            !McpProtocolClient::note_dropped_notification(&queue_full),
+            "repeats in the new episode stay quiet"
+        );
     }
 }

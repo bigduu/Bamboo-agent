@@ -247,6 +247,17 @@ impl McpServerManager {
             phase
         );
 
+        // Wire the server-notification consumer (#366): take this client's
+        // notification receiver and spawn a drain task that dispatches notifications
+        // (e.g. `tools/list_changed` -> refresh_tools). Runs on every (re)connect,
+        // since bootstrap is the sole client-construction path for both `start` and
+        // `reconnect`; the previous connection's drain exits when its old client is
+        // dropped (all notification senders close). Without a consumer the queue
+        // fills to capacity and silently drops every later notification.
+        if let Some(rx) = client.take_notification_receiver().await {
+            self.spawn_notification_drain(server_id.to_string(), rx);
+        }
+
         Ok((client, tools, instructions))
     }
 
