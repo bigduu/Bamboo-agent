@@ -81,6 +81,12 @@ async fn subagent_create_runs_actor_process_through_the_server() {
     };
     let mut ctx = ToolExecutionContext::none("t1");
     ctx.session_id = Some(parent_id);
+    // `SubAgent create` is now permission-classified (spawns a child agent
+    // process — see #395/#402), so through the real executor it requires an
+    // approval that a non-interactive test has no sink for and it fails closed.
+    // This test exercises the actor-spawn WIRING, not the permission gate, so we
+    // run it under bypass (the gate is covered by bamboo-permission's own tests).
+    ctx.bypass_permissions = true;
     let result = tools
         .execute_with_context(&call, ctx)
         .await
@@ -217,6 +223,12 @@ async fn cancel_running_actor_child_through_the_server() {
     };
     let mut ctx = ToolExecutionContext::none("t1");
     ctx.session_id = Some(parent_id);
+    // `SubAgent create` is now permission-classified (spawns a child agent
+    // process — see #395/#402), so through the real executor it requires an
+    // approval that a non-interactive test has no sink for and it fails closed.
+    // This test exercises the actor-spawn WIRING, not the permission gate, so we
+    // run it under bypass (the gate is covered by bamboo-permission's own tests).
+    ctx.bypass_permissions = true;
     let result = tools.execute_with_context(&create, ctx).await.unwrap();
     assert!(result.success, "create failed: {}", result.result);
     let child_id = serde_json::from_str::<serde_json::Value>(&result.result).unwrap()
