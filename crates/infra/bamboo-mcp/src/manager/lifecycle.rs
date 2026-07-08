@@ -22,7 +22,7 @@ impl McpServerManager {
         info!("Starting MCP server '{}'", server_id);
 
         let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
-        let (client, tools, instructions) = self
+        let (client, tools, instructions, notification_rx) = self
             .bootstrap_server_client(&server_id, &config, "start")
             .await?;
 
@@ -63,6 +63,13 @@ impl McpServerManager {
 
         // Store runtime
         self.runtimes.insert(server_id.clone(), runtime.clone());
+
+        // Spawn the notification drain only AFTER the runtime is registered, so an
+        // immediate `tools/list_changed` resolves via `refresh_tools` instead of
+        // racing `ServerNotFound`. (#420)
+        if let Some(rx) = notification_rx {
+            self.spawn_notification_drain(server_id.clone(), rx);
+        }
 
         // Emit event
         if let Some(ref tx) = self.event_tx {

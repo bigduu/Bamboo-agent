@@ -1,5 +1,7 @@
 use tokio::time::Duration;
 
+use crate::protocol::models::JsonRpcNotification;
+
 use super::*;
 
 impl McpServerManager {
@@ -148,7 +150,7 @@ impl McpServerManager {
             }
         }
 
-        let (client, tools, instructions) = self
+        let (client, tools, instructions, notification_rx) = self
             .bootstrap_server_client(&server_id, &runtime.config, "reconnect")
             .await?;
 
@@ -156,6 +158,13 @@ impl McpServerManager {
         {
             let mut client_lock = runtime.client.write().await;
             *client_lock = client;
+        }
+
+        // Spawn the notification drain only AFTER the new client is swapped in, so
+        // an immediate `tools/list_changed` refreshes against the NEW connection
+        // (not the old, disconnected one). (#420)
+        if let Some(rx) = notification_rx {
+            self.spawn_notification_drain(server_id.clone(), rx);
         }
 
         // Update tools
@@ -204,7 +213,12 @@ impl McpServerManager {
         server_id: &str,
         config: &McpServerConfig,
         phase: &'static str,
-    ) -> Result<(McpProtocolClient, Vec<McpTool>, Option<String>)> {
+    ) -> Result<(
+        McpProtocolClient,
+        Vec<McpTool>,
+        Option<String>,
+        Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
+    )> {
         let transport = self.build_transport(&config.transport).await?;
         let mut client = McpProtocolClient::new(transport);
 
@@ -247,18 +261,17 @@ impl McpServerManager {
             phase
         );
 
-        // Wire the server-notification consumer (#366): take this client's
-        // notification receiver and spawn a drain task that dispatches notifications
-        // (e.g. `tools/list_changed` -> refresh_tools). Runs on every (re)connect,
-        // since bootstrap is the sole client-construction path for both `start` and
-        // `reconnect`; the previous connection's drain exits when its old client is
-        // dropped (all notification senders close). Without a consumer the queue
-        // fills to capacity and silently drops every later notification.
-        if let Some(rx) = client.take_notification_receiver().await {
-            self.spawn_notification_drain(server_id.to_string(), rx);
-        }
+        // Take this client's server-notification receiver (#366) and hand it BACK
+        // to the caller rather than spawning the drain here. The drain dispatches
+        // `tools/list_changed` -> `refresh_tools`, which resolves the runtime by
+        // `server_id` and reads `runtime.client` — so it must not start until the
+        // caller has REGISTERED the runtime (`start`) / SWAPPED in the new client
+        // (`reconnect`). Spawning it inside bootstrap raced those: an immediate
+        // notification could hit `ServerNotFound` (start) or read the old,
+        // disconnected client (reconnect). (#420)
+        let notification_rx = client.take_notification_receiver().await;
 
-        Ok((client, tools, instructions))
+        Ok((client, tools, instructions, notification_rx))
     }
 
     async fn build_transport(&self, config: &TransportConfig) -> Result<Box<dyn McpTransport>> {
