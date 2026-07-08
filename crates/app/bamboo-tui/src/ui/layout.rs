@@ -162,7 +162,7 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn render_help(f: &mut Frame) {
-    let area = centered_rect(50, 22, f.area());
+    let area = centered_rect(50, 25, f.area());
     let help_text = vec![
         Line::from(Span::styled(
             " Keybindings",
@@ -175,6 +175,9 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("  Tab         Next tab"),
         Line::raw("  Shift+Tab   Previous tab"),
         Line::raw("  Enter       Send message / Select item"),
+        Line::raw("                (Sessions: resume w/ history + reattach)"),
+        Line::raw("  Ctrl+N      New session"),
+        Line::raw("  Ctrl+Q      Reopen pending question (if dismissed)"),
         Line::raw("  Ctrl+C      Quit / Stop streaming"),
         Line::raw("  Ctrl+S      Stop agent execution"),
         Line::raw("  Ctrl+X      Expand/collapse tool args & results"),

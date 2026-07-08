@@ -68,6 +68,101 @@ pub struct RespondRequest {
     pub response: String,
 }
 
+/// Wire shape of `GET /api/v1/sessions/{session_id}` — the server wraps the
+/// single summary in a `{ "session": ... }` envelope rather than a bare
+/// object.
+#[derive(Deserialize, Debug, Clone)]
+pub struct GetSessionEnvelope {
+    pub session: SessionSummary,
+}
+
+// ── Session resume (history + pending question) ──
+
+/// `function` payload of a [`HistoryToolCall`] — mirrors the server's
+/// `FunctionCall` (`bamboo-domain::session::tool_types::FunctionCall`).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct HistoryFunctionCall {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// One tool call attached to an assistant [`HistoryMessage`] — mirrors the
+/// server's `ToolCall`.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct HistoryToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub function: HistoryFunctionCall,
+}
+
+/// One entry in `GET /api/v1/history/{session_id}`'s `messages` array — a
+/// lenient subset of the server's `Message`
+/// (`bamboo-domain::session::types::Message`). Only the fields
+/// `history::map_history` needs are modeled; everything else (content_parts,
+/// image_ocr, phase, compression fields, metadata) is ignored on decode
+/// rather than breaking deserialization.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct HistoryMessage {
+    #[serde(default)]
+    pub id: String,
+    /// "system" | "user" | "assistant" | "tool", lowercase.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<HistoryToolCall>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_success: Option<bool>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Wire shape of `GET /api/v1/history/{session_id}` (see the route's ACTUAL
+/// registration in `routes/agent.rs` — the doc comment on the handler itself
+/// names a different, stale path).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct HistoryResponse {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub messages: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub is_delta: bool,
+    /// Whether the server dropped older messages to stay under its cold-fetch
+    /// cap — surfaced to the operator as "showing last N of M messages".
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub total_message_count: usize,
+}
+
+/// Wire shape of `GET /api/v1/respond/{session_id}/pending`.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct PendingQuestion {
+    #[serde(default)]
+    pub has_pending_question: bool,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_custom: bool,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
 // ── MCP ──
 
 #[derive(Deserialize, Debug, Clone)]
@@ -338,5 +433,108 @@ mod tests {
         assert!(s.updated_at.is_none());
         assert_eq!(s.message_count, 0);
         assert!(!s.pinned);
+    }
+
+    /// Fixture mirroring the real `GET /api/v1/history/{id}` response,
+    /// including server fields the TUI doesn't model (`compression_events`,
+    /// `gold_config`, `goal_state`) — those must be ignored, not break
+    /// deserialization.
+    #[test]
+    fn history_response_deserializes_lenient_message_shapes() {
+        let json = r#"{
+            "session_id": "s1",
+            "messages": [
+                {"id": "m1", "role": "system", "content": "you are helpful", "created_at": "2026-07-01T00:00:00Z"},
+                {"id": "m2", "role": "user", "content": "read foo.txt", "created_at": "2026-07-01T00:00:01Z"},
+                {
+                    "id": "m3",
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "let me check",
+                    "tool_calls": [
+                        {"id": "t1", "type": "function", "function": {"name": "Read", "arguments": "{\"path\":\"foo.txt\"}"}}
+                    ],
+                    "created_at": "2026-07-01T00:00:02Z"
+                },
+                {"id": "m4", "role": "tool", "content": "file body", "tool_call_id": "t1", "tool_success": true, "created_at": "2026-07-01T00:00:03Z"}
+            ],
+            "is_delta": false,
+            "truncated": true,
+            "total_message_count": 4,
+            "compression_events": [],
+            "gold_config": {"anything": "opaque"},
+            "goal_state": {"status": "in_progress"}
+        }"#;
+        let resp: HistoryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.session_id, "s1");
+        assert_eq!(resp.messages.len(), 4);
+        assert!(resp.truncated);
+        assert_eq!(resp.total_message_count, 4);
+
+        let asst = &resp.messages[2];
+        assert_eq!(asst.role, "assistant");
+        assert_eq!(asst.reasoning.as_deref(), Some("let me check"));
+        let tool_calls = asst.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].id, "t1");
+        assert_eq!(tool_calls[0].function.name, "Read");
+
+        let tool_msg = &resp.messages[3];
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("t1"));
+        assert_eq!(tool_msg.tool_success, Some(true));
+    }
+
+    /// A near-empty message (only `role`/`content`) must still deserialize —
+    /// the lenient-degrade contract that lets the TUI survive server-side
+    /// field additions/removals.
+    #[test]
+    fn history_message_defaults_missing_fields() {
+        let json = r#"{"role": "user", "content": "hi"}"#;
+        let m: HistoryMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "hi");
+        assert!(m.id.is_empty());
+        assert!(m.reasoning.is_none());
+        assert!(m.tool_calls.is_none());
+        assert!(m.tool_call_id.is_none());
+        assert!(m.tool_success.is_none());
+    }
+
+    /// `has_pending_question: false` responses omit every other field.
+    #[test]
+    fn pending_question_deserializes_both_shapes() {
+        let none: PendingQuestion =
+            serde_json::from_str(r#"{"has_pending_question": false}"#).unwrap();
+        assert!(!none.has_pending_question);
+        assert!(none.question.is_empty());
+
+        let some: PendingQuestion = serde_json::from_str(
+            r#"{
+                "has_pending_question": true,
+                "question": "Run rm -rf?",
+                "options": ["Yes", "No"],
+                "allow_custom": true,
+                "tool_call_id": "t1",
+                "tool_name": "Bash",
+                "source": "permission"
+            }"#,
+        )
+        .unwrap();
+        assert!(some.has_pending_question);
+        assert_eq!(some.question, "Run rm -rf?");
+        assert_eq!(
+            some.options.as_deref(),
+            Some(&["Yes".to_string(), "No".to_string()][..])
+        );
+        assert!(some.allow_custom);
+    }
+
+    /// `GET /api/v1/sessions/{id}` wraps the summary in a `{ "session": ... }`
+    /// envelope.
+    #[test]
+    fn get_session_envelope_unwraps() {
+        let json = r#"{"session": {"id": "s1", "model": "claude-sonnet-5"}}"#;
+        let envelope: GetSessionEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(envelope.session.id, "s1");
+        assert_eq!(envelope.session.model, "claude-sonnet-5");
     }
 }

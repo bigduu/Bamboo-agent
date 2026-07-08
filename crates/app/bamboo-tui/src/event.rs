@@ -1,6 +1,9 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::api::types::{ListSessionsEnvelope, McpServer, Schedule, Skill, SkillDetail, ToolInfo};
+use crate::api::types::{
+    ListSessionsEnvelope, McpServer, PendingQuestion, Schedule, Skill, SkillDetail, ToolInfo,
+};
+use crate::app::OpenedSession;
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -39,4 +42,15 @@ pub enum AppEvent {
     StopFinished(Loaded<()>),
     /// A skill's detail view finished loading (`Enter` on the Skills tab).
     SkillDetailLoaded(Loaded<SkillDetail>),
+    /// A session resume (Sessions-tab `Enter` or `--session-id` at startup)
+    /// finished fetching history + summary (+ pending question, if any).
+    /// Carries `session_id` alongside the result so the handler can still
+    /// report which session failed to open.
+    SessionOpened {
+        session_id: String,
+        result: Result<OpenedSession, String>,
+    },
+    /// `Ctrl+Q` with no cached dismissed question found one on the server (or
+    /// confirmed there isn't one).
+    PendingQuestionChecked(Loaded<PendingQuestion>),
 }

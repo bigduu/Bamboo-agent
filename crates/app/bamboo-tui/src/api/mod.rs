@@ -102,6 +102,44 @@ impl BambooClient {
         Ok(auto_resume)
     }
 
+    // ── Session resume ──
+
+    /// `GET /api/v1/history/{session_id}` — full message history, used to
+    /// replay a resumed session's transcript into the Chat tab.
+    pub async fn get_history(&self, session_id: &str) -> Result<HistoryResponse> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/api/v1/history/{}", session_id)))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get history failed ({status}): {body}");
+        }
+        let history: HistoryResponse = resp.json().await?;
+        Ok(history)
+    }
+
+    /// `GET /api/v1/respond/{session_id}/pending` — the agent's currently
+    /// pending question, if any. Used both by session resume (to pre-populate
+    /// the question modal) and by the Ctrl+Q recovery path when no dismissed
+    /// question is cached locally.
+    pub async fn get_pending_question(&self, session_id: &str) -> Result<PendingQuestion> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/api/v1/respond/{}/pending", session_id)))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get pending question failed ({status}): {body}");
+        }
+        let pending: PendingQuestion = resp.json().await?;
+        Ok(pending)
+    }
+
     // ── Sessions ──
 
     /// `GET /api/v1/sessions`. The server wraps the page in an envelope
@@ -134,6 +172,24 @@ impl BambooClient {
         }
         let envelope: ListSessionsEnvelope = resp.json().await?;
         Ok(envelope)
+    }
+
+    /// `GET /api/v1/sessions/{session_id}` — unwraps the `{ "session": ... }`
+    /// envelope. Used by session resume to get the model + `is_running` /
+    /// `has_pending_question` flags the history endpoint doesn't carry.
+    pub async fn get_session(&self, session_id: &str) -> Result<SessionSummary> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/api/v1/sessions/{}", session_id)))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get session failed ({status}): {body}");
+        }
+        let envelope: GetSessionEnvelope = resp.json().await?;
+        Ok(envelope.session)
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<()> {

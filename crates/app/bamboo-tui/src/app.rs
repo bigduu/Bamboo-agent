@@ -11,6 +11,7 @@ use crate::api::sse::SseStream;
 use crate::api::types::*;
 use crate::api::BambooClient;
 use crate::event::AppEvent;
+use crate::history::map_history;
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,6 +142,21 @@ impl ChatState {
             sub_agents: Vec::new(),
         }
     }
+}
+
+/// Result of a session resume (history + summary + pending question fetched
+/// off the event loop), posted back as `AppEvent::SessionOpened`. Kept
+/// separate from `ChatState` since it's a one-shot transfer object, not
+/// long-lived UI state.
+pub struct OpenedSession {
+    pub messages: Vec<ChatMessage>,
+    pub model: String,
+    pub is_running: bool,
+    pub pending: Option<PendingQuestion>,
+    /// The server dropped older messages to stay under its cold-fetch cap.
+    pub truncated: bool,
+    /// Pre-cap message count, for the "showing last N of M" notice.
+    pub total_message_count: usize,
 }
 
 // ── Per-tab states ──
@@ -290,6 +306,26 @@ pub struct ActiveQuestion {
     pub custom: Option<String>,
 }
 
+impl ActiveQuestion {
+    /// Build the modal state from a `GET .../pending` response. Mirrors the
+    /// SSE `NeedClarification` handler: no preset options opens straight into
+    /// free-text entry instead of an empty option list.
+    fn from_pending(pending: &PendingQuestion) -> Self {
+        let options = pending.options.clone().unwrap_or_default();
+        let custom = if options.is_empty() {
+            Some(String::new())
+        } else {
+            None
+        };
+        Self {
+            question: pending.question.clone(),
+            options,
+            selected: 0,
+            custom,
+        }
+    }
+}
+
 /// In-progress "new schedule" form (opened with `n` on the Schedules tab).
 #[derive(Default)]
 pub struct ScheduleForm {
@@ -336,6 +372,12 @@ pub struct App {
     /// The agent's pending question (permission gate / clarification). When
     /// `Some`, a modal captures the answer and keystrokes route to it.
     pub pending_question: Option<ActiveQuestion>,
+    /// The most recently *dismissed* (Esc'd) pending question, kept around
+    /// because dismissing the modal does NOT tell the server to stop
+    /// waiting — the run is still blocked on an answer. `Ctrl+Q` restores it
+    /// without a round-trip; cleared once answered/resumed or on a fresh
+    /// session (`Ctrl+N` / opening a different session).
+    pub dismissed_question: Option<ActiveQuestion>,
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
@@ -380,6 +422,7 @@ impl App {
             help_visible: false,
             spinner_tick: 0,
             pending_question: None,
+            dismissed_question: None,
             schedule_form: None,
             config_editor: None,
             pending_delete: None,
@@ -408,6 +451,13 @@ impl App {
         self.event_tx = Some(event_tx.clone());
         // Kick off the initial tab's data load without blocking startup.
         self.load_tab_data();
+
+        // `--session-id` on the command line: resume it the same way `Enter`
+        // on the Sessions tab does (history replay + live reattach + pending
+        // question recovery), not a bespoke startup-only path.
+        if let Some(session_id) = self.chat.session_id.clone() {
+            self.resume_session(session_id);
+        }
 
         // Spawn crossterm event reader.
         let tx = event_tx.clone();
@@ -626,6 +676,71 @@ impl App {
                 }
                 Err(e) => self.skills.error = Some(e),
             },
+            AppEvent::SessionOpened { session_id, result } => match result {
+                Ok(opened) => {
+                    // Reset every per-run scratch field `finalize_streaming`
+                    // would otherwise leave behind from whatever was open
+                    // before — a resumed session must not inherit stale
+                    // in-flight-turn state from a prior chat.
+                    self.chat.session_id = Some(session_id.clone());
+                    self.chat.model = opened.model;
+                    self.chat.current_response.clear();
+                    self.chat.current_tool_calls.clear();
+                    self.chat.current_reasoning.clear();
+                    self.chat.sub_agents.clear();
+                    self.chat.token_usage = None;
+                    self.chat.scroll_offset = 0;
+                    self.chat.streaming = false;
+                    self.pending_question = None;
+                    self.dismissed_question = None;
+
+                    let shown = opened.messages.len();
+                    self.chat.messages = opened.messages;
+                    self.chat.auto_scroll = true;
+                    self.tab = Tab::Chat;
+                    self.status_message = "Session resumed".to_string();
+
+                    if opened.truncated {
+                        self.notify(
+                            NoticeLevel::Info,
+                            format!(
+                                "Showing last {shown} of {} messages",
+                                opened.total_message_count
+                            ),
+                        );
+                    }
+
+                    if opened.is_running {
+                        self.attach_stream(session_id);
+                        self.chat.streaming = true;
+                        self.status_message = "Reattached — streaming".to_string();
+                    }
+
+                    if let Some(pending) = &opened.pending {
+                        self.status_message =
+                            format!("Question: {} (answer in the dialog)", pending.question);
+                        self.pending_question = Some(ActiveQuestion::from_pending(pending));
+                    }
+                }
+                Err(e) => {
+                    self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
+                }
+            },
+            AppEvent::PendingQuestionChecked(r) => match r {
+                Ok(pending) if pending.has_pending_question => {
+                    self.pending_question = Some(ActiveQuestion::from_pending(&pending));
+                    self.status_message = "Question reopened".to_string();
+                }
+                Ok(_) => {
+                    self.notify(NoticeLevel::Info, "No pending question on the server");
+                }
+                Err(e) => {
+                    self.notify(
+                        NoticeLevel::Error,
+                        format!("Failed to check pending question: {e}"),
+                    );
+                }
+            },
             _ => {}
         }
         Ok(())
@@ -703,6 +818,24 @@ impl App {
         // below — same rationale as the schedule form.
         if self.config_editor.is_some() {
             return self.handle_config_editor_key(key);
+        }
+
+        // Ctrl+N / Ctrl+Q: global, but only reachable once every modal above
+        // has had first refusal at the key (each of those branches returns
+        // early) — so getting here already means no modal is open, matching
+        // the "no modal open" requirement for Ctrl+N specifically.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('n') if !self.chat.streaming => {
+                    self.new_session();
+                    return Ok(());
+                }
+                KeyCode::Char('q') => {
+                    self.reopen_pending_question();
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         if let KeyCode::Char(c) = key.code {
@@ -818,10 +951,13 @@ impl App {
         match action {
             QAction::Submit(answer) => self.submit_answer(answer).await?,
             QAction::Dismiss => {
-                self.pending_question = None;
-                self.status_message =
-                    "Question dismissed (still pending on the server — Ctrl+C stops the run)"
-                        .to_string();
+                // Keep it, not just drop it: dismissing does NOT tell the
+                // server to stop waiting, so the run is still blocked on an
+                // answer — Ctrl+Q brings the modal back without a round-trip.
+                self.dismissed_question = self.pending_question.take();
+                self.status_message = "Question dismissed (still pending on the server — \
+                    Ctrl+Q to reopen, Ctrl+C stops the run)"
+                    .to_string();
             }
             QAction::None => {}
         }
@@ -1062,15 +1198,30 @@ impl App {
         });
     }
 
-    /// After `chat` returns a session id, open the SSE stream (before execute, so
-    /// no early event is missed) and spawn the agent run.
-    fn start_stream_and_execute(&mut self, session_id: String) {
+    /// Open the SSE stream for `session_id`, wiring `sse_tx`/`sse_rx` so
+    /// `poll_sse`/`run`'s select loop starts receiving events. Shared by a
+    /// freshly-started run (`start_stream_and_execute`, before `execute` so no
+    /// early event is missed) and reattaching to an already-running session on
+    /// resume (`AppEvent::SessionOpened` with `is_running: true`) — in both
+    /// cases the server replays cached critical events then live-tails, so
+    /// connecting mid-flight doesn't lose anything. Returns whether the
+    /// connection was opened; on failure it has already `notify`'d.
+    fn attach_stream(&mut self, session_id: String) -> bool {
         let (sse_tx, sse_rx) = mpsc::unbounded_channel();
         self.sse_tx = Some(sse_tx.clone());
         self.sse_rx = Some(sse_rx);
         let base_url = self.client.base_url.clone();
         if let Err(e) = SseStream::start(&base_url, &session_id, sse_tx) {
             self.notify(NoticeLevel::Error, format!("SSE start failed: {e}"));
+            return false;
+        }
+        true
+    }
+
+    /// After `chat` returns a session id, open the SSE stream (before execute, so
+    /// no early event is missed) and spawn the agent run.
+    fn start_stream_and_execute(&mut self, session_id: String) {
+        if !self.attach_stream(session_id.clone()) {
             return;
         }
         let Some(tx) = self.event_tx.clone() else {
@@ -1087,6 +1238,111 @@ impl App {
             if let Err(e) = client.execute(&session_id, model.as_deref()).await {
                 let _ = tx.send(AppEvent::ExecuteFailed(e.to_string()));
             }
+        });
+    }
+
+    /// Resume a session fully off the event loop: fetch its history + summary
+    /// (+ pending question, when the summary reports one), map the history
+    /// into chat messages, and post a single `SessionOpened` event. Used both
+    /// by `Enter` on the Sessions tab and by `--session-id` at startup so
+    /// there's exactly one resume code path.
+    fn resume_session(&mut self, session_id: String) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.status_message = "Resuming session...".to_string();
+        tokio::spawn(async move {
+            let history = match client.get_history(&session_id).await {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SessionOpened {
+                        session_id,
+                        result: Err(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let summary = match client.get_session(&session_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SessionOpened {
+                        session_id,
+                        result: Err(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            // Only fetch the pending question when the summary says there is
+            // one — saves a round-trip for the common case, and a failure
+            // here is non-fatal: the session still opens, just without the
+            // modal pre-populated (Ctrl+Q can fetch it again).
+            let pending = if summary.has_pending_question {
+                client
+                    .get_pending_question(&session_id)
+                    .await
+                    .ok()
+                    .filter(|p| p.has_pending_question)
+            } else {
+                None
+            };
+            let opened = OpenedSession {
+                messages: map_history(history.messages),
+                model: summary.model,
+                is_running: summary.is_running,
+                pending,
+                truncated: history.truncated,
+                total_message_count: history.total_message_count,
+            };
+            let _ = tx.send(AppEvent::SessionOpened {
+                session_id,
+                result: Ok(opened),
+            });
+        });
+    }
+
+    /// `Ctrl+N`: start a fresh session. Keeps the current model (the operator
+    /// picked it for a reason) but drops everything session-scoped.
+    fn new_session(&mut self) {
+        self.chat.session_id = None;
+        self.chat.messages.clear();
+        self.chat.current_response.clear();
+        self.chat.current_tool_calls.clear();
+        self.chat.current_reasoning.clear();
+        self.chat.sub_agents.clear();
+        self.chat.token_usage = None;
+        self.chat.scroll_offset = 0;
+        self.chat.auto_scroll = true;
+        self.chat.plan_mode = false;
+        self.pending_question = None;
+        self.dismissed_question = None;
+        self.status_message = "New session".to_string();
+    }
+
+    /// `Ctrl+Q`: restore the last dismissed question if one is cached; else,
+    /// if there's an active session, check the server off the event loop (the
+    /// result comes back as `AppEvent::PendingQuestionChecked`).
+    fn reopen_pending_question(&mut self) {
+        if let Some(q) = self.dismissed_question.take() {
+            self.pending_question = Some(q);
+            self.status_message = "Question reopened".to_string();
+            return;
+        }
+        let Some(session_id) = self.chat.session_id.clone() else {
+            self.notify(NoticeLevel::Info, "No pending question to reopen");
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.status_message = "Checking for a pending question...".to_string();
+        tokio::spawn(async move {
+            let r = client
+                .get_pending_question(&session_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::PendingQuestionChecked(r));
         });
     }
 
@@ -1313,9 +1569,10 @@ impl App {
         self.sse_rx = None;
         self.chat.sub_agents.clear();
         // A run that ended (completed / cancelled / stopped) can no longer accept
-        // an answer, so drop any open question modal to avoid answering a dead
-        // session.
+        // an answer, so drop any open (or dismissed-but-cached) question modal
+        // to avoid answering a dead session.
         self.pending_question = None;
+        self.dismissed_question = None;
     }
 
     /// Stop the current run WITHOUT blocking the event loop: the `stop` POST
@@ -1354,15 +1611,11 @@ impl App {
                 self.sessions.selected = self.sessions.selected.saturating_sub(1);
             }
             KeyCode::Enter => {
-                // TODO(WP3): also load the session's history into `chat.messages`
-                // — for now this only points the Chat tab at the session id/model,
-                // matching prior behavior.
+                // Full resume, off the event loop: history replay + live
+                // reattach (if the run is still going) + pending-question
+                // recovery, all landing in one `SessionOpened` event.
                 if let Some(session) = self.sessions.sessions.get(self.sessions.selected) {
-                    self.chat.session_id = Some(session.id.clone());
-                    if !session.model.is_empty() {
-                        self.chat.model = session.model.clone();
-                    }
-                    self.tab = Tab::Chat;
+                    self.resume_session(session.id.clone());
                 }
             }
             KeyCode::Char('d') => {
@@ -2248,5 +2501,280 @@ mod question_tests {
 
         assert!(!app.chat.streaming);
         assert_eq!(app.status_message, "Stopped");
+    }
+
+    // ── Session resume (WP3) ──
+
+    fn opened(messages: Vec<ChatMessage>) -> OpenedSession {
+        OpenedSession {
+            messages,
+            model: "claude-sonnet-5".to_string(),
+            is_running: false,
+            pending: None,
+            truncated: false,
+            total_message_count: 0,
+        }
+    }
+
+    fn asst_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        }
+    }
+
+    /// A successful resume installs the mapped history, the model, and the
+    /// session id; switches to the Chat tab; and leaves `streaming` false
+    /// when the session isn't currently running.
+    #[tokio::test]
+    async fn session_opened_installs_state_and_switches_tab() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        // Leftover scratch state from a previous session — must be wiped.
+        app.chat.current_response = "stale partial".to_string();
+        app.chat.token_usage = Some(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(opened(vec![asst_msg("hello again")])),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
+        assert_eq!(app.chat.model, "claude-sonnet-5");
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.tab, Tab::Chat);
+        assert!(app.chat.auto_scroll);
+        assert!(
+            !app.chat.streaming,
+            "is_running: false must not start streaming"
+        );
+        assert!(app.chat.current_response.is_empty(), "scratch state wiped");
+        assert!(app.chat.token_usage.is_none(), "scratch state wiped");
+    }
+
+    /// `is_running: true` reattaches the SSE stream and sets `streaming`.
+    /// `event_tx` isn't wired in a bare `App::new`, so `attach_stream`'s
+    /// `SseStream::start` call still runs (it only spawns a task, no network
+    /// yet) — this asserts the flag flip, not a real connection.
+    #[tokio::test]
+    async fn session_opened_reattaches_when_running() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(OpenedSession {
+                is_running: true,
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.chat.streaming, "is_running: true must reattach");
+        assert_eq!(app.status_message, "Reattached — streaming");
+    }
+
+    /// A truncated resume surfaces "showing last N of M" as an Info
+    /// notification.
+    #[tokio::test]
+    async fn session_opened_truncated_notifies() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(OpenedSession {
+                truncated: true,
+                total_message_count: 5000,
+                ..opened(vec![asst_msg("a"), asst_msg("b")])
+            }),
+        })
+        .await
+        .unwrap();
+
+        let last = app.notifications.last().expect("truncation notified");
+        assert!(last.text.contains("Showing last 2 of 5000 messages"));
+    }
+
+    /// A resumed session with a pending question opens the modal, matching
+    /// the SSE `NeedClarification` free-text-when-no-options rule.
+    #[tokio::test]
+    async fn session_opened_with_pending_question_opens_modal() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(OpenedSession {
+                pending: Some(PendingQuestion {
+                    has_pending_question: true,
+                    question: "Proceed?".to_string(),
+                    options: None,
+                    allow_custom: true,
+                    ..Default::default()
+                }),
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+
+        let q = app.pending_question.as_ref().expect("modal opened");
+        assert_eq!(q.question, "Proceed?");
+        assert!(q.options.is_empty());
+        assert!(q.custom.is_some(), "no options ⇒ free-text entry");
+    }
+
+    /// A failed resume surfaces an error and touches nothing else.
+    #[tokio::test]
+    async fn session_opened_failure_notifies_and_leaves_chat_untouched() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("old".to_string());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Err("not found".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.chat.session_id.as_deref(),
+            Some("old"),
+            "a failed resume must not clobber the current session"
+        );
+        let last = app.notifications.last().expect("failure notified");
+        assert!(last.text.contains("not found"));
+        assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    /// `Ctrl+N` clears every session-scoped field but keeps the model.
+    #[tokio::test]
+    async fn ctrl_n_clears_session_but_keeps_model() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "claude-sonnet-5".to_string();
+        app.chat.messages = vec![asst_msg("leftover")];
+        app.chat.current_response = "partial".to_string();
+        app.chat.token_usage = Some(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+        app.dismissed_question = Some(ActiveQuestion {
+            question: "q".to_string(),
+            options: vec![],
+            selected: 0,
+            custom: Some(String::new()),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert!(app.chat.session_id.is_none());
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.current_response.is_empty());
+        assert!(app.chat.token_usage.is_none());
+        assert!(app.pending_question.is_none());
+        assert!(
+            app.dismissed_question.is_none(),
+            "a stale cached question from the old session must not survive"
+        );
+        assert_eq!(
+            app.chat.model, "claude-sonnet-5",
+            "model must survive a new session"
+        );
+        assert_eq!(app.status_message, "New session");
+    }
+
+    /// `Ctrl+N` is a no-op while a run is streaming (must stop it explicitly
+    /// first, same as every other destructive Sessions/Chat action).
+    #[tokio::test]
+    async fn ctrl_n_is_noop_while_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
+    }
+
+    /// Esc dismisses the question modal but caches it; `Ctrl+Q` brings it
+    /// straight back without a network round-trip.
+    #[tokio::test]
+    async fn esc_then_ctrl_q_restores_the_dismissed_question() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(app.dismissed_question.is_some());
+        assert!(app.status_message.contains("Ctrl+Q"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let q = app.pending_question.as_ref().expect("question restored");
+        assert_eq!(q.question, "Run this command?");
+        assert_eq!(q.options, vec!["Approve".to_string(), "Deny".to_string()]);
+        assert!(app.dismissed_question.is_none(), "cache consumed on reopen");
+    }
+
+    /// With nothing cached and no active session, `Ctrl+Q` just notifies
+    /// instead of spawning a doomed fetch.
+    #[tokio::test]
+    async fn ctrl_q_with_nothing_cached_and_no_session_notifies() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.pending_question.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert!(last.text.contains("No pending question"));
+    }
+
+    /// `PendingQuestionChecked` (Ctrl+Q's server round-trip when nothing was
+    /// cached) opens the modal when the server reports one waiting.
+    #[tokio::test]
+    async fn pending_question_checked_opens_when_present() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_event(AppEvent::PendingQuestionChecked(Ok(PendingQuestion {
+            has_pending_question: true,
+            question: "Still there?".to_string(),
+            options: Some(vec!["Yes".to_string()]),
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.pending_question.as_ref().map(|q| q.question.as_str()),
+            Some("Still there?")
+        );
+    }
+
+    /// ...and reports there's nothing to reopen when the server agrees.
+    #[tokio::test]
+    async fn pending_question_checked_notifies_when_absent() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_event(AppEvent::PendingQuestionChecked(Ok(PendingQuestion {
+            has_pending_question: false,
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert!(last.text.contains("No pending question"));
     }
 }
