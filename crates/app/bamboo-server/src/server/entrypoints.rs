@@ -10,7 +10,10 @@ use tracing::{error, info};
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
-use crate::config::{build_cors, build_rate_limiter, build_security_headers, is_loopback_bind};
+use crate::config::{
+    build_cors, build_rate_limiter, build_security_headers, is_loopback_bind,
+    require_limiter_for_nonloopback,
+};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use crate::services::frontend_package::{
     ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
@@ -294,12 +297,15 @@ pub async fn run_with_bind_and_static_tls(
     let workers = resolve_worker_count();
 
     // Per-IP rate limiter for the network-exposed production server (#13). Built
-    // once and shared (Clone) across workers; `Governor` is the outermost wrap so
-    // a throttled request is rejected with 429 before any handler work.
+    // once and shared (Clone) across workers. It is wrapped so that a throttled
+    // request is rejected with 429 before any handler work runs.
     let rate_limiter = build_rate_limiter();
     // Loopback/desktop binds skip the limiter (see is_loopback_bind): the local
     // frontend bursts ~45 asset requests on load. Network binds stay throttled.
     let apply_rate_limit = !is_loopback_bind(bind);
+    // Bind-aware guard: a non-loopback bind must have the limiter applied (it is
+    // here). Defends against a future edit that disables it for a routable bind. #169.
+    require_limiter_for_nonloopback(bind, apply_rate_limit)?;
     let bind_for_cors = bind.to_string();
     let app_factory = move || {
         // Request size limits (base64-image chats) come from the one shared
@@ -307,6 +313,14 @@ pub async fn run_with_bind_and_static_tls(
         // (#252).
         let mut app = super::web_service::with_body_limits(App::new())
             .app_data(app_state.clone())
+            // WRAP ORDER (#169 part 2): Governor is registered BEFORE `build_cors`,
+            // making CORS the OUTER layer and Governor the INNER one. This ordering
+            // is load-bearing: (1) a genuine CORS preflight is short-circuited by
+            // CORS and never reaches Governor, so it is not counted against the
+            // bucket; and (2) a 429 from Governor propagates back OUT through CORS,
+            // which adds `Access-Control-Allow-Origin` so a browser receives a
+            // readable 429 instead of an opaque network error. Reversing the two
+            // wraps regresses both (see config.rs `governor_*_cors_*` tests).
             .wrap(actix_web::middleware::Condition::new(
                 apply_rate_limit,
                 Governor::new(&rate_limiter),

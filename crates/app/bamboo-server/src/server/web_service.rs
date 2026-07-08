@@ -40,7 +40,10 @@ where
 }
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
-use crate::config::{build_cors, build_rate_limiter, build_security_headers, is_loopback_bind};
+use crate::config::{
+    build_cors, build_rate_limiter, build_security_headers, is_loopback_bind,
+    require_limiter_for_nonloopback,
+};
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use actix_governor::Governor;
 use bamboo_config::TlsConfig;
@@ -100,6 +103,12 @@ impl WebService {
         if self.server_handle.is_some() {
             return Err("Web service is already running".to_string());
         }
+
+        // This serve path installs NO rate limiter (API-only WebService). Refuse a
+        // non-loopback bind so it can't silently run unthrottled on a routable
+        // interface — that would re-open the #13 DoS surface. Loopback binds stay
+        // allowed (desktop behavior preserved). #169 part 3.
+        require_limiter_for_nonloopback(bind, false)?;
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         self.port = port;
@@ -211,6 +220,10 @@ impl WebService {
         // throttled to a 429 (chunk import fails / "Too many requests").
         let rate_limiter = build_rate_limiter();
         let apply_rate_limit = !is_loopback_bind(bind);
+        // Bind-aware guard: a non-loopback bind must have the limiter applied
+        // (it is here for non-loopback binds). Belt-and-suspenders against a
+        // future edit that flips `apply_rate_limit` off for a routable bind. #169.
+        require_limiter_for_nonloopback(bind, apply_rate_limit)?;
         let bind_addr = bind.to_string();
         let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
@@ -218,6 +231,15 @@ impl WebService {
         let server = HttpServer::new(move || {
             with_body_limits(App::new())
                 .app_data(app_state.clone())
+                // WRAP ORDER (#169 part 2): Governor is registered BEFORE `build_cors`,
+                // so CORS is the OUTER layer and Governor the INNER one. This is
+                // load-bearing: (1) a genuine CORS preflight is answered by CORS and
+                // never reaches Governor, so it isn't counted against the bucket; and
+                // (2) a 429 from Governor propagates back OUT through CORS, which adds
+                // `Access-Control-Allow-Origin` so a browser sees a readable 429 rather
+                // than an opaque network error. Reversing these two wraps regresses both
+                // (see the config.rs `governor_inside_cors_*` / `governor_outside_cors_*`
+                // tests).
                 .wrap(actix_web::middleware::Condition::new(
                     apply_rate_limit,
                     Governor::new(&rate_limiter),
@@ -388,6 +410,38 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "actix's default JSON limit must reject a >2MB body"
         );
+    }
+
+    /// #169 part 3: the no-limiter `start_with_bind` path must REFUSE a
+    /// non-loopback bind (which would run unthrottled on a routable interface),
+    /// while still accepting a loopback bind. Without the guard, this call would
+    /// happily start an unthrottled network server (returning `Ok`), so the
+    /// `is_err()` assertion fails without the fix.
+    #[tokio::test]
+    async fn start_with_bind_rejects_nonloopback_without_limiter() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let mut service = WebService::new(home.path().to_path_buf());
+
+        // Port 0 → OS-assigned ephemeral port, so a false "Ok" would actually bind.
+        let err = service
+            .start_with_bind(0, "0.0.0.0")
+            .await
+            .expect_err("non-loopback bind without a limiter must be rejected (#169 part 3)");
+        assert!(
+            err.contains("without a rate limiter"),
+            "rejection must explain the missing limiter, got: {err}"
+        );
+        assert!(
+            !service.is_running(),
+            "the guard must reject BEFORE the server starts"
+        );
+
+        // Sanity: loopback is still accepted (desktop behavior preserved).
+        service
+            .start_with_bind(0, "127.0.0.1")
+            .await
+            .expect("loopback bind must still start without a limiter");
+        service.stop().await.expect("web service stops");
     }
 
     /// #119 e2e: WebService::stop() must cancel the AppState-owned MCP-proxy

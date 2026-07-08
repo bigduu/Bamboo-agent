@@ -218,6 +218,32 @@ pub fn is_loopback_bind(bind: &str) -> bool {
     matches!(bind, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Bind-aware limiter guard (#169 part 3).
+///
+/// The per-IP rate limiter (#13) is what protects a network-exposed bind from a
+/// DoS flood. Some serve paths (notably [`crate::server::WebService::start_with_bind`])
+/// never install the limiter, and every bind-accepting path takes an arbitrary
+/// `bind` string — so a caller COULD start an unthrottled server on `0.0.0.0`
+/// (or another routable interface) and silently re-open the surface #13 closed.
+///
+/// This guard rejects exactly that combination: a NON-loopback bind with NO
+/// limiter applied. Loopback binds (see [`is_loopback_bind`]) are exempt because
+/// the desktop sidecar intentionally runs un-throttled to serve its local
+/// frontend — so this never weakens the established localhost behavior. Paths
+/// that DO apply the limiter pass `limiter_applied = true` and are always
+/// accepted, regardless of bind.
+pub fn require_limiter_for_nonloopback(bind: &str, limiter_applied: bool) -> Result<(), String> {
+    if !limiter_applied && !is_loopback_bind(bind) {
+        return Err(format!(
+            "refusing to serve on non-loopback bind '{bind}' without a rate limiter: it would \
+             run unthrottled and re-open the per-IP DoS surface closed by #13. Use a \
+             limiter-applying serve path (e.g. start_with_bind_and_static / run_with_bind) or \
+             bind to loopback (127.0.0.1 / localhost / ::1)."
+        ));
+    }
+    Ok(())
+}
+
 // Keep the default CSP reasonably strict while remaining compatible with the Lotus UI runtime.
 // Lotus + Ant Design inject runtime styles, so `style-src 'unsafe-inline'` is required for the
 // current frontend bundle. Keep scripts strict (no `unsafe-eval`) and allow operators to override
@@ -981,6 +1007,168 @@ mod tests {
             mask_ipv6_prefix(v6),
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0))
         );
+    }
+
+    // --- #169 part 2: preflight/CORS-safe 429 -----------------------------------
+    //
+    // These build the REAL production wrap order (Governor registered *before*
+    // CORS, i.e. Governor is the INNER wrap and CORS is OUTER) and a browser
+    // request, then assert what a browser actually receives. `probe!` drains the
+    // burst with `gets` GETs (allowed Origin) then sends one CORS preflight,
+    // yielding `(last_get_status, last_get_has_acao, preflight_status)`.
+    macro_rules! probe_cors_and_preflight {
+        ($app:expr, $ip:expr, $origin:expr, $gets:expr) => {{
+            use actix_web::http::header;
+            use actix_web::test;
+
+            let mut status = actix_web::http::StatusCode::OK;
+            let mut has_acao = false;
+            for _ in 0..$gets {
+                let res = test::call_service(
+                    &$app,
+                    test::TestRequest::get()
+                        .uri("/")
+                        .peer_addr($ip)
+                        .insert_header((header::ORIGIN, $origin))
+                        .to_request(),
+                )
+                .await;
+                status = res.status();
+                has_acao = res
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+            }
+
+            let pre = test::call_service(
+                &$app,
+                test::TestRequest::default()
+                    .method(actix_web::http::Method::OPTIONS)
+                    .uri("/")
+                    .peer_addr($ip)
+                    .insert_header((header::ORIGIN, $origin))
+                    .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+                    .to_request(),
+            )
+            .await;
+
+            (status, has_acao, pre.status())
+        }};
+    }
+
+    /// The production order (`.wrap(Governor).wrap(build_cors(...))` → Governor
+    /// INSIDE CORS) must give a browser a READABLE 429: the throttled response
+    /// carries `Access-Control-Allow-Origin`, and a CORS preflight is NOT counted
+    /// against the bucket (CORS answers it before it reaches Governor).
+    #[actix_web::test]
+    async fn governor_inside_cors_makes_429_cors_readable_and_exempts_preflight() {
+        use actix_governor::Governor;
+        use actix_web::http::StatusCode;
+        use actix_web::{test, web, App, HttpResponse};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // burst=1: the 2nd GET from an IP is throttled.
+        let conf = rate_limiter_config(1, 1, ClientIpKeyExtractor::peer_ip());
+        let app = test::init_service(
+            App::new()
+                .wrap(Governor::new(&conf)) // inner
+                .wrap(build_cors("0.0.0.0", 9562)) // outer
+                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 9999);
+        let (get_status, get_has_acao, preflight_status) =
+            probe_cors_and_preflight!(app, ip, "http://localhost:5173", 2);
+
+        assert_eq!(
+            get_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 2nd GET past the burst must be throttled (#13 guarantee intact)"
+        );
+        assert!(
+            get_has_acao,
+            "a 429 must carry Access-Control-Allow-Origin so a browser sees a readable 429, \
+             not an opaque network error (#169 part 2)"
+        );
+        assert_ne!(
+            preflight_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a CORS preflight must NOT be throttled — it never reaches Governor (#169 part 2)"
+        );
+    }
+
+    /// Guards the ordering as load-bearing: the REVERSED order
+    /// (`.wrap(build_cors).wrap(Governor)` → Governor OUTSIDE CORS) is the pre-fix
+    /// state that motivated #169 — a 429 escapes without CORS headers and the
+    /// preflight is throttled. If a refactor ever flips the wrap order back, the
+    /// positive test above breaks; this test documents *why* by asserting the
+    /// broken behavior of the wrong order.
+    #[actix_web::test]
+    async fn governor_outside_cors_regression_drops_cors_and_throttles_preflight() {
+        use actix_governor::Governor;
+        use actix_web::http::StatusCode;
+        use actix_web::{test, web, App, HttpResponse};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let conf = rate_limiter_config(1, 1, ClientIpKeyExtractor::peer_ip());
+        let app = test::init_service(
+            App::new()
+                .wrap(build_cors("0.0.0.0", 9562)) // inner (WRONG)
+                .wrap(Governor::new(&conf)) // outer (WRONG)
+                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 9999);
+        let (get_status, get_has_acao, preflight_status) =
+            probe_cors_and_preflight!(app, ip, "http://localhost:5173", 2);
+
+        assert_eq!(
+            get_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "still a 429 in the wrong order..."
+        );
+        assert!(
+            !get_has_acao,
+            "...but WITHOUT CORS headers — the browser-opaque failure #169 part 2 fixes"
+        );
+        assert_eq!(
+            preflight_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "and the preflight IS throttled in the wrong order (counted against the bucket)"
+        );
+    }
+
+    // --- #169 part 3: bind-aware limiter guard ----------------------------------
+
+    #[test]
+    fn require_limiter_rejects_nonloopback_without_limiter() {
+        // The dangerous combination: a routable bind with no limiter → rejected.
+        for b in ["0.0.0.0", "192.168.1.10", "::"] {
+            assert!(
+                require_limiter_for_nonloopback(b, false).is_err(),
+                "{b} without a limiter must be rejected (#169 part 3)"
+            );
+        }
+    }
+
+    #[test]
+    fn require_limiter_allows_loopback_and_limited_binds() {
+        // Loopback with no limiter is preserved (desktop sidecar, intentionally
+        // un-throttled) — the guard must NOT weaken it.
+        for b in ["127.0.0.1", "localhost", "::1"] {
+            assert!(
+                require_limiter_for_nonloopback(b, false).is_ok(),
+                "{b} loopback must stay allowed without a limiter (desktop behavior)"
+            );
+        }
+        // A non-loopback bind IS allowed once a limiter is applied.
+        for b in ["0.0.0.0", "192.168.1.10"] {
+            assert!(
+                require_limiter_for_nonloopback(b, true).is_ok(),
+                "{b} with a limiter applied must be allowed"
+            );
+        }
     }
 
     #[test]
