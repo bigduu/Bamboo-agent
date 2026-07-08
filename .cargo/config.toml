@@ -1,0 +1,11 @@
+# Dev-profile tuning to slow down target/ disk growth (target/debug was 74G).
+# Release profile is untouched.
+
+[profile.dev]
+# Line tables keep file:line in backtraces at a fraction of full debuginfo size.
+debug = "line-tables-only"
+
+# Third-party dependencies get no debug info at all ("*" excludes workspace
+# members, so bamboo_* crates keep their line tables).
+[profile.dev.package."*"]
+debug = false
