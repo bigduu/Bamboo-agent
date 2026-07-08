@@ -39,12 +39,18 @@ impl OverflowRecoveryState {
 
 pub(super) struct InFlightTaskEvaluation {
     pub(super) request: AsyncTaskEvaluationRequest,
-    pub(super) join_handle: tokio::task::JoinHandle<AsyncTaskEvaluationResult>,
+    // `Option<..>` output: the spawned future `select!`s on the run's
+    // `CancellationToken`, so a cancelled run yields `None` (the eval work was
+    // dropped at an await point, stopping the wasted LLM spend) instead of a
+    // completed result. See `spawn_task_evaluation_request`.
+    pub(super) join_handle: tokio::task::JoinHandle<Option<AsyncTaskEvaluationResult>>,
 }
 
 pub(super) struct InFlightGoldEvaluation {
     pub(super) request: AsyncGoldEvaluationRequest,
-    pub(super) join_handle: tokio::task::JoinHandle<AsyncGoldEvaluationResult>,
+    // `Option<..>` output: `None` when the run was cancelled while the Gold
+    // evaluation was in flight (see `spawn_gold_evaluation_request`).
+    pub(super) join_handle: tokio::task::JoinHandle<Option<AsyncGoldEvaluationResult>>,
 }
 
 #[derive(Default)]
