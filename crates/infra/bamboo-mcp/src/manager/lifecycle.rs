@@ -2,6 +2,13 @@ use tokio::time::{interval, Duration};
 
 use super::fingerprint::desired_proxy_fingerprint;
 use super::*;
+use crate::protocol::models::JsonRpcNotification;
+
+/// MCP methods a server sends when its tool list changes. Per the MCP spec the
+/// wire method is `notifications/tools/list_changed`; the bare `tools/list_changed`
+/// is accepted defensively for servers that omit the `notifications/` prefix. #366.
+const TOOLS_LIST_CHANGED_METHODS: [&str; 2] =
+    ["notifications/tools/list_changed", "tools/list_changed"];
 
 impl McpServerManager {
     /// Start a new MCP server connection.
@@ -349,5 +356,67 @@ impl McpServerManager {
                 }
             }
         });
+    }
+
+    /// Spawns the per-connection task that DRAINS this client's server-notification
+    /// queue and dispatches each notification. #366.
+    ///
+    /// The task owns the receiver (taken from the client) so it parks on
+    /// `recv().await` with zero wakeups while idle — no client lock held across the
+    /// await, no polling. It exits cleanly when every notification sender closes
+    /// (the client is disconnected/replaced on reconnect, or dropped on shutdown),
+    /// mirroring the message-handler's channel-close contract.
+    ///
+    /// Without this consumer the queue would silently fill to capacity and drop
+    /// every later notification (the #363 non-blocking send is a safety valve, not
+    /// a drain), so any capability driven by server notifications — here,
+    /// `tools/list_changed` -> tool-list refresh — would be inert.
+    pub(super) fn spawn_notification_drain(
+        &self,
+        server_id: String,
+        mut receiver: tokio::sync::mpsc::Receiver<JsonRpcNotification>,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = receiver.recv().await {
+                manager
+                    .dispatch_server_notification(&server_id, notification)
+                    .await;
+            }
+            tracing::trace!(
+                "MCP notification drain for server '{}' exited (channel closed)",
+                server_id
+            );
+        });
+    }
+
+    /// Dispatches a single server-initiated notification. Handles
+    /// `tools/list_changed` by refreshing the server's tool list (re-registering
+    /// the tool index + emitting `ToolsChanged`); all other methods are drained and
+    /// traced so the queue can never saturate. #366.
+    async fn dispatch_server_notification(
+        &self,
+        server_id: &str,
+        notification: JsonRpcNotification,
+    ) {
+        let method = notification.method.as_str();
+        if TOOLS_LIST_CHANGED_METHODS.contains(&method) {
+            info!(
+                "MCP server '{}' announced '{}'; refreshing tool list",
+                server_id, method
+            );
+            if let Err(e) = self.refresh_tools(server_id).await {
+                warn!(
+                    "Failed to refresh tools for MCP server '{}' after '{}': {}",
+                    server_id, method, e
+                );
+            }
+        } else {
+            tracing::trace!(
+                "MCP server '{}' notification '{}' drained (no dispatcher)",
+                server_id,
+                method
+            );
+        }
     }
 }

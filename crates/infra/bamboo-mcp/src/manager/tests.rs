@@ -1,6 +1,7 @@
 use super::fingerprint::proxy_fingerprint;
 use super::*;
 use crate::config::{ReconnectConfig, SseConfig, StdioConfig};
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -417,4 +418,205 @@ async fn qos_signals_recycle_at_reconnect_threshold() {
     assert!(!qos.record_failure("s", "t", &err).await);
     assert!(!qos.record_failure("s", "t", &err).await);
     assert!(qos.record_failure("s", "t", &err).await);
+}
+
+// ---------------------------------------------------------------------------
+// #366: server-notification drain + tools/list_changed -> refresh dispatch.
+// ---------------------------------------------------------------------------
+
+/// Mock transport for the notification-drain test. Preloads server-initiated
+/// messages for the client's handler to forward, and answers `tools/list`
+/// requests with a configurable tool set so `refresh_tools` can complete.
+struct NotifyingMockTransport {
+    connected: bool,
+    /// Messages delivered TO the client (its handler consumes these).
+    to_client_rx: tokio::sync::Mutex<Option<mpsc::Receiver<String>>>,
+    /// Sender used to push `tools/list` responses back to the client.
+    to_client_tx: mpsc::Sender<String>,
+    /// `(name, description)` returned by `tools/list`.
+    tools: Vec<(String, String)>,
+}
+
+impl NotifyingMockTransport {
+    fn new(preload: &[&str], tools: &[(&str, &str)]) -> Self {
+        let (tx, rx) = mpsc::channel::<String>(64);
+        for msg in preload {
+            tx.try_send((*msg).to_string())
+                .expect("preload fits the channel");
+        }
+        Self {
+            connected: false,
+            to_client_rx: tokio::sync::Mutex::new(Some(rx)),
+            to_client_tx: tx,
+            tools: tools
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl McpTransport for NotifyingMockTransport {
+    async fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+    async fn disconnect(&mut self) -> Result<()> {
+        self.connected = false;
+        Ok(())
+    }
+    async fn send(&self, message: String) -> Result<()> {
+        let req: serde_json::Value =
+            serde_json::from_str(&message).map_err(|e| McpError::Protocol(e.to_string()))?;
+        if req["method"].as_str() == Some("tools/list") {
+            let tools: Vec<serde_json::Value> = self
+                .tools
+                .iter()
+                .map(|(n, d)| {
+                    serde_json::json!({
+                        "name": n,
+                        "description": d,
+                        "inputSchema": { "type": "object" }
+                    })
+                })
+                .collect();
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req["id"].clone(),
+                "result": { "tools": tools }
+            });
+            let _ = self.to_client_tx.send(resp.to_string()).await;
+        }
+        Ok(())
+    }
+    async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
+        self.to_client_rx.lock().await.take()
+    }
+    async fn receive(&self) -> Result<Option<String>> {
+        Err(McpError::Disconnected)
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+}
+
+/// Inserts a `ServerRuntime` backed by an already-connected `client`, starting
+/// with zero registered tools. Returns the runtime so the test can take the
+/// client's notification receiver.
+fn insert_mock_runtime(
+    manager: &McpServerManager,
+    server_id: &str,
+    client: McpProtocolClient,
+) -> Arc<ServerRuntime> {
+    let runtime = Arc::new(ServerRuntime {
+        config: create_test_server_config(server_id),
+        client: RwLock::new(client),
+        info: RwLock::new(RuntimeInfo {
+            status: ServerStatus::Ready,
+            last_error: None,
+            connected_at: Some(Utc::now()),
+            disconnected_at: None,
+            tool_count: 0,
+            restart_count: 0,
+            last_ping_at: Some(Utc::now()),
+            instructions: None,
+        }),
+        tools: RwLock::new(Vec::new()),
+        shutdown: AtomicBool::new(false),
+        reconnecting: AtomicBool::new(false),
+        qos: McpServerQos::new(McpQosConfig::default()),
+        proxy_fingerprint: None,
+    });
+    manager
+        .runtimes
+        .insert(server_id.to_string(), runtime.clone());
+    runtime
+}
+
+#[tokio::test]
+async fn tools_list_changed_notification_triggers_refresh() {
+    // #366 headline capability: a server-initiated `tools/list_changed` reaches the
+    // drain consumer and triggers a real tool-list refresh (re-registering the
+    // index + emitting `ToolsChanged`). Before the fix the notification channel had
+    // no consumer, so the notification was dropped and this never fired.
+    let (event_tx, mut event_rx) = mpsc::channel::<McpEvent>(16);
+    let manager = McpServerManager::new().with_event_channel(event_tx);
+
+    // Mock server preloads a `tools/list_changed` for the client to forward, and
+    // answers the follow-up `tools/list` with two tools.
+    let transport = NotifyingMockTransport::new(
+        &[r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#],
+        &[("alpha", "Alpha tool"), ("beta", "Beta tool")],
+    );
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect mock client");
+
+    let runtime = insert_mock_runtime(&manager, "srv", client);
+
+    // Wire the real drain (exactly as bootstrap does in production).
+    let rx = runtime
+        .client
+        .read()
+        .await
+        .take_notification_receiver()
+        .await
+        .expect("notification receiver available exactly once");
+    manager.spawn_notification_drain("srv".to_string(), rx);
+
+    // The drain observes the notification -> refresh_tools -> ToolsChanged.
+    let evt = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+        .await
+        .expect("a ToolsChanged event must be emitted after tools/list_changed")
+        .expect("event channel stays open");
+    match evt {
+        McpEvent::ToolsChanged { server_id, tools } => {
+            assert_eq!(server_id, "srv");
+            assert_eq!(tools.len(), 2, "refresh should register the two new tools");
+        }
+        other => panic!("expected ToolsChanged, got {other:?}"),
+    }
+
+    // The tool index now holds the two aliases from the refreshed list.
+    assert_eq!(
+        manager.tool_index().all_aliases().len(),
+        2,
+        "refreshed tools should be registered in the index"
+    );
+}
+
+/// A notification with no dispatcher is still drained (so the queue can't
+/// saturate) and does NOT trigger a tool-list refresh.
+#[tokio::test]
+async fn unhandled_notification_is_drained_without_refresh() {
+    let (event_tx, mut event_rx) = mpsc::channel::<McpEvent>(16);
+    let manager = McpServerManager::new().with_event_channel(event_tx);
+
+    let transport = NotifyingMockTransport::new(
+        &[r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}"#],
+        &[("alpha", "Alpha tool")],
+    );
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect mock client");
+
+    let runtime = insert_mock_runtime(&manager, "srv", client);
+    let rx = runtime
+        .client
+        .read()
+        .await
+        .take_notification_receiver()
+        .await
+        .expect("notification receiver available");
+    manager.spawn_notification_drain("srv".to_string(), rx);
+
+    // No dispatcher for `notifications/message` -> no ToolsChanged emitted.
+    let got = tokio::time::timeout(Duration::from_millis(300), event_rx.recv()).await;
+    assert!(
+        got.is_err(),
+        "an unhandled notification must not trigger a refresh event"
+    );
+    assert!(
+        manager.tool_index().all_aliases().is_empty(),
+        "no tools should be registered without a tools/list_changed"
+    );
 }
