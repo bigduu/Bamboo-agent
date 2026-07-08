@@ -93,17 +93,49 @@ impl BambooClient {
 
     // ── Sessions ──
 
-    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-        let resp = self.client.get(self.url("/api/v1/sessions")).send().await?;
-        let sessions = resp.json().await?;
-        Ok(sessions)
+    /// `GET /api/v1/sessions`. The server wraps the page in an envelope
+    /// (`total`/`limit`/`offset`/`next_offset`, #421/#252) rather than a bare
+    /// array, so the caller can page through a large session list. Both
+    /// params are optional — omitted, the server applies its own bounded
+    /// default page.
+    pub async fn list_sessions(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListSessionsEnvelope> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(offset) = offset {
+            query.push(("offset", offset.to_string()));
+        }
+        let resp = self
+            .client
+            .get(self.url("/api/v1/sessions"))
+            .query(&query)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list sessions failed ({status}): {body}");
+        }
+        let envelope: ListSessionsEnvelope = resp.json().await?;
+        Ok(envelope)
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .delete(self.url(&format!("/api/v1/sessions/{}", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("delete session failed ({status}): {body}");
+        }
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::api::types::{McpServer, Schedule, SessionSummary, Skill, ToolInfo};
+use crate::api::types::{ListSessionsEnvelope, McpServer, Schedule, Skill, ToolInfo};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -14,7 +14,7 @@ pub enum AppEvent {
     Resize,
 
     // ── Non-blocking API results (posted by spawned tasks) ──
-    SessionsLoaded(Loaded<Vec<SessionSummary>>),
+    SessionsLoaded(Loaded<ListSessionsEnvelope>),
     McpServersLoaded(Loaded<Vec<McpServer>>),
     McpToolsLoaded(Loaded<Vec<ToolInfo>>),
     SchedulesLoaded(Loaded<Vec<Schedule>>),

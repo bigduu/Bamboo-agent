@@ -162,7 +162,7 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn render_help(f: &mut Frame) {
-    let area = centered_rect(50, 21, f.area());
+    let area = centered_rect(50, 22, f.area());
     let help_text = vec![
         Line::from(Span::styled(
             " Keybindings",
@@ -182,7 +182,8 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("  j/k         Scroll down/up"),
         Line::raw("  n           New schedule (Schedules)"),
         Line::raw("  e           Edit config (Config)"),
-        Line::raw("  d           Delete (with context)"),
+        Line::raw("  d           Delete (with confirm)"),
+        Line::raw("  ] / [       Next / previous page (Sessions)"),
         Line::raw("  r           Refresh / Run schedule"),
         Line::raw("  t           Refresh MCP tools"),
         Line::raw("  ?           Toggle this help"),
@@ -352,6 +353,49 @@ pub fn render_question(f: &mut Frame, app: &App) {
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+/// Modal confirming a session delete (`d` on the Sessions tab). Mirrors the
+/// question modal's key rationale: a destructive action must not fire on a
+/// single stray keystroke, so it stops here until `y`/Enter or `n`/Esc.
+pub fn render_delete_confirm(f: &mut Frame, app: &App) {
+    let Some((_, title)) = &app.pending_delete else {
+        return;
+    };
+    let display_title: &str = if title.is_empty() {
+        "(untitled)"
+    } else {
+        title
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " Delete session?",
+            Style::default()
+                .fg(colors::ERROR)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::raw(format!("  \"{}\"", display_title)),
+        Line::raw(""),
+        Line::raw("  This cannot be undone."),
+        Line::raw(""),
+        Line::raw("  y / Enter confirm  ·  n / Esc cancel"),
+    ];
+
+    let height = (lines.len() as u16 + 2).min(f.area().height);
+    let area = centered_rect(50, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::ERROR))
+        .title(" Confirm ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Modal form for creating a new schedule (opened with `n` on the Schedules tab).

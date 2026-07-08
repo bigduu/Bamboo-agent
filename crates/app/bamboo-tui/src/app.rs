@@ -146,6 +146,20 @@ pub struct SessionsState {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// Total sessions across all pages, as reported by the server envelope
+    /// (#421). Used to render `page X/Y · total N`.
+    pub total: usize,
+    /// Offset of the currently-loaded page. Advanced/retreated by `]`/`[`.
+    pub offset: usize,
+    /// The page size the server actually applied (its clamped default, or the
+    /// client-requested value echoed back) — used both to render the page
+    /// number and to step `offset` by a full page on `[`. `0` until the first
+    /// page loads, at which point `list_sessions` is asked for the server's
+    /// own default instead of an arbitrary client guess.
+    pub page_limit: usize,
+    /// Offset to request for the next page, or `None` on the last page —
+    /// gates whether `]` does anything.
+    pub next_offset: Option<usize>,
 }
 
 impl SessionsState {
@@ -155,6 +169,10 @@ impl SessionsState {
             selected: 0,
             loading: false,
             error: None,
+            total: 0,
+            offset: 0,
+            page_limit: 0,
+            next_offset: None,
         }
     }
 }
@@ -320,6 +338,12 @@ pub struct App {
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
+    /// Pending session-delete confirmation (Sessions tab, `d`): `(id, title)`
+    /// of the session awaiting `y`/Enter confirm or `n`/Esc cancel. Kept as a
+    /// modal (rather than deleting immediately) so a stray `d` can't destroy a
+    /// session, and the actual DELETE runs off the event loop like every other
+    /// mutation.
+    pub pending_delete: Option<(String, String)>,
     /// Capped scrollback of past status messages so errors/warnings aren't lost
     /// when the single status line is overwritten. Viewed with `Ctrl+L`.
     pub notifications: Vec<Notification>,
@@ -354,6 +378,7 @@ impl App {
             pending_question: None,
             schedule_form: None,
             config_editor: None,
+            pending_delete: None,
             notifications: Vec::new(),
             notifications_visible: false,
             unseen_alerts: 0,
@@ -466,8 +491,16 @@ impl App {
             AppEvent::SessionsLoaded(r) => {
                 self.sessions.loading = false;
                 match r {
-                    Ok(s) => {
-                        self.sessions.sessions = s;
+                    Ok(envelope) => {
+                        self.sessions.selected = self
+                            .sessions
+                            .selected
+                            .min(envelope.sessions.len().saturating_sub(1));
+                        self.sessions.total = envelope.total;
+                        self.sessions.offset = envelope.offset;
+                        self.sessions.page_limit = envelope.limit;
+                        self.sessions.next_offset = envelope.next_offset;
+                        self.sessions.sessions = envelope.sessions;
                         self.sessions.error = None;
                     }
                     Err(e) => self.sessions.error = Some(e),
@@ -604,6 +637,12 @@ impl App {
         // stops the run) until it is answered or dismissed.
         if self.pending_question.is_some() {
             return self.handle_question_key(key).await;
+        }
+
+        // The delete-confirmation modal likewise captures all input before
+        // anything else (including tab-switching digits) can reach it.
+        if self.pending_delete.is_some() {
+            return self.handle_delete_confirm_key(key).await;
         }
 
         // The schedule-authoring modal likewise captures all input: Tab moves
@@ -775,6 +814,39 @@ impl App {
         Ok(())
     }
 
+    /// Drive the delete-confirmation modal (`d` on the Sessions tab). `y`/Enter
+    /// confirms and spawns the DELETE off the event loop (never `?` on the UI
+    /// thread — a failed delete must surface via `notify`, not tear down the
+    /// TUI); `n`/Esc cancels without calling the server.
+    async fn handle_delete_confirm_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some((id, _title)) = self.pending_delete.clone() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_delete = None;
+                if let Some(tx) = self.event_tx.clone() {
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let outcome = match client.delete_session(&id).await {
+                            Ok(()) => Ok("Session deleted".to_string()),
+                            Err(e) => Err(format!("Delete failed: {e}")),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            outcome,
+                            reload_tab: true,
+                        });
+                    });
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.pending_delete = None;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Load the current tab's data WITHOUT blocking the event loop: mark the
     /// tab loading and spawn the fetch, which posts its result back as an
     /// `AppEvent` handled in `handle_event`.
@@ -787,8 +859,15 @@ impl App {
             Tab::Chat => {}
             Tab::Sessions => {
                 self.sessions.loading = true;
+                let offset = self.sessions.offset;
+                // `0` means "no page size established yet" — let the server
+                // pick its own bounded default rather than guessing one here.
+                let limit = (self.sessions.page_limit > 0).then_some(self.sessions.page_limit);
                 tokio::spawn(async move {
-                    let r = client.list_sessions().await.map_err(|e| e.to_string());
+                    let r = client
+                        .list_sessions(limit, Some(offset))
+                        .await
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(AppEvent::SessionsLoaded(r));
                 });
             }
@@ -1146,22 +1225,39 @@ impl App {
                 self.sessions.selected = self.sessions.selected.saturating_sub(1);
             }
             KeyCode::Enter => {
+                // TODO(WP3): also load the session's history into `chat.messages`
+                // — for now this only points the Chat tab at the session id/model,
+                // matching prior behavior.
                 if let Some(session) = self.sessions.sessions.get(self.sessions.selected) {
                     self.chat.session_id = Some(session.id.clone());
-                    if let Some(model) = &session.model {
-                        self.chat.model = model.clone();
+                    if !session.model.is_empty() {
+                        self.chat.model = session.model.clone();
                     }
                     self.tab = Tab::Chat;
                 }
             }
             KeyCode::Char('d') => {
+                // Open a confirmation modal instead of deleting immediately — the
+                // actual DELETE is fired from `handle_delete_confirm_key` off the
+                // event loop, never `?`-propagated on the UI thread.
                 if let Some(session) = self.sessions.sessions.get(self.sessions.selected) {
-                    let id = session.id.clone();
-                    self.client.delete_session(&id).await?;
-                    self.load_tab_data();
+                    self.pending_delete = Some((session.id.clone(), session.title.clone()));
                 }
             }
             KeyCode::Char('r') => {
+                self.load_tab_data();
+            }
+            KeyCode::Char(']') => {
+                if let Some(next) = self.sessions.next_offset {
+                    self.sessions.offset = next;
+                    self.sessions.selected = 0;
+                    self.load_tab_data();
+                }
+            }
+            KeyCode::Char('[') if self.sessions.offset > 0 => {
+                let step = self.sessions.page_limit.max(1);
+                self.sessions.offset = self.sessions.offset.saturating_sub(step);
+                self.sessions.selected = 0;
                 self.load_tab_data();
             }
             _ => {}
@@ -1572,23 +1668,38 @@ mod question_tests {
         assert!(text.contains("more"), "overflow marker missing");
     }
 
+    fn bare_session(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            title: String::new(),
+            model: String::new(),
+            is_running: false,
+            has_pending_question: false,
+            last_run_status: None,
+            updated_at: None,
+            message_count: 0,
+            pinned: false,
+        }
+    }
+
     #[tokio::test]
     async fn loaded_event_applies_to_state_and_clears_loading() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.sessions.loading = true;
-        app.handle_event(AppEvent::SessionsLoaded(Ok(vec![SessionSummary {
-            id: "s1".into(),
-            title: None,
-            model: None,
-            created_at: None,
-            updated_at: None,
-            message_count: None,
-            status: None,
-        }])))
+        app.handle_event(AppEvent::SessionsLoaded(Ok(ListSessionsEnvelope {
+            sessions: vec![bare_session("s1")],
+            total: 1,
+            limit: 200,
+            offset: 0,
+            next_offset: None,
+        })))
         .await
         .unwrap();
         assert!(!app.sessions.loading, "loading flag must clear");
         assert_eq!(app.sessions.sessions.len(), 1);
+        assert_eq!(app.sessions.total, 1);
+        assert_eq!(app.sessions.page_limit, 200);
+        assert!(app.sessions.next_offset.is_none());
         assert!(app.sessions.error.is_none());
 
         // Error result surfaces on the tab and clears loading.
@@ -1598,6 +1709,94 @@ mod question_tests {
             .unwrap();
         assert!(!app.sessions.loading);
         assert_eq!(app.sessions.error.as_deref(), Some("boom"));
+    }
+
+    /// `]` advances to the next page only when the server reported one; `[`
+    /// steps back by a full page and clamps at 0. Selection resets on every
+    /// page change.
+    #[tokio::test]
+    async fn sessions_paging_keys_respect_next_offset_and_clamp() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![bare_session("s1"), bare_session("s2")];
+        app.sessions.selected = 1;
+        app.sessions.total = 5;
+        app.sessions.page_limit = 2;
+        app.sessions.offset = 0;
+        app.sessions.next_offset = Some(2);
+
+        // No event_tx wired (tests construct App directly), so `load_tab_data`
+        // is a no-op past the state mutation — enough to assert the key logic.
+        app.handle_sessions_key(k(KeyCode::Char(']')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 2, "] advances by the reported page");
+        assert_eq!(app.sessions.selected, 0, "selection resets on page change");
+
+        // On the last page (`next_offset` is `None`), `]` is a no-op.
+        app.sessions.next_offset = None;
+        app.sessions.selected = 1;
+        app.handle_sessions_key(k(KeyCode::Char(']')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 2, "] does nothing past the last page");
+        assert_eq!(app.sessions.selected, 1, "no page change, no reset");
+
+        // `[` steps back by a full page.
+        app.handle_sessions_key(k(KeyCode::Char('[')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 0);
+        assert_eq!(app.sessions.selected, 0);
+
+        // Already at offset 0: `[` clamps and does not go negative (saturating).
+        app.sessions.selected = 1;
+        app.handle_sessions_key(k(KeyCode::Char('[')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 0);
+        assert_eq!(
+            app.sessions.selected, 1,
+            "no page change at offset 0, no reset"
+        );
+    }
+
+    /// `d` on the Sessions tab opens a confirmation modal instead of deleting
+    /// immediately; `Esc`/`n` cancel it without touching `event_tx`.
+    #[tokio::test]
+    async fn sessions_delete_opens_confirm_modal_and_cancel_clears_it() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![bare_session("s1")];
+        app.sessions.selected = 0;
+
+        app.handle_key(k(KeyCode::Char('d'))).await.unwrap();
+        assert_eq!(
+            app.pending_delete.as_ref().map(|(id, _)| id.as_str()),
+            Some("s1")
+        );
+
+        // While the modal is open, keys route to it — not tab switching.
+        app.handle_key(k(KeyCode::Char('1'))).await.unwrap();
+        assert_eq!(app.tab, Tab::Sessions, "digit must not switch tabs");
+        assert!(app.pending_delete.is_some());
+
+        app.handle_key(k(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_delete.is_none(), "Esc cancels");
+    }
+
+    /// Confirming (`y`) clears the modal and posts the delete off the event
+    /// loop; without `run()` having wired `event_tx`, there's nothing to spawn
+    /// into, so this only asserts the modal itself is cleared synchronously.
+    #[tokio::test]
+    async fn sessions_delete_confirm_clears_modal() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
+        app.handle_key(k(KeyCode::Char('y'))).await.unwrap();
+        assert!(app.pending_delete.is_none());
     }
 
     #[test]

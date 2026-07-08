@@ -19,21 +19,48 @@ pub use bamboo_client_core::{
 
 // ── Sessions ──
 
+/// Subset of the server's `SessionSummary` (see
+/// `bamboo-server/src/handlers/agent/sessions/types.rs`) the TUI renders.
+/// Every field carries `#[serde(default)]` so server-side additions/removals
+/// degrade gracefully instead of breaking deserialization (there is
+/// deliberately no flat `status` string on the server — see `last_run_status`
+/// / `is_running` / `has_pending_question` below).
 #[derive(Deserialize, Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
     #[serde(default)]
-    pub title: Option<String>,
+    pub title: String,
     #[serde(default)]
-    pub model: Option<String>,
+    pub model: String,
     #[serde(default)]
-    pub created_at: Option<DateTime<Utc>>,
+    pub is_running: bool,
+    #[serde(default)]
+    pub has_pending_question: bool,
+    #[serde(default)]
+    pub last_run_status: Option<String>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub message_count: Option<u32>,
+    pub message_count: usize,
     #[serde(default)]
-    pub status: Option<String>,
+    pub pinned: bool,
+}
+
+/// Wire shape of `GET /api/v1/sessions` — the server wraps the page in an
+/// envelope (`ListSessionsResponse`, #421/#252) so the list can be paginated
+/// instead of growing without bound as session count grows forever.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ListSessionsEnvelope {
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -197,4 +224,119 @@ pub struct SkillDetail {
     pub prompt: Option<String>,
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fixture mirroring the real `ListSessionsResponse` shape (#421), including
+    /// fields the TUI doesn't model (`kind`, `placement`, …) — those must be
+    /// ignored rather than break deserialization.
+    const ENVELOPE_JSON: &str = r#"{
+        "sessions": [
+            {
+                "id": "s1",
+                "kind": "root",
+                "title": "Fix the bug",
+                "title_version": 3,
+                "pinned": true,
+                "root_session_id": "s1",
+                "spawn_depth": 0,
+                "model": "claude-sonnet-5",
+                "created_at": "2026-07-01T00:00:00Z",
+                "updated_at": "2026-07-09T12:34:00Z",
+                "last_activity_at": "2026-07-09T12:34:00Z",
+                "message_count": 12,
+                "has_attachments": false,
+                "is_running": true,
+                "has_pending_question": false,
+                "running_child_count": 0,
+                "placement": {"kind": "local", "host": "box"}
+            },
+            {
+                "id": "s2",
+                "kind": "root",
+                "title": "",
+                "title_version": 0,
+                "pinned": false,
+                "root_session_id": "s2",
+                "spawn_depth": 0,
+                "model": "gpt-5",
+                "created_at": "2026-07-01T00:00:00Z",
+                "updated_at": "2026-07-08T08:00:00Z",
+                "last_activity_at": "2026-07-08T08:00:00Z",
+                "message_count": 0,
+                "has_attachments": false,
+                "is_running": false,
+                "has_pending_question": true,
+                "last_run_status": "error",
+                "running_child_count": 0,
+                "placement": {"kind": "local", "host": "box"}
+            }
+        ],
+        "total": 5,
+        "limit": 2,
+        "offset": 0,
+        "next_offset": 2
+    }"#;
+
+    #[test]
+    fn envelope_deserializes_with_pagination_metadata() {
+        let envelope: ListSessionsEnvelope = serde_json::from_str(ENVELOPE_JSON).unwrap();
+        assert_eq!(envelope.total, 5);
+        assert_eq!(envelope.limit, 2);
+        assert_eq!(envelope.offset, 0);
+        assert_eq!(envelope.next_offset, Some(2));
+        assert_eq!(envelope.sessions.len(), 2);
+
+        let s1 = &envelope.sessions[0];
+        assert_eq!(s1.id, "s1");
+        assert_eq!(s1.title, "Fix the bug");
+        assert_eq!(s1.model, "claude-sonnet-5");
+        assert!(s1.is_running);
+        assert!(!s1.has_pending_question);
+        assert_eq!(s1.message_count, 12);
+        assert!(s1.pinned);
+        assert!(s1.last_run_status.is_none());
+
+        let s2 = &envelope.sessions[1];
+        assert!(s2.title.is_empty());
+        assert!(!s2.is_running);
+        assert!(s2.has_pending_question);
+        assert_eq!(s2.last_run_status.as_deref(), Some("error"));
+    }
+
+    /// A last page (`next_offset` omitted entirely) must deserialize to `None`,
+    /// and unknown top-level fields must not break parsing.
+    #[test]
+    fn envelope_tolerates_missing_next_offset_and_unknown_fields() {
+        let json = r#"{
+            "sessions": [],
+            "total": 0,
+            "limit": 200,
+            "offset": 0,
+            "some_future_field": "ignored"
+        }"#;
+        let envelope: ListSessionsEnvelope = serde_json::from_str(json).unwrap();
+        assert!(envelope.sessions.is_empty());
+        assert_eq!(envelope.next_offset, None);
+    }
+
+    /// A minimal (nearly-empty) session object must still deserialize thanks to
+    /// `#[serde(default)]` on every non-id field — the lenient-degrade contract.
+    #[test]
+    fn session_summary_defaults_missing_fields() {
+        let json = r#"{"id": "bare"}"#;
+        let s: SessionSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(s.id, "bare");
+        assert_eq!(s.title, "");
+        assert_eq!(s.model, "");
+        assert!(!s.is_running);
+        assert!(!s.has_pending_question);
+        assert!(s.last_run_status.is_none());
+        assert!(s.updated_at.is_none());
+        assert_eq!(s.message_count, 0);
+        assert!(!s.pinned);
+    }
 }

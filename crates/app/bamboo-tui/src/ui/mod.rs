@@ -42,6 +42,10 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_question(f, app);
     }
 
+    if app.pending_delete.is_some() {
+        layout::render_delete_confirm(f, app);
+    }
+
     if app.schedule_form.is_some() {
         layout::render_schedule_form(f, app);
     }
