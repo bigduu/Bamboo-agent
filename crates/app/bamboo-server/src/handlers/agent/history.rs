@@ -8,6 +8,27 @@ use serde::Deserialize;
 
 use crate::app_state::AppState;
 
+/// Hard cap on the number of UI-visible messages a cold (non-delta) history
+/// fetch returns, so a pathological long-running session can't return an
+/// unbounded array (#252). The most recent messages are kept — the tail is what
+/// a chat UI renders first — and `truncated` is surfaced so a client knows
+/// earlier messages were dropped. A delta fetch is already bounded by its cursor
+/// and is never trimmed.
+const MAX_HISTORY_MESSAGES: usize = 2000;
+
+/// Cold-fetch cap for the history response: when returning a full (non-delta)
+/// history that exceeds [`MAX_HISTORY_MESSAGES`], drop the oldest overflow so
+/// only the newest `MAX_HISTORY_MESSAGES` remain. Returns whether it trimmed.
+fn cap_cold_history<T>(messages: &mut Vec<T>, is_delta: bool) -> bool {
+    if !is_delta && messages.len() > MAX_HISTORY_MESSAGES {
+        let drop = messages.len() - MAX_HISTORY_MESSAGES;
+        messages.drain(..drop);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct HistoryQuery {
     /// When set, return only UI-visible messages appended *after* the message
@@ -136,6 +157,13 @@ pub async fn handler(
         }
     }
 
+    // Bound a cold fetch: a session that never used the delta cursor would
+    // otherwise return its entire (unbounded) message history in one response
+    // (#252). The count *before* capping is reported so a client can tell it
+    // received a truncated tail.
+    let total_message_count = messages.len();
+    let truncated = cap_cold_history(&mut messages, is_delta);
+
     // Include the session-level gold config so the frontend can update its
     // local session summary after sync-recovery without an extra round-trip.
     let gold_config = session
@@ -156,6 +184,10 @@ pub async fn handler(
         "session_id": session_id,
         "messages": messages,
         "is_delta": is_delta,
+        // Whether the cold fetch dropped older messages to stay under the cap,
+        // and the pre-cap UI-visible count so a client can detect the gap (#252).
+        "truncated": truncated,
+        "total_message_count": total_message_count,
         "compression_events": session.compression_events
     });
 
@@ -174,6 +206,36 @@ pub async fn handler(
     }
 
     HttpResponse::Ok().json(response)
+}
+
+// Pure cold-fetch-cap unit test — kept in its own module that does NOT import
+// `actix_web::test`, so the built-in `#[test]` attribute isn't shadowed by the
+// actix test-macro re-export.
+#[cfg(test)]
+mod cold_cap_tests {
+    use super::{cap_cold_history, MAX_HISTORY_MESSAGES};
+
+    #[test]
+    fn cap_cold_history_trims_cold_fetch_to_newest() {
+        // A cold fetch over the cap keeps only the newest MAX_HISTORY_MESSAGES,
+        // preserving the tail and dropping the oldest overflow (#252).
+        let mut over: Vec<u32> = (0..(MAX_HISTORY_MESSAGES as u32 + 5)).collect();
+        let newest = *over.last().unwrap();
+        assert!(cap_cold_history(&mut over, false));
+        assert_eq!(over.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(*over.last().unwrap(), newest, "keeps the newest message");
+        assert_eq!(over[0], 5, "drops the oldest overflow");
+
+        // At/under the cap the cold fetch is untouched.
+        let mut small: Vec<u32> = (0..10).collect();
+        assert!(!cap_cold_history(&mut small, false));
+        assert_eq!(small.len(), 10);
+
+        // A delta fetch is never trimmed, even when large.
+        let mut delta: Vec<u32> = (0..(MAX_HISTORY_MESSAGES as u32 + 5)).collect();
+        assert!(!cap_cold_history(&mut delta, true));
+        assert_eq!(delta.len(), MAX_HISTORY_MESSAGES + 5);
+    }
 }
 
 #[cfg(test)]

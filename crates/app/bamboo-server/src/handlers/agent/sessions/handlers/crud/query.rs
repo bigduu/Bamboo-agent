@@ -4,15 +4,39 @@ use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 
-use super::super::super::types::{GetSessionResponse, ListSessionsResponse, SessionSummary};
+use super::super::super::types::{
+    GetSessionResponse, ListSessionsQuery, ListSessionsResponse, SessionSummary,
+};
 use super::running::{is_session_running, running_session_ids};
 
+/// Default page size for `GET /api/v1/sessions` when the client omits `limit`.
+/// Deliberately generous so a typical client sees all of its recent sessions in
+/// one page, while still bounding the response so the list can't grow without
+/// limit as session count grows forever (#252).
+const DEFAULT_SESSIONS_PAGE: usize = 200;
+/// Hard cap on the page size, so a client-supplied `limit` can't force an
+/// unbounded read (mirrors the metrics `normalize_limit` clamp). (#252)
+const MAX_SESSIONS_PAGE: usize = 1000;
+
+/// Resolve the effective page size: the default when omitted, otherwise clamped
+/// to `1..=MAX_SESSIONS_PAGE`. Never unbounded. (#252)
+fn clamp_page_size(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_SESSIONS_PAGE)
+        .clamp(1, MAX_SESSIONS_PAGE)
+}
+
 /// `GET /api/v1/sessions`
-pub async fn list_sessions(state: web::Data<AppState>) -> Result<HttpResponse> {
+pub async fn list_sessions(
+    state: web::Data<AppState>,
+    query: web::Query<ListSessionsQuery>,
+) -> Result<HttpResponse> {
     let running = running_session_ids(&state).await;
     let entries = state.session_store.list_index_entries().await;
 
-    // Compute running child counts per parent session.
+    // Compute running child counts per parent session over the FULL set: a
+    // parent's running children may land on a different page, so this count must
+    // not be paginated or it would be wrong for parents shown on this page.
     let mut running_child_counts: HashMap<String, u32> = HashMap::new();
     for entry in &entries {
         if running.contains(&entry.id) {
@@ -22,17 +46,35 @@ pub async fn list_sessions(state: web::Data<AppState>) -> Result<HttpResponse> {
         }
     }
 
+    // Server-enforced pagination bounds the response so the list stays finite as
+    // session count grows (#252). `list_index_entries` is already sorted
+    // newest-first, giving a deterministic page order.
+    let total = entries.len();
+    let limit = clamp_page_size(query.limit);
+    let offset = query.offset.unwrap_or(0).min(total);
+
+    let sessions: Vec<SessionSummary> = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|entry| {
+            let is_running = running.contains(&entry.id);
+            let mut summary = SessionSummary::from_entry(entry, is_running);
+            summary.running_child_count =
+                running_child_counts.get(&summary.id).copied().unwrap_or(0);
+            summary
+        })
+        .collect();
+
+    let end = offset + sessions.len();
+    let next_offset = if end < total { Some(end) } else { None };
+
     Ok(HttpResponse::Ok().json(ListSessionsResponse {
-        sessions: entries
-            .into_iter()
-            .map(|entry| {
-                let is_running = running.contains(&entry.id);
-                let mut summary = SessionSummary::from_entry(entry, is_running);
-                summary.running_child_count =
-                    running_child_counts.get(&summary.id).copied().unwrap_or(0);
-                summary
-            })
-            .collect(),
+        sessions,
+        total,
+        limit,
+        offset,
+        next_offset,
     }))
 }
 
@@ -76,5 +118,129 @@ pub async fn get_session(
             "error": "Session not found",
             "session_id": session_id
         }))),
+    }
+}
+
+// Pure clamp unit test — kept in its own module that does NOT import
+// `actix_web::test`, so the built-in `#[test]` attribute isn't shadowed by the
+// actix test-macro re-export.
+#[cfg(test)]
+mod clamp_tests {
+    use super::{clamp_page_size, DEFAULT_SESSIONS_PAGE, MAX_SESSIONS_PAGE};
+
+    #[test]
+    fn clamp_page_size_defaults_and_caps() {
+        // Omitted → the bounded default, never an unbounded read (#252).
+        assert_eq!(clamp_page_size(None), DEFAULT_SESSIONS_PAGE);
+        // In-range passes through untouched.
+        assert_eq!(clamp_page_size(Some(50)), 50);
+        // Over the hard cap is clamped down; zero is clamped up to 1.
+        assert_eq!(clamp_page_size(Some(10_000_000)), MAX_SESSIONS_PAGE);
+        assert_eq!(clamp_page_size(Some(0)), 1);
+    }
+}
+
+#[cfg(test)]
+mod pagination_http_tests {
+    use actix_web::{test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use super::{DEFAULT_SESSIONS_PAGE, MAX_SESSIONS_PAGE};
+    use crate::routes::configure_routes;
+    use crate::AppState;
+    use bamboo_agent_core::Session;
+
+    async fn app_state_with_sessions(n: usize) -> web::Data<AppState> {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        for i in 0..n {
+            let mut session = Session::new(format!("sess-{i:03}"), "model");
+            state.save_and_cache_session(&mut session).await;
+        }
+        state
+    }
+
+    /// Omitting `limit` returns the server default page size (bounded), and a
+    /// `limit` above the hard max is clamped to the max — mirrors the metrics
+    /// `normalize_limit` clamp. Without the pagination fix the response carries
+    /// no `limit` field at all, so these assertions fail. (#252)
+    #[actix_web::test]
+    async fn list_sessions_default_and_max_are_enforced() {
+        let state = app_state_with_sessions(3).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // No params → the effective page size is the server default, not unbounded.
+        let resp: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp["limit"], DEFAULT_SESSIONS_PAGE as u64);
+        assert_eq!(resp["total"], 3);
+        assert_eq!(resp["sessions"].as_array().unwrap().len(), 3);
+        // Everything fits on the first page, so there is no next page.
+        assert!(resp.get("next_offset").is_none() || resp["next_offset"].is_null());
+
+        // A `limit` above the hard cap is clamped down to the max.
+        let capped: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?limit=10000000")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(capped["limit"], MAX_SESSIONS_PAGE as u64);
+    }
+
+    /// `limit`/`offset` slice the newest-first list and `next_offset` walks the
+    /// pages, ending at `None` on the last page. (#252)
+    #[actix_web::test]
+    async fn list_sessions_pages_with_limit_and_offset() {
+        let state = app_state_with_sessions(3).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // First page of 2 of 3 → a next page starts at offset 2.
+        let page1: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?limit=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(page1["total"], 3);
+        assert_eq!(page1["limit"], 2);
+        assert_eq!(page1["offset"], 0);
+        assert_eq!(page1["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["next_offset"], 2);
+
+        // Second page picks up the remaining 1 and reports no further page.
+        let page2: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?limit=2&offset=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(page2["offset"], 2);
+        assert_eq!(page2["sessions"].as_array().unwrap().len(), 1);
+        assert!(page2.get("next_offset").is_none() || page2["next_offset"].is_null());
     }
 }
