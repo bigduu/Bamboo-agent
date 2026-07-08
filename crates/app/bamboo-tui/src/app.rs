@@ -73,6 +73,10 @@ pub enum MessageRole {
 
 #[derive(Debug, Clone)]
 pub struct ToolCallDisplay {
+    /// `tool_call_id` from the SSE stream. Tool events (Complete/Error/
+    /// Lifecycle) are paired by this id, not list position — with parallel
+    /// tool calls, position-based pairing lands results on the wrong entry.
+    pub id: String,
     pub tool_name: String,
     pub arguments: String,
     pub result: Option<String>,
@@ -425,6 +429,14 @@ impl App {
             }
         });
 
+        // Redraw ticker: the loop below only otherwise iterates (and redraws)
+        // when a key/mouse event or an SSE event arrives, so a long tool call
+        // with no token traffic would freeze the braille spinner and make the
+        // UI look hung. Created ONCE here (not inside the loop) so `tick()`
+        // correctly accounts for elapsed time across iterations instead of
+        // firing immediately every time.
+        let mut redraw_interval = tokio::time::interval(std::time::Duration::from_millis(120));
+
         // Main event loop.
         while self.running {
             self.poll_sse();
@@ -449,6 +461,9 @@ impl App {
                             self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
                         }
                     }
+                }
+                _ = redraw_interval.tick() => {
+                    // No new state — just a steady redraw so the spinner animates.
                 }
             }
         }
@@ -582,6 +597,35 @@ impl App {
                     self.notify(NoticeLevel::Error, format!("Error: {e}"));
                 }
             },
+            AppEvent::ExecuteFailed(msg) => {
+                // The POST that starts the run never succeeded, so no SSE
+                // terminal event is ever coming — finalize here or
+                // `chat.streaming` spins forever.
+                self.notify(NoticeLevel::Error, format!("Failed to start run: {msg}"));
+                self.finalize_streaming();
+            }
+            AppEvent::StopFinished(r) => {
+                // Finalize regardless of outcome: even if the stop request
+                // failed (server down/unreachable), the operator must regain
+                // control of the input instead of being stuck waiting for a
+                // terminal SSE event that a dead server will never send.
+                // `finalize_streaming` resets `status_message` to "Ready"
+                // internally, so the outcome-specific message is set AFTER it
+                // (same ordering the old synchronous `stop_streaming` used to
+                // get "Stopped" to stick instead of being overwritten).
+                self.finalize_streaming();
+                match r {
+                    Ok(()) => self.status_message = "Stopped".to_string(),
+                    Err(e) => self.notify(NoticeLevel::Error, format!("Stop failed: {e}")),
+                }
+            }
+            AppEvent::SkillDetailLoaded(r) => match r {
+                Ok(detail) => {
+                    self.skills.detail = Some(detail);
+                    self.skills.error = None;
+                }
+                Err(e) => self.skills.error = Some(e),
+            },
             _ => {}
         }
         Ok(())
@@ -615,7 +659,7 @@ impl App {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if self.chat.streaming {
-                    self.stop_streaming().await?;
+                    self.stop_streaming();
                     return Ok(());
                 }
                 self.running = false;
@@ -918,7 +962,7 @@ impl App {
         if self.chat.streaming {
             match key.code {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.stop_streaming().await?;
+                    self.stop_streaming();
                 }
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.chat.expand_tools = !self.chat.expand_tools;
@@ -1029,12 +1073,33 @@ impl App {
             self.notify(NoticeLevel::Error, format!("SSE start failed: {e}"));
             return;
         }
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
         let client = self.client.clone();
         let model = self.chat.model.clone();
         tokio::spawn(async move {
             let model = if model.is_empty() { None } else { Some(model) };
-            let _ = client.execute(&session_id, model.as_deref()).await;
+            // If this POST fails (server down, 4xx/5xx), no SSE terminal event
+            // will ever arrive for a run that never started — report it back so
+            // the handler can finalize `chat.streaming` instead of spinning
+            // forever waiting for events behind a run that doesn't exist.
+            if let Err(e) = client.execute(&session_id, model.as_deref()).await {
+                let _ = tx.send(AppEvent::ExecuteFailed(e.to_string()));
+            }
         });
+    }
+
+    /// Find the in-progress tool call matching `tool_call_id`. Tool events are
+    /// paired by this server-assigned id rather than list position/name so
+    /// that parallel tool calls (multiple in-flight at once) each get their
+    /// own Complete/Error/Lifecycle update instead of clobbering whichever
+    /// entry happens to be last in the list.
+    fn find_tool_mut(&mut self, tool_call_id: &str) -> Option<&mut ToolCallDisplay> {
+        self.chat
+            .current_tool_calls
+            .iter_mut()
+            .find(|t| t.id == tool_call_id)
     }
 
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
@@ -1050,11 +1115,12 @@ impl App {
                 self.chat.current_reasoning.push_str(&content);
             }
             AgentEvent::ToolStart {
+                tool_call_id,
                 tool_name,
                 arguments,
-                ..
             } => {
                 self.chat.current_tool_calls.push(ToolCallDisplay {
+                    id: tool_call_id,
                     tool_name,
                     arguments: serde_json::to_string(&arguments).unwrap_or_default(),
                     result: None,
@@ -1062,32 +1128,73 @@ impl App {
                     phase: "running".to_string(),
                 });
             }
-            AgentEvent::ToolComplete { result, .. } => {
-                if let Some(tc) = self.chat.current_tool_calls.last_mut() {
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } => match self.find_tool_mut(&tool_call_id) {
+                Some(tc) => {
                     tc.result = Some(result.result);
                     tc.phase = "complete".to_string();
                 }
-            }
-            AgentEvent::ToolError { error, .. } => {
-                if let Some(tc) = self.chat.current_tool_calls.last_mut() {
+                None => {
+                    // No matching ToolStart (dropped/out-of-order) — surface it
+                    // defensively instead of silently losing the result.
+                    self.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: tool_call_id,
+                        tool_name: "unknown".to_string(),
+                        arguments: String::new(),
+                        result: Some(result.result),
+                        error: None,
+                        phase: "complete".to_string(),
+                    });
+                }
+            },
+            AgentEvent::ToolError {
+                tool_call_id,
+                error,
+            } => match self.find_tool_mut(&tool_call_id) {
+                Some(tc) => {
                     tc.error = Some(error);
                     tc.phase = "error".to_string();
                 }
-            }
+                None => {
+                    self.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: tool_call_id,
+                        tool_name: "unknown".to_string(),
+                        arguments: String::new(),
+                        result: None,
+                        error: Some(error),
+                        phase: "error".to_string(),
+                    });
+                }
+            },
             AgentEvent::ToolLifecycle {
-                tool_name,
+                tool_call_id,
                 phase,
                 summary,
+                error,
                 ..
             } => {
-                if let Some(tc) = self.chat.current_tool_calls.iter_mut().rev().find(|t| {
-                    t.tool_name == tool_name && t.phase != "complete" && t.phase != "error"
-                }) {
-                    tc.phase = phase;
-                    if let Some(s) = summary {
-                        tc.result = Some(s);
+                // Lifecycle phases ("begin"/"executing"/"finished"/"cancelled")
+                // are supplementary progress strings, not the UI's terminal
+                // vocabulary ("complete"/"error") — once ToolComplete/ToolError
+                // has set one of those, a later Lifecycle event must not
+                // overwrite it back to a non-terminal phase (the UI's ✓/✗ icon
+                // is keyed on those exact strings).
+                if let Some(tc) = self.find_tool_mut(&tool_call_id) {
+                    if tc.phase != "complete" && tc.phase != "error" {
+                        tc.phase = phase;
+                        if let Some(s) = summary {
+                            tc.result = Some(s);
+                        }
+                        if let Some(e) = error {
+                            tc.error = Some(e);
+                        }
                     }
                 }
+                // No matching entry: a Lifecycle event with no known Start is
+                // dropped (it carries only supplementary progress info, unlike
+                // Complete/Error's definitive terminal result).
             }
             AgentEvent::NeedClarification {
                 question, options, ..
@@ -1120,6 +1227,11 @@ impl App {
                 self.finalize_streaming();
             }
             AgentEvent::ToolToken { content, .. } => {
+                // Deliberately not routed into the matching ToolCallDisplay by
+                // `tool_call_id`: today's rendering already prints tool output
+                // inline with the response text, and threading a per-call
+                // streaming buffer through to the UI is beyond this fix's
+                // scope. Kept as the simpler, behavior-preserving option.
                 self.chat.current_response.push_str(&content);
             }
             AgentEvent::ContextCompressionStatus { phase, status } => {
@@ -1206,13 +1318,30 @@ impl App {
         self.pending_question = None;
     }
 
-    async fn stop_streaming(&mut self) -> Result<()> {
-        if let Some(sid) = &self.chat.session_id {
-            self.client.stop(sid).await?;
-        }
-        self.finalize_streaming();
-        self.status_message = "Stopped".to_string();
-        Ok(())
+    /// Stop the current run WITHOUT blocking the event loop: the `stop` POST
+    /// is spawned off the UI thread and its outcome comes back as
+    /// `AppEvent::StopFinished` (handled in `handle_event`, which finalizes
+    /// streaming either way). Previously this awaited `client.stop()` and
+    /// `?`-propagated a network error — a dead server hit at the worst
+    /// possible moment (pressing Ctrl+C to stop a run) tore down the whole
+    /// TUI instead of just failing the stop.
+    fn stop_streaming(&mut self) {
+        let Some(sid) = self.chat.session_id.clone() else {
+            // Nothing to stop server-side; still clear local streaming state.
+            self.finalize_streaming();
+            self.status_message = "Stopped".to_string();
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
+            self.finalize_streaming();
+            return;
+        };
+        self.status_message = "Stopping...".to_string();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let r = client.stop(&sid).await.map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::StopFinished(r));
+        });
     }
 
     async fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1432,11 +1561,19 @@ impl App {
                 self.skills.selected = self.skills.selected.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if let Some(skill) = self.skills.skills.get(self.skills.selected) {
-                    match self.client.get_skill(&skill.id).await {
-                        Ok(detail) => self.skills.detail = Some(detail),
-                        Err(e) => self.skills.error = Some(e.to_string()),
-                    }
+                // Fetch the detail off the event loop: `get_skill` used to be
+                // awaited right here on the UI thread, so a slow/unreachable
+                // server froze every keystroke until it returned.
+                if let (Some(skill), Some(tx)) = (
+                    self.skills.skills.get(self.skills.selected),
+                    self.event_tx.clone(),
+                ) {
+                    let id = skill.id.clone();
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let r = client.get_skill(&id).await.map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::SkillDetailLoaded(r));
+                    });
                 }
             }
             _ => {}
@@ -1542,6 +1679,7 @@ impl App {
 #[cfg(test)]
 mod question_tests {
     use super::*;
+    use bamboo_client_core::ToolResult;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1981,5 +2119,134 @@ mod question_tests {
         })
         .unwrap();
         assert_eq!(app.chat.sub_agents[0].status, "completed");
+    }
+
+    /// Parallel tool calls: a `ToolComplete` must land on the entry whose
+    /// `tool_call_id` it names, not on whichever entry is last in the list.
+    #[tokio::test]
+    async fn tool_events_pair_by_id_not_position() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "a".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "b".into(),
+            tool_name: "Write".into(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+
+        // "b" was started most recently (last in the list), but the Complete
+        // event names "a" — position-based pairing would wrongly land this on
+        // "b".
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "a".into(),
+            result: ToolResult {
+                success: true,
+                result: "a-result".into(),
+            },
+        })
+        .unwrap();
+
+        let calls = &app.chat.current_tool_calls;
+        assert_eq!(calls.len(), 2, "no entry is dropped or duplicated");
+        let a = calls.iter().find(|t| t.id == "a").unwrap();
+        let b = calls.iter().find(|t| t.id == "b").unwrap();
+        assert_eq!(a.result.as_deref(), Some("a-result"));
+        assert_eq!(a.phase, "complete");
+        assert!(b.result.is_none(), "b's result must be untouched");
+        assert_eq!(b.phase, "running", "b must still be running");
+    }
+
+    /// A `ToolComplete`/`ToolError` for an id with no matching `ToolStart` is
+    /// surfaced defensively (not silently dropped).
+    #[tokio::test]
+    async fn tool_complete_for_unknown_id_inserts_defensively() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "ghost".into(),
+            result: ToolResult {
+                success: true,
+                result: "surprise".into(),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.current_tool_calls.len(), 1);
+        let tc = &app.chat.current_tool_calls[0];
+        assert_eq!(tc.id, "ghost");
+        assert_eq!(tc.tool_name, "unknown");
+        assert_eq!(tc.result.as_deref(), Some("surprise"));
+        assert_eq!(tc.phase, "complete");
+    }
+
+    /// `AppEvent::ExecuteFailed` (posted when the `execute` POST itself fails)
+    /// must clear `chat.streaming` even though no SSE terminal event ever
+    /// arrived for the run.
+    #[tokio::test]
+    async fn execute_failed_event_clears_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_response = "partial".to_string();
+
+        app.handle_event(AppEvent::ExecuteFailed("connection refused".to_string()))
+            .await
+            .unwrap();
+
+        assert!(
+            !app.chat.streaming,
+            "streaming must clear on execute failure"
+        );
+        // notify() runs before finalize_streaming() (mirroring the existing
+        // AgentEvent::Error handler), so the transient status line ends up
+        // "Ready" — the failure detail is preserved in the notification log
+        // instead, which is what Ctrl+L surfaces.
+        let last = app.notifications.last().expect("notify logged an entry");
+        assert!(last.text.contains("connection refused"));
+        assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    /// `StopFinished(Err)` must still finalize streaming locally so the
+    /// operator regains control of the input even when the stop request
+    /// itself failed (e.g. the server is unreachable) — `App::running` stays
+    /// `true` (the app itself does not exit).
+    #[tokio::test]
+    async fn stop_failure_still_finalizes_and_keeps_app_running() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_event(AppEvent::StopFinished(
+            Err("server unreachable".to_string()),
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            !app.chat.streaming,
+            "streaming must clear despite the error"
+        );
+        assert!(app.running, "a failed stop must not tear down the app");
+        assert!(app.status_message.contains("server unreachable"));
+    }
+
+    /// `StopFinished(Ok)` finalizes streaming and reports "Stopped".
+    #[tokio::test]
+    async fn stop_success_finalizes_with_stopped_status() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_event(AppEvent::StopFinished(Ok(())))
+            .await
+            .unwrap();
+
+        assert!(!app.chat.streaming);
+        assert_eq!(app.status_message, "Stopped");
     }
 }

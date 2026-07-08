@@ -46,6 +46,17 @@ impl BambooClient {
             })
             .send()
             .await?;
+        // Without this check, a non-2xx (server down mid-request, 4xx/5xx, or a
+        // JSON error body that fails to parse as `ExecuteResponse`) surfaces as
+        // an opaque decode error at best — and at worst, if the body happens to
+        // parse, silently pretends the run started. Either way the caller must
+        // be able to tell "the run never started" apart from a real response so
+        // it can stop waiting for SSE events that will never arrive.
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("execute failed ({status}): {}", body.trim());
+        }
         let exec_resp = resp.json().await?;
         Ok(exec_resp)
     }

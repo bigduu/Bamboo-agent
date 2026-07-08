@@ -1,6 +1,6 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::api::types::{ListSessionsEnvelope, McpServer, Schedule, Skill, ToolInfo};
+use crate::api::types::{ListSessionsEnvelope, McpServer, Schedule, Skill, SkillDetail, ToolInfo};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -29,4 +29,14 @@ pub enum AppEvent {
     },
     /// A chat turn was created + started; carries the new session id.
     ChatStarted(Loaded<String>),
+    /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).
+    /// Since no SSE terminal event will ever arrive for a run that never
+    /// started, this is how `chat.streaming` gets unstuck.
+    ExecuteFailed(String),
+    /// The background `stop` POST finished; `Err` still finalizes streaming
+    /// locally (see `stop_streaming`) so the operator regains control even if
+    /// the server is unreachable.
+    StopFinished(Loaded<()>),
+    /// A skill's detail view finished loading (`Enter` on the Skills tab).
+    SkillDetailLoaded(Loaded<SkillDetail>),
 }

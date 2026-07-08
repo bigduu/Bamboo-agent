@@ -256,6 +256,7 @@ mod tests {
 
     fn tc(args: &str, result: Option<&str>) -> ToolCallDisplay {
         ToolCallDisplay {
+            id: "call-1".into(),
             tool_name: "Read".into(),
             arguments: args.into(),
             result: result.map(String::from),
