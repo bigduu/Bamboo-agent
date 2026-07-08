@@ -205,7 +205,8 @@ bamboo/
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
 - **CI** (`.github/workflows/ci.yml`) -- Tests on Linux, macOS, and Windows. Runs `rustfmt` and `clippy`. Builds documentation. Runs `cargo-audit` for security.
-- **Publish** (`.github/workflows/publish.yml`) -- Publishes to crates.io on release. Builds release binaries for all platforms.
+- **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes the workspace crates to crates.io in dependency order. Normally dispatched by the Zenith release train with the unified date version and the `@bigduu/lotus` frontend version to embed; supports `dry_run`.
+- **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
 - **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
 
 ### Badge URLs
