@@ -13,6 +13,11 @@ on:
         required: false
         default: false
         type: boolean
+      lotus_version:
+        description: "@bigduu/lotus npm version to embed as the web frontend (for example: 2026.3.11). 'latest' resolves the newest published version."
+        required: false
+        default: "latest"
+        type: string
 
 permissions:
   contents: read
@@ -31,11 +36,26 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Stage frontend package
+      - name: Stage frontend package from npm
+        # Embed the published @bigduu/lotus package instead of the committed
+        # frontend_package/ zip — the committed copy goes stale between Lotus
+        # releases (the release train passes the exact same-day version).
+        # LOTUS_SOURCE=package hard-fails when the npm package is missing, so a
+        # fetch failure can never silently fall back to the stale zip.
+        env:
+          LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
         run: |
-          node scripts/frontend-package.cjs stage
+          set -euo pipefail
+          npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
+          LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
           test -f frontend_package/lotus-frontend.zip
           test -f frontend_package/frontend-manifest.json
+          EMBEDDED="$(node -p "require('./frontend_package/frontend-manifest.json').frontend_version")"
+          echo "Embedded lotus frontend version: ${EMBEDDED}"
+          if [ "${LOTUS_VERSION}" != "latest" ] && [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
+            echo "::error::Embedded lotus version ${EMBEDDED} does not match requested ${LOTUS_VERSION}"
+            exit 1
+          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

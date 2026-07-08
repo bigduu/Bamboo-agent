@@ -6,4 +6,7 @@ target
 /examples
 **/*.log
 .DS_Store
+# Host-side npm install used only to stage frontend_package/ before the build;
+# the workspace include_bytes! embed needs the staged zip, not node_modules.
+node_modules
 
