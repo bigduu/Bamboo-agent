@@ -13,12 +13,21 @@ name: Publish Docker image (GHCR)
 # larger-runner plan, drop the arm64 matrix entry or switch to a single QEMU
 # job with docker/setup-qemu-action.)
 #
-# The lotus frontend is embedded automatically: frontend_package/ is committed
-# and crates/app/bamboo-server/frontend_package symlinks to it, so the in-image
-# `cargo build` picks it up via include_bytes! — no host-side staging needed.
+# The lotus frontend is embedded via frontend_package/ (which
+# crates/app/bamboo-server/frontend_package symlinks to, picked up by the
+# in-image `cargo build` through include_bytes!). Each build job re-stages that
+# directory from the published @bigduu/lotus npm package first, so the image
+# ships the requested (default: newest) frontend instead of whatever zip was
+# last committed — the committed copy goes stale between Lotus releases.
 
 on:
   workflow_dispatch:
+    inputs:
+      lotus_version:
+        description: "@bigduu/lotus npm version to embed as the web frontend. 'latest' resolves the newest published version."
+        required: false
+        default: "latest"
+        type: string
   push:
     tags:
       - "v*"
@@ -49,6 +58,31 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Stage frontend package from npm
+        # Overwrites the committed frontend_package/ in the build context with a
+        # bundle staged from the published npm package (tag pushes carry no
+        # inputs and stage 'latest'). LOTUS_SOURCE=package hard-fails when the
+        # package is missing — never silently falls back to the stale zip.
+        env:
+          LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
+          LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
+          test -f frontend_package/lotus-frontend.zip
+          test -f frontend_package/frontend-manifest.json
+          EMBEDDED="$(node -p "require('./frontend_package/frontend-manifest.json').frontend_version")"
+          echo "Embedded lotus frontend version: ${EMBEDDED}"
+          if [ "${LOTUS_VERSION}" != "latest" ] && [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
+            echo "::error::Embedded lotus version ${EMBEDDED} does not match requested ${LOTUS_VERSION}"
+            exit 1
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
