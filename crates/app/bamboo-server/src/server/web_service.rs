@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use actix_files as fs;
+use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::{web, App, HttpServer};
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -13,6 +14,30 @@ use super::listeners::DEFAULT_WORKER_COUNT;
 /// payload defaults and rejecting them with 413 (#252).
 pub(crate) const MAX_JSON_BODY_BYTES: usize = 25 * 1024 * 1024;
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 30 * 1024 * 1024;
+
+/// Install the shared request body-size limits ([`MAX_JSON_BODY_BYTES`] /
+/// [`MAX_PAYLOAD_BYTES`]) onto an actix `App`.
+///
+/// EVERY serve path — desktop (`run_with_tls`), production
+/// (`run_with_bind_and_static_tls`), and `WebService::start*` — funnels its
+/// `App::new()` through this one helper, so the limits can no longer drift
+/// between paths. That drift was the #252 bug: the desktop/embedded server set
+/// neither limit and rejected an inline-image chat request with 413 while the
+/// production server (which set them) accepted it. Callers layer their own app
+/// data, middleware, routes, and static files on top of the returned `App`.
+pub(crate) fn with_body_limits<T>(app: App<T>) -> App<T>
+where
+    T: ServiceFactory<
+        ServiceRequest,
+        Config = (),
+        Response = ServiceResponse,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+{
+    app.app_data(web::JsonConfig::default().limit(MAX_JSON_BODY_BYTES))
+        .app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
+}
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{build_cors, build_rate_limiter, build_security_headers, is_loopback_bind};
@@ -91,9 +116,7 @@ impl WebService {
         let bind_for_log = bind_addr.clone();
 
         let server = HttpServer::new(move || {
-            App::new()
-                .app_data(web::JsonConfig::default().limit(MAX_JSON_BODY_BYTES))
-                .app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
+            with_body_limits(App::new())
                 .app_data(app_state.clone())
                 .wrap(build_cors(&bind_addr, port))
                 .configure(configure_routes) // No rate limiting for WebService
@@ -193,9 +216,7 @@ impl WebService {
         let bind_for_log = bind_addr.clone();
 
         let server = HttpServer::new(move || {
-            App::new()
-                .app_data(web::JsonConfig::default().limit(MAX_JSON_BODY_BYTES))
-                .app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
+            with_body_limits(App::new())
                 .app_data(app_state.clone())
                 .wrap(actix_web::middleware::Condition::new(
                     apply_rate_limit,
@@ -314,6 +335,60 @@ impl Drop for WebService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #252: the shared [`with_body_limits`] factory must raise actix's default
+    /// ~2MB JSON limit to 25MB on every serve path. This is the limit the
+    /// desktop/embedded serve path previously lacked (rejecting inline-image
+    /// chat requests with 413 while production accepted them). The control app
+    /// built without `with_body_limits` rejects the same body, proving the
+    /// factory — not a default — is doing the work, so this test fails without
+    /// the shared-factory change.
+    #[actix_web::test]
+    async fn shared_factory_raises_json_body_limit() {
+        use actix_web::{http::StatusCode, test, HttpResponse};
+
+        async fn echo(_body: web::Json<serde_json::Value>) -> HttpResponse {
+            HttpResponse::Ok().finish()
+        }
+
+        // ~3MB JSON body: over actix's ~2MB default, under the 25MB shared limit.
+        let big = "x".repeat(3 * 1024 * 1024);
+        let payload = serde_json::json!({ "data": big });
+
+        // Via the shared factory (what every serve path now funnels through).
+        let app =
+            test::init_service(with_body_limits(App::new()).route("/echo", web::post().to(echo)))
+                .await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/echo")
+                .set_json(&payload)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "shared factory must accept a >2MB JSON body (#252)"
+        );
+
+        // Control: a plain `App` (actix's ~2MB default) rejects the same body.
+        let app_default = test::init_service(App::new().route("/echo", web::post().to(echo))).await;
+        let resp_default = test::call_service(
+            &app_default,
+            test::TestRequest::post()
+                .uri("/echo")
+                .set_json(&payload)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resp_default.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "actix's default JSON limit must reject a >2MB body"
+        );
+    }
 
     /// #119 e2e: WebService::stop() must cancel the AppState-owned MCP-proxy
     /// reconnect supervisor's token, so it terminates on server stop rather than

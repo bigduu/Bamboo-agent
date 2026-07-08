@@ -110,13 +110,11 @@ pub async fn run_with_tls(
     let workers = resolve_worker_count();
 
     let app_factory = move || {
-        let mut app = App::new()
-            // Same body limits as the production/static path so a desktop chat
-            // request with an inline image isn't rejected with 413 (#252).
-            .app_data(web::JsonConfig::default().limit(super::web_service::MAX_JSON_BODY_BYTES))
-            .app_data(web::PayloadConfig::new(
-                super::web_service::MAX_PAYLOAD_BYTES,
-            ))
+        // Body limits (and any future shared app config) come from the one shared
+        // factory used by every serve path, so a desktop chat request with an
+        // inline image isn't rejected with 413 while production accepts it — the
+        // paths can no longer drift apart (#252).
+        let mut app = super::web_service::with_body_limits(App::new())
             .app_data(app_state.clone())
             .wrap(build_cors("127.0.0.1", port))
             // Immutable long-cache for hashed `/assets/*` (parity with the web
@@ -304,13 +302,10 @@ pub async fn run_with_bind_and_static_tls(
     let apply_rate_limit = !is_loopback_bind(bind);
     let bind_for_cors = bind.to_string();
     let app_factory = move || {
-        let mut app = App::new()
-            // Request size limits to prevent DoS. Chat requests may include
-            // base64 images; shared with every serve path (#252).
-            .app_data(web::JsonConfig::default().limit(super::web_service::MAX_JSON_BODY_BYTES))
-            .app_data(web::PayloadConfig::new(
-                super::web_service::MAX_PAYLOAD_BYTES,
-            ))
+        // Request size limits (base64-image chats) come from the one shared
+        // factory used by every serve path — same limits everywhere, no drift
+        // (#252).
+        let mut app = super::web_service::with_body_limits(App::new())
             .app_data(app_state.clone())
             .wrap(actix_web::middleware::Condition::new(
                 apply_rate_limit,

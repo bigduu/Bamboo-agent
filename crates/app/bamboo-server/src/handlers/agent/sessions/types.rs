@@ -130,9 +130,36 @@ pub(crate) fn local_placement() -> SessionPlacement {
     }
 }
 
+/// Query parameters for `GET /api/v1/sessions`.
+///
+/// Both are optional so existing clients that omit them stay working: the
+/// server applies a bounded default page instead of materializing every session
+/// (the index grows without limit as session count grows forever — #252).
+#[derive(Debug, Default, Deserialize)]
+pub struct ListSessionsQuery {
+    /// Page size. Server-clamped to `1..=MAX_SESSIONS_PAGE`; omitted → the
+    /// server default page size (never unbounded).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Number of (newest-first) sessions to skip before this page. Omitted → 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ListSessionsResponse {
     pub sessions: Vec<SessionSummary>,
+    /// Total sessions in the index before pagination, so a client can tell how
+    /// many pages remain. (#252)
+    pub total: usize,
+    /// The page size actually applied (the server-clamped default/max), so a
+    /// client can see the effective bound even when it sent no `limit`.
+    pub limit: usize,
+    /// The offset applied to this page.
+    pub offset: usize,
+    /// Offset to request the next page, or `None` when this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 /// Snapshot of an actively running session for frontend boot/reconnect replay.
@@ -368,10 +395,22 @@ mod tests {
 
     #[test]
     fn test_list_sessions_response_serialization() {
-        let response = ListSessionsResponse { sessions: vec![] };
+        let response = ListSessionsResponse {
+            sessions: vec![],
+            total: 0,
+            limit: 200,
+            offset: 0,
+            next_offset: None,
+        };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"sessions\":[]"));
+        // Pagination metadata is present so clients can page (#252). `next_offset`
+        // is omitted when absent.
+        assert!(json.contains("\"total\":0"));
+        assert!(json.contains("\"limit\":200"));
+        assert!(json.contains("\"offset\":0"));
+        assert!(!json.contains("next_offset"));
     }
 
     #[test]
