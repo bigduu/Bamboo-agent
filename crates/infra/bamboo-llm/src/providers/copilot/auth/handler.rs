@@ -253,11 +253,7 @@ mod tests {
         std::fs::read_dir(dir)
             .expect("read_dir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .count()
     }
 
@@ -273,7 +269,11 @@ mod tests {
             .expect("write cache");
 
         assert!(handler.read_cached_copilot_config(&token_path).is_some());
-        assert_eq!(count_tmp_files(dir.path()), 0, "no .tmp files should remain");
+        assert_eq!(
+            count_tmp_files(dir.path()),
+            0,
+            "no .tmp files should remain"
+        );
     }
 
     /// Concurrent writers (the #237 401-burst scenario) must never leave the
@@ -1640,7 +1640,9 @@ mod retry_tests {
             Method::GET,
             "/copilot_internal/v2/token",
             request_count.clone(),
-            (0..8).map(|_| copilot_token_reply("refreshed-token")).collect(),
+            (0..8)
+                .map(|_| copilot_token_reply("refreshed-token"))
+                .collect(),
         );
         let client = create_test_client_with_retry(mock);
         let temp_dir = tempfile::tempdir().expect("tempdir");

@@ -66,7 +66,10 @@ mod reasoning_heuristic_tests {
             bad,
             "Invalid value for 'reasoning_effort': must be one of low, medium, high"
         )); // bad VALUE, not unsupported
-        assert!(!f(bad, "Invalid request: missing required field 'messages'"));
+        assert!(!f(
+            bad,
+            "Invalid request: missing required field 'messages'"
+        ));
         assert!(!f(bad, "The model gpt-x is unknown or unsupported")); // model, not reasoning
 
         // Only the listed 4xx statuses qualify.

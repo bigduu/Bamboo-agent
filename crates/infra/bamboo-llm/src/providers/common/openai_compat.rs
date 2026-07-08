@@ -438,8 +438,10 @@ mod tests {
         assert_eq!(out[1]["content"], "captured");
         assert_eq!(out[2]["role"], "user");
         let content = out[2]["content"].as_array().expect("array content");
-        assert!(content.iter().any(|p| p["type"] == "image_url"
-            && p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+        assert!(content
+            .iter()
+            .any(|p| p["type"] == "image_url"
+                && p["image_url"]["url"] == "data:image/png;base64,AAAA"));
     }
 
     #[test]
