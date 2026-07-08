@@ -331,6 +331,25 @@ fn detect_manual_compression_request(session: &mut Session) {
     }
 }
 
+/// Best-effort mid-turn context compression, run after a single tool result.
+///
+/// Mid-turn compression is an OPTIMIZATION, never a correctness requirement. By
+/// the time it runs the assistant turn is already mid-execution: the assistant
+/// message (carrying this round's `tool_calls`) has been appended and one or
+/// more tools have run and committed their side effects. If the host
+/// summarization LLM call fails transiently (HTTP 500 / 429 / timeout), that
+/// error MUST NOT propagate out of `execute_round_tool_calls`. Propagating it
+/// surfaces the failure to the per-turn retry loop, which would either
+///   (a) classify it as retryable and re-run the WHOLE turn — appending a
+///       SECOND assistant message, re-billing the LLM, and orphaning the
+///       not-yet-executed tool calls; or
+///   (b) fail the turn terminally and abort the remaining tools.
+/// Both corrupt session state over a discardable optimization.
+///
+/// So this function is INFALLIBLE by construction: a compression failure is
+/// logged and swallowed, and the turn keeps executing its remaining tools with
+/// the uncompressed context. Compression is retried on the next natural
+/// trigger. (issue #238)
 #[allow(clippy::too_many_arguments)]
 async fn maybe_apply_mid_turn_context_compression_after_tool(
     session: &mut Session,
@@ -341,14 +360,14 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
     model_name: Option<&str>,
     _compression_model_provider: Option<&Arc<dyn LLMProvider>>,
     tool_schemas: &[ToolSchema],
-) -> Result<(), AgentError> {
+) {
     let Some(model_name) = model_name else {
-        return Ok(());
+        return;
     };
 
     detect_manual_compression_request(session);
 
-    if super::round_lifecycle::maybe_apply_mid_turn_context_compression(
+    match super::round_lifecycle::maybe_apply_mid_turn_context_compression(
         session,
         config,
         llm,
@@ -357,14 +376,25 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
         model_name,
         tool_schemas,
     )
-    .await?
+    .await
     {
-        tracing::debug!(
-            "[{}] Applied mid-turn host context compression after single tool result",
-            session_id
-        );
+        Ok(true) => {
+            tracing::debug!(
+                "[{}] Applied mid-turn host context compression after single tool result",
+                session_id
+            );
+        }
+        Ok(false) => {}
+        // Degrade gracefully: a transient summarization failure must never abort
+        // or retry the whole turn — keep running the remaining tools uncompressed.
+        Err(error) => {
+            tracing::warn!(
+                "[{}] Mid-turn context compression failed; continuing the turn with uncompressed context (best-effort, will retry on next trigger): {}",
+                session_id,
+                error
+            );
+        }
     }
-    Ok(())
 }
 
 pub(crate) async fn execute_round_tool_calls(
@@ -461,7 +491,7 @@ pub(crate) async fn execute_round_tool_calls(
                         compression_model_provider,
                         tool_schemas,
                     )
-                    .await?;
+                    .await;
 
                     if control.should_break || control.stop_round {
                         break 'tool_calls;
@@ -500,7 +530,7 @@ pub(crate) async fn execute_round_tool_calls(
                     compression_model_provider,
                     tool_schemas,
                 )
-                .await?;
+                .await;
 
                 if control.should_break || control.stop_round {
                     break 'tool_calls;
@@ -668,7 +698,7 @@ pub(crate) async fn execute_round_tool_calls(
                     compression_model_provider,
                     tool_schemas,
                 )
-                .await?;
+                .await;
 
                 if should_break {
                     break 'tool_calls;
@@ -708,7 +738,7 @@ pub(crate) async fn execute_round_tool_calls(
             compression_model_provider,
             tool_schemas,
         )
-        .await?;
+        .await;
 
         if control.should_break || control.stop_round {
             break;

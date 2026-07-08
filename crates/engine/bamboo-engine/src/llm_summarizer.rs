@@ -33,7 +33,11 @@ pub enum SummaryMode {
 /// LLM-based summarizer that calls the current session's model to generate
 /// a rich summary of compressed/removed messages.
 ///
-/// Falls back to [`HeuristicSummarizer`] if the LLM call fails.
+/// Falls back to [`HeuristicSummarizer`] if the LLM call fails, UNLESS
+/// [`with_heuristic_fallback_on_error(false)`](Self::with_heuristic_fallback_on_error)
+/// is set — in which case a transient LLM *error* surfaces to the caller so a
+/// best-effort caller (mid-turn context compression) can skip and degrade
+/// gracefully instead of silently substituting a low-quality heuristic summary.
 pub struct LlmSummarizer {
     llm: Arc<dyn LLMProvider>,
     model: String,
@@ -45,6 +49,12 @@ pub struct LlmSummarizer {
     custom_instructions: Option<String>,
     /// Controls how the summarizer handles existing summaries.
     summary_mode: SummaryMode,
+    /// When true (default), a transient LLM call/stream failure is recovered by
+    /// falling back to the [`HeuristicSummarizer`]. When false, that error is
+    /// returned to the caller instead — used by best-effort callers that would
+    /// rather SKIP compression than emit a degraded heuristic summary. The
+    /// empty-response fallback is unaffected either way. (issue #238)
+    heuristic_fallback_on_error: bool,
 }
 
 impl LlmSummarizer {
@@ -76,7 +86,17 @@ impl LlmSummarizer {
             context_blocks,
             custom_instructions: None,
             summary_mode: SummaryMode::default(),
+            heuristic_fallback_on_error: true,
         }
+    }
+
+    /// Control whether a transient LLM *error* recovers via the heuristic
+    /// summarizer (default `true`) or surfaces to the caller (`false`). Set
+    /// `false` for best-effort compression (mid-turn) that should skip rather
+    /// than substitute a heuristic summary. (issue #238)
+    pub fn with_heuristic_fallback_on_error(mut self, enabled: bool) -> Self {
+        self.heuristic_fallback_on_error = enabled;
+        self
     }
 
     pub fn with_context_blocks(mut self, context_blocks: Vec<ContextBlock>) -> Self {
@@ -312,12 +332,22 @@ impl Summarizer for LlmSummarizer {
                 );
                 HeuristicSummarizer::new().summarize(messages).await
             }
-            Err(e) => {
+            Err(e) if self.heuristic_fallback_on_error => {
                 tracing::warn!(
                     "LlmSummarizer: LLM call failed ({}), falling back to heuristic",
                     e
                 );
                 HeuristicSummarizer::new().summarize(messages).await
+            }
+            // Best-effort caller opted out of the heuristic fallback: surface the
+            // transient error so the caller can skip compression entirely rather
+            // than substitute a low-quality heuristic summary. (issue #238)
+            Err(e) => {
+                tracing::warn!(
+                    "LlmSummarizer: LLM call failed ({}); surfacing error (heuristic fallback disabled)",
+                    e
+                );
+                Err(e)
             }
         }
     }
@@ -618,6 +648,60 @@ mod tests {
         assert!(
             user_content.contains("Previous summary content"),
             "IncrementalMerge user prompt should include the actual summary text"
+        );
+    }
+
+    /// Provider whose summarization stream call fails transiently (500/429/timeout).
+    struct FailingProvider;
+
+    #[async_trait]
+    impl LLMProvider for FailingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_domain::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api("http 500 transient".to_string()))
+        }
+    }
+
+    fn summary_messages() -> Vec<Message> {
+        vec![
+            Message::user("do the work"),
+            Message::assistant("working on it", None),
+            Message::user("keep going"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn summarize_falls_back_to_heuristic_on_llm_error_by_default() {
+        // Default: a transient LLM failure is recovered by the heuristic
+        // summarizer, so summarize() succeeds. This is what makes pre-turn /
+        // overflow compression resilient (and, historically, masked #238).
+        let summarizer =
+            LlmSummarizer::new(Arc::new(FailingProvider), "model".to_string(), None, None);
+        let out = summarizer.summarize(&summary_messages()).await;
+        assert!(
+            out.is_ok(),
+            "default heuristic fallback should recover from a transient LLM error, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_surfaces_llm_error_when_heuristic_fallback_disabled() {
+        // Best-effort caller (mid-turn compression) opts out of the heuristic
+        // fallback: the transient error must SURFACE so the caller can skip
+        // compression rather than substitute a low-quality heuristic summary.
+        // (issue #238)
+        let summarizer =
+            LlmSummarizer::new(Arc::new(FailingProvider), "model".to_string(), None, None)
+                .with_heuristic_fallback_on_error(false);
+        let out = summarizer.summarize(&summary_messages()).await;
+        assert!(
+            out.is_err(),
+            "with the heuristic fallback disabled, a transient LLM error must surface"
         );
     }
 }

@@ -3946,6 +3946,280 @@ mod tests {
         );
     }
 
+    // ── Mid-turn compression failure is best-effort, not a whole-turn retry (#238)
+    //
+    // A transient failure in the MID-TURN context-compression summarization call
+    // (host summarizer LLM) used to propagate out of `execute_round_tool_calls`
+    // via `?`, out of `handle_tool_calls_path`'s `result?`, and into the per-turn
+    // retry loop. Because the assistant message (with its `tool_calls`) is
+    // appended BEFORE tools run and tools execute one-by-one, that propagation
+    // corrupted state: it aborted the not-yet-executed tool calls and — if the
+    // error were classified retryable — re-ran the WHOLE turn, appending a SECOND
+    // assistant message and re-billing the LLM. The fix makes mid-turn
+    // compression infallible (log + degrade): the turn keeps running its
+    // remaining tools with the uncompressed context, and the failure never
+    // reaches the retry path.
+
+    /// Tool executor that records execution order and forces STRICTLY sequential
+    /// scheduling (so the mid-turn compression runs after EACH tool, never
+    /// batched — the exact one-by-one path the bug lives in). `compact_context`
+    /// is included so its post-execution tool result flips the session's manual
+    /// compression flag, deterministically triggering the mid-turn summarization
+    /// call without any token-budget arithmetic.
+    struct RecordingSequentialExecutor {
+        executed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RecordingSequentialExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            self.executed
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
+            Ok(ToolResult {
+                success: true,
+                result: format!("result-of-{}", call.function.name),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["compact_context", "tool_b", "tool_c"]
+                .iter()
+                .map(|name| ToolSchema {
+                    schema_type: "function".to_string(),
+                    function: FunctionSchema {
+                        name: name.to_string(),
+                        description: "test tool".to_string(),
+                        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                    },
+                })
+                .collect()
+        }
+
+        // Force Sequential scheduling for every tool: Mutating + not
+        // concurrency-safe => tools run one-by-one with a compression check
+        // interleaved after each, never in a parallel batch.
+        fn call_parallel_classification(
+            &self,
+            _call: &ToolCall,
+        ) -> (bamboo_agent_core::tools::ToolMutability, bool) {
+            (bamboo_agent_core::tools::ToolMutability::Mutating, false)
+        }
+    }
+
+    /// Provider whose only job is to FAIL the mid-turn context-compression
+    /// summarization call (identified by `request_purpose == "compression"`,
+    /// set by `LlmSummarizer`) with a transient upstream error, counting the
+    /// attempts. It is never asked to run a main-agent round here
+    /// (`handle_tool_calls_path` consumes an already-produced `StreamHandlingOutput`),
+    /// so `chat_stream` is a benign stub.
+    struct FailingCompressionProvider {
+        compression_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for FailingCompressionProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            options: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let purpose = options
+                .and_then(|o| o.request_purpose.as_deref())
+                .unwrap_or("");
+            if purpose == "compression" {
+                self.compression_calls.fetch_add(1, Ordering::SeqCst);
+                // Transient failure: HTTP 500 / rate limit / timeout on the
+                // summarization call. This is exactly the class of error the fix
+                // downgrades to best-effort.
+                return Err(LLMError::Api(
+                    "http 500 transient upstream failure (compression summarization)".to_string(),
+                ));
+            }
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compression_failure_is_best_effort_and_does_not_retry_turn() {
+        let compression_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let llm: Arc<dyn LLMProvider> = Arc::new(FailingCompressionProvider {
+            compression_calls: compression_calls.clone(),
+        });
+        let tools: Arc<dyn ToolExecutor> = Arc::new(RecordingSequentialExecutor {
+            executed: executed.clone(),
+        });
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(128);
+
+        // `background_model_name` set + no explicit summarization provider =>
+        // the summarizer runs against `frame.llm` (our failing provider).
+        let config = AgentLoopConfig {
+            model_name: Some("model".to_string()),
+            background_model_name: Some("summarizer".to_string()),
+            ..AgentLoopConfig::default()
+        };
+
+        let mut session = Session::new("s-compress-fail", "model");
+        // Seed enough non-system history that `summary_source_messages` clears the
+        // >= 3 message floor once compact_context's result is appended, so the
+        // summarization call is genuinely attempted (and fails).
+        session.add_message(Message::system("system"));
+        session.add_message(Message::user("do the work"));
+        session.add_message(Message::assistant("prior assistant turn".to_string(), None));
+        session.add_message(Message::user("keep going"));
+
+        let frame = RoundFrame {
+            session_id: "s-compress-fail",
+            round_id: "r1",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let auxiliary_models = crate::runtime::config::AuxiliaryModelConfig::default();
+        let mut task_context: Option<TaskLoopContext> = None;
+        let cancel_token = CancellationToken::new();
+
+        // Assistant turn issues three tool calls; the FIRST is `compact_context`,
+        // whose post-execution result trips the manual-compression flag so the
+        // mid-turn summarization fires right after it — and fails transiently.
+        let stream_output = StreamHandlingOutput {
+            response_id: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            token_count: 0,
+            tool_calls: vec![
+                tool_call("call-compact", "compact_context"),
+                tool_call("call-b", "tool_b"),
+                tool_call("call-c", "tool_c"),
+            ],
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            input_tokens: 0,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            handle_tool_calls_path(
+                &frame,
+                stream_output,
+                MetricsTokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+                &mut session,
+                &auxiliary_models,
+                "model",
+                &mut task_context,
+                &cancel_token,
+            ),
+        )
+        .await
+        .expect("handle_tool_calls_path did not return within 10s");
+
+        // The transient compression failure must NOT surface as a turn error.
+        // Without the fix it propagates as Err out of handle_tool_calls_path,
+        // which run_pipeline's per-turn retry loop treats as a whole-turn failure
+        // (re-appending a duplicate assistant message / re-billing). The retry is
+        // gated on this Err, so proving Ok here proves the turn is not retried.
+        let _outcome = result.expect(
+            "mid-turn compression failure must be best-effort (Ok), not a whole-turn error/retry",
+        );
+
+        // The compression path was genuinely exercised and failed — else the test
+        // would prove nothing.
+        assert!(
+            compression_calls.load(Ordering::SeqCst) >= 1,
+            "mid-turn compression summarization must have been attempted (and failed)"
+        );
+
+        // (a) The turn kept running the REMAINING tools despite the failure — no
+        // orphaned tool calls. Without the fix, execution aborts right after
+        // compact_context and tool_b / tool_c never run.
+        let ran = executed.lock().unwrap().clone();
+        assert_eq!(
+            ran,
+            vec![
+                "compact_context".to_string(),
+                "tool_b".to_string(),
+                "tool_c".to_string(),
+            ],
+            "all tools must execute in order despite the mid-turn compression failure"
+        );
+
+        // (b) Exactly ONE assistant message carries this turn's tool calls — no
+        // duplicate from a whole-turn re-run.
+        let assistant_turns = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == bamboo_agent_core::Role::Assistant
+                    && m.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|c| c.function.name == "compact_context")
+                    })
+            })
+            .count();
+        assert_eq!(
+            assistant_turns, 1,
+            "exactly one assistant message must exist for the turn (no duplicate)"
+        );
+
+        // (c) Each tool produced exactly one tool-result message (no re-execution
+        // / no duplicated results from a retried turn).
+        for (id, name) in [
+            ("call-compact", "compact_context"),
+            ("call-b", "tool_b"),
+            ("call-c", "tool_c"),
+        ] {
+            let count = session
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.role == bamboo_agent_core::Role::Tool && m.tool_call_id.as_deref() == Some(id)
+                })
+                .count();
+            assert_eq!(count, 1, "tool {name} must have exactly one result message");
+        }
+    }
+
     // ── Async Gold/Task eval cancel + abort-on-early-exit (issue #347) ────
     //
     // The runner spawns Gold/Task evaluations as detached tokio tasks and only

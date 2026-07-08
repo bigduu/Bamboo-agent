@@ -338,12 +338,22 @@ async fn maybe_apply_host_context_compression_with_budget(
         .as_ref()
         .or(config.background_model_provider.as_ref())
         .unwrap_or(llm);
+    // Mid-turn compression is BEST-EFFORT (it runs between a turn's tool calls,
+    // after the assistant message is already committed). A transient
+    // summarization failure there must NOT be papered over with a low-quality
+    // heuristic summary that mutates in-flight context; it should SURFACE so the
+    // mid-turn call site can skip compression and continue with the uncompressed
+    // context (see `maybe_apply_mid_turn_context_compression_after_tool`). Every
+    // other phase (pre-turn, overflow-recovery) keeps the heuristic fallback so a
+    // round that genuinely needs the context reduced stays resilient. (issue #238)
+    let heuristic_fallback_on_error = phase_label != "mid-turn";
     let summarizer = LlmSummarizer::new(
         Arc::clone(summary_provider),
         summary_model.to_string(),
         existing_summary.clone(),
         None,
     )
+    .with_heuristic_fallback_on_error(heuristic_fallback_on_error)
     .with_context_blocks(compression_context_blocks)
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {
