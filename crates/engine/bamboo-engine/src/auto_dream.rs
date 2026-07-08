@@ -485,7 +485,10 @@ fn full_rebuild_marker_line(
     {
         format!("Last full rebuild at: {}\n", now.to_rfc3339())
     } else if let Some(existing_rebuild_at) = last_full_rebuild_at {
-        format!("Last full rebuild at: {}\n", existing_rebuild_at.to_rfc3339())
+        format!(
+            "Last full rebuild at: {}\n",
+            existing_rebuild_at.to_rfc3339()
+        )
     } else {
         String::new()
     }
@@ -648,8 +651,12 @@ async fn run_auto_dream_once_for_scope(
     };
     let notebook_body =
         build_dream_notebook_body(&bg_provider, &model, &source_window, generation_mode).await?;
-    let last_full_rebuild_line =
-        full_rebuild_marker_line(force_full_rebuild, generation_mode, last_full_rebuild_at, now);
+    let last_full_rebuild_line = full_rebuild_marker_line(
+        force_full_rebuild,
+        generation_mode,
+        last_full_rebuild_at,
+        now,
+    );
     let final_note = match scope {
         MemoryScope::Global => format!(
             "# Bamboo Dream Notebook\n\nLast consolidated at: {}\n{}Sessions reviewed: {}\nModel: {}\n\n{}\n",
@@ -799,7 +806,10 @@ mod tests {
         // must SEED the marker with `now`, so the 30-day periodic cadence has a
         // start point instead of never firing.
         let line = full_rebuild_marker_line(false, DreamGenerationMode::Rebuild, None, now);
-        assert_eq!(line, format!("Last full rebuild at: {}\n", now.to_rfc3339()));
+        assert_eq!(
+            line,
+            format!("Last full rebuild at: {}\n", now.to_rfc3339())
+        );
     }
 
     #[test]
@@ -810,12 +820,8 @@ mod tests {
         // Once seeded, an ordinary (non-forced) pass must PRESERVE the marker, not
         // reset it to `now` — otherwise the timer would restart every tick and the
         // periodic sweep would never come due.
-        let line = full_rebuild_marker_line(
-            false,
-            DreamGenerationMode::Rebuild,
-            Some(existing),
-            now,
-        );
+        let line =
+            full_rebuild_marker_line(false, DreamGenerationMode::Rebuild, Some(existing), now);
         assert_eq!(
             line,
             format!("Last full rebuild at: {}\n", existing.to_rfc3339())
@@ -830,7 +836,10 @@ mod tests {
         // The periodic forced pass re-stamps `now`, advancing the cadence.
         let line =
             full_rebuild_marker_line(true, DreamGenerationMode::Rebuild, Some(existing), now);
-        assert_eq!(line, format!("Last full rebuild at: {}\n", now.to_rfc3339()));
+        assert_eq!(
+            line,
+            format!("Last full rebuild at: {}\n", now.to_rfc3339())
+        );
     }
 
     #[test]

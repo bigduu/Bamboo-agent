@@ -1854,8 +1854,9 @@ mod tests {
         );
         // ...and the image is preserved as an input_image part.
         assert!(
-            arr.iter().any(|p| p["type"] == "input_image"
-                && p["image_url"] == "data:image/png;base64,AAAA"),
+            arr.iter()
+                .any(|p| p["type"] == "input_image"
+                    && p["image_url"] == "data:image/png;base64,AAAA"),
             "image part missing: {output}"
         );
     }
@@ -1890,12 +1891,11 @@ mod tests {
         let arr = out[0]["content"]
             .as_array()
             .expect("fallback content should be a typed array");
+        assert!(arr.iter().any(|p| p["type"] == "input_text"
+            && p["text"].as_str().unwrap_or("").contains("[tool_result]")));
         assert!(arr
             .iter()
-            .any(|p| p["type"] == "input_text"
-                && p["text"].as_str().unwrap_or("").contains("[tool_result]")));
-        assert!(arr.iter().any(|p| p["type"] == "input_image"
-            && p["image_url"] == "data:image/png;base64,BBBB"));
+            .any(|p| p["type"] == "input_image" && p["image_url"] == "data:image/png;base64,BBBB"));
     }
 
     #[test]

@@ -21,7 +21,9 @@
 
 use actix_cors::Cors;
 use actix_governor::governor::middleware::NoOpMiddleware;
-use actix_governor::{GovernorConfig, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError};
+use actix_governor::{
+    GovernorConfig, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError,
+};
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::header;
@@ -973,9 +975,7 @@ mod tests {
         let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(mask_ipv6_prefix(v4), v4);
 
-        let v6 = IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6,
-        ));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6));
         // /56: first 7 bytes preserved, remaining 9 zeroed.
         assert_eq!(
             mask_ipv6_prefix(v6),
