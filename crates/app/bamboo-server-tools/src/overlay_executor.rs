@@ -19,6 +19,30 @@ impl OverlayToolExecutor {
     pub fn new(base: std::sync::Arc<dyn ToolExecutor>, overlay: std::sync::Arc<dyn Tool>) -> Self {
         Self { base, overlay }
     }
+
+    /// Resolve the args to hand the overlay tool, parsing the raw JSON at most
+    /// once (issue #106). When the dispatch loop already parsed them (threaded via
+    /// `ctx.pre_parsed_args`), reuse that value — the malformed-args fallback
+    /// `warn!` was already emitted (or not) at the dispatch site, so it is never
+    /// re-emitted here. Otherwise parse leniently, warning once on fallback,
+    /// preserving the original single-parse-per-consumer behavior.
+    fn resolve_args(&self, call: &ToolCall, ctx: &ToolExecutionContext<'_>) -> serde_json::Value {
+        if let Some(pre_parsed) = ctx.pre_parsed_args {
+            return pre_parsed.clone();
+        }
+        let args_raw = call.function.arguments.trim();
+        let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+        if let Some(warning) = parse_warning {
+            tracing::warn!(
+                "Overlay tool argument parsing fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
+                call.id,
+                call.function.name,
+                args_raw.len(),
+                warning
+            );
+        }
+        args
+    }
 }
 
 #[async_trait]
@@ -47,17 +71,15 @@ impl ToolExecutor for OverlayToolExecutor {
             if let Some(outcome) = self.base.check_permissions_for(call, &ctx).await? {
                 return Ok(outcome.into_tool_result());
             }
-            let args_raw = call.function.arguments.trim();
-            let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
-            if let Some(warning) = parse_warning {
-                tracing::warn!(
-                    "Overlay tool argument parsing fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
-                    call.id,
-                    call.function.name,
-                    args_raw.len(),
-                    warning
-                );
-            }
+            // Reuse the args the dispatching loop already parsed (threaded via the
+            // context) instead of re-parsing the raw JSON string a second time here
+            // (issue #106). The threaded value is the exact output of the same
+            // parser on the same input, so reuse is behavior-preserving — and it
+            // means the malformed-args fallback `warn!` fires at most once per call
+            // (at the dispatch site), never re-emitted here. When absent (`none()`
+            // contexts, tests, synthesized child calls), parse leniently exactly as
+            // before, including the fallback warning.
+            let args = self.resolve_args(call, &ctx);
             return self
                 .overlay
                 .invoke(args, ctx.to_tool_ctx())
@@ -83,7 +105,9 @@ impl ToolExecutor for OverlayToolExecutor {
             if let Some(outcome) = self.base.check_permissions_for(call, &ctx).await? {
                 return Ok(outcome);
             }
-            let (args, _) = parse_tool_args_best_effort(&call.function.arguments);
+            // Reuse the dispatch-parsed args (parse-once) exactly as in
+            // `execute_with_context` above (issue #106).
+            let args = self.resolve_args(call, &ctx);
             return self.overlay.invoke(args, ctx.to_tool_ctx()).await;
         }
         self.base.execute_with_context_outcome(call, ctx).await
@@ -410,6 +434,150 @@ mod tests {
         assert!(
             matches!(result, Err(ToolError::Execution(ref msg)) if msg.contains("denied-by-base-gate")),
             "overlay check_permissions_for must return the base's decision, got: {result:?}"
+        );
+    }
+
+    // ---- issue #106: overlay reuses pre-parsed args (parse-once, no re-warn) ---
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
+
+    /// An overlay tool that records the exact args `Value` it was invoked with, so
+    /// a test can prove WHICH value the overlay passed through: the threaded
+    /// pre-parsed value, or a re-parse of the raw string.
+    struct ArgsRecordingOverlayTool {
+        seen: std::sync::Arc<StdMutex<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ArgsRecordingOverlayTool {
+        fn name(&self) -> &str {
+            "memory"
+        }
+
+        fn description(&self) -> &str {
+            "records the args it was invoked with"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object","properties":{}})
+        }
+
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            *self.seen.lock().unwrap() = Some(args);
+            Ok(ToolOutcome::Completed(ToolResult {
+                success: true,
+                result: "ok".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            }))
+        }
+    }
+
+    /// Minimal tracing subscriber that counts WARN-level events on the current
+    /// thread — lets a test assert whether the malformed-args fallback `warn!`
+    /// fired, without pulling in `tracing-subscriber` as a dev-dependency.
+    #[derive(Clone, Default)]
+    struct WarnCounter {
+        warns: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.warns.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _s: &tracing::span::Id) {}
+        fn exit(&self, _s: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn overlay_reuses_pre_parsed_args_and_skips_refallback_warn() {
+        // The dispatch loop already parsed the args once and threaded them via
+        // `ctx.pre_parsed_args`. The overlay must reuse that value rather than
+        // re-parse `call.function.arguments` — so even MALFORMED raw args do NOT
+        // trigger a second parse (nor its malformed-args fallback `warn!`).
+        let seen = std::sync::Arc::new(StdMutex::new(None));
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(BaseExecutor),
+            std::sync::Arc::new(ArgsRecordingOverlayTool { seen: seen.clone() }),
+        );
+
+        // Distinctive parsed value; raw args are deliberately broken so a re-parse
+        // would fall back to `{}` AND warn — neither must happen.
+        let pre_parsed = json!({"action": "query", "threaded": true});
+        let call = make_call_with_args("memory", "{ this is not valid json");
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.pre_parsed_args = Some(&pre_parsed);
+
+        let counter = WarnCounter::default();
+        let warns = counter.warns.clone();
+        {
+            let _guard = tracing::subscriber::set_default(counter);
+            overlay
+                .execute_with_context(&call, ctx)
+                .await
+                .expect("overlay call should succeed");
+        }
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(pre_parsed),
+            "overlay must invoke with the threaded pre-parsed args, not a re-parse of the raw string"
+        );
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            0,
+            "reusing pre-parsed args must NOT re-emit the malformed-args fallback warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_without_pre_parsed_reparses_and_warns_on_malformed_args() {
+        // Control proving the WarnCounter observes the fallback warn and that the
+        // reuse path above is what suppresses it: with NO pre-parsed args, the
+        // overlay re-parses the malformed raw string, falls back to `{}`, warns once.
+        let seen = std::sync::Arc::new(StdMutex::new(None));
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(BaseExecutor),
+            std::sync::Arc::new(ArgsRecordingOverlayTool { seen: seen.clone() }),
+        );
+
+        let call = make_call_with_args("memory", "{ this is not valid json");
+        let ctx = ToolExecutionContext::none(&call.id); // pre_parsed_args = None
+
+        let counter = WarnCounter::default();
+        let warns = counter.warns.clone();
+        {
+            let _guard = tracing::subscriber::set_default(counter);
+            overlay
+                .execute_with_context(&call, ctx)
+                .await
+                .expect("overlay call should succeed");
+        }
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(json!({})),
+            "no pre-parsed args → the malformed raw string parses to the empty-object fallback"
+        );
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            1,
+            "the malformed-args fallback must warn exactly once when it actually parses"
         );
     }
 }

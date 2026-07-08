@@ -53,6 +53,14 @@ enum HeadlessPromptAction {
     /// `response` is the answer to submit (the `deny` option, fail-closed);
     /// `message` explains the auto-decision to the operator/log.
     Resolve { response: String, message: String },
+    /// stdin is NOT a terminal AND the gate has no submittable fail-closed answer
+    /// (no `deny`-labelled option and custom answers are disabled — e.g.
+    /// `exit_plan_mode`'s `["Approve …", "Stay in plan mode"]`). Routing the
+    /// literal `"deny"` fallback through `submit_response` would be guaranteed
+    /// invalid and the run would exit on a `respond rejected` error. Skip that
+    /// doomed round-trip and exit gracefully — still fail-closed (the gated tool
+    /// never runs), just cleanly (#80). `message` explains why to the operator.
+    Abort { message: String },
 }
 
 /// Decide how to handle a pending question given whether stdin is a terminal.
@@ -73,8 +81,28 @@ fn resolve_headless_permission(
     }
     // Fail closed: pick the question's own `deny` option (e.g. permission gates use
     // ["Approve", "Deny"]) so the respond validator's exact-match accepts it.
+    let deny = pick_option(&pending.options, "deny");
+    // `pick_option` falls back to the literal "deny" when no option matches. For an
+    // Approve-first gate with no deny-labelled option (e.g. `exit_plan_mode`'s
+    // `["Approve …", "Stay in plan mode"]`), that literal is NOT one of the options,
+    // so — unless the gate accepts custom answers — submitting it is guaranteed to
+    // be rejected by the respond validator. Don't route a doomed answer: abort
+    // gracefully instead (still fail-closed; the gated tool never runs) (#80).
+    let deny_is_submittable =
+        pending.allow_custom || pending.options.iter().any(|opt| opt == &deny);
+    if !deny_is_submittable {
+        return HeadlessPromptAction::Abort {
+            message: format!(
+                "cannot auto-resolve this permission gate in headless mode \
+                 (no deny option among {:?} and custom answers are disabled): \"{}\". \
+                 Pass --permission-mode bypass|accept-edits|dont-ask to run non-interactively.",
+                pending.options,
+                pending.question.trim()
+            ),
+        };
+    }
     HeadlessPromptAction::Resolve {
-        response: pick_option(&pending.options, "deny"),
+        response: deny,
         message: format!(
             "no interactive approver (stdin is not a TTY): auto-denying \"{}\". \
              Pass --permission-mode bypass|accept-edits|dont-ask to run non-interactively.",
@@ -104,6 +132,12 @@ async fn prompt_pending_response(pending: &bamboo_agent_core::PendingQuestion) -
         HeadlessPromptAction::Resolve { response, message } => {
             eprintln!("\n⏸  {message}");
             return Some(response);
+        }
+        HeadlessPromptAction::Abort { message } => {
+            // No submittable fail-closed answer: report and leave the question
+            // unanswered rather than routing a guaranteed-invalid one (#80).
+            eprintln!("\n⏸  {message}");
+            return None;
         }
         HeadlessPromptAction::Prompt => {}
     }
@@ -448,7 +482,10 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         let Some(pending) = pending else { break 'run };
 
         let Some(response) = prompt_pending_response(&pending).await else {
-            eprintln!("• no input (EOF) — leaving the question unanswered");
+            // Either EOF on a TTY or a headless gate with no submittable
+            // fail-closed answer (see `HeadlessPromptAction::Abort`). Either way,
+            // leave the question unanswered and exit — the gated tool never ran.
+            eprintln!("• leaving the question unanswered (headless, fail-closed)");
             break 'run;
         };
 
@@ -724,6 +761,9 @@ mod tests {
                 assert!(message.contains("--permission-mode"));
                 assert!(message.to_ascii_lowercase().contains("deny"));
             }
+            HeadlessPromptAction::Abort { .. } => {
+                panic!("a gate with a real Deny option must resolve to it, not abort");
+            }
             HeadlessPromptAction::Prompt => {
                 panic!("non-TTY must resolve deterministically, not prompt on stdin");
             }
@@ -751,7 +791,87 @@ mod tests {
             HeadlessPromptAction::Resolve { response, .. } => {
                 assert_eq!(response, "Deny this");
             }
+            HeadlessPromptAction::Abort { .. } => {
+                panic!("a gate with a deny-containing option must resolve to it, not abort")
+            }
             HeadlessPromptAction::Prompt => panic!("expected deterministic resolve"),
+        }
+    }
+
+    /// Issue #80 (part a): an Approve-FIRST gate with NO `deny`-labelled option
+    /// (e.g. `exit_plan_mode`'s `["Approve …", "Stay in plan mode"]`) must, under a
+    /// non-TTY headless run, NEVER resolve to the Approve option — it stays fail
+    /// closed regardless of how the no-deny case is handled.
+    #[test]
+    fn non_tty_approve_first_never_auto_approves() {
+        let mut pending = permission_gate();
+        pending.options = vec![
+            "Approve (proceed with the plan)".to_string(),
+            "Stay in plan mode".to_string(),
+        ];
+        match resolve_headless_permission(false, &pending) {
+            HeadlessPromptAction::Resolve { response, .. } => assert!(
+                !response.to_ascii_lowercase().contains("approve"),
+                "fail-closed must never auto-approve; got {response:?}"
+            ),
+            // No answer is routed at all → trivially never approves.
+            HeadlessPromptAction::Abort { .. } => {}
+            HeadlessPromptAction::Prompt => {
+                panic!("non-TTY must resolve deterministically, not prompt on stdin")
+            }
+        }
+    }
+
+    /// Issue #80 (part b): the same Approve-FIRST / no-deny-label gate must not
+    /// route the guaranteed-invalid literal `"deny"` through `submit_response`
+    /// (which would exit on a `respond rejected` error). It resolves to a graceful
+    /// `Abort` that points at the escape hatch — still fail-closed, just clean.
+    #[test]
+    fn non_tty_approve_first_without_deny_label_aborts_gracefully() {
+        let mut pending = permission_gate();
+        pending.question = "Ready to code? Here is the plan…".to_string();
+        pending.options = vec![
+            "Approve (proceed with the plan)".to_string(),
+            "Keep planning".to_string(),
+            "Stay in plan mode".to_string(),
+        ];
+        pending.allow_custom = false;
+        match resolve_headless_permission(false, &pending) {
+            HeadlessPromptAction::Abort { message } => {
+                assert!(message.to_ascii_lowercase().contains("cannot auto-resolve"));
+                assert!(message.contains("--permission-mode"));
+            }
+            HeadlessPromptAction::Resolve { response, .. } => {
+                // Even without part (b) the fallback must never auto-approve, but a
+                // guaranteed-invalid literal answer is exactly what (b) removes.
+                assert!(
+                    !response.to_ascii_lowercase().contains("approve"),
+                    "must never auto-approve; got {response:?}"
+                );
+                panic!(
+                    "approve-first gate with no deny option must Abort gracefully, \
+                     not route the invalid answer {response:?} through submit_response"
+                );
+            }
+            HeadlessPromptAction::Prompt => panic!("non-TTY must resolve deterministically"),
+        }
+    }
+
+    /// A gate that accepts custom answers can still submit the literal `"deny"`
+    /// even with no deny-labelled option, so it resolves (does not abort).
+    #[test]
+    fn non_tty_no_deny_label_but_custom_allowed_resolves() {
+        let mut pending = permission_gate();
+        pending.options = vec!["Approve".to_string(), "Stay in plan mode".to_string()];
+        pending.allow_custom = true;
+        match resolve_headless_permission(false, &pending) {
+            HeadlessPromptAction::Resolve { response, .. } => {
+                assert_eq!(response, "deny");
+            }
+            HeadlessPromptAction::Abort { .. } => {
+                panic!("custom-answer gates can submit the literal deny; must not abort")
+            }
+            HeadlessPromptAction::Prompt => panic!("non-TTY must resolve deterministically"),
         }
     }
 
