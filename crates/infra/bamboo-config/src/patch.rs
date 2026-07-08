@@ -8,10 +8,17 @@ use serde_json::{Map, Value};
 use crate::Config;
 
 /// Detect whether a string value looks like a masked/placeholder API key.
+///
+/// Only a value consisting entirely of `*`/`.` characters counts (the redaction
+/// placeholder `****...****`, or truncated/retyped variants of it). Substring
+/// matching is deliberately avoided: the UI prefills the placeholder into the
+/// editable field, so a paste that doesn't fully clear it yields values like
+/// `****...****sk-new…` — treating those as "keep existing key" silently
+/// discards the user's new token (#430).
 pub fn is_masked_api_key(value: &str) -> bool {
     let v = value.trim();
     // Empty string is treated as an explicit "clear" signal (we control all clients).
-    v.contains("***") || v.contains("...") || v == "****...****"
+    !v.is_empty() && v.chars().all(|c| c == '*' || c == '.')
 }
 
 /// Extract API-key update intents from a config patch.
@@ -409,5 +416,26 @@ mod tests {
         assert!(!intents.providers.contains("openai"));
         assert!(intents.provider_instances.contains("personal-openai"));
         assert!(!intents.provider_instances.contains("work-openai"));
+    }
+
+    #[test]
+    fn is_masked_api_key_requires_placeholder_only_values() {
+        // The redaction placeholder and all-asterisk/dot variants are masked.
+        assert!(is_masked_api_key("****...****"));
+        assert!(is_masked_api_key("********"));
+        assert!(is_masked_api_key("  ****...****  "));
+
+        // Empty is a "clear" signal, not a mask.
+        assert!(!is_masked_api_key(""));
+        assert!(!is_masked_api_key("   "));
+
+        // A placeholder with a real key pasted after it must NOT be treated as
+        // masked — that silently discards the user's new token (#430).
+        assert!(!is_masked_api_key("****...****sk-newkey123"));
+        assert!(!is_masked_api_key("sk-newkey123****...****"));
+
+        // Real keys containing dots or asterisks among other characters are keys.
+        assert!(!is_masked_api_key("id.secret...suffix"));
+        assert!(!is_masked_api_key("sk-live-abc"));
     }
 }

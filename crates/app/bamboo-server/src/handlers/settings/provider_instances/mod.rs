@@ -214,6 +214,14 @@ fn build_instance_from_create(
 
     let instance: ProviderInstanceConfig = serde_json::from_value(Value::Object(obj))
         .map_err(|e| AppError::BadRequest(format!("Invalid provider instance config: {e}")))?;
+    // On CREATE there is no existing key a placeholder could refer to — storing
+    // the literal `****...****` as the api_key would break the provider (#430).
+    if config_manager::is_masked_api_key(&instance.api_key) {
+        return Err(AppError::BadRequest(
+            "api_key looks like a masked placeholder (`****...****`); enter the real key"
+                .to_string(),
+        ));
+    }
     validate_instance_config(&instance)?;
     Ok(instance)
 }
@@ -490,4 +498,34 @@ pub async fn set_default_provider_instance(
         "success": true,
         "default_provider_instance_id": new_config.default_provider_instance,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_request(api_key: &str) -> CreateInstanceRequest {
+        CreateInstanceRequest {
+            provider_type: "openai".to_string(),
+            label: None,
+            enabled: None,
+            config: serde_json::json!({ "api_key": api_key }),
+        }
+    }
+
+    #[test]
+    fn create_rejects_masked_placeholder_api_key() {
+        let err = build_instance_from_create(&create_request("****...****"))
+            .expect_err("placeholder api_key must be rejected on create");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn create_accepts_real_api_key_even_with_placeholder_residue() {
+        // A paste that didn't fully clear the prefilled placeholder is a real
+        // (if garbled) key — it must be stored as given, not silently dropped.
+        let instance = build_instance_from_create(&create_request("****...****sk-new"))
+            .expect("mixed value is not a placeholder");
+        assert_eq!(instance.api_key, "****...****sk-new");
+    }
 }
