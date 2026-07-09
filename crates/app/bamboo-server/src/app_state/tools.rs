@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
+use bamboo_agent_core::AgentEvent;
 use bamboo_llm::Config;
 use bamboo_mcp::manager::McpServerManager;
 use bamboo_skills::SkillManager;
@@ -21,6 +22,7 @@ use bamboo_storage::LockedSessionStore;
 use bamboo_storage::SessionStoreV2;
 
 use super::init::PermissionChecker;
+use super::watchers::SessionWatchers;
 use super::{AgentRunner, ScheduleManager, ScheduleStore, SpawnScheduler};
 
 #[allow(clippy::too_many_arguments)]
@@ -33,6 +35,9 @@ pub(super) fn build_base_tools(
     persistence: Arc<LockedSessionStore>,
     sessions: bamboo_engine::SessionCache,
     app_data_dir: PathBuf,
+    notification_service: Arc<bamboo_notification::NotificationService>,
+    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_watchers: Arc<SessionWatchers>,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -83,7 +88,7 @@ pub(super) fn build_base_tools(
 
     let read_skill_resource_tool = Arc::new(crate::tools::ReadSkillResourceTool::new(
         skill_manager,
-        config,
+        config.clone(),
         session_repo,
     ));
     let with_skills: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
@@ -93,9 +98,25 @@ pub(super) fn build_base_tools(
 
     // compact_context is available to all sessions for manual compression.
     let compact_tool = Arc::new(crate::tools::CompactContextTool);
-    Arc::new(crate::tools::OverlayToolExecutor::new(
+    let with_compact: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_skills,
         compact_tool,
+    ));
+
+    // notify is available to all sessions (including headless/scheduled runs
+    // with no live subscriber — that's the whole point of proactively
+    // alerting the owner) for proactively surfacing something outside the
+    // chat transcript.
+    let notify_dispatcher = Arc::new(crate::tools::ServerNotificationDispatcher::new(
+        notification_service,
+        session_event_senders,
+        session_watchers,
+        config,
+    ));
+    let notify_tool = Arc::new(crate::tools::NotifyTool::new(notify_dispatcher));
+    Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_compact,
+        notify_tool,
     ))
 }
 

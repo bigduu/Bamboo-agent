@@ -277,6 +277,17 @@ pub fn check_permissions(
         // Read-only: session_inspector (list / get_meta / read_messages) and the
         // session_history viewer never mutate or spin up compute. #395.
         "session_inspector" | "session_history" => Ok(None),
+        // `notify` fires an outbound OS popup / push notification but mutates
+        // nothing in the session or workspace, so it is explicitly ungated
+        // (auto-approved) by design: a reminder/alert tool that itself
+        // prompts for permission is useless in headless/scheduled runs — the
+        // whole point is surfacing something to the human without them
+        // having to already be watching. A user `deny notify(*)` ask-rule can
+        // still target it by name if they want to opt out. Listed explicitly
+        // (not left to the catch-all) per the #395 lesson: an unlisted tool
+        // being silently ungated is a bug, an intentionally-ungated one
+        // documented here is a decision.
+        "notify" => Ok(None),
         _ => Ok(None),
     }
 }
@@ -434,6 +445,23 @@ mod tests {
                 "{tool} {args} should stay ungated"
             );
         }
+    }
+
+    #[test]
+    fn notify_is_explicitly_ungated() {
+        // `notify` must hit the EXPLICIT `"notify" => Ok(None)` arm, not the
+        // catch-all — asserting a specific-enough shape (empty args) still
+        // pass through confirms it isn't relying on `required_string_arg`
+        // machinery that would otherwise error first.
+        let contexts = check_permissions(
+            "notify",
+            &json!({"title": "Reminder", "message": "Stand up", "priority": "high"}),
+        )
+        .unwrap();
+        assert!(
+            contexts.is_none(),
+            "notify must be auto-approved (ungated) by design"
+        );
     }
 
     #[test]

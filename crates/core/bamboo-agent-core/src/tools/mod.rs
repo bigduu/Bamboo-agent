@@ -155,6 +155,16 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // mutation happens in the engine, and it touches no user-facing state, so it
     // never needs approval.
     "update_goal",
+    // `notify` (an overlay tool, like `compact_context`/`session_inspector`
+    // above) fires an outbound OS popup / push side effect but mutates
+    // nothing in the session or workspace and produces no result the model
+    // reads back — safe both to run in the concurrent read-only batch
+    // (`ToolExecutor::tool_concurrency_safe`, which name-matches here since
+    // overlay tools aren't in a `BuiltinToolExecutor` registry for their own
+    // `Tool::classify()` to be consulted) and to allow through the Plan Mode
+    // gate (surfacing a heads-up is exactly the "needs attention" case Plan
+    // Mode shouldn't block).
+    "notify",
 ];
 
 /// Classify a tool call as read-only or mutating.

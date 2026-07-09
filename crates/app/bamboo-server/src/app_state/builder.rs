@@ -222,6 +222,13 @@ impl AppState {
             provider_registry.clone(),
         ));
 
+        // Long-lived session event senders map (UI subscriptions + background tasks).
+        // Declared before `build_base_tools` (moved up from its original spot below)
+        // because the `notify` tool overlaid there needs it to broadcast onto a
+        // session's live channel — see `app_state::tools::build_base_tools`.
+        let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -231,11 +238,10 @@ impl AppState {
             persistence.clone(),
             sessions.clone(),
             bamboo_home_dir.clone(),
+            notification_service.clone(),
+            session_event_senders.clone(),
+            session_watchers.clone(),
         );
-
-        // Long-lived session event senders map (UI subscriptions + background tasks).
-        let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
 
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
