@@ -161,9 +161,39 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(tabs, area);
 }
 
+/// Every binding `App::handle_key`/the per-tab handlers respond to, paired
+/// into two side-by-side columns so the overlay stays to one screen instead
+/// of scrolling off a normal-height terminal. Keep in sync with `app.rs` —
+/// this is the single source of truth for "what can I press right now".
+const HELP_LEFT: &[(&str, &str)] = &[
+    ("1-6", "Switch tab (Chat types digits)"),
+    ("Tab / Shift+Tab", "Next / previous tab"),
+    ("Enter", "Send / select / resume session"),
+    ("Alt+Enter", "Insert newline (Chat)"),
+    ("\u{2191}/\u{2193}, Wheel", "Move selection (lists)"),
+    ("j/k, Wheel", "Scroll (Chat/Config)"),
+    ("PgUp/PgDn", "Scroll by page (Chat/Config)"),
+    ("g / G", "Jump to top / bottom (Chat)"),
+];
+const HELP_RIGHT: &[(&str, &str)] = &[
+    ("Ctrl+N", "New session"),
+    ("Ctrl+O", "Model picker (Chat)"),
+    ("Ctrl+Q", "Reopen pending question"),
+    ("Ctrl+C", "Quit / stop streaming"),
+    ("Ctrl+S", "Stop agent execution"),
+    ("Ctrl+X", "Expand/collapse tool detail"),
+    ("Ctrl+L", "Notification log"),
+    ("] / [", "Next / previous page (Sessions)"),
+    ("d", "Delete, with confirm (Sessions/Schedules)"),
+    ("n / e", "New schedule / edit config"),
+    ("r / t", "Refresh / run · refresh MCP tools"),
+    ("F1 / ?", "Toggle this help (? not on Chat)"),
+];
+
 pub fn render_help(f: &mut Frame) {
-    let area = centered_rect(50, 25, f.area());
-    let help_text = vec![
+    let screen = f.area();
+    const KEY_COL: usize = 17;
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             " Keybindings",
             Style::default()
@@ -171,36 +201,22 @@ pub fn render_help(f: &mut Frame) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
-        Line::raw("  1-6         Switch tab (non-Chat tabs; Chat types digits)"),
-        Line::raw("  Tab         Next tab"),
-        Line::raw("  Shift+Tab   Previous tab"),
-        Line::raw("  Enter       Send message / Select item"),
-        Line::raw("                (Sessions: resume w/ history + reattach)"),
-        Line::raw("  Alt+Enter   Insert newline (Chat)"),
-        Line::raw("  Ctrl+N      New session"),
-        Line::raw("  Ctrl+O      Model picker (Chat)"),
-        Line::raw("  Ctrl+Q      Reopen pending question (if dismissed)"),
-        Line::raw("  Ctrl+C      Quit / Stop streaming"),
-        Line::raw("  Ctrl+S      Stop agent execution"),
-        Line::raw("  Ctrl+X      Expand/collapse tool args & results"),
-        Line::raw("  Ctrl+L      Notification log"),
-        Line::raw("  j/k         Scroll down/up (Chat/Config)"),
-        Line::raw("  PgUp/PgDn   Scroll by page (Chat/Config)"),
-        Line::raw("  g / G       Jump to top / bottom (Chat)"),
-        Line::raw("  Wheel       Scroll (Chat/Config) or move selection (lists)"),
-        Line::raw("  n           New schedule (Schedules)"),
-        Line::raw("  e           Edit config (Config)"),
-        Line::raw("  d           Delete (with confirm)"),
-        Line::raw("  ] / [       Next / previous page (Sessions)"),
-        Line::raw("  r           Refresh / Run schedule"),
-        Line::raw("  t           Refresh MCP tools"),
-        Line::raw("  F1          Toggle this help (any tab)"),
-        Line::raw("  ?           Toggle this help (non-Chat tabs)"),
-        Line::raw(""),
-        Line::raw("  Press any key to close"),
     ];
+    let rows = HELP_LEFT.len().max(HELP_RIGHT.len());
+    for i in 0..rows {
+        let (lk, ld) = HELP_LEFT.get(i).copied().unwrap_or(("", ""));
+        let (rk, rd) = HELP_RIGHT.get(i).copied().unwrap_or(("", ""));
+        lines.push(Line::raw(format!(
+            "  {lk:<KEY_COL$}{ld:<34}{rk:<KEY_COL$}{rd}"
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("  Press any key to close"));
 
-    let help = Paragraph::new(help_text).block(
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(90, height, screen);
+    f.render_widget(Clear, area);
+    let help = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(colors::BRAND)),
@@ -566,4 +582,44 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
         popup_width.min(r.width),
         height.min(r.height),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::BambooClient;
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// The two-column help overlay must fit a normal-height terminal without
+    /// vertical clipping and must still mention the headline bindings — the
+    /// single-column version it replaced listed 29 lines in a fixed 25-row
+    /// modal and silently clipped the bottom entries on anything but a tall
+    /// terminal.
+    #[test]
+    fn help_overlay_fits_one_screen_and_lists_bindings() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.help_visible = true;
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        for needle in [
+            "Ctrl+N",
+            "Ctrl+O",
+            "Ctrl+Q",
+            "Ctrl+C",
+            "Ctrl+S",
+            "Ctrl+X",
+            "Ctrl+L",
+            "Alt+Enter",
+            "F1",
+            "Press any key to close",
+        ] {
+            assert!(text.contains(needle), "help overlay missing {needle:?}");
+        }
+    }
 }

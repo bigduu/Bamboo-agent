@@ -910,6 +910,34 @@ impl App {
         self.config.scroll_offset = self.config.scroll_offset.saturating_sub(delta);
     }
 
+    /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
+    /// Ctrl+L are gated on this so they can't stack a second overlay on top
+    /// of one of these five — see the precedence comment on `handle_key`.
+    fn any_modal_open(&self) -> bool {
+        self.pending_question.is_some()
+            || self.pending_delete.is_some()
+            || self.model_picker.is_some()
+            || self.schedule_form.is_some()
+            || self.config_editor.is_some()
+    }
+
+    /// Route one key event.
+    ///
+    /// Modal precedence (checked top to bottom, each returning early — so at
+    /// most one modal ever owns the keyboard, and every one of them runs
+    /// before the global bindings further down: Ctrl+N/Ctrl+O/Ctrl+Q, `?`,
+    /// digit tab-switching, Tab/Shift+Tab):
+    ///   1. `pending_question` — agent permission/clarification gate
+    ///   2. `pending_delete`   — session delete confirmation
+    ///   3. `model_picker`     — Ctrl+O provider-catalog picker
+    ///   4. `schedule_form`    — new-schedule authoring form
+    ///   5. `config_editor`    — raw config JSON editor
+    ///
+    /// Ctrl+C (stop/quit) always preempts every modal. F1/Ctrl+`?`/Ctrl+L
+    /// (help/notifications) are gated on `any_modal_open` below instead: with
+    /// a modal open they fall straight through to that modal's own handler,
+    /// so a stray F1 can't eat the keystroke the modal was waiting for or
+    /// stack the help overlay on top of it.
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
@@ -920,7 +948,7 @@ impl App {
                 self.running = false;
                 return Ok(());
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('?')) => {
+            (KeyModifiers::CONTROL, KeyCode::Char('?')) if !self.any_modal_open() => {
                 // Most terminals never deliver Ctrl+Shift+/ as Ctrl+'?' (it
                 // maps elsewhere), so this is kept only as a harmless extra —
                 // F1 below and plain `?` (further down, non-Chat tabs) are
@@ -928,13 +956,13 @@ impl App {
                 self.help_visible = true;
                 return Ok(());
             }
-            (_, KeyCode::F(1)) => {
+            (_, KeyCode::F(1)) if !self.any_modal_open() => {
                 // F1 opens help on every tab, including Chat, regardless of
                 // modifiers — unlike `?` it never collides with typing.
                 self.help_visible = true;
                 return Ok(());
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+            (KeyModifiers::CONTROL, KeyCode::Char('l')) if !self.any_modal_open() => {
                 self.notifications_visible = true;
                 self.unseen_alerts = 0;
                 return Ok(());
@@ -942,19 +970,26 @@ impl App {
             _ => {}
         }
 
-        // A pending agent question captures all input (Ctrl+C above still
+        // 1. A pending agent question captures all input (Ctrl+C above still
         // stops the run) until it is answered or dismissed.
         if self.pending_question.is_some() {
             return self.handle_question_key(key).await;
         }
 
-        // The delete-confirmation modal likewise captures all input before
+        // 2. The delete-confirmation modal likewise captures all input before
         // anything else (including tab-switching digits) can reach it.
         if self.pending_delete.is_some() {
             return self.handle_delete_confirm_key(key).await;
         }
 
-        // The schedule-authoring modal likewise captures all input: Tab moves
+        // 3. The model picker likewise captures all input (navigation/apply)
+        // before the global bindings below — same pattern as the other
+        // modals.
+        if self.model_picker.is_some() {
+            return self.handle_model_picker_key(key).await;
+        }
+
+        // 4. The schedule-authoring modal likewise captures all input: Tab moves
         // between fields and digits belong in cron expressions, so it must run
         // before the global Tab/1-6 tab-switching below (which would otherwise
         // swallow those keys and never reach the form).
@@ -963,18 +998,11 @@ impl App {
             return Ok(());
         }
 
-        // The config editor is a full multi-line text buffer, so it must claim
+        // 5. The config editor is a full multi-line text buffer, so it must claim
         // every key (digits, Tab, Enter/newlines) before the global navigation
         // below — same rationale as the schedule form.
         if self.config_editor.is_some() {
             return self.handle_config_editor_key(key);
-        }
-
-        // The model picker likewise captures all input (navigation/apply)
-        // before the global bindings below — same pattern as the other
-        // modals.
-        if self.model_picker.is_some() {
-            return self.handle_model_picker_key(key).await;
         }
 
         // Ctrl+N / Ctrl+Q: global, but only reachable once every modal above
@@ -1893,23 +1921,45 @@ impl App {
                 self.schedules.selected = self.schedules.selected.saturating_sub(1);
             }
             KeyCode::Char('d') => {
-                if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                // Spawned off the event loop like every other mutation here
+                // (see `handle_mcp_key`'s connect/disconnect) — an inline
+                // `.await` on the UI thread would freeze the whole app
+                // (spinner, redraw, SSE receipt) for the round-trip.
+                if let (Some(schedule), Some(tx)) = (
+                    self.schedules.schedules.get(self.schedules.selected),
+                    self.event_tx.clone(),
+                ) {
                     let id = schedule.id.clone();
-                    // Don't `?`-propagate: a failed delete must surface in the
-                    // log, not tear down the whole TUI event loop.
-                    match self.client.delete_schedule(&id).await {
-                        Ok(()) => self.load_tab_data(),
-                        Err(e) => self.notify(NoticeLevel::Error, format!("Delete failed: {e}")),
-                    }
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let outcome = match client.delete_schedule(&id).await {
+                            Ok(()) => Ok("Schedule deleted".to_string()),
+                            Err(e) => Err(format!("Delete failed: {e}")),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            outcome,
+                            reload_tab: true,
+                        });
+                    });
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                if let (Some(schedule), Some(tx)) = (
+                    self.schedules.schedules.get(self.schedules.selected),
+                    self.event_tx.clone(),
+                ) {
                     let id = schedule.id.clone();
-                    match self.client.run_schedule_now(&id).await {
-                        Ok(()) => self.notify(NoticeLevel::Info, "Schedule triggered"),
-                        Err(e) => self.notify(NoticeLevel::Error, format!("Run failed: {e}")),
-                    }
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let outcome = match client.run_schedule_now(&id).await {
+                            Ok(()) => Ok("Schedule triggered".to_string()),
+                            Err(e) => Err(format!("Run failed: {e}")),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            outcome,
+                            reload_tab: false,
+                        });
+                    });
                 }
             }
             _ => {}
@@ -2443,6 +2493,31 @@ mod question_tests {
         app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
         app.handle_key(k(KeyCode::Char('y'))).await.unwrap();
         assert!(app.pending_delete.is_none());
+    }
+
+    /// F1/Ctrl+L must not stack the help/notification overlay on top of an
+    /// already-open modal — `any_modal_open` gates them so the keystroke
+    /// falls through to the modal's own handler instead (a no-op there,
+    /// since neither key means anything to the delete-confirm modal).
+    #[tokio::test]
+    async fn f1_and_ctrl_l_are_suppressed_while_a_modal_is_open() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
+
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(!app.help_visible, "F1 must not open help over a modal");
+        assert!(app.pending_delete.is_some(), "the modal must stay open");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(
+            !app.notifications_visible,
+            "Ctrl+L must not open the log over a modal"
+        );
+        assert!(app.pending_delete.is_some(), "the modal must stay open");
     }
 
     #[test]

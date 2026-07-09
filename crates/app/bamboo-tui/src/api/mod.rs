@@ -33,6 +33,11 @@ impl BambooClient {
             .json(&req)
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("chat failed ({status}): {}", body.trim());
+        }
         let chat_resp = resp.json().await?;
         Ok(chat_resp)
     }
@@ -62,10 +67,16 @@ impl BambooClient {
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(self.url(&format!("/api/v1/stop/{}", session_id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("stop failed ({status}): {}", body.trim());
+        }
         Ok(())
     }
 
@@ -255,23 +266,40 @@ impl BambooClient {
             .get(self.url("/api/v1/mcp/servers"))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list mcp servers failed ({status}): {body}");
+        }
         let servers = resp.json().await?;
         Ok(servers)
     }
 
     pub async fn connect_mcp(&self, id: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(self.url(&format!("/api/v1/mcp/servers/{}/connect", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("connect mcp failed ({status}): {}", body.trim());
+        }
         Ok(())
     }
 
     pub async fn disconnect_mcp(&self, id: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(self.url(&format!("/api/v1/mcp/servers/{}/disconnect", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("disconnect mcp failed ({status}): {}", body.trim());
+        }
         Ok(())
     }
 
@@ -281,6 +309,11 @@ impl BambooClient {
             .get(self.url(&format!("/api/v1/mcp/servers/{}/tools", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get mcp tools failed ({status}): {body}");
+        }
         let tools = resp.json().await?;
         Ok(tools)
     }
@@ -322,18 +355,30 @@ impl BambooClient {
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .delete(self.url(&format!("/api/v1/schedules/{}", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("delete schedule failed ({status}): {body}");
+        }
         Ok(())
     }
 
     pub async fn run_schedule_now(&self, id: &str) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(self.url(&format!("/api/v1/schedules/{}/run", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("run schedule failed ({status}): {body}");
+        }
         Ok(())
     }
 
@@ -341,6 +386,11 @@ impl BambooClient {
 
     pub async fn list_skills(&self) -> Result<Vec<Skill>> {
         let resp = self.client.get(self.url("/v1/skills")).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list skills failed ({status}): {body}");
+        }
         let skills = resp.json().await?;
         Ok(skills)
     }
@@ -351,6 +401,11 @@ impl BambooClient {
             .get(self.url(&format!("/v1/skills/{}", id)))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get skill failed ({status}): {body}");
+        }
         let detail = resp.json().await?;
         Ok(detail)
     }
@@ -363,6 +418,11 @@ impl BambooClient {
             .get(self.url("/v1/bamboo/config"))
             .send()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get config failed ({status}): {body}");
+        }
         let val = resp.json().await?;
         Ok(val)
     }
