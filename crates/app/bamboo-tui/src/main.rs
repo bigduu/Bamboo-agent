@@ -13,6 +13,7 @@ mod api;
 mod app;
 mod components;
 mod event;
+mod history;
 mod theme;
 mod ui;
 

@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
@@ -11,6 +13,7 @@ use crate::api::sse::SseStream;
 use crate::api::types::*;
 use crate::api::BambooClient;
 use crate::event::AppEvent;
+use crate::history::map_history;
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,6 +76,10 @@ pub enum MessageRole {
 
 #[derive(Debug, Clone)]
 pub struct ToolCallDisplay {
+    /// `tool_call_id` from the SSE stream. Tool events (Complete/Error/
+    /// Lifecycle) are paired by this id, not list position — with parallel
+    /// tool calls, position-based pairing lands results on the wrong entry.
+    pub id: String,
     pub tool_name: String,
     pub arguments: String,
     pub result: Option<String>,
@@ -96,11 +103,23 @@ pub struct ChatMessage {
     pub reasoning: Option<String>,
 }
 
+/// Textarea placeholder shown on an empty Chat input, kept as one constant so
+/// the initial state and the post-send reset (`handle_chat_key`) can't drift.
+const CHAT_PLACEHOLDER: &str = "Type a message... (Enter send · Alt+Enter newline)";
+
 pub struct ChatState {
     pub session_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
     pub scroll_offset: u16,
+    /// Largest meaningful `scroll_offset` for the transcript as last rendered
+    /// (`total_lines - visible_height`), refreshed every frame by
+    /// `ui::chat::render`. `App` only has `&App` at render time, so this is a
+    /// `Cell` — it lets the render function record the bound through a shared
+    /// reference instead of needing `&mut App` there. Key/mouse handlers clamp
+    /// against `.get()` so scrolling past the bottom can't require an equal
+    /// number of up-presses to "catch up" before the view visibly moves.
+    pub max_scroll: Cell<u16>,
     pub auto_scroll: bool,
     pub streaming: bool,
     pub current_response: String,
@@ -119,12 +138,13 @@ pub struct ChatState {
 impl ChatState {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
-        textarea.set_placeholder_text("Type a message... (Enter to send)");
+        textarea.set_placeholder_text(CHAT_PLACEHOLDER);
         Self {
             session_id: None,
             messages: Vec::new(),
             textarea,
             scroll_offset: 0,
+            max_scroll: Cell::new(0),
             auto_scroll: true,
             streaming: false,
             current_response: String::new(),
@@ -139,6 +159,21 @@ impl ChatState {
     }
 }
 
+/// Result of a session resume (history + summary + pending question fetched
+/// off the event loop), posted back as `AppEvent::SessionOpened`. Kept
+/// separate from `ChatState` since it's a one-shot transfer object, not
+/// long-lived UI state.
+pub struct OpenedSession {
+    pub messages: Vec<ChatMessage>,
+    pub model: String,
+    pub is_running: bool,
+    pub pending: Option<PendingQuestion>,
+    /// The server dropped older messages to stay under its cold-fetch cap.
+    pub truncated: bool,
+    /// Pre-cap message count, for the "showing last N of M" notice.
+    pub total_message_count: usize,
+}
+
 // ── Per-tab states ──
 
 pub struct SessionsState {
@@ -146,6 +181,20 @@ pub struct SessionsState {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// Total sessions across all pages, as reported by the server envelope
+    /// (#421). Used to render `page X/Y · total N`.
+    pub total: usize,
+    /// Offset of the currently-loaded page. Advanced/retreated by `]`/`[`.
+    pub offset: usize,
+    /// The page size the server actually applied (its clamped default, or the
+    /// client-requested value echoed back) — used both to render the page
+    /// number and to step `offset` by a full page on `[`. `0` until the first
+    /// page loads, at which point `list_sessions` is asked for the server's
+    /// own default instead of an arbitrary client guess.
+    pub page_limit: usize,
+    /// Offset to request for the next page, or `None` on the last page —
+    /// gates whether `]` does anything.
+    pub next_offset: Option<usize>,
 }
 
 impl SessionsState {
@@ -155,6 +204,10 @@ impl SessionsState {
             selected: 0,
             loading: false,
             error: None,
+            total: 0,
+            offset: 0,
+            page_limit: 0,
+            next_offset: None,
         }
     }
 }
@@ -222,6 +275,10 @@ pub struct ConfigState {
     pub loading: bool,
     pub error: Option<String>,
     pub scroll_offset: u16,
+    /// Largest meaningful `scroll_offset` for the raw config view as last
+    /// rendered; see `ChatState::max_scroll` for the `Cell`-through-`&App`
+    /// rationale.
+    pub max_scroll: Cell<u16>,
 }
 
 impl ConfigState {
@@ -231,6 +288,7 @@ impl ConfigState {
             loading: false,
             error: None,
             scroll_offset: 0,
+            max_scroll: Cell::new(0),
         }
     }
 }
@@ -268,6 +326,26 @@ pub struct ActiveQuestion {
     pub custom: Option<String>,
 }
 
+impl ActiveQuestion {
+    /// Build the modal state from a `GET .../pending` response. Mirrors the
+    /// SSE `NeedClarification` handler: no preset options opens straight into
+    /// free-text entry instead of an empty option list.
+    fn from_pending(pending: &PendingQuestion) -> Self {
+        let options = pending.options.clone().unwrap_or_default();
+        let custom = if options.is_empty() {
+            Some(String::new())
+        } else {
+            None
+        };
+        Self {
+            question: pending.question.clone(),
+            options,
+            selected: 0,
+            custom,
+        }
+    }
+}
+
 /// In-progress "new schedule" form (opened with `n` on the Schedules tab).
 #[derive(Default)]
 pub struct ScheduleForm {
@@ -295,6 +373,15 @@ pub struct ConfigEditor {
     pub textarea: TextArea<'static>,
 }
 
+/// In-progress model picker (`Ctrl+O` on the Chat tab). Opens immediately with
+/// `loading: true` and an empty list; the provider-catalog fetch runs off the
+/// event loop and lands via `AppEvent::CatalogLoaded`.
+pub struct ModelPicker {
+    pub models: Vec<CatalogModel>,
+    pub selected: usize,
+    pub loading: bool,
+}
+
 // ── Main App ──
 
 pub struct App {
@@ -314,12 +401,27 @@ pub struct App {
     /// The agent's pending question (permission gate / clarification). When
     /// `Some`, a modal captures the answer and keystrokes route to it.
     pub pending_question: Option<ActiveQuestion>,
+    /// The most recently *dismissed* (Esc'd) pending question, kept around
+    /// because dismissing the modal does NOT tell the server to stop
+    /// waiting — the run is still blocked on an answer. `Ctrl+Q` restores it
+    /// without a round-trip; cleared once answered/resumed or on a fresh
+    /// session (`Ctrl+N` / opening a different session).
+    pub dismissed_question: Option<ActiveQuestion>,
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
+    /// In-progress model picker (`Ctrl+O`, Chat tab). When `Some`, a modal
+    /// captures navigation/apply keystrokes.
+    pub model_picker: Option<ModelPicker>,
+    /// Pending session-delete confirmation (Sessions tab, `d`): `(id, title)`
+    /// of the session awaiting `y`/Enter confirm or `n`/Esc cancel. Kept as a
+    /// modal (rather than deleting immediately) so a stray `d` can't destroy a
+    /// session, and the actual DELETE runs off the event loop like every other
+    /// mutation.
+    pub pending_delete: Option<(String, String)>,
     /// Capped scrollback of past status messages so errors/warnings aren't lost
     /// when the single status line is overwritten. Viewed with `Ctrl+L`.
     pub notifications: Vec<Notification>,
@@ -333,6 +435,17 @@ pub struct App {
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
     sse_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     sse_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+}
+
+/// Move a list selection by `delta` (positive = down, negative = up),
+/// clamped to `[0, len-1]` (or `0` when the list is empty). Shared by every
+/// list tab's mouse-wheel handling in `App::handle_mouse`.
+fn scroll_selection(selected: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let next = selected as i64 + delta as i64;
+    next.clamp(0, (len - 1) as i64) as usize
 }
 
 impl App {
@@ -352,8 +465,11 @@ impl App {
             help_visible: false,
             spinner_tick: 0,
             pending_question: None,
+            dismissed_question: None,
             schedule_form: None,
             config_editor: None,
+            model_picker: None,
+            pending_delete: None,
             notifications: Vec::new(),
             notifications_visible: false,
             unseen_alerts: 0,
@@ -380,6 +496,13 @@ impl App {
         // Kick off the initial tab's data load without blocking startup.
         self.load_tab_data();
 
+        // `--session-id` on the command line: resume it the same way `Enter`
+        // on the Sessions tab does (history replay + live reattach + pending
+        // question recovery), not a bespoke startup-only path.
+        if let Some(session_id) = self.chat.session_id.clone() {
+            self.resume_session(session_id);
+        }
+
         // Spawn crossterm event reader.
         let tx = event_tx.clone();
         tokio::spawn(async move {
@@ -399,6 +522,14 @@ impl App {
                 }
             }
         });
+
+        // Redraw ticker: the loop below only otherwise iterates (and redraws)
+        // when a key/mouse event or an SSE event arrives, so a long tool call
+        // with no token traffic would freeze the braille spinner and make the
+        // UI look hung. Created ONCE here (not inside the loop) so `tick()`
+        // correctly accounts for elapsed time across iterations instead of
+        // firing immediately every time.
+        let mut redraw_interval = tokio::time::interval(std::time::Duration::from_millis(120));
 
         // Main event loop.
         while self.running {
@@ -424,6 +555,9 @@ impl App {
                             self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
                         }
                     }
+                }
+                _ = redraw_interval.tick() => {
+                    // No new state — just a steady redraw so the spinner animates.
                 }
             }
         }
@@ -466,8 +600,16 @@ impl App {
             AppEvent::SessionsLoaded(r) => {
                 self.sessions.loading = false;
                 match r {
-                    Ok(s) => {
-                        self.sessions.sessions = s;
+                    Ok(envelope) => {
+                        self.sessions.selected = self
+                            .sessions
+                            .selected
+                            .min(envelope.sessions.len().saturating_sub(1));
+                        self.sessions.total = envelope.total;
+                        self.sessions.offset = envelope.offset;
+                        self.sessions.page_limit = envelope.limit;
+                        self.sessions.next_offset = envelope.next_offset;
+                        self.sessions.sessions = envelope.sessions;
                         self.sessions.error = None;
                     }
                     Err(e) => self.sessions.error = Some(e),
@@ -549,50 +691,278 @@ impl App {
                     self.notify(NoticeLevel::Error, format!("Error: {e}"));
                 }
             },
+            AppEvent::ExecuteFailed(msg) => {
+                // The POST that starts the run never succeeded, so no SSE
+                // terminal event is ever coming — finalize here or
+                // `chat.streaming` spins forever.
+                self.notify(NoticeLevel::Error, format!("Failed to start run: {msg}"));
+                self.finalize_streaming();
+            }
+            AppEvent::StopFinished(r) => {
+                // Finalize regardless of outcome: even if the stop request
+                // failed (server down/unreachable), the operator must regain
+                // control of the input instead of being stuck waiting for a
+                // terminal SSE event that a dead server will never send.
+                // `finalize_streaming` resets `status_message` to "Ready"
+                // internally, so the outcome-specific message is set AFTER it
+                // (same ordering the old synchronous `stop_streaming` used to
+                // get "Stopped" to stick instead of being overwritten).
+                self.finalize_streaming();
+                match r {
+                    Ok(()) => self.status_message = "Stopped".to_string(),
+                    Err(e) => self.notify(NoticeLevel::Error, format!("Stop failed: {e}")),
+                }
+            }
+            AppEvent::SkillDetailLoaded(r) => match r {
+                Ok(detail) => {
+                    self.skills.detail = Some(detail);
+                    self.skills.error = None;
+                }
+                Err(e) => self.skills.error = Some(e),
+            },
+            AppEvent::SessionOpened { session_id, result } => match result {
+                Ok(opened) => {
+                    // Reset every per-run scratch field `finalize_streaming`
+                    // would otherwise leave behind from whatever was open
+                    // before — a resumed session must not inherit stale
+                    // in-flight-turn state from a prior chat.
+                    self.chat.session_id = Some(session_id.clone());
+                    self.chat.model = opened.model;
+                    self.chat.current_response.clear();
+                    self.chat.current_tool_calls.clear();
+                    self.chat.current_reasoning.clear();
+                    self.chat.sub_agents.clear();
+                    self.chat.token_usage = None;
+                    self.chat.scroll_offset = 0;
+                    self.chat.streaming = false;
+                    self.pending_question = None;
+                    self.dismissed_question = None;
+
+                    let shown = opened.messages.len();
+                    self.chat.messages = opened.messages;
+                    self.chat.auto_scroll = true;
+                    self.tab = Tab::Chat;
+                    self.status_message = "Session resumed".to_string();
+
+                    if opened.truncated {
+                        self.notify(
+                            NoticeLevel::Info,
+                            format!(
+                                "Showing last {shown} of {} messages",
+                                opened.total_message_count
+                            ),
+                        );
+                    }
+
+                    if opened.is_running {
+                        self.attach_stream(session_id);
+                        self.chat.streaming = true;
+                        self.status_message = "Reattached — streaming".to_string();
+                    }
+
+                    if let Some(pending) = &opened.pending {
+                        self.status_message =
+                            format!("Question: {} (answer in the dialog)", pending.question);
+                        self.pending_question = Some(ActiveQuestion::from_pending(pending));
+                    }
+                }
+                Err(e) => {
+                    self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
+                }
+            },
+            AppEvent::PendingQuestionChecked(r) => match r {
+                Ok(pending) if pending.has_pending_question => {
+                    self.pending_question = Some(ActiveQuestion::from_pending(&pending));
+                    self.status_message = "Question reopened".to_string();
+                }
+                Ok(_) => {
+                    self.notify(NoticeLevel::Info, "No pending question on the server");
+                }
+                Err(e) => {
+                    self.notify(
+                        NoticeLevel::Error,
+                        format!("Failed to check pending question: {e}"),
+                    );
+                }
+            },
+            AppEvent::CatalogLoaded(r) => {
+                // The picker may already have been closed (Esc) before this
+                // fetch returned — drop the result instead of reopening it.
+                let Some(picker) = self.model_picker.as_mut() else {
+                    return Ok(());
+                };
+                match r {
+                    Ok(catalog) if catalog.models.is_empty() => {
+                        self.model_picker = None;
+                        self.notify(NoticeLevel::Warn, "No models in provider catalog");
+                    }
+                    Ok(catalog) => {
+                        picker.models = catalog.models;
+                        picker.selected = 0;
+                        picker.loading = false;
+                        self.status_message = "Ready".to_string();
+                    }
+                    Err(e) => {
+                        self.model_picker = None;
+                        self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to load provider catalog: {e}"),
+                        );
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
-    /// Mouse wheel scrolls the active scrollable view (chat transcript / config).
+    /// Mouse wheel: on the two scrollable-text tabs (Chat/Config) it scrolls
+    /// the view; everywhere else (the four list tabs) there's nothing to
+    /// scroll independently of the selection, so the wheel moves the
+    /// selection instead (3 rows per notch, clamped) rather than being a
+    /// dead input.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::MouseEventKind;
-        let delta = match mouse.kind {
-            MouseEventKind::ScrollUp => -3i32,
-            MouseEventKind::ScrollDown => 3i32,
+        let delta: i32 = match mouse.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
             _ => return,
         };
         match self.tab {
             Tab::Chat => {
-                self.chat.auto_scroll = false;
-                self.chat.scroll_offset =
-                    self.chat.scroll_offset.saturating_add_signed(delta as i16);
+                if delta < 0 {
+                    self.chat_scroll_up(delta.unsigned_abs() as u16);
+                } else {
+                    self.chat_scroll_down(delta as u16);
+                }
             }
             Tab::Config => {
-                self.config.scroll_offset = self
-                    .config
-                    .scroll_offset
-                    .saturating_add_signed(delta as i16);
+                if delta < 0 {
+                    self.config_scroll_up(delta.unsigned_abs() as u16);
+                } else {
+                    self.config_scroll_down(delta as u16);
+                }
             }
-            _ => {}
+            Tab::Sessions => {
+                self.sessions.selected =
+                    scroll_selection(self.sessions.selected, self.sessions.sessions.len(), delta);
+            }
+            Tab::Mcp => {
+                self.mcp.selected =
+                    scroll_selection(self.mcp.selected, self.mcp.servers.len(), delta);
+            }
+            Tab::Schedules => {
+                self.schedules.selected = scroll_selection(
+                    self.schedules.selected,
+                    self.schedules.schedules.len(),
+                    delta,
+                );
+            }
+            Tab::Skills => {
+                self.skills.selected =
+                    scroll_selection(self.skills.selected, self.skills.skills.len(), delta);
+            }
         }
     }
 
+    /// Scroll the chat transcript down by `delta` lines, clamped to
+    /// `chat.max_scroll` (see its doc comment) so repeated presses past the
+    /// bottom don't leave the opposite key needing an equal number of presses
+    /// before the view visibly moves.
+    fn chat_scroll_down(&mut self, delta: u16) {
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = self
+            .chat
+            .scroll_offset
+            .saturating_add(delta)
+            .min(self.chat.max_scroll.get());
+    }
+
+    /// Scroll the chat transcript up by `delta` lines; naturally bounded at 0.
+    fn chat_scroll_up(&mut self, delta: u16) {
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(delta);
+    }
+
+    /// `g`: jump to the top of the transcript.
+    fn chat_scroll_top(&mut self) {
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = 0;
+    }
+
+    /// `G`: jump to the bottom and resume auto-scroll.
+    fn chat_scroll_bottom(&mut self) {
+        self.chat.auto_scroll = true;
+    }
+
+    /// Scroll the raw config view down by `delta` lines, clamped to
+    /// `config.max_scroll` — same rationale as `chat_scroll_down`.
+    fn config_scroll_down(&mut self, delta: u16) {
+        self.config.scroll_offset = self
+            .config
+            .scroll_offset
+            .saturating_add(delta)
+            .min(self.config.max_scroll.get());
+    }
+
+    /// Scroll the raw config view up by `delta` lines; naturally bounded at 0.
+    fn config_scroll_up(&mut self, delta: u16) {
+        self.config.scroll_offset = self.config.scroll_offset.saturating_sub(delta);
+    }
+
+    /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
+    /// Ctrl+L are gated on this so they can't stack a second overlay on top
+    /// of one of these five — see the precedence comment on `handle_key`.
+    fn any_modal_open(&self) -> bool {
+        self.pending_question.is_some()
+            || self.pending_delete.is_some()
+            || self.model_picker.is_some()
+            || self.schedule_form.is_some()
+            || self.config_editor.is_some()
+    }
+
+    /// Route one key event.
+    ///
+    /// Modal precedence (checked top to bottom, each returning early — so at
+    /// most one modal ever owns the keyboard, and every one of them runs
+    /// before the global bindings further down: Ctrl+N/Ctrl+O/Ctrl+Q, `?`,
+    /// digit tab-switching, Tab/Shift+Tab):
+    ///   1. `pending_question` — agent permission/clarification gate
+    ///   2. `pending_delete`   — session delete confirmation
+    ///   3. `model_picker`     — Ctrl+O provider-catalog picker
+    ///   4. `schedule_form`    — new-schedule authoring form
+    ///   5. `config_editor`    — raw config JSON editor
+    ///
+    /// Ctrl+C (stop/quit) always preempts every modal. F1/Ctrl+`?`/Ctrl+L
+    /// (help/notifications) are gated on `any_modal_open` below instead: with
+    /// a modal open they fall straight through to that modal's own handler,
+    /// so a stray F1 can't eat the keystroke the modal was waiting for or
+    /// stack the help overlay on top of it.
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if self.chat.streaming {
-                    self.stop_streaming().await?;
+                    self.stop_streaming();
                     return Ok(());
                 }
                 self.running = false;
                 return Ok(());
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('?')) => {
+            (KeyModifiers::CONTROL, KeyCode::Char('?')) if !self.any_modal_open() => {
+                // Most terminals never deliver Ctrl+Shift+/ as Ctrl+'?' (it
+                // maps elsewhere), so this is kept only as a harmless extra —
+                // F1 below and plain `?` (further down, non-Chat tabs) are
+                // the bindings that are actually reachable.
                 self.help_visible = true;
                 return Ok(());
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+            (_, KeyCode::F(1)) if !self.any_modal_open() => {
+                // F1 opens help on every tab, including Chat, regardless of
+                // modifiers — unlike `?` it never collides with typing.
+                self.help_visible = true;
+                return Ok(());
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('l')) if !self.any_modal_open() => {
                 self.notifications_visible = true;
                 self.unseen_alerts = 0;
                 return Ok(());
@@ -600,13 +970,26 @@ impl App {
             _ => {}
         }
 
-        // A pending agent question captures all input (Ctrl+C above still
+        // 1. A pending agent question captures all input (Ctrl+C above still
         // stops the run) until it is answered or dismissed.
         if self.pending_question.is_some() {
             return self.handle_question_key(key).await;
         }
 
-        // The schedule-authoring modal likewise captures all input: Tab moves
+        // 2. The delete-confirmation modal likewise captures all input before
+        // anything else (including tab-switching digits) can reach it.
+        if self.pending_delete.is_some() {
+            return self.handle_delete_confirm_key(key).await;
+        }
+
+        // 3. The model picker likewise captures all input (navigation/apply)
+        // before the global bindings below — same pattern as the other
+        // modals.
+        if self.model_picker.is_some() {
+            return self.handle_model_picker_key(key).await;
+        }
+
+        // 4. The schedule-authoring modal likewise captures all input: Tab moves
         // between fields and digits belong in cron expressions, so it must run
         // before the global Tab/1-6 tab-switching below (which would otherwise
         // swallow those keys and never reach the form).
@@ -615,18 +998,53 @@ impl App {
             return Ok(());
         }
 
-        // The config editor is a full multi-line text buffer, so it must claim
+        // 5. The config editor is a full multi-line text buffer, so it must claim
         // every key (digits, Tab, Enter/newlines) before the global navigation
         // below — same rationale as the schedule form.
         if self.config_editor.is_some() {
             return self.handle_config_editor_key(key);
         }
 
+        // Ctrl+N / Ctrl+Q: global, but only reachable once every modal above
+        // has had first refusal at the key (each of those branches returns
+        // early) — so getting here already means no modal is open, matching
+        // the "no modal open" requirement for Ctrl+N specifically.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('n') if !self.chat.streaming => {
+                    self.new_session();
+                    return Ok(());
+                }
+                KeyCode::Char('q') => {
+                    self.reopen_pending_question();
+                    return Ok(());
+                }
+                KeyCode::Char('o') if self.tab == Tab::Chat && !self.chat.streaming => {
+                    self.open_model_picker();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // `?` opens help everywhere EXCEPT Chat, where it must type into the
+        // textarea instead (mirrors the digit rule right below: Chat's
+        // textarea wins over global single-key bindings). F1 above is the
+        // Chat-safe way to reach help.
+        if key.code == KeyCode::Char('?') && self.tab != Tab::Chat {
+            self.help_visible = true;
+            return Ok(());
+        }
+
+        // 1-6 switch tabs EXCEPT on Chat, where digits must type into the
+        // message instead — otherwise typing e.g. "top 3 issues" silently
+        // jumps to the Config tab on the '3'. Shift+digit (many keyboards'
+        // symbol row) never switches tabs, matching the pre-existing rule.
         if let KeyCode::Char(c) = key.code {
             if let Some(digit) = c.to_digit(10) {
                 if (1..=6).contains(&digit)
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
-                    && (!self.chat.streaming || self.tab != Tab::Chat)
+                    && self.tab != Tab::Chat
                 {
                     self.tab = Tab::from_index((digit - 1) as usize).unwrap_or(self.tab);
                     self.load_tab_data();
@@ -735,10 +1153,13 @@ impl App {
         match action {
             QAction::Submit(answer) => self.submit_answer(answer).await?,
             QAction::Dismiss => {
-                self.pending_question = None;
-                self.status_message =
-                    "Question dismissed (still pending on the server — Ctrl+C stops the run)"
-                        .to_string();
+                // Keep it, not just drop it: dismissing does NOT tell the
+                // server to stop waiting, so the run is still blocked on an
+                // answer — Ctrl+Q brings the modal back without a round-trip.
+                self.dismissed_question = self.pending_question.take();
+                self.status_message = "Question dismissed (still pending on the server — \
+                    Ctrl+Q to reopen, Ctrl+C stops the run)"
+                    .to_string();
             }
             QAction::None => {}
         }
@@ -775,6 +1196,39 @@ impl App {
         Ok(())
     }
 
+    /// Drive the delete-confirmation modal (`d` on the Sessions tab). `y`/Enter
+    /// confirms and spawns the DELETE off the event loop (never `?` on the UI
+    /// thread — a failed delete must surface via `notify`, not tear down the
+    /// TUI); `n`/Esc cancels without calling the server.
+    async fn handle_delete_confirm_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some((id, _title)) = self.pending_delete.clone() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_delete = None;
+                if let Some(tx) = self.event_tx.clone() {
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let outcome = match client.delete_session(&id).await {
+                            Ok(()) => Ok("Session deleted".to_string()),
+                            Err(e) => Err(format!("Delete failed: {e}")),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            outcome,
+                            reload_tab: true,
+                        });
+                    });
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.pending_delete = None;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Load the current tab's data WITHOUT blocking the event loop: mark the
     /// tab loading and spawn the fetch, which posts its result back as an
     /// `AppEvent` handled in `handle_event`.
@@ -787,8 +1241,15 @@ impl App {
             Tab::Chat => {}
             Tab::Sessions => {
                 self.sessions.loading = true;
+                let offset = self.sessions.offset;
+                // `0` means "no page size established yet" — let the server
+                // pick its own bounded default rather than guessing one here.
+                let limit = (self.sessions.page_limit > 0).then_some(self.sessions.page_limit);
                 tokio::spawn(async move {
-                    let r = client.list_sessions().await.map_err(|e| e.to_string());
+                    let r = client
+                        .list_sessions(limit, Some(offset))
+                        .await
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(AppEvent::SessionsLoaded(r));
                 });
             }
@@ -839,28 +1300,33 @@ impl App {
         if self.chat.streaming {
             match key.code {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.stop_streaming().await?;
+                    self.stop_streaming();
                 }
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.chat.expand_tools = !self.chat.expand_tools;
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.chat.auto_scroll = false;
-                    self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(3);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.chat.auto_scroll = false;
-                    self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
-                }
-                KeyCode::Char('G') => {
-                    self.chat.auto_scroll = true;
-                }
+                KeyCode::Char('j') | KeyCode::Down => self.chat_scroll_down(3),
+                KeyCode::Char('k') | KeyCode::Up => self.chat_scroll_up(3),
+                KeyCode::PageDown => self.chat_scroll_down(10),
+                KeyCode::PageUp => self.chat_scroll_up(10),
+                KeyCode::Char('g') => self.chat_scroll_top(),
+                KeyCode::Char('G') => self.chat_scroll_bottom(),
                 _ => {}
             }
             return Ok(());
         }
 
         match key.code {
+            // Alt+Enter (and Shift+Enter, on the kitty-protocol terminals
+            // that report it — plain crossterm terminals mostly don't, so
+            // this arm is harmless there) inserts a newline instead of
+            // sending, since plain Enter always sends.
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.chat.textarea.insert_newline();
+            }
             KeyCode::Enter => {
                 let input = self.chat.textarea.lines().join("\n");
                 let input = input.trim().to_string();
@@ -868,22 +1334,15 @@ impl App {
                     return Ok(());
                 }
                 self.chat.textarea = TextArea::default();
-                self.chat
-                    .textarea
-                    .set_placeholder_text("Type a message... (Enter to send)");
+                self.chat.textarea.set_placeholder_text(CHAT_PLACEHOLDER);
                 self.send_message(input);
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.chat.auto_scroll = false;
-                self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(3);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.chat.auto_scroll = false;
-                self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
-            }
-            KeyCode::Char('G') => {
-                self.chat.auto_scroll = true;
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.chat_scroll_down(3),
+            KeyCode::Char('k') | KeyCode::Up => self.chat_scroll_up(3),
+            KeyCode::PageDown => self.chat_scroll_down(10),
+            KeyCode::PageUp => self.chat_scroll_up(10),
+            KeyCode::Char('g') => self.chat_scroll_top(),
+            KeyCode::Char('G') => self.chat_scroll_bottom(),
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.chat.expand_tools = !self.chat.expand_tools;
             }
@@ -939,23 +1398,164 @@ impl App {
         });
     }
 
-    /// After `chat` returns a session id, open the SSE stream (before execute, so
-    /// no early event is missed) and spawn the agent run.
-    fn start_stream_and_execute(&mut self, session_id: String) {
+    /// Open the SSE stream for `session_id`, wiring `sse_tx`/`sse_rx` so
+    /// `poll_sse`/`run`'s select loop starts receiving events. Shared by a
+    /// freshly-started run (`start_stream_and_execute`, before `execute` so no
+    /// early event is missed) and reattaching to an already-running session on
+    /// resume (`AppEvent::SessionOpened` with `is_running: true`) — in both
+    /// cases the server replays cached critical events then live-tails, so
+    /// connecting mid-flight doesn't lose anything. Returns whether the
+    /// connection was opened; on failure it has already `notify`'d.
+    fn attach_stream(&mut self, session_id: String) -> bool {
         let (sse_tx, sse_rx) = mpsc::unbounded_channel();
         self.sse_tx = Some(sse_tx.clone());
         self.sse_rx = Some(sse_rx);
         let base_url = self.client.base_url.clone();
         if let Err(e) = SseStream::start(&base_url, &session_id, sse_tx) {
             self.notify(NoticeLevel::Error, format!("SSE start failed: {e}"));
+            return false;
+        }
+        true
+    }
+
+    /// After `chat` returns a session id, open the SSE stream (before execute, so
+    /// no early event is missed) and spawn the agent run.
+    fn start_stream_and_execute(&mut self, session_id: String) {
+        if !self.attach_stream(session_id.clone()) {
             return;
         }
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
         let client = self.client.clone();
         let model = self.chat.model.clone();
         tokio::spawn(async move {
             let model = if model.is_empty() { None } else { Some(model) };
-            let _ = client.execute(&session_id, model.as_deref()).await;
+            // If this POST fails (server down, 4xx/5xx), no SSE terminal event
+            // will ever arrive for a run that never started — report it back so
+            // the handler can finalize `chat.streaming` instead of spinning
+            // forever waiting for events behind a run that doesn't exist.
+            if let Err(e) = client.execute(&session_id, model.as_deref()).await {
+                let _ = tx.send(AppEvent::ExecuteFailed(e.to_string()));
+            }
         });
+    }
+
+    /// Resume a session fully off the event loop: fetch its history + summary
+    /// (+ pending question, when the summary reports one), map the history
+    /// into chat messages, and post a single `SessionOpened` event. Used both
+    /// by `Enter` on the Sessions tab and by `--session-id` at startup so
+    /// there's exactly one resume code path.
+    fn resume_session(&mut self, session_id: String) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.status_message = "Resuming session...".to_string();
+        tokio::spawn(async move {
+            let history = match client.get_history(&session_id).await {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SessionOpened {
+                        session_id,
+                        result: Err(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let summary = match client.get_session(&session_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SessionOpened {
+                        session_id,
+                        result: Err(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            // Only fetch the pending question when the summary says there is
+            // one — saves a round-trip for the common case, and a failure
+            // here is non-fatal: the session still opens, just without the
+            // modal pre-populated (Ctrl+Q can fetch it again).
+            let pending = if summary.has_pending_question {
+                client
+                    .get_pending_question(&session_id)
+                    .await
+                    .ok()
+                    .filter(|p| p.has_pending_question)
+            } else {
+                None
+            };
+            let opened = OpenedSession {
+                messages: map_history(history.messages),
+                model: summary.model,
+                is_running: summary.is_running,
+                pending,
+                truncated: history.truncated,
+                total_message_count: history.total_message_count,
+            };
+            let _ = tx.send(AppEvent::SessionOpened {
+                session_id,
+                result: Ok(opened),
+            });
+        });
+    }
+
+    /// `Ctrl+N`: start a fresh session. Keeps the current model (the operator
+    /// picked it for a reason) but drops everything session-scoped.
+    fn new_session(&mut self) {
+        self.chat.session_id = None;
+        self.chat.messages.clear();
+        self.chat.current_response.clear();
+        self.chat.current_tool_calls.clear();
+        self.chat.current_reasoning.clear();
+        self.chat.sub_agents.clear();
+        self.chat.token_usage = None;
+        self.chat.scroll_offset = 0;
+        self.chat.auto_scroll = true;
+        self.chat.plan_mode = false;
+        self.pending_question = None;
+        self.dismissed_question = None;
+        self.status_message = "New session".to_string();
+    }
+
+    /// `Ctrl+Q`: restore the last dismissed question if one is cached; else,
+    /// if there's an active session, check the server off the event loop (the
+    /// result comes back as `AppEvent::PendingQuestionChecked`).
+    fn reopen_pending_question(&mut self) {
+        if let Some(q) = self.dismissed_question.take() {
+            self.pending_question = Some(q);
+            self.status_message = "Question reopened".to_string();
+            return;
+        }
+        let Some(session_id) = self.chat.session_id.clone() else {
+            self.notify(NoticeLevel::Info, "No pending question to reopen");
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.status_message = "Checking for a pending question...".to_string();
+        tokio::spawn(async move {
+            let r = client
+                .get_pending_question(&session_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::PendingQuestionChecked(r));
+        });
+    }
+
+    /// Find the in-progress tool call matching `tool_call_id`. Tool events are
+    /// paired by this server-assigned id rather than list position/name so
+    /// that parallel tool calls (multiple in-flight at once) each get their
+    /// own Complete/Error/Lifecycle update instead of clobbering whichever
+    /// entry happens to be last in the list.
+    fn find_tool_mut(&mut self, tool_call_id: &str) -> Option<&mut ToolCallDisplay> {
+        self.chat
+            .current_tool_calls
+            .iter_mut()
+            .find(|t| t.id == tool_call_id)
     }
 
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
@@ -971,11 +1571,12 @@ impl App {
                 self.chat.current_reasoning.push_str(&content);
             }
             AgentEvent::ToolStart {
+                tool_call_id,
                 tool_name,
                 arguments,
-                ..
             } => {
                 self.chat.current_tool_calls.push(ToolCallDisplay {
+                    id: tool_call_id,
                     tool_name,
                     arguments: serde_json::to_string(&arguments).unwrap_or_default(),
                     result: None,
@@ -983,32 +1584,73 @@ impl App {
                     phase: "running".to_string(),
                 });
             }
-            AgentEvent::ToolComplete { result, .. } => {
-                if let Some(tc) = self.chat.current_tool_calls.last_mut() {
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } => match self.find_tool_mut(&tool_call_id) {
+                Some(tc) => {
                     tc.result = Some(result.result);
                     tc.phase = "complete".to_string();
                 }
-            }
-            AgentEvent::ToolError { error, .. } => {
-                if let Some(tc) = self.chat.current_tool_calls.last_mut() {
+                None => {
+                    // No matching ToolStart (dropped/out-of-order) — surface it
+                    // defensively instead of silently losing the result.
+                    self.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: tool_call_id,
+                        tool_name: "unknown".to_string(),
+                        arguments: String::new(),
+                        result: Some(result.result),
+                        error: None,
+                        phase: "complete".to_string(),
+                    });
+                }
+            },
+            AgentEvent::ToolError {
+                tool_call_id,
+                error,
+            } => match self.find_tool_mut(&tool_call_id) {
+                Some(tc) => {
                     tc.error = Some(error);
                     tc.phase = "error".to_string();
                 }
-            }
+                None => {
+                    self.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: tool_call_id,
+                        tool_name: "unknown".to_string(),
+                        arguments: String::new(),
+                        result: None,
+                        error: Some(error),
+                        phase: "error".to_string(),
+                    });
+                }
+            },
             AgentEvent::ToolLifecycle {
-                tool_name,
+                tool_call_id,
                 phase,
                 summary,
+                error,
                 ..
             } => {
-                if let Some(tc) = self.chat.current_tool_calls.iter_mut().rev().find(|t| {
-                    t.tool_name == tool_name && t.phase != "complete" && t.phase != "error"
-                }) {
-                    tc.phase = phase;
-                    if let Some(s) = summary {
-                        tc.result = Some(s);
+                // Lifecycle phases ("begin"/"executing"/"finished"/"cancelled")
+                // are supplementary progress strings, not the UI's terminal
+                // vocabulary ("complete"/"error") — once ToolComplete/ToolError
+                // has set one of those, a later Lifecycle event must not
+                // overwrite it back to a non-terminal phase (the UI's ✓/✗ icon
+                // is keyed on those exact strings).
+                if let Some(tc) = self.find_tool_mut(&tool_call_id) {
+                    if tc.phase != "complete" && tc.phase != "error" {
+                        tc.phase = phase;
+                        if let Some(s) = summary {
+                            tc.result = Some(s);
+                        }
+                        if let Some(e) = error {
+                            tc.error = Some(e);
+                        }
                     }
                 }
+                // No matching entry: a Lifecycle event with no known Start is
+                // dropped (it carries only supplementary progress info, unlike
+                // Complete/Error's definitive terminal result).
             }
             AgentEvent::NeedClarification {
                 question, options, ..
@@ -1041,6 +1683,11 @@ impl App {
                 self.finalize_streaming();
             }
             AgentEvent::ToolToken { content, .. } => {
+                // Deliberately not routed into the matching ToolCallDisplay by
+                // `tool_call_id`: today's rendering already prints tool output
+                // inline with the response text, and threading a per-call
+                // streaming buffer through to the UI is beyond this fix's
+                // scope. Kept as the simpler, behavior-preserving option.
                 self.chat.current_response.push_str(&content);
             }
             AgentEvent::ContextCompressionStatus { phase, status } => {
@@ -1122,18 +1769,36 @@ impl App {
         self.sse_rx = None;
         self.chat.sub_agents.clear();
         // A run that ended (completed / cancelled / stopped) can no longer accept
-        // an answer, so drop any open question modal to avoid answering a dead
-        // session.
+        // an answer, so drop any open (or dismissed-but-cached) question modal
+        // to avoid answering a dead session.
         self.pending_question = None;
+        self.dismissed_question = None;
     }
 
-    async fn stop_streaming(&mut self) -> Result<()> {
-        if let Some(sid) = &self.chat.session_id {
-            self.client.stop(sid).await?;
-        }
-        self.finalize_streaming();
-        self.status_message = "Stopped".to_string();
-        Ok(())
+    /// Stop the current run WITHOUT blocking the event loop: the `stop` POST
+    /// is spawned off the UI thread and its outcome comes back as
+    /// `AppEvent::StopFinished` (handled in `handle_event`, which finalizes
+    /// streaming either way). Previously this awaited `client.stop()` and
+    /// `?`-propagated a network error — a dead server hit at the worst
+    /// possible moment (pressing Ctrl+C to stop a run) tore down the whole
+    /// TUI instead of just failing the stop.
+    fn stop_streaming(&mut self) {
+        let Some(sid) = self.chat.session_id.clone() else {
+            // Nothing to stop server-side; still clear local streaming state.
+            self.finalize_streaming();
+            self.status_message = "Stopped".to_string();
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
+            self.finalize_streaming();
+            return;
+        };
+        self.status_message = "Stopping...".to_string();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let r = client.stop(&sid).await.map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::StopFinished(r));
+        });
     }
 
     async fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1146,22 +1811,35 @@ impl App {
                 self.sessions.selected = self.sessions.selected.saturating_sub(1);
             }
             KeyCode::Enter => {
+                // Full resume, off the event loop: history replay + live
+                // reattach (if the run is still going) + pending-question
+                // recovery, all landing in one `SessionOpened` event.
                 if let Some(session) = self.sessions.sessions.get(self.sessions.selected) {
-                    self.chat.session_id = Some(session.id.clone());
-                    if let Some(model) = &session.model {
-                        self.chat.model = model.clone();
-                    }
-                    self.tab = Tab::Chat;
+                    self.resume_session(session.id.clone());
                 }
             }
             KeyCode::Char('d') => {
+                // Open a confirmation modal instead of deleting immediately — the
+                // actual DELETE is fired from `handle_delete_confirm_key` off the
+                // event loop, never `?`-propagated on the UI thread.
                 if let Some(session) = self.sessions.sessions.get(self.sessions.selected) {
-                    let id = session.id.clone();
-                    self.client.delete_session(&id).await?;
-                    self.load_tab_data();
+                    self.pending_delete = Some((session.id.clone(), session.title.clone()));
                 }
             }
             KeyCode::Char('r') => {
+                self.load_tab_data();
+            }
+            KeyCode::Char(']') => {
+                if let Some(next) = self.sessions.next_offset {
+                    self.sessions.offset = next;
+                    self.sessions.selected = 0;
+                    self.load_tab_data();
+                }
+            }
+            KeyCode::Char('[') if self.sessions.offset > 0 => {
+                let step = self.sessions.page_limit.max(1);
+                self.sessions.offset = self.sessions.offset.saturating_sub(step);
+                self.sessions.selected = 0;
                 self.load_tab_data();
             }
             _ => {}
@@ -1243,23 +1921,45 @@ impl App {
                 self.schedules.selected = self.schedules.selected.saturating_sub(1);
             }
             KeyCode::Char('d') => {
-                if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                // Spawned off the event loop like every other mutation here
+                // (see `handle_mcp_key`'s connect/disconnect) — an inline
+                // `.await` on the UI thread would freeze the whole app
+                // (spinner, redraw, SSE receipt) for the round-trip.
+                if let (Some(schedule), Some(tx)) = (
+                    self.schedules.schedules.get(self.schedules.selected),
+                    self.event_tx.clone(),
+                ) {
                     let id = schedule.id.clone();
-                    // Don't `?`-propagate: a failed delete must surface in the
-                    // log, not tear down the whole TUI event loop.
-                    match self.client.delete_schedule(&id).await {
-                        Ok(()) => self.load_tab_data(),
-                        Err(e) => self.notify(NoticeLevel::Error, format!("Delete failed: {e}")),
-                    }
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let outcome = match client.delete_schedule(&id).await {
+                            Ok(()) => Ok("Schedule deleted".to_string()),
+                            Err(e) => Err(format!("Delete failed: {e}")),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            outcome,
+                            reload_tab: true,
+                        });
+                    });
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                if let (Some(schedule), Some(tx)) = (
+                    self.schedules.schedules.get(self.schedules.selected),
+                    self.event_tx.clone(),
+                ) {
                     let id = schedule.id.clone();
-                    match self.client.run_schedule_now(&id).await {
-                        Ok(()) => self.notify(NoticeLevel::Info, "Schedule triggered"),
-                        Err(e) => self.notify(NoticeLevel::Error, format!("Run failed: {e}")),
-                    }
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let outcome = match client.run_schedule_now(&id).await {
+                            Ok(()) => Ok("Schedule triggered".to_string()),
+                            Err(e) => Err(format!("Run failed: {e}")),
+                        };
+                        let _ = tx.send(AppEvent::ActionDone {
+                            outcome,
+                            reload_tab: false,
+                        });
+                    });
                 }
             }
             _ => {}
@@ -1336,11 +2036,19 @@ impl App {
                 self.skills.selected = self.skills.selected.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if let Some(skill) = self.skills.skills.get(self.skills.selected) {
-                    match self.client.get_skill(&skill.id).await {
-                        Ok(detail) => self.skills.detail = Some(detail),
-                        Err(e) => self.skills.error = Some(e.to_string()),
-                    }
+                // Fetch the detail off the event loop: `get_skill` used to be
+                // awaited right here on the UI thread, so a slow/unreachable
+                // server froze every keystroke until it returned.
+                if let (Some(skill), Some(tx)) = (
+                    self.skills.skills.get(self.skills.selected),
+                    self.event_tx.clone(),
+                ) {
+                    let id = skill.id.clone();
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let r = client.get_skill(&id).await.map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::SkillDetailLoaded(r));
+                    });
                 }
             }
             _ => {}
@@ -1371,12 +2079,10 @@ impl App {
 
     fn handle_config_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down => {
-                self.config.scroll_offset = self.config.scroll_offset.saturating_add(1);
-            }
-            KeyCode::Up => {
-                self.config.scroll_offset = self.config.scroll_offset.saturating_sub(1);
-            }
+            KeyCode::Down => self.config_scroll_down(1),
+            KeyCode::Up => self.config_scroll_up(1),
+            KeyCode::PageDown => self.config_scroll_down(10),
+            KeyCode::PageUp => self.config_scroll_up(10),
             KeyCode::Char('e') => {
                 // Open the raw-JSON editor prefilled with the current config.
                 match &self.config.config {
@@ -1441,11 +2147,97 @@ impl App {
         }
         Ok(())
     }
+
+    /// `Ctrl+O` on the Chat tab: open the model picker and load the provider
+    /// catalog off the event loop — the modal opens immediately (`loading:
+    /// true`, empty list) and populates when `AppEvent::CatalogLoaded` lands.
+    fn open_model_picker(&mut self) {
+        self.model_picker = Some(ModelPicker {
+            models: Vec::new(),
+            selected: 0,
+            loading: true,
+        });
+        self.status_message = "Loading models...".to_string();
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let r = client
+                .get_provider_catalog()
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::CatalogLoaded(r));
+        });
+    }
+
+    /// Drive the model picker modal: `↑/↓`/`j`/`k` move the selection, `Enter`
+    /// applies the highlighted model (a no-op while the catalog is still
+    /// loading — the list is empty, so there's nothing to apply), `Esc`
+    /// closes without changes.
+    async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if picker.selected + 1 < picker.models.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(model) = picker.models.get(picker.selected).cloned() {
+                    self.model_picker = None;
+                    self.apply_model(model);
+                }
+            }
+            KeyCode::Esc => {
+                self.model_picker = None;
+                self.status_message = "Ready".to_string();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply a model picked from the catalog. `chat.model` gets the plain
+    /// model id — the string form `ChatRequest.model` / `ExecuteRequest.model`
+    /// / `PatchSessionRequest.model` actually resolve on the server (see
+    /// `execute::types::ExecuteRequest`'s doc comment: `request.model` is a
+    /// bare id, not a `provider/model` pair; that pairing only exists via the
+    /// separate `model_ref` field, which this picker deliberately doesn't
+    /// use). If a session is already active, also fires a fire-and-forget
+    /// PATCH so the server-side session record doesn't drift from what the
+    /// next turn will actually send.
+    fn apply_model(&mut self, model: CatalogModel) {
+        let model_id = model.reference.model.clone();
+        self.chat.model = model_id.clone();
+        self.status_message = format!("Model: {}", model.display_name);
+
+        if let (Some(session_id), Some(tx)) = (self.chat.session_id.clone(), self.event_tx.clone())
+        {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let outcome = match client.patch_session_model(&session_id, &model_id).await {
+                    Ok(()) => Ok("Session model updated".to_string()),
+                    Err(e) => Err(format!("Failed to update session model: {e}")),
+                };
+                let _ = tx.send(AppEvent::ActionDone {
+                    outcome,
+                    reload_tab: false,
+                });
+            });
+        }
+    }
 }
 
 #[cfg(test)]
 mod question_tests {
     use super::*;
+    use bamboo_client_core::ToolResult;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1572,23 +2364,38 @@ mod question_tests {
         assert!(text.contains("more"), "overflow marker missing");
     }
 
+    fn bare_session(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            title: String::new(),
+            model: String::new(),
+            is_running: false,
+            has_pending_question: false,
+            last_run_status: None,
+            updated_at: None,
+            message_count: 0,
+            pinned: false,
+        }
+    }
+
     #[tokio::test]
     async fn loaded_event_applies_to_state_and_clears_loading() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.sessions.loading = true;
-        app.handle_event(AppEvent::SessionsLoaded(Ok(vec![SessionSummary {
-            id: "s1".into(),
-            title: None,
-            model: None,
-            created_at: None,
-            updated_at: None,
-            message_count: None,
-            status: None,
-        }])))
+        app.handle_event(AppEvent::SessionsLoaded(Ok(ListSessionsEnvelope {
+            sessions: vec![bare_session("s1")],
+            total: 1,
+            limit: 200,
+            offset: 0,
+            next_offset: None,
+        })))
         .await
         .unwrap();
         assert!(!app.sessions.loading, "loading flag must clear");
         assert_eq!(app.sessions.sessions.len(), 1);
+        assert_eq!(app.sessions.total, 1);
+        assert_eq!(app.sessions.page_limit, 200);
+        assert!(app.sessions.next_offset.is_none());
         assert!(app.sessions.error.is_none());
 
         // Error result surfaces on the tab and clears loading.
@@ -1600,12 +2407,128 @@ mod question_tests {
         assert_eq!(app.sessions.error.as_deref(), Some("boom"));
     }
 
+    /// `]` advances to the next page only when the server reported one; `[`
+    /// steps back by a full page and clamps at 0. Selection resets on every
+    /// page change.
+    #[tokio::test]
+    async fn sessions_paging_keys_respect_next_offset_and_clamp() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![bare_session("s1"), bare_session("s2")];
+        app.sessions.selected = 1;
+        app.sessions.total = 5;
+        app.sessions.page_limit = 2;
+        app.sessions.offset = 0;
+        app.sessions.next_offset = Some(2);
+
+        // No event_tx wired (tests construct App directly), so `load_tab_data`
+        // is a no-op past the state mutation — enough to assert the key logic.
+        app.handle_sessions_key(k(KeyCode::Char(']')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 2, "] advances by the reported page");
+        assert_eq!(app.sessions.selected, 0, "selection resets on page change");
+
+        // On the last page (`next_offset` is `None`), `]` is a no-op.
+        app.sessions.next_offset = None;
+        app.sessions.selected = 1;
+        app.handle_sessions_key(k(KeyCode::Char(']')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 2, "] does nothing past the last page");
+        assert_eq!(app.sessions.selected, 1, "no page change, no reset");
+
+        // `[` steps back by a full page.
+        app.handle_sessions_key(k(KeyCode::Char('[')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 0);
+        assert_eq!(app.sessions.selected, 0);
+
+        // Already at offset 0: `[` clamps and does not go negative (saturating).
+        app.sessions.selected = 1;
+        app.handle_sessions_key(k(KeyCode::Char('[')))
+            .await
+            .unwrap();
+        assert_eq!(app.sessions.offset, 0);
+        assert_eq!(
+            app.sessions.selected, 1,
+            "no page change at offset 0, no reset"
+        );
+    }
+
+    /// `d` on the Sessions tab opens a confirmation modal instead of deleting
+    /// immediately; `Esc`/`n` cancel it without touching `event_tx`.
+    #[tokio::test]
+    async fn sessions_delete_opens_confirm_modal_and_cancel_clears_it() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![bare_session("s1")];
+        app.sessions.selected = 0;
+
+        app.handle_key(k(KeyCode::Char('d'))).await.unwrap();
+        assert_eq!(
+            app.pending_delete.as_ref().map(|(id, _)| id.as_str()),
+            Some("s1")
+        );
+
+        // While the modal is open, keys route to it — not tab switching.
+        app.handle_key(k(KeyCode::Char('1'))).await.unwrap();
+        assert_eq!(app.tab, Tab::Sessions, "digit must not switch tabs");
+        assert!(app.pending_delete.is_some());
+
+        app.handle_key(k(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_delete.is_none(), "Esc cancels");
+    }
+
+    /// Confirming (`y`) clears the modal and posts the delete off the event
+    /// loop; without `run()` having wired `event_tx`, there's nothing to spawn
+    /// into, so this only asserts the modal itself is cleared synchronously.
+    #[tokio::test]
+    async fn sessions_delete_confirm_clears_modal() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
+        app.handle_key(k(KeyCode::Char('y'))).await.unwrap();
+        assert!(app.pending_delete.is_none());
+    }
+
+    /// F1/Ctrl+L must not stack the help/notification overlay on top of an
+    /// already-open modal — `any_modal_open` gates them so the keystroke
+    /// falls through to the modal's own handler instead (a no-op there,
+    /// since neither key means anything to the delete-confirm modal).
+    #[tokio::test]
+    async fn f1_and_ctrl_l_are_suppressed_while_a_modal_is_open() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
+
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(!app.help_visible, "F1 must not open help over a modal");
+        assert!(app.pending_delete.is_some(), "the modal must stay open");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(
+            !app.notifications_visible,
+            "Ctrl+L must not open the log over a modal"
+        );
+        assert!(app.pending_delete.is_some(), "the modal must stay open");
+    }
+
     #[test]
     fn mouse_wheel_scrolls_chat() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Chat;
         app.chat.scroll_offset = 10;
+        // Simulates a render having already established the bound (a real
+        // frame always renders before the first input is handled).
+        app.chat.max_scroll.set(50);
         let ev = |k| MouseEvent {
             kind: k,
             column: 0,
@@ -1617,6 +2540,31 @@ mod question_tests {
         assert!(!app.chat.auto_scroll);
         app.handle_mouse(ev(MouseEventKind::ScrollDown));
         assert_eq!(app.chat.scroll_offset, 10);
+    }
+
+    /// Scrolling down is clamped to `max_scroll` (set by the render function
+    /// each frame): spamming `j` past the bottom must not overshoot into a
+    /// dead zone that then eats several `k` presses before the view moves.
+    #[tokio::test]
+    async fn chat_scroll_down_clamps_to_max_scroll() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.chat.max_scroll.set(5);
+
+        for _ in 0..50 {
+            app.chat_scroll_down(3);
+        }
+        assert_eq!(
+            app.chat.scroll_offset, 5,
+            "scrolling down must clamp at max_scroll, not grow unbounded"
+        );
+
+        // One `k` must immediately move the view (not be swallowed catching
+        // up from an overshot offset).
+        app.handle_key(k(KeyCode::Char('k'))).await.unwrap();
+        assert_eq!(app.chat.scroll_offset, 2);
     }
 
     #[test]
@@ -1782,5 +2730,767 @@ mod question_tests {
         })
         .unwrap();
         assert_eq!(app.chat.sub_agents[0].status, "completed");
+    }
+
+    /// Parallel tool calls: a `ToolComplete` must land on the entry whose
+    /// `tool_call_id` it names, not on whichever entry is last in the list.
+    #[tokio::test]
+    async fn tool_events_pair_by_id_not_position() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "a".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "b".into(),
+            tool_name: "Write".into(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+
+        // "b" was started most recently (last in the list), but the Complete
+        // event names "a" — position-based pairing would wrongly land this on
+        // "b".
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "a".into(),
+            result: ToolResult {
+                success: true,
+                result: "a-result".into(),
+            },
+        })
+        .unwrap();
+
+        let calls = &app.chat.current_tool_calls;
+        assert_eq!(calls.len(), 2, "no entry is dropped or duplicated");
+        let a = calls.iter().find(|t| t.id == "a").unwrap();
+        let b = calls.iter().find(|t| t.id == "b").unwrap();
+        assert_eq!(a.result.as_deref(), Some("a-result"));
+        assert_eq!(a.phase, "complete");
+        assert!(b.result.is_none(), "b's result must be untouched");
+        assert_eq!(b.phase, "running", "b must still be running");
+    }
+
+    /// A `ToolComplete`/`ToolError` for an id with no matching `ToolStart` is
+    /// surfaced defensively (not silently dropped).
+    #[tokio::test]
+    async fn tool_complete_for_unknown_id_inserts_defensively() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "ghost".into(),
+            result: ToolResult {
+                success: true,
+                result: "surprise".into(),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.current_tool_calls.len(), 1);
+        let tc = &app.chat.current_tool_calls[0];
+        assert_eq!(tc.id, "ghost");
+        assert_eq!(tc.tool_name, "unknown");
+        assert_eq!(tc.result.as_deref(), Some("surprise"));
+        assert_eq!(tc.phase, "complete");
+    }
+
+    /// `AppEvent::ExecuteFailed` (posted when the `execute` POST itself fails)
+    /// must clear `chat.streaming` even though no SSE terminal event ever
+    /// arrived for the run.
+    #[tokio::test]
+    async fn execute_failed_event_clears_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_response = "partial".to_string();
+
+        app.handle_event(AppEvent::ExecuteFailed("connection refused".to_string()))
+            .await
+            .unwrap();
+
+        assert!(
+            !app.chat.streaming,
+            "streaming must clear on execute failure"
+        );
+        // notify() runs before finalize_streaming() (mirroring the existing
+        // AgentEvent::Error handler), so the transient status line ends up
+        // "Ready" — the failure detail is preserved in the notification log
+        // instead, which is what Ctrl+L surfaces.
+        let last = app.notifications.last().expect("notify logged an entry");
+        assert!(last.text.contains("connection refused"));
+        assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    /// `StopFinished(Err)` must still finalize streaming locally so the
+    /// operator regains control of the input even when the stop request
+    /// itself failed (e.g. the server is unreachable) — `App::running` stays
+    /// `true` (the app itself does not exit).
+    #[tokio::test]
+    async fn stop_failure_still_finalizes_and_keeps_app_running() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_event(AppEvent::StopFinished(
+            Err("server unreachable".to_string()),
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            !app.chat.streaming,
+            "streaming must clear despite the error"
+        );
+        assert!(app.running, "a failed stop must not tear down the app");
+        assert!(app.status_message.contains("server unreachable"));
+    }
+
+    /// `StopFinished(Ok)` finalizes streaming and reports "Stopped".
+    #[tokio::test]
+    async fn stop_success_finalizes_with_stopped_status() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_event(AppEvent::StopFinished(Ok(())))
+            .await
+            .unwrap();
+
+        assert!(!app.chat.streaming);
+        assert_eq!(app.status_message, "Stopped");
+    }
+
+    // ── Session resume (WP3) ──
+
+    fn opened(messages: Vec<ChatMessage>) -> OpenedSession {
+        OpenedSession {
+            messages,
+            model: "claude-sonnet-5".to_string(),
+            is_running: false,
+            pending: None,
+            truncated: false,
+            total_message_count: 0,
+        }
+    }
+
+    fn asst_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        }
+    }
+
+    /// A successful resume installs the mapped history, the model, and the
+    /// session id; switches to the Chat tab; and leaves `streaming` false
+    /// when the session isn't currently running.
+    #[tokio::test]
+    async fn session_opened_installs_state_and_switches_tab() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        // Leftover scratch state from a previous session — must be wiped.
+        app.chat.current_response = "stale partial".to_string();
+        app.chat.token_usage = Some(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(opened(vec![asst_msg("hello again")])),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
+        assert_eq!(app.chat.model, "claude-sonnet-5");
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.tab, Tab::Chat);
+        assert!(app.chat.auto_scroll);
+        assert!(
+            !app.chat.streaming,
+            "is_running: false must not start streaming"
+        );
+        assert!(app.chat.current_response.is_empty(), "scratch state wiped");
+        assert!(app.chat.token_usage.is_none(), "scratch state wiped");
+    }
+
+    /// `is_running: true` reattaches the SSE stream and sets `streaming`.
+    /// `event_tx` isn't wired in a bare `App::new`, so `attach_stream`'s
+    /// `SseStream::start` call still runs (it only spawns a task, no network
+    /// yet) — this asserts the flag flip, not a real connection.
+    #[tokio::test]
+    async fn session_opened_reattaches_when_running() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(OpenedSession {
+                is_running: true,
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.chat.streaming, "is_running: true must reattach");
+        assert_eq!(app.status_message, "Reattached — streaming");
+    }
+
+    /// A truncated resume surfaces "showing last N of M" as an Info
+    /// notification.
+    #[tokio::test]
+    async fn session_opened_truncated_notifies() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(OpenedSession {
+                truncated: true,
+                total_message_count: 5000,
+                ..opened(vec![asst_msg("a"), asst_msg("b")])
+            }),
+        })
+        .await
+        .unwrap();
+
+        let last = app.notifications.last().expect("truncation notified");
+        assert!(last.text.contains("Showing last 2 of 5000 messages"));
+    }
+
+    /// A resumed session with a pending question opens the modal, matching
+    /// the SSE `NeedClarification` free-text-when-no-options rule.
+    #[tokio::test]
+    async fn session_opened_with_pending_question_opens_modal() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Ok(OpenedSession {
+                pending: Some(PendingQuestion {
+                    has_pending_question: true,
+                    question: "Proceed?".to_string(),
+                    options: None,
+                    allow_custom: true,
+                    ..Default::default()
+                }),
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+
+        let q = app.pending_question.as_ref().expect("modal opened");
+        assert_eq!(q.question, "Proceed?");
+        assert!(q.options.is_empty());
+        assert!(q.custom.is_some(), "no options ⇒ free-text entry");
+    }
+
+    /// A failed resume surfaces an error and touches nothing else.
+    #[tokio::test]
+    async fn session_opened_failure_notifies_and_leaves_chat_untouched() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("old".to_string());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "s1".to_string(),
+            result: Err("not found".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.chat.session_id.as_deref(),
+            Some("old"),
+            "a failed resume must not clobber the current session"
+        );
+        let last = app.notifications.last().expect("failure notified");
+        assert!(last.text.contains("not found"));
+        assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    /// `Ctrl+N` clears every session-scoped field but keeps the model.
+    #[tokio::test]
+    async fn ctrl_n_clears_session_but_keeps_model() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "claude-sonnet-5".to_string();
+        app.chat.messages = vec![asst_msg("leftover")];
+        app.chat.current_response = "partial".to_string();
+        app.chat.token_usage = Some(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+        app.dismissed_question = Some(ActiveQuestion {
+            question: "q".to_string(),
+            options: vec![],
+            selected: 0,
+            custom: Some(String::new()),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert!(app.chat.session_id.is_none());
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.current_response.is_empty());
+        assert!(app.chat.token_usage.is_none());
+        assert!(app.pending_question.is_none());
+        assert!(
+            app.dismissed_question.is_none(),
+            "a stale cached question from the old session must not survive"
+        );
+        assert_eq!(
+            app.chat.model, "claude-sonnet-5",
+            "model must survive a new session"
+        );
+        assert_eq!(app.status_message, "New session");
+    }
+
+    /// `Ctrl+N` is a no-op while a run is streaming (must stop it explicitly
+    /// first, same as every other destructive Sessions/Chat action).
+    #[tokio::test]
+    async fn ctrl_n_is_noop_while_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
+    }
+
+    /// Esc dismisses the question modal but caches it; `Ctrl+Q` brings it
+    /// straight back without a network round-trip.
+    #[tokio::test]
+    async fn esc_then_ctrl_q_restores_the_dismissed_question() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("s1".to_string());
+
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(app.dismissed_question.is_some());
+        assert!(app.status_message.contains("Ctrl+Q"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let q = app.pending_question.as_ref().expect("question restored");
+        assert_eq!(q.question, "Run this command?");
+        assert_eq!(q.options, vec!["Approve".to_string(), "Deny".to_string()]);
+        assert!(app.dismissed_question.is_none(), "cache consumed on reopen");
+    }
+
+    /// With nothing cached and no active session, `Ctrl+Q` just notifies
+    /// instead of spawning a doomed fetch.
+    #[tokio::test]
+    async fn ctrl_q_with_nothing_cached_and_no_session_notifies() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.pending_question.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert!(last.text.contains("No pending question"));
+    }
+
+    /// `PendingQuestionChecked` (Ctrl+Q's server round-trip when nothing was
+    /// cached) opens the modal when the server reports one waiting.
+    #[tokio::test]
+    async fn pending_question_checked_opens_when_present() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_event(AppEvent::PendingQuestionChecked(Ok(PendingQuestion {
+            has_pending_question: true,
+            question: "Still there?".to_string(),
+            options: Some(vec!["Yes".to_string()]),
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.pending_question.as_ref().map(|q| q.question.as_str()),
+            Some("Still there?")
+        );
+    }
+
+    /// ...and reports there's nothing to reopen when the server agrees.
+    #[tokio::test]
+    async fn pending_question_checked_notifies_when_absent() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_event(AppEvent::PendingQuestionChecked(Ok(PendingQuestion {
+            has_pending_question: false,
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert!(last.text.contains("No pending question"));
+    }
+
+    /// Regression (mirrors `schedule_form_captures_keys_through_handle_key`):
+    /// on the Chat tab, idle, a digit must type into the message textarea —
+    /// not switch tabs — or something like "top 3 issues" silently jumps to
+    /// the Mcp tab on the '3'.
+    #[tokio::test]
+    async fn digit_on_chat_tab_types_into_textarea_not_tab_switch() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_key(k(KeyCode::Char('3'))).await.unwrap();
+        assert_eq!(
+            app.tab,
+            Tab::Chat,
+            "digit must not switch tabs while composing on Chat"
+        );
+        assert_eq!(app.chat.textarea.lines().join("\n"), "3");
+    }
+
+    /// ...but on every other tab digits still switch tabs (unchanged).
+    #[tokio::test]
+    async fn digit_on_sessions_tab_still_switches_tab() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.handle_key(k(KeyCode::Char('3'))).await.unwrap();
+        assert_eq!(
+            app.tab,
+            Tab::Mcp,
+            "digit '3' switches to tab index 2 (Mcp) outside Chat"
+        );
+    }
+
+    /// Alt+Enter inserts a newline into the compose textarea; it must not
+    /// send the message the way plain Enter does.
+    #[tokio::test]
+    async fn alt_enter_inserts_newline_without_sending() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.chat.textarea.lines().len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.chat.textarea.lines().len(),
+            2,
+            "Alt+Enter must grow the textarea by a line, not send"
+        );
+        assert_eq!(app.chat.textarea.lines()[0], "hi");
+        assert!(!app.chat.streaming, "Alt+Enter must not send the message");
+        assert!(app.chat.messages.is_empty());
+    }
+
+    /// `?` is reachable as help everywhere except Chat, where it must type
+    /// into the textarea instead (F1 is the Chat-safe way to reach help).
+    #[tokio::test]
+    async fn question_mark_opens_help_except_on_chat() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = || KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.handle_key(k()).await.unwrap();
+        assert!(app.help_visible, "'?' opens help on non-Chat tabs");
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_key(k()).await.unwrap();
+        assert!(
+            !app.help_visible,
+            "'?' must type into the chat textarea, not open help"
+        );
+        assert_eq!(app.chat.textarea.lines().join("\n"), "?");
+    }
+
+    /// F1 opens help on every tab, including Chat, unlike `?`.
+    #[tokio::test]
+    async fn f1_opens_help_on_chat_tab() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.help_visible);
+        assert!(
+            app.chat.textarea.lines().join("\n").is_empty(),
+            "F1 must not leak into the textarea"
+        );
+    }
+
+    /// Mouse wheel on a list tab (Sessions here) moves the selection instead
+    /// of being a dead input, 3 rows per notch and clamped to the list.
+    #[test]
+    fn mouse_wheel_on_sessions_moves_selection() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![
+            bare_session("s1"),
+            bare_session("s2"),
+            bare_session("s3"),
+            bare_session("s4"),
+            bare_session("s5"),
+        ];
+        app.sessions.selected = 0;
+        let ev = |k| MouseEvent {
+            kind: k,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+
+        app.handle_mouse(ev(MouseEventKind::ScrollDown));
+        assert_eq!(app.sessions.selected, 3, "3 rows per notch");
+        app.handle_mouse(ev(MouseEventKind::ScrollDown));
+        assert_eq!(app.sessions.selected, 4, "clamped to the last index");
+        app.handle_mouse(ev(MouseEventKind::ScrollUp));
+        assert_eq!(app.sessions.selected, 1);
+    }
+
+    // ── Model picker (WP5) ──
+
+    fn catalog_model(
+        provider: &str,
+        model: &str,
+        display: &str,
+        provider_display: &str,
+    ) -> CatalogModel {
+        CatalogModel {
+            reference: CatalogModelRef {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+            display_name: display.to_string(),
+            provider_display_name: provider_display.to_string(),
+        }
+    }
+
+    /// `Ctrl+O` opens the picker only on the Chat tab, and only when idle —
+    /// same rationale as `Ctrl+N` being a no-op while streaming.
+    #[tokio::test]
+    async fn ctrl_o_opens_model_picker_on_chat_tab_only() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_none(), "Ctrl+O is Chat-tab only");
+
+        app.tab = Tab::Chat;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        let picker = app.model_picker.as_ref().expect("Ctrl+O opens on Chat");
+        assert!(picker.loading, "opens immediately with loading: true");
+        assert!(picker.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_ignored_while_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.chat.streaming = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_none());
+    }
+
+    /// `↑/↓` move the selection (clamped); `Enter` applies the highlighted
+    /// model — `chat.model` gets the plain model id (NOT `provider/model`),
+    /// matching what `ChatRequest`/`ExecuteRequest`/`PatchSessionRequest.model`
+    /// resolve on the server.
+    #[tokio::test]
+    async fn model_picker_navigation_and_enter_applies() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![
+                catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI"),
+                catalog_model(
+                    "anthropic",
+                    "claude-sonnet-5",
+                    "Claude Sonnet 5",
+                    "Anthropic",
+                ),
+            ],
+            selected: 0,
+            loading: false,
+        });
+
+        app.handle_model_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 1);
+        app.handle_model_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().selected,
+            1,
+            "clamped at the last index"
+        );
+        app.handle_model_picker_key(key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 0);
+
+        app.handle_model_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        app.handle_model_picker_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+
+        assert!(app.model_picker.is_none(), "Enter closes the picker");
+        assert_eq!(
+            app.chat.model, "claude-sonnet-5",
+            "chat.model gets the plain model id, not provider/model"
+        );
+        assert_eq!(app.status_message, "Model: Claude Sonnet 5");
+    }
+
+    /// `Enter` while the catalog is still loading (empty list) is a no-op —
+    /// there's nothing to apply, and the picker stays open.
+    #[tokio::test]
+    async fn model_picker_enter_while_loading_is_noop() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![],
+            selected: 0,
+            loading: true,
+        });
+        app.handle_model_picker_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+        assert!(
+            app.model_picker.is_some(),
+            "no models to apply yet — picker stays open"
+        );
+    }
+
+    /// `Esc` closes the picker without touching `chat.model`.
+    #[tokio::test]
+    async fn model_picker_esc_leaves_model_unchanged() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "old-model".to_string();
+        app.model_picker = Some(ModelPicker {
+            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+            selected: 0,
+            loading: false,
+        });
+
+        app.handle_model_picker_key(key(KeyCode::Esc))
+            .await
+            .unwrap();
+
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.chat.model, "old-model", "Esc must not change the model");
+    }
+
+    /// `CatalogLoaded(Err(...))` notifies and closes the picker instead of
+    /// leaving it stuck on "Loading models...".
+    #[tokio::test]
+    async fn catalog_loaded_err_notifies_and_closes_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![],
+            selected: 0,
+            loading: true,
+        });
+
+        app.handle_event(AppEvent::CatalogLoaded(Err(
+            "connection refused".to_string()
+        )))
+        .await
+        .unwrap();
+
+        assert!(app.model_picker.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert!(last.text.contains("connection refused"));
+        assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    /// An empty catalog (no providers configured) notifies a warning instead
+    /// of leaving an empty modal open.
+    #[tokio::test]
+    async fn catalog_loaded_empty_notifies_warn_and_closes_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![],
+            selected: 0,
+            loading: true,
+        });
+
+        app.handle_event(AppEvent::CatalogLoaded(Ok(ProviderCatalog {
+            models: vec![],
+        })))
+        .await
+        .unwrap();
+
+        assert!(app.model_picker.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert_eq!(last.text, "No models in provider catalog");
+        assert_eq!(last.level, NoticeLevel::Warn);
+    }
+
+    /// A catalog fetch that lands after the picker was already dismissed
+    /// (`Esc`) must not reopen it.
+    #[tokio::test]
+    async fn catalog_loaded_dropped_if_picker_already_closed() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        assert!(app.model_picker.is_none());
+
+        app.handle_event(AppEvent::CatalogLoaded(Ok(ProviderCatalog {
+            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+        })))
+        .await
+        .unwrap();
+
+        assert!(
+            app.model_picker.is_none(),
+            "a stale fetch must not reopen a closed picker"
+        );
+    }
+
+    #[test]
+    fn model_picker_renders_model_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+            selected: 0,
+            loading: false,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("GPT-4.1"), "model display name missing");
+        assert!(text.contains("OpenAI"), "provider display name missing");
     }
 }

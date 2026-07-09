@@ -37,9 +37,20 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_notifications(f, app);
     }
 
-    // Pending-question modal takes visual priority — it's the blocking interaction.
+    // Exclusive modals — at most one of these is ever `Some` at a time (see
+    // the precedence comment on `App::handle_key`), so draw order only
+    // matters for visually layering over the help/notification overlays
+    // above; kept in the same 1-5 precedence order as the key routing.
     if app.pending_question.is_some() {
         layout::render_question(f, app);
+    }
+
+    if app.pending_delete.is_some() {
+        layout::render_delete_confirm(f, app);
+    }
+
+    if app.model_picker.is_some() {
+        layout::render_model_picker(f, app);
     }
 
     if app.schedule_form.is_some() {
