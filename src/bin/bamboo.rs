@@ -792,6 +792,12 @@ async fn main() {
             if let Some(ppid) = parent_pid {
                 spawn_orphan_guard(ppid);
             }
+            // Desktop notification sink default posture (see
+            // `notify_sinks::desktop::desktop_enabled`): a sidecar runs under a
+            // native shell (e.g. Bodhi) that owns notification UX, so the
+            // desktop sink's "auto" default flips off in that mode. Set once,
+            // here, before the Actix runtime starts.
+            bamboo_agent::server::notify_sinks::set_sidecar_mode(parent_pid.is_some());
 
             // Start server using the unified config
             println!("Starting Bamboo server at {}", config.server_addr());

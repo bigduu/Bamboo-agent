@@ -105,6 +105,7 @@ struct TestHarness {
     parent_session_id: String,
     child_session_id: String,
     parent_rx: broadcast::Receiver<AgentEvent>,
+    notification_service: Arc<bamboo_notification::NotificationService>,
 }
 
 async fn build_test_harness() -> TestHarness {
@@ -191,6 +192,20 @@ async fn build_test_harness_with_resolver(
         account_feed_inbox: None,
     }));
 
+    // Real notification service + relay deps (not stubbed): lets tests verify
+    // `enqueue_child_run` actually starts the always-on relay for the child
+    // session, the same way `AppState::notification_relay_deps` bundles it
+    // for the execute handler / schedule manager in production.
+    let notification_service = Arc::new(bamboo_notification::NotificationService::new(
+        bamboo_home.join("notification_preferences.json"),
+    ));
+    let notification_relay_deps = crate::app_state::session_events::NotificationRelayDeps {
+        notification_service: notification_service.clone(),
+        session_event_senders: session_event_senders.clone(),
+        session_watchers: crate::app_state::watchers::SessionWatchers::new(),
+        config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
+    };
+
     let adapter = Arc::new(ChildSessionAdapter {
         session_store,
         storage: storage.clone(),
@@ -202,6 +217,7 @@ async fn build_test_harness_with_resolver(
         subagent_model_resolver,
         config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        notification_relay: Some(notification_relay_deps),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
 
@@ -213,6 +229,7 @@ async fn build_test_harness_with_resolver(
         parent_session_id,
         child_session_id,
         parent_rx,
+        notification_service,
     }
 }
 
@@ -1089,6 +1106,51 @@ async fn send_message_can_queue_child_immediately() {
 
     assert_eq!(started_event.0, harness.parent_session_id);
     assert_eq!(started_event.1, harness.child_session_id);
+}
+
+#[tokio::test]
+async fn enqueue_child_run_starts_the_notification_relay_for_the_child() {
+    // A headless child (nobody subscribed to its own SSE/WS stream) must still
+    // get the always-on notification relay started for ITS session id — not
+    // just the parent's — so events that only ever appear on the child's own
+    // stream (e.g. a background Bash finishing, or critical context pressure
+    // inside the child) are classified instead of silently dropped. See the
+    // `notification_relay` field doc on `ChildSessionAdapter`.
+    let harness = build_test_harness().await;
+
+    invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": "retry with a narrower scope"
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_relay",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("send_message should queue the child and start its relay");
+
+    // `try_begin_relay` only returns `true` the FIRST time it claims a
+    // session id; a second call returning `false` proves a relay is already
+    // running for the child — the same technique
+    // `session_events::ensure_notification_relay_is_idempotent_and_classifies_events`
+    // uses.
+    assert!(
+        !harness
+            .notification_service
+            .try_begin_relay(&harness.child_session_id),
+        "enqueue_child_run should have started a relay for the child session"
+    );
 }
 
 #[tokio::test]

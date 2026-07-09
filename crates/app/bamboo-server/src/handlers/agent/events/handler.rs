@@ -124,6 +124,11 @@ pub async fn handler(
         "[{}] Events -> LIVE stream opened (kept open, awaiting runner events)",
         session_id,
     );
+    // Held by the stream body for the connection's lifetime; decrements the
+    // session's live-watcher count on drop (graceful close or client
+    // disconnect) — see `app_state::watchers`.
+    let watcher_guard =
+        crate::app_state::watchers::WatcherGuard::new(state.session_watchers.clone(), &session_id);
     live_stream_response(
         budget_event_to_replay,
         critical_events_to_replay,
@@ -131,5 +136,6 @@ pub async fn handler(
         state.clone(),
         session_id,
         batch_ms,
+        watcher_guard,
     )
 }

@@ -152,6 +152,7 @@ fn build_manager(
         .expect("build agent");
 
     let agent = Arc::new(agent);
+    let config_for_relay = config.clone();
     let resolve_run_config = Arc::new(move |_job: &ScheduleRunJob| {
         let model =
             bamboo_agent::server::model_config_helper::get_schedule_model_from_config(&config)
@@ -186,6 +187,18 @@ fn build_manager(
         account_feed_inbox: None,
         app_data_dir: None,
         trigger_engine: bamboo_agent::server::schedule_app::default_trigger_engine(),
+        notification_relay:
+            bamboo_agent::server::app_state::session_events::NotificationRelayDeps {
+                notification_service: Arc::new(bamboo_notification::NotificationService::new(
+                    dir.join("notification_preferences.json"),
+                )),
+                session_event_senders: Arc::new(RwLock::new(HashMap::<
+                    String,
+                    broadcast::Sender<AgentEvent>,
+                >::new())),
+                session_watchers: bamboo_agent::server::app_state::watchers::SessionWatchers::new(),
+                config: Arc::new(RwLock::new(config_for_relay)),
+            },
         resolve_run_config,
     };
 

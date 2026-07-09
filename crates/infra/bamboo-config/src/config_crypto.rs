@@ -435,6 +435,71 @@ impl Config {
         }
     }
 
+    // ── Notification channel secrets (ntfy token, Bark device key) ─────
+
+    /// Decrypt notification-channel secrets into in-memory plaintext after
+    /// loading config. Mirrors [`Config::hydrate_provider_api_keys_from_encrypted`]:
+    /// the plaintext fields are `#[serde(skip_serializing)]` (never on disk), so
+    /// this is the only way they get populated after a fresh load.
+    pub fn hydrate_notifications_from_encrypted(&mut self) {
+        let ntfy = &mut self.notifications.ntfy;
+        if ntfy
+            .token
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(encrypted) = ntfy.token_encrypted.as_deref() {
+                match crate::encryption::decrypt(encrypted) {
+                    Ok(value) => ntfy.token = Some(value),
+                    Err(e) => tracing::warn!("Failed to decrypt ntfy token: {}", e),
+                }
+            }
+        }
+
+        let bark = &mut self.notifications.bark;
+        if bark
+            .device_key
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(encrypted) = bark.device_key_encrypted.as_deref() {
+                match crate::encryption::decrypt(encrypted) {
+                    Ok(value) => bark.device_key = Some(value),
+                    Err(e) => tracing::warn!("Failed to decrypt Bark device key: {}", e),
+                }
+            }
+        }
+    }
+
+    /// Re-encrypt notification-channel secrets from current in-memory plaintext
+    /// before persisting to disk. Mirrors
+    /// [`Config::refresh_provider_api_keys_encrypted`]: an empty/absent
+    /// plaintext leaves any existing ciphertext intact (a redacted round-trip
+    /// where the client never re-sent the secret keeps it).
+    pub fn refresh_notifications_encrypted(&mut self) -> Result<()> {
+        let ntfy = &mut self.notifications.ntfy;
+        let token = ntfy.token.as_deref().unwrap_or("").trim();
+        if !token.is_empty() {
+            ntfy.token_encrypted =
+                Some(crate::encryption::encrypt(token).context("Failed to encrypt ntfy token")?);
+        }
+
+        let bark = &mut self.notifications.bark;
+        let device_key = bark.device_key.as_deref().unwrap_or("").trim();
+        if !device_key.is_empty() {
+            bark.device_key_encrypted = Some(
+                crate::encryption::encrypt(device_key)
+                    .context("Failed to encrypt Bark device key")?,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Restore env-sourced provider `api_key`s that a serde round-trip dropped.
     ///
     /// `api_key` is `#[serde(skip_serializing)]`, so serializing `previous` and

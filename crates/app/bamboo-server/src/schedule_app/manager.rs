@@ -62,6 +62,12 @@ pub struct ScheduleContext {
     pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     pub app_data_dir: Option<std::path::PathBuf>,
     pub trigger_engine: DynTriggerEngine,
+    /// Dependencies to start the always-on notification relay (see
+    /// `crate::app_state::session_events::ensure_notification_relay`).
+    /// Scheduled runs previously never classified events into notifications
+    /// at all — nothing spawned a relay for a session no SSE/WS client had
+    /// ever subscribed to, which is the common case for a headless run.
+    pub notification_relay: crate::app_state::session_events::NotificationRelayDeps,
     /// Adapter-provided callback that resolves model, system prompt, workspace path
     /// and reasoning effort for a schedule run job.
     pub resolve_run_config: Arc<dyn Fn(&ScheduleRunJob) -> ResolvedRunConfig + Send + Sync>,
@@ -202,6 +208,98 @@ impl ScheduleManager {
     }
 }
 
+/// Maximum length, in characters, of the final-assistant-message excerpt
+/// used as a schedule-completion notification body (mirrors
+/// `bamboo_notification::policy`'s `RUN_FAILED_BODY_MAX`, which isn't
+/// exported for reuse here).
+const SCHEDULE_NOTIFY_BODY_MAX: usize = 200;
+
+/// Unicode-safe truncation to at most `max` chars, appending an ellipsis when
+/// cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Builds the "Schedule '<name>' completed|failed" notification title.
+fn schedule_run_title(schedule_name: &str, success: bool) -> String {
+    if success {
+        format!("Schedule '{schedule_name}' completed")
+    } else {
+        format!("Schedule '{schedule_name}' failed")
+    }
+}
+
+/// Excerpts the most recent non-empty assistant message from `messages`
+/// (walking back from the end), truncated to [`SCHEDULE_NOTIFY_BODY_MAX`]
+/// chars. This is "cheaply reachable" because the session is already in
+/// memory at the point the completion hook runs — no extra fetch or compute.
+/// Returns `None` when there is no such message, so the caller can fall back
+/// to a run-status string.
+fn final_assistant_excerpt(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant) && !m.content.trim().is_empty())
+        .map(|m| truncate_chars(m.content.trim(), SCHEDULE_NOTIFY_BODY_MAX))
+}
+
+/// Emits a schedule-specific completion/failure notification, enriching the
+/// generic `run_completed`/`run_failed` notification the always-on relay
+/// (`ensure_notification_relay`, wired in [`run_schedule_job`] below) already
+/// produces from the raw `AgentEvent::Complete`/`Error` this run's agent loop
+/// emits.
+///
+/// No-double-fire design: both sources mint through
+/// [`bamboo_notification::NotificationService::notify_schedule_run`] /
+/// `notify`, which share the SAME dedup key
+/// (`bamboo_notification::policy::classify_schedule_run`'s doc comment has
+/// the full rationale) within the service's 30s dedup window — so whichever
+/// of the two actually reaches the service first "wins" the user-visible
+/// copy and the second is silently coalesced. The run can therefore never
+/// double-notify its owner; this call is always safe to make unconditionally
+/// alongside the relay.
+async fn notify_schedule_run_outcome(
+    relay: &crate::app_state::session_events::NotificationRelayDeps,
+    session_id: &str,
+    success: bool,
+    title: String,
+    body: String,
+) {
+    let Some(notification) = relay
+        .notification_service
+        .notify_schedule_run(session_id, success, title, body)
+    else {
+        // Deduped away by the generic relay-classified notification (or
+        // notifications/this category are disabled) — nothing to deliver.
+        return;
+    };
+
+    // Build the sink payload before `notification` is moved into the
+    // broadcast send below (mirrors `ensure_notification_relay`).
+    let sink_notification = crate::notify_sinks::SinkNotification::from_event(&notification);
+
+    let tx = relay
+        .session_event_senders
+        .read()
+        .await
+        .get(session_id)
+        .cloned();
+    if let Some(tx) = tx {
+        let _ = tx.send(notification);
+    }
+
+    if let Some(sink_notification) = sink_notification {
+        let has_watcher = relay.session_watchers.has_watcher(session_id);
+        let config_snapshot = relay.config.read().await.clone();
+        crate::AppState::dispatch_to_sinks(&config_snapshot, has_watcher, &sink_notification);
+    }
+}
+
 async fn run_schedule_job(
     ctx: ScheduleContext,
     job: ScheduleRunJob,
@@ -316,6 +414,18 @@ async fn run_schedule_job(
 
     let session_tx = get_or_create_event_sender(&ctx.session_event_senders, &session_id).await;
 
+    // Always-on relay (the critical gap this closes): a scheduled/headless
+    // run has no SSE/WS client subscribed at start — often ever — so nothing
+    // used to spawn a notification relay for it, and approval/clarification/
+    // context/completion events for scheduled sessions never classified into
+    // notifications. Idempotent (`try_begin_relay`), so this harmlessly races
+    // a client that later opens the session's live stream.
+    crate::app_state::session_events::ensure_notification_relay(
+        &ctx.notification_relay,
+        &session_id,
+        session_tx.clone(),
+    );
+
     // Insert runner status (for cancellation/status introspection).
     let Some(RunnerReservation { cancel_token, .. }) = try_reserve_runner(
         &ctx.agent_runners,
@@ -364,6 +474,8 @@ async fn run_schedule_job(
     let schedule_id_for_state = job.schedule_id.clone();
     let run_id_for_state = job.run_id.clone();
     let log_session_id = session_id.clone();
+    let schedule_name_for_notify = job.schedule_name.clone();
+    let notification_relay_for_hook = ctx.notification_relay.clone();
 
     let on_complete: SessionCompletionHook = Box::new(move |outcome, session| {
         Box::pin(async move {
@@ -396,6 +508,33 @@ async fn run_schedule_job(
                     ScheduleRunStatus::Failed
                 }
             };
+
+            // Owner notification, enriched with the schedule's name and the
+            // final assistant message (see `notify_schedule_run_outcome`'s
+            // doc comment for why this can never double-fire alongside the
+            // always-on relay's generic classification of the same run's
+            // raw `AgentEvent::Complete`/`Error`). Placed AFTER the failure
+            // marker above is appended to `session.messages`, so a failed
+            // run's body is that marker's text via `final_assistant_excerpt`.
+            let notify_title = schedule_run_title(&schedule_name_for_notify, outcome.success);
+            let notify_body = final_assistant_excerpt(&session.messages).unwrap_or_else(|| {
+                if outcome.success {
+                    "Run completed.".to_string()
+                } else {
+                    format!(
+                        "Run failed: {}",
+                        outcome.error.as_deref().unwrap_or("unknown error")
+                    )
+                }
+            });
+            notify_schedule_run_outcome(
+                &notification_relay_for_hook,
+                &log_session_id,
+                outcome.success,
+                notify_title,
+                notify_body,
+            )
+            .await;
 
             if let Err(error) = schedule_store
                 .mark_run_terminal(
@@ -485,6 +624,7 @@ pub fn build_schedule_context(
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
         persistence: base.persistence,
+        notification_relay: base.notification_relay,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
             resolve_run_config_from_config(job, &config, &provider_registry)
         }),
@@ -679,5 +819,161 @@ mod build_context_tests {
         let resolved =
             resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
         assert_eq!(resolved.model_roster.model.as_deref(), Some("gpt-chat"));
+    }
+}
+
+#[cfg(test)]
+mod notify_outcome_tests {
+    use super::*;
+    use crate::app_state::session_events::NotificationRelayDeps;
+    use crate::app_state::watchers::SessionWatchers;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::sync::RwLock as TokioRwLock;
+
+    fn relay_deps() -> (NotificationRelayDeps, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let notification_service = Arc::new(bamboo_notification::NotificationService::new(
+            dir.path().join("prefs.json"),
+        ));
+        let deps = NotificationRelayDeps {
+            notification_service,
+            session_event_senders: Arc::new(TokioRwLock::new(HashMap::new())),
+            session_watchers: SessionWatchers::new(),
+            config: Arc::new(TokioRwLock::new(bamboo_llm::Config::default())),
+        };
+        (deps, dir)
+    }
+
+    #[test]
+    fn truncate_chars_appends_ellipsis_only_when_cut() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        let truncated = truncate_chars(&"x".repeat(300), SCHEDULE_NOTIFY_BODY_MAX);
+        assert_eq!(truncated.chars().count(), SCHEDULE_NOTIFY_BODY_MAX + 1);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn schedule_run_title_names_the_schedule_and_outcome() {
+        assert_eq!(
+            schedule_run_title("nightly", true),
+            "Schedule 'nightly' completed"
+        );
+        assert_eq!(
+            schedule_run_title("nightly", false),
+            "Schedule 'nightly' failed"
+        );
+    }
+
+    #[test]
+    fn final_assistant_excerpt_finds_the_last_non_empty_assistant_message() {
+        let messages = vec![
+            Message::user("hi"),
+            Message::assistant("first reply", None),
+            Message::assistant("   ", None), // blank — skipped
+            Message::assistant("final reply", None),
+        ];
+        assert_eq!(
+            final_assistant_excerpt(&messages).as_deref(),
+            Some("final reply")
+        );
+    }
+
+    #[test]
+    fn final_assistant_excerpt_truncates_long_content() {
+        let long = "x".repeat(300);
+        let messages = vec![Message::assistant(long, None)];
+        let excerpt = final_assistant_excerpt(&messages).unwrap();
+        assert_eq!(excerpt.chars().count(), SCHEDULE_NOTIFY_BODY_MAX + 1);
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn final_assistant_excerpt_none_when_no_assistant_message() {
+        let messages = vec![Message::user("hi")];
+        assert!(final_assistant_excerpt(&messages).is_none());
+    }
+
+    /// The manager-level no-double-fire guarantee, exercised through
+    /// [`notify_schedule_run_outcome`] itself (not just the underlying
+    /// `NotificationService` primitive it wraps): the generic relay path
+    /// (raw `AgentEvent::Complete`, classified via
+    /// `NotificationService::notify`) firing FIRST must dedup away a
+    /// subsequent schedule-level enrichment call for the same session — the
+    /// scenario `ensure_notification_relay` (spawned before
+    /// `spawn_session_execution` in `run_schedule_job`) races against this
+    /// hook.
+    #[tokio::test]
+    async fn notify_schedule_run_outcome_is_deduped_by_a_prior_generic_complete() {
+        let (deps, _dir) = relay_deps();
+        let (tx, mut rx) = broadcast::channel(16);
+        deps.session_event_senders
+            .write()
+            .await
+            .insert("sess-1".to_string(), tx.clone());
+
+        // Simulate the always-on relay having already classified the raw
+        // AgentEvent::Complete for this session (inserts the shared dedup
+        // key into the service's window).
+        let relay_fired = deps.notification_service.notify(
+            "sess-1",
+            &AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        );
+        assert!(relay_fired.is_some());
+
+        notify_schedule_run_outcome(
+            &deps,
+            "sess-1",
+            true,
+            "Schedule 'nightly' completed".to_string(),
+            "All done.".to_string(),
+        )
+        .await;
+
+        // The manager-level call was deduped — it must not have broadcast a
+        // second notification onto the session channel.
+        let outcome = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            outcome.is_err(),
+            "deduped schedule-level notification must not broadcast a second event"
+        );
+    }
+
+    /// Same guarantee, exercised in the opposite call order: the
+    /// schedule-level enrichment fires first and wins; a subsequent generic
+    /// relay classification for the same raw event is what gets deduped.
+    #[tokio::test]
+    async fn notify_schedule_run_outcome_first_dedups_a_later_generic_complete() {
+        let (deps, _dir) = relay_deps();
+
+        notify_schedule_run_outcome(
+            &deps,
+            "sess-2",
+            true,
+            "Schedule 'nightly' completed".to_string(),
+            "All done.".to_string(),
+        )
+        .await;
+
+        let relay_fired = deps.notification_service.notify(
+            "sess-2",
+            &AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        );
+        assert!(
+            relay_fired.is_none(),
+            "the later generic classification must be deduped away"
+        );
     }
 }

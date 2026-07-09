@@ -481,6 +481,109 @@ pub struct BrokerClientConfig {
     pub token_encrypted: Option<String>,
 }
 
+/// Native desktop (OS-notification) delivery channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DesktopChannelConfig {
+    /// `None` = auto: on when Bamboo runs as a standalone `bamboo serve`
+    /// process, off when spawned as a sidecar under `--parent-pid` (a native
+    /// shell such as Bodhi owns notification UX in that mode — desktop
+    /// notifications from both the sidecar and the shell would double-fire).
+    /// `Some(_)` is an explicit user override of that default in either
+    /// direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// [ntfy.sh](https://ntfy.sh) push notification channel (self-hostable).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NtfyChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// ntfy server base URL (public ntfy.sh or a self-hosted instance).
+    #[serde(default = "default_ntfy_base_url")]
+    pub base_url: String,
+    /// Topic to publish to. Priority mapping from notification category is
+    /// left to the delivery sink, not configured here.
+    #[serde(default)]
+    pub topic: String,
+    /// Access token for a protected/self-hosted ntfy instance (public ntfy.sh
+    /// topics need none).
+    ///
+    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
+    /// never serialized and is hydrated in memory on load (mirrors
+    /// [`EnvVarEntry`] / [`BrokerClientConfig::token`]).
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
+    /// Encrypted ciphertext of `token` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_encrypted: Option<String>,
+}
+
+impl Default for NtfyChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_ntfy_base_url(),
+            topic: String::new(),
+            token: None,
+            token_encrypted: None,
+        }
+    }
+}
+
+fn default_ntfy_base_url() -> String {
+    "https://ntfy.sh".to_string()
+}
+
+/// [Bark](https://github.com/Finb/Bark) iOS push notification channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BarkChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bark server base URL (public api.day.app or a self-hosted instance).
+    #[serde(default = "default_bark_base_url")]
+    pub base_url: String,
+    /// Bark device key identifying the target iOS device.
+    ///
+    /// Secret: encrypted at rest in `device_key_encrypted`; this plaintext
+    /// field is never serialized and is hydrated in memory on load (mirrors
+    /// [`NtfyChannelConfig::token`]).
+    #[serde(default, skip_serializing)]
+    pub device_key: Option<String>,
+    /// Encrypted ciphertext of `device_key` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key_encrypted: Option<String>,
+}
+
+impl Default for BarkChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_bark_base_url(),
+            device_key: None,
+            device_key_encrypted: None,
+        }
+    }
+}
+
+fn default_bark_base_url() -> String {
+    "https://api.day.app".to_string()
+}
+
+/// Notification delivery channels: native desktop plus push-relay services.
+///
+/// Additive/back-compat: an absent `notifications` key in `config.json`
+/// deserializes to the defaults (desktop auto, ntfy/bark disabled).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub desktop: DesktopChannelConfig,
+    #[serde(default)]
+    pub ntfy: NtfyChannelConfig,
+    #[serde(default)]
+    pub bark: BarkChannelConfig,
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -625,6 +728,13 @@ pub struct Config {
     // conventions). We still accept the legacy `mcp` key for backward compatibility.
     #[serde(default, rename = "mcpServers", alias = "mcp")]
     pub mcp: bamboo_domain::mcp_config::McpConfig,
+
+    /// Notification delivery channels (desktop + push-relay services).
+    /// Secrets (ntfy token, Bark device key) are encrypted at rest — see
+    /// [`Config::hydrate_notifications_from_encrypted`] /
+    /// [`Config::refresh_notifications_encrypted`].
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 
     /// Extension fields stored at the root of `config.json`.
     ///
@@ -1474,6 +1584,8 @@ impl Config {
         config.hydrate_cluster_fabric_from_encrypted();
         // Decrypt the encrypted broker token into in-memory plaintext.
         config.hydrate_broker_token_from_encrypted();
+        // Decrypt encrypted notification-channel secrets into in-memory plaintext.
+        config.hydrate_notifications_from_encrypted();
         config.normalize_tool_settings();
         config.normalize_skill_settings();
 
@@ -1621,6 +1733,7 @@ impl Config {
             config.hydrate_env_vars_from_encrypted();
             config.hydrate_cluster_fabric_from_encrypted();
             config.hydrate_broker_token_from_encrypted();
+            config.hydrate_notifications_from_encrypted();
             config.normalize_tool_settings();
             config.normalize_skill_settings();
             config
@@ -2139,6 +2252,7 @@ impl Config {
             defaults: None,
             memory: None,
             mcp: bamboo_domain::mcp_config::McpConfig::default(),
+            notifications: NotificationsConfig::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -2178,6 +2292,7 @@ impl Config {
         to_save.sanitize_cluster_fabric_for_disk();
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
+        to_save.refresh_notifications_encrypted()?;
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
         let content =
@@ -4245,6 +4360,111 @@ mod tests {
                 .token_encrypted
                 .as_deref(),
             Some("existing-cipher"),
+        );
+    }
+
+    #[test]
+    fn notifications_config_defaults_when_key_missing() {
+        // Additive/back-compat: an absent `notifications` key must deserialize
+        // to the built-in defaults (desktop auto, ntfy/bark disabled).
+        let config: Config = serde_json::from_str("{}").expect("empty object parses");
+        assert_eq!(config.notifications, NotificationsConfig::default());
+        assert_eq!(config.notifications.desktop.enabled, None);
+        assert!(!config.notifications.ntfy.enabled);
+        assert_eq!(config.notifications.ntfy.base_url, "https://ntfy.sh");
+        assert_eq!(config.notifications.ntfy.token, None);
+        assert!(!config.notifications.bark.enabled);
+        assert_eq!(config.notifications.bark.base_url, "https://api.day.app");
+        assert_eq!(config.notifications.bark.device_key, None);
+    }
+
+    #[test]
+    fn ntfy_token_round_trips_encrypt_serialize_hydrate() {
+        let mut config = Config::default();
+        config.notifications.ntfy = NtfyChannelConfig {
+            enabled: true,
+            base_url: "https://ntfy.sh".to_string(),
+            topic: "bamboo-alerts".to_string(),
+            token: Some("tk_super_secret".to_string()),
+            token_encrypted: None,
+        };
+
+        // Persist path: encrypt (what save_to_dir does).
+        config.refresh_notifications_encrypted().unwrap();
+        assert!(config.notifications.ntfy.token_encrypted.is_some());
+        assert_ne!(
+            config.notifications.ntfy.token_encrypted.as_deref(),
+            Some("tk_super_secret")
+        );
+
+        // `token` is `#[serde(skip_serializing)]` — never lands on disk, only
+        // the ciphertext does.
+        let json = serde_json::to_string(&config.notifications.ntfy).unwrap();
+        assert!(
+            !json.contains("tk_super_secret"),
+            "plaintext token must never be serialized"
+        );
+        assert!(json.contains("token_encrypted"));
+
+        // Load path: simulate a fresh load (plaintext gone, ciphertext present)
+        // and confirm hydrate restores the plaintext.
+        config.notifications.ntfy.token = None;
+        config.hydrate_notifications_from_encrypted();
+        assert_eq!(
+            config.notifications.ntfy.token.as_deref(),
+            Some("tk_super_secret")
+        );
+    }
+
+    #[test]
+    fn bark_device_key_round_trips_encrypt_serialize_hydrate() {
+        let mut config = Config::default();
+        config.notifications.bark = BarkChannelConfig {
+            enabled: true,
+            base_url: "https://api.day.app".to_string(),
+            device_key: Some("dk_super_secret".to_string()),
+            device_key_encrypted: None,
+        };
+
+        config.refresh_notifications_encrypted().unwrap();
+        assert!(config.notifications.bark.device_key_encrypted.is_some());
+        assert_ne!(
+            config.notifications.bark.device_key_encrypted.as_deref(),
+            Some("dk_super_secret")
+        );
+
+        let json = serde_json::to_string(&config.notifications.bark).unwrap();
+        assert!(
+            !json.contains("dk_super_secret"),
+            "plaintext device key must never be serialized"
+        );
+        assert!(json.contains("device_key_encrypted"));
+
+        config.notifications.bark.device_key = None;
+        config.hydrate_notifications_from_encrypted();
+        assert_eq!(
+            config.notifications.bark.device_key.as_deref(),
+            Some("dk_super_secret")
+        );
+    }
+
+    #[test]
+    fn notification_secrets_empty_refresh_preserves_ciphertext() {
+        // A redacted round-trip (plaintext empty/absent) must not wipe the
+        // stored ciphertext for either channel.
+        let mut config = Config::default();
+        config.notifications.ntfy.token_encrypted = Some("existing-ntfy-cipher".to_string());
+        config.notifications.bark.device_key_encrypted = Some("existing-bark-cipher".to_string());
+
+        config.refresh_notifications_encrypted().unwrap();
+
+        assert_eq!(
+            config.notifications.ntfy.token_encrypted.as_deref(),
+            Some("existing-ntfy-cipher")
+        );
+        assert_eq!(
+            config.notifications.bark.device_key_encrypted.as_deref(),
+            Some("existing-bark-cipher")
         );
     }
 

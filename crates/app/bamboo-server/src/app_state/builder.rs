@@ -155,6 +155,7 @@ impl AppState {
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
             bamboo_home_dir.join("notification_preferences.json"),
         ));
+        let session_watchers = super::watchers::SessionWatchers::new();
         let mcp_manager = init_mcp_manager(config.clone());
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
@@ -221,6 +222,25 @@ impl AppState {
             provider_registry.clone(),
         ));
 
+        // Long-lived session event senders map (UI subscriptions + background tasks).
+        // Declared before `build_base_tools` (moved up from its original spot below)
+        // because the `notify` tool overlaid there needs it to broadcast onto a
+        // session's live channel — see `app_state::tools::build_base_tools`.
+        let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Shared bundle of always-on notification relay deps (see
+        // `session_events::NotificationRelayDeps`). Built once and cloned into
+        // every entry point that starts a relay directly at execution time —
+        // the schedule manager, the root child-session adapter, and the
+        // guardian child-session adapter below — so they can never drift.
+        let notification_relay_deps = crate::app_state::session_events::NotificationRelayDeps {
+            notification_service: notification_service.clone(),
+            session_event_senders: session_event_senders.clone(),
+            session_watchers: session_watchers.clone(),
+            config: config.clone(),
+        };
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -230,11 +250,10 @@ impl AppState {
             persistence.clone(),
             sessions.clone(),
             bamboo_home_dir.clone(),
+            notification_service.clone(),
+            session_event_senders.clone(),
+            session_watchers.clone(),
         );
-
-        // Long-lived session event senders map (UI subscriptions + background tasks).
-        let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
 
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
@@ -359,6 +378,7 @@ impl AppState {
             provider_registry.clone(),
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
+            notification_relay_deps.clone(),
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task(
@@ -446,6 +466,7 @@ impl AppState {
             provider_registry.clone(),
             config_snapshot.subagents.broker.clone(),
             fabric_deployer.clone(),
+            notification_relay_deps.clone(),
         );
 
         child_completion_coordinator
@@ -478,6 +499,7 @@ impl AppState {
             subagent_model_resolver: None,
             config: config.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            notification_relay: Some(notification_relay_deps.clone()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         // Wire the spawner into the completion coordinator too, so a resumed run
@@ -521,6 +543,7 @@ impl AppState {
             tool_factory,
             permission_checker,
             notification_service,
+            session_watchers,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             mcp_proxy_shutdown,
             skill_manager,

@@ -20,6 +20,19 @@ fn default_true() -> bool {
 ///
 /// Every field defaults to `true` (via `serde(default = ...)`), so missing keys
 /// in a partial JSON document are treated as opted-in.
+///
+/// # Whole-struct-PUT caveat
+///
+/// The server's `PUT /api/v1/notifications/preferences` endpoint deserializes
+/// this struct directly and replaces the persisted value wholesale — it is
+/// not a per-field patch. This has always meant that a client holding a
+/// stale in-memory copy (fetched before some field existed, or simply never
+/// refreshed) will silently reset any field it doesn't know about back to its
+/// `serde(default)` on its next save, clobbering whatever the user
+/// previously chose for it. This applies equally to every field below,
+/// including the two most recently added (`on_run_complete`,
+/// `on_run_failed`); frontends must always PUT back a full, freshly-fetched
+/// copy rather than a hand-built partial one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NotificationPreferences {
     /// Master switch. When `false`, nothing is ever notified.
@@ -40,6 +53,12 @@ pub struct NotificationPreferences {
     /// Notify when a background shell/command (Bash `run_in_background`) finishes.
     #[serde(default = "default_true")]
     pub on_background_task_complete: bool,
+    /// Notify when a run finishes successfully (`AgentEvent::Complete`).
+    #[serde(default = "default_true")]
+    pub on_run_complete: bool,
+    /// Notify when a run fails (`AgentEvent::Error`).
+    #[serde(default = "default_true")]
+    pub on_run_failed: bool,
 }
 
 impl Default for NotificationPreferences {
@@ -51,6 +70,8 @@ impl Default for NotificationPreferences {
             on_context_pressure: true,
             on_subagent_complete: true,
             on_background_task_complete: true,
+            on_run_complete: true,
+            on_run_failed: true,
         }
     }
 }
@@ -107,6 +128,9 @@ mod tests {
         assert!(prefs.on_tool_approval);
         assert!(prefs.on_context_pressure);
         assert!(prefs.on_subagent_complete);
+        assert!(prefs.on_background_task_complete);
+        assert!(prefs.on_run_complete);
+        assert!(prefs.on_run_failed);
     }
 
     #[test]
@@ -120,6 +144,8 @@ mod tests {
             on_context_pressure: false,
             on_subagent_complete: true,
             on_background_task_complete: false,
+            on_run_complete: false,
+            on_run_failed: true,
         };
         prefs.save(&path).unwrap();
         let loaded = NotificationPreferences::load(&path);
@@ -148,5 +174,31 @@ mod tests {
         assert!(loaded.on_tool_approval);
         assert!(loaded.on_context_pressure);
         assert!(loaded.on_subagent_complete);
+        assert!(loaded.on_background_task_complete);
+        assert!(loaded.on_run_complete);
+        assert!(loaded.on_run_failed);
+    }
+
+    #[test]
+    fn new_keys_missing_from_an_older_clients_json_default_to_true() {
+        // Simulates a preferences file written by a client that predates
+        // on_run_complete/on_run_failed (the whole-struct-PUT caveat above).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "enabled": true,
+                "on_clarification": true,
+                "on_tool_approval": true,
+                "on_context_pressure": true,
+                "on_subagent_complete": true,
+                "on_background_task_complete": true
+            }"#,
+        )
+        .unwrap();
+        let loaded = NotificationPreferences::load(&path);
+        assert!(loaded.on_run_complete);
+        assert!(loaded.on_run_failed);
     }
 }

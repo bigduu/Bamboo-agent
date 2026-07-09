@@ -191,6 +191,16 @@ pub(crate) fn spawn_agent_forwarder(
     tokio::spawn(async move {
         let seq = AgentSeq::default();
 
+        // Held for the whole forwarder task's lifetime: dropped on graceful
+        // completion (terminal/closed) OR on `JoinHandle::abort()` (channel
+        // unsubscribe / connection teardown both abort this task — Tokio
+        // still runs its local drop glue), decrementing the session's
+        // live-watcher count. Never read — only its RAII drop matters.
+        let _watcher_guard = crate::app_state::watchers::WatcherGuard::new(
+            state.session_watchers.clone(),
+            &session_id,
+        );
+
         // Replay cached critical state events first (task list, sub-sessions, …),
         // then the last budget event — mirroring the v1 SSE replay order.
         for event in critical_events_to_replay {

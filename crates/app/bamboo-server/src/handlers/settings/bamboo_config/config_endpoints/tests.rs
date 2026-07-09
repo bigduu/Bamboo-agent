@@ -265,3 +265,97 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     assert_eq!(limits[0]["model_pattern"], "gpt-4o");
     assert_eq!(limits[0]["max_context_tokens"], 128000);
 }
+
+/// End-to-end: POST an ntfy token, confirm the GET response masks it, then
+/// POST again with the masked placeholder unchanged (as the UI would on an
+/// unrelated field edit) — the exact-mask keep-on-save rule must resolve that
+/// back to the live plaintext rather than wiping the stored secret. #430-style
+/// contract, applied to the new notification channel secrets.
+#[actix_web::test]
+async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    // 1) Set a real ntfy token.
+    let post = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "notifications": {
+                "ntfy": {
+                    "enabled": true,
+                    "base_url": "https://ntfy.sh",
+                    "topic": "bamboo-alerts",
+                    "token": "tk-real-secret"
+                }
+            }
+        }))
+        .to_request();
+    let post_resp = test::call_service(&app, post).await;
+    assert!(post_resp.status().is_success(), "set config should succeed");
+
+    // The stored config.json must hold ciphertext, never the plaintext token.
+    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist after set");
+    assert!(
+        config_text.contains("token_encrypted"),
+        "ntfy token must be persisted encrypted"
+    );
+    assert!(
+        !config_text.contains("tk-real-secret"),
+        "plaintext ntfy token must never be persisted"
+    );
+
+    // 2) GET masks the token as configured.
+    let get = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(body["notifications"]["ntfy"]["token"], "****...****");
+    assert_eq!(body["notifications"]["ntfy"]["topic"], "bamboo-alerts");
+
+    // 3) Re-POST with the masked placeholder (as the UI echoes it back) plus
+    // an unrelated field change — the secret must survive untouched.
+    let post2 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "notifications": {
+                "ntfy": {
+                    "enabled": true,
+                    "base_url": "https://ntfy.sh",
+                    "topic": "renamed-topic",
+                    "token": "****...****"
+                }
+            }
+        }))
+        .to_request();
+    let post2_resp = test::call_service(&app, post2).await;
+    assert!(
+        post2_resp.status().is_success(),
+        "second set config should succeed"
+    );
+
+    let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body2: serde_json::Value = test::call_and_read_body_json(&app, get2).await;
+    assert_eq!(
+        body2["notifications"]["ntfy"]["token"], "****...****",
+        "token must still read as configured"
+    );
+    assert_eq!(
+        body2["notifications"]["ntfy"]["topic"], "renamed-topic",
+        "unrelated field change must apply"
+    );
+}

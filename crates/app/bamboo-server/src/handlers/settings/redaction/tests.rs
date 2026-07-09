@@ -281,6 +281,78 @@ fn redact_config_handles_empty_env_vars() {
     assert!(env_vars.is_empty());
 }
 
+// ── Notification-channel secret redaction tests ──────────────────────
+
+#[test]
+fn redact_config_masks_configured_notification_secrets() {
+    let mut config = Config::default();
+    config.notifications.ntfy.token_encrypted = Some("enc-ntfy".to_string());
+    config.notifications.bark.device_key_encrypted = Some("enc-bark".to_string());
+
+    let input = json!({
+        "notifications": {
+            "ntfy": { "enabled": true, "base_url": "https://ntfy.sh", "topic": "alerts" },
+            "bark": { "enabled": true, "base_url": "https://api.day.app" }
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert_eq!(redacted["notifications"]["ntfy"]["token"], "****...****");
+    assert!(redacted["notifications"]["ntfy"]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("token_encrypted")));
+    assert_eq!(
+        redacted["notifications"]["bark"]["device_key"],
+        "****...****"
+    );
+    assert!(redacted["notifications"]["bark"]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("device_key_encrypted")));
+}
+
+#[test]
+fn redact_config_omits_unconfigured_notification_secret_fields() {
+    let config = Config::default();
+    let input = json!({
+        "notifications": {
+            "ntfy": { "enabled": false, "base_url": "https://ntfy.sh", "topic": "" },
+            "bark": { "enabled": false, "base_url": "https://api.day.app" }
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert!(redacted["notifications"]["ntfy"]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("token")));
+    assert!(redacted["notifications"]["bark"]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("device_key")));
+}
+
+#[test]
+fn redact_config_never_leaks_notification_ciphertext_even_when_client_supplied() {
+    // A client should never be able to smuggle ciphertext through the response
+    // path; this also guards against a future accidental re-serialization.
+    let config = Config::default();
+    let input = json!({
+        "notifications": {
+            "ntfy": { "token_encrypted": "sneaky-cipher" },
+            "bark": { "device_key_encrypted": "sneaky-cipher" }
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert!(redacted["notifications"]["ntfy"]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("token_encrypted")));
+    assert!(redacted["notifications"]["bark"]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("device_key_encrypted")));
+}
+
 #[test]
 fn redact_config_defaults_secret_false_when_missing() {
     let config = Config::default();

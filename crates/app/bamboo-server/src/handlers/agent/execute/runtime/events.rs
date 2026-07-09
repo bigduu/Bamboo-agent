@@ -32,6 +32,19 @@ pub(crate) fn spawn_event_forwarder(
     session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
     gold_config: Option<GoldConfig>,
 ) {
+    // Always-on relay: previously the notification relay only started when an
+    // SSE/WS client subscribed, so a run that finishes (or hits a
+    // clarification/approval gate) before any client ever connects — a race
+    // on the interactive path, or a session opened later — silently never
+    // classified events into notifications. This is called at every
+    // execution start site (paired 1:1 with `spawn_agent_execution` here and
+    // in `resume_adapter`), so the relay is guaranteed running the moment a
+    // run begins, not just when someone happens to be watching.
+    // Idempotent (`try_begin_relay`), so this and a client's own
+    // `ensure_notification_relay` call race harmlessly — whichever runs
+    // first wins.
+    state.ensure_notification_relay(&session_id, session_tx.clone());
+
     let span_session_id = session_id.clone();
     let session_span = tracing::info_span!("event_forwarder", session_id = %span_session_id);
 

@@ -7,6 +7,9 @@
 //! optional [`ClassifiedNotification`]. Dedup timing and id/timestamp minting
 //! happen one layer up in [`crate::service`].
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use bamboo_agent_core::AgentEvent;
 
 use crate::preferences::NotificationPreferences;
@@ -16,6 +19,9 @@ const CLARIFICATION_BODY_MAX: usize = 120;
 
 /// Maximum body length for a background-task-completed notification, in characters.
 const BACKGROUND_TASK_BODY_MAX: usize = 120;
+
+/// Maximum body length for a run-failed notification, in characters.
+const RUN_FAILED_BODY_MAX: usize = 200;
 
 /// The kind of user-facing notification a classified event maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +36,13 @@ pub enum NotificationCategory {
     SubagentCompleted,
     /// A background shell/command (Bash `run_in_background`) has finished.
     BackgroundTaskCompleted,
+    /// A run finished successfully (`AgentEvent::Complete`).
+    RunCompleted,
+    /// A run failed (`AgentEvent::Error`).
+    RunFailed,
+    /// A caller-supplied notification minted directly by the `notify` tool
+    /// rather than derived from a specific `AgentEvent` variant.
+    Custom,
 }
 
 impl NotificationCategory {
@@ -41,6 +54,9 @@ impl NotificationCategory {
             NotificationCategory::ContextCritical => "context_critical",
             NotificationCategory::SubagentCompleted => "subagent_completed",
             NotificationCategory::BackgroundTaskCompleted => "background_task_completed",
+            NotificationCategory::RunCompleted => "run_completed",
+            NotificationCategory::RunFailed => "run_failed",
+            NotificationCategory::Custom => "custom",
         }
     }
 }
@@ -225,7 +241,122 @@ pub fn classify(
             })
         }
 
+        AgentEvent::Complete { usage } => {
+            if !prefs.on_run_complete {
+                return None;
+            }
+            Some(ClassifiedNotification {
+                category: NotificationCategory::RunCompleted,
+                priority: NotificationPriority::Normal,
+                title: "Run complete".to_string(),
+                body: format!(
+                    "Session {session_id} finished ({} tokens).",
+                    usage.total_tokens
+                ),
+                dedup_key: format!("run:{session_id}:done"),
+            })
+        }
+
+        AgentEvent::Error { message } => {
+            if !prefs.on_run_failed {
+                return None;
+            }
+            Some(ClassifiedNotification {
+                category: NotificationCategory::RunFailed,
+                priority: NotificationPriority::High,
+                title: "Run failed".to_string(),
+                body: truncate(message, RUN_FAILED_BODY_MAX),
+                dedup_key: format!("run:{session_id}:failed"),
+            })
+        }
+
         _ => None,
+    }
+}
+
+/// Classifies a caller-supplied notification (from the `notify` tool) into a
+/// candidate notification.
+///
+/// Unlike [`classify`], this does not gate on a per-category preference —
+/// there is no dedicated preference for arbitrary agent-chosen content, only
+/// the master [`NotificationPreferences::enabled`] switch applies here. The
+/// dedup key hashes `title` + `body` so an identical repeated call within the
+/// dedup window is coalesced while distinct content from the same session
+/// still notifies. Kept in `policy` (not `service`) to stay pure and
+/// unit-testable without a service instance.
+pub fn classify_custom(
+    session_id: &str,
+    title: &str,
+    body: &str,
+    priority: NotificationPriority,
+    prefs: &NotificationPreferences,
+) -> Option<ClassifiedNotification> {
+    if !prefs.enabled {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    title.hash(&mut hasher);
+    body.hash(&mut hasher);
+    let digest = hasher.finish();
+    Some(ClassifiedNotification {
+        category: NotificationCategory::Custom,
+        priority,
+        title: title.to_string(),
+        body: body.to_string(),
+        dedup_key: format!("custom:{session_id}:{digest:x}"),
+    })
+}
+
+/// Classifies a schedule-run completion/failure into a notification.
+///
+/// Unlike [`classify`], `title`/`body` are caller-supplied rather than
+/// derived from a raw `AgentEvent` — the schedule manager can name the
+/// schedule and quote the run's final assistant message, which the generic
+/// `AgentEvent::Complete`/`Error` path has no way to know. Everything else
+/// (category, priority, prefs gate, and — critically — the dedup key) is
+/// deliberately IDENTICAL to what [`classify`] derives for
+/// `AgentEvent::Complete`/`Error`: `"run:{session_id}:done"` /
+/// `"run:{session_id}:failed"`. A scheduled run's agent loop still emits that
+/// raw event, which the always-on notification relay independently
+/// classifies via [`classify`] — sharing the dedup key means whichever of the
+/// two sources reaches [`crate::service::NotificationService`] first wins the
+/// user-visible copy and the second is coalesced within
+/// [`crate::service::NotificationService::DEDUP_WINDOW`], so a scheduled run
+/// can never double-notify its owner. See
+/// `bamboo_server::schedule_app::manager`'s completion hook for the call
+/// site.
+pub fn classify_schedule_run(
+    session_id: &str,
+    success: bool,
+    title: String,
+    body: String,
+    prefs: &NotificationPreferences,
+) -> Option<ClassifiedNotification> {
+    if !prefs.enabled {
+        return None;
+    }
+    if success {
+        if !prefs.on_run_complete {
+            return None;
+        }
+        Some(ClassifiedNotification {
+            category: NotificationCategory::RunCompleted,
+            priority: NotificationPriority::Normal,
+            title,
+            body,
+            dedup_key: format!("run:{session_id}:done"),
+        })
+    } else {
+        if !prefs.on_run_failed {
+            return None;
+        }
+        Some(ClassifiedNotification {
+            category: NotificationCategory::RunFailed,
+            priority: NotificationPriority::High,
+            title,
+            body,
+            dedup_key: format!("run:{session_id}:failed"),
+        })
     }
 }
 
@@ -266,6 +397,22 @@ mod tests {
             command: "npm run build".to_string(),
             exit_code,
             status: status.to_string(),
+        }
+    }
+
+    fn complete(total_tokens: u64) -> AgentEvent {
+        AgentEvent::Complete {
+            usage: bamboo_agent_core::TokenUsage {
+                prompt_tokens: total_tokens / 2,
+                completion_tokens: total_tokens - total_tokens / 2,
+                total_tokens,
+            },
+        }
+    }
+
+    fn error(message: &str) -> AgentEvent {
+        AgentEvent::Error {
+            message: message.to_string(),
         }
     }
 
@@ -434,6 +581,9 @@ mod tests {
         assert!(classify("sess", &subagent("completed"), &prefs).is_none());
         assert!(classify("sess", &clarification("q", None), &prefs).is_none());
         assert!(classify("sess", &bash("sh-1", "completed", Some(0)), &prefs).is_none());
+        assert!(classify("sess", &complete(100), &prefs).is_none());
+        assert!(classify("sess", &error("boom"), &prefs).is_none());
+        assert!(classify_custom("sess", "t", "b", NotificationPriority::Low, &prefs).is_none());
     }
 
     #[test]
@@ -443,5 +593,183 @@ mod tests {
             content: "hello".to_string(),
         };
         assert!(classify("sess", &event, &prefs).is_none());
+    }
+
+    #[test]
+    fn run_completed_fires_with_token_usage_in_body() {
+        let prefs = NotificationPreferences::default();
+        let result = classify("sess-1", &complete(1234), &prefs).unwrap();
+        assert_eq!(result.category, NotificationCategory::RunCompleted);
+        assert_eq!(result.priority, NotificationPriority::Normal);
+        assert_eq!(result.title, "Run complete");
+        assert!(result.body.contains("sess-1"));
+        assert!(result.body.contains("1234"));
+        assert_eq!(result.dedup_key, "run:sess-1:done");
+    }
+
+    #[test]
+    fn run_completed_gated_by_on_run_complete() {
+        let prefs = NotificationPreferences {
+            on_run_complete: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify("sess", &complete(10), &prefs).is_none());
+    }
+
+    #[test]
+    fn run_failed_fires_with_truncated_message() {
+        let prefs = NotificationPreferences::default();
+        let long_message = "x".repeat(300);
+        let result = classify("sess-2", &error(&long_message), &prefs).unwrap();
+        assert_eq!(result.category, NotificationCategory::RunFailed);
+        assert_eq!(result.priority, NotificationPriority::High);
+        assert_eq!(result.title, "Run failed");
+        assert_eq!(result.body.chars().count(), RUN_FAILED_BODY_MAX + 1);
+        assert!(result.body.ends_with('…'));
+        assert_eq!(result.dedup_key, "run:sess-2:failed");
+    }
+
+    #[test]
+    fn run_failed_gated_by_on_run_failed() {
+        let prefs = NotificationPreferences {
+            on_run_failed: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify("sess", &error("boom"), &prefs).is_none());
+    }
+
+    #[test]
+    fn classify_custom_mints_custom_category_with_hashed_dedup_key() {
+        let prefs = NotificationPreferences::default();
+        let result =
+            classify_custom("sess-3", "Title", "Body", NotificationPriority::Low, &prefs).unwrap();
+        assert_eq!(result.category, NotificationCategory::Custom);
+        assert_eq!(result.priority, NotificationPriority::Low);
+        assert_eq!(result.title, "Title");
+        assert_eq!(result.body, "Body");
+        assert!(result.dedup_key.starts_with("custom:sess-3:"));
+    }
+
+    #[test]
+    fn classify_custom_dedup_key_is_stable_for_identical_content() {
+        let prefs = NotificationPreferences::default();
+        let a =
+            classify_custom("sess", "Title", "Body", NotificationPriority::Low, &prefs).unwrap();
+        let b =
+            classify_custom("sess", "Title", "Body", NotificationPriority::Low, &prefs).unwrap();
+        assert_eq!(a.dedup_key, b.dedup_key);
+    }
+
+    #[test]
+    fn classify_custom_dedup_key_differs_for_different_content() {
+        let prefs = NotificationPreferences::default();
+        let a =
+            classify_custom("sess", "Title", "Body", NotificationPriority::Low, &prefs).unwrap();
+        let b = classify_custom(
+            "sess",
+            "Title",
+            "Different body",
+            NotificationPriority::Low,
+            &prefs,
+        )
+        .unwrap();
+        assert_ne!(a.dedup_key, b.dedup_key);
+    }
+
+    #[test]
+    fn classify_custom_ignores_per_category_prefs() {
+        // classify_custom must not be gated by any per-category flag — only
+        // the master `enabled` switch applies.
+        let prefs = NotificationPreferences {
+            on_clarification: false,
+            on_tool_approval: false,
+            on_context_pressure: false,
+            on_subagent_complete: false,
+            on_background_task_complete: false,
+            on_run_complete: false,
+            on_run_failed: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify_custom("sess", "t", "b", NotificationPriority::Low, &prefs).is_some());
+    }
+
+    #[test]
+    fn classify_schedule_run_success_shares_dedup_key_with_classify_complete() {
+        let prefs = NotificationPreferences::default();
+        let scheduled = classify_schedule_run(
+            "sess-1",
+            true,
+            "Schedule 'nightly' completed".to_string(),
+            "All done.".to_string(),
+            &prefs,
+        )
+        .unwrap();
+        let raw = classify("sess-1", &complete(10), &prefs).unwrap();
+        assert_eq!(scheduled.dedup_key, raw.dedup_key);
+        assert_eq!(scheduled.category, NotificationCategory::RunCompleted);
+        assert_eq!(scheduled.priority, NotificationPriority::Normal);
+        assert_eq!(scheduled.title, "Schedule 'nightly' completed");
+        assert_eq!(scheduled.body, "All done.");
+    }
+
+    #[test]
+    fn classify_schedule_run_failure_shares_dedup_key_with_classify_error() {
+        let prefs = NotificationPreferences::default();
+        let scheduled = classify_schedule_run(
+            "sess-2",
+            false,
+            "Schedule 'nightly' failed".to_string(),
+            "boom".to_string(),
+            &prefs,
+        )
+        .unwrap();
+        let raw = classify("sess-2", &error("boom"), &prefs).unwrap();
+        assert_eq!(scheduled.dedup_key, raw.dedup_key);
+        assert_eq!(scheduled.category, NotificationCategory::RunFailed);
+        assert_eq!(scheduled.priority, NotificationPriority::High);
+    }
+
+    #[test]
+    fn classify_schedule_run_gated_by_on_run_complete_and_on_run_failed() {
+        let complete_off = NotificationPreferences {
+            on_run_complete: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify_schedule_run(
+            "sess",
+            true,
+            "t".to_string(),
+            "b".to_string(),
+            &complete_off
+        )
+        .is_none());
+
+        let failed_off = NotificationPreferences {
+            on_run_failed: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify_schedule_run(
+            "sess",
+            false,
+            "t".to_string(),
+            "b".to_string(),
+            &failed_off
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn classify_schedule_run_master_switch_off_yields_none() {
+        let prefs = NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(
+            classify_schedule_run("sess", true, "t".to_string(), "b".to_string(), &prefs).is_none()
+        );
+        assert!(
+            classify_schedule_run("sess", false, "t".to_string(), "b".to_string(), &prefs)
+                .is_none()
+        );
     }
 }

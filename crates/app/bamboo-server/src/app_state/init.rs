@@ -404,6 +404,7 @@ pub fn build_schedule_manager(
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
     app_data_dir: Option<std::path::PathBuf>,
     account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+    notification_relay: crate::app_state::session_events::NotificationRelayDeps,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
         schedule_store,
@@ -416,6 +417,7 @@ pub fn build_schedule_manager(
         persistence,
         app_data_dir,
         trigger_engine: crate::schedule_app::default_trigger_engine(),
+        notification_relay,
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };
     Arc::new(ScheduleManager::new(build_schedule_context(
