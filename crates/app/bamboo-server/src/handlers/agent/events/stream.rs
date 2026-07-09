@@ -190,6 +190,7 @@ pub(super) fn live_stream_response(
     state: web::Data<AppState>,
     session_id: String,
     batch_ms: u64,
+    watcher_guard: crate::app_state::watchers::WatcherGuard,
 ) -> HttpResponse {
     HttpResponse::Ok()
         .append_header((header::CONTENT_TYPE, "text/event-stream; charset=utf-8"))
@@ -197,6 +198,11 @@ pub(super) fn live_stream_response(
         .append_header((header::CONNECTION, "keep-alive"))
         .append_header(("X-Accel-Buffering", "no"))
         .streaming(async_stream::stream! {
+            // Held for the whole generator's lifetime: dropped when this
+            // stream ends (naturally or via early client disconnect),
+            // decrementing the session's live-watcher count. Never read —
+            // only its RAII drop matters.
+            let _watcher_guard = watcher_guard;
             // Replay cached critical state events first (task list, sub-sessions, …).
             for event in &critical_events_to_replay {
                 if let Some(sse_data) = as_sse_data(Some(event)) {

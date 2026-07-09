@@ -155,6 +155,7 @@ impl AppState {
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
             bamboo_home_dir.join("notification_preferences.json"),
         ));
+        let session_watchers = super::watchers::SessionWatchers::new();
         let mcp_manager = init_mcp_manager(config.clone());
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
@@ -359,6 +360,12 @@ impl AppState {
             provider_registry.clone(),
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
+            crate::app_state::session_events::NotificationRelayDeps {
+                notification_service: notification_service.clone(),
+                session_event_senders: session_event_senders.clone(),
+                session_watchers: session_watchers.clone(),
+                config: config.clone(),
+            },
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task(
@@ -521,6 +528,7 @@ impl AppState {
             tool_factory,
             permission_checker,
             notification_service,
+            session_watchers,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             mcp_proxy_shutdown,
             skill_manager,

@@ -270,6 +270,12 @@ pub struct AppState {
     /// clients to render; preferences are persisted server-side.
     pub notification_service: Arc<bamboo_notification::NotificationService>,
 
+    /// Live SSE/WS client-subscriber counts per session (see
+    /// [`watchers::SessionWatchers`]). Used to suppress a redundant desktop
+    /// popup for categories the UI already surfaces while a client is
+    /// actively watching a session.
+    pub session_watchers: Arc<watchers::SessionWatchers>,
+
     /// Cancellation tokens for in-flight requests
     ///
     /// Maps request/session IDs to their cancellation tokens,
@@ -391,9 +397,14 @@ mod persistence;
 mod provider_api;
 pub mod resume_adapter;
 pub mod runner_lifecycle;
-pub(crate) mod session_events;
+// `pub` (not `pub(crate)`): `ScheduleContext::notification_relay` (a public
+// field of the public `schedule_app::ScheduleContext`) is typed
+// `session_events::NotificationRelayDeps`, so external callers that build a
+// `ScheduleContext` by hand (e.g. integration tests) need to name it.
+pub mod session_events;
 mod session_loader;
 mod tools;
+pub mod watchers;
 
 #[cfg(test)]
 mod tests;

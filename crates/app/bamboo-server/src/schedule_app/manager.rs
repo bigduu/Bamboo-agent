@@ -62,6 +62,12 @@ pub struct ScheduleContext {
     pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     pub app_data_dir: Option<std::path::PathBuf>,
     pub trigger_engine: DynTriggerEngine,
+    /// Dependencies to start the always-on notification relay (see
+    /// `crate::app_state::session_events::ensure_notification_relay`).
+    /// Scheduled runs previously never classified events into notifications
+    /// at all — nothing spawned a relay for a session no SSE/WS client had
+    /// ever subscribed to, which is the common case for a headless run.
+    pub notification_relay: crate::app_state::session_events::NotificationRelayDeps,
     /// Adapter-provided callback that resolves model, system prompt, workspace path
     /// and reasoning effort for a schedule run job.
     pub resolve_run_config: Arc<dyn Fn(&ScheduleRunJob) -> ResolvedRunConfig + Send + Sync>,
@@ -316,6 +322,18 @@ async fn run_schedule_job(
 
     let session_tx = get_or_create_event_sender(&ctx.session_event_senders, &session_id).await;
 
+    // Always-on relay (the critical gap this closes): a scheduled/headless
+    // run has no SSE/WS client subscribed at start — often ever — so nothing
+    // used to spawn a notification relay for it, and approval/clarification/
+    // context/completion events for scheduled sessions never classified into
+    // notifications. Idempotent (`try_begin_relay`), so this harmlessly races
+    // a client that later opens the session's live stream.
+    crate::app_state::session_events::ensure_notification_relay(
+        &ctx.notification_relay,
+        &session_id,
+        session_tx.clone(),
+    );
+
     // Insert runner status (for cancellation/status introspection).
     let Some(RunnerReservation { cancel_token, .. }) = try_reserve_runner(
         &ctx.agent_runners,
@@ -485,6 +503,7 @@ pub fn build_schedule_context(
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
         persistence: base.persistence,
+        notification_relay: base.notification_relay,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
             resolve_run_config_from_config(job, &config, &provider_registry)
         }),

@@ -111,6 +111,7 @@ pub mod error;
 pub mod events;
 pub mod handlers;
 pub mod logging;
+pub mod notify_sinks;
 pub mod reloadable_provider;
 pub mod routes;
 pub mod schedule_app;
