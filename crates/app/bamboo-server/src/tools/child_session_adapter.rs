@@ -47,6 +47,20 @@ pub struct ChildSessionAdapter {
     /// calls at once → `join_all`) into a single parent persist. See
     /// [`ChildSessionAdapter::register_parent_wait_for_child`].
     pub(crate) parent_wait_slots: Arc<dashmap::DashMap<String, Arc<ParentWaitSlot>>>,
+    /// Deps to start the always-on notification relay for a NEWLY ENQUEUED
+    /// child session (see [`ChildSessionAdapter::enqueue_child_run`]).
+    ///
+    /// Without this, a child's own events (e.g. a `run_in_background` Bash
+    /// command finishing, or the child hitting critical context pressure)
+    /// only ever get classified if a client happens to be subscribed to that
+    /// specific child session's SSE/WS stream — the child's completion
+    /// (`SubAgentCompleted`) still reaches the owner via the PARENT's own
+    /// relay (already running for any in-process parent execution), but
+    /// events that occur only on the child's own stream would otherwise be
+    /// silently dropped for a headless/unwatched child. `None` for the
+    /// out-of-process worker binary (`ChildSessionAdapter::new`), which has
+    /// no local desktop/ntfy/bark config surface to deliver through.
+    pub(crate) notification_relay: Option<crate::app_state::session_events::NotificationRelayDeps>,
 }
 
 /// Per-parent coalescing slot for batched wait registration.
@@ -126,6 +140,10 @@ impl ChildSessionAdapter {
             // Fresh per-adapter wait-coalescing map (the type is private to this
             // crate, so out-of-crate callers can't supply it).
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            // The worker binary runs on a different machine than the desktop
+            // it would notify; it reports events back to the orchestrating
+            // server over the wire instead. See the field doc.
+            notification_relay: None,
         }
     }
 
@@ -557,6 +575,18 @@ impl ChildSessionPort for ChildSessionAdapter {
             .and_then(|raw| serde_json::from_str::<std::collections::BTreeSet<String>>(raw).ok())
             .filter(|set| !set.is_empty())
             .map(|set| set.into_iter().collect::<Vec<String>>());
+
+        // Start the always-on notification relay for the CHILD's own session
+        // before enqueueing the job — mirrors the execute handler starting it
+        // at execution entry (`spawn_event_forwarder`) rather than waiting
+        // for a client to subscribe. Idempotent (`try_begin_relay`) and races
+        // harmlessly with the engine's own `get_or_create_event_sender` call
+        // for the same id in `run_child_spawn`, since both resolve to the
+        // same map entry. See the `notification_relay` field doc.
+        if let Some(relay) = &self.notification_relay {
+            let child_tx = get_or_create_event_sender(&self.session_event_senders, &child.id).await;
+            crate::app_state::session_events::ensure_notification_relay(relay, &child.id, child_tx);
+        }
 
         // NOTE: enqueue only *runs* the child in the background. Registering the
         // parent's wait (which suspends the parent) is now an explicit, separate

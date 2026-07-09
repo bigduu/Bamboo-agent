@@ -229,6 +229,18 @@ impl AppState {
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
+        // Shared bundle of always-on notification relay deps (see
+        // `session_events::NotificationRelayDeps`). Built once and cloned into
+        // every entry point that starts a relay directly at execution time —
+        // the schedule manager, the root child-session adapter, and the
+        // guardian child-session adapter below — so they can never drift.
+        let notification_relay_deps = crate::app_state::session_events::NotificationRelayDeps {
+            notification_service: notification_service.clone(),
+            session_event_senders: session_event_senders.clone(),
+            session_watchers: session_watchers.clone(),
+            config: config.clone(),
+        };
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -366,12 +378,7 @@ impl AppState {
             provider_registry.clone(),
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
-            crate::app_state::session_events::NotificationRelayDeps {
-                notification_service: notification_service.clone(),
-                session_event_senders: session_event_senders.clone(),
-                session_watchers: session_watchers.clone(),
-                config: config.clone(),
-            },
+            notification_relay_deps.clone(),
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task(
@@ -459,6 +466,7 @@ impl AppState {
             provider_registry.clone(),
             config_snapshot.subagents.broker.clone(),
             fabric_deployer.clone(),
+            notification_relay_deps.clone(),
         );
 
         child_completion_coordinator
@@ -491,6 +499,7 @@ impl AppState {
             subagent_model_resolver: None,
             config: config.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            notification_relay: Some(notification_relay_deps.clone()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         // Wire the spawner into the completion coordinator too, so a resumed run

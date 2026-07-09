@@ -139,6 +139,7 @@ pub(super) fn build_root_tools(
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
     broker: Option<bamboo_config::BrokerClientConfig>,
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
+    notification_relay: super::session_events::NotificationRelayDeps,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -152,6 +153,7 @@ pub(super) fn build_root_tools(
         subagent_model_resolver,
         config: config.clone(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        notification_relay: Some(notification_relay),
     });
 
     // Root sessions can create and manage child sessions via unified SubAgent tool.
