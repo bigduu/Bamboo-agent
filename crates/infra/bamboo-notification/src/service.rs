@@ -23,6 +23,7 @@ use bamboo_domain::poison::PoisonRecover;
 use dashmap::DashSet;
 
 use crate::policy;
+use crate::policy::{ClassifiedNotification, NotificationPriority};
 use crate::preferences::NotificationPreferences;
 
 /// Notification policy service: classification + dedup + preference persistence.
@@ -70,7 +71,40 @@ impl NotificationService {
             let prefs = self.preferences.read().recover_poison();
             policy::classify(session_id, event, &prefs)?
         };
+        self.dedup_and_mint(session_id, classified)
+    }
 
+    /// Mints a custom notification for the `notify` tool.
+    ///
+    /// This is a passthrough classification (see
+    /// [`policy::classify_custom`]): it does not consult a per-category
+    /// preference — there isn't one for arbitrary agent-chosen content — only
+    /// the master `enabled` switch and the shared dedup window apply. Callers
+    /// choose `priority`; `title`/`body` are used verbatim (no truncation).
+    pub fn mint_custom(
+        &self,
+        session_id: &str,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        priority: NotificationPriority,
+    ) -> Option<AgentEvent> {
+        let title = title.into();
+        let body = body.into();
+        let classified = {
+            let prefs = self.preferences.read().recover_poison();
+            policy::classify_custom(session_id, &title, &body, priority, &prefs)?
+        };
+        self.dedup_and_mint(session_id, classified)
+    }
+
+    /// Shared dedup-check + [`AgentEvent::Notification`] minting used by both
+    /// [`Self::notify`] and [`Self::mint_custom`], once a
+    /// [`ClassifiedNotification`] has already cleared policy gating.
+    fn dedup_and_mint(
+        &self,
+        session_id: &str,
+        classified: ClassifiedNotification,
+    ) -> Option<AgentEvent> {
         {
             let mut dedup = self.dedup.lock().recover_poison();
             if let Some(last) = dedup.get(&classified.dedup_key) {
@@ -205,6 +239,8 @@ mod tests {
             on_context_pressure: true,
             on_subagent_complete: false,
             on_background_task_complete: true,
+            on_run_complete: false,
+            on_run_failed: true,
         };
         svc.set_preferences(updated.clone()).unwrap();
         assert_eq!(svc.preferences(), updated);
@@ -238,5 +274,117 @@ mod tests {
         assert!(svc
             .notify("sess", &clarification("question", "tc-1"))
             .is_none());
+    }
+
+    #[test]
+    fn mint_custom_dedups_identical_content_and_refires_on_change() {
+        let (svc, _dir) = service();
+        let first = svc.mint_custom("sess", "Title", "Body", NotificationPriority::Low);
+        assert!(first.is_some());
+
+        // Same title+body within the window → suppressed.
+        let second = svc.mint_custom("sess", "Title", "Body", NotificationPriority::Low);
+        assert!(second.is_none());
+
+        // Different body → distinct dedup key → fires.
+        let third = svc.mint_custom("sess", "Title", "Different body", NotificationPriority::Low);
+        assert!(third.is_some());
+    }
+
+    #[test]
+    fn mint_custom_builds_notification_variant_with_custom_category() {
+        let (svc, _dir) = service();
+        let event = svc
+            .mint_custom(
+                "sess-7",
+                "Heads up",
+                "Something happened",
+                NotificationPriority::Normal,
+            )
+            .unwrap();
+        match event {
+            AgentEvent::Notification {
+                session_id,
+                category,
+                priority,
+                title,
+                body,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-7");
+                assert_eq!(category, "custom");
+                assert_eq!(priority, "normal");
+                assert_eq!(title, "Heads up");
+                assert_eq!(body, "Something happened");
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mint_custom_returns_none_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let svc = NotificationService::new(path);
+        svc.set_preferences(NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc
+            .mint_custom("sess", "Title", "Body", NotificationPriority::Low)
+            .is_none());
+    }
+
+    #[test]
+    fn notify_run_completed_and_run_failed() {
+        let (svc, _dir) = service();
+        let complete = svc
+            .notify(
+                "sess-1",
+                &AgentEvent::Complete {
+                    usage: bamboo_agent_core::TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                    },
+                },
+            )
+            .unwrap();
+        match complete {
+            AgentEvent::Notification {
+                category,
+                priority,
+                dedup_key,
+                ..
+            } => {
+                assert_eq!(category, "run_completed");
+                assert_eq!(priority, "normal");
+                assert_eq!(dedup_key.as_deref(), Some("run:sess-1:done"));
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+
+        let failed = svc
+            .notify(
+                "sess-1",
+                &AgentEvent::Error {
+                    message: "boom".to_string(),
+                },
+            )
+            .unwrap();
+        match failed {
+            AgentEvent::Notification {
+                category,
+                priority,
+                dedup_key,
+                ..
+            } => {
+                assert_eq!(category, "run_failed");
+                assert_eq!(priority, "high");
+                assert_eq!(dedup_key.as_deref(), Some("run:sess-1:failed"));
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
     }
 }
