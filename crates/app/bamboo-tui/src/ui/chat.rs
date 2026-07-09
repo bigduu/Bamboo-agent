@@ -64,12 +64,15 @@ pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
     let total_lines = lines.len() as u16;
 
     let visible_height = content.height;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    // Recorded every frame so key/mouse handlers (which only see `&mut App`,
+    // not this frame's layout) can clamp `scroll_offset` — see
+    // `ChatState::max_scroll`'s doc comment.
+    app.chat.max_scroll.set(max_scroll);
     let scroll_offset = if app.chat.auto_scroll {
-        total_lines.saturating_sub(visible_height)
+        max_scroll
     } else {
-        app.chat
-            .scroll_offset
-            .min(total_lines.saturating_sub(visible_height))
+        app.chat.scroll_offset.min(max_scroll)
     };
 
     let messages = Paragraph::new(lines)

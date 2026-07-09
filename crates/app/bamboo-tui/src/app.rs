@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
@@ -101,11 +103,23 @@ pub struct ChatMessage {
     pub reasoning: Option<String>,
 }
 
+/// Textarea placeholder shown on an empty Chat input, kept as one constant so
+/// the initial state and the post-send reset (`handle_chat_key`) can't drift.
+const CHAT_PLACEHOLDER: &str = "Type a message... (Enter send · Alt+Enter newline)";
+
 pub struct ChatState {
     pub session_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
     pub scroll_offset: u16,
+    /// Largest meaningful `scroll_offset` for the transcript as last rendered
+    /// (`total_lines - visible_height`), refreshed every frame by
+    /// `ui::chat::render`. `App` only has `&App` at render time, so this is a
+    /// `Cell` — it lets the render function record the bound through a shared
+    /// reference instead of needing `&mut App` there. Key/mouse handlers clamp
+    /// against `.get()` so scrolling past the bottom can't require an equal
+    /// number of up-presses to "catch up" before the view visibly moves.
+    pub max_scroll: Cell<u16>,
     pub auto_scroll: bool,
     pub streaming: bool,
     pub current_response: String,
@@ -124,12 +138,13 @@ pub struct ChatState {
 impl ChatState {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
-        textarea.set_placeholder_text("Type a message... (Enter to send)");
+        textarea.set_placeholder_text(CHAT_PLACEHOLDER);
         Self {
             session_id: None,
             messages: Vec::new(),
             textarea,
             scroll_offset: 0,
+            max_scroll: Cell::new(0),
             auto_scroll: true,
             streaming: false,
             current_response: String::new(),
@@ -260,6 +275,10 @@ pub struct ConfigState {
     pub loading: bool,
     pub error: Option<String>,
     pub scroll_offset: u16,
+    /// Largest meaningful `scroll_offset` for the raw config view as last
+    /// rendered; see `ChatState::max_scroll` for the `Cell`-through-`&App`
+    /// rationale.
+    pub max_scroll: Cell<u16>,
 }
 
 impl ConfigState {
@@ -269,6 +288,7 @@ impl ConfigState {
             loading: false,
             error: None,
             scroll_offset: 0,
+            max_scroll: Cell::new(0),
         }
     }
 }
@@ -403,6 +423,17 @@ pub struct App {
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
     sse_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     sse_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+}
+
+/// Move a list selection by `delta` (positive = down, negative = up),
+/// clamped to `[0, len-1]` (or `0` when the list is empty). Shared by every
+/// list tab's mouse-wheel handling in `App::handle_mouse`.
+fn scroll_selection(selected: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let next = selected as i64 + delta as i64;
+    next.clamp(0, (len - 1) as i64) as usize
 }
 
 impl App {
@@ -746,28 +777,98 @@ impl App {
         Ok(())
     }
 
-    /// Mouse wheel scrolls the active scrollable view (chat transcript / config).
+    /// Mouse wheel: on the two scrollable-text tabs (Chat/Config) it scrolls
+    /// the view; everywhere else (the four list tabs) there's nothing to
+    /// scroll independently of the selection, so the wheel moves the
+    /// selection instead (3 rows per notch, clamped) rather than being a
+    /// dead input.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::MouseEventKind;
-        let delta = match mouse.kind {
-            MouseEventKind::ScrollUp => -3i32,
-            MouseEventKind::ScrollDown => 3i32,
+        let delta: i32 = match mouse.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
             _ => return,
         };
         match self.tab {
             Tab::Chat => {
-                self.chat.auto_scroll = false;
-                self.chat.scroll_offset =
-                    self.chat.scroll_offset.saturating_add_signed(delta as i16);
+                if delta < 0 {
+                    self.chat_scroll_up(delta.unsigned_abs() as u16);
+                } else {
+                    self.chat_scroll_down(delta as u16);
+                }
             }
             Tab::Config => {
-                self.config.scroll_offset = self
-                    .config
-                    .scroll_offset
-                    .saturating_add_signed(delta as i16);
+                if delta < 0 {
+                    self.config_scroll_up(delta.unsigned_abs() as u16);
+                } else {
+                    self.config_scroll_down(delta as u16);
+                }
             }
-            _ => {}
+            Tab::Sessions => {
+                self.sessions.selected =
+                    scroll_selection(self.sessions.selected, self.sessions.sessions.len(), delta);
+            }
+            Tab::Mcp => {
+                self.mcp.selected =
+                    scroll_selection(self.mcp.selected, self.mcp.servers.len(), delta);
+            }
+            Tab::Schedules => {
+                self.schedules.selected = scroll_selection(
+                    self.schedules.selected,
+                    self.schedules.schedules.len(),
+                    delta,
+                );
+            }
+            Tab::Skills => {
+                self.skills.selected =
+                    scroll_selection(self.skills.selected, self.skills.skills.len(), delta);
+            }
         }
+    }
+
+    /// Scroll the chat transcript down by `delta` lines, clamped to
+    /// `chat.max_scroll` (see its doc comment) so repeated presses past the
+    /// bottom don't leave the opposite key needing an equal number of presses
+    /// before the view visibly moves.
+    fn chat_scroll_down(&mut self, delta: u16) {
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = self
+            .chat
+            .scroll_offset
+            .saturating_add(delta)
+            .min(self.chat.max_scroll.get());
+    }
+
+    /// Scroll the chat transcript up by `delta` lines; naturally bounded at 0.
+    fn chat_scroll_up(&mut self, delta: u16) {
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(delta);
+    }
+
+    /// `g`: jump to the top of the transcript.
+    fn chat_scroll_top(&mut self) {
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = 0;
+    }
+
+    /// `G`: jump to the bottom and resume auto-scroll.
+    fn chat_scroll_bottom(&mut self) {
+        self.chat.auto_scroll = true;
+    }
+
+    /// Scroll the raw config view down by `delta` lines, clamped to
+    /// `config.max_scroll` — same rationale as `chat_scroll_down`.
+    fn config_scroll_down(&mut self, delta: u16) {
+        self.config.scroll_offset = self
+            .config
+            .scroll_offset
+            .saturating_add(delta)
+            .min(self.config.max_scroll.get());
+    }
+
+    /// Scroll the raw config view up by `delta` lines; naturally bounded at 0.
+    fn config_scroll_up(&mut self, delta: u16) {
+        self.config.scroll_offset = self.config.scroll_offset.saturating_sub(delta);
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -781,6 +882,16 @@ impl App {
                 return Ok(());
             }
             (KeyModifiers::CONTROL, KeyCode::Char('?')) => {
+                // Most terminals never deliver Ctrl+Shift+/ as Ctrl+'?' (it
+                // maps elsewhere), so this is kept only as a harmless extra —
+                // F1 below and plain `?` (further down, non-Chat tabs) are
+                // the bindings that are actually reachable.
+                self.help_visible = true;
+                return Ok(());
+            }
+            (_, KeyCode::F(1)) => {
+                // F1 opens help on every tab, including Chat, regardless of
+                // modifiers — unlike `?` it never collides with typing.
                 self.help_visible = true;
                 return Ok(());
             }
@@ -838,11 +949,24 @@ impl App {
             }
         }
 
+        // `?` opens help everywhere EXCEPT Chat, where it must type into the
+        // textarea instead (mirrors the digit rule right below: Chat's
+        // textarea wins over global single-key bindings). F1 above is the
+        // Chat-safe way to reach help.
+        if key.code == KeyCode::Char('?') && self.tab != Tab::Chat {
+            self.help_visible = true;
+            return Ok(());
+        }
+
+        // 1-6 switch tabs EXCEPT on Chat, where digits must type into the
+        // message instead — otherwise typing e.g. "top 3 issues" silently
+        // jumps to the Config tab on the '3'. Shift+digit (many keyboards'
+        // symbol row) never switches tabs, matching the pre-existing rule.
         if let KeyCode::Char(c) = key.code {
             if let Some(digit) = c.to_digit(10) {
                 if (1..=6).contains(&digit)
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
-                    && (!self.chat.streaming || self.tab != Tab::Chat)
+                    && self.tab != Tab::Chat
                 {
                     self.tab = Tab::from_index((digit - 1) as usize).unwrap_or(self.tab);
                     self.load_tab_data();
@@ -1103,23 +1227,28 @@ impl App {
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.chat.expand_tools = !self.chat.expand_tools;
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.chat.auto_scroll = false;
-                    self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(3);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.chat.auto_scroll = false;
-                    self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
-                }
-                KeyCode::Char('G') => {
-                    self.chat.auto_scroll = true;
-                }
+                KeyCode::Char('j') | KeyCode::Down => self.chat_scroll_down(3),
+                KeyCode::Char('k') | KeyCode::Up => self.chat_scroll_up(3),
+                KeyCode::PageDown => self.chat_scroll_down(10),
+                KeyCode::PageUp => self.chat_scroll_up(10),
+                KeyCode::Char('g') => self.chat_scroll_top(),
+                KeyCode::Char('G') => self.chat_scroll_bottom(),
                 _ => {}
             }
             return Ok(());
         }
 
         match key.code {
+            // Alt+Enter (and Shift+Enter, on the kitty-protocol terminals
+            // that report it — plain crossterm terminals mostly don't, so
+            // this arm is harmless there) inserts a newline instead of
+            // sending, since plain Enter always sends.
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.chat.textarea.insert_newline();
+            }
             KeyCode::Enter => {
                 let input = self.chat.textarea.lines().join("\n");
                 let input = input.trim().to_string();
@@ -1127,22 +1256,15 @@ impl App {
                     return Ok(());
                 }
                 self.chat.textarea = TextArea::default();
-                self.chat
-                    .textarea
-                    .set_placeholder_text("Type a message... (Enter to send)");
+                self.chat.textarea.set_placeholder_text(CHAT_PLACEHOLDER);
                 self.send_message(input);
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.chat.auto_scroll = false;
-                self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(3);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.chat.auto_scroll = false;
-                self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
-            }
-            KeyCode::Char('G') => {
-                self.chat.auto_scroll = true;
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.chat_scroll_down(3),
+            KeyCode::Char('k') | KeyCode::Up => self.chat_scroll_up(3),
+            KeyCode::PageDown => self.chat_scroll_down(10),
+            KeyCode::PageUp => self.chat_scroll_up(10),
+            KeyCode::Char('g') => self.chat_scroll_top(),
+            KeyCode::Char('G') => self.chat_scroll_bottom(),
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.chat.expand_tools = !self.chat.expand_tools;
             }
@@ -1857,12 +1979,10 @@ impl App {
 
     fn handle_config_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down => {
-                self.config.scroll_offset = self.config.scroll_offset.saturating_add(1);
-            }
-            KeyCode::Up => {
-                self.config.scroll_offset = self.config.scroll_offset.saturating_sub(1);
-            }
+            KeyCode::Down => self.config_scroll_down(1),
+            KeyCode::Up => self.config_scroll_up(1),
+            KeyCode::PageDown => self.config_scroll_down(10),
+            KeyCode::PageUp => self.config_scroll_up(10),
             KeyCode::Char('e') => {
                 // Open the raw-JSON editor prefilled with the current config.
                 match &self.config.config {
@@ -2196,6 +2316,9 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Chat;
         app.chat.scroll_offset = 10;
+        // Simulates a render having already established the bound (a real
+        // frame always renders before the first input is handled).
+        app.chat.max_scroll.set(50);
         let ev = |k| MouseEvent {
             kind: k,
             column: 0,
@@ -2207,6 +2330,31 @@ mod question_tests {
         assert!(!app.chat.auto_scroll);
         app.handle_mouse(ev(MouseEventKind::ScrollDown));
         assert_eq!(app.chat.scroll_offset, 10);
+    }
+
+    /// Scrolling down is clamped to `max_scroll` (set by the render function
+    /// each frame): spamming `j` past the bottom must not overshoot into a
+    /// dead zone that then eats several `k` presses before the view moves.
+    #[tokio::test]
+    async fn chat_scroll_down_clamps_to_max_scroll() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.chat.max_scroll.set(5);
+
+        for _ in 0..50 {
+            app.chat_scroll_down(3);
+        }
+        assert_eq!(
+            app.chat.scroll_offset, 5,
+            "scrolling down must clamp at max_scroll, not grow unbounded"
+        );
+
+        // One `k` must immediately move the view (not be swallowed catching
+        // up from an overshot offset).
+        app.handle_key(k(KeyCode::Char('k'))).await.unwrap();
+        assert_eq!(app.chat.scroll_offset, 2);
     }
 
     #[test]
@@ -2776,5 +2924,138 @@ mod question_tests {
         assert!(app.pending_question.is_none());
         let last = app.notifications.last().expect("notified");
         assert!(last.text.contains("No pending question"));
+    }
+
+    /// Regression (mirrors `schedule_form_captures_keys_through_handle_key`):
+    /// on the Chat tab, idle, a digit must type into the message textarea —
+    /// not switch tabs — or something like "top 3 issues" silently jumps to
+    /// the Mcp tab on the '3'.
+    #[tokio::test]
+    async fn digit_on_chat_tab_types_into_textarea_not_tab_switch() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_key(k(KeyCode::Char('3'))).await.unwrap();
+        assert_eq!(
+            app.tab,
+            Tab::Chat,
+            "digit must not switch tabs while composing on Chat"
+        );
+        assert_eq!(app.chat.textarea.lines().join("\n"), "3");
+    }
+
+    /// ...but on every other tab digits still switch tabs (unchanged).
+    #[tokio::test]
+    async fn digit_on_sessions_tab_still_switches_tab() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.handle_key(k(KeyCode::Char('3'))).await.unwrap();
+        assert_eq!(
+            app.tab,
+            Tab::Mcp,
+            "digit '3' switches to tab index 2 (Mcp) outside Chat"
+        );
+    }
+
+    /// Alt+Enter inserts a newline into the compose textarea; it must not
+    /// send the message the way plain Enter does.
+    #[tokio::test]
+    async fn alt_enter_inserts_newline_without_sending() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.chat.textarea.lines().len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.chat.textarea.lines().len(),
+            2,
+            "Alt+Enter must grow the textarea by a line, not send"
+        );
+        assert_eq!(app.chat.textarea.lines()[0], "hi");
+        assert!(!app.chat.streaming, "Alt+Enter must not send the message");
+        assert!(app.chat.messages.is_empty());
+    }
+
+    /// `?` is reachable as help everywhere except Chat, where it must type
+    /// into the textarea instead (F1 is the Chat-safe way to reach help).
+    #[tokio::test]
+    async fn question_mark_opens_help_except_on_chat() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = || KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty());
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.handle_key(k()).await.unwrap();
+        assert!(app.help_visible, "'?' opens help on non-Chat tabs");
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_key(k()).await.unwrap();
+        assert!(
+            !app.help_visible,
+            "'?' must type into the chat textarea, not open help"
+        );
+        assert_eq!(app.chat.textarea.lines().join("\n"), "?");
+    }
+
+    /// F1 opens help on every tab, including Chat, unlike `?`.
+    #[tokio::test]
+    async fn f1_opens_help_on_chat_tab() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.help_visible);
+        assert!(
+            app.chat.textarea.lines().join("\n").is_empty(),
+            "F1 must not leak into the textarea"
+        );
+    }
+
+    /// Mouse wheel on a list tab (Sessions here) moves the selection instead
+    /// of being a dead input, 3 rows per notch and clamped to the list.
+    #[test]
+    fn mouse_wheel_on_sessions_moves_selection() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![
+            bare_session("s1"),
+            bare_session("s2"),
+            bare_session("s3"),
+            bare_session("s4"),
+            bare_session("s5"),
+        ];
+        app.sessions.selected = 0;
+        let ev = |k| MouseEvent {
+            kind: k,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+
+        app.handle_mouse(ev(MouseEventKind::ScrollDown));
+        assert_eq!(app.sessions.selected, 3, "3 rows per notch");
+        app.handle_mouse(ev(MouseEventKind::ScrollDown));
+        assert_eq!(app.sessions.selected, 4, "clamped to the last index");
+        app.handle_mouse(ev(MouseEventKind::ScrollUp));
+        assert_eq!(app.sessions.selected, 1);
     }
 }

@@ -29,6 +29,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         None => "No config loaded".to_string(),
     };
 
+    let total_lines = config_text.lines().count() as u16;
+    // Recorded every frame so key handlers can clamp `scroll_offset` — see
+    // `ChatState::max_scroll`'s doc comment (same `Cell`-through-`&App`
+    // rationale applies here).
+    app.config
+        .max_scroll
+        .set(total_lines.saturating_sub(area.height));
+
     let lines: Vec<Line> = config_text
         .lines()
         .skip(app.config.scroll_offset as usize)
