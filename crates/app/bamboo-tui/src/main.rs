@@ -19,7 +19,8 @@ mod ui;
 
 #[derive(Parser)]
 #[command(name = "bamboo-tui")]
-#[command(about = "Terminal UI client for the Bamboo agent runtime")]
+#[command(about = "Terminal UI client for the Bamboo agent runtime. \
+    For a loopback --server-url, use --auto-serve to auto-start `bamboo serve`.")]
 #[command(version)]
 struct Cli {
     /// Bamboo server URL. Defaults to the concrete loopback IPv4 (not
@@ -35,6 +36,17 @@ struct Cli {
     /// Model to use
     #[arg(short, long)]
     model: Option<String>,
+
+    /// If `--server-url` is unreachable and loopback, start a local `bamboo
+    /// serve` automatically instead of asking (y/n). No effect for a remote
+    /// (non-loopback) `--server-url` — that always just warns.
+    #[arg(long, conflicts_with = "no_auto_serve")]
+    auto_serve: bool,
+
+    /// Never offer/auto-start a local server, even for an unreachable
+    /// loopback `--server-url` — just warn, like a remote URL always does.
+    #[arg(long, conflicts_with = "auto_serve")]
+    no_auto_serve: bool,
 }
 
 #[tokio::main]
@@ -59,9 +71,16 @@ async fn main() -> Result<()> {
     if let Some(model) = cli.model {
         app.chat.model = model;
     }
+    let auto_serve_mode = if cli.auto_serve {
+        app::AutoServeMode::Auto
+    } else if cli.no_auto_serve {
+        app::AutoServeMode::Off
+    } else {
+        app::AutoServeMode::Prompt
+    };
 
     // Run app.
-    let result = app.run(&mut terminal).await;
+    let result = app.run(&mut terminal, auto_serve_mode).await;
 
     // Restore terminal.
     disable_raw_mode()?;
