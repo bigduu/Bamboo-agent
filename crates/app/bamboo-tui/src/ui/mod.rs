@@ -53,4 +53,8 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.config_editor.is_some() {
         config::render_editor(f, app);
     }
+
+    if app.model_picker.is_some() {
+        layout::render_model_picker(f, app);
+    }
 }

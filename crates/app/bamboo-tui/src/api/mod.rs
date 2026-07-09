@@ -206,6 +206,47 @@ impl BambooClient {
         Ok(())
     }
 
+    // ── Provider catalog (model picker, Ctrl+O) ──
+
+    /// `GET /v1/bamboo/provider-catalog` — note the `/v1` prefix (like
+    /// `get_config`/`set_config` below), not `/api/v1`.
+    pub async fn get_provider_catalog(&self) -> Result<ProviderCatalog> {
+        let resp = self
+            .client
+            .get(self.url("/v1/bamboo/provider-catalog"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get provider catalog failed ({status}): {}", body.trim());
+        }
+        let catalog: ProviderCatalog = resp.json().await?;
+        Ok(catalog)
+    }
+
+    /// PATCH the active session's model after the picker applies a selection.
+    /// Fire-and-forget from the caller's point of view (the model already
+    /// took effect locally via `chat.model`) — this just keeps the server's
+    /// session record from drifting, so a failure is reported via `notify`,
+    /// never treated as fatal to the model change itself.
+    pub async fn patch_session_model(&self, session_id: &str, model: &str) -> Result<()> {
+        let resp = self
+            .client
+            .patch(self.url(&format!("/api/v1/sessions/{}", session_id)))
+            .json(&PatchSessionModelRequest {
+                model: model.to_string(),
+            })
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("patch session model failed ({status}): {}", body.trim());
+        }
+        Ok(())
+    }
+
     // ── MCP ──
 
     pub async fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {

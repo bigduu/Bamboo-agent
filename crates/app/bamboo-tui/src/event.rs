@@ -1,7 +1,8 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
-    ListSessionsEnvelope, McpServer, PendingQuestion, Schedule, Skill, SkillDetail, ToolInfo,
+    ListSessionsEnvelope, McpServer, PendingQuestion, ProviderCatalog, Schedule, Skill,
+    SkillDetail, ToolInfo,
 };
 use crate::app::OpenedSession;
 
@@ -53,4 +54,7 @@ pub enum AppEvent {
     /// `Ctrl+Q` with no cached dismissed question found one on the server (or
     /// confirmed there isn't one).
     PendingQuestionChecked(Loaded<PendingQuestion>),
+    /// `Ctrl+O`'s provider-catalog fetch finished. Dropped by the handler if
+    /// `model_picker` was already closed (Esc) before this arrived.
+    CatalogLoaded(Loaded<ProviderCatalog>),
 }

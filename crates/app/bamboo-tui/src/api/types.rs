@@ -297,6 +297,53 @@ pub struct ScheduleRunConfigReq {
     pub auto_execute: bool,
 }
 
+// ── Provider catalog (model picker, Ctrl+O) ──
+
+/// Mirrors the server's `ProviderModelRef` (`crates/core/bamboo-domain`) on
+/// the wire: `{"provider": "...", "model": "..."}`. `model` alone (NOT
+/// `provider/model`) is the string form `ChatRequest.model` /
+/// `ExecuteRequest.model` / `PatchSessionRequest.model` actually resolve —
+/// see `apply_model` in `app.rs`.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct CatalogModelRef {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+/// One entry in `GET /v1/bamboo/provider-catalog`'s `models` array — a
+/// lenient subset of the server's `ProviderModelDescriptor`
+/// (`bamboo-domain::provider_catalog`). `capabilities`/`source`/
+/// `discovered_at` aren't rendered by the picker, so they're ignored on
+/// decode rather than modeled.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct CatalogModel {
+    #[serde(default)]
+    pub reference: CatalogModelRef,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub provider_display_name: String,
+}
+
+/// Wire shape of `GET /v1/bamboo/provider-catalog`. `providers` isn't
+/// rendered by the picker (each model entry already carries
+/// `provider_display_name`), so only `models` is modeled.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ProviderCatalog {
+    #[serde(default)]
+    pub models: Vec<CatalogModel>,
+}
+
+/// Body of `PATCH /api/v1/sessions/{id}` for the model-picker's
+/// fire-and-forget session update. Must match the server's
+/// `PatchSessionRequest.model` field name.
+#[derive(Serialize)]
+pub struct PatchSessionModelRequest {
+    pub model: String,
+}
+
 // ── Skills ──
 
 #[derive(Deserialize, Debug, Clone)]
@@ -536,5 +583,61 @@ mod tests {
         let envelope: GetSessionEnvelope = serde_json::from_str(json).unwrap();
         assert_eq!(envelope.session.id, "s1");
         assert_eq!(envelope.session.model, "claude-sonnet-5");
+    }
+
+    /// Fixture mirroring the real `GET /v1/bamboo/provider-catalog` response
+    /// (`bamboo-domain::ProviderCatalog`), including fields the picker doesn't
+    /// model (`providers`, `capabilities`, `source`, `updated_at`) — those must
+    /// be ignored, not break deserialization.
+    #[test]
+    fn provider_catalog_deserializes_lenient_model_shapes() {
+        let json = r#"{
+            "providers": [
+                {"id": "openai", "display_name": "OpenAI", "enabled": true, "authenticated": true}
+            ],
+            "models": [
+                {
+                    "reference": {"provider": "openai", "model": "gpt-4.1"},
+                    "display_name": "GPT-4.1",
+                    "provider_display_name": "OpenAI",
+                    "capabilities": {"supports_tools": true, "supports_vision": true},
+                    "source": "upstream",
+                    "discovered_at": "2026-07-01T00:00:00Z"
+                },
+                {
+                    "reference": {"provider": "anthropic", "model": "claude-sonnet-5"},
+                    "display_name": "Claude Sonnet 5",
+                    "provider_display_name": "Anthropic"
+                }
+            ],
+            "updated_at": "2026-07-09T00:00:00Z"
+        }"#;
+        let catalog: ProviderCatalog = serde_json::from_str(json).unwrap();
+        assert_eq!(catalog.models.len(), 2);
+        let m0 = &catalog.models[0];
+        assert_eq!(m0.reference.provider, "openai");
+        assert_eq!(m0.reference.model, "gpt-4.1");
+        assert_eq!(m0.display_name, "GPT-4.1");
+        assert_eq!(m0.provider_display_name, "OpenAI");
+        let m1 = &catalog.models[1];
+        assert_eq!(m1.reference.model, "claude-sonnet-5");
+    }
+
+    /// An empty catalog (no providers configured) must still deserialize —
+    /// the model picker keys "nothing to show" off `models.is_empty()`.
+    #[test]
+    fn provider_catalog_tolerates_empty_models() {
+        let json = r#"{"providers": [], "models": []}"#;
+        let catalog: ProviderCatalog = serde_json::from_str(json).unwrap();
+        assert!(catalog.models.is_empty());
+    }
+
+    #[test]
+    fn patch_session_model_request_serializes_model_field() {
+        let req = PatchSessionModelRequest {
+            model: "gpt-4.1".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"model":"gpt-4.1"}"#);
     }
 }

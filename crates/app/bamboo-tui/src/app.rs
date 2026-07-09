@@ -373,6 +373,15 @@ pub struct ConfigEditor {
     pub textarea: TextArea<'static>,
 }
 
+/// In-progress model picker (`Ctrl+O` on the Chat tab). Opens immediately with
+/// `loading: true` and an empty list; the provider-catalog fetch runs off the
+/// event loop and lands via `AppEvent::CatalogLoaded`.
+pub struct ModelPicker {
+    pub models: Vec<CatalogModel>,
+    pub selected: usize,
+    pub loading: bool,
+}
+
 // ── Main App ──
 
 pub struct App {
@@ -404,6 +413,9 @@ pub struct App {
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
+    /// In-progress model picker (`Ctrl+O`, Chat tab). When `Some`, a modal
+    /// captures navigation/apply keystrokes.
+    pub model_picker: Option<ModelPicker>,
     /// Pending session-delete confirmation (Sessions tab, `d`): `(id, title)`
     /// of the session awaiting `y`/Enter confirm or `n`/Esc cancel. Kept as a
     /// modal (rather than deleting immediately) so a stray `d` can't destroy a
@@ -456,6 +468,7 @@ impl App {
             dismissed_question: None,
             schedule_form: None,
             config_editor: None,
+            model_picker: None,
             pending_delete: None,
             notifications: Vec::new(),
             notifications_visible: false,
@@ -772,6 +785,32 @@ impl App {
                     );
                 }
             },
+            AppEvent::CatalogLoaded(r) => {
+                // The picker may already have been closed (Esc) before this
+                // fetch returned — drop the result instead of reopening it.
+                let Some(picker) = self.model_picker.as_mut() else {
+                    return Ok(());
+                };
+                match r {
+                    Ok(catalog) if catalog.models.is_empty() => {
+                        self.model_picker = None;
+                        self.notify(NoticeLevel::Warn, "No models in provider catalog");
+                    }
+                    Ok(catalog) => {
+                        picker.models = catalog.models;
+                        picker.selected = 0;
+                        picker.loading = false;
+                        self.status_message = "Ready".to_string();
+                    }
+                    Err(e) => {
+                        self.model_picker = None;
+                        self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to load provider catalog: {e}"),
+                        );
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -931,6 +970,13 @@ impl App {
             return self.handle_config_editor_key(key);
         }
 
+        // The model picker likewise captures all input (navigation/apply)
+        // before the global bindings below — same pattern as the other
+        // modals.
+        if self.model_picker.is_some() {
+            return self.handle_model_picker_key(key).await;
+        }
+
         // Ctrl+N / Ctrl+Q: global, but only reachable once every modal above
         // has had first refusal at the key (each of those branches returns
         // early) — so getting here already means no modal is open, matching
@@ -943,6 +989,10 @@ impl App {
                 }
                 KeyCode::Char('q') => {
                     self.reopen_pending_question();
+                    return Ok(());
+                }
+                KeyCode::Char('o') if self.tab == Tab::Chat && !self.chat.streaming => {
+                    self.open_model_picker();
                     return Ok(());
                 }
                 _ => {}
@@ -2047,6 +2097,91 @@ impl App {
         }
         Ok(())
     }
+
+    /// `Ctrl+O` on the Chat tab: open the model picker and load the provider
+    /// catalog off the event loop — the modal opens immediately (`loading:
+    /// true`, empty list) and populates when `AppEvent::CatalogLoaded` lands.
+    fn open_model_picker(&mut self) {
+        self.model_picker = Some(ModelPicker {
+            models: Vec::new(),
+            selected: 0,
+            loading: true,
+        });
+        self.status_message = "Loading models...".to_string();
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let r = client
+                .get_provider_catalog()
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::CatalogLoaded(r));
+        });
+    }
+
+    /// Drive the model picker modal: `↑/↓`/`j`/`k` move the selection, `Enter`
+    /// applies the highlighted model (a no-op while the catalog is still
+    /// loading — the list is empty, so there's nothing to apply), `Esc`
+    /// closes without changes.
+    async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if picker.selected + 1 < picker.models.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(model) = picker.models.get(picker.selected).cloned() {
+                    self.model_picker = None;
+                    self.apply_model(model);
+                }
+            }
+            KeyCode::Esc => {
+                self.model_picker = None;
+                self.status_message = "Ready".to_string();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply a model picked from the catalog. `chat.model` gets the plain
+    /// model id — the string form `ChatRequest.model` / `ExecuteRequest.model`
+    /// / `PatchSessionRequest.model` actually resolve on the server (see
+    /// `execute::types::ExecuteRequest`'s doc comment: `request.model` is a
+    /// bare id, not a `provider/model` pair; that pairing only exists via the
+    /// separate `model_ref` field, which this picker deliberately doesn't
+    /// use). If a session is already active, also fires a fire-and-forget
+    /// PATCH so the server-side session record doesn't drift from what the
+    /// next turn will actually send.
+    fn apply_model(&mut self, model: CatalogModel) {
+        let model_id = model.reference.model.clone();
+        self.chat.model = model_id.clone();
+        self.status_message = format!("Model: {}", model.display_name);
+
+        if let (Some(session_id), Some(tx)) = (self.chat.session_id.clone(), self.event_tx.clone())
+        {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let outcome = match client.patch_session_model(&session_id, &model_id).await {
+                    Ok(()) => Ok("Session model updated".to_string()),
+                    Err(e) => Err(format!("Failed to update session model: {e}")),
+                };
+                let _ = tx.send(AppEvent::ActionDone {
+                    outcome,
+                    reload_tab: false,
+                });
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3057,5 +3192,230 @@ mod question_tests {
         assert_eq!(app.sessions.selected, 4, "clamped to the last index");
         app.handle_mouse(ev(MouseEventKind::ScrollUp));
         assert_eq!(app.sessions.selected, 1);
+    }
+
+    // ── Model picker (WP5) ──
+
+    fn catalog_model(
+        provider: &str,
+        model: &str,
+        display: &str,
+        provider_display: &str,
+    ) -> CatalogModel {
+        CatalogModel {
+            reference: CatalogModelRef {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+            display_name: display.to_string(),
+            provider_display_name: provider_display.to_string(),
+        }
+    }
+
+    /// `Ctrl+O` opens the picker only on the Chat tab, and only when idle —
+    /// same rationale as `Ctrl+N` being a no-op while streaming.
+    #[tokio::test]
+    async fn ctrl_o_opens_model_picker_on_chat_tab_only() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Sessions;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_none(), "Ctrl+O is Chat-tab only");
+
+        app.tab = Tab::Chat;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        let picker = app.model_picker.as_ref().expect("Ctrl+O opens on Chat");
+        assert!(picker.loading, "opens immediately with loading: true");
+        assert!(picker.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_ignored_while_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.chat.streaming = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_none());
+    }
+
+    /// `↑/↓` move the selection (clamped); `Enter` applies the highlighted
+    /// model — `chat.model` gets the plain model id (NOT `provider/model`),
+    /// matching what `ChatRequest`/`ExecuteRequest`/`PatchSessionRequest.model`
+    /// resolve on the server.
+    #[tokio::test]
+    async fn model_picker_navigation_and_enter_applies() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![
+                catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI"),
+                catalog_model(
+                    "anthropic",
+                    "claude-sonnet-5",
+                    "Claude Sonnet 5",
+                    "Anthropic",
+                ),
+            ],
+            selected: 0,
+            loading: false,
+        });
+
+        app.handle_model_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 1);
+        app.handle_model_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().selected,
+            1,
+            "clamped at the last index"
+        );
+        app.handle_model_picker_key(key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 0);
+
+        app.handle_model_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        app.handle_model_picker_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+
+        assert!(app.model_picker.is_none(), "Enter closes the picker");
+        assert_eq!(
+            app.chat.model, "claude-sonnet-5",
+            "chat.model gets the plain model id, not provider/model"
+        );
+        assert_eq!(app.status_message, "Model: Claude Sonnet 5");
+    }
+
+    /// `Enter` while the catalog is still loading (empty list) is a no-op —
+    /// there's nothing to apply, and the picker stays open.
+    #[tokio::test]
+    async fn model_picker_enter_while_loading_is_noop() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![],
+            selected: 0,
+            loading: true,
+        });
+        app.handle_model_picker_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+        assert!(
+            app.model_picker.is_some(),
+            "no models to apply yet — picker stays open"
+        );
+    }
+
+    /// `Esc` closes the picker without touching `chat.model`.
+    #[tokio::test]
+    async fn model_picker_esc_leaves_model_unchanged() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "old-model".to_string();
+        app.model_picker = Some(ModelPicker {
+            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+            selected: 0,
+            loading: false,
+        });
+
+        app.handle_model_picker_key(key(KeyCode::Esc))
+            .await
+            .unwrap();
+
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.chat.model, "old-model", "Esc must not change the model");
+    }
+
+    /// `CatalogLoaded(Err(...))` notifies and closes the picker instead of
+    /// leaving it stuck on "Loading models...".
+    #[tokio::test]
+    async fn catalog_loaded_err_notifies_and_closes_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![],
+            selected: 0,
+            loading: true,
+        });
+
+        app.handle_event(AppEvent::CatalogLoaded(Err(
+            "connection refused".to_string()
+        )))
+        .await
+        .unwrap();
+
+        assert!(app.model_picker.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert!(last.text.contains("connection refused"));
+        assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    /// An empty catalog (no providers configured) notifies a warning instead
+    /// of leaving an empty modal open.
+    #[tokio::test]
+    async fn catalog_loaded_empty_notifies_warn_and_closes_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![],
+            selected: 0,
+            loading: true,
+        });
+
+        app.handle_event(AppEvent::CatalogLoaded(Ok(ProviderCatalog {
+            models: vec![],
+        })))
+        .await
+        .unwrap();
+
+        assert!(app.model_picker.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert_eq!(last.text, "No models in provider catalog");
+        assert_eq!(last.level, NoticeLevel::Warn);
+    }
+
+    /// A catalog fetch that lands after the picker was already dismissed
+    /// (`Esc`) must not reopen it.
+    #[tokio::test]
+    async fn catalog_loaded_dropped_if_picker_already_closed() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        assert!(app.model_picker.is_none());
+
+        app.handle_event(AppEvent::CatalogLoaded(Ok(ProviderCatalog {
+            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+        })))
+        .await
+        .unwrap();
+
+        assert!(
+            app.model_picker.is_none(),
+            "a stale fetch must not reopen a closed picker"
+        );
+    }
+
+    #[test]
+    fn model_picker_renders_model_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(ModelPicker {
+            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+            selected: 0,
+            loading: false,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("GPT-4.1"), "model display name missing");
+        assert!(text.contains("OpenAI"), "provider display name missing");
     }
 }

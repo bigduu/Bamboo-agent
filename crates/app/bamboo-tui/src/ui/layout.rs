@@ -178,6 +178,7 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("                (Sessions: resume w/ history + reattach)"),
         Line::raw("  Alt+Enter   Insert newline (Chat)"),
         Line::raw("  Ctrl+N      New session"),
+        Line::raw("  Ctrl+O      Model picker (Chat)"),
         Line::raw("  Ctrl+Q      Reopen pending question (if dismissed)"),
         Line::raw("  Ctrl+C      Quit / Stop streaming"),
         Line::raw("  Ctrl+S      Stop agent execution"),
@@ -459,6 +460,98 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Model picker modal (`Ctrl+O` on the Chat tab): pick a model from the
+/// provider catalog. Mirrors `render_question`'s option-list windowing so the
+/// selection stays visible (and the modal never overflows the screen) no
+/// matter how many models the catalog reports.
+pub fn render_model_picker(f: &mut Frame, app: &App) {
+    let Some(picker) = &app.model_picker else {
+        return;
+    };
+
+    let screen = f.area();
+    let header: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " Select a model",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+
+    let mut body: Vec<Line> = Vec::new();
+    if picker.loading {
+        body.push(Line::raw("  Loading models..."));
+        body.push(Line::raw(""));
+        body.push(Line::raw("  Esc cancel"));
+    } else if picker.models.is_empty() {
+        // Reachable only transiently — an empty catalog closes the picker
+        // and notifies (`AppEvent::CatalogLoaded`) rather than leaving this
+        // rendered — but keep a safe fallback instead of an empty modal.
+        body.push(Line::raw("  No models available"));
+        body.push(Line::raw(""));
+        body.push(Line::raw("  Esc cancel"));
+    } else {
+        let max_h = screen.height.min(22);
+        // rows available for models = modal height - borders(2) - header - footer(1)
+        let budget = (max_h as usize).saturating_sub(2 + header.len() + 1).max(1);
+        let total = picker.models.len();
+        let start = if total <= budget {
+            0
+        } else {
+            picker
+                .selected
+                .saturating_sub(budget / 2)
+                .min(total.saturating_sub(budget))
+        };
+        let end = (start + budget).min(total);
+        if start > 0 {
+            body.push(Line::raw(format!("  \u{2191} {start} more")));
+        }
+        for i in start..end {
+            let m = &picker.models[i];
+            let selected = i == picker.selected;
+            let marker = if selected { "\u{203a}" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            body.push(Line::from(Span::styled(
+                format!(
+                    "  {marker} {}  ({})",
+                    m.display_name, m.provider_display_name
+                ),
+                style,
+            )));
+        }
+        if end < total {
+            body.push(Line::raw(format!("  \u{2193} {} more", total - end)));
+        }
+        body.push(Line::raw(""));
+        body.push(Line::raw(
+            "  \u{2191}/\u{2193} select  \u{b7}  Enter apply  \u{b7}  Esc cancel",
+        ));
+    }
+
+    let mut lines = header;
+    lines.extend(body);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(60, height, screen);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::BRAND))
+        .title(" Model ");
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
 }
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
