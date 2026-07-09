@@ -197,6 +197,25 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
         }
     }
 
+    // Never allow clients to set encrypted notification-channel secrets directly.
+    if let Some(notifications) = patch_obj
+        .get_mut("notifications")
+        .and_then(|v| v.as_object_mut())
+    {
+        if let Some(ntfy) = notifications
+            .get_mut("ntfy")
+            .and_then(|v| v.as_object_mut())
+        {
+            ntfy.remove("token_encrypted");
+        }
+        if let Some(bark) = notifications
+            .get_mut("bark")
+            .and_then(|v| v.as_object_mut())
+        {
+            bark.remove("device_key_encrypted");
+        }
+    }
+
     // Never allow clients to set encrypted secret material directly.
     //
     // Canonical MCP format:
@@ -340,6 +359,67 @@ pub fn preserve_masked_provider_api_keys(patch_obj: &mut Map<String, Value>, cur
     }
 }
 
+/// Replace masked notification-channel secret placeholders (ntfy `token`, Bark
+/// `device_key`) in a patch with the current config's plaintext values.
+///
+/// Mirrors [`preserve_masked_provider_api_keys`]: the UI sends the masked
+/// placeholder to mean "do not change this secret"; this resolves that back to
+/// the live plaintext so the merge doesn't wipe it. A masked value with no
+/// existing plaintext (nothing configured yet) is dropped from the patch
+/// entirely, same as an unset key.
+pub fn preserve_masked_notification_secrets(patch_obj: &mut Map<String, Value>, current: &Config) {
+    let Some(notifications) = patch_obj
+        .get_mut("notifications")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+
+    if let Some(ntfy) = notifications
+        .get_mut("ntfy")
+        .and_then(|v| v.as_object_mut())
+    {
+        preserve_masked_secret_field(ntfy, "token", current.notifications.ntfy.token.as_deref());
+    }
+
+    if let Some(bark) = notifications
+        .get_mut("bark")
+        .and_then(|v| v.as_object_mut())
+    {
+        preserve_masked_secret_field(
+            bark,
+            "device_key",
+            current.notifications.bark.device_key.as_deref(),
+        );
+    }
+}
+
+/// Resolve a single masked secret field in place: replace a masked placeholder
+/// with `existing_plain`, or drop the field if nothing is configured yet.
+/// A non-masked value (a genuine new secret, or an explicit empty-string
+/// clear) is left untouched.
+fn preserve_masked_secret_field(
+    obj: &mut Map<String, Value>,
+    field: &str,
+    existing_plain: Option<&str>,
+) {
+    let Some(value) = obj.get(field).and_then(|v| v.as_str()) else {
+        return;
+    };
+    if !is_masked_api_key(value) {
+        return;
+    }
+
+    match existing_plain {
+        Some(plain) if !plain.trim().is_empty() => {
+            obj.insert(field.to_string(), Value::String(plain.to_string()));
+        }
+        _ => {
+            obj.remove(field);
+        }
+    }
+}
+
 /// Deep merge `src` into `dst`, recursively combining objects and replacing leaf values.
 pub fn deep_merge_json(dst: &mut Value, src: Value) {
     match (dst, src) {
@@ -437,5 +517,78 @@ mod tests {
         // Real keys containing dots or asterisks among other characters are keys.
         assert!(!is_masked_api_key("id.secret...suffix"));
         assert!(!is_masked_api_key("sk-live-abc"));
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_notification_encrypted_fields() {
+        let mut patch = json!({
+            "notifications": {
+                "ntfy": { "token": "new-token", "token_encrypted": "client-supplied-cipher" },
+                "bark": { "device_key": "new-key", "device_key_encrypted": "client-supplied-cipher" }
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        assert!(!obj["notifications"]["ntfy"]
+            .as_object()
+            .unwrap()
+            .contains_key("token_encrypted"));
+        assert!(!obj["notifications"]["bark"]
+            .as_object()
+            .unwrap()
+            .contains_key("device_key_encrypted"));
+        // Plaintext fields the client legitimately sent are untouched.
+        assert_eq!(obj["notifications"]["ntfy"]["token"], "new-token");
+        assert_eq!(obj["notifications"]["bark"]["device_key"], "new-key");
+    }
+
+    #[test]
+    fn preserve_masked_notification_secrets_keeps_existing_plaintext() {
+        let mut current = Config::default();
+        current.notifications.ntfy.token = Some("existing-ntfy-token".to_string());
+        current.notifications.bark.device_key = Some("existing-bark-key".to_string());
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"notifications":{"ntfy":{"token":"****...****"},"bark":{"device_key":"****...****"}}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_notification_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["notifications"]["ntfy"]["token"],
+            "existing-ntfy-token"
+        );
+        assert_eq!(
+            patch["notifications"]["bark"]["device_key"],
+            "existing-bark-key"
+        );
+    }
+
+    #[test]
+    fn preserve_masked_notification_secrets_drops_mask_when_nothing_configured() {
+        let current = Config::default();
+        let mut patch: Map<String, Value> =
+            serde_json::from_str(r#"{"notifications":{"ntfy":{"token":"****...****"}}}"#).unwrap();
+
+        preserve_masked_notification_secrets(&mut patch, &current);
+
+        assert!(!patch["notifications"]["ntfy"]
+            .as_object()
+            .unwrap()
+            .contains_key("token"));
+    }
+
+    #[test]
+    fn preserve_masked_notification_secrets_leaves_real_values_untouched() {
+        let current = Config::default();
+        let mut patch: Map<String, Value> =
+            serde_json::from_str(r#"{"notifications":{"ntfy":{"token":"tk-real-new-value"}}}"#)
+                .unwrap();
+
+        preserve_masked_notification_secrets(&mut patch, &current);
+
+        assert_eq!(patch["notifications"]["ntfy"]["token"], "tk-real-new-value");
     }
 }

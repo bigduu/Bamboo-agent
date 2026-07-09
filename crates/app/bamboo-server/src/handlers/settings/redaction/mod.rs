@@ -103,6 +103,61 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         broker.remove("token_encrypted");
     }
 
+    // Redact notification-channel secrets (ntfy token, Bark device key).
+    // `token`/`device_key` are `#[serde(skip_serializing)]` on `Config` so they
+    // never appear here already; mirror the provider-instance `api_key`
+    // pattern above by inserting a masked placeholder when configured.
+    if let Some(notifications) = root
+        .get_mut("notifications")
+        .and_then(|v| v.as_object_mut())
+    {
+        if let Some(ntfy) = notifications
+            .get_mut("ntfy")
+            .and_then(|v| v.as_object_mut())
+        {
+            let configured = config
+                .notifications
+                .ntfy
+                .token
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+                || config.notifications.ntfy.token_encrypted.is_some();
+            if configured {
+                ntfy.insert(
+                    "token".to_string(),
+                    Value::String("****...****".to_string()),
+                );
+            } else {
+                ntfy.remove("token");
+            }
+            ntfy.remove("token_encrypted");
+        }
+
+        if let Some(bark) = notifications
+            .get_mut("bark")
+            .and_then(|v| v.as_object_mut())
+        {
+            let configured = config
+                .notifications
+                .bark
+                .device_key
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+                || config.notifications.bark.device_key_encrypted.is_some();
+            if configured {
+                bark.insert(
+                    "device_key".to_string(),
+                    Value::String("****...****".to_string()),
+                );
+            } else {
+                bark.remove("device_key");
+            }
+            bark.remove("device_key_encrypted");
+        }
+    }
+
     // Redact cluster-fabric SSH secrets on each node's placement.auth.
     if let Some(nodes) = root
         .get_mut("cluster_fabric")

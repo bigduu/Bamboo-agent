@@ -108,6 +108,11 @@ pub(super) async fn redacted_config_json(
     let mut config_for_response = config.clone();
     config_for_response.refresh_proxy_auth_encrypted()?;
     config_for_response.refresh_provider_api_keys_encrypted()?;
+    // A secret set earlier in THIS request only exists as plaintext on
+    // `config` until `save_to_dir` (which clones internally) refreshes it —
+    // refresh here too so the immediate response's redaction sees it as
+    // "configured" (mirrors the provider-API-key refresh above).
+    config_for_response.refresh_notifications_encrypted()?;
     let value = serde_json::to_value(&config_for_response)?;
     let mut redacted = redact_config_for_api(value, &config_for_response);
 
