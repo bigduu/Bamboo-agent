@@ -6,6 +6,8 @@
 use actix_web::{web, HttpResponse, Responder};
 use serde::Deserialize;
 
+use bamboo_agent_core::Role;
+
 use crate::app_state::AppState;
 
 /// Hard cap on the number of UI-visible messages a cold (non-delta) history
@@ -19,14 +21,31 @@ const MAX_HISTORY_MESSAGES: usize = 2000;
 /// Cold-fetch cap for the history response: when returning a full (non-delta)
 /// history that exceeds [`MAX_HISTORY_MESSAGES`], drop the oldest overflow so
 /// only the newest `MAX_HISTORY_MESSAGES` remain. Returns whether it trimmed.
-fn cap_cold_history<T>(messages: &mut Vec<T>, is_delta: bool) -> bool {
-    if !is_delta && messages.len() > MAX_HISTORY_MESSAGES {
-        let drop = messages.len() - MAX_HISTORY_MESSAGES;
-        messages.drain(..drop);
-        true
-    } else {
-        false
+///
+/// The count-based drop is tool-pair aware: `is_tool_result` reports whether a
+/// message is a `tool_result`, and after the count trim any LEADING orphaned
+/// tool_result(s) are dropped too. Otherwise a session over the cap could start
+/// a cold fetch mid-pair — the assistant `tool_call` was in the dropped overflow
+/// but its `tool_result` survived at the head, leaving a dangling result the LLM
+/// (and frontend) can't match to a call. A parallel-call turn can leave several
+/// consecutive orphaned results, so all leading ones are dropped to the next
+/// safe turn boundary. (#422)
+fn cap_cold_history<T>(
+    messages: &mut Vec<T>,
+    is_delta: bool,
+    is_tool_result: impl Fn(&T) -> bool,
+) -> bool {
+    if is_delta || messages.len() <= MAX_HISTORY_MESSAGES {
+        return false;
     }
+    let drop = messages.len() - MAX_HISTORY_MESSAGES;
+    messages.drain(..drop);
+
+    let orphan_head = messages.iter().take_while(|m| is_tool_result(m)).count();
+    if orphan_head > 0 {
+        messages.drain(..orphan_head);
+    }
+    true
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -162,7 +181,7 @@ pub async fn handler(
     // (#252). The count *before* capping is reported so a client can tell it
     // received a truncated tail.
     let total_message_count = messages.len();
-    let truncated = cap_cold_history(&mut messages, is_delta);
+    let truncated = cap_cold_history(&mut messages, is_delta, |m| matches!(m.role, Role::Tool));
 
     // Include the session-level gold config so the frontend can update its
     // local session summary after sync-recovery without an extra round-trip.
@@ -221,20 +240,67 @@ mod cold_cap_tests {
         // preserving the tail and dropping the oldest overflow (#252).
         let mut over: Vec<u32> = (0..(MAX_HISTORY_MESSAGES as u32 + 5)).collect();
         let newest = *over.last().unwrap();
-        assert!(cap_cold_history(&mut over, false));
+        assert!(cap_cold_history(&mut over, false, |_| false));
         assert_eq!(over.len(), MAX_HISTORY_MESSAGES);
         assert_eq!(*over.last().unwrap(), newest, "keeps the newest message");
         assert_eq!(over[0], 5, "drops the oldest overflow");
 
         // At/under the cap the cold fetch is untouched.
         let mut small: Vec<u32> = (0..10).collect();
-        assert!(!cap_cold_history(&mut small, false));
+        assert!(!cap_cold_history(&mut small, false, |_| false));
         assert_eq!(small.len(), 10);
 
         // A delta fetch is never trimmed, even when large.
         let mut delta: Vec<u32> = (0..(MAX_HISTORY_MESSAGES as u32 + 5)).collect();
-        assert!(!cap_cold_history(&mut delta, true));
+        assert!(!cap_cold_history(&mut delta, true, |_| false));
         assert_eq!(delta.len(), MAX_HISTORY_MESSAGES + 5);
+    }
+
+    #[test]
+    fn cap_cold_history_drops_leading_orphaned_tool_results_to_safe_boundary() {
+        // (value, is_tool_result). The count trim drops the oldest overflow; if
+        // that lands the head on a tool_result whose assistant tool_call was
+        // dropped, the cap must advance past the leading orphaned result(s) to the
+        // next safe turn boundary. (#422)
+        let mut msgs: Vec<(u32, bool)> = (0..(MAX_HISTORY_MESSAGES as u32 + 3))
+            .map(|i| (i, false))
+            .collect();
+        // len = MAX+3 → drops the oldest 3 (indices 0,1,2), head becomes index 3.
+        // Mark indices 3 and 4 as orphaned tool_results (a parallel-call pair);
+        // index 5 is a normal message — the safe boundary.
+        msgs[3].1 = true;
+        msgs[4].1 = true;
+        let is_tool = |m: &(u32, bool)| m.1;
+
+        assert!(cap_cold_history(&mut msgs, false, is_tool));
+        assert!(
+            !msgs.first().unwrap().1,
+            "head must not be a leading orphaned tool_result"
+        );
+        assert_eq!(
+            msgs.first().unwrap().0,
+            5,
+            "trimmed past the orphaned pair to the next safe boundary"
+        );
+        // 3 dropped by count + 2 orphaned results → slightly under the cap.
+        assert_eq!(msgs.len(), MAX_HISTORY_MESSAGES - 2);
+    }
+
+    #[test]
+    fn cap_cold_history_keeps_head_when_boundary_already_safe() {
+        // If the count trim lands on a non-tool message, nothing extra is dropped.
+        let mut msgs: Vec<(u32, bool)> = (0..(MAX_HISTORY_MESSAGES as u32 + 3))
+            .map(|i| (i, false))
+            .collect();
+        let is_tool = |m: &(u32, bool)| m.1;
+
+        assert!(cap_cold_history(&mut msgs, false, is_tool));
+        assert_eq!(msgs.len(), MAX_HISTORY_MESSAGES, "no extra orphan trim");
+        assert_eq!(
+            msgs.first().unwrap().0,
+            3,
+            "only the count overflow dropped"
+        );
     }
 }
 
