@@ -85,6 +85,32 @@ pub trait NotificationSink: Send + Sync {
     fn deliver(&self, n: &SinkNotification);
 }
 
+/// Channel names [`dispatch_to_sinks`] would attempt delivery through, given
+/// `config`/`has_watcher`/`category` — the exact same gating `dispatch_to_sinks`
+/// applies (desktop's auto-vs-sidecar default + explicit override + watcher
+/// suppression; ntfy/bark's plain `enabled` flag). Factored out so the two
+/// never drift apart: [`dispatch_to_sinks`] delivers through this list, and
+/// the `POST /notifications/test` handler (`handlers::agent::notifications`)
+/// reports it back to the caller so a setup UI can show which channels were
+/// actually exercised.
+pub fn attempted_channels(config: &Config, has_watcher: bool, category: &str) -> Vec<&'static str> {
+    let mut channels = Vec::new();
+    if desktop::desktop_enabled(
+        config.notifications.desktop.enabled,
+        desktop::is_sidecar_mode(),
+    ) && !desktop::suppressed_by_watcher(category, has_watcher)
+    {
+        channels.push("desktop");
+    }
+    if config.notifications.ntfy.enabled {
+        channels.push("ntfy");
+    }
+    if config.notifications.bark.enabled {
+        channels.push("bark");
+    }
+    channels
+}
+
 /// Fans a classified notification out to every enabled/gated sink, reading
 /// `config` (a snapshot the caller just took — see
 /// `app_state::session_events::ensure_notification_relay`) so a hot-reloaded
@@ -97,20 +123,13 @@ pub trait NotificationSink: Send + Sync {
 /// (`run_completed`, `needs_*`) — push sinks (ntfy/bark) are never suppressed
 /// by a watcher: a phone push is still useful while the desktop UI is open.
 pub fn dispatch_to_sinks(config: &Config, has_watcher: bool, notification: &SinkNotification) {
-    if desktop::desktop_enabled(
-        config.notifications.desktop.enabled,
-        desktop::is_sidecar_mode(),
-    ) && !desktop::suppressed_by_watcher(&notification.category, has_watcher)
-    {
-        desktop::DesktopSink.deliver(notification);
-    }
-
-    if config.notifications.ntfy.enabled {
-        ntfy::NtfySink::from_config(&config.notifications.ntfy).deliver(notification);
-    }
-
-    if config.notifications.bark.enabled {
-        bark::BarkSink::from_config(&config.notifications.bark).deliver(notification);
+    for channel in attempted_channels(config, has_watcher, &notification.category) {
+        match channel {
+            "desktop" => desktop::DesktopSink.deliver(notification),
+            "ntfy" => ntfy::NtfySink::from_config(&config.notifications.ntfy).deliver(notification),
+            "bark" => bark::BarkSink::from_config(&config.notifications.bark).deliver(notification),
+            _ => unreachable!("attempted_channels only ever returns known channel names"),
+        }
     }
 }
 
@@ -158,5 +177,58 @@ mod tests {
         config.notifications.desktop.enabled = Some(false);
         let notification = SinkNotification::from_event(&sample()).unwrap();
         dispatch_to_sinks(&config, false, &notification);
+    }
+
+    #[test]
+    fn attempted_channels_reports_none_when_everything_disabled() {
+        let mut config = Config::default();
+        config.notifications.desktop.enabled = Some(false);
+        assert!(attempted_channels(&config, false, "custom").is_empty());
+    }
+
+    #[test]
+    fn attempted_channels_reports_every_enabled_channel_in_order() {
+        let mut config = Config::default();
+        config.notifications.desktop.enabled = Some(true);
+        config.notifications.ntfy.enabled = true;
+        config.notifications.bark.enabled = true;
+        assert_eq!(
+            attempted_channels(&config, false, "custom"),
+            vec!["desktop", "ntfy", "bark"]
+        );
+    }
+
+    #[test]
+    fn attempted_channels_omits_desktop_when_suppressed_by_watcher() {
+        let mut config = Config::default();
+        config.notifications.desktop.enabled = Some(true);
+        config.notifications.ntfy.enabled = true;
+        // run_completed + a live watcher suppresses ONLY the desktop popup.
+        assert_eq!(
+            attempted_channels(&config, true, "run_completed"),
+            vec!["ntfy"]
+        );
+    }
+
+    #[test]
+    fn attempted_channels_matches_what_dispatch_to_sinks_would_attempt() {
+        // A lightweight cross-check that the two never drift: every channel
+        // `attempted_channels` reports is one `dispatch_to_sinks` actually has
+        // gating logic for (desktop/ntfy/bark), for a representative matrix.
+        let matrices = [
+            (Some(true), true, true),
+            (Some(false), false, true),
+            (None, true, false),
+        ];
+        for (desktop_enabled, ntfy_enabled, bark_enabled) in matrices {
+            let mut config = Config::default();
+            config.notifications.desktop.enabled = desktop_enabled;
+            config.notifications.ntfy.enabled = ntfy_enabled;
+            config.notifications.bark.enabled = bark_enabled;
+            let names = attempted_channels(&config, false, "custom");
+            assert!(names
+                .iter()
+                .all(|c| ["desktop", "ntfy", "bark"].contains(c)));
+        }
     }
 }

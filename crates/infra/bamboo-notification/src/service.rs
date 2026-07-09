@@ -97,6 +97,27 @@ impl NotificationService {
         self.dedup_and_mint(session_id, classified)
     }
 
+    /// Mints a schedule-run completion/failure notification (see
+    /// [`policy::classify_schedule_run`] for the full no-double-fire
+    /// rationale): it shares the SAME category/priority/dedup key that
+    /// [`Self::notify`] would derive from the raw `AgentEvent::Complete`/
+    /// `Error` a scheduled run's agent loop also emits, so this is safe to
+    /// call unconditionally alongside the always-on relay — at most one of
+    /// the two ever survives this service's dedup window.
+    pub fn notify_schedule_run(
+        &self,
+        session_id: &str,
+        success: bool,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Option<AgentEvent> {
+        let classified = {
+            let prefs = self.preferences.read().recover_poison();
+            policy::classify_schedule_run(session_id, success, title.into(), body.into(), &prefs)?
+        };
+        self.dedup_and_mint(session_id, classified)
+    }
+
     /// Shared dedup-check + [`AgentEvent::Notification`] minting used by both
     /// [`Self::notify`] and [`Self::mint_custom`], once a
     /// [`ClassifiedNotification`] has already cleared policy gating.
@@ -386,5 +407,117 @@ mod tests {
             }
             other => panic!("expected Notification, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn notify_schedule_run_builds_expected_notification() {
+        let (svc, _dir) = service();
+        let completed = svc
+            .notify_schedule_run("sess-9", true, "Schedule 'nightly' completed", "All done.")
+            .unwrap();
+        match completed {
+            AgentEvent::Notification {
+                category,
+                priority,
+                title,
+                body,
+                dedup_key,
+                ..
+            } => {
+                assert_eq!(category, "run_completed");
+                assert_eq!(priority, "normal");
+                assert_eq!(title, "Schedule 'nightly' completed");
+                assert_eq!(body, "All done.");
+                assert_eq!(dedup_key.as_deref(), Some("run:sess-9:done"));
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    /// The core no-double-fire guarantee (WP5): a scheduled run's raw
+    /// `AgentEvent::Complete` is independently classified by the always-on
+    /// relay via `notify`, AND the schedule manager's completion hook calls
+    /// `notify_schedule_run` to enrich it — both share dedup key
+    /// `"run:{session_id}:done"`, so within the dedup window only the FIRST
+    /// of the two ever produces a delivered notification; the second is
+    /// coalesced. This holds regardless of call order.
+    #[test]
+    fn notify_schedule_run_shares_dedup_window_with_generic_complete_event() {
+        let (svc, _dir) = service();
+        // Generic relay path fires first (raw AgentEvent::Complete)...
+        let first = svc.notify(
+            "sess-1",
+            &AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        );
+        assert!(first.is_some());
+        // ...the schedule-level enrichment attempt is deduped away.
+        let second =
+            svc.notify_schedule_run("sess-1", true, "Schedule 'nightly' completed", "All done.");
+        assert!(second.is_none());
+    }
+
+    /// Same guarantee, opposite call order: the schedule-level enrichment
+    /// wins the race and the later generic relay classification is the one
+    /// deduped away. Either order is safe — never both.
+    #[test]
+    fn notify_schedule_run_first_dedups_the_later_generic_complete_event() {
+        let (svc, _dir) = service();
+        let first =
+            svc.notify_schedule_run("sess-2", true, "Schedule 'nightly' completed", "All done.");
+        assert!(first.is_some());
+        let second = svc.notify(
+            "sess-2",
+            &AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        );
+        assert!(second.is_none());
+    }
+
+    /// Same guarantee for the failure side (`run:{session_id}:failed`).
+    #[test]
+    fn notify_schedule_run_failure_shares_dedup_window_with_generic_error_event() {
+        let (svc, _dir) = service();
+        let first = svc.notify(
+            "sess-3",
+            &AgentEvent::Error {
+                message: "boom".to_string(),
+            },
+        );
+        assert!(first.is_some());
+        let second = svc.notify_schedule_run("sess-3", false, "Schedule 'nightly' failed", "boom");
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn notify_schedule_run_gated_by_prefs_and_disabled_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let svc = NotificationService::new(path);
+        svc.set_preferences(NotificationPreferences {
+            on_run_complete: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc.notify_schedule_run("sess", true, "t", "b").is_none());
+        // Failure category is unaffected by the on_run_complete flag.
+        assert!(svc.notify_schedule_run("sess", false, "t", "b").is_some());
+
+        svc.set_preferences(NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc.notify_schedule_run("sess", false, "t", "b").is_none());
     }
 }

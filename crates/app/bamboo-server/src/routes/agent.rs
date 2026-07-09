@@ -203,6 +203,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::put().to(agent::notifications::update_preferences),
         )
         .route(
+            "/notifications/test",
+            web::post().to(agent::notifications::send_test_notification),
+        )
+        .route(
             "/sessions/{session_id}",
             web::delete().to(agent::delete::handler),
         )

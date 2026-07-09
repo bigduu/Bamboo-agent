@@ -307,6 +307,59 @@ pub fn classify_custom(
     })
 }
 
+/// Classifies a schedule-run completion/failure into a notification.
+///
+/// Unlike [`classify`], `title`/`body` are caller-supplied rather than
+/// derived from a raw `AgentEvent` — the schedule manager can name the
+/// schedule and quote the run's final assistant message, which the generic
+/// `AgentEvent::Complete`/`Error` path has no way to know. Everything else
+/// (category, priority, prefs gate, and — critically — the dedup key) is
+/// deliberately IDENTICAL to what [`classify`] derives for
+/// `AgentEvent::Complete`/`Error`: `"run:{session_id}:done"` /
+/// `"run:{session_id}:failed"`. A scheduled run's agent loop still emits that
+/// raw event, which the always-on notification relay independently
+/// classifies via [`classify`] — sharing the dedup key means whichever of the
+/// two sources reaches [`crate::service::NotificationService`] first wins the
+/// user-visible copy and the second is coalesced within
+/// [`crate::service::NotificationService::DEDUP_WINDOW`], so a scheduled run
+/// can never double-notify its owner. See
+/// `bamboo_server::schedule_app::manager`'s completion hook for the call
+/// site.
+pub fn classify_schedule_run(
+    session_id: &str,
+    success: bool,
+    title: String,
+    body: String,
+    prefs: &NotificationPreferences,
+) -> Option<ClassifiedNotification> {
+    if !prefs.enabled {
+        return None;
+    }
+    if success {
+        if !prefs.on_run_complete {
+            return None;
+        }
+        Some(ClassifiedNotification {
+            category: NotificationCategory::RunCompleted,
+            priority: NotificationPriority::Normal,
+            title,
+            body,
+            dedup_key: format!("run:{session_id}:done"),
+        })
+    } else {
+        if !prefs.on_run_failed {
+            return None;
+        }
+        Some(ClassifiedNotification {
+            category: NotificationCategory::RunFailed,
+            priority: NotificationPriority::High,
+            title,
+            body,
+            dedup_key: format!("run:{session_id}:failed"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +691,85 @@ mod tests {
             ..NotificationPreferences::default()
         };
         assert!(classify_custom("sess", "t", "b", NotificationPriority::Low, &prefs).is_some());
+    }
+
+    #[test]
+    fn classify_schedule_run_success_shares_dedup_key_with_classify_complete() {
+        let prefs = NotificationPreferences::default();
+        let scheduled = classify_schedule_run(
+            "sess-1",
+            true,
+            "Schedule 'nightly' completed".to_string(),
+            "All done.".to_string(),
+            &prefs,
+        )
+        .unwrap();
+        let raw = classify("sess-1", &complete(10), &prefs).unwrap();
+        assert_eq!(scheduled.dedup_key, raw.dedup_key);
+        assert_eq!(scheduled.category, NotificationCategory::RunCompleted);
+        assert_eq!(scheduled.priority, NotificationPriority::Normal);
+        assert_eq!(scheduled.title, "Schedule 'nightly' completed");
+        assert_eq!(scheduled.body, "All done.");
+    }
+
+    #[test]
+    fn classify_schedule_run_failure_shares_dedup_key_with_classify_error() {
+        let prefs = NotificationPreferences::default();
+        let scheduled = classify_schedule_run(
+            "sess-2",
+            false,
+            "Schedule 'nightly' failed".to_string(),
+            "boom".to_string(),
+            &prefs,
+        )
+        .unwrap();
+        let raw = classify("sess-2", &error("boom"), &prefs).unwrap();
+        assert_eq!(scheduled.dedup_key, raw.dedup_key);
+        assert_eq!(scheduled.category, NotificationCategory::RunFailed);
+        assert_eq!(scheduled.priority, NotificationPriority::High);
+    }
+
+    #[test]
+    fn classify_schedule_run_gated_by_on_run_complete_and_on_run_failed() {
+        let complete_off = NotificationPreferences {
+            on_run_complete: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify_schedule_run(
+            "sess",
+            true,
+            "t".to_string(),
+            "b".to_string(),
+            &complete_off
+        )
+        .is_none());
+
+        let failed_off = NotificationPreferences {
+            on_run_failed: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(classify_schedule_run(
+            "sess",
+            false,
+            "t".to_string(),
+            "b".to_string(),
+            &failed_off
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn classify_schedule_run_master_switch_off_yields_none() {
+        let prefs = NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        };
+        assert!(
+            classify_schedule_run("sess", true, "t".to_string(), "b".to_string(), &prefs).is_none()
+        );
+        assert!(
+            classify_schedule_run("sess", false, "t".to_string(), "b".to_string(), &prefs)
+                .is_none()
+        );
     }
 }
