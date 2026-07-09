@@ -57,4 +57,10 @@ pub enum AppEvent {
     /// `Ctrl+O`'s provider-catalog fetch finished. Dropped by the handler if
     /// `model_picker` was already closed (Esc) before this arrived.
     CatalogLoaded(Loaded<ProviderCatalog>),
+    /// The auto-serve health-poll waiter finished: `Ok(pid)` once
+    /// `client.health()` succeeded (carries the spawned server's pid, for the
+    /// confirmation notice); `Err(message)` if it never became healthy within
+    /// the poll deadline (`message` names the server log path so the operator
+    /// can diagnose it). See `App::spawn_local_server`.
+    LocalServerReady(Loaded<u32>),
 }

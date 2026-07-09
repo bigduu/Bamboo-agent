@@ -278,6 +278,47 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
     );
 }
 
+/// Startup-only y/n prompt offered when the initial health check fails
+/// against a loopback URL and auto-serve wasn't forced on (`--auto-serve`)
+/// or off (`--no-auto-serve`). See `App::serve_offer` / `AutoServeMode`.
+/// Precedence-wise this is checked *before* `render_question` and the other
+/// exclusive modals below (see `App::handle_key`'s doc comment) since it can
+/// only ever be open before any of them exist.
+pub fn render_serve_offer(f: &mut Frame, app: &App) {
+    let Some(offer) = &app.serve_offer else {
+        return;
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " Local server not reachable",
+            Style::default()
+                .fg(colors::WARNING)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::raw(format!("  {}", offer.url)),
+        Line::raw(""),
+        Line::raw("  Start a local `bamboo serve`?"),
+        Line::raw(""),
+        Line::raw("  y / Enter start  ·  n / Esc skip"),
+    ];
+
+    let height = (lines.len() as u16 + 2).min(f.area().height);
+    let area = centered_rect(56, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::WARNING))
+        .title(" Auto-serve ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// Modal for an agent question (permission gate / clarification): the operator
 /// selects an option or types a free-text answer. Rendered over everything when
 /// `app.pending_question` is set.

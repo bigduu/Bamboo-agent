@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -6,6 +7,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
@@ -382,6 +384,140 @@ pub struct ModelPicker {
     pub loading: bool,
 }
 
+// ── Auto-serve (local `bamboo serve` bootstrap) ──
+
+/// How `App::run`'s startup connectivity check should react when it fails
+/// against a loopback URL (see [`is_loopback_url`]); irrelevant for a remote
+/// URL, which always just warns regardless of this. Set once from CLI flags
+/// (`--auto-serve` / `--no-auto-serve`, mutually exclusive) and consumed by
+/// `run` before the main loop starts — nothing later re-reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutoServeMode {
+    /// `--auto-serve`: skip the y/n offer and start spawning immediately.
+    Auto,
+    /// Default: open the [`ServeOffer`] y/n modal.
+    Prompt,
+    /// `--no-auto-serve`: never offer or spawn; just warn, like a remote URL.
+    Off,
+}
+
+/// Startup-only "start a local server?" y/n prompt (`AutoServeMode::Prompt`).
+/// Exists ONLY before `App::run`'s main loop starts driving any other
+/// modal — nothing after startup ever sets it again — which is why it is
+/// checked first in `handle_key`'s modal-precedence chain.
+pub struct ServeOffer {
+    pub url: String,
+}
+
+/// The `serve` subcommand's own compiled-in defaults (`bamboo-config`'s
+/// `default_port`/`default_bind`). Duplicated here rather than imported —
+/// `bamboo-tui` intentionally has no dependency on the server crates (see
+/// `Cargo.toml`) — and used only to decide whether the auto-spawned server
+/// needs explicit `--port`/`--bind` overrides at all.
+const DEFAULT_SERVER_PORT: u16 = 9562;
+const DEFAULT_SERVER_BIND: &str = "127.0.0.1";
+
+/// Split an http(s) URL's authority into `(host, port)`. Pure string
+/// parsing — no new deps, no DNS resolution. Handles a bracketed IPv6 host
+/// (`[::1]:9562`), userinfo (`user:pass@host`), and a missing port (`None`,
+/// meaning the server's own default applies).
+fn parse_authority(url: &str) -> (String, Option<u16>) {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    // Drop any path/query/fragment after the authority.
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    // Drop userinfo, if present.
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]:9562` or bare `[::1]`.
+        let mut parts = rest.splitn(2, ']');
+        let host = parts.next().unwrap_or(rest).to_string();
+        let port = parts
+            .next()
+            .and_then(|tail| tail.strip_prefix(':'))
+            .and_then(|p| p.parse().ok());
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), port.parse().ok()),
+            None => (authority.to_string(), None),
+        }
+    }
+}
+
+/// Whether `url`'s host is loopback (`127.0.0.1`/`127.x.x.x`, `localhost`,
+/// `::1` — bracketed or not) — i.e. safe to offer auto-starting a local
+/// `bamboo serve` for. A hostname other than the literal `localhost` is
+/// never resolved/DNS-checked; this is a syntactic check only, matching
+/// `parse_authority`'s no-new-deps string parsing. The `127.x.x.x` case
+/// parses `host` as a strict `Ipv4Addr` literal (std, no new dep) rather
+/// than `starts_with("127.")` — the latter would also match a non-loopback
+/// hostname like `127.0.0.1.evil.example.com`, wrongly offering/auto-
+/// starting a local server for what the operator meant as a remote URL.
+pub fn is_loopback_url(url: &str) -> bool {
+    let (host, _) = parse_authority(url);
+    host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.octets()[0] == 127)
+}
+
+/// `bamboo`'s platform binary name, used both by `discover_bamboo_bin` and
+/// its tests.
+fn bamboo_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "bamboo.exe"
+    } else {
+        "bamboo"
+    }
+}
+
+/// Resolve the `bamboo` binary to spawn for auto-serve, in precedence order:
+/// (a) `$BAMBOO_BIN`, if set — even when the path doesn't exist, so a
+///     typo'd override fails loudly at spawn time instead of silently
+///     falling through to a different binary; (b) a `bamboo`/`bamboo.exe`
+///     binary sitting next to the running `bamboo-tui` executable (the
+///     layout when both ship together, e.g. bodhi's sidecar bundle); (c) the
+///     first `bamboo` found on `$PATH`.
+///
+/// Takes its inputs as plain parameters instead of reading
+/// `std::env`/`std::env::current_exe` itself — the caller
+/// (`App::spawn_local_server`) snapshots the environment once, which keeps
+/// this function pure and its tests parallel-safe (no process-global env
+/// mutation to serialize against).
+pub fn discover_bamboo_bin(
+    env_override: Option<PathBuf>,
+    exe_dir: Option<&Path>,
+    path_var: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(path) = env_override {
+        return Some(path);
+    }
+    let name = bamboo_bin_name();
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Some(path_var) = path_var {
+        for dir in std::env::split_paths(path_var) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 // ── Main App ──
 
 pub struct App {
@@ -398,6 +534,20 @@ pub struct App {
     pub connected: bool,
     pub help_visible: bool,
     pub spinner_tick: usize,
+    /// Startup-only "start a local server?" y/n offer; see [`ServeOffer`].
+    /// Set at most once, by `run`'s initial health check, and cleared by
+    /// `handle_serve_offer_key` before anything else can run — see the
+    /// modal-precedence doc on `handle_key`.
+    pub serve_offer: Option<ServeOffer>,
+    /// The `bamboo serve` child this TUI spawned via auto-serve, if any.
+    /// Held with `kill_on_drop(true)` so it dies when `App` (and hence this
+    /// field) is dropped — the *graceful* death-link, covering a clean quit
+    /// or panic-unwind. The *crash-safe* backstop (SIGKILL, force-quit — no
+    /// Rust destructor runs at all) is the `--parent-pid <this pid>` flag
+    /// passed to the child in `spawn_local_server`, which self-exits when it
+    /// notices this process is gone — the same double death-link bodhi's
+    /// sidecar uses (`bodhi/src-tauri/src/sidecar.rs`).
+    pub spawned_server: Option<Child>,
     /// The agent's pending question (permission gate / clarification). When
     /// `Some`, a modal captures the answer and keystrokes route to it.
     pub pending_question: Option<ActiveQuestion>,
@@ -464,6 +614,8 @@ impl App {
             connected: false,
             help_visible: false,
             spinner_tick: 0,
+            serve_offer: None,
+            spawned_server: None,
             pending_question: None,
             dismissed_question: None,
             schedule_form: None,
@@ -482,17 +634,40 @@ impl App {
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        auto_serve_mode: AutoServeMode,
     ) -> Result<()> {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
+        // Keep a sender so background API tasks can post their results back.
+        // Set BEFORE the initial health check below: for `AutoServeMode::Auto`
+        // that check may call `spawn_local_server`, which needs this sender to
+        // post its health-poll waiter's result back as `LocalServerReady`.
+        self.event_tx = Some(event_tx.clone());
+
         self.connected = self.client.health().await.unwrap_or(false);
         if self.connected {
             self.status_message = "Connected".to_string();
         } else {
-            self.notify(NoticeLevel::Warn, "Cannot connect to server");
+            let url = self.client.base_url.clone();
+            match (is_loopback_url(&url), auto_serve_mode) {
+                (true, AutoServeMode::Auto) => self.spawn_local_server(),
+                (true, AutoServeMode::Prompt) => {
+                    self.status_message = format!(
+                        "Bamboo server is not reachable at {url}. Start a local server? (y/n)"
+                    );
+                    self.serve_offer = Some(ServeOffer { url });
+                }
+                // Loopback but auto-serve explicitly disabled, or a remote URL
+                // (never auto-started regardless of flags): keep the previous
+                // "just warn" behavior, improved to name the URL.
+                (true, AutoServeMode::Off) | (false, _) => {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        format!("Cannot connect to server at {url}"),
+                    );
+                }
+            }
         }
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
-        // Keep a sender so background API tasks can post their results back.
-        self.event_tx = Some(event_tx.clone());
         // Kick off the initial tab's data load without blocking startup.
         self.load_tab_data();
 
@@ -811,6 +986,32 @@ impl App {
                     }
                 }
             }
+            AppEvent::LocalServerReady(Ok(pid)) => {
+                self.connected = true;
+                self.notify(
+                    NoticeLevel::Info,
+                    format!("Local server started (pid {pid})"),
+                );
+                self.load_tab_data();
+                // The `--session-id` startup resume (in `run`) ran while
+                // disconnected and so left `chat.session_id` set but
+                // `chat.messages` empty — retry it now that the server is up.
+                if self.chat.messages.is_empty() {
+                    if let Some(session_id) = self.chat.session_id.clone() {
+                        self.resume_session(session_id);
+                    }
+                }
+            }
+            AppEvent::LocalServerReady(Err(e)) => {
+                self.notify(
+                    NoticeLevel::Error,
+                    format!("Local server failed to start: {e}"),
+                );
+                if let Some(mut child) = self.spawned_server.take() {
+                    let _ = child.start_kill();
+                }
+                self.connected = false;
+            }
             _ => {}
         }
         Ok(())
@@ -912,9 +1113,10 @@ impl App {
 
     /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
     /// Ctrl+L are gated on this so they can't stack a second overlay on top
-    /// of one of these five — see the precedence comment on `handle_key`.
+    /// of one of these six — see the precedence comment on `handle_key`.
     fn any_modal_open(&self) -> bool {
-        self.pending_question.is_some()
+        self.serve_offer.is_some()
+            || self.pending_question.is_some()
             || self.pending_delete.is_some()
             || self.model_picker.is_some()
             || self.schedule_form.is_some()
@@ -927,11 +1129,18 @@ impl App {
     /// most one modal ever owns the keyboard, and every one of them runs
     /// before the global bindings further down: Ctrl+N/Ctrl+O/Ctrl+Q, `?`,
     /// digit tab-switching, Tab/Shift+Tab):
+    ///   0. `serve_offer`      — startup-only "start a local server?" offer
     ///   1. `pending_question` — agent permission/clarification gate
     ///   2. `pending_delete`   — session delete confirmation
     ///   3. `model_picker`     — Ctrl+O provider-catalog picker
     ///   4. `schedule_form`    — new-schedule authoring form
     ///   5. `config_editor`    — raw config JSON editor
+    ///
+    /// `serve_offer` can never actually coexist with 1-5 in practice — `run`
+    /// sets it (if at all) before the main loop starts driving any of the
+    /// others, and it's always cleared before the loop's first redraw — but
+    /// it is still checked first, for the same "whichever modal is open gets
+    /// first refusal at every key" reason as the rest of this list.
     ///
     /// Ctrl+C (stop/quit) always preempts every modal. F1/Ctrl+`?`/Ctrl+L
     /// (help/notifications) are gated on `any_modal_open` below instead: with
@@ -968,6 +1177,13 @@ impl App {
                 return Ok(());
             }
             _ => {}
+        }
+
+        // 0. The startup "start a local server?" offer captures all input
+        // (Ctrl+C above still quits) until answered — see `ServeOffer`.
+        if self.serve_offer.is_some() {
+            self.handle_serve_offer_key(key);
+            return Ok(());
         }
 
         // 1. A pending agent question captures all input (Ctrl+C above still
@@ -1067,6 +1283,154 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Drive the startup "start a local server?" offer (`ServeOffer`):
+    /// `y`/Enter starts the spawn flow (`spawn_local_server`); `n`/Esc
+    /// dismisses without spawning, leaving the operator to restart with
+    /// `--auto-serve` or start `bamboo serve` themselves. Every other key is
+    /// swallowed — see the modal-precedence doc on `handle_key`.
+    fn handle_serve_offer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.serve_offer = None;
+                self.spawn_local_server();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.serve_offer = None;
+                self.status_message =
+                    "Not connected — restart with --auto-serve or start 'bamboo serve' yourself"
+                        .to_string();
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the `bamboo` binary and spawn `bamboo serve` as an auto-serve
+    /// child. Everything here is off the UI loop except the actual
+    /// `Command::spawn()` call, which is synchronous but non-blocking (it
+    /// forks/execs and returns immediately, it doesn't wait on the child) —
+    /// only the health-poll wait *after* the spawn is a `tokio::spawn`'d
+    /// task. The `Child` is created and stored here (not inside that task)
+    /// so it lands in `self.spawned_server` — and hence gets `kill_on_drop`
+    /// protection — before this function returns, rather than floating in a
+    /// detached task with no owner in the meantime.
+    fn spawn_local_server(&mut self) {
+        let Some(bin) = discover_bamboo_bin(
+            std::env::var_os("BAMBOO_BIN").map(PathBuf::from),
+            std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(Path::parent),
+            std::env::var("PATH").ok().as_deref(),
+        ) else {
+            self.notify(
+                NoticeLevel::Error,
+                "Can't find a `bamboo` binary to auto-start — set BAMBOO_BIN or add it to PATH",
+            );
+            return;
+        };
+
+        // `serve`'s stdout is NOT quiet (tracing_subscriber fmt lines plus a
+        // raw `println!`) — inheriting it here would corrupt this
+        // alternate-screen TUI, so both streams are redirected to a log file
+        // instead (mirrors bodhi's sidecar, which drains and re-logs rather
+        // than inheriting).
+        let log_path = std::env::temp_dir().join("bamboo-tui-server.log");
+        let (stdout_file, stderr_file) = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|f| Ok((f.try_clone()?, f)))
+        {
+            Ok(files) => files,
+            Err(e) => {
+                self.notify(
+                    NoticeLevel::Error,
+                    format!("Failed to open server log {}: {e}", log_path.display()),
+                );
+                return;
+            }
+        };
+
+        let mut args = vec![
+            "serve".to_string(),
+            // Crash-safe orphan guard: `serve` exits if this TUI process
+            // disappears without running any cleanup (SIGKILL) — the second
+            // line of defense behind `spawned_server`'s `kill_on_drop`.
+            "--parent-pid".to_string(),
+            std::process::id().to_string(),
+        ];
+        let (host, port) = parse_authority(&self.client.base_url);
+        if let Some(port) = port {
+            if port != DEFAULT_SERVER_PORT {
+                args.push("--port".to_string());
+                args.push(port.to_string());
+                args.push("--bind".to_string());
+                args.push(if host.is_empty() {
+                    DEFAULT_SERVER_BIND.to_string()
+                } else {
+                    host
+                });
+            }
+        }
+
+        let mut command = Command::new(&bin);
+        command
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout_file))
+            .stderr(std::process::Stdio::from(stderr_file))
+            .kill_on_drop(true);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.notify(
+                    NoticeLevel::Error,
+                    format!(
+                        "Failed to spawn {} serve: {e} (log: {})",
+                        bin.display(),
+                        log_path.display()
+                    ),
+                );
+                return;
+            }
+        };
+        // `Child::id()` only returns `None` once the child has already been
+        // reaped (`wait`ed on) — never true immediately after a successful
+        // `spawn()`, so `0` here is unreachable in practice, not a silently
+        // wrong pid.
+        let pid = child.id().unwrap_or(0);
+
+        let Some(tx) = self.event_tx.clone() else {
+            // No event loop to report back to (shouldn't happen — `run` sets
+            // this before the health check that leads here) — best-effort
+            // kill so an orphaned child isn't left behind either.
+            let _ = child.start_kill();
+            return;
+        };
+        self.spawned_server = Some(child);
+        self.status_message = "Starting local server...".to_string();
+
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if matches!(client.health().await, Ok(true)) {
+                    let _ = tx.send(AppEvent::LocalServerReady(Ok(pid)));
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = tx.send(AppEvent::LocalServerReady(Err(format!(
+                        "local server did not become healthy within 20s (log: {})",
+                        log_path.display()
+                    ))));
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        });
     }
 
     /// Drive the pending-question modal. Returns an answer to submit (if the
@@ -3492,5 +3856,269 @@ mod question_tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("GPT-4.1"), "model display name missing");
         assert!(text.contains("OpenAI"), "provider display name missing");
+    }
+}
+
+#[cfg(test)]
+mod auto_serve_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Mutex;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    // ── is_loopback_url ──
+
+    #[test]
+    fn is_loopback_url_table() {
+        let cases: &[(&str, bool)] = &[
+            ("http://127.0.0.1:9562", true),
+            ("http://localhost:9562", true),
+            ("http://[::1]:9562", true),
+            ("https://127.0.0.1:9562", true),
+            ("https://127.0.0.1", true),              // no port
+            ("http://127.0.0.1/api/v1/health", true), // path after authority
+            ("http://127.5.0.9:9562", true),          // any 127.x.x.x is loopback
+            ("http://example.com:9562", false),       // remote host
+            ("https://bamboo.example.com", false),    // remote, https, no port
+            ("http://192.168.1.20:9562", false),      // LAN host, not loopback
+            // Regression: a hostname merely *starting with* "127." is not an
+            // IPv4 127.x.x.x literal and must not be treated as loopback.
+            ("http://127.0.0.1.evil.example.com:9562", false),
+            // Regression: an out-of-range octet is not a valid IPv4 literal
+            // at all, even though the string starts with "127.".
+            ("http://127.256.0.1:9562", false),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(is_loopback_url(url), *expected, "url={url}");
+        }
+    }
+
+    // ── discover_bamboo_bin ──
+
+    /// Real files under a fresh, uniquely-named temp dir (no tempfile crate —
+    /// no new deps). Parallel-safe: each call gets its own subdirectory.
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bamboo-tui-test-{}-{label}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn touch_bin(dir: &Path) -> PathBuf {
+        let path = dir.join(bamboo_bin_name());
+        std::fs::write(&path, b"").expect("write fake binary");
+        path
+    }
+
+    #[test]
+    fn discover_bamboo_bin_env_override_wins_even_if_missing() {
+        let sibling_dir = unique_temp_dir("env-override-sibling");
+        touch_bin(&sibling_dir); // a real sibling binary exists...
+        let path_dir = unique_temp_dir("env-override-path");
+        touch_bin(&path_dir); // ...and a real PATH binary exists too...
+        let missing = unique_temp_dir("env-override-missing").join("bamboo-does-not-exist");
+
+        // ...but the env override still wins, even though it doesn't exist.
+        let result = discover_bamboo_bin(
+            Some(missing.clone()),
+            Some(&sibling_dir),
+            Some(&path_dir.to_string_lossy()),
+        );
+        assert_eq!(result, Some(missing));
+    }
+
+    #[test]
+    fn discover_bamboo_bin_sibling_beats_path() {
+        let exe_dir = unique_temp_dir("sibling-wins-exe");
+        let sibling = touch_bin(&exe_dir);
+        let path_dir = unique_temp_dir("sibling-wins-path");
+        touch_bin(&path_dir);
+
+        let result = discover_bamboo_bin(None, Some(&exe_dir), Some(&path_dir.to_string_lossy()));
+        assert_eq!(result, Some(sibling));
+    }
+
+    #[test]
+    fn discover_bamboo_bin_falls_back_to_path() {
+        let exe_dir = unique_temp_dir("path-fallback-exe"); // no sibling binary
+        let path_dir = unique_temp_dir("path-fallback-path");
+        let on_path = touch_bin(&path_dir);
+
+        let result = discover_bamboo_bin(None, Some(&exe_dir), Some(&path_dir.to_string_lossy()));
+        assert_eq!(result, Some(on_path));
+    }
+
+    #[test]
+    fn discover_bamboo_bin_none_when_nothing_found() {
+        let exe_dir = unique_temp_dir("none-exe"); // empty
+        let path_dir = unique_temp_dir("none-path"); // empty
+
+        let result = discover_bamboo_bin(None, Some(&exe_dir), Some(&path_dir.to_string_lossy()));
+        assert_eq!(result, None);
+        // No exe_dir/PATH at all either.
+        assert_eq!(discover_bamboo_bin(None, None, None), None);
+    }
+
+    // ── serve_offer modal key routing ──
+
+    fn app_with_offer() -> App {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.serve_offer = Some(ServeOffer {
+            url: "http://127.0.0.1:9562".to_string(),
+        });
+        app
+    }
+
+    #[test]
+    fn serve_offer_n_dismisses_without_spawning() {
+        let mut app = app_with_offer();
+        app.handle_serve_offer_key(key(KeyCode::Char('n')));
+        assert!(app.serve_offer.is_none());
+        assert!(app.spawned_server.is_none());
+        assert!(app.status_message.contains("--auto-serve"));
+    }
+
+    #[test]
+    fn serve_offer_esc_dismisses_without_spawning() {
+        let mut app = app_with_offer();
+        app.handle_serve_offer_key(key(KeyCode::Esc));
+        assert!(app.serve_offer.is_none());
+        assert!(app.spawned_server.is_none());
+    }
+
+    /// The offer must swallow every other key too (e.g. digits, which
+    /// elsewhere switch tabs) — verified through the full `handle_key` path
+    /// so the modal-precedence routing itself (not just the leaf handler) is
+    /// exercised.
+    #[tokio::test]
+    async fn serve_offer_captures_digits_instead_of_switching_tabs() {
+        let mut app = app_with_offer();
+        let starting_tab = app.tab;
+
+        app.handle_key(key(KeyCode::Char('3'))).await.unwrap();
+
+        assert_eq!(app.tab, starting_tab);
+        assert!(app.serve_offer.is_some());
+    }
+
+    /// Single crate-wide lock serializing tests that mutate the
+    /// process-global `BAMBOO_BIN` env var (the repo's convention for
+    /// unavoidable env-manipulating tests — see e.g.
+    /// `bamboo-config/src/paths.rs`'s `env_cache_lock_acquire`).
+    static BAMBOO_BIN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `y` starts the spawn flow; pointing `BAMBOO_BIN` at a path that
+    /// doesn't exist exercises the resolve-succeeds-but-`Command::spawn`-
+    /// fails path without touching any real process, and must notify an
+    /// error and clear the offer rather than leaving it open or panicking.
+    #[tokio::test]
+    async fn serve_offer_y_with_broken_bamboo_bin_notifies_error_and_clears_offer() {
+        let _guard = BAMBOO_BIN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var_os("BAMBOO_BIN");
+        let missing = unique_temp_dir("broken-bin").join("bamboo-does-not-exist");
+        std::env::set_var("BAMBOO_BIN", &missing);
+
+        let mut app = app_with_offer();
+        app.handle_serve_offer_key(key(KeyCode::Char('y')));
+
+        match original {
+            Some(v) => std::env::set_var("BAMBOO_BIN", v),
+            None => std::env::remove_var("BAMBOO_BIN"),
+        }
+
+        assert!(app.serve_offer.is_none());
+        assert!(app.spawned_server.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert_eq!(last.level, NoticeLevel::Error);
+        assert!(last.text.contains("Failed to spawn"));
+    }
+
+    // ── AppEvent::LocalServerReady ──
+
+    #[tokio::test]
+    async fn local_server_ready_ok_connects_and_resumes_pending_session() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        // Simulates the `--session-id`-at-startup-while-disconnected case:
+        // `resume_session` already ran once (in `run`) and failed, leaving
+        // `session_id` set but `messages` empty.
+        app.chat.session_id = Some("sess-1".to_string());
+        assert!(app.chat.messages.is_empty());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_event(AppEvent::LocalServerReady(Ok(4242)))
+            .await
+            .unwrap();
+
+        assert!(app.connected);
+        // `resume_session` sets this status immediately (its fetch itself is
+        // off the event loop) — proof a resume was actually initiated.
+        assert_eq!(app.status_message, "Resuming session...");
+        assert!(app.notifications.iter().any(|n| n.text.contains("4242")));
+    }
+
+    #[tokio::test]
+    async fn local_server_ready_ok_does_not_resume_when_messages_already_present() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-1".to_string());
+        app.chat.messages.push(ChatMessage {
+            role: MessageRole::User,
+            content: "hi".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_event(AppEvent::LocalServerReady(Ok(1)))
+            .await
+            .unwrap();
+
+        assert!(app.connected);
+        assert_ne!(app.status_message, "Resuming session...");
+    }
+
+    #[tokio::test]
+    async fn local_server_ready_err_notifies_and_stays_disconnected() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_event(AppEvent::LocalServerReady(Err("boom".to_string())))
+            .await
+            .unwrap();
+
+        assert!(!app.connected);
+        assert!(app.spawned_server.is_none());
+        let last = app.notifications.last().expect("notified");
+        assert_eq!(last.level, NoticeLevel::Error);
+        assert!(last.text.contains("boom"));
+    }
+
+    /// The offer modal renders through the normal `ui::render` overlay chain
+    /// without panicking, and shows the URL it's offering to serve.
+    #[test]
+    fn serve_offer_renders_without_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = app_with_offer();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("127.0.0.1:9562"), "offer URL missing");
+        assert!(text.contains("Start a local"), "offer prompt missing");
     }
 }
