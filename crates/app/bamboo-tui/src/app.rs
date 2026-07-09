@@ -455,10 +455,18 @@ fn parse_authority(url: &str) -> (String, Option<u16>) {
 /// `::1` — bracketed or not) — i.e. safe to offer auto-starting a local
 /// `bamboo serve` for. A hostname other than the literal `localhost` is
 /// never resolved/DNS-checked; this is a syntactic check only, matching
-/// `parse_authority`'s no-new-deps string parsing.
+/// `parse_authority`'s no-new-deps string parsing. The `127.x.x.x` case
+/// parses `host` as a strict `Ipv4Addr` literal (std, no new dep) rather
+/// than `starts_with("127.")` — the latter would also match a non-loopback
+/// hostname like `127.0.0.1.evil.example.com`, wrongly offering/auto-
+/// starting a local server for what the operator meant as a remote URL.
 pub fn is_loopback_url(url: &str) -> bool {
     let (host, _) = parse_authority(url);
-    host == "127.0.0.1" || host == "localhost" || host == "::1" || host.starts_with("127.")
+    host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.octets()[0] == 127)
 }
 
 /// `bamboo`'s platform binary name, used both by `discover_bamboo_bin` and
@@ -3876,6 +3884,12 @@ mod auto_serve_tests {
             ("http://example.com:9562", false),       // remote host
             ("https://bamboo.example.com", false),    // remote, https, no port
             ("http://192.168.1.20:9562", false),      // LAN host, not loopback
+            // Regression: a hostname merely *starting with* "127." is not an
+            // IPv4 127.x.x.x literal and must not be treated as loopback.
+            ("http://127.0.0.1.evil.example.com:9562", false),
+            // Regression: an out-of-range octet is not a valid IPv4 literal
+            // at all, even though the string starts with "127.".
+            ("http://127.256.0.1:9562", false),
         ];
         for (url, expected) in cases {
             assert_eq!(is_loopback_url(url), *expected, "url={url}");
