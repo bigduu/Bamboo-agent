@@ -353,8 +353,9 @@ enum Commands {
         command: SkillsCommands,
     },
 
-    /// Inspect the MCP servers configured in `config.json` (offline read; live
-    /// connection status needs a running server via `bamboo status`).
+    /// Manage MCP servers: `list` is an offline read of `config.json`; the
+    /// other verbs (`status`/`connect`/`disconnect`/`refresh`/`tools`/`add`/
+    /// `remove`) talk to a running `bamboo serve` instance.
     Mcp {
         #[command(subcommand)]
         command: McpCommands,
@@ -404,11 +405,90 @@ enum SkillsCommands {
 
 #[derive(Subcommand)]
 enum McpCommands {
-    /// List configured MCP servers (id, enabled, transport, name).
+    /// List configured MCP servers (id, enabled, transport, name) — offline
+    /// read of `config.json`; no running server required.
     List {
         /// Data directory holding config.json (defaults to ~/.bamboo).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+
+    /// Live status from a running server: connection state, tool counts and
+    /// last errors per server (GET /api/v1/mcp/servers).
+    Status {
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Print the raw JSON response instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Enable and (re)connect a configured server on a running instance
+    /// (POST /api/v1/mcp/servers/{id}/connect).
+    Connect {
+        /// Server id (see `bamboo mcp status`).
+        name: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Disable and disconnect a server on a running instance
+    /// (POST /api/v1/mcp/servers/{id}/disconnect).
+    Disconnect {
+        /// Server id (see `bamboo mcp status`).
+        name: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Re-list tools from one server, or from every enabled server when no id
+    /// is given (POST /api/v1/mcp/servers/{id}/refresh).
+    Refresh {
+        /// Server id; omit to refresh every enabled server.
+        name: Option<String>,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// List the tools a server exposes, or every server's tools when no id is
+    /// given (GET /api/v1/mcp/servers/{id}/tools, GET /api/v1/mcp/tools).
+    Tools {
+        /// Server id; omit for all servers.
+        name: Option<String>,
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Print the raw JSON response instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Add (or overwrite) a server from a raw JSON payload passed through to
+    /// POST /api/v1/mcp/servers. Accepts the mainstream flat shape
+    /// (`{"id": "...", "command": "..."}` / `{"id": "...", "url": "..."}`)
+    /// or Bamboo's internal shape, exactly like the HTTP API.
+    Add {
+        /// Path to a JSON file with the server config, or `-` to read stdin.
+        #[arg(long = "json", value_name = "FILE|-")]
+        json: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Stop and delete a server (DELETE /api/v1/mcp/servers/{id}). Asks for
+    /// confirmation unless --yes (a removed server can be re-added with
+    /// `bamboo mcp add`).
+    Remove {
+        /// Server id (see `bamboo mcp status`).
+        name: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
     },
 }
 
@@ -577,18 +657,32 @@ impl From<ConnArgs> for bamboo_agent::admin_cli::ConnArgs {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Set a single config value by dotted key. Supported keys:
+    /// Set a single config value by dotted key.
+    ///
+    /// Secret-aware keys (stored encrypted at rest):
     ///   provider
-    ///   providers.<anthropic|openai|gemini>.api_key
+    ///   providers.<anthropic|openai|gemini|bodhi>.api_key
     ///   providers.<anthropic|openai|gemini>.model
+    ///   provider_instances.<id>.api_key
+    ///   notifications.ntfy.token / notifications.bark.device_key
+    ///
+    /// Any other key is a generic validated dot-path into config.json
+    /// (e.g. `server.port 9563`, `features.provider_model_ref true`,
+    /// `tools.disabled '["Bash"]'`). The value is parsed as JSON when it
+    /// parses, else taken as a string; unknown keys and type mismatches are
+    /// rejected before anything is written. `proxy_auth.*` and `*_encrypted`
+    /// keys cannot be set here.
     Set {
         /// Dotted config key, e.g. `providers.anthropic.api_key`.
         key: String,
-        /// Value to store.
+        /// Value to store (JSON or plain string).
         value: String,
         /// Data directory holding config.json (defaults to ~/.bamboo).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Validate and preview the resulting change without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1251,9 +1345,12 @@ async fn main() {
                 key,
                 value,
                 data_dir,
+                dry_run,
             }) = action
             {
-                if let Err(e) = bamboo_agent::setup_cli::run_config_set(&key, &value, data_dir) {
+                if let Err(e) =
+                    bamboo_agent::setup_cli::run_config_set(&key, &value, data_dir, dry_run)
+                {
                     eprintln!("config set failed: {e:#}");
                     std::process::exit(1);
                 }
@@ -1424,8 +1521,33 @@ async fn main() {
         }
 
         Commands::Mcp { command } => {
-            let McpCommands::List { data_dir } = command;
-            if let Err(e) = bamboo_agent::read_cli::mcp_list(data_dir).await {
+            let result = match command {
+                // Offline read (no server) — unchanged.
+                McpCommands::List { data_dir } => bamboo_agent::read_cli::mcp_list(data_dir).await,
+                // Server-backed verbs over the /api/v1/mcp routes.
+                McpCommands::Status { conn, json } => {
+                    bamboo_agent::admin_cli::mcp_status(conn.into(), json).await
+                }
+                McpCommands::Connect { name, conn } => {
+                    bamboo_agent::admin_cli::mcp_connect(conn.into(), &name).await
+                }
+                McpCommands::Disconnect { name, conn } => {
+                    bamboo_agent::admin_cli::mcp_disconnect(conn.into(), &name).await
+                }
+                McpCommands::Refresh { name, conn } => {
+                    bamboo_agent::admin_cli::mcp_refresh(conn.into(), name.as_deref()).await
+                }
+                McpCommands::Tools { name, conn, json } => {
+                    bamboo_agent::admin_cli::mcp_tools(conn.into(), name.as_deref(), json).await
+                }
+                McpCommands::Add { json, conn } => {
+                    bamboo_agent::admin_cli::mcp_add(conn.into(), &json).await
+                }
+                McpCommands::Remove { name, yes, conn } => {
+                    bamboo_agent::admin_cli::mcp_remove(conn.into(), &name, yes).await
+                }
+            };
+            if let Err(e) = result {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
