@@ -175,13 +175,15 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo status` | One-screen overview of a running server: address, health, session counts. |
 | `bamboo sessions` | List sessions on a running server (stop one with `bamboo stop <id>`). |
 | `bamboo stop <session_id>` | Stop a running session's agent loop. |
-| `bamboo history <session_id>` | Print a session's message transcript from a running server (review a headless `-p` run's log). |
+| `bamboo history <session_id>` | Print a session's message transcript from a running server (review a headless `-p` run's log); reports the true message total and notes when cold history is capped. |
+| `bamboo respond <session_id> [<answer>\|--pending]` | Answer a session's pending question / permission gate out-of-band — the run resumes server-side (e.g. unblock a headless or scheduled run). `--pending [--json]` prints the waiting question and its options instead. |
+| `bamboo session show\|delete <id>` | Per-session lifecycle: `show [--json]` prints one session's detail (model, status, pending question, placement…); `delete` removes it (confirms unless `--yes`; running descendants are cancelled first). |
 | `bamboo schedules list\|show\|create\|delete\|run\|runs` | Manage schedules (timed tasks) on a running server: list/inspect, create (`--cron`/`--every`/`--daily` + `--prompt`, or a raw `--json <file\|->` payload), delete (confirms unless `--yes`), trigger now, and view run history. |
 | `bamboo skills list` | List the skills the agent would load from `<data_dir>/skills` (offline; no server needed). |
 | `bamboo mcp list` | List the MCP servers configured in `config.json` (offline; no server needed). |
 | `bamboo mcp status\|connect\|disconnect\|refresh\|tools\|add\|remove` | Manage MCP servers on a running instance over `/api/v1/mcp`: live connection state + tool counts (`status [--json]`), enable/connect + disable/disconnect a server, re-list tools (`refresh [<id>]`), inspect tools (`tools [<id>] [--json]`), add from a raw JSON payload (`add --json <file\|->`), and delete (`remove <id>`, confirms unless `--yes`; a removed server can be re-added with `add`). |
 
-The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`); the other `mcp` verbs are server-backed and take the same connection flags. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
+The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `respond` / `session` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`); the other `mcp` verbs are server-backed and take the same connection flags. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
 A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present).
 

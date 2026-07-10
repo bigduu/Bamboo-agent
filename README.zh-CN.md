@@ -141,8 +141,12 @@ bamboo serve
 | 命令 | 作用 |
 |---|---|
 | `bamboo serve` | 启动 HTTP/SSE 服务（见上）。 |
+| `bamboo init` | 首次安装引导：写入含 provider + API key 的 `config.json`（交互式，CI 用 `--non-interactive`）。 |
+| `bamboo doctor` | 诊断安装状态（配置存在、provider 已配 key、服务可达）；有阻塞问题时以非零退出。 |
 | `bamboo config [--path] [--show-secrets]` | 查看解析后的配置。 |
-| `bamboo -p "<prompt>"` | 一次性 **headless** 智能体运行（启动完整运行时，含子代理，打印结果后退出）。可选 `-s <session>` 继续会话、`-m provider:model` 指定模型、`--workspace`、`--data-dir`、`--stream-json`（stdout 输出 NDJSON）、`--echo`（无 key 的链路冒烟）。 |
+| `bamboo config set <key> <value>` | 按点号路径设置单个配置项。密钥类路径（`providers.<p>.api_key`、`provider_instances.<id>.api_key`、`notifications.ntfy.token`、`notifications.bark.device_key`）落盘时加密；其余路径为通用校验写入（如 `server.port 9563`、`tools.disabled '["Bash"]'`）——值可解析为 JSON 时按 JSON 处理，未知键/类型不符会在写入前被拒绝。`--dry-run` 预览差异。 |
+| `bamboo -p "<prompt>"` | 一次性 **headless** 智能体运行（启动完整运行时，含子代理，打印结果后退出）。`-p -` 从 stdin 读提示词。可选 `-s <session>` 继续会话、`-m provider:model` 或裸 `-m <model>`（绑定 `--provider`，否则用默认 provider）、`--provider <name>`、`--reasoning-effort <low\|medium\|high\|xhigh>`、`--skill-mode <mode>`、`--workspace`、`--data-dir`、`--stream-json`（stdout 输出 NDJSON）、`--echo`（无 key 的链路冒烟）。 |
+| `bamboo completions <shell>` | 输出 shell 补全脚本（`bash`/`zsh`/`fish`/`powershell`/`elvish`），如 `bamboo completions zsh > ~/.zfunc/_bamboo`。 |
 | `bamboo actor run\|serve\|list\|call` | 从终端驱动子代理 actor fabric（启动并流式输出、作为服务常驻、发现、或发送任务）。 |
 | `bamboo broker serve` | 运行独立的子代理消息 broker（基于持久 mailbox 的 WebSocket 总线）。 |
 | `bamboo broker-agent serve` | 运行连接到 broker 的代理（本地 / Docker / 远程），为其 mailbox 应答 Ask/Task。 |
@@ -150,9 +154,15 @@ bamboo serve
 | `bamboo status` | 运行中服务的一屏概览：地址、健康状态、会话数。 |
 | `bamboo sessions` | 列出运行中服务的会话（用 `bamboo stop <id>` 停止某个会话）。 |
 | `bamboo stop <session_id>` | 停止某个运行中会话的 agent loop。 |
+| `bamboo history <session_id>` | 打印某会话的消息记录（用于复查 headless `-p` 运行的日志）；显示真实消息总数,冷历史被截断时会注明。 |
+| `bamboo respond <session_id> [<answer>\|--pending]` | 在会话外应答挂起的提问/权限门（运行随之在服务端恢复）——可解锁被卡住的 headless 或定时任务运行。`--pending [--json]` 改为打印等待中的问题及其选项。 |
+| `bamboo session show\|delete <id>` | 单会话生命周期：`show [--json]` 打印会话详情（模型、状态、挂起问题、部署位置…）；`delete` 删除会话（无 `--yes` 时二次确认；先取消运行中的子代理）。 |
 | `bamboo schedules list\|show\|create\|delete\|run\|runs` | 管理运行中服务上的定时任务：列出/查看、创建（`--cron`/`--every`/`--daily` + `--prompt`，或 `--json <file\|->` 原始载荷）、删除（无 `--yes` 时二次确认）、立即触发、查看运行历史。 |
+| `bamboo skills list` | 列出 `<data_dir>/skills` 下智能体会加载的技能（离线，无需服务）。 |
+| `bamboo mcp list` | 列出 `config.json` 中配置的 MCP 服务器（离线，无需服务）。 |
+| `bamboo mcp status\|connect\|disconnect\|refresh\|tools\|add\|remove` | 通过 `/api/v1/mcp` 管理运行中实例的 MCP 服务器：实时连接状态与工具数（`status [--json]`）、启用连接/停用断开、重新拉取工具列表（`refresh [<id>]`）、查看工具（`tools [<id>] [--json]`）、按原始 JSON 载荷新增（`add --json <file\|->`）、删除（`remove <id>`，无 `--yes` 时二次确认；删除后可用 `add` 重新加回）。 |
 
-管理类命令（`health` / `status` / `sessions` / `stop` / `schedules`）是针对运行中 `bamboo serve` 的轻量 HTTP 客户端；用 `--server-url` / `--port` / `--data-dir` 指向非默认服务。（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
+管理类命令（`health` / `status` / `sessions` / `stop` / `history` / `respond` / `session` / `schedules`）是针对运行中 `bamboo serve` 的轻量 HTTP 客户端；用 `--server-url` / `--port` / `--data-dir` 指向非默认服务。只读命令（`skills list` / `mcp list`）离线读取 `--data-dir`（默认 `~/.bamboo`）；其余 `mcp` 动词依赖运行中的服务,使用同样的连接参数。（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
 
 **默认值**（已对照代码核实）：
 
