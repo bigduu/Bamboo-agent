@@ -326,6 +326,13 @@ pub struct ActiveQuestion {
     /// `Some(buf)` = free-text entry mode (typing into `buf`); `None` =
     /// option-select mode. Starts `Some("")` when there are no options.
     pub custom: Option<String>,
+    /// An answer POST is in flight for this question: the modal renders a
+    /// "Submitting answer…" state and `handle_question_key` swallows every
+    /// key (preventing a double-submit on repeated Enter, and preventing the
+    /// modal from being dismissed/mutated out from under the request) until
+    /// `AppEvent::AnswerSubmitted` lands. Cleared on failure so the operator
+    /// can retry; on success the whole question is dropped.
+    pub submitting: bool,
 }
 
 impl ActiveQuestion {
@@ -344,6 +351,7 @@ impl ActiveQuestion {
             options,
             selected: 0,
             custom,
+            submitting: false,
         }
     }
 }
@@ -580,6 +588,13 @@ pub struct App {
     /// Count of warn/error notifications since the log was last opened; shown as
     /// a badge in the status bar.
     pub unseen_alerts: usize,
+    /// Monotonic epoch for answer submissions (see
+    /// `AppEvent::AnswerSubmitted`): bumped by `submit_answer` when it spawns
+    /// the POST (the in-flight task carries a copy) and by
+    /// `supersede_pending_answer` whenever the question context changes
+    /// underneath it, so a late response for a superseded question is
+    /// discarded instead of applied to the wrong question/session.
+    answer_epoch: u64,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -625,6 +640,7 @@ impl App {
             notifications: Vec::new(),
             notifications_visible: false,
             unseen_alerts: 0,
+            answer_epoch: 0,
             event_tx: None,
             sse_tx: None,
             sse_rx: None,
@@ -910,6 +926,7 @@ impl App {
                     self.chat.token_usage = None;
                     self.chat.scroll_offset = 0;
                     self.chat.streaming = false;
+                    self.supersede_pending_answer();
                     self.pending_question = None;
                     self.dismissed_question = None;
 
@@ -947,6 +964,7 @@ impl App {
             },
             AppEvent::PendingQuestionChecked(r) => match r {
                 Ok(pending) if pending.has_pending_question => {
+                    self.supersede_pending_answer();
                     self.pending_question = Some(ActiveQuestion::from_pending(&pending));
                     self.status_message = "Question reopened".to_string();
                 }
@@ -960,6 +978,49 @@ impl App {
                     );
                 }
             },
+            AppEvent::AnswerSubmitted {
+                epoch,
+                answer,
+                result,
+            } => {
+                // A late response for a question that has since been
+                // superseded (new question arrived, session switched, run
+                // finalized, modal reopened — every one of those bumps
+                // `answer_epoch` via `supersede_pending_answer`) must be
+                // discarded outright: applying it would clear or resume state
+                // that belongs to a different question than the one this
+                // answer was for.
+                if epoch != self.answer_epoch {
+                    return Ok(());
+                }
+                match result {
+                    Ok(status) => {
+                        self.pending_question = None;
+                        // Only keep the spinner on if a run is actually
+                        // running: the server returns 200 even when it did
+                        // NOT resume (e.g. the session already `completed`),
+                        // so a blind `streaming = true` would spin forever
+                        // with no events behind it. No SSE reattach here —
+                        // the stream opened for the run stays attached across
+                        // the question, exactly as before.
+                        if matches!(status.as_str(), "started" | "already_running") {
+                            self.status_message = format!("Answered: {answer} — resuming");
+                            self.chat.streaming = true;
+                        } else {
+                            self.status_message = format!("Answered: {answer} ({status})");
+                            self.finalize_streaming();
+                        }
+                    }
+                    Err(e) => {
+                        // Keep the modal open — with input re-enabled — so
+                        // the operator can pick a valid option or retry.
+                        if let Some(q) = self.pending_question.as_mut() {
+                            q.submitting = false;
+                        }
+                        self.notify(NoticeLevel::Error, format!("Answer rejected: {e}"));
+                    }
+                }
+            }
             AppEvent::CatalogLoaded(r) => {
                 // The picker may already have been closed (Esc) before this
                 // fetch returned — drop the result instead of reopening it.
@@ -1446,6 +1507,13 @@ impl App {
             let Some(q) = self.pending_question.as_mut() else {
                 return Ok(());
             };
+            if q.submitting {
+                // An answer POST is in flight: swallow every key. This both
+                // prevents a double-submit on repeated Enter and keeps the
+                // question from being dismissed/mutated out from under the
+                // request (Ctrl+C at the top of `handle_key` still preempts).
+                return Ok(());
+            }
             if let Some(buf) = q.custom.as_mut() {
                 // Free-text entry mode.
                 match key.code {
@@ -1515,11 +1583,12 @@ impl App {
         };
 
         match action {
-            QAction::Submit(answer) => self.submit_answer(answer).await?,
+            QAction::Submit(answer) => self.submit_answer(answer),
             QAction::Dismiss => {
                 // Keep it, not just drop it: dismissing does NOT tell the
                 // server to stop waiting, so the run is still blocked on an
                 // answer — Ctrl+Q brings the modal back without a round-trip.
+                self.supersede_pending_answer();
                 self.dismissed_question = self.pending_question.take();
                 self.status_message = "Question dismissed (still pending on the server — \
                     Ctrl+Q to reopen, Ctrl+C stops the run)"
@@ -1530,34 +1599,61 @@ impl App {
         Ok(())
     }
 
-    /// Submit an answer to the agent's pending question and resume the run.
-    async fn submit_answer(&mut self, answer: String) -> Result<()> {
+    /// Invalidate any in-flight answer POST by bumping `answer_epoch`. Called
+    /// from every site that changes the pending-question context (a new
+    /// question arriving, a session switch/resume, the run finalizing, the
+    /// modal being dismissed or reopened) so that a late
+    /// `AppEvent::AnswerSubmitted` carrying an older epoch is discarded in
+    /// `handle_event` instead of applied to a question it doesn't belong to.
+    fn supersede_pending_answer(&mut self) {
+        self.answer_epoch = self.answer_epoch.wrapping_add(1);
+    }
+
+    /// Submit an answer to the agent's pending question WITHOUT blocking the
+    /// event loop: the `respond` POST is spawned off the UI thread (this used
+    /// to be awaited inline inside `handle_event`, freezing every redraw/key/
+    /// SSE drain until the server replied) and its outcome comes back as
+    /// `AppEvent::AnswerSubmitted`. Until then the modal stays open in a
+    /// "Submitting answer…" state with input disabled.
+    fn submit_answer(&mut self, answer: String) {
         let Some(session_id) = self.chat.session_id.clone() else {
             self.notify(NoticeLevel::Warn, "No active chat session to answer");
+            self.supersede_pending_answer();
             self.pending_question = None;
-            return Ok(());
+            return;
         };
-        match self.client.respond(&session_id, &answer).await {
-            Ok(status) => {
-                self.pending_question = None;
-                // Only keep the spinner on if a run is actually running: the
-                // server returns 200 even when it did NOT resume (e.g. the
-                // session already `completed`), so a blind `streaming = true`
-                // would spin forever with no events behind it.
-                if matches!(status.as_str(), "started" | "already_running") {
-                    self.status_message = format!("Answered: {answer} — resuming");
-                    self.chat.streaming = true;
-                } else {
-                    self.status_message = format!("Answered: {answer} ({status})");
-                    self.finalize_streaming();
-                }
-            }
-            Err(e) => {
-                // Keep the modal open so the operator can pick a valid option.
-                self.notify(NoticeLevel::Error, format!("Answer rejected: {e}"));
-            }
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let Some(q) = self.pending_question.as_mut() else {
+            return;
+        };
+        if q.submitting {
+            // Belt-and-braces double-submit guard: `handle_question_key`
+            // already swallows every key while in flight.
+            return;
         }
-        Ok(())
+        q.submitting = true;
+
+        // Claim a fresh epoch for this submission; the spawned task carries a
+        // copy so the handler can tell whether the response still belongs to
+        // the current question when it lands.
+        self.supersede_pending_answer();
+        let epoch = self.answer_epoch;
+        self.status_message = format!("Submitting answer: {answer}…");
+
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .respond(&session_id, &answer)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::AnswerSubmitted {
+                epoch,
+                answer,
+                result,
+            });
+        });
     }
 
     /// Drive the delete-confirmation modal (`d` on the Sessions tab). `y`/Enter
@@ -1878,6 +1974,7 @@ impl App {
         self.chat.scroll_offset = 0;
         self.chat.auto_scroll = true;
         self.chat.plan_mode = false;
+        self.supersede_pending_answer();
         self.pending_question = None;
         self.dismissed_question = None;
         self.status_message = "New session".to_string();
@@ -1888,6 +1985,10 @@ impl App {
     /// result comes back as `AppEvent::PendingQuestionChecked`).
     fn reopen_pending_question(&mut self) {
         if let Some(q) = self.dismissed_question.take() {
+            // Reopening counts as a new question context too: any answer
+            // somehow still in flight for the pre-dismissal modal must not
+            // land on the reopened one.
+            self.supersede_pending_answer();
             self.pending_question = Some(q);
             self.status_message = "Question reopened".to_string();
             return;
@@ -2027,11 +2128,15 @@ impl App {
                     None
                 };
                 self.status_message = format!("Question: {} (answer in the dialog)", question);
+                // A new question supersedes any answer still in flight for a
+                // previous one — a late response must not clear this modal.
+                self.supersede_pending_answer();
                 self.pending_question = Some(ActiveQuestion {
                     question,
                     options,
                     selected: 0,
                     custom,
+                    submitting: false,
                 });
             }
             AgentEvent::Complete { usage } => {
@@ -2134,7 +2239,9 @@ impl App {
         self.chat.sub_agents.clear();
         // A run that ended (completed / cancelled / stopped) can no longer accept
         // an answer, so drop any open (or dismissed-but-cached) question modal
-        // to avoid answering a dead session.
+        // to avoid answering a dead session — and invalidate any answer POST
+        // still in flight for it.
+        self.supersede_pending_answer();
         self.pending_question = None;
         self.dismissed_question = None;
     }
@@ -2621,6 +2728,7 @@ mod question_tests {
             options,
             selected: 0,
             custom,
+            submitting: false,
         });
         app
     }
@@ -2702,6 +2810,214 @@ mod question_tests {
         assert!(text.contains("Approve"), "option label missing");
     }
 
+    /// Enter dispatches the answer POST off the event loop: the modal stays
+    /// open in a submitting state with input disabled (no double-submit on
+    /// repeated Enter, no dismissal out from under the request), and the
+    /// spawned task posts exactly one `AnswerSubmitted` back through
+    /// `event_tx`.
+    #[tokio::test]
+    async fn submit_dispatches_async_and_sets_in_flight() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("sess-1".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+
+        // The modal stays open, marked in flight — NOT cleared synchronously
+        // (the old inline-await path cleared it only after the server reply).
+        let q = app.pending_question.as_ref().expect("modal stays open");
+        assert!(q.submitting, "submitting flag must be set");
+        assert!(app.status_message.contains("Submitting"));
+
+        // While in flight, every key is swallowed: navigation is frozen, a
+        // repeated Enter is a no-op, and Esc cannot dismiss the modal.
+        app.handle_question_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.pending_question.as_ref().unwrap().selected, 0);
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(
+            app.pending_question.is_some(),
+            "Esc is disabled while submitting"
+        );
+
+        // The spawned task posts its result back (the POST itself fails fast
+        // here — nothing listens on port 0 — which is fine: the dispatch and
+        // its epoch/answer payload are what's under test).
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("async result must be posted back")
+            .expect("channel open");
+        let AppEvent::AnswerSubmitted {
+            epoch,
+            answer,
+            result,
+        } = event
+        else {
+            panic!("expected AnswerSubmitted");
+        };
+        assert_eq!(answer, "Approve");
+        assert_eq!(epoch, app.answer_epoch, "in-flight epoch is current");
+        assert!(result.is_err(), "no server behind port 0");
+        // The swallowed repeat-Enter must not have dispatched a second POST.
+        assert!(rx.try_recv().is_err(), "exactly one dispatch expected");
+    }
+
+    /// A late `AnswerSubmitted` whose epoch no longer matches (the question
+    /// was superseded mid-flight by a new one arriving over SSE) is discarded
+    /// outright: it must neither clear the new modal nor flip streaming.
+    #[tokio::test]
+    async fn stale_epoch_answer_response_is_discarded() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("sess-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        // Submit → the in-flight POST carries this epoch.
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        let stale_epoch = app.answer_epoch;
+
+        // A NEW question arrives before the response lands — supersedes it.
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Second question?".to_string(),
+            options: Some(vec!["A".to_string(), "B".to_string()]),
+        })
+        .unwrap();
+        assert_ne!(app.answer_epoch, stale_epoch, "supersede bumps the epoch");
+
+        // The stale success response must be discarded, not applied.
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: stale_epoch,
+            answer: "Approve".to_string(),
+            result: Ok("started".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let q = app.pending_question.as_ref().expect("new question stays");
+        assert_eq!(q.question, "Second question?");
+        assert!(!q.submitting, "the new question is not in flight");
+        assert!(
+            !app.chat.streaming,
+            "stale response must not flip streaming"
+        );
+
+        // Session switch / run finalization also supersede an in-flight answer.
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        let stale_epoch = app.answer_epoch;
+        app.finalize_streaming();
+        assert_ne!(app.answer_epoch, stale_epoch);
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: stale_epoch,
+            answer: "A".to_string(),
+            result: Ok("started".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(!app.chat.streaming, "answer for a finalized run discarded");
+    }
+
+    /// A failed submit re-enables the modal (question kept, `submitting`
+    /// cleared so Enter can retry) and surfaces the error through the
+    /// notification overlay.
+    #[tokio::test]
+    async fn failed_submit_restores_question_and_notifies() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("sess-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.pending_question.as_ref().unwrap().submitting);
+
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            answer: "Approve".to_string(),
+            result: Err("boom".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let q = app
+            .pending_question
+            .as_ref()
+            .expect("question kept for retry");
+        assert!(!q.submitting, "input re-enabled for retry");
+        let last = app.notifications.last().expect("notified");
+        assert_eq!(last.level, NoticeLevel::Error);
+        assert!(last.text.contains("boom"));
+
+        // And a retry dispatches again.
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.pending_question.as_ref().unwrap().submitting);
+    }
+
+    /// Success preserves the pre-existing post-submit semantics: the modal
+    /// clears, and the `auto_resume_status` gate decides whether the spinner
+    /// stays on (`started`/`already_running` — the SSE stream opened for the
+    /// run is still attached) or streaming is finalized (any other status).
+    #[tokio::test]
+    async fn successful_submit_applies_auto_resume_gate() {
+        // `started` → modal cleared, streaming on.
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("sess-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            answer: "Approve".to_string(),
+            result: Ok("started".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none(), "modal clears on success");
+        assert!(app.chat.streaming, "resuming run keeps the spinner on");
+        assert!(app.status_message.contains("resuming"));
+
+        // `completed` (nothing resumed server-side) → modal cleared,
+        // streaming finalized instead of spinning forever.
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = Some("sess-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            answer: "Approve".to_string(),
+            result: Ok("completed".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(!app.chat.streaming, "non-resuming status must not spin");
+    }
+
+    /// While the POST is out, the modal renders the submitting state instead
+    /// of the interactive key hints.
+    #[test]
+    fn question_modal_shows_submitting_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.pending_question.as_mut().unwrap().submitting = true;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains("Submitting answer"),
+            "submitting hint missing"
+        );
+        assert!(
+            !text.contains("Enter answer"),
+            "interactive hints must be hidden while in flight"
+        );
+    }
+
     #[test]
     fn many_options_window_keeps_selection_visible() {
         use ratatui::backend::TestBackend;
@@ -2714,6 +3030,7 @@ mod question_tests {
             options: opts,
             selected: 24, // "25. opt25", deep in the list
             custom: None,
+            submitting: false,
         });
 
         let backend = TestBackend::new(80, 24);
@@ -3394,6 +3711,7 @@ mod question_tests {
             options: vec![],
             selected: 0,
             custom: Some(String::new()),
+            submitting: false,
         });
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))

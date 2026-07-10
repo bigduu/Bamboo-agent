@@ -319,6 +319,16 @@ pub fn render_serve_offer(f: &mut Frame, app: &App) {
     );
 }
 
+/// Footer line shown in the question modal while the answer POST is in
+/// flight, replacing the interactive key hints (input is disabled — see
+/// `ActiveQuestion::submitting`).
+fn submitting_hint() -> Line<'static> {
+    Line::from(Span::styled(
+        "  Submitting answer\u{2026}",
+        Style::default().fg(colors::WARNING),
+    ))
+}
+
 /// Modal for an agent question (permission gate / clarification): the operator
 /// selects an option or types a free-text answer. Rendered over everything when
 /// `app.pending_question` is set.
@@ -357,11 +367,15 @@ pub fn render_question(f: &mut Frame, app: &App) {
                 Style::default().fg(colors::BRAND),
             )));
             body.push(Line::raw(""));
-            body.push(Line::raw(if q.options.is_empty() {
-                "  Enter answer  ·  Esc dismiss"
+            if q.submitting {
+                body.push(submitting_hint());
             } else {
-                "  Enter answer  ·  Esc back to options"
-            }));
+                body.push(Line::raw(if q.options.is_empty() {
+                    "  Enter answer  ·  Esc dismiss"
+                } else {
+                    "  Enter answer  ·  Esc back to options"
+                }));
+            }
         }
         None => {
             // Window the option list around the selection so it stays visible and
@@ -400,9 +414,13 @@ pub fn render_question(f: &mut Frame, app: &App) {
                 body.push(Line::raw(format!("  \u{2193} {} more", total - end)));
             }
             body.push(Line::raw(""));
-            body.push(Line::raw(
-                "  \u{2191}/\u{2193} select  ·  Enter answer  ·  1-9 quick  ·  c custom  ·  Esc dismiss",
-            ));
+            if q.submitting {
+                body.push(submitting_hint());
+            } else {
+                body.push(Line::raw(
+                    "  \u{2191}/\u{2193} select  ·  Enter answer  ·  1-9 quick  ·  c custom  ·  Esc dismiss",
+                ));
+            }
         }
     }
 

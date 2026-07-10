@@ -54,6 +54,19 @@ pub enum AppEvent {
     /// `Ctrl+Q` with no cached dismissed question found one on the server (or
     /// confirmed there isn't one).
     PendingQuestionChecked(Loaded<PendingQuestion>),
+    /// The answer POST for the pending question finished (`submit_answer`
+    /// spawns it off the event loop — awaiting it inline froze the whole UI
+    /// for the round-trip). `epoch` is the submission epoch captured when the
+    /// POST was spawned; the handler discards the event when it no longer
+    /// matches `App::answer_epoch` (the question was superseded mid-flight —
+    /// new question arrived, session switched, run finalized, modal
+    /// reopened). `answer` is echoed back for the post-submit status message;
+    /// `result` carries the server's `auto_resume_status` on success.
+    AnswerSubmitted {
+        epoch: u64,
+        answer: String,
+        result: Loaded<String>,
+    },
     /// `Ctrl+O`'s provider-catalog fetch finished. Dropped by the handler if
     /// `model_picker` was already closed (Esc) before this arrived.
     CatalogLoaded(Loaded<ProviderCatalog>),
