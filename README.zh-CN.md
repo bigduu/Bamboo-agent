@@ -150,8 +150,9 @@ bamboo serve
 | `bamboo status` | 运行中服务的一屏概览：地址、健康状态、会话数。 |
 | `bamboo sessions` | 列出运行中服务的会话（用 `bamboo stop <id>` 停止某个会话）。 |
 | `bamboo stop <session_id>` | 停止某个运行中会话的 agent loop。 |
+| `bamboo schedules list\|show\|create\|delete\|run\|runs` | 管理运行中服务上的定时任务：列出/查看、创建（`--cron`/`--every`/`--daily` + `--prompt`，或 `--json <file\|->` 原始载荷）、删除（无 `--yes` 时二次确认）、立即触发、查看运行历史。 |
 
-管理类命令（`health` / `status` / `sessions` / `stop`）是针对运行中 `bamboo serve` 的轻量 HTTP 客户端；用 `--server-url` / `--port` / `--data-dir` 指向非默认服务。（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
+管理类命令（`health` / `status` / `sessions` / `stop` / `schedules`）是针对运行中 `bamboo serve` 的轻量 HTTP 客户端；用 `--server-url` / `--port` / `--data-dir` 指向非默认服务。（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
 
 **默认值**（已对照代码核实）：
 

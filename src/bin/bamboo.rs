@@ -338,6 +338,14 @@ enum Commands {
         conn: ConnArgs,
     },
 
+    /// Manage schedules (timed tasks) on a running server (/api/v1/schedules).
+    /// The scheduler creates a fresh session per fire and auto-executes its
+    /// task prompt.
+    Schedules {
+        #[command(subcommand)]
+        command: SchedulesCommands,
+    },
+
     /// Inspect the skill surface the agent would load (offline read of
     /// `<data_dir>/skills`; no running server required).
     Skills {
@@ -401,6 +409,140 @@ enum McpCommands {
         /// Data directory holding config.json (defaults to ~/.bamboo).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchedulesCommands {
+    /// List schedules (id, name, trigger, enabled, next/last run).
+    List {
+        /// Print the raw server response as pretty JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Show one schedule in detail (definition, state counters, run config).
+    Show {
+        /// Schedule id to show.
+        schedule_id: String,
+
+        /// Print the schedule as pretty JSON instead of the detail view.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Create a schedule. Give exactly one trigger: --cron, --every, --daily —
+    /// or --json for a raw create payload (full schema: weekly/monthly
+    /// triggers, misfire/overlap policies, start/end window, ...).
+    #[command(group(
+        clap::ArgGroup::new("trigger")
+            .required(true)
+            .args(["cron", "every", "daily", "json"])
+    ))]
+    #[command(after_help = "EXAMPLES:\n  \
+        # Every day at 09:00 (server timezone unless --timezone)\n  \
+        bamboo schedules create --name standup --daily 09:00 \\\n    \
+        --prompt \"summarize yesterday's commits\" --timezone Asia/Shanghai\n\n  \
+        # Cron trigger (seconds-first expression), pinned model + workspace\n  \
+        bamboo schedules create --name nightly --cron '0 0 2 * * *' \\\n    \
+        --prompt \"run the test suite and report\" \\\n    \
+        --model anthropic:claude-sonnet-4 --workspace /path/to/repo\n\n  \
+        # Full-fidelity raw payload (POST /api/v1/schedules body)\n  \
+        bamboo schedules create --json schedule.json\n  \
+        cat schedule.json | bamboo schedules create --json -")]
+    Create {
+        /// Schedule name.
+        #[arg(long, required_unless_present = "json")]
+        name: Option<String>,
+
+        /// Cron trigger: a seconds-first cron expression,
+        /// e.g. '0 30 9 * * *' = every day at 09:30:00.
+        #[arg(long, value_name = "EXPR")]
+        cron: Option<String>,
+
+        /// Interval trigger: fire every N seconds.
+        #[arg(long, value_name = "SECONDS")]
+        every: Option<u64>,
+
+        /// Daily trigger at a wall-clock time, e.g. '09:30' or '09:30:15'.
+        #[arg(long, value_name = "HH:MM[:SS]")]
+        daily: Option<String>,
+
+        /// Task prompt: each fire creates a fresh session with this user
+        /// message and auto-executes it.
+        #[arg(long, required_unless_present = "json")]
+        prompt: Option<String>,
+
+        /// Model as 'provider:model' for the fired sessions (defaults to the
+        /// server's configured schedule model).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Working directory for the fired sessions' file tools.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// IANA timezone for wall-clock triggers, e.g. 'Asia/Shanghai'
+        /// (defaults to the server's timezone handling).
+        #[arg(long)]
+        timezone: Option<String>,
+
+        /// Create the schedule disabled (it won't fire until enabled).
+        #[arg(long)]
+        disabled: bool,
+
+        /// Raw CreateScheduleRequest JSON: a FILE path or '-' for stdin,
+        /// POSTed verbatim. Conflicts with the flag-based fields.
+        #[arg(
+            long,
+            value_name = "FILE|-",
+            conflicts_with_all = ["name", "prompt", "model", "workspace", "timezone", "disabled"]
+        )]
+        json: Option<String>,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Delete a schedule (asks for confirmation unless --yes).
+    Delete {
+        /// Schedule id to delete.
+        schedule_id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Trigger a schedule to run now (POST /api/v1/schedules/{id}/run).
+    Run {
+        /// Schedule id to run.
+        schedule_id: String,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Show a schedule's run history (status, timings, session ids).
+    Runs {
+        /// Schedule id whose runs to list.
+        schedule_id: String,
+
+        /// Print the raw server response as pretty JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
     },
 }
 
@@ -709,6 +851,7 @@ async fn main() {
         | Some(Commands::Respond { .. })
         | Some(Commands::Session { .. })
         | Some(Commands::History { .. })
+        | Some(Commands::Schedules { .. })
         | Some(Commands::Skills { .. })
         | Some(Commands::Mcp { .. })
         | Some(Commands::Init { .. })
@@ -1206,6 +1349,67 @@ async fn main() {
 
         Commands::History { session_id, conn } => {
             if let Err(e) = bamboo_agent::admin_cli::history(conn.into(), &session_id).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Schedules { command } => {
+            use bamboo_agent::admin_cli;
+            let result = match command {
+                SchedulesCommands::List { json, conn } => {
+                    admin_cli::schedules_list(conn.into(), json).await
+                }
+                SchedulesCommands::Show {
+                    schedule_id,
+                    json,
+                    conn,
+                } => admin_cli::schedules_show(conn.into(), &schedule_id, json).await,
+                SchedulesCommands::Create {
+                    name,
+                    cron,
+                    every,
+                    daily,
+                    prompt,
+                    model,
+                    workspace,
+                    timezone,
+                    disabled,
+                    json,
+                    conn,
+                } => {
+                    admin_cli::schedules_create(
+                        conn.into(),
+                        admin_cli::ScheduleCreateArgs {
+                            name,
+                            cron,
+                            every,
+                            daily,
+                            prompt,
+                            model,
+                            workspace,
+                            timezone,
+                            disabled,
+                            json,
+                        },
+                    )
+                    .await
+                }
+                SchedulesCommands::Delete {
+                    schedule_id,
+                    yes,
+                    conn,
+                } => admin_cli::schedules_delete(conn.into(), &schedule_id, yes).await,
+                SchedulesCommands::Run { schedule_id, conn } => {
+                    admin_cli::schedules_run(conn.into(), &schedule_id).await
+                }
+                SchedulesCommands::Runs {
+                    schedule_id,
+                    json,
+                    conn,
+                } => admin_cli::schedules_runs(conn.into(), &schedule_id, json).await,
+            };
+            if let Err(e) = result {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
