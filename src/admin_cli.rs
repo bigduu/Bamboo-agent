@@ -1132,6 +1132,335 @@ fn fmt_ts(value: Option<&serde_json::Value>) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `bamboo mcp status|connect|disconnect|refresh|tools|add|remove` — MCP server
+// management on a running instance (/api/v1/mcp). The offline config view
+// stays `bamboo mcp list` (read_cli).
+// ---------------------------------------------------------------------------
+
+/// Startup/refresh of an MCP server can take a while (stdio child spawn +
+/// initialize handshake, default startup timeout 20s), so the mutating MCP
+/// verbs get a more generous budget than the plain reads.
+const MCP_MUTATE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `bamboo mcp status` — live view over `GET /api/v1/mcp/servers`: connection
+/// state + tool counts per configured server. `--json` prints the raw response.
+pub async fn mcp_status(conn: ConnArgs, json: bool) -> anyhow::Result<()> {
+    let base = conn.api_base();
+    let url = format!("{base}/mcp/servers");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("GET {url} -> HTTP {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    let servers = v.get("servers").and_then(|s| s.as_array());
+    let servers = match servers {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            println!("(no MCP servers configured)");
+            return Ok(());
+        }
+    };
+
+    // Plain (un-colored) cells so the column widths line up.
+    println!(
+        "{:<24} {:<8} {:<14} {:>5}  NAME",
+        "ID", "ENABLED", "STATUS", "TOOLS"
+    );
+    for s in servers {
+        let id = s.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        let enabled = s.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+        let status = s.get("status").and_then(|x| x.as_str()).unwrap_or("?");
+        let tools = s.get("tool_count").and_then(|x| x.as_u64()).unwrap_or(0);
+        let name = s.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        println!(
+            "{:<24} {:<8} {:<14} {:>5}  {}",
+            truncate(id, 24),
+            if enabled { "yes" } else { "no" },
+            truncate(status, 14),
+            tools,
+            truncate(name, 40)
+        );
+    }
+    for s in servers {
+        if let Some(err) = s.get("last_error").and_then(|e| e.as_str()) {
+            if !err.trim().is_empty() {
+                let id = s.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+                println!("{} {id}: {}", "!".yellow(), truncate(err, 100));
+            }
+        }
+    }
+    let connected = servers
+        .iter()
+        .filter(|s| s.get("status").and_then(|x| x.as_str()) == Some("connected"))
+        .count();
+    println!("\n{connected} connected of {}.", servers.len());
+    Ok(())
+}
+
+/// `bamboo mcp connect <id>` — enable + (re)connect a configured server
+/// (`POST /api/v1/mcp/servers/{id}/connect`).
+pub async fn mcp_connect(conn: ConnArgs, server_id: &str) -> anyhow::Result<()> {
+    guard_id_segment("MCP server id", server_id)?;
+    let base = conn.api_base();
+    let url = format!("{base}/mcp/servers/{server_id}/connect");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .timeout(MCP_MUTATE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if status.is_success() {
+        println!("{} server '{server_id}' connected", "✓".green());
+        Ok(())
+    } else if status.as_u16() == 404 {
+        anyhow::bail!("MCP server '{server_id}' not found (check `bamboo mcp status`)");
+    } else {
+        anyhow::bail!(
+            "connect failed: HTTP {status} {}",
+            server_error_message(&body)
+        );
+    }
+}
+
+/// `bamboo mcp disconnect <id>` — disable + disconnect a server
+/// (`POST /api/v1/mcp/servers/{id}/disconnect`).
+pub async fn mcp_disconnect(conn: ConnArgs, server_id: &str) -> anyhow::Result<()> {
+    guard_id_segment("MCP server id", server_id)?;
+    let base = conn.api_base();
+    let url = format!("{base}/mcp/servers/{server_id}/disconnect");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .timeout(MCP_MUTATE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if status.is_success() {
+        println!("{} server '{server_id}' disconnected", "✓".green());
+        Ok(())
+    } else if status.as_u16() == 404 {
+        anyhow::bail!("MCP server '{server_id}' not found (check `bamboo mcp status`)");
+    } else {
+        anyhow::bail!(
+            "disconnect failed: HTTP {status} {}",
+            server_error_message(&body)
+        );
+    }
+}
+
+/// `bamboo mcp refresh [<id>]` — re-list tools from one server, or from every
+/// enabled server when no id is given (`POST /api/v1/mcp/servers/{id}/refresh`).
+pub async fn mcp_refresh(conn: ConnArgs, server_id: Option<&str>) -> anyhow::Result<()> {
+    let base = conn.api_base();
+    let client = reqwest::Client::new();
+
+    let targets: Vec<String> = match server_id {
+        Some(id) => {
+            guard_id_segment("MCP server id", id)?;
+            vec![id.to_string()]
+        }
+        None => {
+            // Refresh every ENABLED server (a disabled one has nothing to list).
+            let url = format!("{base}/mcp/servers");
+            let resp = client
+                .get(&url)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| unreachable(&base, e))?;
+            if !resp.status().is_success() {
+                anyhow::bail!("GET {url} -> HTTP {}", resp.status());
+            }
+            let v: serde_json::Value = resp.json().await?;
+            let ids: Vec<String> = v
+                .get("servers")
+                .and_then(|s| s.as_array())
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .filter(|s| s.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false))
+                        .filter_map(|s| s.get("id").and_then(|x| x.as_str()))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                println!("(no enabled MCP servers to refresh)");
+                return Ok(());
+            }
+            ids
+        }
+    };
+
+    let mut failures = 0usize;
+    for id in &targets {
+        let url = format!("{base}/mcp/servers/{id}/refresh");
+        let result = client.post(&url).timeout(MCP_MUTATE_TIMEOUT).send().await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+                let tools = body.get("tool_count").and_then(|t| t.as_u64()).unwrap_or(0);
+                println!("{} {id}: {tools} tool(s)", "✓".green());
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+                println!(
+                    "{} {id}: HTTP {status} {}",
+                    "✗".red(),
+                    server_error_message(&body)
+                );
+                failures += 1;
+            }
+            Err(e) => {
+                println!("{} {id}: {e}", "✗".red());
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} of {} refresh(es) failed", targets.len());
+    }
+    Ok(())
+}
+
+/// `bamboo mcp tools [<id>]` — list the tools one server exposes
+/// (`GET /api/v1/mcp/servers/{id}/tools`), or every server's tools
+/// (`GET /api/v1/mcp/tools`) when no id is given. `--json` prints raw JSON.
+pub async fn mcp_tools(conn: ConnArgs, server_id: Option<&str>, json: bool) -> anyhow::Result<()> {
+    let base = conn.api_base();
+    let url = match server_id {
+        Some(id) => {
+            guard_id_segment("MCP server id", id)?;
+            format!("{base}/mcp/servers/{id}/tools")
+        }
+        None => format!("{base}/mcp/tools"),
+    };
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    if resp.status().as_u16() == 404 {
+        anyhow::bail!(
+            "MCP server '{}' not found (check `bamboo mcp status`)",
+            server_id.unwrap_or("?")
+        );
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("GET {url} -> HTTP {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    let tools = v.get("tools").and_then(|t| t.as_array());
+    let tools = match tools {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            println!("(no tools)");
+            return Ok(());
+        }
+    };
+    println!("{:<32} {:<20} DESCRIPTION", "ALIAS", "SERVER");
+    for t in tools {
+        let alias = t.get("alias").and_then(|x| x.as_str()).unwrap_or("?");
+        let server = t.get("server_id").and_then(|x| x.as_str()).unwrap_or("");
+        let desc = t.get("description").and_then(|x| x.as_str()).unwrap_or("");
+        println!(
+            "{:<32} {:<20} {}",
+            truncate(alias, 32),
+            truncate(server, 20),
+            truncate(desc, 70)
+        );
+    }
+    println!("\n{} tool(s).", tools.len());
+    Ok(())
+}
+
+/// `bamboo mcp add --json <file|->` — add (or overwrite) a server from a raw
+/// JSON payload passed through to `POST /api/v1/mcp/servers`. The payload may
+/// be the internal shape or the mainstream flat shape (`command`/`url`), same
+/// as the HTTP API.
+pub async fn mcp_add(conn: ConnArgs, payload_source: &str) -> anyhow::Result<()> {
+    // Fail fast on malformed JSON instead of bouncing off the server.
+    let payload = read_json_payload(payload_source)?;
+
+    let base = conn.api_base();
+    let url = format!("{base}/mcp/servers");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .timeout(MCP_MUTATE_TIMEOUT)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if status.is_success() {
+        let id = body
+            .get("server_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
+        println!("{} server '{id}' saved", "✓".green());
+        Ok(())
+    } else {
+        anyhow::bail!("add failed: HTTP {status} {}", server_error_message(&body));
+    }
+}
+
+/// `bamboo mcp remove <id>` — stop + delete a server
+/// (`DELETE /api/v1/mcp/servers/{id}`). Destructive (the stored config is
+/// gone), though a removed server can be re-added with `bamboo mcp add` — so
+/// it confirms like `sessions delete` / `schedules delete` unless `--yes`.
+pub async fn mcp_remove(conn: ConnArgs, server_id: &str, yes: bool) -> anyhow::Result<()> {
+    guard_id_segment("MCP server id", server_id)?;
+    if !yes
+        && !confirm(&format!(
+            "Remove MCP server '{server_id}'? This stops it and deletes its stored config."
+        ))?
+    {
+        println!("aborted (nothing removed).");
+        return Ok(());
+    }
+    let base = conn.api_base();
+    let url = format!("{base}/mcp/servers/{server_id}");
+    let resp = reqwest::Client::new()
+        .delete(&url)
+        .timeout(MCP_MUTATE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| unreachable(&base, e))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if status.is_success() {
+        println!("{} server '{server_id}' removed", "✓".green());
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "remove failed: HTTP {status} {}",
+            server_error_message(&body)
+        );
+    }
+}
+
 /// Count array entries whose `is_running` is true.
 fn count_running(sessions: &[serde_json::Value]) -> usize {
     sessions

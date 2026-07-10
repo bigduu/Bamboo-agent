@@ -165,7 +165,7 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo init` | First-run setup: write `config.json` with a provider + API key (interactive, or `--non-interactive` for CI). |
 | `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
 | `bamboo config [--path] [--show-secrets]` | Inspect the resolved configuration. |
-| `bamboo config set <key> <value>` | Set one value, e.g. `providers.anthropic.api_key`, `providers.<p>.model`, or `provider`. |
+| `bamboo config set <key> <value>` | Set one value by dotted key. Secret-aware keys (`providers.<p>.api_key`, `provider_instances.<id>.api_key`, `notifications.ntfy.token`, `notifications.bark.device_key`) are stored encrypted at rest; every other key is a generic validated dot-path (e.g. `server.port 9563`, `tools.disabled '["Bash"]'`) — JSON values are parsed as JSON, unknown keys / type mismatches are rejected before writing. `--dry-run` previews the diff. |
 | `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Use `-p -` to read the prompt from stdin. Optional `-s <session>` to continue, `-m provider:model` **or** a bare `-m <model>` (bound to `--provider`, else the configured default provider) to pin the model, `--provider <name>` to select a provider, `--reasoning-effort <low\|medium\|high\|xhigh>`, `--skill-mode <mode>`, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
 | `bamboo completions <shell>` | Print a shell completion script (`bash`/`zsh`/`fish`/`powershell`/`elvish`), e.g. `bamboo completions zsh > ~/.zfunc/_bamboo`. |
 | `bamboo actor run\|serve\|list\|call` | Drive the sub-agent actor fabric from the terminal (spawn + stream, run as a service, discover, or send a task). |
@@ -178,9 +178,10 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo history <session_id>` | Print a session's message transcript from a running server (review a headless `-p` run's log). |
 | `bamboo schedules list\|show\|create\|delete\|run\|runs` | Manage schedules (timed tasks) on a running server: list/inspect, create (`--cron`/`--every`/`--daily` + `--prompt`, or a raw `--json <file\|->` payload), delete (confirms unless `--yes`), trigger now, and view run history. |
 | `bamboo skills list` | List the skills the agent would load from `<data_dir>/skills` (offline; no server needed). |
-| `bamboo mcp list` | List the MCP servers configured in `config.json` (offline; live status via `bamboo status`). |
+| `bamboo mcp list` | List the MCP servers configured in `config.json` (offline; no server needed). |
+| `bamboo mcp status\|connect\|disconnect\|refresh\|tools\|add\|remove` | Manage MCP servers on a running instance over `/api/v1/mcp`: live connection state + tool counts (`status [--json]`), enable/connect + disable/disconnect a server, re-list tools (`refresh [<id>]`), inspect tools (`tools [<id>] [--json]`), add from a raw JSON payload (`add --json <file\|->`), and delete (`remove <id>`, confirms unless `--yes`; a removed server can be re-added with `add`). |
 
-The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`). (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
+The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`); the other `mcp` verbs are server-backed and take the same connection flags. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
 A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present).
 

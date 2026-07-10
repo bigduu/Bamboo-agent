@@ -215,18 +215,59 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
 
 /// `bamboo config set <key> <value>` — write a single config value.
 ///
-/// Supported keys: `provider`, `providers.<provider>.api_key`,
-/// `providers.<provider>.model` (provider ∈ anthropic|openai|gemini). Existing
-/// fields on the provider are preserved.
-pub fn run_config_set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Result<()> {
+/// Two classes of keys:
+///
+/// **Secret-aware keys** (encrypted at rest; the value is set on the typed
+/// config and `Config::save_to_dir` writes the `*_encrypted` form):
+///   - `provider` (default provider selection; not a secret, kept for
+///     backward compatibility)
+///   - `providers.<anthropic|openai|gemini>.api_key` (unchanged legacy path)
+///   - `providers.bodhi.api_key`
+///   - `provider_instances.<id>.api_key` (the instance must already exist)
+///   - `notifications.ntfy.token`, `notifications.bark.device_key`
+///   - `providers.<anthropic|openai|gemini>.model` (legacy path, not a secret)
+///
+/// **Everything else** goes through the generic validated dot-path setter
+/// ([`bamboo_config::dot_path::apply_dot_path_set`]): the value is parsed as
+/// JSON when it parses (numbers/bools/arrays/objects), else taken as a
+/// string; the result must deserialize back into the typed `Config` (type
+/// mismatches and unknown fields are rejected before anything is written).
+/// `proxy_auth.*`, `subagents.broker.*` and all `*_encrypted` keys are
+/// refused. With `dry_run` the resulting diff is printed and nothing is
+/// saved.
+pub fn run_config_set(
+    key: &str,
+    value: &str,
+    data_dir: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
 
     let parts: Vec<&str> = key.split('.').collect();
-    match parts.as_slice() {
+    // `Some(outcome)` = generic dot-path set (validated new config inside);
+    // `None` = a dedicated arm mutated `config` in place.
+    let outcome = match parts.as_slice() {
         // Selecting the default provider accepts any known provider (incl.
         // copilot/bodhi), not just the keyed ones.
-        ["provider"] => config.provider = normalize_known_provider(value)?,
+        ["provider"] => {
+            config.provider = normalize_known_provider(value)?;
+            None
+        }
+        // Bodhi's static key is secret-aware too, but is not a keyed provider
+        // for `init` — handled before the legacy keyed-provider arm.
+        ["providers", "bodhi", "api_key"] => {
+            let v = value.trim();
+            if v.is_empty() {
+                bail!("api_key must not be empty");
+            }
+            config
+                .providers
+                .bodhi
+                .get_or_insert_with(empty_provider)
+                .api_key = v.to_string();
+            None
+        }
         ["providers", p, "api_key"] => {
             let p = normalize_provider(p)?;
             let v = value.trim();
@@ -234,6 +275,7 @@ pub fn run_config_set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Resu
                 bail!("api_key must not be empty");
             }
             set_provider_api_key(&mut config, &p, v)?;
+            None
         }
         ["providers", p, "model"] => {
             let p = normalize_provider(p)?;
@@ -242,25 +284,114 @@ pub fn run_config_set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Resu
                 bail!("model must not be empty");
             }
             set_provider_model(&mut config, &p, v)?;
+            None
         }
-        _ => bail!(
-            "unsupported config key '{key}'. Supported keys:\n  \
-             provider\n  \
-             providers.<anthropic|openai|gemini>.api_key\n  \
-             providers.<anthropic|openai|gemini>.model"
-        ),
-    }
+        ["provider_instances", id, "api_key"] => {
+            let v = value.trim();
+            if v.is_empty() {
+                bail!("api_key must not be empty");
+            }
+            let Some(instance) = config.provider_instances.get_mut(*id) else {
+                bail!(
+                    "provider instance '{id}' not found; create the instance first \
+                     (its api_key is then stored encrypted at rest)"
+                );
+            };
+            instance.api_key = v.to_string();
+            None
+        }
+        ["notifications", "ntfy", "token"] => {
+            let v = value.trim();
+            if v.is_empty() {
+                bail!("token must not be empty");
+            }
+            config.notifications.ntfy.token = Some(v.to_string());
+            None
+        }
+        ["notifications", "bark", "device_key"] => {
+            let v = value.trim();
+            if v.is_empty() {
+                bail!("device_key must not be empty");
+            }
+            config.notifications.bark.device_key = Some(v.to_string());
+            None
+        }
+        // Generic, validated dot-path set for every other key. Secret paths
+        // not routed above are refused inside (defense in depth), so a
+        // plaintext secret can never be silently dropped or mis-stored.
+        _ => {
+            let parsed = bamboo_config::dot_path::parse_cli_value(value);
+            Some(bamboo_config::dot_path::apply_dot_path_set(
+                &config, key, parsed,
+            )?)
+        }
+    };
 
-    config
-        .save_to_dir(data_dir.clone())
-        .context("failed to write config.json")?;
-    let shown = if key.ends_with("api_key") {
+    let is_secret_key =
+        key.ends_with("api_key") || key.ends_with(".token") || key.ends_with(".device_key");
+    let shown = if is_secret_key {
         mask_secret(value)
     } else {
         value.to_string()
     };
+
+    if dry_run {
+        match &outcome {
+            Some(out) => print_dry_run_diff(&config, &out.config),
+            None => println!(
+                "--dry-run: would set {key} = {shown} via the dedicated setter \
+                 (secrets are stored encrypted at rest). No changes written."
+            ),
+        }
+        return Ok(());
+    }
+
+    let to_save = match outcome {
+        Some(out) => out.config,
+        None => config,
+    };
+    to_save
+        .save_to_dir(data_dir.clone())
+        .context("failed to write config.json")?;
     println!("✓ set {key} = {shown}");
     Ok(())
+}
+
+/// Print the prospective `config set` change as a path-level diff.
+/// Both sides are serialized with plaintext secrets sanitized (the same
+/// clearing `save_to_dir` performs), so the preview never leaks a secret.
+fn print_dry_run_diff(current: &Config, updated: &Config) {
+    let before = sanitized_config_value(current);
+    let after = sanitized_config_value(updated);
+    let diff = bamboo_config::dot_path::diff_json(&before, &after);
+    if diff.is_empty() {
+        println!("--dry-run: no effective change. Nothing would be written.");
+        return;
+    }
+    println!(
+        "--dry-run: would apply {} change(s) (secrets omitted):",
+        diff.len()
+    );
+    for (path, old, new) in diff {
+        let old = old
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(absent)".to_string());
+        let new = new
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(absent)".to_string());
+        println!("  {path}: {old} -> {new}");
+    }
+    println!("No changes written.");
+}
+
+/// In-memory serialization with the same plaintext-secret clearing that
+/// `save_to_dir` applies before writing (env vars, cluster-fabric SSH
+/// secrets; `api_key`/token plaintexts are `skip_serializing` already).
+fn sanitized_config_value(config: &Config) -> serde_json::Value {
+    let mut c = config.clone();
+    c.sanitize_env_vars_for_disk();
+    c.sanitize_cluster_fabric_for_disk();
+    serde_json::to_value(&c).unwrap_or(serde_json::Value::Null)
 }
 
 // ---- provider helpers ----
@@ -582,5 +713,102 @@ mod tests {
         assert!(m.starts_with("sk-"));
         assert!(m.ends_with("chars)"));
         assert!(!m.contains("1234567890"));
+    }
+
+    #[test]
+    fn config_set_generic_key_round_trips_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        run_config_set("server.port", "19999", Some(data_dir.clone()), false).unwrap();
+        let raw = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(root["server"]["port"], serde_json::json!(19999));
+
+        // Unknown / mistyped keys are rejected without writing.
+        assert!(run_config_set("server.prot", "1", Some(data_dir.clone()), false).is_err());
+        assert!(
+            run_config_set("server.port", "not-a-port", Some(data_dir.clone()), false).is_err()
+        );
+        let raw_after = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+        assert_eq!(root["server"]["port"], serde_json::json!(19999));
+    }
+
+    #[test]
+    fn config_set_dry_run_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        run_config_set("server.port", "12001", Some(data_dir.clone()), true).unwrap();
+        assert!(
+            !data_dir.join("config.json").exists(),
+            "--dry-run must not create/modify config.json"
+        );
+    }
+
+    #[test]
+    fn config_set_api_key_still_encrypted_at_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        // Legacy secret-aware arm (unchanged behavior).
+        run_config_set(
+            "providers.anthropic.api_key",
+            "sk-ant-setupcli-secret",
+            Some(data_dir.clone()),
+            false,
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        assert!(
+            !raw.contains("sk-ant-setupcli-secret"),
+            "plaintext api_key must never reach disk"
+        );
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(root["providers"]["anthropic"]["api_key_encrypted"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+
+        // A follow-up generic set must keep the stored ciphertext intact.
+        run_config_set(
+            "providers.anthropic.model",
+            "claude-x",
+            Some(data_dir.clone()),
+            false,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        assert!(!raw.contains("sk-ant-setupcli-secret"));
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(root["providers"]["anthropic"]["model"], "claude-x");
+        assert!(root["providers"]["anthropic"]["api_key_encrypted"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+
+        let reloaded = Config::from_data_dir_without_env(Some(data_dir));
+        assert_eq!(
+            reloaded.providers.anthropic.as_ref().unwrap().api_key,
+            "sk-ant-setupcli-secret",
+            "the stored key must still decrypt after a generic set"
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_secret_paths_it_cannot_protect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        for (key, value) in [
+            ("proxy_auth.username", "alice"),
+            ("providers.anthropic.api_key_encrypted", "cipher"),
+            ("provider_instances.nope.api_key", "sk-x"),
+        ] {
+            assert!(
+                run_config_set(key, value, Some(data_dir.clone()), false).is_err(),
+                "{key} must be refused"
+            );
+        }
+        assert!(!data_dir.join("config.json").exists());
     }
 }
