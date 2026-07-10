@@ -95,10 +95,10 @@ homepage = "https://github.com/bigduu/Bamboo-agent"
 repository = "https://github.com/bigduu/Bamboo-agent"
 documentation = "https://docs.rs/bamboo-agent"
 readme = "README.md"
-keywords = ["ai", "agent", "llm", "automation", "assistant"]
+keywords = ["ai", "agent", "llm", "automation", "mcp"]
 categories = [
+    "artificial-intelligence",
     "development-tools",
-    "api-bindings",
     "web-programming",
     "asynchronous",
 ]
