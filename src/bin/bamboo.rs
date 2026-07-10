@@ -291,6 +291,44 @@ enum Commands {
         conn: ConnArgs,
     },
 
+    /// Answer a session's pending question (permission gate / clarification)
+    /// from the terminal (POST /api/v1/respond/{id}). Answering resumes the
+    /// blocked run server-side — handy for a headless/scheduled run that is
+    /// waiting on input. Use --pending to view the question first.
+    #[command(after_help = "EXAMPLES:\n  \
+        # See what a blocked session is asking\n  \
+        bamboo respond <session-id> --pending\n\n  \
+        # Answer it (the run resumes server-side)\n  \
+        bamboo respond <session-id> \"Yes\"")]
+    Respond {
+        /// Session id with the pending question.
+        session_id: String,
+
+        /// The answer — one of the offered options, or free text when the
+        /// question allows custom input. Omit it with --pending to only view
+        /// the question.
+        #[arg(required_unless_present = "pending", conflicts_with = "pending")]
+        answer: Option<String>,
+
+        /// Show the pending question (text + options) instead of answering.
+        #[arg(long)]
+        pending: bool,
+
+        /// With --pending: print the raw JSON response instead of pretty text.
+        #[arg(long, requires = "pending")]
+        json: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Per-session lifecycle verbs on a running server (list with
+    /// `bamboo sessions`).
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
+    },
+
     /// Print a session's message transcript from a running server
     /// (GET /api/v1/history/{id}). Handy to review a headless `-p` run's log.
     History {
@@ -316,6 +354,37 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum SessionCommands {
+    /// Show one session's detail (GET /api/v1/sessions/{id}): title, model,
+    /// running state, pending question, message count, placement.
+    Show {
+        /// Session id to show.
+        session_id: String,
+
+        /// Print the raw JSON response instead of the pretty summary.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Delete a session permanently (DELETE /api/v1/sessions/{id}). Cancels
+    /// any running execution first. Asks for confirmation unless --yes.
+    Delete {
+        /// Session id to delete.
+        session_id: String,
+
+        /// Skip the confirmation prompt (required for scripts / non-TTY use).
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+}
+
+#[derive(Subcommand)]
 enum SkillsCommands {
     /// List discovered skills (id, name, description).
     List {
@@ -336,7 +405,8 @@ enum McpCommands {
 }
 
 /// Connection options shared by the admin subcommands (`health` / `status` /
-/// `sessions` / `stop`). Resolves which running server to talk to.
+/// `sessions` / `session` / `stop` / `respond` / `history`). Resolves which
+/// running server to talk to.
 #[derive(clap::Args, Clone)]
 struct ConnArgs {
     /// Full base URL of the server, e.g. `http://127.0.0.1:9562`.
@@ -636,6 +706,8 @@ async fn main() {
         | Some(Commands::Status { .. })
         | Some(Commands::Sessions { .. })
         | Some(Commands::Stop { .. })
+        | Some(Commands::Respond { .. })
+        | Some(Commands::Session { .. })
         | Some(Commands::History { .. })
         | Some(Commands::Skills { .. })
         | Some(Commands::Mcp { .. })
@@ -1088,6 +1160,45 @@ async fn main() {
 
         Commands::Stop { session_id, conn } => {
             if let Err(e) = bamboo_agent::admin_cli::stop(conn.into(), &session_id).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Respond {
+            session_id,
+            answer,
+            pending,
+            json,
+            conn,
+        } => {
+            let result = if pending {
+                bamboo_agent::admin_cli::respond_pending(conn.into(), &session_id, json).await
+            } else {
+                // clap enforces `answer` is present when --pending is absent.
+                let answer = answer.unwrap_or_default();
+                bamboo_agent::admin_cli::respond(conn.into(), &session_id, &answer).await
+            };
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Session { command } => {
+            let result = match command {
+                SessionCommands::Show {
+                    session_id,
+                    json,
+                    conn,
+                } => bamboo_agent::admin_cli::session_show(conn.into(), &session_id, json).await,
+                SessionCommands::Delete {
+                    session_id,
+                    yes,
+                    conn,
+                } => bamboo_agent::admin_cli::session_delete(conn.into(), &session_id, yes).await,
+            };
+            if let Err(e) = result {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
