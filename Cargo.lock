@@ -1294,6 +1294,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-plugin"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bamboo-config",
+ "bamboo-domain",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bamboo-sdk"
 version = "0.0.0"
 dependencies = [
