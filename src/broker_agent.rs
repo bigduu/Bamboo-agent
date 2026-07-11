@@ -89,6 +89,10 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 model.clone(),
                 permission_mode.clone(),
                 spec.workspace.clone(),
+                Some(crate::claude_code_executor::resolve_claude_code_state_dir(
+                    &spec.storage_dir,
+                    &spec.identity.child_id,
+                )),
             )),
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };

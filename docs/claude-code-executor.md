@@ -132,13 +132,63 @@ the decision — same shape as the codex app-server adapter in cc-connect
 
 ## 4. Session identity & resume
 
-- The session id is **agent-assigned**: read it from `system` / `result` events;
-  persist per bamboo child.
-- Live continuity = same process, more stdin writes. Resume after restart =
-  `--resume <persisted_id>`; the resumed process may assign a NEW id — keep a
-  history of prior ids if you need to recognize transcripts.
-- Transcripts live at `~/.claude/projects/<hashed-workdir>/<session_id>.jsonl`
-  if history listing is ever wanted (`claudecode.go:532-587`).
+Implemented (issue #444) in `ClaudeCodeExecutor`. `RunSpec.messages` is the
+activation discriminant (`proto.rs:28`): empty on the first activation of an
+actor, non-empty on a reactivation (`send_message`/`update`/`rerun`) that
+ships the actor's prior conversation.
+
+**Durable state.** The executor persists the agent-assigned session id in the
+child's stable per-activation storage dir — resolved exactly like
+`BambooRuntimeExecutor::build` (`subagent_worker.rs:194-202`): `spec.storage_dir`
+when the parent already isolated it, else `$TMPDIR/bamboo-subagents/<child_id>`.
+Both worker factory arms (`subagent_worker.rs`, `broker_agent.rs`) resolve this
+dir and pass it into `ClaudeCodeExecutor::new`'s `state_dir` parameter.
+
+State file: `<dir>/claude-code-session.json`
+
+```json
+{ "session_id": "...", "workspace": "...", "updated_at": "2026-..." }
+```
+
+Written atomically (tmp file + `rename` in the same dir) on EVERY `system` or
+`result` frame that carries a `session_id` — a resumed session may be assigned
+a brand-new id, so this always re-captures rather than assuming stability.
+`workspace` is recorded alongside the id: Claude Code transcripts are
+machine-local under `~/.claude/projects/<hashed-workdir>/`, so a later
+activation against a DIFFERENT workspace (different project, or a different
+machine entirely) treats the persisted id as unusable.
+
+**Activation logic** (`ClaudeCodeExecutor::run`):
+
+1. `messages` empty → fresh session; delete any stale state file first (a
+   `rerun` must never accidentally resume).
+2. `messages` non-empty AND the state file has an id recorded against the
+   SAME `workspace` → spawn with `--resume <id>`, sending just the live
+   assignment (the CLI already owns the transcript).
+3. `messages` non-empty but no usable id (first run on this machine, storage
+   GC'd, workspace changed) → **fallback rehydration**: the shipped history
+   is rendered into a bounded text preamble (role-tagged, `**role**: content`,
+   capped to the last ~40 messages / ~24k chars with oldest dropped first and
+   an explicit `_[truncated: N earlier message(s) omitted]_` note), clearly
+   delimited under `## Prior conversation (rehydrated)` / `## Current task`
+   headings so the model doesn't confuse rehydrated context with the live
+   task, and prepended to the assignment. The assignment's own trailing user
+   message (shipped in `messages` per the wire contract) is excluded from the
+   preamble so it isn't duplicated. A warning is logged; context is never
+   silently dropped.
+4. **Resume-failure retry:** if a `--resume` spawn exits before ever emitting
+   a terminal `result` frame (bad/GC'd session id — the CLI errors out fast),
+   the run retries ONCE without `--resume`, using the same fallback
+   rehydration as step 3, after clearing the stale state file. No retry loop
+   beyond this single attempt, and the retry only triggers for THIS specific
+   failure mode (a `--resume` attempt that never produced a result) — any
+   other error is returned as-is.
+
+**Non-goals (still).** Mid-turn steering into a genuinely new turn on the same
+session, and multimodal/env-forwarding (#443) — unaffected by this change.
+Cross-machine resume is out of scope by construction (see the workspace/
+machine-locality note above); if the actor is redeployed to a different host
+or workspace, activation falls through to fallback rehydration automatically.
 
 ## 5. Cancellation / shutdown
 
@@ -160,24 +210,42 @@ June 15 credit split was paused). If the host also configures `ANTHROPIC_API_KEY
 in the child env, the CLI bills the API key instead — decide explicitly which
 one the executor forwards.
 
-## 7. Minimal executor sketch
+## 7. Executor shape (as implemented)
 
 ```rust
-pub struct ClaudeCodeExecutor { /* binary path, defaults */ }
+pub struct ClaudeCodeExecutor {
+    binary: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    workspace: Option<String>,
+    /// Stable per-child dir the resumed-session state file lives in — see §4.
+    /// `None` disables resume persistence (every activation is fresh).
+    state_dir: Option<PathBuf>,
+}
 
 #[async_trait]
 impl ChildExecutor for ClaudeCodeExecutor {
     async fn run(&self, spec: RunSpec, events: EventSink,
                  steer: SteerInbox, cancel: CancellationToken) -> ChildOutcome {
-        // 1. spawn `claude` (fresh or --resume from spec metadata), own pgroup
-        // 2. write the assignment as a stream-json user message
-        // 3. select-loop:
+        // steer is drained for the whole activation (both possible attempts
+        // below) but not acted on — no reliable mid-turn interrupt (§5).
+        //
+        // §4 activation logic, then `run_once` (spawn → select-loop → §5
+        // shutdown) is called once, or twice on a resume-failure retry:
+        // 1. messages empty          → delete stale state; fresh spawn.
+        // 2. messages non-empty + id → spawn `--resume <id>` with just the
+        //                              live assignment.
+        // 3. messages non-empty, no id → fallback: rendered history preamble
+        //                                + assignment, fresh spawn.
+        // 4. a `--resume` spawn that exited with no `result` frame → clear
+        //    state, retry ONCE with the fallback body, no `--resume`.
+        //
+        // Inside each `run_once` attempt, the select-loop:
         //    - stdout line  → parse → events.emit(...)   (§2 table)
+        //      `system`/`result` with a session_id → persist state (§4)
         //      control_request → events.emit(NeedsHuman) + park oneshot
-        //    - steer msg    → permission decision → control_response
-        //                     | plain text → inject as next user message
         //    - cancel       → §5 shutdown → ChildOutcome::Cancelled
-        //    - `result` with Done → drain, keep process warm or close per policy
+        //    - `result`     → §5 shutdown → ChildOutcome::Completed
     }
 }
 ```

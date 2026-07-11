@@ -9,16 +9,24 @@
 //! `AgentEvent`s the real bamboo runtime emits (so the parent's child preview
 //! renders identically — see [`BambooRuntimeExecutor`](crate::subagent_worker::BambooRuntimeExecutor)),
 //! and relay `can_use_tool` permission asks through [`EventSink::host`] when a
-//! host bridge is wired. Session resume (`--resume`) and mid-turn steering are
-//! explicitly out of scope — see the doc comment on [`ChildExecutor::run`]'s
-//! `steer` parameter below.
+//! host bridge is wired. Mid-turn steering remains out of scope — see the doc
+//! comment on [`ChildExecutor::run`]'s `steer` parameter below.
+//!
+//! Session resume (issue #444): `RunSpec.messages` empty/non-empty is the
+//! discriminant a reactivation ships (`proto.rs:28`). A non-empty shipment
+//! means this activation has prior context, resolved by [`ClaudeCodeExecutor::run`]
+//! in four steps — see its doc comment for the full state-machine and
+//! `docs/claude-code-executor.md` §4 for the on-disk state file shape.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -54,6 +62,43 @@ const GRACEFUL_EXIT_WAIT: Duration = Duration::from_secs(5);
 /// Phase 3: bounded wait after SIGTERM before escalating to SIGKILL.
 const SIGTERM_WAIT: Duration = Duration::from_secs(2);
 
+/// Resolve this actor's stable per-child storage dir, exactly like
+/// [`BambooRuntimeExecutor::build`](crate::subagent_worker::BambooRuntimeExecutor::build)
+/// (`subagent_worker.rs:194-202`): `spec.storage_dir` when the parent already
+/// isolated it, else a temp dir keyed by `child_id` — stable across
+/// activations of the SAME child. Both `ExecutorSpec::ClaudeCode` factory
+/// arms (`subagent_worker.rs`, `broker_agent.rs`) call this to give
+/// [`ClaudeCodeExecutor::new`]'s `state_dir` a location the resumed-session
+/// state file (issue #444) survives in.
+pub fn resolve_claude_code_state_dir(storage_dir: &Option<String>, child_id: &str) -> PathBuf {
+    storage_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents").join(child_id))
+}
+
+/// State file name inside a child's stable storage dir (issue #444). Holds the
+/// agent-assigned Claude Code session id this actor last saw, so the NEXT
+/// activation of the SAME child can `--resume` it instead of losing context.
+const STATE_FILE_NAME: &str = "claude-code-session.json";
+
+/// Fallback history preamble cap (issue #444 test plan: "~24k chars / last
+/// ~40 messages, oldest dropped first").
+const HISTORY_PREAMBLE_MAX_CHARS: usize = 24_000;
+const HISTORY_PREAMBLE_MAX_MESSAGES: usize = 40;
+
+/// On-disk shape of [`STATE_FILE_NAME`]. `workspace` is recorded so a later
+/// activation on a DIFFERENT workspace (or a different machine — Claude Code
+/// transcripts are machine-local under `~/.claude/projects/<hashed-workdir>/`,
+/// docs §4) treats the persisted id as unusable rather than resuming into the
+/// wrong project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeSessionState {
+    session_id: String,
+    workspace: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
 /// Drives `claude --output-format stream-json --input-format stream-json ...`
 /// as the engine behind one sub-agent run.
 pub struct ClaudeCodeExecutor {
@@ -66,6 +111,13 @@ pub struct ClaudeCodeExecutor {
     /// worker process's own cwd (mirrors how [`BambooRuntimeExecutor`](crate::subagent_worker::BambooRuntimeExecutor)
     /// treats an absent `ProvisionSpec.workspace`).
     workspace: Option<String>,
+    /// This child's stable per-activation storage dir, used to persist
+    /// [`STATE_FILE_NAME`] across activations (issue #444). Resolved by the
+    /// caller exactly like [`BambooRuntimeExecutor::build`](crate::subagent_worker::BambooRuntimeExecutor::build)
+    /// (`spec.storage_dir` else a temp dir keyed by `child_id`) — NOT inside
+    /// this constructor, so tests can point it at an isolated tempdir. `None`
+    /// disables resume persistence entirely (every activation is fresh).
+    state_dir: Option<PathBuf>,
 }
 
 impl ClaudeCodeExecutor {
@@ -74,16 +126,91 @@ impl ClaudeCodeExecutor {
         model: Option<String>,
         permission_mode: Option<String>,
         workspace: Option<String>,
+        state_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             binary: binary.unwrap_or_else(|| "claude".to_string()),
             model,
             permission_mode,
             workspace,
+            state_dir,
         }
     }
 
-    fn build_command(&self) -> Command {
+    fn state_file_path(&self) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|dir| dir.join(STATE_FILE_NAME))
+    }
+
+    /// Read and parse the state file, if any. Any failure (missing dir, no
+    /// file, corrupt JSON) is treated as "no usable id" rather than an error
+    /// — resume is a best-effort optimization, never a hard requirement.
+    async fn read_state(&self) -> Option<ClaudeSessionState> {
+        let path = self.state_file_path()?;
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Delete the state file (best-effort). Called before a fresh-session
+    /// activation (`messages` empty) so a subsequent `rerun` never
+    /// accidentally resumes stale context, and before a resume-failure retry
+    /// so a garbage-collected/bad id isn't offered again.
+    async fn delete_state_file(&self) {
+        if let Some(path) = self.state_file_path() {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+
+    /// Atomically persist the session id this activation last saw (tmp file +
+    /// rename, in the same dir so the rename is same-filesystem). Called on
+    /// EVERY `system`/`result` frame that carries a session id — a resumed
+    /// session may be assigned a brand-new one, so this always re-captures
+    /// rather than assuming stability.
+    async fn write_state(&self, session_id: &str) {
+        let Some(dir) = &self.state_dir else { return };
+        let path = dir.join(STATE_FILE_NAME);
+        let state = ClaudeSessionState {
+            session_id: session_id.to_string(),
+            workspace: self.workspace.clone(),
+            updated_at: Utc::now(),
+        };
+        let Ok(bytes) = serde_json::to_vec_pretty(&state) else {
+            return;
+        };
+        if tokio::fs::create_dir_all(dir).await.is_err() {
+            return;
+        }
+        // Unique tmp name (pid + session id) so concurrent activations of
+        // different children never collide on the same tmp path.
+        let tmp_path = dir.join(format!("{STATE_FILE_NAME}.{}.tmp", std::process::id()));
+        if tokio::fs::write(&tmp_path, &bytes).await.is_err() {
+            return;
+        }
+        let _ = tokio::fs::rename(&tmp_path, &path).await;
+    }
+
+    /// Step 2 of the activation logic (issue #444): a usable persisted id
+    /// requires a non-empty `messages` shipment (the reactivation
+    /// discriminant) AND a state file whose recorded `workspace` matches this
+    /// executor's current one — a mismatch (different project, or a
+    /// different machine entirely, since Claude Code transcripts are
+    /// machine-local) makes the id unusable and falls through to step 3.
+    async fn resolve_resume_id(&self) -> Option<String> {
+        let state = self.read_state().await?;
+        if state.workspace != self.workspace {
+            tracing::warn!(
+                recorded = ?state.workspace,
+                current = ?self.workspace,
+                "claude code: state file workspace mismatch; falling back to history rehydration"
+            );
+            return None;
+        }
+        Some(state.session_id)
+    }
+
+    /// `resume_id`: when `Some`, append `--resume <id>` (step 2 of the
+    /// activation logic — reattach to a persisted Claude Code session
+    /// instead of spawning fresh).
+    fn build_command(&self, resume_id: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("--output-format")
             .arg("stream-json")
@@ -98,6 +225,9 @@ impl ClaudeCodeExecutor {
         }
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
+        }
+        if let Some(id) = resume_id {
+            cmd.arg("--resume").arg(id);
         }
         // Nested-session detection: Claude Code misbehaves if it inherits its
         // own env var from an outer session (docs/claude-code-executor.md §1).
@@ -141,6 +271,9 @@ impl ClaudeCodeExecutor {
                     .unwrap_or("");
                 let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 tracing::debug!(session_id, model, "claude code: session bootstrap");
+                if !session_id.is_empty() {
+                    self.write_state(session_id).await;
+                }
                 None
             }
             "assistant" => {
@@ -166,6 +299,13 @@ impl ClaudeCodeExecutor {
                     // — see docs/claude-code-executor.md §2's `result` row).
                     tracing::debug!("claude code: mid-turn compaction result, continuing");
                     return None;
+                }
+                // A resumed session may be assigned a brand-new id — always
+                // re-capture from `result` too, not just `system` (issue #444).
+                if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
+                    if !session_id.is_empty() {
+                        self.write_state(session_id).await;
+                    }
                 }
                 let final_text = value
                     .get("result")
@@ -290,43 +430,46 @@ impl ClaudeCodeExecutor {
     }
 }
 
-#[async_trait]
-impl ChildExecutor for ClaudeCodeExecutor {
-    async fn run(
+impl ClaudeCodeExecutor {
+    /// One `claude` child process activation: spawn (fresh or `--resume
+    /// resume_id`), write `body` as the stdin user turn, read frames until a
+    /// terminal `result` (or EOF/cancel), then run the graceful shutdown.
+    /// Extracted out of [`ChildExecutor::run`] so the resume-failure retry
+    /// (step 4 of the activation logic) doesn't duplicate the whole read
+    /// loop — `run` calls this up to twice for a single activation, sharing
+    /// one `events` sink and `cancel` token across both attempts.
+    ///
+    /// Returns `(outcome, exited_without_result)` — the second element is
+    /// `true` only for the specific "process exited before a terminal
+    /// `result` frame arrived" error path, which is the ONLY case `run`
+    /// treats as retry-eligible.
+    async fn run_once(
         &self,
-        spec: RunSpec,
-        events: EventSink,
-        // Claude Code's stream-json protocol has no mid-turn user-message
-        // injection: a turn is one stdin write followed by a read to `result`
-        // (docs/claude-code-executor.md §5 — "no reliable mid-turn interrupt
-        // over this protocol"). Steering is drained (so an unbounded backlog
-        // can't build up on the sender side) but never acted on for this MVP;
-        // a future revision would need session resume (`--resume`) to turn a
-        // steer message into a genuinely new turn on the SAME session.
-        mut steer: SteerInbox,
-        cancel: CancellationToken,
-    ) -> ChildOutcome {
-        if !spec.messages.is_empty() {
-            // History rehydration is an explicit non-goal (issue #441) — the
-            // CLI has no equivalent of "replay this transcript then continue"
-            // without `--resume` against a persisted session id we don't
-            // track yet. Surface it at debug so a caller that shipped history
-            // (e.g. a reactivation) can see why it was ignored.
-            tracing::debug!(
-                messages = spec.messages.len(),
-                "claude code executor: ignoring shipped history (not yet supported)"
-            );
-        }
-
-        let mut child = match self.build_command().spawn() {
+        body: &str,
+        resume_id: Option<&str>,
+        events: &EventSink,
+        cancel: &CancellationToken,
+    ) -> (ChildOutcome, bool) {
+        let mut child = match self.build_command(resume_id).spawn() {
             Ok(c) => c,
-            Err(e) => return ChildOutcome::error(format!("spawn '{}': {e}", self.binary)),
+            Err(e) => {
+                return (
+                    ChildOutcome::error(format!("spawn '{}': {e}", self.binary)),
+                    false,
+                )
+            }
         };
         let Some(stdin) = child.stdin.take() else {
-            return ChildOutcome::error("claude child has no stdin pipe".to_string());
+            return (
+                ChildOutcome::error("claude child has no stdin pipe".to_string()),
+                false,
+            );
         };
         let Some(stdout) = child.stdout.take() else {
-            return ChildOutcome::error("claude child has no stdout pipe".to_string());
+            return (
+                ChildOutcome::error("claude child has no stdout pipe".to_string()),
+                false,
+            );
         };
         let stderr = child.stderr.take();
 
@@ -339,27 +482,26 @@ impl ChildExecutor for ClaudeCodeExecutor {
         let (write_tx, writer_handle) = spawn_stdin_writer(stdin);
         let assignment_frame = json!({
             "type": "user",
-            "message": { "role": "user", "content": spec.assignment },
+            "message": { "role": "user", "content": body },
         });
         if write_tx.send(assignment_frame).is_err() {
             let _ = child.start_kill();
-            return ChildOutcome::error(
-                "claude code executor: failed to queue the assignment on stdin".to_string(),
+            return (
+                ChildOutcome::error(
+                    "claude code executor: failed to queue the assignment on stdin".to_string(),
+                ),
+                false,
             );
         }
-
-        // Ignore steer messages (see doc comment on `steer` above) but keep
-        // draining so the sender never sees an unbounded backlog.
-        let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
 
         let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, stdout);
         let mut pending: HashMap<String, JoinHandle<()>> = HashMap::new();
         let mut last_text = String::new();
 
-        let outcome = loop {
+        let (outcome, exited_without_result) = loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    break ChildOutcome::cancelled();
+                    break (ChildOutcome::cancelled(), false);
                 }
                 line = read_bounded_line(&mut reader, MAX_STDOUT_LINE_BYTES) => {
                     match line {
@@ -375,10 +517,10 @@ impl ChildExecutor for ClaudeCodeExecutor {
                                 }
                             };
                             if let Some(outcome) = self
-                                .handle_frame(value, &events, &write_tx, &mut pending, &mut last_text)
+                                .handle_frame(value, events, &write_tx, &mut pending, &mut last_text)
                                 .await
                             {
-                                break outcome;
+                                break (outcome, false);
                             }
                         }
                         Ok(None) => {
@@ -386,20 +528,19 @@ impl ChildExecutor for ClaudeCodeExecutor {
                             // exited (or closed stdout) unexpectedly.
                             let code = child.wait().await.ok().and_then(|s| s.code());
                             let tail = stderr_tail.lock().await.clone();
-                            break ChildOutcome::error(format!(
+                            break (ChildOutcome::error(format!(
                                 "claude exited (code {code:?}) without a result frame; stderr tail: {}",
                                 if tail.is_empty() { "<empty>" } else { tail.trim() }
-                            ));
+                            )), true);
                         }
                         Err(e) => {
-                            break ChildOutcome::error(format!("claude stdout read error: {e}"));
+                            break (ChildOutcome::error(format!("claude stdout read error: {e}")), false);
                         }
                     }
                 }
             }
         };
 
-        steer_drain.abort();
         for (_, handle) in pending.drain() {
             handle.abort();
         }
@@ -416,6 +557,85 @@ impl ChildExecutor for ClaudeCodeExecutor {
         }
 
         Self::shutdown_child(&mut child).await;
+        (outcome, exited_without_result)
+    }
+}
+
+#[async_trait]
+impl ChildExecutor for ClaudeCodeExecutor {
+    /// Activation logic (issue #444), driven by `spec.messages` — empty means
+    /// first activation, non-empty means a reactivation carrying prior
+    /// context (`RunSpec.messages` doc, `proto.rs:28`):
+    ///
+    /// 1. `messages` empty → fresh session; delete any stale state file (a
+    ///    `rerun` must never accidentally resume).
+    /// 2. `messages` non-empty AND the state file has an id recorded against
+    ///    the SAME `workspace` → spawn with `--resume <id>`, sending just the
+    ///    live assignment (the CLI already has the transcript).
+    /// 3. `messages` non-empty but no usable id (first run on this machine,
+    ///    storage GC'd, workspace changed) → fallback: render the shipped
+    ///    history into a bounded preamble prepended to the assignment.
+    /// 4. If a `--resume` spawn exits without ever producing a `result`
+    ///    frame (bad/GC'd session id — the CLI errors out fast), retry
+    ///    ONCE without `--resume`, using the same fallback rehydration as
+    ///    step 3. No retry loop beyond this single attempt.
+    async fn run(
+        &self,
+        spec: RunSpec,
+        events: EventSink,
+        // Claude Code's stream-json protocol has no mid-turn user-message
+        // injection: a turn is one stdin write followed by a read to `result`
+        // (docs/claude-code-executor.md §5 — "no reliable mid-turn interrupt
+        // over this protocol"). Steering is drained (so an unbounded backlog
+        // can't build up on the sender side) but never acted on — turning a
+        // steer message into a genuinely new turn on the SAME (possibly
+        // resumed) session is left to a future revision.
+        mut steer: SteerInbox,
+        cancel: CancellationToken,
+    ) -> ChildOutcome {
+        // Ignore steer messages (see doc comment on `steer` above) but keep
+        // draining so the sender never sees an unbounded backlog. Spans BOTH
+        // possible spawn attempts below — the inbox belongs to the whole
+        // activation, not to one child process.
+        let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
+
+        // Step 1: a fresh activation must never resume stale context.
+        if spec.messages.is_empty() {
+            self.delete_state_file().await;
+        }
+
+        // Step 2: a usable persisted id under the SAME workspace.
+        let resume_id = if spec.messages.is_empty() {
+            None
+        } else {
+            self.resolve_resume_id().await
+        };
+
+        // Step 3: fallback body when there's history but no usable id.
+        let body = build_turn_body(&spec, resume_id.as_deref());
+
+        let used_resume = resume_id.is_some();
+        let (outcome, exited_without_result) = self
+            .run_once(&body, resume_id.as_deref(), &events, &cancel)
+            .await;
+
+        // Step 4: retry-once, ONLY when the failed attempt itself used
+        // `--resume` and died before a `result` frame ever arrived.
+        let outcome = if used_resume && exited_without_result {
+            tracing::warn!(
+                "claude code: --resume spawn exited without a result frame; \
+                 retrying once without --resume"
+            );
+            self.delete_state_file().await;
+            let fallback_body = build_turn_body(&spec, None);
+            self.run_once(&fallback_body, None, &events, &cancel)
+                .await
+                .0
+        } else {
+            outcome
+        };
+
+        steer_drain.abort();
         outcome
     }
 }
@@ -632,6 +852,94 @@ fn tool_result_text(content: Option<&Value>) -> String {
     }
 }
 
+/// Step 2/3 of the activation logic: the actual stdin body for one turn.
+/// `resume_id: Some` (or an empty `spec.messages`) means the CLI already has
+/// (or needs no) context, so the plain assignment is sent; otherwise the
+/// fallback history preamble is prepended, clearly delimited from the live
+/// task so the model doesn't confuse rehydrated context with the current ask.
+fn build_turn_body(spec: &RunSpec, resume_id: Option<&str>) -> String {
+    if resume_id.is_some() || spec.messages.is_empty() {
+        return spec.assignment.clone();
+    }
+    match render_history_preamble(&spec.messages, &spec.assignment) {
+        Some(preamble) => format!("{preamble}\n\n## Current task\n\n{}", spec.assignment),
+        None => spec.assignment.clone(),
+    }
+}
+
+/// Render `RunSpec.messages` (serialized domain `Message`s, oldest first,
+/// INCLUDING the assignment's own trailing user message per the wire
+/// contract — `proto.rs:28`) into a bounded fallback preamble. Unknown/
+/// malformed entries (missing `role`/`content`, non-string `content`) are
+/// skipped defensively rather than failing the run. Returns `None` when
+/// there is nothing left to render (e.g. the only shipped message IS the
+/// current assignment, already excluded below to avoid duplicating it).
+fn render_history_preamble(messages: &[Value], assignment: &str) -> Option<String> {
+    let mut entries: Vec<(String, String)> = messages
+        .iter()
+        .filter_map(|m| {
+            let role = m.get("role").and_then(Value::as_str)?.to_string();
+            let content = m.get("content").and_then(Value::as_str)?;
+            if content.is_empty() {
+                return None;
+            }
+            Some((role, content.to_string()))
+        })
+        .collect();
+
+    // The assignment's own user message rides in `messages` too (contract) —
+    // drop it here so the preamble doesn't duplicate the live task below it.
+    if let Some((role, content)) = entries.last() {
+        if role == "user" && content == assignment {
+            entries.pop();
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+
+    // Cap by message count, oldest dropped first.
+    let dropped_by_count = entries.len().saturating_sub(HISTORY_PREAMBLE_MAX_MESSAGES);
+    if dropped_by_count > 0 {
+        entries.drain(0..dropped_by_count);
+    }
+
+    let mut rendered: Vec<String> = entries
+        .iter()
+        .map(|(role, content)| format!("**{role}**: {content}"))
+        .collect();
+
+    // Cap by char budget, oldest rendered entry dropped first; if even the
+    // single most-recent entry alone exceeds the budget, truncate it in place
+    // (never silently drop the entire preamble).
+    let mut dropped_by_chars = 0usize;
+    while rendered.len() > 1
+        && rendered
+            .iter()
+            .map(|s| s.chars().count() + 2)
+            .sum::<usize>()
+            > HISTORY_PREAMBLE_MAX_CHARS
+    {
+        rendered.remove(0);
+        dropped_by_chars += 1;
+    }
+    if let [only] = rendered.as_mut_slice() {
+        if only.chars().count() > HISTORY_PREAMBLE_MAX_CHARS {
+            *only = truncate_chars(only, HISTORY_PREAMBLE_MAX_CHARS);
+        }
+    }
+
+    let mut out = String::from("## Prior conversation (rehydrated)\n\n");
+    if dropped_by_count > 0 || dropped_by_chars > 0 {
+        out.push_str(&format!(
+            "_[truncated: {} earlier message(s) omitted]_\n\n",
+            dropped_by_count + dropped_by_chars
+        ));
+    }
+    out.push_str(&rendered.join("\n\n"));
+    Some(out)
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
@@ -760,12 +1068,23 @@ mod tests {
         path
     }
 
+    /// No state dir — matches the MVP's fresh-session-every-time behavior
+    /// (used by tests that don't exercise resume at all).
     fn executor(binary: PathBuf) -> ClaudeCodeExecutor {
+        executor_with_state(binary, None, None)
+    }
+
+    fn executor_with_state(
+        binary: PathBuf,
+        state_dir: Option<PathBuf>,
+        workspace: Option<String>,
+    ) -> ClaudeCodeExecutor {
         ClaudeCodeExecutor::new(
             Some(binary.to_string_lossy().into_owned()),
             None,
             None,
-            None,
+            workspace,
+            state_dir,
         )
     }
 
@@ -775,6 +1094,31 @@ mod tests {
             reasoning_effort: None,
             messages: Vec::new(),
         }
+    }
+
+    fn run_spec_with_messages(assignment: &str, messages: Vec<Value>) -> RunSpec {
+        RunSpec {
+            assignment: assignment.to_string(),
+            reasoning_effort: None,
+            messages,
+        }
+    }
+
+    fn msg(role: &str, content: &str) -> Value {
+        json!({ "role": role, "content": content })
+    }
+
+    fn read_argv(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap_or_default()
+    }
+
+    /// Extract the JSON `message.content` string a stub captured from its
+    /// first stdin line (the `{"type":"user","message":{...}}` assignment
+    /// frame `spawn_stdin_writer` writes).
+    fn stdin_body(dir: &std::path::Path, name: &str) -> String {
+        let raw = std::fs::read_to_string(dir.join(name)).unwrap();
+        let value: Value = serde_json::from_str(raw.trim()).unwrap();
+        value["message"]["content"].as_str().unwrap().to_string()
     }
 
     #[tokio::test]
@@ -1005,6 +1349,7 @@ echo '{{"type":"result","subtype":"success","result":"ok"}}'
             None,
             None,
             None,
+            None,
         )
         .run(
             run_spec("hi"),
@@ -1036,5 +1381,333 @@ echo '{{"type":"result","subtype":"success","result":"ok"}}'
             "a\nb".to_string()
         );
         assert_eq!(tool_result_text(None), "".to_string());
+    }
+
+    // ---- issue #444: session resume across activations ----
+
+    /// Stub that: (1) echoes its full argv into `argv-<N>.txt` (N = 1-based
+    /// invocation counter, tracked via a `count` file so the SAME stub binary
+    /// can be reused across sequential `run()` calls on one executor, just
+    /// like the real `claude` binary is one binary reused across activations)
+    /// and (2) echoes its first stdin line into `stdin-<N>.txt`, then emits a
+    /// `system`+`result` pair whose `session_id` depends on N.
+    const MULTI_RUN_STUB: &str = r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+N=$(cat "$DIR/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$DIR/count"
+printf '%s\n' "$@" > "$DIR/argv-$N.txt"
+read -r line
+printf '%s\n' "$line" > "$DIR/stdin-$N.txt"
+if [ "$N" = "1" ]; then
+  echo '{"type":"system","session_id":"s-1"}'
+  echo '{"type":"result","subtype":"success","result":"first"}'
+elif [ "$N" = "2" ]; then
+  echo '{"type":"system","session_id":"s-2"}'
+  echo '{"type":"result","subtype":"success","result":"second"}'
+else
+  echo '{"type":"result","subtype":"success","result":"third"}'
+fi
+"#;
+
+    #[tokio::test]
+    async fn resume_state_written_reused_and_cleared_across_activations() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(bin_dir.path(), MULTI_RUN_STUB);
+        let exec = executor_with_state(bin, Some(state_dir.path().to_path_buf()), None);
+        let state_path = state_dir.path().join("claude-code-session.json");
+
+        // Run 1 (messages empty): fresh session, no --resume; state file
+        // written from the `system` frame's session_id.
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec("task one"),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        assert!(!read_argv(bin_dir.path(), "argv-1.txt").contains("--resume"));
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(state["session_id"], "s-1");
+
+        // Run 2 (messages non-empty, same executor/state dir): resumes s-1;
+        // stub assigns a NEW id s-2, which rewrites the state file. The
+        // resumed turn sends only the live assignment (the CLI already has
+        // the transcript) — no rehydrated preamble.
+        let (sink, _rx) = EventSink::channel();
+        let messages = vec![msg("user", "task one"), msg("assistant", "did it")];
+        let outcome = exec
+            .run(
+                run_spec_with_messages("task two", messages),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let argv2 = read_argv(bin_dir.path(), "argv-2.txt");
+        assert!(argv2.contains("--resume"));
+        assert!(argv2.contains("s-1"));
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(state["session_id"], "s-2");
+        assert_eq!(stdin_body(bin_dir.path(), "stdin-2.txt"), "task two");
+
+        // Run 3 (messages empty again): the stale state is deleted BEFORE
+        // spawn (no accidental resume on a plain rerun), and this stub
+        // invocation reports no session id at all — so the file stays gone.
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec("task three"),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        assert!(!read_argv(bin_dir.path(), "argv-3.txt").contains("--resume"));
+        assert!(!state_path.exists());
+    }
+
+    #[tokio::test]
+    async fn fallback_rehydration_renders_preamble_without_state() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            bin_dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$@" > "$DIR/argv.txt"
+read -r line
+printf '%s\n' "$line" > "$DIR/stdin.txt"
+echo '{"type":"result","subtype":"success","result":"ok"}'
+"#,
+        );
+        let exec = executor_with_state(bin, Some(state_dir.path().to_path_buf()), None);
+        let messages = vec![
+            msg("user", "please do X"),
+            msg("assistant", "sure, doing X"),
+            // Trailing user message duplicating the assignment — must be
+            // excluded from the rendered preamble.
+            msg("user", "continue"),
+        ];
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec_with_messages("continue", messages),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        assert!(!read_argv(bin_dir.path(), "argv.txt").contains("--resume"));
+        let body = stdin_body(bin_dir.path(), "stdin.txt");
+        assert!(body.contains("## Prior conversation (rehydrated)"));
+        assert!(body.contains("please do X"));
+        assert!(body.contains("## Current task"));
+        assert!(!body.contains("truncated"));
+        // "continue" must appear exactly once (under "Current task"), not
+        // duplicated by an un-deduplicated trailing history entry.
+        assert_eq!(body.matches("continue").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_rehydration_truncates_over_message_cap() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            bin_dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+read -r line
+printf '%s\n' "$line" > "$DIR/stdin.txt"
+echo '{"type":"result","subtype":"success","result":"ok"}'
+"#,
+        );
+        let exec = executor_with_state(bin, Some(state_dir.path().to_path_buf()), None);
+        let mut messages: Vec<Value> = (0..50)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                msg(role, &format!("message {i}"))
+            })
+            .collect();
+        messages.push(msg("user", "final ask"));
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec_with_messages("final ask", messages),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let body = stdin_body(bin_dir.path(), "stdin.txt");
+        assert!(body.contains("truncated"));
+        // Oldest (message-count cap) dropped first; most recent retained.
+        assert!(!body.contains("message 0"));
+        assert!(body.contains("message 49"));
+    }
+
+    #[tokio::test]
+    async fn fallback_rehydration_truncates_oversized_single_message() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            bin_dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+read -r line
+printf '%s\n' "$line" > "$DIR/stdin.txt"
+echo '{"type":"result","subtype":"success","result":"ok"}'
+"#,
+        );
+        let exec = executor_with_state(bin, Some(state_dir.path().to_path_buf()), None);
+        let huge = "x".repeat(30_000);
+        let messages = vec![msg("user", &huge), msg("user", "current ask")];
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec_with_messages("current ask", messages),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let body = stdin_body(bin_dir.path(), "stdin.txt");
+        assert!(body.contains("truncated"));
+        assert!(body.len() < huge.len());
+    }
+
+    #[tokio::test]
+    async fn workspace_mismatch_state_treated_as_unusable_falls_back() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        // A real directory — `build_command` does `cmd.current_dir(workspace)`,
+        // which fails the spawn outright if it doesn't exist on disk.
+        let workspace_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state_dir.path().join("claude-code-session.json"),
+            serde_json::to_vec(&json!({
+                "session_id": "stale-id",
+                "workspace": "/some/other/workspace",
+                "updated_at": chrono::Utc::now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let bin = write_stub(
+            bin_dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$@" > "$DIR/argv.txt"
+read -r _line
+echo '{"type":"result","subtype":"success","result":"ok"}'
+"#,
+        );
+        let exec = executor_with_state(
+            bin,
+            Some(state_dir.path().to_path_buf()),
+            Some(workspace_dir.path().to_string_lossy().into_owned()),
+        );
+        let messages = vec![msg("user", "hi"), msg("user", "go")];
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec_with_messages("go", messages),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let argv = read_argv(bin_dir.path(), "argv.txt");
+        assert!(!argv.contains("--resume"));
+        assert!(!argv.contains("stale-id"));
+    }
+
+    #[tokio::test]
+    async fn resume_failure_retries_once_with_fallback_history() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state_dir.path().join("claude-code-session.json"),
+            serde_json::to_vec(&json!({
+                "session_id": "dead-id",
+                "workspace": null,
+                "updated_at": chrono::Utc::now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let bin = write_stub(
+            bin_dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+N=$(cat "$DIR/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$DIR/count"
+printf '%s\n' "$@" > "$DIR/argv-$N.txt"
+case "$*" in
+  *--resume*)
+    exit 1
+    ;;
+  *)
+    read -r line
+    printf '%s\n' "$line" > "$DIR/stdin-$N.txt"
+    echo '{"type":"system","session_id":"s-fresh"}'
+    echo '{"type":"result","subtype":"success","result":"recovered"}'
+    ;;
+esac
+"#,
+        );
+        let exec = executor_with_state(bin, Some(state_dir.path().to_path_buf()), None);
+        let messages = vec![
+            msg("user", "earlier context"),
+            msg("user", "please continue"),
+        ];
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec_with_messages("please continue", messages),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        assert_eq!(outcome.result.as_deref(), Some("recovered"));
+        assert_eq!(read_argv(bin_dir.path(), "count").trim(), "2");
+
+        let argv1 = read_argv(bin_dir.path(), "argv-1.txt");
+        assert!(argv1.contains("--resume"));
+        assert!(argv1.contains("dead-id"));
+        let argv2 = read_argv(bin_dir.path(), "argv-2.txt");
+        assert!(!argv2.contains("--resume"));
+        let body2 = stdin_body(bin_dir.path(), "stdin-2.txt");
+        assert!(body2.contains("## Prior conversation (rehydrated)"));
+        assert!(body2.contains("earlier context"));
+
+        // The retry rewrites the state file from the fallback attempt's own
+        // `system` frame, parses cleanly (atomic tmp+rename), and no leftover
+        // tmp files remain in the state dir.
+        let state: Value = serde_json::from_str(
+            &std::fs::read_to_string(state_dir.path().join("claude-code-session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["session_id"], "s-fresh");
+        let leftover_tmp = std::fs::read_dir(state_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover_tmp);
     }
 }
