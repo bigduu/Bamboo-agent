@@ -112,6 +112,146 @@ pub trait PluginInstaller {
     async fn list(&self) -> PluginResult<Vec<InstalledPlugin>>;
 }
 
+/// Directory names directly under `<plugin_dir>/skills/` that contain a
+/// `SKILL.md` (i.e. what discovery would actually pick up in place). Used
+/// by [`preflight_install`] to enforce that `provides.skills` is
+/// authoritative (MAJOR 4).
+pub async fn on_disk_skill_dirs(plugin_dir: &Path) -> Vec<String> {
+    let skills_root = plugin_dir.join("skills");
+    let mut found = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&skills_root).await else {
+        return found;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let has_skill_md = tokio::fs::try_exists(entry.path().join("SKILL.md"))
+            .await
+            .unwrap_or(false);
+        if !has_skill_md {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
+/// Everything an `install` can validate/resolve WITHOUT touching `AppState`:
+/// manifest validation, platform gating, per-entry MCP resolution (so a
+/// malformed entry — e.g. an empty stdio command — fails fast before any
+/// registration happens), and the `provides.skills` / `provides.workflows`
+/// on-disk existence + authoritative checks (MAJOR 4).
+///
+/// Shared by [`LocalPluginInstaller`] and any real `AppState`-backed
+/// installer (see `PLUGIN_PLAN.md` § Installer-core agent) so the two can
+/// never drift apart. Returns the resolved MCP server configs (the caller
+/// needs them anyway to register step 1) so a real installer doesn't have to
+/// re-resolve them a second time.
+pub async fn preflight_install(
+    manifest: &PluginManifest,
+    plugin_dir: &Path,
+) -> PluginResult<Vec<bamboo_domain::mcp_config::McpServerConfig>> {
+    manifest.validate()?;
+
+    let current_platform = Platform::current();
+    if let Some(platforms) = &manifest.platforms {
+        // An unrecognized host OS (`current_platform == None`) fails closed
+        // rather than guessing.
+        let supported = current_platform.is_some_and(|platform| platforms.contains(&platform));
+        if !supported {
+            return Err(PluginError::UnsupportedPlatform {
+                plugin_id: manifest.id.clone(),
+                platform: current_platform
+                    .map(|platform| platform.as_str().to_string())
+                    .unwrap_or_else(|| std::env::consts::OS.to_string()),
+            });
+        }
+    }
+
+    // Resolve what each declared MCP server WOULD look like once registered.
+    // Pure — fails early on an unresolvable entry (e.g. empty stdio command)
+    // and hands the caller the resolved configs to register in step 1.
+    let platform = current_platform.unwrap_or(Platform::Linux);
+    let resolved_mcp_servers = manifest
+        .provides
+        .mcp_servers
+        .iter()
+        .map(|entry| entry.resolve(plugin_dir, &manifest.id, platform))
+        .collect::<PluginResult<Vec<_>>>()?;
+
+    // Sanity-check declared skill dirs exist on disk. Skills need no further
+    // action here — they're discovered in place by bamboo-skills' plugin
+    // discovery-dir extension, not copied.
+    for skill_dir in &manifest.provides.skills {
+        let skill_md = plugin_dir.join("skills").join(skill_dir).join("SKILL.md");
+        if !tokio::fs::try_exists(&skill_md).await.unwrap_or(false) {
+            return Err(PluginError::InvalidManifest(format!(
+                "declared skill '{skill_dir}' has no SKILL.md at {}",
+                skill_md.display()
+            )));
+        }
+    }
+    // `provides.skills` is AUTHORITATIVE: reject any on-disk skill dir the
+    // manifest does not declare. Discovery is a dumb globber that picks up
+    // every `<plugin_dir>/skills/*` with a SKILL.md, so without this a
+    // bundle could smuggle an undeclared skill live past its own manifest.
+    {
+        use std::collections::HashSet;
+        let declared: HashSet<&str> = manifest
+            .provides
+            .skills
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for on_disk in on_disk_skill_dirs(plugin_dir).await {
+            if !declared.contains(on_disk.as_str()) {
+                return Err(PluginError::InvalidManifest(format!(
+                    "skill directory '{on_disk}' exists under skills/ but is not declared in \
+                     provides.skills (a plugin must declare every skill it ships)"
+                )));
+            }
+        }
+    }
+    for workflow_file in &manifest.provides.workflows {
+        let workflow_path = plugin_dir.join("workflows").join(workflow_file);
+        if !tokio::fs::try_exists(&workflow_path).await.unwrap_or(false) {
+            return Err(PluginError::InvalidManifest(format!(
+                "declared workflow '{workflow_file}' not found at {}",
+                workflow_path.display()
+            )));
+        }
+    }
+
+    Ok(resolved_mcp_servers)
+}
+
+/// Loads prior provenance for `plugin_id` from `installed_json_path` and
+/// applies the [`InstallDisposition`] gate: [`InstallDisposition::FailIfInstalled`]
+/// errors [`PluginError::AlreadyInstalled`] when an entry already exists;
+/// [`InstallDisposition::Upgrade`] passes through either way. Returns the
+/// previous entry (`None` for a fresh install), which the caller needs for
+/// the upgrade drop-diff (BLOCKER 2).
+pub async fn load_previous_for_disposition(
+    installed_json_path: &Path,
+    plugin_id: &str,
+    disposition: InstallDisposition,
+) -> PluginResult<Option<InstalledPlugin>> {
+    let existing = InstalledPlugins::load(installed_json_path).await?;
+    let previous = existing.get(plugin_id).cloned();
+    if previous.is_some() && disposition == InstallDisposition::FailIfInstalled {
+        return Err(PluginError::AlreadyInstalled(plugin_id.to_string()));
+    }
+    Ok(previous)
+}
+
 /// Reference skeleton — see module docs. Holds only a `bamboo_dir` so tests
 /// can point it at a tempdir instead of the real `~/.bamboo`.
 pub struct LocalPluginInstaller {
@@ -129,37 +269,6 @@ impl LocalPluginInstaller {
 
     fn installed_json_path(&self) -> PathBuf {
         self.plugins_dir().join("installed.json")
-    }
-
-    /// Directory names directly under `<plugin_dir>/skills/` that contain a
-    /// `SKILL.md` (i.e. what discovery would actually pick up in place). Used
-    /// to enforce that `provides.skills` is authoritative.
-    async fn on_disk_skill_dirs(plugin_dir: &Path) -> Vec<String> {
-        let skills_root = plugin_dir.join("skills");
-        let mut found = Vec::new();
-        let Ok(mut entries) = tokio::fs::read_dir(&skills_root).await else {
-            return found;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|file_type| file_type.is_dir())
-                .unwrap_or(false);
-            if !is_dir {
-                continue;
-            }
-            let has_skill_md = tokio::fs::try_exists(entry.path().join("SKILL.md"))
-                .await
-                .unwrap_or(false);
-            if !has_skill_md {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                found.push(name.to_string());
-            }
-        }
-        found
     }
 }
 
@@ -179,96 +288,22 @@ impl PluginInstaller for LocalPluginInstaller {
         disposition: InstallDisposition,
         _installed_at: DateTime<Utc>,
     ) -> PluginResult<InstalledPlugin> {
-        manifest.validate()?;
-
-        let current_platform = Platform::current();
-        if let Some(platforms) = &manifest.platforms {
-            // An unrecognized host OS (`current_platform == None`) fails closed
-            // rather than guessing.
-            let supported = current_platform.is_some_and(|platform| platforms.contains(&platform));
-            if !supported {
-                return Err(PluginError::UnsupportedPlatform {
-                    plugin_id: manifest.id.clone(),
-                    platform: current_platform
-                        .map(|platform| platform.as_str().to_string())
-                        .unwrap_or_else(|| std::env::consts::OS.to_string()),
-                });
-            }
-        }
-
         // --- Disposition / upgrade decision (fully implemented here) ---
         //
         // Load prior provenance FIRST so we can (a) reject a first-time
         // install of an already-installed id, and (b) on upgrade, capture the
         // old registered set for the drop-diff below.
-        let existing = InstalledPlugins::load(&self.installed_json_path()).await?;
-        let previous = existing.get(&manifest.id).cloned();
-        if previous.is_some() && disposition == InstallDisposition::FailIfInstalled {
-            return Err(PluginError::AlreadyInstalled(manifest.id.clone()));
-        }
+        let previous =
+            load_previous_for_disposition(&self.installed_json_path(), &manifest.id, disposition)
+                .await?;
         // On upgrade this is the set the installer-core agent must
         // `removed_since`-diff against the new registered set and de-register.
         let _previous_registered = previous.as_ref().map(|plugin| plugin.registered.clone());
 
-        // --- Path resolution (trivial, pure — fully implemented here) ---
-        //
-        // Resolve what each declared MCP server WOULD look like once
-        // registered. Kept even though it's unused past this point (`_`) to
-        // fail `install` early if a manifest has an unresolvable entry (e.g.
-        // empty stdio command), and to demonstrate the resolution call the
-        // installer-core agent should reuse.
-        let platform = current_platform.unwrap_or(Platform::Linux);
-        let _resolved_mcp_servers = manifest
-            .provides
-            .mcp_servers
-            .iter()
-            .map(|entry| entry.resolve(plugin_dir, &manifest.id, platform))
-            .collect::<PluginResult<Vec<_>>>()?;
-
-        // Sanity-check declared skill dirs / workflow files exist on disk.
-        // Skills need no further action here — they're discovered in place by
-        // bamboo-skills' plugin discovery-dir extension, not copied.
-        for skill_dir in &manifest.provides.skills {
-            let skill_md = plugin_dir.join("skills").join(skill_dir).join("SKILL.md");
-            if !tokio::fs::try_exists(&skill_md).await.unwrap_or(false) {
-                return Err(PluginError::InvalidManifest(format!(
-                    "declared skill '{skill_dir}' has no SKILL.md at {}",
-                    skill_md.display()
-                )));
-            }
-        }
-        // `provides.skills` is AUTHORITATIVE: reject any on-disk skill dir the
-        // manifest does not declare. Discovery is a dumb globber that picks up
-        // every `<plugin_dir>/skills/*` with a SKILL.md, so without this a
-        // bundle could smuggle an undeclared skill live past its own manifest.
-        // We enforce the manifest here at install time and keep discovery
-        // simple (MAJOR 4).
-        {
-            use std::collections::HashSet;
-            let declared: HashSet<&str> = manifest
-                .provides
-                .skills
-                .iter()
-                .map(String::as_str)
-                .collect();
-            for on_disk in Self::on_disk_skill_dirs(plugin_dir).await {
-                if !declared.contains(on_disk.as_str()) {
-                    return Err(PluginError::InvalidManifest(format!(
-                        "skill directory '{on_disk}' exists under skills/ but is not declared in \
-                         provides.skills (a plugin must declare every skill it ships)"
-                    )));
-                }
-            }
-        }
-        for workflow_file in &manifest.provides.workflows {
-            let workflow_path = plugin_dir.join("workflows").join(workflow_file);
-            if !tokio::fs::try_exists(&workflow_path).await.unwrap_or(false) {
-                return Err(PluginError::InvalidManifest(format!(
-                    "declared workflow '{workflow_file}' not found at {}",
-                    workflow_path.display()
-                )));
-            }
-        }
+        // --- Validation + pure path resolution (fully implemented here,
+        // shared with any real AppState-backed installer via
+        // `preflight_install`) ---
+        let _resolved_mcp_servers = preflight_install(manifest, plugin_dir).await?;
 
         // --- Capability-registration wiring (TODO: installer-core agent) ---
         //

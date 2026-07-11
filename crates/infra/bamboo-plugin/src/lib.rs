@@ -38,7 +38,10 @@ pub mod manifest;
 pub mod registry;
 
 pub use error::{PluginError, PluginResult};
-pub use installer::{InstallDisposition, LocalPluginInstaller, PluginInstaller};
+pub use installer::{
+    load_previous_for_disposition, on_disk_skill_dirs, preflight_install, InstallDisposition,
+    LocalPluginInstaller, PluginInstaller,
+};
 pub use manifest::{
     McpServerManifestEntry, McpTransportManifest, Platform, PluginArtifact, PluginManifest,
     PluginPromptPreset, PluginProvides,

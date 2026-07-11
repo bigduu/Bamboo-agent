@@ -52,6 +52,25 @@ pub enum PluginError {
     #[error("not yet implemented: {0}")]
     NotImplemented(String),
 
+    /// A capability failed to register/deregister against `AppState` for a
+    /// reason OTHER than an ownership conflict (e.g. `config.json` couldn't
+    /// be persisted, a network fetch during source-staging failed). Kept
+    /// distinct from [`Self::Conflict`] (a deliberate REFUSAL, not a
+    /// failure) so callers/HTTP status mapping can tell "your plugin
+    /// collides with something" apart from "something broke while trying to
+    /// register/fetch it".
+    #[error("plugin registration failed: {0}")]
+    Registration(String),
+
+    /// A downloaded artifact's sha256 did not match the manifest's declared
+    /// hash. Checked BEFORE unpacking (supply-chain: a URL-installed plugin
+    /// ships a binary that will be executed) — never surfaced as a generic
+    /// `Registration`/`InvalidManifest` error so callers can distinguish "the
+    /// author's manifest is malformed" from "the bytes served at that URL do
+    /// not match what the manifest promised".
+    #[error("artifact verification failed: {0}")]
+    ArtifactVerificationFailed(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
