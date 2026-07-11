@@ -178,6 +178,13 @@ pub async fn discover_plugin_skill_dirs(plugins_root: &Path) -> Vec<SkillDiscove
         });
     }
 
+    // Deterministic order: `read_dir` yields entries in an unspecified order,
+    // which would make the winner of a plugin-vs-plugin same-skill-id
+    // collision non-deterministic (it depends on load order). Sort by plugin
+    // directory path so the lowest-sorting plugin id deterministically wins,
+    // and the shadowed loser is logged consistently (see the WARN in the skill
+    // store's resolver).
+    discovered.sort_by(|left, right| left.dir.cmp(&right.dir));
     discovered
 }
 

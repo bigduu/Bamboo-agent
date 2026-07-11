@@ -216,12 +216,32 @@ impl SkillStore {
             let should_keep_existing = resolved_meta.contains_key(&skill_id) && !should_replace;
 
             if should_keep_existing {
-                tracing::debug!(
-                    "Keeping existing skill '{}' over candidate from {:?} (mode={})",
-                    skill_id,
-                    candidate_meta.source,
-                    candidate_meta.mode.as_deref().unwrap_or("generic")
-                );
+                // A same-tier, same-mode collision is a genuine AMBIGUITY (two
+                // plugins, or two dirs at the same precedence, shipping the
+                // same skill id) — the winner is decided only by discovery
+                // order, so surface it at WARN. Legitimate precedence
+                // overrides (project > global > plugin, or mode-specific >
+                // generic) are expected and stay at debug.
+                let existing_meta = resolved_meta.get(&skill_id);
+                let is_ambiguous_collision = existing_meta.is_some_and(|existing| {
+                    existing.source == candidate_meta.source && existing.mode == candidate_meta.mode
+                });
+                if is_ambiguous_collision {
+                    tracing::warn!(
+                        "Skill id '{}' is shipped by more than one source at the same precedence \
+                         ({:?}); keeping the first and shadowing this duplicate (mode={})",
+                        skill_id,
+                        candidate_meta.source,
+                        candidate_meta.mode.as_deref().unwrap_or("generic")
+                    );
+                } else {
+                    tracing::debug!(
+                        "Keeping existing skill '{}' over candidate from {:?} (mode={})",
+                        skill_id,
+                        candidate_meta.source,
+                        candidate_meta.mode.as_deref().unwrap_or("generic")
+                    );
+                }
                 continue;
             }
 
@@ -1213,6 +1233,45 @@ Use this skill for testing.
         assert_eq!(
             skill.description, "global version",
             "a global skill must win over a plugin skill sharing its id"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_plugins_same_skill_id_resolve_deterministically_by_plugin_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        // Two plugins ship the SAME skill id. Discovery sorts plugin dirs by
+        // path, so "alpha-plugin" (sorts first) must deterministically win over
+        // "beta-plugin" regardless of read_dir order.
+        let alpha_skills = data_dir.join("plugins").join("alpha-plugin").join("skills");
+        let beta_skills = data_dir.join("plugins").join("beta-plugin").join("skills");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        write_skill(&alpha_skills, "shared-id", "alpha version", "Alpha prompt")
+            .await
+            .expect("write alpha skill");
+        write_skill(&beta_skills, "shared-id", "beta version", "Beta prompt")
+            .await
+            .expect("write beta skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: None,
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        let skill = store
+            .get_skill("shared-id")
+            .await
+            .expect("shared-id must exist");
+        assert_eq!(
+            skill.description, "alpha version",
+            "lowest-sorting plugin id must deterministically win a same-id collision"
         );
     }
 
