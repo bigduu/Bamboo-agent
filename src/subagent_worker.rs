@@ -35,6 +35,8 @@ use bamboo_subagent::provision::{ExecutorSpec, ProvisionSpec};
 use bamboo_subagent::transport::WsServer;
 use futures::StreamExt;
 
+use crate::claude_code_executor::ClaudeCodeExecutor;
+
 /// How long a finished actor's isolated storage is retained for debugging
 /// before background GC removes it.
 const STORAGE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
@@ -63,6 +65,16 @@ pub async fn run() -> std::result::Result<(), String> {
     let executor: Arc<dyn ChildExecutor> = match &spec.executor {
         ExecutorSpec::Echo => Arc::new(EchoExecutor),
         ExecutorSpec::BambooRuntime => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
+        ExecutorSpec::ClaudeCode {
+            binary,
+            model,
+            permission_mode,
+        } => Arc::new(ClaudeCodeExecutor::new(
+            binary.clone(),
+            model.clone(),
+            permission_mode.clone(),
+            spec.workspace.clone(),
+        )),
         ExecutorSpec::CliAdapter { .. } => {
             return Err("cli_adapter executor is not implemented yet".to_string());
         }

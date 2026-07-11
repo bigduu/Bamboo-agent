@@ -105,6 +105,16 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
                 Some("bamboo_runtime") | None => {
                     bamboo_subagent::provision::ExecutorSpec::BambooRuntime
                 }
+                // The profile schema has no dedicated model/permission-mode
+                // fields yet for a non-bamboo_runtime executor (#441 follow-up);
+                // this kind runs with the CLI's own defaults (binary `claude`
+                // on PATH, default permission mode) until that's plumbed
+                // through.
+                Some("claude_code") => bamboo_subagent::provision::ExecutorSpec::ClaudeCode {
+                    binary: None,
+                    model: None,
+                    permission_mode: None,
+                },
                 Some(other) => {
                     tracing::error!(
                         "Actor agent profile {} has unknown executor '{}'; skipping",
@@ -214,6 +224,14 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
     let executor = match sub.executor.as_deref() {
         Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
         Some("bamboo_runtime") | None => bamboo_subagent::provision::ExecutorSpec::BambooRuntime,
+        // See the matching arm in `build_external_child_runner` above: no
+        // config field carries model/permission-mode for this kind yet, so it
+        // runs with the CLI's own defaults (#441 follow-up).
+        Some("claude_code") => bamboo_subagent::provision::ExecutorSpec::ClaudeCode {
+            binary: None,
+            model: None,
+            permission_mode: None,
+        },
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };
 

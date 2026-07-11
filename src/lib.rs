@@ -49,6 +49,10 @@ pub mod commands;
 /// The `bamboo subagent-worker` actor worker (provision via stdin, serve over WS).
 pub mod subagent_worker;
 
+/// `ClaudeCodeExecutor`: drives the official Claude Code CLI as a
+/// `ChildExecutor` (`ExecutorSpec::ClaudeCode`), sibling of `subagent_worker`.
+pub mod claude_code_executor;
+
 /// The `bamboo broker-agent serve` worker: connect to a central broker and
 /// answer Ask/Task (query/steer) for its mailbox; deployable local/Docker/remote.
 pub mod broker_agent;

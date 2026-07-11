@@ -219,6 +219,20 @@ pub enum ExecutorSpec {
     BambooRuntime,
     /// Wrap an external CLI agent as the engine.
     CliAdapter { command: String, args: Vec<String> },
+    /// Drive the official Claude Code CLI (`claude`) as the engine over its
+    /// stream-json wire protocol (see `docs/claude-code-executor.md`). `binary`
+    /// overrides the executable (tests point it at a stub script); `None` runs
+    /// `claude` from `PATH`. `model`/`permission_mode` map to the CLI's
+    /// `--model` / `--permission-mode` flags; `None` omits the flag (CLI
+    /// default).
+    ClaudeCode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+    },
 }
 
 /// Provider+model pair, parent-resolved. (Local mirror of `ProviderModelRef`;
@@ -530,5 +544,25 @@ mod tests {
             serde_json::to_value(ExecutorSpec::BambooRuntime).unwrap()["kind"],
             "bamboo_runtime"
         );
+        let claude_code = ExecutorSpec::ClaudeCode {
+            binary: Some("/usr/local/bin/claude".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            permission_mode: Some("bypassPermissions".into()),
+        };
+        let vcc = serde_json::to_value(&claude_code).unwrap();
+        assert_eq!(vcc["kind"], "claude_code");
+        assert_eq!(vcc["binary"], "/usr/local/bin/claude");
+        // Round-trips.
+        assert_eq!(
+            serde_json::from_value::<ExecutorSpec>(vcc).unwrap(),
+            claude_code
+        );
+        let minimal = ExecutorSpec::ClaudeCode {
+            binary: None,
+            model: None,
+            permission_mode: None,
+        };
+        let vmin = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(vmin, serde_json::json!({"kind": "claude_code"}));
     }
 }

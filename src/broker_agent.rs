@@ -80,6 +80,16 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
         tracing::info!(id = %me.session_id, broker = %endpoint, "broker-agent serving from piped spec");
         let executor: Arc<dyn bamboo_subagent::ChildExecutor> = match spec.executor {
             ExecutorSpec::Echo => Arc::new(EchoExecutor),
+            ExecutorSpec::ClaudeCode {
+                ref binary,
+                ref model,
+                ref permission_mode,
+            } => Arc::new(crate::claude_code_executor::ClaudeCodeExecutor::new(
+                binary.clone(),
+                model.clone(),
+                permission_mode.clone(),
+                spec.workspace.clone(),
+            )),
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };
         return bamboo_broker::serve_executor(&endpoint, me, &token, executor)
