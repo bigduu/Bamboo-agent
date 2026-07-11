@@ -215,17 +215,10 @@ jobs:
           - workspace dependency resolution
           - workspace buildability
 
-          Real publish order:
-          1. bamboo-domain
-          2. bamboo-infrastructure
-          3. bamboo-agent-core
-          4. bamboo-compression
-          5. bamboo-memory
-          6. bamboo-tools
-          7. bamboo-engine
-          8. bamboo-server
-          9. bamboo-agent
+          Real publish order (computed from the dependency graph, exactly as
+          the publish step below computes it):
           EOF
+          python3 scripts/compute-publish-order.py
 
       - name: Publish to crates.io
         if: github.event.inputs.dry_run != 'true'

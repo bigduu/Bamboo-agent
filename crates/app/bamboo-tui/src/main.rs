@@ -1,21 +1,10 @@
-use anyhow::Result;
-use clap::Parser;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
-use std::io;
+//! Standalone `bamboo-tui` binary — a thin clap wrapper over the `bamboo_tui`
+//! library. The same TUI ships inside the main `bamboo` binary as the
+//! `bamboo tui` subcommand; keep the flag surfaces in lock-step.
 
-mod api;
-mod app;
-mod components;
-mod event;
-mod history;
-mod theme;
-mod ui;
+use anyhow::Result;
+use bamboo_tui::{AutoServeMode, TuiOptions};
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "bamboo-tui")]
@@ -26,7 +15,7 @@ struct Cli {
     /// Bamboo server URL. Defaults to the concrete loopback IPv4 (not
     /// `localhost`, which resolves to `::1` first on dual-stack hosts while the
     /// server default-binds `127.0.0.1` only → ECONNREFUSED).
-    #[arg(long, default_value = "http://127.0.0.1:9562")]
+    #[arg(long, default_value = bamboo_tui::DEFAULT_SERVER_URL)]
     server_url: String,
 
     /// Session ID to resume (optional)
@@ -53,43 +42,19 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Setup terminal.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Create client and app.
-    let client = api::BambooClient::new(&cli.server_url);
-    let mut app = app::App::new(client);
-
-    // Apply CLI args.
-    if let Some(session_id) = cli.session_id {
-        app.chat.session_id = Some(session_id);
-    }
-    if let Some(model) = cli.model {
-        app.chat.model = model;
-    }
-    let auto_serve_mode = if cli.auto_serve {
-        app::AutoServeMode::Auto
+    let auto_serve = if cli.auto_serve {
+        AutoServeMode::Auto
     } else if cli.no_auto_serve {
-        app::AutoServeMode::Off
+        AutoServeMode::Off
     } else {
-        app::AutoServeMode::Prompt
+        AutoServeMode::Prompt
     };
 
-    // Run app.
-    let result = app.run(&mut terminal, auto_serve_mode).await;
-
-    // Restore terminal.
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    result
+    bamboo_tui::run(TuiOptions {
+        server_url: cli.server_url,
+        session_id: cli.session_id,
+        model: cli.model,
+        auto_serve,
+    })
+    .await
 }

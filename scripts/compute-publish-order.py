@@ -8,9 +8,10 @@ release: a dependency was published before the crates it needs existed on the
 index. Computing the order here keeps it in lock-step with the workspace.
 
 Scope: ``bamboo-agent``'s transitive workspace-dependency closure (the published
-library and everything it pulls in), dependencies first. Standalone binaries
-outside that closure (bamboo-tui, bamboo-client-core) are not part
-of the published library and are intentionally excluded.
+library and everything it pulls in), dependencies first. Since the TUI folded
+into the main binary as ``bamboo tui``, that closure includes bamboo-tui and
+bamboo-client-core automatically — no list to maintain. Workspace members
+outside the closure are intentionally excluded.
 
 Run from the workspace root (where the top-level Cargo.toml lives).
 """
