@@ -293,11 +293,29 @@ pub struct PluginPromptPreset {
 
 /// Per-platform downloadable artifact for the URL-install source (fetch logic
 /// is a later agent's job — this is schema-only).
+///
+/// # Archive contract (pinned for Wave-2 fetch code + plugin authors)
+///
+/// `url` points at an **archive**, never a raw executable: a `.zip` **or**
+/// `.tar.gz`/`.tgz`. The installer:
+/// 1. downloads it, verifies [`Self::sha256`] (lowercase hex, over the raw
+///    archive bytes) BEFORE unpacking anything,
+/// 2. unpacks it, and expects **exactly one executable at the archive root**
+///    named `<plugin id>` (unix) or `<plugin id>.exe` (windows),
+/// 3. places that executable at `<plugin_dir>/bin/<platform>/<plugin id>[.exe]`
+///    — the exact path [`platform_bin_path`] resolves, so `${platform_bin}`
+///    then points at it.
+///
+/// This matches how real release assets ship (e.g. nova's are
+/// `nova-v<ver>-<triple>.zip` with `nova.exe` at the zip root, and a
+/// `.tar.gz` with `nova` at the tar root) — a plugin does NOT have to
+/// re-layout its release binaries, it just declares the archive URL + hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginArtifact {
+    /// Archive URL (`.zip` / `.tar.gz` / `.tgz`) — see the type-level docs.
     pub url: String,
-    /// Lowercase hex-encoded sha256 of the artifact, verified by the
-    /// installer after download before it is trusted/unpacked.
+    /// Lowercase hex-encoded sha256 of the raw archive bytes, verified by the
+    /// installer after download and BEFORE unpacking.
     pub sha256: String,
 }
 
@@ -368,6 +386,15 @@ pub struct PluginManifest {
 const MAX_PLUGIN_ID_LEN: usize = 64;
 const MAX_PRESET_ID_LEN: usize = 80;
 
+/// Preset ids the plugin system must NOT let a plugin claim, because
+/// bamboo-server reserves them. `"general_assistant"` is its
+/// `DEFAULT_PRESET_ID` (see
+/// `crates/app/bamboo-server/src/handlers/agent/prompt_presets/types.rs`);
+/// `sanitize_store` there silently STRIPS any stored preset with that id, so a
+/// plugin declaring it would pass a naive `[a-z0-9_]` check but then vanish at
+/// runtime with no error. Reject it up front at manifest validation instead.
+const RESERVED_PRESET_IDS: &[&str] = &["general_assistant"];
+
 /// `[a-z0-9-_]`, non-empty, no leading/trailing separator, no `--`/`__` runs
 /// are NOT specifically forbidden (unlike skill ids) since plugin ids may
 /// legitimately contain underscores (e.g. ported from an npm-style package
@@ -382,10 +409,13 @@ pub fn is_valid_plugin_id(id: &str) -> bool {
 
 /// Same rule bamboo-server's prompt-preset store enforces
 /// (`validate_preset_id` in `handlers/agent/prompt_presets/storage.rs`):
-/// `[a-z0-9_]`, length <= 80.
+/// `[a-z0-9_]`, length <= 80 — plus a rejection of ids bamboo-server reserves
+/// (see [`RESERVED_PRESET_IDS`]) so a plugin can't declare one that would be
+/// silently dropped later.
 pub fn is_valid_preset_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_PRESET_ID_LEN
+        && !RESERVED_PRESET_IDS.contains(&id)
         && id
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
@@ -530,10 +560,24 @@ impl PluginManifest {
         }
 
         for (platform_key, artifact) in &self.artifacts {
-            if Platform::parse(platform_key).is_none() {
+            let Some(artifact_platform) = Platform::parse(platform_key) else {
                 return Err(PluginError::InvalidManifest(format!(
                     "unknown platform key '{platform_key}' in artifacts (expected macos/windows/linux)"
                 )));
+            };
+            // An artifact for a platform this plugin does not claim to support
+            // is dead weight at best and a sign of a mistake at worst — reject
+            // it so the manifest can't drift out of sync with its own gate.
+            if let Some(gate) = &self.platforms {
+                if !gate.contains(&artifact_platform) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "artifacts contains platform '{platform_key}' which is not in the \
+                         `platforms` gate {:?}",
+                        gate.iter()
+                            .map(|platform| platform.as_str())
+                            .collect::<Vec<_>>()
+                    )));
+                }
             }
             if artifact.url.trim().is_empty() {
                 return Err(PluginError::InvalidManifest(format!(
@@ -549,6 +593,27 @@ impl PluginManifest {
             }
         }
 
+        // Binary-backed URL install: if a per-platform binary is needed
+        // (`${platform_bin}` is used) AND this manifest ships downloadable
+        // `artifacts` (the URL-install path), then every platform the plugin
+        // claims to support MUST have an artifact — otherwise the install
+        // would fail opaquely on that OS at runtime (no binary to place under
+        // `bin/`) instead of here, at manifest validation. Local-dir/archive
+        // installs ship `bin/` directly and declare no `artifacts`, so this is
+        // (correctly) skipped for them.
+        if !self.artifacts.is_empty() && self.uses_platform_bin_token() {
+            for platform in self.effective_platforms() {
+                if !self.artifacts.contains_key(platform.as_str()) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin uses ${{platform_bin}} and ships URL artifacts, but has no \
+                         artifact for supported platform '{}' (every supported platform needs a \
+                         downloadable binary bundle)",
+                        platform.as_str()
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -559,6 +624,38 @@ impl PluginManifest {
             None => true,
             Some(platforms) => platforms.contains(&platform),
         }
+    }
+
+    /// The effective set of platforms this plugin claims to support: the
+    /// `platforms` gate if present, otherwise all three (an unset gate means
+    /// "all platforms").
+    pub fn effective_platforms(&self) -> Vec<Platform> {
+        self.platforms
+            .clone()
+            .unwrap_or_else(|| vec![Platform::Macos, Platform::Windows, Platform::Linux])
+    }
+
+    /// Whether any declared MCP stdio server references the `${platform_bin}`
+    /// substitution token (in command, args, cwd, or an env value) — i.e.
+    /// whether this plugin needs a per-platform binary to run. Drives the
+    /// artifacts/platform cross-check in [`Self::validate`].
+    pub fn uses_platform_bin_token(&self) -> bool {
+        const TOKEN: &str = "${platform_bin}";
+        self.provides.mcp_servers.iter().any(|entry| {
+            let McpTransportManifest::Stdio {
+                command,
+                args,
+                cwd,
+                env,
+            } = &entry.transport
+            else {
+                return false;
+            };
+            command.contains(TOKEN)
+                || args.iter().any(|value| value.contains(TOKEN))
+                || cwd.as_deref().is_some_and(|value| value.contains(TOKEN))
+                || env.values().any(|value| value.contains(TOKEN))
+        })
     }
 }
 
@@ -619,7 +716,8 @@ mod tests {
             },
             "artifacts": {
                 "macos": {"url": "https://example.com/nova-macos.tar.gz", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-                "windows": {"url": "https://example.com/nova-windows.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+                "windows": {"url": "https://example.com/nova-windows.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+                "linux": {"url": "https://example.com/nova-linux.tar.gz", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
             }
         }"#;
 
@@ -737,6 +835,116 @@ mod tests {
         );
         let error = manifest.validate().expect_err("bad sha256 should fail");
         assert!(error.to_string().contains("sha256"));
+    }
+
+    #[test]
+    fn rejects_platform_bin_plugin_missing_an_artifact_for_a_supported_platform() {
+        // Uses ${platform_bin}, supports all three platforms (no gate), ships
+        // URL artifacts — but only for macos + windows. Missing linux artifact
+        // must be caught at validation, not at install time on a linux host.
+        let json = r#"{
+            "id": "binbacked",
+            "name": "Bin Backed",
+            "version": "1.0.0",
+            "provides": {
+                "mcp_servers": [
+                    {"id": "srv", "transport": {"type": "stdio", "command": "${platform_bin}"}}
+                ]
+            },
+            "artifacts": {
+                "macos": {"url": "https://example.com/x-macos.tar.gz", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "windows": {"url": "https://example.com/x-windows.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+            }
+        }"#;
+        let manifest = PluginManifest::parse_str(json).unwrap();
+        let error = manifest
+            .validate()
+            .expect_err("missing linux artifact should fail");
+        assert!(error.to_string().contains("linux"));
+    }
+
+    #[test]
+    fn platform_bin_plugin_is_valid_when_gate_narrows_to_covered_platforms() {
+        // Same plugin, but a `platforms` gate narrows support to exactly the
+        // platforms that DO have artifacts → valid.
+        let json = r#"{
+            "id": "binbacked",
+            "name": "Bin Backed",
+            "version": "1.0.0",
+            "platforms": ["macos", "windows"],
+            "provides": {
+                "mcp_servers": [
+                    {"id": "srv", "transport": {"type": "stdio", "command": "${platform_bin}"}}
+                ]
+            },
+            "artifacts": {
+                "macos": {"url": "https://example.com/x-macos.tar.gz", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "windows": {"url": "https://example.com/x-windows.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+            }
+        }"#;
+        let manifest = PluginManifest::parse_str(json).unwrap();
+        manifest
+            .validate()
+            .expect("gate-narrowed binary plugin is valid");
+        assert!(manifest.uses_platform_bin_token());
+    }
+
+    #[test]
+    fn rejects_artifact_for_platform_outside_the_gate() {
+        let json = r#"{
+            "id": "gated",
+            "name": "Gated",
+            "version": "1.0.0",
+            "platforms": ["macos"],
+            "artifacts": {
+                "linux": {"url": "https://example.com/x-linux.tar.gz", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+            }
+        }"#;
+        let manifest = PluginManifest::parse_str(json).unwrap();
+        let error = manifest
+            .validate()
+            .expect_err("artifact outside gate should fail");
+        assert!(error.to_string().contains("not in the `platforms` gate"));
+    }
+
+    #[test]
+    fn local_install_with_platform_bin_and_no_artifacts_is_valid() {
+        // Local-dir/archive install: uses ${platform_bin} but ships bin/
+        // directly (no `artifacts`). The cross-check must NOT fire.
+        let json = r#"{
+            "id": "localbin",
+            "name": "Local Bin",
+            "version": "1.0.0",
+            "provides": {
+                "mcp_servers": [
+                    {"id": "srv", "transport": {"type": "stdio", "command": "${platform_bin}"}}
+                ]
+            }
+        }"#;
+        let manifest = PluginManifest::parse_str(json).unwrap();
+        manifest
+            .validate()
+            .expect("local binary plugin without artifacts is valid");
+    }
+
+    #[test]
+    fn rejects_reserved_preset_id() {
+        let json = r#"{
+            "id": "reserver",
+            "name": "Reserver",
+            "version": "1.0.0",
+            "provides": {
+                "prompts": [
+                    {"id": "general_assistant", "name": "Nope", "content": "x"}
+                ]
+            }
+        }"#;
+        let manifest = PluginManifest::parse_str(json).unwrap();
+        let error = manifest
+            .validate()
+            .expect_err("reserved preset id should fail");
+        assert!(error.to_string().contains("prompt preset id"));
+        assert!(!is_valid_preset_id("general_assistant"));
     }
 
     #[test]
