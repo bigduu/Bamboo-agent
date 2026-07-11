@@ -141,6 +141,7 @@ bamboo serve
 | 命令 | 作用 |
 |---|---|
 | `bamboo serve` | 启动 HTTP/SSE 服务（见上）。 |
+| `bamboo tui` | 全屏终端客户端（聊天、会话、MCP、定时任务、技能、配置），连接运行中的服务；本地服务不可达时会提示自动拉起（`--auto-serve`/`--no-auto-serve`）。 |
 | `bamboo init` | 首次安装引导：写入含 provider + API key 的 `config.json`（交互式，CI 用 `--non-interactive`）。 |
 | `bamboo doctor` | 诊断安装状态（配置存在、provider 已配 key、服务可达）；有阻塞问题时以非零退出。 |
 | `bamboo config [--path] [--show-secrets]` | 查看解析后的配置。 |

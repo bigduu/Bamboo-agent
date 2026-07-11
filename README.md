@@ -162,6 +162,7 @@ Arguments supported by `bamboo serve` (all override the config file):
 | Command | What it does |
 |---|---|
 | `bamboo serve` | Start the HTTP/SSE server (above). |
+| `bamboo tui` | Full-screen terminal client (chat, sessions, MCP, schedules, skills, config) over a running server; offers to auto-start a local one when unreachable (`--auto-serve`/`--no-auto-serve`). |
 | `bamboo init` | First-run setup: write `config.json` with a provider + API key (interactive, or `--non-interactive` for CI). |
 | `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
 | `bamboo config [--path] [--show-secrets]` | Inspect the resolved configuration. |

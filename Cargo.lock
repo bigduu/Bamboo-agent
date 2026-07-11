@@ -909,6 +909,7 @@ dependencies = [
  "bamboo-storage",
  "bamboo-subagent",
  "bamboo-tools",
+ "bamboo-tui",
  "base64",
  "bytes",
  "chrono",

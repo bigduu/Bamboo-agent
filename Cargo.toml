@@ -128,6 +128,7 @@ bamboo-broker = { path = "crates/app/bamboo-broker" }
 bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
 bamboo-skills = { path = "crates/infra/bamboo-skills" }
 bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
+bamboo-tui = { path = "crates/app/bamboo-tui" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -169,6 +169,44 @@ enum Commands {
         parent_pid: Option<u32>,
     },
 
+    /// Full-screen terminal client (TUI) over a running server: chat,
+    /// sessions, MCP, schedules, skills and config in one keyboard-driven
+    /// interface. If a loopback --server-url is unreachable it offers to
+    /// start a local `bamboo serve` (y/n) — see --auto-serve/--no-auto-serve.
+    #[command(after_help = "EXAMPLES:\n  \
+        # Connect to the default local server (offers to start one if absent)\n  \
+        bamboo tui\n\n  \
+        # Resume a session, headless-server URL pinned\n  \
+        bamboo tui --server-url http://127.0.0.1:9562 --session-id <id>\n\n  \
+        # Never offer/auto-start a local server (just warn when unreachable)\n  \
+        bamboo tui --no-auto-serve")]
+    Tui {
+        /// Bamboo server URL. Defaults to the concrete loopback IPv4 (not
+        /// `localhost`, which resolves to `::1` first on dual-stack hosts
+        /// while the server default-binds `127.0.0.1` only → ECONNREFUSED).
+        #[arg(long, default_value = bamboo_tui::DEFAULT_SERVER_URL)]
+        server_url: String,
+
+        /// Session ID to resume (optional)
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Model to use
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// If `--server-url` is unreachable and loopback, start a local
+        /// `bamboo serve` automatically instead of asking (y/n). No effect for
+        /// a remote (non-loopback) `--server-url` — that always just warns.
+        #[arg(long, conflicts_with = "no_auto_serve")]
+        auto_serve: bool,
+
+        /// Never offer/auto-start a local server, even for an unreachable
+        /// loopback `--server-url` — just warn, like a remote URL always does.
+        #[arg(long, conflicts_with = "auto_serve")]
+        no_auto_serve: bool,
+    },
+
     /// First-run setup: write `config.json` with a provider + API key.
     ///
     /// Interactive by default (prompts for anything not given as a flag). Pass
@@ -934,6 +972,12 @@ async fn main() {
                 )
                 .init();
         }
+        Some(Commands::Tui { .. }) => {
+            // No logging subscriber: the TUI owns the terminal (raw mode +
+            // alternate screen), so a stdout/stderr fmt layer would garble the
+            // display. Matches the standalone `bamboo-tui` binary, which
+            // installs none.
+        }
         Some(Commands::SubagentWorker)
         | Some(Commands::Actor { .. })
         | Some(Commands::Broker { .. })
@@ -1134,6 +1178,36 @@ async fn main() {
 
             if let Err(e) = result {
                 eprintln!("Failed to start server: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Tui {
+            server_url,
+            session_id,
+            model,
+            auto_serve,
+            no_auto_serve,
+        } => {
+            let auto_serve = if auto_serve {
+                bamboo_tui::AutoServeMode::Auto
+            } else if no_auto_serve {
+                bamboo_tui::AutoServeMode::Off
+            } else {
+                bamboo_tui::AutoServeMode::Prompt
+            };
+            // `bamboo_tui::run` fails closed on a non-TTY stdin/stdout before
+            // touching terminal state (raw mode / alternate screen), so a
+            // scripted `bamboo tui` errors cleanly instead of garbling output.
+            let result = bamboo_tui::run(bamboo_tui::TuiOptions {
+                server_url,
+                session_id,
+                model,
+                auto_serve,
+            })
+            .await;
+            if let Err(e) = result {
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }
@@ -1656,5 +1730,64 @@ mod tests {
             "super-secret"
         );
         assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
+    }
+
+    #[test]
+    fn cli_tree_includes_tui_subcommand_with_standalone_flag_surface() {
+        use clap::CommandFactory;
+
+        let cmd = super::Cli::command();
+        // Full-tree consistency check (what `--help` generation relies on).
+        cmd.clone().debug_assert();
+
+        let tui = cmd
+            .find_subcommand("tui")
+            .expect("`tui` must be in the subcommand tree");
+        let args: Vec<&str> = tui.get_arguments().map(|a| a.get_id().as_str()).collect();
+        // Same flag surface as the standalone `bamboo-tui` binary.
+        for expected in [
+            "server_url",
+            "session_id",
+            "model",
+            "auto_serve",
+            "no_auto_serve",
+        ] {
+            assert!(args.contains(&expected), "missing --{expected} on `tui`");
+        }
+    }
+
+    #[test]
+    fn tui_help_parses_and_auto_serve_flags_conflict() {
+        use clap::Parser;
+
+        // `bamboo tui --help` parses down the tree (clap reports help as an
+        // "error" of kind DisplayHelp).
+        let Err(help) = super::Cli::try_parse_from(["bamboo", "tui", "--help"]) else {
+            panic!("--help must surface as a DisplayHelp error");
+        };
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+
+        // The flags parse.
+        assert!(super::Cli::try_parse_from(["bamboo", "tui", "--auto-serve"]).is_ok());
+        assert!(super::Cli::try_parse_from([
+            "bamboo",
+            "tui",
+            "--server-url",
+            "http://127.0.0.1:9999",
+            "--session-id",
+            "abc",
+            "-m",
+            "anthropic:claude-sonnet-4",
+            "--no-auto-serve",
+        ])
+        .is_ok());
+
+        // --auto-serve and --no-auto-serve are mutually exclusive.
+        let Err(conflict) =
+            super::Cli::try_parse_from(["bamboo", "tui", "--auto-serve", "--no-auto-serve"])
+        else {
+            panic!("conflicting flags must be rejected");
+        };
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
