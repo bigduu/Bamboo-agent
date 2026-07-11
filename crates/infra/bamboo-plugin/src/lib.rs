@@ -38,9 +38,12 @@ pub mod manifest;
 pub mod registry;
 
 pub use error::{PluginError, PluginResult};
-pub use installer::{LocalPluginInstaller, PluginInstaller};
+pub use installer::{InstallDisposition, LocalPluginInstaller, PluginInstaller};
 pub use manifest::{
     McpServerManifestEntry, McpTransportManifest, Platform, PluginArtifact, PluginManifest,
     PluginPromptPreset, PluginProvides,
 };
-pub use registry::{InstalledPlugin, InstalledPlugins, PluginSource, RegisteredCapabilities};
+pub use registry::{
+    classify_ownership, reconcile_exclusive, ExclusiveReconciliation, InstalledPlugin,
+    InstalledPlugins, Ownership, PluginSource, RegisteredCapabilities,
+};

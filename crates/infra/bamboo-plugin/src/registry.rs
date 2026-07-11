@@ -11,6 +11,7 @@
 //! deregistering capabilities (MCP servers, prompt presets, workflow files)
 //! is the installer's job (see [`crate::installer`] and `PLUGIN_PLAN.md`).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -67,6 +68,108 @@ impl RegisteredCapabilities {
             && self.preset_ids.is_empty()
             && self.workflow_filenames.is_empty()
     }
+
+    /// The capabilities present in `old` (a prior install's registered set)
+    /// but ABSENT from `self` (the set the new/upgraded install will register).
+    ///
+    /// These are exactly the entries an in-place upgrade must DE-register:
+    /// their ids/filenames vanish from provenance across the upgrade, so if
+    /// they are not actively removed here they leak — orphaned forever,
+    /// un-removable because no future uninstall knows they were ours. See the
+    /// upgrade sequence in [`crate::installer`] / `PLUGIN_PLAN.md`.
+    ///
+    /// Order-preserving relative to `old` (stable output for diffing/logging).
+    pub fn removed_since(&self, old: &RegisteredCapabilities) -> RegisteredCapabilities {
+        RegisteredCapabilities {
+            mcp_server_ids: subtract(&old.mcp_server_ids, &self.mcp_server_ids),
+            skill_dirs: subtract(&old.skill_dirs, &self.skill_dirs),
+            preset_ids: subtract(&old.preset_ids, &self.preset_ids),
+            workflow_filenames: subtract(&old.workflow_filenames, &self.workflow_filenames),
+        }
+    }
+}
+
+/// Elements of `from` not present in `remove`, preserving `from`'s order.
+fn subtract(from: &[String], remove: &[String]) -> Vec<String> {
+    let drop: HashSet<&str> = remove.iter().map(String::as_str).collect();
+    from.iter()
+        .filter(|value| !drop.contains(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Ownership classification of one declared capability id/filename against a
+/// shared store, for the REFUSE-on-conflict capability kinds (MCP servers,
+/// workflow files). Prompt presets do NOT use this — they rename on collision
+/// via bamboo-server's `ensure_unique_preset_id` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// Not present in the shared store — safe to create AND record as
+    /// plugin-owned/removable.
+    New,
+    /// Present, and registered by THIS plugin's prior install — an upgrade
+    /// re-registering its own entry. Safe; stays recorded as plugin-owned.
+    OwnedReinstall,
+    /// Present and NOT owned by this plugin (a user's own entry, or another
+    /// plugin's). Must block the install — never recorded as removable.
+    ForeignConflict,
+}
+
+/// Classify one id against the shared store's current `existing` ids and the
+/// `owned_previously` ids that THIS plugin's prior install registered.
+pub fn classify_ownership(
+    id: &str,
+    existing: &HashSet<&str>,
+    owned_previously: &HashSet<&str>,
+) -> Ownership {
+    if !existing.contains(id) {
+        Ownership::New
+    } else if owned_previously.contains(id) {
+        Ownership::OwnedReinstall
+    } else {
+        Ownership::ForeignConflict
+    }
+}
+
+/// Result of reconciling a plugin's declared ids/filenames against a shared
+/// store for a REFUSE-on-conflict capability (MCP servers, workflow files).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExclusiveReconciliation {
+    /// Genuinely-new plus this-plugin's-own-from-a-prior-install: register
+    /// these and record them as plugin-owned/removable in provenance.
+    pub to_register: Vec<String>,
+    /// Foreign collisions (exist, not owned by this plugin). If this is
+    /// non-empty the caller MUST refuse the install (return
+    /// [`PluginError::Conflict`]) — do not register or record any of these.
+    pub foreign_conflicts: Vec<String>,
+}
+
+/// Reconcile `declared` ids against the shared store for a REFUSE-on-conflict
+/// capability. `existing` = every id currently in the shared store;
+/// `owned_previously` = the ids THIS plugin's prior install recorded (empty
+/// for a fresh install). Pure — the caller supplies the store state (which,
+/// for MCP/workflows, only the app layer can read).
+///
+/// This is the pre-check that closes BLOCKER 1: a pre-existing collision with
+/// a non-plugin entry lands in `foreign_conflicts`, so it is NEVER registered
+/// and NEVER recorded as removable — uninstall can therefore only ever delete
+/// entries this plugin genuinely created.
+pub fn reconcile_exclusive(
+    declared: &[String],
+    existing: &[String],
+    owned_previously: &[String],
+) -> ExclusiveReconciliation {
+    let existing_set: HashSet<&str> = existing.iter().map(String::as_str).collect();
+    let owned_set: HashSet<&str> = owned_previously.iter().map(String::as_str).collect();
+
+    let mut result = ExclusiveReconciliation::default();
+    for id in declared {
+        match classify_ownership(id, &existing_set, &owned_set) {
+            Ownership::New | Ownership::OwnedReinstall => result.to_register.push(id.clone()),
+            Ownership::ForeignConflict => result.foreign_conflicts.push(id.clone()),
+        }
+    }
+    result
 }
 
 /// A single installed plugin's provenance record.
@@ -235,6 +338,73 @@ mod tests {
         assert_eq!(removed.id, "hello-plugin");
         assert!(store.get("hello-plugin").is_none());
         assert!(store.remove("hello-plugin").is_none());
+    }
+
+    #[test]
+    fn reconcile_exclusive_fresh_install_splits_new_from_foreign() {
+        // Fresh install (no prior ownership): "a" is new, "b" collides with a
+        // user's own entry.
+        let declared = vec!["a".to_string(), "b".to_string()];
+        let existing = vec!["b".to_string(), "user-thing".to_string()];
+        let owned_previously: Vec<String> = vec![];
+
+        let reconciliation = reconcile_exclusive(&declared, &existing, &owned_previously);
+        assert_eq!(reconciliation.to_register, vec!["a".to_string()]);
+        assert_eq!(reconciliation.foreign_conflicts, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_exclusive_upgrade_reregisters_own_but_refuses_new_foreign() {
+        // Upgrade: "a" was ours last time (owned reinstall, fine); "c" is new;
+        // "d" newly collides with a user entry that appeared since → foreign.
+        let declared = vec!["a".to_string(), "c".to_string(), "d".to_string()];
+        let existing = vec!["a".to_string(), "d".to_string()];
+        let owned_previously = vec!["a".to_string()];
+
+        let reconciliation = reconcile_exclusive(&declared, &existing, &owned_previously);
+        assert_eq!(
+            reconciliation.to_register,
+            vec!["a".to_string(), "c".to_string()]
+        );
+        assert_eq!(reconciliation.foreign_conflicts, vec!["d".to_string()]);
+    }
+
+    #[test]
+    fn classify_ownership_three_way() {
+        let existing: HashSet<&str> = ["x", "y"].into_iter().collect();
+        let owned: HashSet<&str> = ["y"].into_iter().collect();
+        assert_eq!(classify_ownership("z", &existing, &owned), Ownership::New);
+        assert_eq!(
+            classify_ownership("y", &existing, &owned),
+            Ownership::OwnedReinstall
+        );
+        assert_eq!(
+            classify_ownership("x", &existing, &owned),
+            Ownership::ForeignConflict
+        );
+    }
+
+    #[test]
+    fn removed_since_computes_dropped_capabilities_per_kind() {
+        let old = RegisteredCapabilities {
+            mcp_server_ids: vec!["srv-a".to_string(), "srv-b".to_string()],
+            skill_dirs: vec!["skill-a".to_string()],
+            preset_ids: vec!["preset-a".to_string(), "preset-b".to_string()],
+            workflow_filenames: vec!["wf-a.md".to_string()],
+        };
+        // New version drops srv-b and preset-a, keeps the rest, adds srv-c.
+        let new = RegisteredCapabilities {
+            mcp_server_ids: vec!["srv-a".to_string(), "srv-c".to_string()],
+            skill_dirs: vec!["skill-a".to_string()],
+            preset_ids: vec!["preset-b".to_string()],
+            workflow_filenames: vec!["wf-a.md".to_string()],
+        };
+
+        let removed = new.removed_since(&old);
+        assert_eq!(removed.mcp_server_ids, vec!["srv-b".to_string()]);
+        assert!(removed.skill_dirs.is_empty());
+        assert_eq!(removed.preset_ids, vec!["preset-a".to_string()]);
+        assert!(removed.workflow_filenames.is_empty());
     }
 
     #[tokio::test]

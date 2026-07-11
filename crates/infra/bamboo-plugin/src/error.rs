@@ -16,10 +16,30 @@ pub enum PluginError {
     #[error("plugin not found: {0}")]
     NotFound(String),
 
-    /// A plugin with this id is already installed (install without
-    /// `--force`/upgrade intent).
-    #[error("plugin already installed: {0}")]
+    /// A plugin with this id is already installed and `install` was called
+    /// with [`crate::installer::InstallDisposition::FailIfInstalled`] (the
+    /// `bamboo plugin install` verb). Re-run as an upgrade
+    /// (`bamboo plugin update` / [`crate::installer::InstallDisposition::Upgrade`])
+    /// to replace it in place.
+    #[error("plugin already installed: {0} (use `update` to upgrade in place)")]
     AlreadyInstalled(String),
+
+    /// A capability the plugin declares collides with an existing entry in a
+    /// shared store that is NOT owned by this plugin (a user's own entry, or
+    /// another plugin's). For MCP servers and workflows the install REFUSES
+    /// rather than clobbering — an MCP server id / workflow filename is
+    /// referenced elsewhere, so silently overwriting (and later deleting on
+    /// uninstall) would destroy the user's entry. `kind` is a short label
+    /// such as `"mcp server"` or `"workflow"`.
+    #[error(
+        "{kind} '{name}' already exists and is not owned by plugin '{plugin_id}'; \
+         refusing to overwrite — rename the conflicting entry or the plugin's, then retry"
+    )]
+    Conflict {
+        kind: &'static str,
+        name: String,
+        plugin_id: String,
+    },
 
     /// The manifest's `platforms` gate excludes the current OS.
     #[error("plugin '{plugin_id}' does not support platform '{platform}'")]

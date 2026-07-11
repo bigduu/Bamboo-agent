@@ -5,7 +5,8 @@
 //! schema this crate defines.
 
 use bamboo_plugin::{
-    LocalPluginInstaller, PluginError, PluginInstaller, PluginManifest, PluginSource,
+    InstallDisposition, LocalPluginInstaller, PluginError, PluginInstaller, PluginManifest,
+    PluginSource,
 };
 
 fn example_plugin_dir() -> std::path::PathBuf {
@@ -52,6 +53,7 @@ async fn hello_plugin_install_reaches_registration_todo() {
             PluginSource::LocalDir {
                 path: plugin_dir.clone(),
             },
+            InstallDisposition::FailIfInstalled,
             chrono::Utc::now(),
         )
         .await

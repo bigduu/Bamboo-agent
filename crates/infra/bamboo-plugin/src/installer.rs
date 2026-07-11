@@ -12,12 +12,38 @@
 //!
 //! [`LocalPluginInstaller`] below is a reference skeleton that implements
 //! everything this crate CAN implement without `AppState` (manifest
-//! validation, platform gating, MCP-entry token resolution, provenance
-//! listing) and returns [`PluginError::NotImplemented`] at the exact points
-//! that need capability-registration wiring, with a comment enumerating what
-//! goes there and citing the exact files. It is a reference/example, not a
-//! requirement to reuse verbatim — Wave-2's installer-core agent may replace
-//! it entirely with a type that holds an `AppState` handle.
+//! validation, platform gating, MCP-entry token resolution, the
+//! disposition/upgrade decision, the `provides.skills`-authoritative check,
+//! provenance listing) and returns [`PluginError::NotImplemented`] at the
+//! exact points that need capability-registration wiring, with a comment
+//! enumerating what goes there and citing the exact files. It is a
+//! reference/example, not a requirement to reuse verbatim — Wave-2's
+//! installer-core agent may replace it entirely with a type that holds an
+//! `AppState` handle.
+//!
+//! # Ownership + upgrade contract (why uninstall is provably safe)
+//!
+//! Two invariants make uninstall/upgrade never touch a user's own entries:
+//!
+//! 1. **Only plugin-created entries are ever recorded as removable.** For the
+//!    REFUSE-on-conflict capabilities (MCP servers, workflow files) the
+//!    installer MUST run [`crate::registry::reconcile_exclusive`] against the
+//!    live shared store before touching anything: a declared id/filename that
+//!    already exists and is not owned by this plugin lands in
+//!    `foreign_conflicts` and the install is REFUSED
+//!    ([`PluginError::Conflict`]) — it is never registered and never written
+//!    into [`crate::registry::RegisteredCapabilities`]. So the `registered`
+//!    set an [`InstalledPlugin`] carries contains ONLY entries this plugin
+//!    genuinely created; `uninstall` iterating that set can only ever delete
+//!    the plugin's own entries. (Prompt presets are the one exception: they
+//!    rename on collision via bamboo-server's `ensure_unique_preset_id`
+//!    instead of refusing, and the RENAMED id is what gets recorded.)
+//! 2. **Upgrade de-registers what the new version dropped.** `install` with
+//!    [`InstallDisposition::Upgrade`] loads the prior [`InstalledPlugin`],
+//!    computes [`crate::registry::RegisteredCapabilities::removed_since`] (old
+//!    minus new), de-registers those dropped capabilities, THEN registers the
+//!    new set and upserts provenance — so a capability the old version had and
+//!    the new one dropped can't leak as an orphan.
 
 use std::path::{Path, PathBuf};
 
@@ -28,32 +54,58 @@ use crate::error::{PluginError, PluginResult};
 use crate::manifest::{Platform, PluginManifest};
 use crate::registry::{InstalledPlugin, InstalledPlugins, PluginSource};
 
-/// The installer method surface. `install`/`uninstall`/`list` are the three
-/// verbs the CLI (`bamboo plugin install/list/remove/update`) and the HTTP
-/// routes (`/api/v1/plugins`) both call through.
+/// How [`PluginInstaller::install`] must treat a plugin id that is ALREADY
+/// installed. Maps directly to the CLI verbs: `bamboo plugin install` uses
+/// [`Self::FailIfInstalled`], `bamboo plugin update` (or `install --force`)
+/// uses [`Self::Upgrade`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallDisposition {
+    /// Refuse a re-install of an already-installed id with
+    /// [`PluginError::AlreadyInstalled`]. A first-time `install` should not
+    /// silently replace an existing plugin.
+    FailIfInstalled,
+    /// Upgrade in place: de-register the capabilities the new version dropped
+    /// (via [`crate::registry::RegisteredCapabilities::removed_since`]),
+    /// register the new set, then upsert provenance.
+    Upgrade,
+}
+
+/// The installer method surface. `install`/`uninstall`/`list` are the verbs
+/// the CLI (`bamboo plugin install/list/remove/update`) and the HTTP routes
+/// (`/api/v1/plugins`) both call through.
 #[async_trait]
 pub trait PluginInstaller {
-    /// Register a plugin already unpacked at `plugin_dir` (source handling —
-    /// copying a local dir, unpacking a `.tar.gz`, fetching+verifying a URL —
-    /// happens BEFORE this is called; by the time `install` runs, `plugin_dir`
-    /// already contains `plugin.json` plus the `skills/`/`prompts/`/
-    /// `workflows/`/`bin/` layout the manifest declares).
+    /// Install (or, with [`InstallDisposition::Upgrade`], upgrade) a plugin
+    /// already unpacked at `plugin_dir` (source handling — copying a local
+    /// dir, unpacking a `.tar.gz`, fetching+verifying a URL + selecting the
+    /// per-platform artifact — happens BEFORE this is called; by the time
+    /// `install` runs, `plugin_dir` already contains `plugin.json` plus the
+    /// `skills/`/`prompts/`/`workflows/`/`bin/` layout the manifest declares).
     ///
-    /// On success, the returned [`InstalledPlugin`] must have already been
-    /// persisted into `installed.json` (i.e. `install` commits provenance
-    /// itself; callers should not need to separately call
-    /// `InstalledPlugins::add`).
+    /// Contract (see the module docs for the full rationale):
+    /// - `disposition` decides already-installed handling (fail vs upgrade).
+    /// - MCP-server and workflow collisions with NON-plugin entries MUST be
+    ///   refused ([`PluginError::Conflict`]) via
+    ///   [`crate::registry::reconcile_exclusive`] — never clobbered.
+    /// - On upgrade, capabilities the new version dropped MUST be
+    ///   de-registered ([`crate::registry::RegisteredCapabilities::removed_since`]).
+    /// - The returned [`InstalledPlugin`] must have already been persisted
+    ///   into `installed.json`, and its `registered` set must contain ONLY
+    ///   entries this plugin genuinely created (so uninstall is safe).
     async fn install(
         &self,
         manifest: &PluginManifest,
         plugin_dir: &Path,
         source: PluginSource,
+        disposition: InstallDisposition,
         installed_at: DateTime<Utc>,
     ) -> PluginResult<InstalledPlugin>;
 
     /// Reverse everything `install` registered for `id` (stop + remove MCP
     /// servers, remove prompt presets, remove workflow files), then remove
-    /// the provenance entry and delete `plugin_dir` from disk.
+    /// the provenance entry and delete `plugin_dir` from disk. Safe by
+    /// construction: the provenance `registered` set only ever names
+    /// plugin-created entries (invariant 1 in the module docs).
     async fn uninstall(&self, id: &str) -> PluginResult<()>;
 
     /// All currently-installed plugins (a thin read of `installed.json`).
@@ -78,6 +130,37 @@ impl LocalPluginInstaller {
     fn installed_json_path(&self) -> PathBuf {
         self.plugins_dir().join("installed.json")
     }
+
+    /// Directory names directly under `<plugin_dir>/skills/` that contain a
+    /// `SKILL.md` (i.e. what discovery would actually pick up in place). Used
+    /// to enforce that `provides.skills` is authoritative.
+    async fn on_disk_skill_dirs(plugin_dir: &Path) -> Vec<String> {
+        let skills_root = plugin_dir.join("skills");
+        let mut found = Vec::new();
+        let Ok(mut entries) = tokio::fs::read_dir(&skills_root).await else {
+            return found;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            let has_skill_md = tokio::fs::try_exists(entry.path().join("SKILL.md"))
+                .await
+                .unwrap_or(false);
+            if !has_skill_md {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                found.push(name.to_string());
+            }
+        }
+        found
+    }
 }
 
 impl Default for LocalPluginInstaller {
@@ -93,6 +176,7 @@ impl PluginInstaller for LocalPluginInstaller {
         manifest: &PluginManifest,
         plugin_dir: &Path,
         _source: PluginSource,
+        disposition: InstallDisposition,
         _installed_at: DateTime<Utc>,
     ) -> PluginResult<InstalledPlugin> {
         manifest.validate()?;
@@ -111,6 +195,20 @@ impl PluginInstaller for LocalPluginInstaller {
                 });
             }
         }
+
+        // --- Disposition / upgrade decision (fully implemented here) ---
+        //
+        // Load prior provenance FIRST so we can (a) reject a first-time
+        // install of an already-installed id, and (b) on upgrade, capture the
+        // old registered set for the drop-diff below.
+        let existing = InstalledPlugins::load(&self.installed_json_path()).await?;
+        let previous = existing.get(&manifest.id).cloned();
+        if previous.is_some() && disposition == InstallDisposition::FailIfInstalled {
+            return Err(PluginError::AlreadyInstalled(manifest.id.clone()));
+        }
+        // On upgrade this is the set the installer-core agent must
+        // `removed_since`-diff against the new registered set and de-register.
+        let _previous_registered = previous.as_ref().map(|plugin| plugin.registered.clone());
 
         // --- Path resolution (trivial, pure — fully implemented here) ---
         //
@@ -139,6 +237,29 @@ impl PluginInstaller for LocalPluginInstaller {
                 )));
             }
         }
+        // `provides.skills` is AUTHORITATIVE: reject any on-disk skill dir the
+        // manifest does not declare. Discovery is a dumb globber that picks up
+        // every `<plugin_dir>/skills/*` with a SKILL.md, so without this a
+        // bundle could smuggle an undeclared skill live past its own manifest.
+        // We enforce the manifest here at install time and keep discovery
+        // simple (MAJOR 4).
+        {
+            use std::collections::HashSet;
+            let declared: HashSet<&str> = manifest
+                .provides
+                .skills
+                .iter()
+                .map(String::as_str)
+                .collect();
+            for on_disk in Self::on_disk_skill_dirs(plugin_dir).await {
+                if !declared.contains(on_disk.as_str()) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "skill directory '{on_disk}' exists under skills/ but is not declared in \
+                         provides.skills (a plugin must declare every skill it ships)"
+                    )));
+                }
+            }
+        }
         for workflow_file in &manifest.provides.workflows {
             let workflow_path = plugin_dir.join("workflows").join(workflow_file);
             if !tokio::fs::try_exists(&workflow_path).await.unwrap_or(false) {
@@ -156,26 +277,42 @@ impl PluginInstaller for LocalPluginInstaller {
         // not depend on). See PLUGIN_PLAN.md § Installer-core agent for the
         // full breakdown. In order:
         //
-        //   1. MCP: merge `_resolved_mcp_servers` into `Config.mcp.servers`
-        //      via `AppState::update_config`
+        //   0. UPGRADE DROP-DIFF (only when `previous` is Some): compute
+        //      `new_registered.removed_since(&_previous_registered.unwrap())`
+        //      and DE-register those dropped mcp ids / preset ids / workflow
+        //      files (same removal ops as `uninstall`) BEFORE registering the
+        //      new set, so a capability the old version had and the new one
+        //      dropped never leaks (BLOCKER 2).
+        //   1. MCP: run `registry::reconcile_exclusive(declared_mcp_ids,
+        //      existing_mcp_ids_in_config, previously_owned_mcp_ids)`. If
+        //      `foreign_conflicts` is non-empty → return `PluginError::Conflict`
+        //      (BLOCKER 1 — do NOT clobber). Otherwise merge only `to_register`
+        //      into `Config.mcp.servers` via `AppState::update_config`
         //      (crates/app/bamboo-server/src/app_state/config_runtime.rs),
         //      reusing the merge-by-id logic in
         //      crates/app/bamboo-server/src/handlers/agent/mcp/server_handlers/import.rs
-        //      (`import_servers`), then call
-        //      `state.mcp_manager.start_server(..)` for each enabled one.
+        //      (`import_servers`), then `state.mcp_manager.start_server(..)`
+        //      for each enabled one. Record exactly `to_register` as owned.
         //   2. Prompts: append `manifest.provides.prompts` into
         //      `prompt-presets.json`
         //      (crates/app/bamboo-server/src/handlers/agent/prompt_presets/storage.rs),
-        //      reusing `validate_preset_id` / `ensure_unique_preset_id` so a
-        //      plugin can never silently clobber an existing user preset id.
-        //   3. Workflows: copy `<plugin_dir>/workflows/<name>.md` into
-        //      `bamboo_config::paths::workflows_dir()/<name>.md` (validate
-        //      each name with `bamboo_config::paths::is_safe_workflow_name`).
-        //   4. Only once 1-3 succeed: build the `RegisteredCapabilities`
-        //      reflecting exactly what got registered, then commit
-        //      provenance via `InstalledPlugins::load` + `.add(..)` +
-        //      `.save(..)` at `self.installed_json_path()`.
-        let _ = self.installed_json_path(); // reserved for step 4 above.
+        //      reusing `validate_preset_id` / `ensure_unique_preset_id` — on an
+        //      id collision RENAME (don't refuse), and record the RENAMED id as
+        //      owned (not the manifest's nominal one).
+        //   3. Workflows: run `reconcile_exclusive` on the workflow filenames
+        //      the same way as MCP (refuse foreign collisions), then copy
+        //      `<plugin_dir>/workflows/<name>.md` into
+        //      `bamboo_config::paths::workflows_dir()/<name>.md` (validate each
+        //      name with `bamboo_config::paths::is_safe_workflow_name`).
+        //   4. Skills: nothing to register (discovered in place). Record the
+        //      declared+validated dir names as owned.
+        //   5. Only once 0-4 succeed: build the `RegisteredCapabilities`
+        //      reflecting exactly what got registered (renamed preset ids, the
+        //      `to_register` mcp/workflow subsets — NOT a blind copy of
+        //      `manifest.provides`), then upsert provenance via
+        //      `InstalledPlugins::load` + `.add(..)` + `.save(..)` at
+        //      `self.installed_json_path()`.
+        let _ = self.installed_json_path(); // reserved for step 5 above.
         Err(PluginError::NotImplemented(
             "capability registration wiring — see PLUGIN_PLAN.md \
              \u{a7} Installer-core agent"
@@ -190,10 +327,11 @@ impl PluginInstaller for LocalPluginInstaller {
         }
 
         // TODO(installer-core agent): using the found entry's `registered`
-        // capabilities, stop + remove each `mcp_server_ids` entry from
-        // `config.json` (`AppState::update_config` + `mcp_manager.stop_server`),
-        // remove each `preset_ids` entry from `prompt-presets.json`, delete
-        // each `workflow_filenames` file from
+        // capabilities (which, by construction, name ONLY plugin-created
+        // entries — see module docs), stop + remove each `mcp_server_ids`
+        // entry from `config.json` (`AppState::update_config` +
+        // `mcp_manager.stop_server`), remove each `preset_ids` entry from
+        // `prompt-presets.json`, delete each `workflow_filenames` file from
         // `bamboo_config::paths::workflows_dir()`. THEN remove the provenance
         // entry (`InstalledPlugins::remove` + `.save(..)`) and finally
         // `tokio::fs::remove_dir_all(entry.plugin_dir)`.
@@ -214,6 +352,7 @@ impl PluginInstaller for LocalPluginInstaller {
 mod tests {
     use super::*;
     use crate::manifest::PluginManifest;
+    use crate::registry::RegisteredCapabilities;
 
     fn manifest_with(skills: Vec<&str>, workflows: Vec<&str>) -> PluginManifest {
         let json = serde_json::json!({
@@ -226,6 +365,20 @@ mod tests {
             }
         });
         PluginManifest::parse_str(&json.to_string()).expect("parse manifest")
+    }
+
+    /// Create `<plugin_dir>/skills/<id>/SKILL.md` for each id.
+    async fn write_skill_dirs(plugin_dir: &Path, ids: &[&str]) {
+        for id in ids {
+            let skill_dir = plugin_dir.join("skills").join(id);
+            tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+            tokio::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: demo\n---\nHi\n"),
+            )
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -266,6 +419,7 @@ mod tests {
                 PluginSource::LocalDir {
                     path: plugin_dir.clone(),
                 },
+                InstallDisposition::FailIfInstalled,
                 Utc::now(),
             )
             .await
@@ -274,20 +428,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_reaches_not_implemented_once_declared_files_exist() {
+    async fn install_rejects_undeclared_on_disk_skill_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let installer = LocalPluginInstaller::new(dir.path().join("bamboo-home"));
 
         let plugin_dir = dir.path().join("plugin-src");
-        let skill_dir = plugin_dir.join("skills").join("hello-world");
-        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
-        tokio::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: hello-world\ndescription: demo\n---\nHi\n",
-        )
-        .await
-        .unwrap();
-
+        // Bundle ships TWO skills on disk but declares only one.
+        write_skill_dirs(&plugin_dir, &["hello-world", "sneaky-extra"]).await;
         let manifest = manifest_with(vec!["hello-world"], vec![]);
 
         let error = installer
@@ -297,6 +444,32 @@ mod tests {
                 PluginSource::LocalDir {
                     path: plugin_dir.clone(),
                 },
+                InstallDisposition::FailIfInstalled,
+                Utc::now(),
+            )
+            .await
+            .expect_err("undeclared skill dir should be rejected");
+        assert!(matches!(error, PluginError::InvalidManifest(_)));
+        assert!(error.to_string().contains("sneaky-extra"));
+    }
+
+    #[tokio::test]
+    async fn install_reaches_not_implemented_once_declared_files_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let installer = LocalPluginInstaller::new(dir.path().join("bamboo-home"));
+
+        let plugin_dir = dir.path().join("plugin-src");
+        write_skill_dirs(&plugin_dir, &["hello-world"]).await;
+        let manifest = manifest_with(vec!["hello-world"], vec![]);
+
+        let error = installer
+            .install(
+                &manifest,
+                &plugin_dir,
+                PluginSource::LocalDir {
+                    path: plugin_dir.clone(),
+                },
+                InstallDisposition::FailIfInstalled,
                 Utc::now(),
             )
             .await
@@ -307,5 +480,91 @@ mod tests {
         // registration never completed.
         let plugins = installer.list().await.expect("list");
         assert!(plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_fails_if_already_installed_under_fail_disposition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bamboo_home = dir.path().join("bamboo-home");
+        let installer = LocalPluginInstaller::new(bamboo_home.clone());
+
+        // Seed provenance with an existing install of the same id.
+        let mut store = InstalledPlugins::default();
+        store.add(InstalledPlugin {
+            id: "hello-plugin".to_string(),
+            version: "0.0.1".to_string(),
+            source: PluginSource::LocalDir {
+                path: dir.path().to_path_buf(),
+            },
+            plugin_dir: bamboo_home.join("plugins").join("hello-plugin"),
+            installed_at: Utc::now(),
+            registered: RegisteredCapabilities::default(),
+        });
+        store
+            .save(&bamboo_home.join("plugins").join("installed.json"))
+            .await
+            .unwrap();
+
+        let plugin_dir = dir.path().join("plugin-src");
+        write_skill_dirs(&plugin_dir, &["hello-world"]).await;
+        let manifest = manifest_with(vec!["hello-world"], vec![]);
+
+        let error = installer
+            .install(
+                &manifest,
+                &plugin_dir,
+                PluginSource::LocalDir {
+                    path: plugin_dir.clone(),
+                },
+                InstallDisposition::FailIfInstalled,
+                Utc::now(),
+            )
+            .await
+            .expect_err("already-installed under FailIfInstalled should error");
+        assert!(matches!(error, PluginError::AlreadyInstalled(_)));
+    }
+
+    #[tokio::test]
+    async fn upgrade_disposition_proceeds_past_the_already_installed_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bamboo_home = dir.path().join("bamboo-home");
+        let installer = LocalPluginInstaller::new(bamboo_home.clone());
+
+        // Same seed as the FailIfInstalled test.
+        let mut store = InstalledPlugins::default();
+        store.add(InstalledPlugin {
+            id: "hello-plugin".to_string(),
+            version: "0.0.1".to_string(),
+            source: PluginSource::LocalDir {
+                path: dir.path().to_path_buf(),
+            },
+            plugin_dir: bamboo_home.join("plugins").join("hello-plugin"),
+            installed_at: Utc::now(),
+            registered: RegisteredCapabilities::default(),
+        });
+        store
+            .save(&bamboo_home.join("plugins").join("installed.json"))
+            .await
+            .unwrap();
+
+        let plugin_dir = dir.path().join("plugin-src");
+        write_skill_dirs(&plugin_dir, &["hello-world"]).await;
+        let manifest = manifest_with(vec!["hello-world"], vec![]);
+
+        // Upgrade must NOT hit AlreadyInstalled; it proceeds to the (still
+        // later-agent) registration TODO.
+        let error = installer
+            .install(
+                &manifest,
+                &plugin_dir,
+                PluginSource::LocalDir {
+                    path: plugin_dir.clone(),
+                },
+                InstallDisposition::Upgrade,
+                Utc::now(),
+            )
+            .await
+            .expect_err("registration wiring is a later-agent TODO");
+        assert!(matches!(error, PluginError::NotImplemented(_)));
     }
 }
