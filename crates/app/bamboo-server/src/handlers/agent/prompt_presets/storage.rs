@@ -11,11 +11,11 @@ use super::types::{PromptPresetStore, StoredPromptPreset, DEFAULT_PRESET_ID};
 const STORE_FILE_NAME: &str = "prompt-presets.json";
 const MAX_PRESET_ID_LEN: usize = 80;
 
-pub(super) fn store_file_path(app_data_dir: &Path) -> PathBuf {
+pub(crate) fn store_file_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(STORE_FILE_NAME)
 }
 
-pub(super) async fn load_store(path: &Path) -> Result<PromptPresetStore, AppError> {
+pub(crate) async fn load_store(path: &Path) -> Result<PromptPresetStore, AppError> {
     if !path.exists() {
         return Ok(PromptPresetStore::default());
     }
@@ -30,7 +30,7 @@ pub(super) async fn load_store(path: &Path) -> Result<PromptPresetStore, AppErro
     Ok(store)
 }
 
-pub(super) async fn save_store(path: &Path, store: &PromptPresetStore) -> Result<(), AppError> {
+pub(crate) async fn save_store(path: &Path, store: &PromptPresetStore) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -99,7 +99,7 @@ pub(super) fn slugify_name(name: &str) -> String {
     }
 }
 
-pub(super) fn ensure_unique_preset_id(base_id: &str, existing: &HashSet<String>) -> String {
+pub(crate) fn ensure_unique_preset_id(base_id: &str, existing: &HashSet<String>) -> String {
     let mut normalized_base = base_id.trim().to_string();
     if normalized_base.len() > MAX_PRESET_ID_LEN {
         normalized_base = normalized_base.chars().take(MAX_PRESET_ID_LEN).collect();
