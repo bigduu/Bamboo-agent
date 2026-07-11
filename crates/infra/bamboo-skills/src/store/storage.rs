@@ -10,6 +10,10 @@ use crate::types::{SkillDefinition, SkillResult};
 pub enum SkillDirectorySource {
     Global,
     Project,
+    /// `~/.bamboo/plugins/<plugin-id>/skills` — an installed plugin's skills,
+    /// discovered *in place* (no copy, no symlink). See
+    /// [`discover_plugin_skill_dirs`].
+    Plugin,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +127,58 @@ pub async fn load_skills_from_discovery_dirs(
 
     info!("Loaded {} skill records from discovery dirs", loaded.len());
     Ok(loaded)
+}
+
+/// Discover additional skill-discovery dirs contributed by installed
+/// plugins: one `SkillDiscoveryDir` per `<plugins_root>/<plugin-id>/skills`
+/// subdirectory.
+///
+/// This does NOT require a `plugin.json` to exist or be valid — it globs
+/// whatever plugin directories are present under `plugins_root` and points a
+/// discovery dir at each one's `skills/` subdirectory. `load_skills_from_discovery_dirs`
+/// already skips a discovery dir that doesn't exist, so a plugin with no
+/// `skills/` subdirectory (or none of its declared skills) is a silent no-op
+/// here, not an error. Plugin skills carry no mode (plugins aren't aware of
+/// `active_mode`).
+pub async fn discover_plugin_skill_dirs(plugins_root: &Path) -> Vec<SkillDiscoveryDir> {
+    let mut discovered = Vec::new();
+
+    let mut entries = match fs::read_dir(plugins_root).await {
+        Ok(entries) => entries,
+        Err(_) => {
+            // Missing (no plugins installed yet) or unreadable — both are a
+            // silent no-op; `installed.json` living alongside plugin dirs is
+            // not itself a directory so it's naturally skipped below anyway.
+            return discovered;
+        }
+    };
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!("Failed to read plugins dir {:?}: {}", plugins_root, error);
+                break;
+            }
+        };
+
+        let is_dir = match entry.file_type().await {
+            Ok(file_type) => file_type.is_dir(),
+            Err(_) => false,
+        };
+        if !is_dir {
+            continue;
+        }
+
+        discovered.push(SkillDiscoveryDir {
+            dir: entry.path().join("skills"),
+            source: SkillDirectorySource::Plugin,
+            mode: None,
+        });
+    }
+
+    discovered
 }
 
 pub fn skill_path(skills_dir: &Path, skill_id: &str) -> PathBuf {

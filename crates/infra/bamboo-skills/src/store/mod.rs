@@ -60,8 +60,8 @@ use tracing::info;
 use crate::store::builtin::load_builtin_skill_bundles;
 use crate::store::parser::render_skill_markdown;
 use crate::store::storage::{
-    ensure_skills_dir, load_skills_from_discovery_dirs, write_skill_file, SkillDirectorySource,
-    SkillDiscoveryDir,
+    discover_plugin_skill_dirs, ensure_skills_dir, load_skills_from_discovery_dirs,
+    write_skill_file, SkillDirectorySource, SkillDiscoveryDir,
 };
 use crate::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
@@ -143,6 +143,22 @@ impl SkillStore {
 
     fn project_skills_mode_dir(project_dir: &Path, mode: &str) -> PathBuf {
         project_dir.join(".bamboo").join(format!("skills-{mode}"))
+    }
+
+    /// Root directory under which installed plugins live, derived as a
+    /// sibling of `skills_dir` (same pattern as [`Self::sibling_skills_mode_dir`]),
+    /// so tests that point `skills_dir` at a tempdir automatically get an
+    /// isolated `<tempdir>/plugins` instead of accidentally globbing the
+    /// real `~/.bamboo/plugins` on whatever machine runs the test. In
+    /// production `skills_dir` is `${BAMBOO_DATA_DIR}/skills`, so this
+    /// resolves to the same place as `bamboo_config::paths::plugins_dir()`
+    /// (`${BAMBOO_DATA_DIR}/plugins`).
+    fn plugins_root_dir(base_skills_dir: &Path) -> PathBuf {
+        let parent = base_skills_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        parent.join("plugins")
     }
 
     fn discovery_dirs_for_mode(&self, mode_override: Option<&str>) -> Vec<SkillDiscoveryDir> {
@@ -230,19 +246,36 @@ impl SkillStore {
         &self,
         mode_override: Option<&str>,
     ) -> SkillResult<(HashMap<SkillId, SkillDefinition>, HashMap<SkillId, PathBuf>)> {
-        let loaded_records =
-            load_skills_from_discovery_dirs(&self.discovery_dirs_for_mode(mode_override)).await?;
+        let mut dirs = self.discovery_dirs_for_mode(mode_override);
+        let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
+        dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
+
+        let loaded_records = load_skills_from_discovery_dirs(&dirs).await?;
         Ok(Self::resolve_from_loaded_records(loaded_records))
+    }
+
+    /// Precedence rank: higher wins when two discovery dirs provide the same
+    /// skill id. Plugin-provided skills sit BELOW both Global and Project so
+    /// an installed plugin can never silently shadow a user's own global or
+    /// project skill of the same id; within the same source tier, a
+    /// mode-specific candidate still overrides a generic one (unchanged from
+    /// the pre-plugin behavior).
+    fn source_rank(source: SkillDirectorySource) -> u8 {
+        match source {
+            SkillDirectorySource::Plugin => 0,
+            SkillDirectorySource::Global => 1,
+            SkillDirectorySource::Project => 2,
+        }
     }
 
     fn should_override_skill(
         existing: &SkillCandidateMeta,
         candidate: &SkillCandidateMeta,
     ) -> bool {
-        match (existing.source, candidate.source) {
-            (SkillDirectorySource::Global, SkillDirectorySource::Project) => return true,
-            (SkillDirectorySource::Project, SkillDirectorySource::Global) => return false,
-            _ => {}
+        let existing_rank = Self::source_rank(existing.source);
+        let candidate_rank = Self::source_rank(candidate.source);
+        if existing_rank != candidate_rank {
+            return candidate_rank > existing_rank;
         }
 
         match (existing.mode.is_some(), candidate.mode.is_some()) {
@@ -1084,6 +1117,143 @@ Use this skill for testing.
             .await
             .expect("mode-target-skill must exist");
         assert_eq!(skill.description, "generic version");
+    }
+
+    #[tokio::test]
+    async fn plugin_skill_is_discovered_in_place() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        let plugin_skills_dir = data_dir.join("plugins").join("hello-plugin").join("skills");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        let plugin_skill_root = write_skill(
+            &plugin_skills_dir,
+            "hello-world",
+            "plugin skill",
+            "Say hello from the plugin.",
+        )
+        .await
+        .expect("write plugin skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: None,
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        let skill = store
+            .get_skill("hello-world")
+            .await
+            .expect("plugin skill must be discovered in place");
+        assert_eq!(skill.description, "plugin skill");
+
+        // "In place": the resolved root is the plugin's own directory, not a
+        // copy elsewhere.
+        let resolved_root = store
+            .get_skill_root("hello-world")
+            .await
+            .expect("skill root");
+        let resolved_root = fs::canonicalize(resolved_root)
+            .await
+            .expect("canonical resolved root");
+        let expected_root = fs::canonicalize(&plugin_skill_root)
+            .await
+            .expect("canonical expected root");
+        assert_eq!(resolved_root, expected_root);
+    }
+
+    #[tokio::test]
+    async fn global_skill_overrides_plugin_skill_with_same_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        let plugin_skills_dir = data_dir.join("plugins").join("hello-plugin").join("skills");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        fs::create_dir_all(&plugin_skills_dir)
+            .await
+            .expect("create plugin skills dir");
+
+        write_skill(
+            &global_skills_dir,
+            "shared-skill",
+            "global version",
+            "Global prompt",
+        )
+        .await
+        .expect("write global skill");
+        write_skill(
+            &plugin_skills_dir,
+            "shared-skill",
+            "plugin version",
+            "Plugin prompt",
+        )
+        .await
+        .expect("write plugin skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: None,
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        let skill = store
+            .get_skill("shared-skill")
+            .await
+            .expect("shared-skill must exist");
+        assert_eq!(
+            skill.description, "global version",
+            "a global skill must win over a plugin skill sharing its id"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_picks_up_a_newly_installed_plugin_skill() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir.clone(),
+            project_dir: None,
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        assert!(store.get_skill("late-plugin-skill").await.is_err());
+
+        // Simulate a plugin being installed after the store was initialized.
+        let plugin_skills_dir = data_dir.join("plugins").join("late-plugin").join("skills");
+        fs::create_dir_all(&plugin_skills_dir)
+            .await
+            .expect("create plugin skills dir");
+        write_skill(
+            &plugin_skills_dir,
+            "late-plugin-skill",
+            "installed later",
+            "Hi from a freshly installed plugin.",
+        )
+        .await
+        .expect("write plugin skill");
+
+        let skills = store.list_skills(None, true).await;
+        assert!(
+            skills.iter().any(|skill| skill.id == "late-plugin-skill"),
+            "list_skills(refresh=true) must pick up a plugin installed after initialize()"
+        );
     }
 
     #[tokio::test]
