@@ -7,6 +7,10 @@
 //! transient mac API error must never break a run.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+// `Once` is only referenced inside the macOS-gated `warm_notification_center`
+// below; an unconditional import is an unused-import ERROR (`-D warnings`) on
+// the Linux CI lint runner.
+#[cfg(target_os = "macos")]
 use std::sync::Once;
 
 use super::{NotificationSink, SinkNotification};
