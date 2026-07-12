@@ -171,15 +171,11 @@ impl CompositionExecutor {
         let mut last_success = None;
 
         for result in results {
-            match result {
-                Ok(tool_result) => {
-                    if !tool_result.success {
-                        return Ok(tool_result);
-                    }
-                    last_success = Some(tool_result);
-                }
-                Err(error) => return Err(error),
+            let tool_result = result?;
+            if !tool_result.success {
+                return Ok(tool_result);
             }
+            last_success = Some(tool_result);
         }
 
         Ok(last_success.unwrap_or_else(|| Self::default_result("all branches completed", true)))
@@ -222,14 +218,10 @@ impl CompositionExecutor {
         let mut last_success = None;
 
         for result in results {
-            match result {
-                Ok(tool_result) => {
-                    if tool_result.success {
-                        success_count += 1;
-                        last_success = Some(tool_result);
-                    }
-                }
-                Err(error) => return Err(error),
+            let tool_result = result?;
+            if tool_result.success {
+                success_count += 1;
+                last_success = Some(tool_result);
             }
         }
 
