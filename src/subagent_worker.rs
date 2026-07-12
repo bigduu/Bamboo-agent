@@ -69,6 +69,8 @@ pub async fn run() -> std::result::Result<(), String> {
             binary,
             model,
             permission_mode,
+            inherit_user_config,
+            forward_env,
         } => Arc::new(ClaudeCodeExecutor::new(
             binary.clone(),
             model.clone(),
@@ -78,6 +80,8 @@ pub async fn run() -> std::result::Result<(), String> {
                 &spec.storage_dir,
                 &spec.identity.child_id,
             )),
+            inherit_user_config.unwrap_or(false),
+            forward_env.clone().unwrap_or_default(),
         )),
         ExecutorSpec::CliAdapter { .. } => {
             return Err("cli_adapter executor is not implemented yet".to_string());

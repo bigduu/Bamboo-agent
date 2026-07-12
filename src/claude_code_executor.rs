@@ -62,6 +62,23 @@ const GRACEFUL_EXIT_WAIT: Duration = Duration::from_secs(5);
 /// Phase 3: bounded wait after SIGTERM before escalating to SIGKILL.
 const SIGTERM_WAIT: Duration = Duration::from_secs(2);
 
+/// Issue #443: how long [`decide_and_respond`] waits on [`HostBridge::approval_call`]
+/// before giving up and denying. A host-in-the-loop approver that never comes
+/// back (crashed UI, orphaned session, dropped WS with no error surfaced)
+/// would otherwise hang the CLI turn forever — this bounds the relay the same
+/// way the graceful-shutdown phases bound the process lifecycle.
+const APPROVAL_RELAY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Issue #443: fixed env allowlist forwarded from the parent process env to
+/// every spawned `claude` child (on top of any executor-specific
+/// `forward_env` names) — `env_clear()` in [`ClaudeCodeExecutor::build_command`]
+/// strips everything else, including `*_API_KEY` and other ambient secrets.
+/// `LC_*` (locale vars: `LC_ALL`, `LC_CTYPE`, …) is matched by prefix, not
+/// listed here.
+const ENV_ALLOWLIST: &[&str] = &[
+    "HOME", "PATH", "SHELL", "TERM", "LANG", "TMPDIR", "USER", "LOGNAME",
+];
+
 /// Resolve this actor's stable per-child storage dir, exactly like
 /// [`BambooRuntimeExecutor::build`](crate::subagent_worker::BambooRuntimeExecutor::build)
 /// (`subagent_worker.rs:194-202`): `spec.storage_dir` when the parent already
@@ -118,15 +135,31 @@ pub struct ClaudeCodeExecutor {
     /// this constructor, so tests can point it at an isolated tempdir. `None`
     /// disables resume persistence entirely (every activation is fresh).
     state_dir: Option<PathBuf>,
+    /// Issue #443: `false` (the default) adds `--strict-mcp-config` and
+    /// `--setting-sources project` so the child does NOT load the invoking
+    /// user's `~/.claude` MCP servers/skills/settings. `true` omits both
+    /// flags (the old inherit-everything behavior).
+    inherit_user_config: bool,
+    /// Issue #443: extra env var NAMES forwarded verbatim from the parent
+    /// process env, on top of the fixed [`ENV_ALLOWLIST`].
+    forward_env: Vec<String>,
+    /// Issue #443: bound on [`HostBridge::approval_call`] in
+    /// [`decide_and_respond`]. Always [`APPROVAL_RELAY_TIMEOUT`] outside
+    /// tests; overridable via [`Self::with_relay_timeout_for_test`] so a unit
+    /// test exercising the expiry path doesn't have to wait 300s.
+    relay_timeout: Duration,
 }
 
 impl ClaudeCodeExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         binary: Option<String>,
         model: Option<String>,
         permission_mode: Option<String>,
         workspace: Option<String>,
         state_dir: Option<PathBuf>,
+        inherit_user_config: bool,
+        forward_env: Vec<String>,
     ) -> Self {
         Self {
             binary: binary.unwrap_or_else(|| "claude".to_string()),
@@ -134,7 +167,19 @@ impl ClaudeCodeExecutor {
             permission_mode,
             workspace,
             state_dir,
+            inherit_user_config,
+            forward_env,
+            relay_timeout: APPROVAL_RELAY_TIMEOUT,
         }
+    }
+
+    /// Test-only override of [`Self::relay_timeout`] — production callers
+    /// always get [`APPROVAL_RELAY_TIMEOUT`]. Lets a unit test exercise the
+    /// timeout-expiry path in milliseconds instead of 300s.
+    #[cfg(test)]
+    fn with_relay_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.relay_timeout = timeout;
+        self
     }
 
     fn state_file_path(&self) -> Option<PathBuf> {
@@ -220,17 +265,53 @@ impl ClaudeCodeExecutor {
             .arg("stdio")
             .arg("--replay-user-messages")
             .arg("--verbose");
-        if let Some(mode) = &self.permission_mode {
-            cmd.arg("--permission-mode").arg(mode);
-        }
+        // Issue #443 CRITICAL: the CLI's headless stream-json default
+        // permission mode is `auto` (self-approve every tool, never asks) --
+        // NOT `default`. Passing no `--permission-mode` flag therefore means
+        // every actor silently self-approves. Always pass an EXPLICIT mode:
+        // the configured value when set, else `default` -- which actually
+        // engages the local-decide policy in `decide_and_respond` below
+        // ("no host bridge -> deny unless bypassPermissions") instead of
+        // that policy being unreachable dead code.
+        cmd.arg("--permission-mode")
+            .arg(self.permission_mode.as_deref().unwrap_or("default"));
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
         if let Some(id) = resume_id {
             cmd.arg("--resume").arg(id);
         }
+        // Issue #443: isolate from the invoking user's ~/.claude setup by
+        // default -- an e2e run showed 6 MCP servers (incl. desktop
+        // control), every skill, and ~8k cache-creation tokens leaking in
+        // from global config for a single `touch`. `inherit_user_config:
+        // true` opts back into the CLI's normal (inherit-everything)
+        // behavior.
+        if !self.inherit_user_config {
+            cmd.arg("--strict-mcp-config");
+            cmd.arg("--setting-sources").arg("project");
+        }
+        // Issue #443: env allowlist. `env_clear()` plus an explicit forward
+        // list supersedes the old single `env_remove("CLAUDECODE")`
+        // hardening -- a cleared env can no longer carry a leaked CLAUDECODE
+        // (or any other ambient secret, e.g. `*_API_KEY`) from the parent at
+        // all. The `env_remove` call below is kept anyway as executable
+        // documentation of the specific nested-session hazard
+        // (docs/claude-code-executor.md, spawn flags section) and as
+        // defense-in-depth if the allowlist is ever loosened.
+        cmd.env_clear();
+        for (key, value) in std::env::vars() {
+            if ENV_ALLOWLIST.contains(&key.as_str()) || key.starts_with("LC_") {
+                cmd.env(key, value);
+            }
+        }
+        for name in &self.forward_env {
+            if let Ok(value) = std::env::var(name) {
+                cmd.env(name, value);
+            }
+        }
         // Nested-session detection: Claude Code misbehaves if it inherits its
-        // own env var from an outer session (docs/claude-code-executor.md §1).
+        // own env var from an outer session.
         cmd.env_remove("CLAUDECODE");
         if let Some(ws) = &self.workspace {
             cmd.current_dir(ws);
@@ -390,12 +471,14 @@ impl ClaudeCodeExecutor {
         let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
         let host = events.host().cloned();
         let permission_mode = self.permission_mode.clone();
+        let relay_timeout = self.relay_timeout;
         let write_tx = write_tx.clone();
         let task_request_id = request_id.clone();
         let handle = tokio::spawn(async move {
             decide_and_respond(
                 host,
                 permission_mode,
+                relay_timeout,
                 &task_request_id,
                 &tool_name,
                 input,
@@ -955,6 +1038,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 async fn decide_and_respond(
     host: Option<HostBridge>,
     permission_mode: Option<String>,
+    relay_timeout: Duration,
     request_id: &str,
     tool_name: &str,
     input: Value,
@@ -979,8 +1063,14 @@ async fn decide_and_respond(
 
     let (allow, deny_message) = if let Some(host) = host {
         let body = json!({ "tool_name": tool_name, "input": input });
-        match host.approval_call(body).await {
-            Ok(reply) => {
+        // Issue #443: bound the relay so a host-in-the-loop approver that
+        // never replies (crashed UI, orphaned session) can't hang this turn
+        // forever — `approval_call`'s own error path (the reply oneshot
+        // DROPPED) is already handled by the `Err(e)` arm below; this timeout
+        // covers the complementary case where the sender is held open but
+        // never sent.
+        match tokio::time::timeout(relay_timeout, host.approval_call(body)).await {
+            Ok(Ok(reply)) => {
                 let approved = reply
                     .get("approved")
                     .and_then(Value::as_bool)
@@ -988,7 +1078,14 @@ async fn decide_and_respond(
                 let msg = (!approved).then(|| "denied by host approver".to_string());
                 (approved, msg)
             }
-            Err(e) => (false, Some(format!("approval relay failed: {e}"))),
+            Ok(Err(e)) => (false, Some(format!("approval relay failed: {e}"))),
+            Err(_) => (
+                false,
+                Some(format!(
+                    "approval relay timed out after {}s; denying",
+                    relay_timeout.as_secs()
+                )),
+            ),
         }
     } else if permission_mode.as_deref() == Some("bypassPermissions") {
         (true, None)
@@ -1085,6 +1182,8 @@ mod tests {
             None,
             workspace,
             state_dir,
+            false,
+            Vec::new(),
         )
     }
 
@@ -1270,6 +1369,111 @@ echo '{"type":"result","subtype":"success","result":"wrote file"}'
     }
 
     #[tokio::test]
+    async fn control_request_approval_relay_times_out_and_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+read -r _assignment
+echo '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi"}}}'
+read -r control_response_line
+printf '%s\n' "$control_response_line" > "$DIR/control_response.json"
+echo '{"type":"result","subtype":"success","result":"continued after timeout"}'
+"#,
+        );
+        let (bridge, mut req_rx) = HostBridge::channel();
+        // Hold the request (and its reply oneshot::Sender) alive without ever
+        // replying — exercises the "sender held open but never sent" path,
+        // distinct from `approval_call`'s already-handled "reply dropped"
+        // error (`control_request_with_no_host_denies_and_run_continues`
+        // covers the no-bridge-at-all case; this is the bridge-present,
+        // never-answers case).
+        let held = tokio::spawn(async move { req_rx.recv().await });
+        let (sink, _rx) = EventSink::channel();
+        let sink = sink.with_host_bridge(bridge);
+        let outcome = executor(bin)
+            .with_relay_timeout_for_test(Duration::from_millis(50))
+            .run(
+                run_spec("do something"),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        assert_eq!(outcome.result.as_deref(), Some("continued after timeout"));
+
+        let written = std::fs::read_to_string(dir.path().join("control_response.json")).unwrap();
+        let value: Value = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(value["response"]["response"]["behavior"], "deny");
+        let msg = value["response"]["response"]["message"].as_str().unwrap();
+        assert!(msg.contains("timed out"), "unexpected deny message: {msg}");
+        assert!(msg.contains("denying"), "unexpected deny message: {msg}");
+
+        // Keep the reply sender alive until here (past the run's completion)
+        // so the timeout path — not a dropped-sender race — is what fired.
+        let _req = held.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn env_allowlist_blocks_canary_secret_but_forwards_listed_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            dir.path(),
+            r#"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+env > "$DIR/env-dump.txt"
+read -r _assignment
+echo '{"type":"result","subtype":"success","result":"ok"}'
+"#,
+        );
+        // A secret-shaped var that must NOT reach the child (not on the fixed
+        // allowlist, not in `forward_env`), and a var that MUST reach it
+        // (explicitly named in `forward_env` — the billing opt-in escape
+        // hatch, e.g. for ANTHROPIC_API_KEY).
+        std::env::set_var("FAKE_SECRET_API_KEY", "leaked-if-broken");
+        std::env::set_var("BAMBOO_TEST_FORWARD_ME", "forwarded-value");
+
+        let exec = ClaudeCodeExecutor::new(
+            Some(bin.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            vec!["BAMBOO_TEST_FORWARD_ME".to_string()],
+        );
+        let (sink, _rx) = EventSink::channel();
+        let outcome = exec
+            .run(
+                run_spec("hi"),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        std::env::remove_var("FAKE_SECRET_API_KEY");
+        std::env::remove_var("BAMBOO_TEST_FORWARD_ME");
+
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let dump = std::fs::read_to_string(dir.path().join("env-dump.txt")).unwrap();
+        assert!(
+            !dump.contains("FAKE_SECRET_API_KEY"),
+            "canary secret leaked into the child env:\n{dump}"
+        );
+        assert!(
+            dump.contains("BAMBOO_TEST_FORWARD_ME=forwarded-value"),
+            "forward_env-listed var missing from the child env:\n{dump}"
+        );
+        // Sanity: PATH (fixed allowlist) must still be present — otherwise
+        // the stub couldn't have run `env`/`cat`-family commands at all, and
+        // this test would be vacuously passing.
+        assert!(dump.contains("PATH="), "PATH missing from the child env");
+    }
+
+    #[tokio::test]
     async fn cancel_kills_the_child_process_group() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_stub(
@@ -1350,6 +1554,8 @@ echo '{{"type":"result","subtype":"success","result":"ok"}}'
             None,
             None,
             None,
+            false,
+            Vec::new(),
         )
         .run(
             run_spec("hi"),

@@ -105,15 +105,14 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
                 Some("bamboo_runtime") | None => {
                     bamboo_subagent::provision::ExecutorSpec::BambooRuntime
                 }
-                // The profile schema has no dedicated model/permission-mode
-                // fields yet for a non-bamboo_runtime executor (#441 follow-up);
-                // this kind runs with the CLI's own defaults (binary `claude`
-                // on PATH, default permission mode) until that's plumbed
-                // through.
+                // #443: binary/model/permission_mode/isolation/env-forward
+                // are plumbed from the profile's `claude_code_*` fields.
                 Some("claude_code") => bamboo_subagent::provision::ExecutorSpec::ClaudeCode {
-                    binary: None,
-                    model: None,
-                    permission_mode: None,
+                    binary: profile.claude_code_binary.clone(),
+                    model: profile.claude_code_model.clone(),
+                    permission_mode: profile.claude_code_permission_mode.clone(),
+                    inherit_user_config: profile.claude_code_inherit_user_config,
+                    forward_env: profile.claude_code_forward_env.clone(),
                 },
                 Some(other) => {
                     tracing::error!(
@@ -224,13 +223,15 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
     let executor = match sub.executor.as_deref() {
         Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
         Some("bamboo_runtime") | None => bamboo_subagent::provision::ExecutorSpec::BambooRuntime,
-        // See the matching arm in `build_external_child_runner` above: no
-        // config field carries model/permission-mode for this kind yet, so it
-        // runs with the CLI's own defaults (#441 follow-up).
+        // #443: binary/model/permission_mode/isolation/env-forward are
+        // plumbed from `subagents.claude_code_*` — mirrors the matching arm
+        // in `build_external_child_runner` above.
         Some("claude_code") => bamboo_subagent::provision::ExecutorSpec::ClaudeCode {
-            binary: None,
-            model: None,
-            permission_mode: None,
+            binary: sub.claude_code_binary.clone(),
+            model: sub.claude_code_model.clone(),
+            permission_mode: sub.claude_code_permission_mode.clone(),
+            inherit_user_config: sub.claude_code_inherit_user_config,
+            forward_env: sub.claude_code_forward_env.clone(),
         },
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };

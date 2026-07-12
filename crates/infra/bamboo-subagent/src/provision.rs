@@ -222,9 +222,11 @@ pub enum ExecutorSpec {
     /// Drive the official Claude Code CLI (`claude`) as the engine over its
     /// stream-json wire protocol (see `docs/claude-code-executor.md`). `binary`
     /// overrides the executable (tests point it at a stub script); `None` runs
-    /// `claude` from `PATH`. `model`/`permission_mode` map to the CLI's
-    /// `--model` / `--permission-mode` flags; `None` omits the flag (CLI
-    /// default).
+    /// `claude` from `PATH`. `model` maps to the CLI's `--model` flag; `None`
+    /// omits it (CLI default). `permission_mode` maps to `--permission-mode`;
+    /// `None` no longer omits the flag — the executor passes an EXPLICIT
+    /// `default` (issue #443: the CLI's headless stream-json default is
+    /// `auto`, which self-approves every tool and never asks).
     ClaudeCode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary: Option<String>,
@@ -232,6 +234,21 @@ pub enum ExecutorSpec {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
+        /// Issue #443: `false`/`None` (the default) isolates the child from
+        /// the invoking user's `~/.claude` setup (`--strict-mcp-config` +
+        /// `--setting-sources project`) — an e2e run showed 6 MCP servers
+        /// (incl. desktop control), all skills, and ~8k cache-creation tokens
+        /// leaking in from global config. `Some(true)` opts back into the old
+        /// inherit-everything behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherit_user_config: Option<bool>,
+        /// Issue #443: extra env var NAMES (verbatim, not values) forwarded
+        /// to the child from the parent process env, on top of the fixed
+        /// HOME/PATH/SHELL/TERM/LANG/LC_*/TMPDIR/USER/LOGNAME allowlist.
+        /// Forwarding `ANTHROPIC_API_KEY` here is an explicit opt-in that
+        /// flips billing from the CLI's own subscription auth to the API key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forward_env: Option<Vec<String>>,
     },
 }
 
@@ -548,10 +565,14 @@ mod tests {
             binary: Some("/usr/local/bin/claude".into()),
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("bypassPermissions".into()),
+            inherit_user_config: Some(true),
+            forward_env: Some(vec!["ANTHROPIC_API_KEY".into()]),
         };
         let vcc = serde_json::to_value(&claude_code).unwrap();
         assert_eq!(vcc["kind"], "claude_code");
         assert_eq!(vcc["binary"], "/usr/local/bin/claude");
+        assert_eq!(vcc["inherit_user_config"], true);
+        assert_eq!(vcc["forward_env"][0], "ANTHROPIC_API_KEY");
         // Round-trips.
         assert_eq!(
             serde_json::from_value::<ExecutorSpec>(vcc).unwrap(),
@@ -561,6 +582,8 @@ mod tests {
             binary: None,
             model: None,
             permission_mode: None,
+            inherit_user_config: None,
+            forward_env: None,
         };
         let vmin = serde_json::to_value(&minimal).unwrap();
         assert_eq!(vmin, serde_json::json!({"kind": "claude_code"}));
