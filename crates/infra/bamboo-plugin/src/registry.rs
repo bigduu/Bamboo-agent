@@ -31,12 +31,34 @@ pub enum PluginSource {
     LocalDir { path: PathBuf },
     /// Installed by unpacking a local `.tar.gz` archive.
     LocalArchive { path: PathBuf },
-    /// Installed by fetching a URL (optionally sha256-verified).
+    /// Installed by fetching a URL. Secure by default: `sha256` is the
+    /// user-verified hash of the downloaded BUNDLE (the `plugin.json`, or
+    /// the archive containing it) — `Some` in the normal case, confirmed
+    /// against a caller-supplied expected hash BEFORE anything was
+    /// extracted/trusted. `sha256` is `None` only when the install
+    /// explicitly opted out of verification (`allow_unverified: true`, no
+    /// hash supplied) — an install refuses outright rather than silently
+    /// trusting an unpinned download, so `None` here always means a
+    /// deliberate risk acceptance, never an oversight.
     Url {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sha256: Option<String>,
+        /// Recorded for audit: true when this install ran with
+        /// `allow_unverified` and no `sha256`. `#[serde(default)]` so a
+        /// pre-existing `installed.json` row (written before this field
+        /// existed, back when only the per-platform binary artifact was
+        /// pinned) loads as `false` rather than failing to deserialize.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_unverified: bool,
     },
+}
+
+/// `skip_serializing_if` helper for a `bool` field that should be omitted
+/// from the JSON when `false` (serde has no built-in equivalent of
+/// `std::ops::Not::not` that takes a reference).
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Exactly what an installed plugin registered into Bamboo's shared capability

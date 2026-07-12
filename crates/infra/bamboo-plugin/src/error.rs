@@ -71,6 +71,29 @@ pub enum PluginError {
     #[error("artifact verification failed: {0}")]
     ArtifactVerificationFailed(String),
 
+    /// A downloaded URL plugin BUNDLE (the `plugin.json` or the archive
+    /// containing it — whatever the app layer's URL-source fetch downloads)
+    /// did not hash to the caller-supplied expected sha256. Checked BEFORE
+    /// any extraction/parsing, so a tampered bundle is never trusted even
+    /// partially. Distinct from [`Self::ArtifactVerificationFailed`] (which
+    /// is pinned by a hash declared INSIDE the manifest — itself only
+    /// trustworthy once the bundle carrying it is verified): this is the
+    /// root-of-trust check that closes the circular-trust hole where the
+    /// manifest's own artifact hash could be rewritten by whoever tampered
+    /// with the bundle.
+    #[error("bundle verification failed: {0}")]
+    BundleVerificationFailed(String),
+
+    /// A URL plugin install/update was requested with neither a `sha256` to
+    /// verify the downloaded bundle against, nor an explicit
+    /// `allow_unverified` opt-in. This is the secure-by-default refusal: a
+    /// URL install must be either checksum-pinned or an explicit,
+    /// deliberate risk acceptance — never a silent "download and trust any
+    /// tar.gz". Raised BEFORE the URL is ever fetched (no network access
+    /// happens for a refused install).
+    #[error("{0}")]
+    ChecksumRequired(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
