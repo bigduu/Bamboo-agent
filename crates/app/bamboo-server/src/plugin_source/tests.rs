@@ -509,9 +509,68 @@ async fn zip_symlink_mode_entry_lands_inert_as_a_regular_file() {
 // ---------------------------------------------------------------------
 // Url
 // ---------------------------------------------------------------------
+//
+// Secure-by-default policy under test throughout this section (see
+// `plugin_source.rs`'s module docs and `fetch_manifest_bundle`):
+//   - a correct bundle sha256 -> verified, install proceeds, the VERIFIED
+//     hash (not the caller's literal input) is recorded in provenance.
+//   - a WRONG bundle sha256 -> `BundleVerificationFailed`, nothing staged.
+//   - no sha256 and `allow_unverified: false` (the default) -> refused
+//     with `ChecksumRequired`, BEFORE the URL is ever fetched.
+//   - no sha256 and `allow_unverified: true` -> proceeds (explicit opt-out).
+
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn url_input(url: &str, sha256: Option<&str>, allow_unverified: bool) -> PluginSourceInput {
+    PluginSourceInput::Url {
+        url: url.to_string(),
+        sha256: sha256.map(|s| s.to_string()),
+        allow_unverified,
+    }
+}
 
 #[tokio::test]
-async fn stages_bare_manifest_from_url_with_no_artifact() {
+async fn stages_bare_manifest_from_url_with_correct_bundle_sha256() {
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let bundle_sha256 = sha256_hex_of(manifest_body.as_bytes());
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+    let staged = stage_plugin_source(url_input(&url, Some(&bundle_sha256), false), &plugins_root)
+        .await
+        .expect("a correct bundle sha256 must verify and stage successfully");
+
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    // The VERIFIED bundle sha256 is what's recorded — this is the
+    // provenance/audit trail a re-install or `plugin list` can trust,
+    // distinct from any per-platform binary artifact hash.
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: Some(bundle_sha256),
+            allow_unverified: false,
+        }
+    );
+    // No skill files were bundled with a bare manifest fetch.
+    assert!(!staged.plugin_dir.join("skills").exists());
+    staged.commit().await;
+}
+
+#[tokio::test]
+async fn url_install_with_wrong_bundle_sha256_is_rejected_before_unpacking() {
     let server = wiremock::MockServer::start().await;
     let manifest_body = hello_manifest_json("hello-plugin");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -523,14 +582,95 @@ async fn stages_bare_manifest_from_url_with_no_artifact() {
     let root = tempfile::tempdir().unwrap();
     let plugins_root = root.path().join("plugins");
     let url = format!("{}/plugin.json", server.uri());
-    let staged = stage_plugin_source(PluginSourceInput::Url(url.clone()), &plugins_root)
+    let wrong_sha256 = "b".repeat(64);
+    let error = stage_plugin_source(url_input(&url, Some(&wrong_sha256), false), &plugins_root)
         .await
-        .expect("stage bare manifest url");
+        .expect_err("a bundle sha256 mismatch must be rejected");
+    assert!(
+        matches!(error, PluginError::BundleVerificationFailed(_)),
+        "expected BundleVerificationFailed, got {error:?}"
+    );
+    assert!(error.to_string().contains(&url));
+
+    // Nothing committed, and no stray staging dir left under plugins_root.
+    assert!(!plugins_root.join("hello-plugin").exists());
+    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
+    assert!(
+        leftovers.next_entry().await.unwrap().is_none(),
+        "a rejected bundle checksum mismatch must leave nothing under plugins_root"
+    );
+}
+
+#[tokio::test]
+async fn url_install_without_checksum_or_allow_unverified_is_refused_before_fetch() {
+    // No mock is mounted at all — if the refusal did NOT happen before the
+    // fetch, this test would hang/error on an unmatched request instead of
+    // cleanly returning `ChecksumRequired`.
+    let server = wiremock::MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    let error = stage_plugin_source(url_input(&url, None, false), &plugins_root)
+        .await
+        .expect_err("no sha256 and no allow_unverified must be refused");
+    assert!(
+        matches!(error, PluginError::ChecksumRequired(_)),
+        "expected ChecksumRequired, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("sha256"), "{message}");
+    assert!(
+        message.contains("allow_unverified") || message.contains("allow-unverified"),
+        "{message}"
+    );
+
+    // The core assertion: `bamboo plugin install <url>` alone must not just
+    // download and trust any tar.gz — confirm the server genuinely never
+    // received a request for it.
+    let received = server.received_requests().await;
+    assert_eq!(
+        received.map(|requests| requests.len()),
+        Some(0),
+        "refusing an unverified URL install must happen BEFORE the URL is ever fetched"
+    );
+
+    // Nothing committed, and no stray staging dir left under plugins_root.
+    assert!(!plugins_root.join("hello-plugin").exists());
+    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
+    assert!(
+        leftovers.next_entry().await.unwrap().is_none(),
+        "a refused unverified install must leave nothing under plugins_root"
+    );
+}
+
+#[tokio::test]
+async fn url_install_with_allow_unverified_and_no_sha256_succeeds() {
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+    let staged = stage_plugin_source(url_input(&url, None, true), &plugins_root)
+        .await
+        .expect("allow_unverified must let an unpinned URL install through");
 
     assert_eq!(staged.manifest.id, "hello-plugin");
-    assert_eq!(staged.source, PluginSource::Url { url, sha256: None });
-    // No skill files were bundled with a bare manifest fetch.
-    assert!(!staged.plugin_dir.join("skills").exists());
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: None,
+            allow_unverified: true,
+        },
+        "an allow_unverified install has no bundle sha256 to record"
+    );
     staged.commit().await;
 }
 
@@ -576,23 +716,22 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
         "hello-plugin"
     };
     let archive_bytes = build_targz(&[(binary_name, b"#!/bin/sh\necho hi\n")]);
-    let sha256 = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&archive_bytes);
-        hex::encode(hasher.finalize())
-    };
+    let artifact_sha256 = sha256_hex_of(&archive_bytes);
+
+    let manifest_body = manifest_with_artifact(
+        "hello-plugin",
+        current_platform_key(),
+        &artifact_sha256,
+        &format!("{}/hello-plugin.tar.gz", server.uri()),
+    );
+    // The BUNDLE (this manifest.json response) is verified independently of
+    // the binary artifact's own sha256 declared inside it — pin it here so
+    // this test exercises both checks staying in force together.
+    let bundle_sha256 = sha256_hex_of(manifest_body.as_bytes());
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/plugin.json"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_string(manifest_with_artifact(
-                "hello-plugin",
-                current_platform_key(),
-                &sha256,
-                &format!("{}/hello-plugin.tar.gz", server.uri()),
-            )),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -604,7 +743,7 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
     let root = tempfile::tempdir().unwrap();
     let plugins_root = root.path().join("plugins");
     let url = format!("{}/plugin.json", server.uri());
-    let staged = stage_plugin_source(PluginSourceInput::Url(url), &plugins_root)
+    let staged = stage_plugin_source(url_input(&url, Some(&bundle_sha256), false), &plugins_root)
         .await
         .expect("stage manifest + artifact");
 
@@ -629,12 +768,17 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
         assert_eq!(mode & 0o111, 0o111, "binary should be executable");
     }
 
-    match staged.source {
+    // Provenance records the verified BUNDLE sha256, not the binary
+    // artifact's — they're deliberately different hashes here, so this
+    // also confirms the two checks aren't accidentally conflated.
+    assert_eq!(
+        staged.source,
         PluginSource::Url {
-            sha256: Some(_), ..
-        } => {}
-        other => panic!("expected Url source with a recorded sha256, got {other:?}"),
-    }
+            url,
+            sha256: Some(bundle_sha256),
+            allow_unverified: false,
+        }
+    );
     staged.commit().await;
 }
 
@@ -643,18 +787,21 @@ async fn artifact_sha256_mismatch_is_rejected_before_unpacking() {
     let server = wiremock::MockServer::start().await;
 
     let archive_bytes = build_targz(&[("hello-plugin", b"whatever")]);
-    let wrong_sha256 = "a".repeat(64);
+    let wrong_artifact_sha256 = "a".repeat(64);
+
+    let manifest_body = manifest_with_artifact(
+        "hello-plugin",
+        current_platform_key(),
+        &wrong_artifact_sha256,
+        &format!("{}/hello-plugin.tar.gz", server.uri()),
+    );
+    // Pin the BUNDLE correctly so this test isolates the artifact-level
+    // check (the bundle-level check is exercised separately above).
+    let bundle_sha256 = sha256_hex_of(manifest_body.as_bytes());
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/plugin.json"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_string(manifest_with_artifact(
-                "hello-plugin",
-                current_platform_key(),
-                &wrong_sha256,
-                &format!("{}/hello-plugin.tar.gz", server.uri()),
-            )),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -666,9 +813,9 @@ async fn artifact_sha256_mismatch_is_rejected_before_unpacking() {
     let root = tempfile::tempdir().unwrap();
     let plugins_root = root.path().join("plugins");
     let url = format!("{}/plugin.json", server.uri());
-    let error = stage_plugin_source(PluginSourceInput::Url(url), &plugins_root)
+    let error = stage_plugin_source(url_input(&url, Some(&bundle_sha256), false), &plugins_root)
         .await
-        .expect_err("sha256 mismatch must be rejected");
+        .expect_err("artifact sha256 mismatch must be rejected");
     assert!(matches!(error, PluginError::ArtifactVerificationFailed(_)));
     assert!(
         !plugins_root.join("hello-plugin").exists(),

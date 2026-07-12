@@ -22,6 +22,8 @@
 //! | `NotFound`                    | 404 |
 //! | `InvalidManifest`             | 400 |
 //! | `ArtifactVerificationFailed`  | 400 |
+//! | `BundleVerificationFailed`    | 400 |
+//! | `ChecksumRequired`            | 400 |
 //! | `Registration` / `Io` / `Json` / `NotImplemented` | 500 |
 //!
 //! `Io`/`Json` are bucketed with `Registration` under 500 rather than 400
@@ -71,6 +73,8 @@ pub fn plugin_error_response(error: &PluginError) -> HttpResponse {
         PluginError::ArtifactVerificationFailed(_) => {
             Some(actix_web::http::StatusCode::BAD_REQUEST)
         }
+        PluginError::BundleVerificationFailed(_) => Some(actix_web::http::StatusCode::BAD_REQUEST),
+        PluginError::ChecksumRequired(_) => Some(actix_web::http::StatusCode::BAD_REQUEST),
         PluginError::Registration(_)
         | PluginError::NotImplemented(_)
         | PluginError::Io(_)
@@ -132,6 +136,14 @@ mod tests {
             ),
             (
                 PluginError::ArtifactVerificationFailed("sha256 mismatch".to_string()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                PluginError::BundleVerificationFailed("sha256 mismatch".to_string()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                PluginError::ChecksumRequired("refusing to install without a checksum".to_string()),
                 StatusCode::BAD_REQUEST,
             ),
             (
