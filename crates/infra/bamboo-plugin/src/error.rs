@@ -94,6 +94,44 @@ pub enum PluginError {
     #[error("{0}")]
     ChecksumRequired(String),
 
+    /// A URL plugin install/update's host (and path) is not in the
+    /// configured `plugin_trust.trusted_hosts` allowlist, and the request did
+    /// not set `allow_untrusted_host`. This is the SOURCE-authorization
+    /// layer (host allowlist) — distinct from [`Self::BundleVerificationFailed`]
+    /// (integrity) and [`Self::UnsignedOrUntrustedSignature`] (publisher
+    /// authenticity). Raised BEFORE the URL is ever fetched, same posture as
+    /// [`Self::ChecksumRequired`].
+    #[error("{0}")]
+    UntrustedHost(String),
+
+    /// A URL plugin bundle is unsigned, or its `.sig` sidecar does not verify
+    /// against any key in `plugin_trust.trusted_keys`, and the request did
+    /// not set `allow_unsigned`. This is the PUBLISHER-authenticity layer —
+    /// a signature proves who produced the bytes, which a bare sha256 (only
+    /// proving WHAT the bytes are) cannot. Raised after the bundle is
+    /// downloaded (the signature is verified over the downloaded bytes) but
+    /// before anything is extracted/parsed.
+    #[error("{0}")]
+    UnsignedOrUntrustedSignature(String),
+
+    /// A URL plugin install whose bytes will NOT be cryptographically
+    /// authenticated (no signature required AND no `sha256` — the fully
+    /// opted-out `allow_unsigned && allow_unverified`, "host-only trust"
+    /// case) was served an HTTP redirect instead of the bytes. In that case
+    /// the host allowlist is the SOLE control over where the bytes come
+    /// from, and it only vetted the FIRST hop — transparently following the
+    /// redirect would let the bytes come from an unvetted host and silently
+    /// defeat the allowlist, so redirects are not followed and a redirect
+    /// response is refused. A trust/authorization refusal (same 403 family
+    /// as [`Self::UntrustedHost`] / [`Self::UnsignedOrUntrustedSignature`]),
+    /// NOT a server error — it tells the caller how to proceed (install from
+    /// the canonical/final URL, provide a signature/`--sha256`, or trust the
+    /// redirect target). Does not arise once a signature or checksum is in
+    /// play: those authenticate the bytes regardless of which host served
+    /// them, so redirects are followed in that case.
+    #[error("{0}")]
+    RedirectRefused(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

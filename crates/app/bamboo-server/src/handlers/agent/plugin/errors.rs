@@ -24,7 +24,18 @@
 //! | `ArtifactVerificationFailed`  | 400 |
 //! | `BundleVerificationFailed`    | 400 |
 //! | `ChecksumRequired`            | 400 |
+//! | `UntrustedHost`               | 403 |
+//! | `UnsignedOrUntrustedSignature`| 403 |
+//! | `RedirectRefused`             | 403 |
 //! | `Registration` / `Io` / `Json` / `NotImplemented` | 500 |
+//!
+//! `UntrustedHost`/`UnsignedOrUntrustedSignature`/`RedirectRefused` are
+//! mapped to 403 rather than 400 (unlike the checksum/manifest variants
+//! above): all three are source-TRUST/authorization refusals — "you may not
+//! install from here / from this publisher / by following a redirect off the
+//! approved host without an explicit opt-out" — not a malformed request, and
+//! not a server bug (a redirect refusal must never look like a 500), which
+//! 403 fits better than either 400 or 500.
 //!
 //! `Io`/`Json` are bucketed with `Registration` under 500 rather than 400
 //! even though they can originate from a caller-supplied plugin bundle
@@ -75,6 +86,11 @@ pub fn plugin_error_response(error: &PluginError) -> HttpResponse {
         }
         PluginError::BundleVerificationFailed(_) => Some(actix_web::http::StatusCode::BAD_REQUEST),
         PluginError::ChecksumRequired(_) => Some(actix_web::http::StatusCode::BAD_REQUEST),
+        PluginError::UntrustedHost(_) => Some(actix_web::http::StatusCode::FORBIDDEN),
+        PluginError::UnsignedOrUntrustedSignature(_) => {
+            Some(actix_web::http::StatusCode::FORBIDDEN)
+        }
+        PluginError::RedirectRefused(_) => Some(actix_web::http::StatusCode::FORBIDDEN),
         PluginError::Registration(_)
         | PluginError::NotImplemented(_)
         | PluginError::Io(_)
@@ -145,6 +161,18 @@ mod tests {
             (
                 PluginError::ChecksumRequired("refusing to install without a checksum".to_string()),
                 StatusCode::BAD_REQUEST,
+            ),
+            (
+                PluginError::UntrustedHost("host not in trusted_hosts".to_string()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                PluginError::UnsignedOrUntrustedSignature("bundle is unsigned".to_string()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                PluginError::RedirectRefused("refused to follow a redirect".to_string()),
+                StatusCode::FORBIDDEN,
             ),
             (
                 PluginError::Registration("config write failed".to_string()),

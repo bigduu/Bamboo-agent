@@ -545,20 +545,29 @@ enum PluginCommands {
     /// the argument) — `POST /api/v1/plugins/install`. Fails if the plugin id
     /// is already installed; use `bamboo plugin update` for that case.
     ///
-    /// A URL source is secure by default: it MUST be either checksum-pinned
-    /// (`--sha256`) or explicitly opted out (`--allow-unverified`) — a bare
-    /// `bamboo plugin install <url>` with neither is refused before the URL
-    /// is even fetched.
+    /// A URL source is checked against three trust layers: a host allowlist
+    /// (`--allow-untrusted-host` opts out), an ed25519 publisher signature
+    /// (`--allow-unsigned` opts out), and a checksum (`--sha256` pins it, or
+    /// `--allow-unverified` opts out — waived automatically when the bundle
+    /// is signature-verified). The defaults trust nova's official plugin
+    /// from its GitHub release, so installing it needs NO flags at all once
+    /// it's signed; any other host/publisher needs the matching opt-out.
     #[command(after_help = "EXAMPLES:\n  \
         # From a local directory (development)\n  \
         bamboo plugin install ./my-plugin\n\n  \
         # From a packaged archive\n  \
         bamboo plugin install ./my-plugin.tar.gz\n\n  \
-        # From a URL, pinned by the bundle's sha256 (preferred)\n  \
+        # Official nova plugin from its trusted GitHub release — no flags\n  \
+        # needed once it's signed by nova's official key (both trusted by\n  \
+        # default; see `plugin_trust` in config.json)\n  \
+        bamboo plugin install https://github.com/bigduu/Nova/releases/download/v0.2.0/nova-plugin-v0.2.0.tar.gz\n\n  \
+        # From a URL, pinned by the bundle's sha256 (checksum layer only)\n  \
         bamboo plugin install https://example.com/my-plugin.tar.gz \\\n    \
-        --sha256 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1\n\n  \
-        # From a URL, explicitly accepting the risk of no checksum\n  \
-        bamboo plugin install https://example.com/my-plugin.tar.gz --allow-unverified")]
+        --sha256 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1 \\\n    \
+        --allow-untrusted-host --allow-unsigned\n\n  \
+        # From an untrusted host, explicitly accepting the risk\n  \
+        bamboo plugin install https://example.com/my-plugin.tar.gz \\\n    \
+        --allow-untrusted-host --allow-unsigned --allow-unverified")]
     Install {
         /// A local directory, a local `.tar.gz`/`.tgz`/`.zip` archive, or an
         /// `http(s)://` URL — the source kind is auto-detected.
@@ -568,7 +577,8 @@ enum PluginCommands {
         /// `plugin.json`, or the archive containing it) fetched from a URL
         /// source. Only valid with a URL source; the server rejects a
         /// mismatch before unpacking anything. Without this, a URL install
-        /// also needs `--allow-unverified`.
+        /// also needs `--allow-unverified` (unless the bundle is
+        /// signature-verified, which satisfies this on its own).
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
 
@@ -578,6 +588,20 @@ enum PluginCommands {
         /// warning for every unverified install.
         #[arg(long)]
         allow_unverified: bool,
+
+        /// Explicit opt-out: install from a URL whose host is not in
+        /// `plugin_trust.trusted_hosts` (config.json; defaults to nova's
+        /// official GitHub org). Only valid with a URL source. The server
+        /// refuses BEFORE fetching unless this is set.
+        #[arg(long)]
+        allow_untrusted_host: bool,
+
+        /// Explicit opt-out: install a bundle that is unsigned, or whose
+        /// `.sig` does not verify against any key in
+        /// `plugin_trust.trusted_keys` (config.json; defaults to nova's
+        /// official signing key). Only valid with a URL source.
+        #[arg(long)]
+        allow_unsigned: bool,
 
         #[command(flatten)]
         conn: ConnArgs,
@@ -624,7 +648,8 @@ enum PluginCommands {
         /// `plugin.json`, or the archive containing it) fetched from a URL
         /// source. Only valid with a URL source; the server rejects a
         /// mismatch before unpacking anything. Without this, a URL source
-        /// also needs `--allow-unverified`.
+        /// also needs `--allow-unverified` (unless the bundle is
+        /// signature-verified, which satisfies this on its own).
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
 
@@ -632,6 +657,17 @@ enum PluginCommands {
         /// verification. Only valid with a URL source.
         #[arg(long)]
         allow_unverified: bool,
+
+        /// Explicit opt-out: update from a URL whose host is not in
+        /// `plugin_trust.trusted_hosts`. Only valid with a URL source.
+        #[arg(long)]
+        allow_untrusted_host: bool,
+
+        /// Explicit opt-out: update from a bundle that is unsigned or not
+        /// signed by a key in `plugin_trust.trusted_keys`. Only valid with a
+        /// URL source.
+        #[arg(long)]
+        allow_unsigned: bool,
 
         #[command(flatten)]
         conn: ConnArgs,
@@ -1742,6 +1778,8 @@ async fn main() {
                     source,
                     sha256,
                     allow_unverified,
+                    allow_untrusted_host,
+                    allow_unsigned,
                     conn,
                 } => {
                     bamboo_agent::plugin_cli::install(
@@ -1749,6 +1787,8 @@ async fn main() {
                         &source,
                         sha256.as_deref(),
                         allow_unverified,
+                        allow_untrusted_host,
+                        allow_unsigned,
                     )
                     .await
                 }
@@ -1763,6 +1803,8 @@ async fn main() {
                     source,
                     sha256,
                     allow_unverified,
+                    allow_untrusted_host,
+                    allow_unsigned,
                     conn,
                 } => {
                     bamboo_agent::plugin_cli::update(
@@ -1771,6 +1813,8 @@ async fn main() {
                         &source,
                         sha256.as_deref(),
                         allow_unverified,
+                        allow_untrusted_host,
+                        allow_unsigned,
                     )
                     .await
                 }
@@ -2051,6 +2095,117 @@ mod tests {
     }
 
     #[test]
+    fn plugin_install_parses_allow_untrusted_host_flag() {
+        use clap::Parser;
+
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "install",
+            "https://example.com/my-plugin.tar.gz",
+            "--allow-untrusted-host",
+        ])
+        .expect("--allow-untrusted-host should parse");
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Install {
+                    allow_untrusted_host,
+                    allow_unsigned,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(allow_untrusted_host);
+        assert!(!allow_unsigned);
+
+        // Defaults to false when omitted.
+        let parsed =
+            super::Cli::try_parse_from(["bamboo", "plugin", "install", "./my-plugin"]).unwrap();
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Install {
+                    allow_untrusted_host,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(!allow_untrusted_host);
+    }
+
+    #[test]
+    fn plugin_install_parses_allow_unsigned_flag() {
+        use clap::Parser;
+
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "install",
+            "https://example.com/my-plugin.tar.gz",
+            "--allow-unsigned",
+        ])
+        .expect("--allow-unsigned should parse");
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Install {
+                    allow_unsigned,
+                    allow_untrusted_host,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(allow_unsigned);
+        assert!(!allow_untrusted_host);
+
+        // All four flags/opts can be combined.
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "install",
+            "https://example.com/my-plugin.tar.gz",
+            "--sha256",
+            "deadbeef",
+            "--allow-unverified",
+            "--allow-untrusted-host",
+            "--allow-unsigned",
+        ])
+        .expect("all four trust flags together should parse");
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Install {
+                    sha256,
+                    allow_unverified,
+                    allow_untrusted_host,
+                    allow_unsigned,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert_eq!(sha256.as_deref(), Some("deadbeef"));
+        assert!(allow_unverified);
+        assert!(allow_untrusted_host);
+        assert!(allow_unsigned);
+
+        // Defaults to false when omitted.
+        let parsed =
+            super::Cli::try_parse_from(["bamboo", "plugin", "install", "./my-plugin"]).unwrap();
+        let super::Commands::Plugin {
+            command: super::PluginCommands::Install { allow_unsigned, .. },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(!allow_unsigned);
+    }
+
+    #[test]
     fn plugin_update_parses_id_and_source() {
         use clap::Parser;
 
@@ -2091,6 +2246,58 @@ mod tests {
             panic!("expected Plugin::Update");
         };
         assert!(allow_unverified);
+    }
+
+    #[test]
+    fn plugin_update_parses_allow_untrusted_host_and_allow_unsigned_flags() {
+        use clap::Parser;
+
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "update",
+            "hello-plugin",
+            "https://example.com/my-plugin.tar.gz",
+            "--allow-untrusted-host",
+            "--allow-unsigned",
+        ])
+        .expect("--allow-untrusted-host and --allow-unsigned should parse on update too");
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Update {
+                    allow_untrusted_host,
+                    allow_unsigned,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Update");
+        };
+        assert!(allow_untrusted_host);
+        assert!(allow_unsigned);
+
+        // Default to false when omitted.
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "update",
+            "hello-plugin",
+            "./my-plugin-v2",
+        ])
+        .unwrap();
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Update {
+                    allow_untrusted_host,
+                    allow_unsigned,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Update");
+        };
+        assert!(!allow_untrusted_host);
+        assert!(!allow_unsigned);
     }
 
     #[test]

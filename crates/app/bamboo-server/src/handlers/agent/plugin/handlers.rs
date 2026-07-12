@@ -25,10 +25,13 @@ fn plugins_root(state: &AppState) -> PathBuf {
 
 /// The wire `SourceSpec` reuses `bamboo_plugin::PluginSource`'s own serde
 /// shape (see `api_types` module docs) directly as the request body — a
-/// `url` source's `sha256`/`allow_unverified` flow straight through to
-/// `PluginSourceInput::Url`, which `plugin_source::fetch_manifest_bundle`
-/// enforces (secure by default: verify-if-given, refuse-if-absent-unless-
-/// explicitly-allowed — see that module's docs).
+/// `url` source's `sha256`/`allow_unverified`/`allow_untrusted_host`/
+/// `allow_unsigned` flow straight through to `PluginSourceInput::Url`, which
+/// `plugin_source::fetch_manifest_bundle` enforces (the three-layer trust
+/// model: host allowlist, signature, checksum — see that module's docs).
+/// `signed_by` is a RESULT of staging (which key verified), never an input,
+/// so it's dropped here — the request-side `PluginSource::Url` field is
+/// meaningless on the way in and `fetch_manifest_bundle` recomputes it fresh.
 fn to_source_input(source: PluginSource) -> PluginSourceInput {
     match source {
         PluginSource::LocalDir { path } => PluginSourceInput::LocalDir(path),
@@ -37,10 +40,15 @@ fn to_source_input(source: PluginSource) -> PluginSourceInput {
             url,
             sha256,
             allow_unverified,
+            allow_untrusted_host,
+            allow_unsigned,
+            signed_by: _,
         } => PluginSourceInput::Url {
             url,
             sha256,
             allow_unverified,
+            allow_untrusted_host,
+            allow_unsigned,
         },
     }
 }
@@ -70,11 +78,13 @@ pub async fn install_plugin(
     let installer = ServerPluginInstaller::new(state.clone());
     let root = plugins_root(&state);
     let input = to_source_input(body.into_inner().source);
+    let trust = state.config.read().await.plugin_trust.clone();
 
     match install_plugin_from_source(
         &installer,
         input,
         &root,
+        &trust,
         InstallDisposition::FailIfInstalled,
     )
     .await
@@ -102,8 +112,9 @@ pub async fn update_plugin(
     let installer = ServerPluginInstaller::new(state.clone());
     let root = plugins_root(&state);
     let input = to_source_input(body.into_inner().source);
+    let trust = state.config.read().await.plugin_trust.clone();
 
-    let staged = match stage_plugin_source(input, &root).await {
+    let staged = match stage_plugin_source(input, &root, &trust).await {
         Ok(staged) => staged,
         Err(error) => return plugin_error_response(&error),
     };

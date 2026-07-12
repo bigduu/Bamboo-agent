@@ -31,15 +31,30 @@ pub enum PluginSource {
     LocalDir { path: PathBuf },
     /// Installed by unpacking a local `.tar.gz` archive.
     LocalArchive { path: PathBuf },
-    /// Installed by fetching a URL. Secure by default: `sha256` is the
-    /// user-verified hash of the downloaded BUNDLE (the `plugin.json`, or
-    /// the archive containing it) — `Some` in the normal case, confirmed
-    /// against a caller-supplied expected hash BEFORE anything was
-    /// extracted/trusted. `sha256` is `None` only when the install
-    /// explicitly opted out of verification (`allow_unverified: true`, no
-    /// hash supplied) — an install refuses outright rather than silently
-    /// trusting an unpinned download, so `None` here always means a
-    /// deliberate risk acceptance, never an oversight.
+    /// Installed by fetching a URL. Three trust layers, all enforced by
+    /// `bamboo-server`'s `plugin_source.rs` before this record is written:
+    ///
+    /// 1. **Host allowlist** (source authorization) — was the URL's host
+    ///    fetched from an operator-trusted host (`allow_untrusted_host` opts
+    ///    out).
+    /// 2. **Signature** (publisher authenticity) — did the bundle's `.sig`
+    ///    verify against a trusted ed25519 key (`signed_by`; `allow_unsigned`
+    ///    opts out of requiring one).
+    /// 3. **Checksum** (integrity) — `sha256` is the user-verified hash of
+    ///    the downloaded BUNDLE (the `plugin.json`, or the archive containing
+    ///    it) — `Some` in the normal case, confirmed against a
+    ///    caller-supplied expected hash BEFORE anything was
+    ///    extracted/trusted.
+    ///
+    /// `sha256` is `None` either when the install explicitly opted out of
+    /// checksum verification (`allow_unverified: true`, no hash supplied), OR
+    /// when a verified signature (`signed_by: Some(_)`) already established
+    /// integrity+authenticity more strongly than a pasted checksum could —
+    /// see `plugin_source.rs`'s module docs for why a valid signature
+    /// supersedes the checksum requirement. An install refuses outright
+    /// rather than silently trusting an unpinned/unsigned download from an
+    /// untrusted host, so every `None`/`false` combination here always means
+    /// a deliberate, recorded risk acceptance, never an oversight.
     Url {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +66,23 @@ pub enum PluginSource {
         /// pinned) loads as `false` rather than failing to deserialize.
         #[serde(default, skip_serializing_if = "is_false")]
         allow_unverified: bool,
+        /// Recorded for audit: true when this install ran with
+        /// `allow_untrusted_host` against a host outside
+        /// `plugin_trust.trusted_hosts`. `#[serde(default)]` for backward
+        /// compat with rows written before this field existed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_untrusted_host: bool,
+        /// Recorded for audit: true when this install ran with
+        /// `allow_unsigned` (no valid signature from a trusted key).
+        /// `#[serde(default)]` for backward compat.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_unsigned: bool,
+        /// The label of the `plugin_trust.trusted_keys` entry the bundle's
+        /// `.sig` verified against, or `None` if the install proceeded
+        /// unsigned (`allow_unsigned: true`). `#[serde(default)]` for
+        /// backward compat with rows written before signing existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_by: Option<String>,
     },
 }
 
