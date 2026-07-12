@@ -71,11 +71,24 @@
 //!   URL is an SSRF vector. A private-IP / metadata-endpoint blocklist (or an
 //!   allowlist of plugin registries) is a threat-model call for the deploy
 //!   layer; noted here so it isn't forgotten.
-//! - **`save_store` / provenance writes are non-atomic** (`fs::write` in place,
-//!   pre-existing behaviour shared with the HTTP prompt-preset handlers): a
-//!   crash mid-write can truncate `prompt-presets.json` / `installed.json`.
-//!   A write-to-temp-then-rename would make each file update atomic; deferred
-//!   as a cross-cutting change to those shared storage helpers.
+//! - **`prompt-presets.json`'s `save_store` is non-atomic** (`fs::write` in
+//!   place, pre-existing behaviour shared with the HTTP prompt-preset
+//!   handlers): a crash mid-write can truncate `prompt-presets.json`. A
+//!   write-to-temp-then-rename would make it atomic, matching what
+//!   `bamboo_plugin::registry::InstalledPlugins::save` (`installed.json`) now
+//!   does; deferred here as a change to a shared, pre-existing storage
+//!   helper rather than this branch's new code.
+//! - **The `plugin_dir` swap in [`stage_plugin_source`] runs BEFORE
+//!   `PLUGIN_OP_LOCK` is acquired** (that lock is taken inside
+//!   `ServerPluginInstaller::install`/`uninstall`, in `crate::plugin_installer`,
+//!   which only runs after staging returns). Two concurrent installs/updates
+//!   of the SAME plugin id could therefore race the backup-rename +
+//!   staging-rename swap itself (not just the capability-registration steps
+//!   the lock does protect). Plugin ops are rare/operator-driven, not
+//!   concurrent by design, so this is accepted as a documented gap rather
+//!   than moving the lock acquisition into this module; a real fix would
+//!   need `stage_plugin_source` and `PluginInstaller::install` to share one
+//!   lock scope (a bigger seam change than this branch's fixes).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -145,11 +158,33 @@ pub async fn stage_plugin_source(
     input: PluginSourceInput,
     plugins_root: &Path,
 ) -> PluginResult<StagedPlugin> {
+    stage_plugin_source_inner(input, plugins_root, MAX_DECOMPRESSED_BYTES).await
+}
+
+/// Test-only seam for [`stage_plugin_source`] that lets a test inject a small
+/// `max_decompressed_bytes` cap (the production cap, [`MAX_DECOMPRESSED_BYTES`],
+/// is a generous 2 GiB — not practical to actually exceed in a unit test).
+/// Exercises the exact same staging/swap machinery as the production path,
+/// just with the archive-extraction ceiling parameterized.
+#[cfg(test)]
+pub(crate) async fn stage_plugin_source_with_decompressed_cap(
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    max_decompressed_bytes: u64,
+) -> PluginResult<StagedPlugin> {
+    stage_plugin_source_inner(input, plugins_root, max_decompressed_bytes).await
+}
+
+async fn stage_plugin_source_inner(
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    max_decompressed_bytes: u64,
+) -> PluginResult<StagedPlugin> {
     tokio::fs::create_dir_all(plugins_root).await?;
     let staging_dir = plugins_root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&staging_dir).await?;
 
-    let staged = stage_into(&input, &staging_dir).await;
+    let staged = stage_into(&input, &staging_dir, max_decompressed_bytes).await;
     let (manifest, source) = match staged {
         Ok(pair) => pair,
         Err(error) => {
@@ -236,6 +271,7 @@ pub async fn install_plugin_from_source(
 async fn stage_into(
     input: &PluginSourceInput,
     staging_dir: &Path,
+    max_decompressed_bytes: u64,
 ) -> PluginResult<(PluginManifest, PluginSource)> {
     match input {
         PluginSourceInput::LocalDir(path) => {
@@ -251,14 +287,21 @@ async fn stage_into(
                     path.display()
                 ))
             })?;
-            extract_archive(bytes, kind, staging_dir.to_path_buf()).await?;
+            extract_archive(
+                bytes,
+                kind,
+                staging_dir.to_path_buf(),
+                max_decompressed_bytes,
+            )
+            .await?;
             flatten_if_single_subdir(staging_dir).await?;
             let manifest = read_and_parse_manifest(staging_dir).await?;
             Ok((manifest, PluginSource::LocalArchive { path: path.clone() }))
         }
         PluginSourceInput::Url(url) => {
-            let manifest = fetch_manifest_bundle(url, staging_dir).await?;
-            let sha256 = fetch_and_place_artifact(&manifest, staging_dir).await?;
+            let manifest = fetch_manifest_bundle(url, staging_dir, max_decompressed_bytes).await?;
+            let sha256 =
+                fetch_and_place_artifact(&manifest, staging_dir, max_decompressed_bytes).await?;
             Ok((
                 manifest,
                 PluginSource::Url {
@@ -279,11 +322,21 @@ async fn stage_into(
 /// Populates `staging_dir` with whatever the bundle contains (just
 /// `plugin.json` for a bare manifest; the full skills/prompts/workflows tree
 /// for an archive).
-async fn fetch_manifest_bundle(url: &str, staging_dir: &Path) -> PluginResult<PluginManifest> {
+async fn fetch_manifest_bundle(
+    url: &str,
+    staging_dir: &Path,
+    max_decompressed_bytes: u64,
+) -> PluginResult<PluginManifest> {
     let bytes = download_bytes(url).await?;
 
     if let Some(kind) = detect_archive_kind(url) {
-        extract_archive(bytes, kind, staging_dir.to_path_buf()).await?;
+        extract_archive(
+            bytes,
+            kind,
+            staging_dir.to_path_buf(),
+            max_decompressed_bytes,
+        )
+        .await?;
         flatten_if_single_subdir(staging_dir).await?;
         read_and_parse_manifest(staging_dir).await
     } else {
@@ -306,6 +359,7 @@ async fn fetch_manifest_bundle(url: &str, staging_dir: &Path) -> PluginResult<Pl
 async fn fetch_and_place_artifact(
     manifest: &PluginManifest,
     staging_dir: &Path,
+    max_decompressed_bytes: u64,
 ) -> PluginResult<Option<String>> {
     let Some(platform) = Platform::current() else {
         return Ok(None);
@@ -331,7 +385,7 @@ async fn fetch_and_place_artifact(
     })?;
 
     let scratch_dir = staging_dir.join(format!(".artifact-scratch-{}", platform.as_str()));
-    extract_archive(bytes, kind, scratch_dir.clone()).await?;
+    extract_archive(bytes, kind, scratch_dir.clone(), max_decompressed_bytes).await?;
 
     let expected_name = if matches!(platform, Platform::Windows) {
         format!("{}.exe", manifest.id)
@@ -393,6 +447,21 @@ fn http_client() -> &'static reqwest::Client {
 /// stream an unbounded body into memory (OOM DoS). 256 MiB is generous for a
 /// plugin bundle + one platform binary while still bounding the worst case.
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Hard ceiling on the TOTAL decompressed bytes any single archive (zip or
+/// tar.gz) may expand to across ALL of its entries combined. Complements
+/// `MAX_DOWNLOAD_BYTES`, which only bounds the COMPRESSED bytes fetched over
+/// the wire — a small, highly-compressible archive (a classic
+/// decompression/"zip bomb") can still expand to many gigabytes on disk with
+/// nothing capping the output side. Enforced incrementally DURING extraction
+/// (see [`copy_capped`]) against the ACTUAL bytes read off the decompression
+/// stream — never an entry's header-declared size, which a crafted archive
+/// can misstate (a zip's `uncompressed_size` field in particular is pure
+/// metadata the reader doesn't have to honor) — so a bomb is aborted close to
+/// this ceiling rather than after it has already exhausted disk. 2 GiB is
+/// generous for any legitimate plugin bundle (skills/prompts/workflows text
+/// plus, at most, one platform binary) while still bounding the worst case.
+const MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
     use futures::StreamExt;
@@ -467,13 +536,21 @@ fn detect_archive_kind(name_or_url: &str) -> Option<ArchiveKind> {
 }
 
 /// Extract `bytes` (a zip or tar.gz archive) into `dest_dir`, rejecting any
-/// entry whose path would escape `dest_dir` (traversal / absolute paths).
-/// Runs the (synchronous) extraction on a blocking thread.
-async fn extract_archive(bytes: Vec<u8>, kind: ArchiveKind, dest_dir: PathBuf) -> PluginResult<()> {
+/// entry whose path would escape `dest_dir` (traversal / absolute paths), and
+/// aborting if the TOTAL decompressed output across all entries would exceed
+/// `max_decompressed_bytes` (decompression-bomb guard — see
+/// [`MAX_DECOMPRESSED_BYTES`] / [`copy_capped`]). Runs the (synchronous)
+/// extraction on a blocking thread.
+async fn extract_archive(
+    bytes: Vec<u8>,
+    kind: ArchiveKind,
+    dest_dir: PathBuf,
+    max_decompressed_bytes: u64,
+) -> PluginResult<()> {
     tokio::fs::create_dir_all(&dest_dir).await?;
     tokio::task::spawn_blocking(move || match kind {
-        ArchiveKind::Zip => extract_zip_sync(&bytes, &dest_dir),
-        ArchiveKind::TarGz => extract_targz_sync(&bytes, &dest_dir),
+        ArchiveKind::Zip => extract_zip_sync(&bytes, &dest_dir, max_decompressed_bytes),
+        ArchiveKind::TarGz => extract_targz_sync(&bytes, &dest_dir, max_decompressed_bytes),
     })
     .await
     .map_err(|error| {
@@ -481,12 +558,52 @@ async fn extract_archive(bytes: Vec<u8>, kind: ArchiveKind, dest_dir: PathBuf) -
     })?
 }
 
-fn extract_zip_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
+/// Copy `reader` into `writer` in small, bounded chunks, tallying bytes into
+/// `running_total` — which the caller carries ACROSS every entry in the
+/// archive, so the cap is on the archive's total decompressed output, not
+/// any one entry — and aborting the moment the cumulative count would exceed
+/// `max_decompressed_bytes`. Chunked copying (rather than `std::io::copy`
+/// followed by a size check afterward) keeps the amount ever actually
+/// written to disk bounded near the cap even for a single maximally
+/// compressible entry: the whole point of the cap is to stop a small archive
+/// from exhausting disk, so only checking after a full `io::copy` completed
+/// would defeat it.
+fn copy_capped(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    running_total: &mut u64,
+    max_decompressed_bytes: u64,
+) -> PluginResult<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        *running_total += bytes_read as u64;
+        if *running_total > max_decompressed_bytes {
+            return Err(PluginError::InvalidManifest(format!(
+                "archive expands to more than the {max_decompressed_bytes}-byte decompressed \
+                 size cap ({running_total} bytes and counting); refusing to unpack (possible \
+                 decompression bomb)"
+            )));
+        }
+        writer.write_all(&buffer[..bytes_read])?;
+    }
+}
+
+fn extract_zip_sync(
+    bytes: &[u8],
+    dest_dir: &Path,
+    max_decompressed_bytes: u64,
+) -> PluginResult<()> {
     use std::io::Cursor;
 
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|error| PluginError::InvalidManifest(format!("invalid zip archive: {error}")))?;
+
+    let mut total_decompressed_bytes: u64 = 0;
 
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|error| {
@@ -510,7 +627,22 @@ fn extract_zip_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
             std::fs::create_dir_all(parent)?;
         }
         let mut out_file = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut file, &mut out_file)?;
+        if let Err(error) = copy_capped(
+            &mut file,
+            &mut out_file,
+            &mut total_decompressed_bytes,
+            max_decompressed_bytes,
+        ) {
+            drop(out_file);
+            // Defense in depth: remove the partial file we were just writing
+            // even though the caller (`stage_plugin_source`) also wipes the
+            // whole staging directory on any `Err` from this function — a
+            // direct caller of this lower-level helper should never see a
+            // half-written entry either.
+            let _ = std::fs::remove_file(&out_path);
+            return Err(error);
+        }
+        drop(out_file);
 
         #[cfg(unix)]
         {
@@ -523,13 +655,18 @@ fn extract_zip_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
     Ok(())
 }
 
-fn extract_targz_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
+fn extract_targz_sync(
+    bytes: &[u8],
+    dest_dir: &Path,
+    max_decompressed_bytes: u64,
+) -> PluginResult<()> {
     use flate2::read::GzDecoder;
     use std::path::Component;
     use tar::{Archive, EntryType};
 
     let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
+    let mut total_decompressed_bytes: u64 = 0;
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
 
@@ -546,7 +683,7 @@ fn extract_targz_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
         // files. A plugin bundle has no legitimate reason to ship a link (same
         // rationale as `copy_dir_recursive` skipping symlinks), so refuse the
         // whole archive. (Zip is not affected: `extract_zip_sync` writes every
-        // entry as a fresh regular file via `io::copy`, so an archived
+        // entry as a fresh regular file via `copy_capped`, so an archived
         // "symlink" lands inert as a plain file.)
         let entry_type = entry.header().entry_type();
         if matches!(entry_type, EntryType::Symlink | EntryType::Link) {
@@ -585,10 +722,46 @@ fn extract_targz_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
             )));
         }
         let out_path = dest_dir.join(&relative_path);
+
+        // Directories carry no content to cap — just create and move on
+        // (mirrors `entry.unpack()`'s own directory handling, which this
+        // function replaces for content-bearing entries below so the
+        // decompressed-size cap can be enforced incrementally; see
+        // `copy_capped`).
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        entry.unpack(&out_path)?;
+        let mut out_file = std::fs::File::create(&out_path)?;
+        if let Err(error) = copy_capped(
+            &mut entry,
+            &mut out_file,
+            &mut total_decompressed_bytes,
+            max_decompressed_bytes,
+        ) {
+            drop(out_file);
+            // Defense in depth: see the identical cleanup in
+            // `extract_zip_sync` — the whole staging dir is also wiped by
+            // the caller, but a direct caller of this helper shouldn't see
+            // a half-written entry either.
+            let _ = std::fs::remove_file(&out_path);
+            return Err(error);
+        }
+        drop(out_file);
+
+        // Preserve the entry's permission bits (matches `entry.unpack()`'s
+        // own behaviour, which this manual copy replaces).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mode) = entry.header().mode() {
+                std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
     }
     Ok(())
 }

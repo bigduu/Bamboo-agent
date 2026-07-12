@@ -780,3 +780,114 @@ async fn install_plugin_from_source_restores_previous_bundle_on_upgrade_failure(
 
 #[allow(dead_code)]
 fn _use_pathbuf(_p: PathBuf) {}
+
+// ---------------------------------------------------------------------
+// Decompression bomb guard: MAX_DOWNLOAD_BYTES only caps the COMPRESSED
+// bytes fetched over the wire; a small, highly-compressible archive must
+// still be rejected once its DECOMPRESSED output would exceed the
+// (separately capped) ceiling — see `MAX_DECOMPRESSED_BYTES` / `copy_capped`.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn targz_exceeding_decompressed_cap_is_rejected_and_nothing_left_under_plugins_root() {
+    let root = tempfile::tempdir().unwrap();
+
+    // A valid, small plugin.json plus one wildly compressible "skill" file
+    // (16 KiB of zeros compresses to a handful of bytes) — with the cap
+    // injected at 1 KiB, extraction must abort partway through that second
+    // entry, well before actually writing 16 KiB to disk.
+    let manifest = hello_manifest_json("hello-plugin");
+    let oversized_content = vec![0u8; 16 * 1024];
+    let archive_bytes = build_targz(&[
+        ("plugin.json", manifest.as_bytes()),
+        ("skills/hello-world/SKILL.md", &oversized_content),
+    ]);
+    let archive_path = root.path().join("bomb.tar.gz");
+    tokio::fs::write(&archive_path, &archive_bytes)
+        .await
+        .unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let error = stage_plugin_source_with_decompressed_cap(
+        PluginSourceInput::LocalArchive(archive_path),
+        &plugins_root,
+        1024,
+    )
+    .await
+    .expect_err("an archive expanding past the injected decompressed cap must be rejected");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(error.to_string().contains("decompress"));
+
+    // Nothing committed under plugins_root: no plugin dir, and no stray
+    // staging/backup directories left behind either.
+    assert!(!plugins_root.join("hello-plugin").exists());
+    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
+    assert!(
+        leftovers.next_entry().await.unwrap().is_none(),
+        "a rejected decompression bomb must leave nothing under plugins_root"
+    );
+}
+
+#[tokio::test]
+async fn zip_exceeding_decompressed_cap_is_rejected_and_nothing_left_under_plugins_root() {
+    let root = tempfile::tempdir().unwrap();
+
+    let manifest = hello_manifest_json("hello-plugin");
+    let oversized_content = vec![0u8; 16 * 1024];
+    let archive_bytes = build_zip(&[
+        ("plugin.json", manifest.as_bytes()),
+        ("skills/hello-world/SKILL.md", &oversized_content),
+    ]);
+    let archive_path = root.path().join("bomb.zip");
+    tokio::fs::write(&archive_path, &archive_bytes)
+        .await
+        .unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let error = stage_plugin_source_with_decompressed_cap(
+        PluginSourceInput::LocalArchive(archive_path),
+        &plugins_root,
+        1024,
+    )
+    .await
+    .expect_err("an archive expanding past the injected decompressed cap must be rejected");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(error.to_string().contains("decompress"));
+
+    assert!(!plugins_root.join("hello-plugin").exists());
+    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
+    assert!(
+        leftovers.next_entry().await.unwrap().is_none(),
+        "a rejected decompression bomb must leave nothing under plugins_root"
+    );
+}
+
+#[tokio::test]
+async fn archive_within_decompressed_cap_still_stages_normally() {
+    // Sanity check the cap doesn't false-positive on an ordinary small
+    // archive comfortably under it.
+    let root = tempfile::tempdir().unwrap();
+    let manifest = hello_manifest_json("hello-plugin");
+    let archive_bytes = build_targz(&[
+        ("plugin.json", manifest.as_bytes()),
+        (
+            "skills/hello-world/SKILL.md",
+            b"---\nname: hello-world\ndescription: demo\n---\nHi\n",
+        ),
+    ]);
+    let archive_path = root.path().join("fine.tar.gz");
+    tokio::fs::write(&archive_path, &archive_bytes)
+        .await
+        .unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let staged = stage_plugin_source_with_decompressed_cap(
+        PluginSourceInput::LocalArchive(archive_path),
+        &plugins_root,
+        1024 * 1024,
+    )
+    .await
+    .expect("an archive well under the cap must still stage normally");
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    staged.commit().await;
+}
