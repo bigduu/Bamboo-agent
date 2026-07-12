@@ -53,6 +53,29 @@
 //! starts from a fresh scratch dir; a leftover `.backup-*`/`.staging-*` dir
 //! is inert and can be swept by an operator or a future cleanup pass) but is
 //! not automatic today.
+//!
+//! # Known follow-ups (deferred — tracked here, not fixed on this branch)
+//!
+//! - **No integrity pin on the URL manifest/content bundle.** Only the
+//!   per-platform BINARY artifact is sha256-pinned (`PluginArtifact.sha256`,
+//!   verified in [`fetch_and_place_artifact`]). The `plugin.json` / content
+//!   archive fetched by [`fetch_manifest_bundle`] is trusted on HTTPS alone —
+//!   a MITM or a compromised host could serve a tampered manifest/skills/
+//!   prompts bundle. A proper fix needs a Wave-1 schema addition (a top-level
+//!   bundle sha256, or a signature) so a URL install can pin the whole bundle,
+//!   not just the binary. Until then, prefer local-dir/archive installs or a
+//!   binary-artifact-only URL plugin for anything security-sensitive.
+//! - **No SSRF guard on URL fetch.** [`download_bytes`] will fetch any URL,
+//!   including `http://169.254.169.254/...` (cloud metadata) or private-range
+//!   / loopback addresses. In a hosted/multi-tenant deployment a plugin-install
+//!   URL is an SSRF vector. A private-IP / metadata-endpoint blocklist (or an
+//!   allowlist of plugin registries) is a threat-model call for the deploy
+//!   layer; noted here so it isn't forgotten.
+//! - **`save_store` / provenance writes are non-atomic** (`fs::write` in place,
+//!   pre-existing behaviour shared with the HTTP prompt-preset handlers): a
+//!   crash mid-write can truncate `prompt-presets.json` / `installed.json`.
+//!   A write-to-temp-then-rename would make each file update atomic; deferred
+//!   as a cross-cutting change to those shared storage helpers.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -365,7 +388,15 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+/// Hard ceiling on any single plugin download (manifest, bundle, or binary
+/// artifact archive). A malicious or misconfigured URL must not be able to
+/// stream an unbounded body into memory (OOM DoS). 256 MiB is generous for a
+/// plugin bundle + one platform binary while still bounding the worst case.
+const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
 async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
+    use futures::StreamExt;
+
     let response =
         http_client().get(url).send().await.map_err(|error| {
             PluginError::Registration(format!("failed to fetch '{url}': {error}"))
@@ -373,10 +404,35 @@ async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
     let response = response.error_for_status().map_err(|error| {
         PluginError::Registration(format!("'{url}' returned an error status: {error}"))
     })?;
-    let bytes = response.bytes().await.map_err(|error| {
-        PluginError::Registration(format!("failed to read response body of '{url}': {error}"))
-    })?;
-    Ok(bytes.to_vec())
+
+    // Reject up front if the server ADVERTISES an over-cap body (cheap, avoids
+    // streaming at all)...
+    if let Some(len) = response.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(PluginError::Registration(format!(
+                "'{url}' advertises a {len}-byte body, over the {MAX_DOWNLOAD_BYTES}-byte plugin \
+                 download cap; refusing"
+            )));
+        }
+    }
+
+    // ...and ALSO cap the actually-streamed bytes, since Content-Length can be
+    // absent (chunked) or a lie.
+    let mut stream = response.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            PluginError::Registration(format!("failed to read response body of '{url}': {error}"))
+        })?;
+        if buffer.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(PluginError::Registration(format!(
+                "'{url}' streamed more than the {MAX_DOWNLOAD_BYTES}-byte plugin download cap; \
+                 aborting"
+            )));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -470,12 +526,51 @@ fn extract_zip_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
 fn extract_targz_sync(bytes: &[u8], dest_dir: &Path) -> PluginResult<()> {
     use flate2::read::GzDecoder;
     use std::path::Component;
-    use tar::Archive;
+    use tar::{Archive, EntryType};
 
     let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
+
+        // SECURITY (symlink/hardlink escape): reject any Symlink or HardLink
+        // entry outright BEFORE unpacking. `entry.unpack()` is the raw tar API
+        // — it validates the entry's OWN path (checked below) but NOT a link
+        // entry's TARGET (`link_name`), which is fully attacker-controlled and
+        // may be absolute or contain `..`. A malicious bundle could ship
+        // e.g. `workflows/evil.md` as a symlink to `~/.ssh/id_rsa` or bamboo's
+        // `config.json`; a later `fs::read_to_string` (register_workflows) would
+        // follow it and copy the victim's real content into a plugin-visible
+        // location = arbitrary file exfiltration, and `flatten_if_single_subdir`
+        // following a symlink-to-a-real-dir could rename/destroy the victim's
+        // files. A plugin bundle has no legitimate reason to ship a link (same
+        // rationale as `copy_dir_recursive` skipping symlinks), so refuse the
+        // whole archive. (Zip is not affected: `extract_zip_sync` writes every
+        // entry as a fresh regular file via `io::copy`, so an archived
+        // "symlink" lands inert as a plain file.)
+        let entry_type = entry.header().entry_type();
+        if matches!(entry_type, EntryType::Symlink | EntryType::Link) {
+            let link_target = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            return Err(PluginError::InvalidManifest(format!(
+                "tar entry '{}' is a {} (target '{link_target}') — plugin bundles must not ship \
+                 links; refusing to unpack",
+                entry
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                if entry_type == EntryType::Symlink {
+                    "symlink"
+                } else {
+                    "hardlink"
+                },
+            )));
+        }
+
         let relative_path = entry.path()?.into_owned();
         let is_unsafe = relative_path.components().any(|component| {
             matches!(
@@ -543,7 +638,14 @@ async fn flatten_if_single_subdir(dir: &Path) -> PluginResult<()> {
     let Some(candidate) = only_entry else {
         return Ok(());
     };
-    if !tokio::fs::metadata(&candidate).await?.is_dir() {
+    // `symlink_metadata` (does NOT follow links), not `metadata`: defense in
+    // depth so a symlink-to-a-real-dir can never pass `is_dir()` here and get
+    // its real children renamed out. Extraction already rejects link entries
+    // (see `extract_targz_sync`) and `copy_dir_recursive` skips symlinks, so
+    // in practice `candidate` is always a real dir/file — but never follow a
+    // link when deciding whether to descend into and move a directory's
+    // contents.
+    if !tokio::fs::symlink_metadata(&candidate).await?.is_dir() {
         return Ok(());
     }
 

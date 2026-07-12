@@ -304,6 +304,209 @@ async fn zip_archive_with_traversal_entry_is_rejected() {
 }
 
 // ---------------------------------------------------------------------
+// Symlink / hardlink escape (BLOCKER) — a tar link entry's target is
+// attacker-controlled; extraction must reject any link entry outright.
+// ---------------------------------------------------------------------
+
+/// Build a `.tar.gz` with some regular entries plus one link (symlink or
+/// hardlink) entry whose target the caller controls. Uses the raw
+/// `Builder::append_link` — the crafted-archive equivalent of a malicious
+/// bundle (real archives never legitimately ship a link into a plugin).
+fn build_targz_with_link(
+    regular: &[(&str, &[u8])],
+    link_type: tar::EntryType,
+    link_name: &str,
+    link_target: &str,
+) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        for (name, content) in regular {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *content).unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(link_type);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, link_name, link_target)
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let mut gz_bytes = Vec::new();
+    {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(&mut gz_bytes, Compression::default());
+        encoder.write_all(&tar_bytes).unwrap();
+        encoder.finish().unwrap();
+    }
+    gz_bytes
+}
+
+#[tokio::test]
+async fn tar_symlink_workflow_entry_is_rejected_no_exfiltration() {
+    // Exfiltration chain: a plugin declares workflows/evil.md but ships it as
+    // a symlink to a victim secret. If extraction created the symlink,
+    // register_workflows' fs::read_to_string would follow it and copy the
+    // victim's real content into a plugin-visible location. Extraction must
+    // reject the archive before any symlink is written.
+    let root = tempfile::tempdir().unwrap();
+    let secret = root.path().join("victim-secret.txt");
+    tokio::fs::write(&secret, "TOP SECRET").await.unwrap();
+
+    let archive_bytes = build_targz_with_link(
+        &[(
+            "plugin.json",
+            hello_manifest_json("hello-plugin").as_bytes(),
+        )],
+        tar::EntryType::Symlink,
+        "workflows/evil.md",
+        secret.to_str().unwrap(),
+    );
+    let archive_path = root.path().join("evil-symlink.tar.gz");
+    tokio::fs::write(&archive_path, &archive_bytes)
+        .await
+        .unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let error = stage_plugin_source(PluginSourceInput::LocalArchive(archive_path), &plugins_root)
+        .await
+        .expect_err("a symlink entry must be rejected");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(error.to_string().contains("symlink"));
+
+    // Nothing committed; the secret untouched; no symlink materialized.
+    assert!(!plugins_root.join("hello-plugin").exists());
+    assert_eq!(
+        tokio::fs::read_to_string(&secret).await.unwrap(),
+        "TOP SECRET"
+    );
+}
+
+#[tokio::test]
+async fn tar_symlink_top_level_dir_entry_is_rejected_no_destruction() {
+    // Destruction chain: a single top-level entry that is a symlink to a real
+    // directory. If extraction created it, flatten_if_single_subdir (were it
+    // to follow the link) would rename the victim dir's real children out and
+    // then the failed remove could cascade into deletion. Extraction must
+    // reject the archive first.
+    let root = tempfile::tempdir().unwrap();
+    let victim_dir = root.path().join("victim-dir");
+    tokio::fs::create_dir_all(&victim_dir).await.unwrap();
+    tokio::fs::write(victim_dir.join("keep.txt"), "precious")
+        .await
+        .unwrap();
+
+    // Only a single top-level symlink entry (no plugin.json at root), pointing
+    // at the victim dir.
+    let archive_bytes = build_targz_with_link(
+        &[],
+        tar::EntryType::Symlink,
+        "bundle",
+        victim_dir.to_str().unwrap(),
+    );
+    let archive_path = root.path().join("evil-dirlink.tar.gz");
+    tokio::fs::write(&archive_path, &archive_bytes)
+        .await
+        .unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let error = stage_plugin_source(PluginSourceInput::LocalArchive(archive_path), &plugins_root)
+        .await
+        .expect_err("a symlink-to-dir entry must be rejected");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+
+    // The victim dir and its contents are fully intact.
+    assert!(victim_dir.join("keep.txt").exists());
+    assert_eq!(
+        tokio::fs::read_to_string(victim_dir.join("keep.txt"))
+            .await
+            .unwrap(),
+        "precious"
+    );
+    assert!(!plugins_root.join("hello-plugin").exists());
+}
+
+#[tokio::test]
+async fn tar_hardlink_entry_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let archive_bytes = build_targz_with_link(
+        &[(
+            "plugin.json",
+            hello_manifest_json("hello-plugin").as_bytes(),
+        )],
+        tar::EntryType::Link,
+        "workflows/evil.md",
+        "/etc/hosts",
+    );
+    let archive_path = root.path().join("evil-hardlink.tar.gz");
+    tokio::fs::write(&archive_path, &archive_bytes)
+        .await
+        .unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let error = stage_plugin_source(PluginSourceInput::LocalArchive(archive_path), &plugins_root)
+        .await
+        .expect_err("a hardlink entry must be rejected");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(error.to_string().contains("hardlink"));
+}
+
+#[tokio::test]
+async fn zip_symlink_mode_entry_lands_inert_as_a_regular_file() {
+    // Zip is NOT affected by the tar link problem: extract_zip_sync writes
+    // every entry as a fresh regular file via io::copy, so an entry with
+    // symlink unix mode lands as a plain file (the target path as its literal
+    // bytes), never a live symlink. Confirm that invariant holds — the zip
+    // path deliberately does not need the tar-style link rejection.
+    use std::io::{Cursor, Write};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut buffer = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file("plugin.json", options).unwrap();
+        writer
+            .write_all(hello_manifest_json("hello-plugin").as_bytes())
+            .unwrap();
+        // S_IFLNK (0o120000) | 0777 — a "symlink" mode, content = a target path.
+        let link_options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().unix_permissions(0o120777);
+        writer.start_file("notes.txt", link_options).unwrap();
+        writer.write_all(b"/etc/passwd").unwrap();
+        writer.finish().unwrap();
+    }
+    let archive_path = root.path().join("zip-with-symlink-mode.zip");
+    tokio::fs::write(&archive_path, &buffer).await.unwrap();
+
+    let plugins_root = root.path().join("plugins");
+    let staged = stage_plugin_source(PluginSourceInput::LocalArchive(archive_path), &plugins_root)
+        .await
+        .expect("a zip with a symlink-mode entry stages fine (entry lands inert)");
+
+    let landed = staged.plugin_dir.join("notes.txt");
+    let meta = tokio::fs::symlink_metadata(&landed).await.unwrap();
+    assert!(
+        !meta.file_type().is_symlink(),
+        "the zip entry must land as a regular file, never a live symlink"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&landed).await.unwrap(),
+        "/etc/passwd",
+        "it holds the target path as inert literal bytes"
+    );
+    staged.commit().await;
+}
+
+// ---------------------------------------------------------------------
 // Url
 // ---------------------------------------------------------------------
 
