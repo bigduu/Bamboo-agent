@@ -84,6 +84,8 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 ref binary,
                 ref model,
                 ref permission_mode,
+                ref inherit_user_config,
+                ref forward_env,
             } => Arc::new(crate::claude_code_executor::ClaudeCodeExecutor::new(
                 binary.clone(),
                 model.clone(),
@@ -93,6 +95,8 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                     &spec.storage_dir,
                     &spec.identity.child_id,
                 )),
+                inherit_user_config.unwrap_or(false),
+                forward_env.clone().unwrap_or_default(),
             )),
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };

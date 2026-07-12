@@ -34,9 +34,38 @@ pub struct ExternalAgentProfile {
     pub fabric_dir: Option<String>,
     /// Actor protocol only: which engine the worker runs.
     /// `"bamboo_runtime"` (default) for the real agent loop, `"echo"` for a
-    /// dependency-free smoke run through the whole chain.
+    /// dependency-free smoke run through the whole chain, `"claude_code"` to
+    /// drive the official Claude Code CLI (see the `claude_code_*` fields
+    /// below).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// `executor = "claude_code"` only: override the `claude` executable.
+    /// `None` runs `claude` resolved from `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_binary: Option<String>,
+    /// `executor = "claude_code"` only: `--model` override. `None` omits the
+    /// flag (CLI default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_model: Option<String>,
+    /// `executor = "claude_code"` only: `--permission-mode` override. `None`
+    /// still passes an EXPLICIT `default` to the CLI (issue #443 — the
+    /// headless stream-json default is `auto`, which self-approves every
+    /// tool and never asks); it does not mean "omit the flag".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_permission_mode: Option<String>,
+    /// `executor = "claude_code"` only: `true` lets the child inherit the
+    /// invoking user's `~/.claude` MCP servers/skills/settings. `false`/unset
+    /// (the default) isolates it (`--strict-mcp-config` +
+    /// `--setting-sources project`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_inherit_user_config: Option<bool>,
+    /// `executor = "claude_code"` only: extra env var NAMES forwarded
+    /// verbatim from this process's env to the child, on top of the fixed
+    /// HOME/PATH/SHELL/TERM/LANG/LC_*/TMPDIR/USER/LOGNAME allowlist.
+    /// Forwarding `ANTHROPIC_API_KEY` here is an explicit opt-in that flips
+    /// billing from the CLI's own subscription auth to the API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_forward_env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

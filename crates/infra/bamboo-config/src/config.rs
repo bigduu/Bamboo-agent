@@ -365,9 +365,37 @@ pub struct SubagentsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric_dir: Option<String>,
     /// Expert: `"echo"` swaps in a dependency-free smoke executor (no LLM)
-    /// to verify the actor chain end-to-end.
+    /// to verify the actor chain end-to-end; `"claude_code"` drives the
+    /// official Claude Code CLI (see the `claude_code_*` fields below).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// `executor = "claude_code"` only: override the `claude` executable.
+    /// `None` runs `claude` resolved from `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_binary: Option<String>,
+    /// `executor = "claude_code"` only: `--model` override. `None` omits the
+    /// flag (CLI default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_model: Option<String>,
+    /// `executor = "claude_code"` only: `--permission-mode` override. `None`
+    /// still passes an EXPLICIT `default` to the CLI (issue #443 — the
+    /// headless stream-json default is `auto`, which self-approves every
+    /// tool and never asks); it does not mean "omit the flag".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_permission_mode: Option<String>,
+    /// `executor = "claude_code"` only: `true` lets the child inherit the
+    /// invoking user's `~/.claude` MCP servers/skills/settings. `false`/unset
+    /// (the default) isolates it (`--strict-mcp-config` +
+    /// `--setting-sources project`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_inherit_user_config: Option<bool>,
+    /// `executor = "claude_code"` only: extra env var NAMES forwarded
+    /// verbatim from this process's env to the child, on top of the fixed
+    /// HOME/PATH/SHELL/TERM/LANG/LC_*/TMPDIR/USER/LOGNAME allowlist.
+    /// Forwarding `ANTHROPIC_API_KEY` here is an explicit opt-in that flips
+    /// billing from the CLI's own subscription auth to the API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_forward_env: Option<Vec<String>>,
     /// The active message-broker endpoint the `ask_agent` tool / sub-agent bus
     /// dials. RUNTIME-ONLY (`#[serde(skip)]`): never read from nor written to
     /// `config.json`. It is populated in memory each boot by `maybe_embed_broker`

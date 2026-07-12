@@ -39,7 +39,8 @@ claude \
   --permission-prompt-tool stdio \
   --replay-user-messages \
   --verbose \
-  [--permission-mode <acceptEdits|plan|bypassPermissions>]   # omit for "default"
+  --permission-mode <acceptEdits|plan|bypassPermissions|default>  # ALWAYS explicit — see below
+  [--strict-mcp-config] [--setting-sources project]               # isolation — see below
   [--resume <session_id>]                                    # omit for a fresh session
   [--model <model>]
   [--allowedTools a,b] [--disallowedTools a,b]
@@ -48,19 +49,53 @@ claude \
 
 (cc-connect: `agent/claudecode/session.go:234-322`)
 
-Environment:
-- **Strip `CLAUDECODE`** from the child env — otherwise Claude Code detects a
-  nested session and misbehaves (`session.go:372`).
+**`--permission-mode` is ALWAYS passed explicitly (issue #443, CRITICAL).**
+Real-machine e2e against claude 2.1.207 found that the headless stream-json
+default — when the flag is omitted entirely — is `auto`, which self-approves
+every tool and never emits a `can_use_tool` ask. `ClaudeCodeExecutor::build_command`
+therefore always sends `permission_mode` when configured, else the literal
+string `default` — never nothing. This is what makes the "no host bridge →
+deny unless `bypassPermissions`" local-decide policy in §3 actually trigger;
+before this fix it was unreachable dead code (every ask was auto-approved by
+the CLI itself, so `control_request` never fired for anything the executor
+would have denied).
+
+**Isolation from the invoking user's `~/.claude`, by default (issue #443).**
+The same e2e run showed the child loading the user's entire global config: 6
+MCP servers (including a desktop-control server), every installed skill, and
+memory paths — ~8k cache-creation tokens and a large ambient-authority surface
+for a single `touch`. Unless `inherit_user_config: true` is set on the
+`ClaudeCode` executor spec, `build_command` adds `--strict-mcp-config` and
+`--setting-sources project`, so the child sees only project-scoped config, not
+the user's global one.
+
+Environment (issue #443 — env allowlist supersedes the earlier
+strip-one-var approach):
+- The child is spawned under `env_clear()` **plus an explicit allowlist**:
+  `HOME`, `PATH`, `SHELL`, `TERM`, `LANG`, `LC_*` (prefix), `TMPDIR`, `USER`,
+  `LOGNAME`. Everything else in the parent process env — including any
+  `*_API_KEY` — is stripped by construction, not by a denylist.
+- `forward_env: Vec<String>` on the executor spec names EXTRA variables to
+  forward verbatim on top of the allowlist. Forwarding `ANTHROPIC_API_KEY`
+  this way is an explicit opt-in that flips billing from the CLI's own
+  subscription auth to the API key — see §6.
+- `CLAUDECODE` is still explicitly `env_remove`d after the allowlist pass —
+  redundant now that `env_clear()` means it can't leak in from the parent at
+  all, kept as executable documentation of the nested-session hazard below.
 - Put the child in its own **process group** so shutdown can kill the whole tree
   (claude → its MCP servers) (`session.go:369`).
-- Inject whatever env the executor wants the agent's shell tools to see
-  (cc-connect injects `CC_PROJECT` / `CC_SESSION_KEY` for its send-back IPC).
+
+Nested-session hazard: Claude Code detects its own `CLAUDECODE` env var and
+misbehaves if it inherits one from an outer session (`session.go:372`).
 
 Gotchas:
 - Drop `--verbose` when routing through claude-code-router — router output
   corrupts the JSON stream (`claudecode.go:524-526`).
 - `bypassPermissions` under euid 0 is rejected by the CLI; downgrade and surface
   a warning (`session.go:225-229`).
+- Even in `default` mode, the CLI's own sandbox auto-runs plain read-only
+  commands (e.g. a bare `echo`) without asking — exercising the permission
+  relay requires a command with a real side effect (a file write).
 
 ## 2. Wire protocol
 
@@ -130,6 +165,15 @@ approval in a map of oneshot channels, resolve it when the steer inbox delivers
 the decision — same shape as the codex app-server adapter in cc-connect
 (`appserver_session.go:542-617`).
 
+**Relay timeout (issue #443).** When a host bridge IS attached,
+`decide_and_respond` wraps `HostBridge::approval_call` in `tokio::time::timeout`
+bounded by `APPROVAL_RELAY_TIMEOUT` (300s). A host approver that never replies
+(crashed UI, orphaned session) no longer hangs the CLI turn forever — on
+expiry the executor denies with `"approval relay timed out after 300s;
+denying"` and the turn continues. This is distinct from `approval_call`'s
+existing error path (the reply `oneshot` sender dropped), which is still
+handled as an immediate deny.
+
 ## 4. Session identity & resume
 
 Implemented (issue #444) in `ClaudeCodeExecutor`. `RunSpec.messages` is the
@@ -185,10 +229,11 @@ machine entirely) treats the persisted id as unusable.
    other error is returned as-is.
 
 **Non-goals (still).** Mid-turn steering into a genuinely new turn on the same
-session, and multimodal/env-forwarding (#443) — unaffected by this change.
-Cross-machine resume is out of scope by construction (see the workspace/
-machine-locality note above); if the actor is redeployed to a different host
-or workspace, activation falls through to fallback rehydration automatically.
+session, and multimodal — unaffected by this change. Env-forwarding shipped
+as part of #443 (see §1/§6). Cross-machine resume is out of scope by
+construction (see the workspace/machine-locality note above); if the actor is
+redeployed to a different host or workspace, activation falls through to
+fallback rehydration automatically.
 
 ## 5. Cancellation / shutdown
 
@@ -206,9 +251,20 @@ rely on `--resume` for continuation.
 
 The spawned binary is official Claude Code with the user's own login; as of
 2026-07 subscription auth still covers `claude -p`/stream-json usage (the
-June 15 credit split was paused). If the host also configures `ANTHROPIC_API_KEY`
-in the child env, the CLI bills the API key instead — decide explicitly which
-one the executor forwards.
+June 15 credit split was paused). Real-machine e2e confirmed this: the
+`system.init` frame reported `apiKeySource: "none"` with no key in the child
+env — the subscription is what actually gets billed.
+
+**Env policy (issue #443, implemented).** The executor no longer forwards the
+parent process env wholesale. `build_command` runs the child under
+`env_clear()` plus a fixed allowlist — `HOME`, `PATH`, `SHELL`, `TERM`, `LANG`,
+`LC_*` (prefix), `TMPDIR`, `USER`, `LOGNAME` — which is enough for the CLI and
+its shell tools to function but excludes every `*_API_KEY` and other ambient
+secret by construction. `forward_env: Vec<String>` on the executor spec (and
+the matching `claude_code_forward_env` config field, §8) names EXTRA variables
+to forward verbatim; forwarding `ANTHROPIC_API_KEY` this way is an EXPLICIT
+opt-in that flips billing from the subscription to the API key — never the
+implicit default.
 
 ## 7. Executor shape (as implemented)
 
@@ -221,6 +277,15 @@ pub struct ClaudeCodeExecutor {
     /// Stable per-child dir the resumed-session state file lives in — see §4.
     /// `None` disables resume persistence (every activation is fresh).
     state_dir: Option<PathBuf>,
+    /// Issue #443: `false` (default) adds `--strict-mcp-config` +
+    /// `--setting-sources project` — see §1.
+    inherit_user_config: bool,
+    /// Issue #443: extra env var NAMES forwarded on top of the fixed
+    /// allowlist — see §1/§6.
+    forward_env: Vec<String>,
+    /// Issue #443: bound on the permission-relay `HostBridge::approval_call`
+    /// — see §3. Always `APPROVAL_RELAY_TIMEOUT` (300s) outside tests.
+    relay_timeout: Duration,
 }
 
 #[async_trait]
@@ -249,3 +314,25 @@ impl ChildExecutor for ClaudeCodeExecutor {
     }
 }
 ```
+
+## 8. Config plumbing (issue #443)
+
+`ExecutorSpec::ClaudeCode` (`bamboo-subagent::provision`) carries `binary`,
+`model`, `permission_mode`, `inherit_user_config: Option<bool>`, and
+`forward_env: Option<Vec<String>>`. Both factory arms that turn a spec into a
+running `ClaudeCodeExecutor` (`src/subagent_worker.rs`, `src/broker_agent.rs`)
+resolve `None` isolation/env fields to the hardened defaults
+(`inherit_user_config.unwrap_or(false)`, `forward_env.unwrap_or_default()`).
+
+Two config surfaces build a `ClaudeCode` spec from `executor = "claude_code"`:
+
+- `bamboo_config::SubagentsConfig` — the built-in local actor worker
+  (`subagents.claude_code_binary` / `_model` / `_permission_mode` /
+  `_inherit_user_config` / `_forward_env`).
+- `bamboo_engine::external_agents::config::ExternalAgentProfile` — a named
+  `externalAgents` profile using the actor protocol (same `claude_code_*`
+  field names).
+
+Both are resolved into the spec in
+`crates/engine/bamboo-engine/src/external_agents/runtime.rs`
+(`build_local_actor_runner` and `build_external_child_runner` respectively).
