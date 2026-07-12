@@ -1294,6 +1294,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-plugin"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bamboo-config",
+ "bamboo-domain",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bamboo-sdk"
 version = "0.0.0"
 dependencies = [
@@ -1340,6 +1356,7 @@ dependencies = [
  "bamboo-memory",
  "bamboo-metrics",
  "bamboo-notification",
+ "bamboo-plugin",
  "bamboo-server-tools",
  "bamboo-skills",
  "bamboo-storage",
@@ -1350,6 +1367,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "dashmap",
+ "flate2",
  "futures",
  "globset",
  "hex",
@@ -1369,6 +1387,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

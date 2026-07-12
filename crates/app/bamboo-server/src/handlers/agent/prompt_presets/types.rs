@@ -5,7 +5,7 @@ pub(super) const DEFAULT_PRESET_NAME: &str = "Bodhi";
 pub(super) const DEFAULT_PRESET_DESCRIPTION: &str = "System prompt configured in Bamboo backend.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct StoredPromptPreset {
+pub(crate) struct StoredPromptPreset {
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -14,7 +14,7 @@ pub(super) struct StoredPromptPreset {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct PromptPresetStore {
+pub(crate) struct PromptPresetStore {
     #[serde(default)]
     pub prompts: Vec<StoredPromptPreset>,
 }

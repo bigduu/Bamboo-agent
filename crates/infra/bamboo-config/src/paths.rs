@@ -82,6 +82,26 @@ pub fn workflows_dir() -> PathBuf {
     bamboo_dir().join("workflows")
 }
 
+/// Get the local plugin bundles root (`~/.bamboo/plugins`).
+///
+/// Each installed plugin lives at `plugins_dir()/<plugin_id>/`, keeping the
+/// plugin's own files together (manifest, skills, prompts, workflows,
+/// optional per-platform binaries under `bin/`). See `bamboo-plugin` for the
+/// manifest/provenance schema.
+pub fn plugins_dir() -> PathBuf {
+    bamboo_dir().join("plugins")
+}
+
+/// Get the installation root for a single plugin (`~/.bamboo/plugins/<id>`).
+pub fn plugin_dir(id: &str) -> PathBuf {
+    plugins_dir().join(id)
+}
+
+/// Get the plugin provenance registry path (`~/.bamboo/plugins/installed.json`).
+pub fn plugins_installed_json_path() -> PathBuf {
+    plugins_dir().join("installed.json")
+}
+
 /// Whether `name` is a safe workflow file-name stem: rejects empty / over-long /
 /// untrimmed names, path separators and `..`, null bytes / control characters,
 /// reserved Windows device names, and anything outside the
@@ -323,6 +343,25 @@ mod tests {
     fn test_workflows_dir() {
         let path = workflows_dir();
         assert!(path.ends_with("workflows"));
+    }
+
+    #[test]
+    fn test_plugins_dir() {
+        let path = plugins_dir();
+        assert!(path.ends_with("plugins"));
+    }
+
+    #[test]
+    fn test_plugin_dir() {
+        let path = plugin_dir("hello-plugin");
+        assert!(path.ends_with("plugins/hello-plugin") || path.ends_with("plugins\\hello-plugin"));
+    }
+
+    #[test]
+    fn test_plugins_installed_json_path() {
+        let path = plugins_installed_json_path();
+        assert!(path.ends_with("installed.json"));
+        assert!(path.parent().unwrap().ends_with("plugins"));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "id": "hello-plugin",
+  "name": "Hello Plugin",
+  "version": "0.1.0",
+  "description": "Trivial reference plugin: one skill + one prompt preset. No binary, no MCP server. Demonstrates the plugin.json schema end-to-end for later Wave-2 agents and plugin authors.",
+  "provides": {
+    "skills": ["hello-world"],
+    "prompts": [
+      {
+        "id": "hello_plugin_greeter",
+        "name": "Hello Plugin Greeter",
+        "description": "A friendly system prompt contributed by the hello-plugin example.",
+        "content": "You are a friendly assistant. Always greet the user warmly before answering, and mention you were configured by the hello-plugin example plugin."
+      }
+    ]
+  }
+}

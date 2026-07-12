@@ -1,0 +1,21 @@
+[package]
+name = "bamboo-plugin"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Local plugin bundles (manifest, install provenance, installer skeleton) for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+serde = { workspace = true }
+serde_json = "1"
+chrono = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

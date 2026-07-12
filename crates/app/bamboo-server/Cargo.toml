@@ -31,6 +31,11 @@ bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
+# Wave 2 (installer-core, PLUGIN_PLAN.md): the AppState-backed `PluginInstaller`
+# impl (`src/plugin_installer.rs`) + source staging (`src/plugin_source.rs`)
+# build directly on this infra-layer crate's manifest/registry/installer
+# skeleton.
+bamboo-plugin = { path = "../../infra/bamboo-plugin" }
 # remote-actor P2a (#181): the server hosts the `/v1/agents` control-plane
 # registry over `bamboo_subagent::proto::AgentRecord`. The engine already pulls
 # this crate in transitively; a DIRECT dep makes the type reuse explicit (no
@@ -99,6 +104,12 @@ hex = "0.4"
 sha2 = "0.11"
 rand = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Plugin source staging (`src/plugin_source.rs`): unpacking a local/remote
+# `.tar.gz`/`.tgz` plugin bundle or platform-artifact archive. `flate2` is
+# already pulled in transitively by `actix-http`'s gzip support, but a crate
+# must declare its own deps to use them directly.
+flate2 = "1"
+tar = "0.4"
 actix-governor = "0.10.0"
 notify-rust = "4.18"
 
