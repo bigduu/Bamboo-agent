@@ -1,6 +1,6 @@
 use super::init::{
-    build_provider_handles, build_schedule_manager, build_spawn_scheduler, init_mcp_manager,
-    init_metrics_service, init_schedule_store, init_skill_manager, init_storage,
+    build_connect_manager, build_provider_handles, build_schedule_manager, build_spawn_scheduler,
+    init_mcp_manager, init_metrics_service, init_schedule_store, init_skill_manager, init_storage,
     load_permission_checker, spawn_session_map_cleanup_task,
 };
 use super::tools::{build_base_tools, build_root_tools};
@@ -482,6 +482,25 @@ impl AppState {
             persistence.clone(),
         );
 
+        // bamboo-connect (#452 / epic #447): drives bamboo sessions from IM
+        // platforms (Telegram first). Fully inert when `config.connect.platforms`
+        // is empty — mirrors the schedule manager / notification relay's
+        // always-constructed-but-only-active-if-configured lifecycle.
+        let connect_manager = Arc::new(
+            build_connect_manager(
+                agent.clone(),
+                tool_factory.get(crate::tools::ToolSurface::Root),
+                session_repo.clone(),
+                agent_runners.clone(),
+                session_event_senders.clone(),
+                Some(account_sink.inbox()),
+                Some(data_dir.clone()),
+                config.clone(),
+                provider_registry.clone(),
+            )
+            .await,
+        );
+
         // Dedicated child-session adapter backing the guardian review spawner.
         // The guardian path passes an explicit model (no subagent_type routing)
         // and registers its parent wait at the terminal gate (not via the
@@ -540,6 +559,7 @@ impl AppState {
             bash_resume_hook,
             schedule_store,
             schedule_manager,
+            connect_manager,
             tool_factory,
             permission_checker,
             notification_service,

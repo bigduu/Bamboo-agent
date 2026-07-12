@@ -216,6 +216,20 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
         }
     }
 
+    // Never allow clients to set encrypted bamboo-connect platform tokens
+    // directly.
+    if let Some(platforms) = patch_obj
+        .get_mut("connect")
+        .and_then(|c| c.get_mut("platforms"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for platform in platforms.iter_mut() {
+            if let Some(obj) = platform.as_object_mut() {
+                obj.remove("token_encrypted");
+            }
+        }
+    }
+
     // Never allow clients to set encrypted secret material directly.
     //
     // Canonical MCP format:
@@ -391,6 +405,39 @@ pub fn preserve_masked_notification_secrets(patch_obj: &mut Map<String, Value>, 
             "device_key",
             current.notifications.bark.device_key.as_deref(),
         );
+    }
+}
+
+/// Replace masked bamboo-connect platform `token` placeholders in a patch with
+/// the current config's plaintext values.
+///
+/// Mirrors [`preserve_masked_notification_secrets`]. `connect.platforms` is a
+/// list (not a single object like ntfy/bark), so entries are matched
+/// POSITIONALLY: patch index `i` is resolved against `current.connect.platforms[i]`.
+/// This mirrors how the settings UI round-trips the list (it always sends the
+/// full array back in the same order it was fetched in — the same convention
+/// `env_vars`' full-array replace relies on) — reordering platforms in the
+/// same request as leaving a token masked is not supported and drops that
+/// entry's token, same as no plaintext being configured yet.
+pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, current: &Config) {
+    let Some(platforms) = patch_obj
+        .get_mut("connect")
+        .and_then(|c| c.get_mut("platforms"))
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+
+    for (index, platform) in platforms.iter_mut().enumerate() {
+        let Some(obj) = platform.as_object_mut() else {
+            continue;
+        };
+        let existing_plain = current
+            .connect
+            .platforms
+            .get(index)
+            .and_then(|p| p.token.as_deref());
+        preserve_masked_secret_field(obj, "token", existing_plain);
     }
 }
 
@@ -590,5 +637,85 @@ mod tests {
         preserve_masked_notification_secrets(&mut patch, &current);
 
         assert_eq!(patch["notifications"]["ntfy"]["token"], "tk-real-new-value");
+    }
+
+    fn connect_platform(platform_type: &str, token: &str) -> crate::ConnectPlatformConfig {
+        crate::ConnectPlatformConfig {
+            platform_type: platform_type.to_string(),
+            token: Some(token.to_string()),
+            token_encrypted: None,
+            allow_from: Vec::new(),
+            admin_from: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_connect_platform_encrypted_field() {
+        let mut patch = json!({
+            "connect": {
+                "platforms": [
+                    { "type": "telegram", "token": "new-token", "token_encrypted": "client-supplied-cipher" }
+                ]
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        let platform = &obj["connect"]["platforms"][0];
+        assert!(!platform
+            .as_object()
+            .unwrap()
+            .contains_key("token_encrypted"));
+        assert_eq!(platform["token"], "new-token");
+    }
+
+    #[test]
+    fn preserve_masked_connect_secrets_keeps_existing_plaintext_by_position() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform("telegram", "existing-bot-token")];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"telegram","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"],
+            "existing-bot-token"
+        );
+    }
+
+    #[test]
+    fn preserve_masked_connect_secrets_drops_mask_when_nothing_configured() {
+        let current = Config::default();
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"telegram","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert!(!patch["connect"]["platforms"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("token"));
+    }
+
+    #[test]
+    fn preserve_masked_connect_secrets_leaves_real_values_untouched() {
+        let current = Config::default();
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"telegram","token":"tg-real-new-value"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"],
+            "tg-real-new-value"
+        );
     }
 }

@@ -27,8 +27,9 @@ use bamboo_llm::Config;
 // can import through `config_manager`.
 pub use bamboo_config::patch::{
     deep_merge_json, domains_for_root_patch, effects_for_root_patch, is_masked_api_key,
-    preserve_masked_notification_secrets, preserve_masked_provider_api_keys,
-    provider_api_key_intents, sanitize_root_patch, DomainChanges, PatchEffects, ReloadMode,
+    preserve_masked_connect_secrets, preserve_masked_notification_secrets,
+    preserve_masked_provider_api_keys, provider_api_key_intents, sanitize_root_patch,
+    DomainChanges, PatchEffects, ReloadMode,
 };
 
 pub fn sync_provider_api_keys_encrypted_for_patch(
@@ -156,6 +157,7 @@ pub fn build_merged_config(
     new_config.hydrate_mcp_secrets_from_encrypted();
     new_config.hydrate_env_vars_from_encrypted();
     new_config.hydrate_notifications_from_encrypted();
+    new_config.hydrate_connect_platform_tokens_from_encrypted();
     // The serde round-trip above drops every provider's `#[serde(skip_serializing)]`
     // `api_key`; hydration only restores ciphertext-backed keys, so an env-sourced
     // key (no ciphertext, #253) would be silently blanked by any settings PATCH.

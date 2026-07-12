@@ -254,6 +254,12 @@ pub struct AppState {
     /// Background schedule manager that triggers scheduled runs.
     pub schedule_manager: Arc<ScheduleManager>,
 
+    /// bamboo-connect manager (#452 / epic #447): owns every configured IM
+    /// platform's long-poll/dispatch background task. Fully inert (zero
+    /// tasks) when `config.connect.platforms` is empty. Held so its tasks
+    /// live for the server's lifetime (`ConnectManager::drop` aborts them).
+    pub connect_manager: Arc<crate::connect::ConnectManager>,
+
     /// Tool surface factory providing pre-built tool executors for each session type.
     ///
     /// Use `state.tools_for(ToolSurface::Root)` for root sessions,

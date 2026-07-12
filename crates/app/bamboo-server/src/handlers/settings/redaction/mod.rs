@@ -158,6 +158,46 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         }
     }
 
+    // Redact bamboo-connect platform tokens (Telegram bot token, etc.).
+    // `token` is `#[serde(skip_serializing)]` on `Config` so it never appears
+    // here already; mirror the notification-channel pattern above by
+    // inserting a masked placeholder when configured. Platforms are matched
+    // POSITIONALLY against `config.connect.platforms` (see
+    // `bamboo_config::patch::preserve_masked_connect_secrets`'s doc comment
+    // for why array order is the contract here, same as `env_vars`).
+    if let Some(platforms) = root
+        .get_mut("connect")
+        .and_then(|c| c.get_mut("platforms"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for (index, platform) in platforms.iter_mut().enumerate() {
+            let Some(obj) = platform.as_object_mut() else {
+                continue;
+            };
+            let configured = config
+                .connect
+                .platforms
+                .get(index)
+                .map(|p| {
+                    p.token
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                        || p.token_encrypted.is_some()
+                })
+                .unwrap_or(false);
+            if configured {
+                obj.insert(
+                    "token".to_string(),
+                    Value::String("****...****".to_string()),
+                );
+            } else {
+                obj.remove("token");
+            }
+            obj.remove("token_encrypted");
+        }
+    }
+
     // Redact cluster-fabric SSH secrets on each node's placement.auth.
     if let Some(nodes) = root
         .get_mut("cluster_fabric")
