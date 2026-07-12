@@ -163,6 +163,7 @@ pub fn build_merged_config(
     new_config.preserve_env_sourced_provider_keys(current);
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
+    new_config.normalize_plugin_trust_settings();
 
     Ok(new_config)
 }

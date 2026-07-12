@@ -15,21 +15,50 @@
 //!   `plugin.json`, content-only and typically an MCP server backed entirely
 //!   by a downloadable binary — e.g. a nova-style plugin with no bundled
 //!   skills/prompts — or an archive containing one, same flattening rule as
-//!   `LocalArchive`). **Secure by default**: the downloaded bundle bytes are
-//!   verified against a caller-supplied `sha256` BEFORE anything is
-//!   extracted or parsed; if no `sha256` was given, the fetch is refused
-//!   outright unless the caller explicitly set `allow_unverified` (see
-//!   [`PluginSourceInput::Url`]'s fields and [`fetch_manifest_bundle`]). THEN,
-//!   separately, for [`Platform::current`] (if the manifest declares an
+//!   `LocalArchive`). **Three trust layers, stacked, enforced in
+//!   [`fetch_manifest_bundle`] in this order:**
+//!
+//!   1. **Host allowlist (source authorization)** — is the URL's `<host><path>`
+//!      one the operator has trusted (`bamboo_config::PluginTrustConfig::trusted_hosts`)?
+//!      Refused BEFORE any network access ([`PluginError::UntrustedHost`])
+//!      unless `allow_untrusted_host` is set.
+//!   2. **Signature (publisher authenticity)** — after the bundle is
+//!      downloaded, does its `<url>.sig` sidecar (a raw 64-byte ed25519
+//!      signature, hex-encoded, over the exact bundle bytes) verify against
+//!      any `bamboo_config::TrustedKey` in `trusted_keys`? Refused
+//!      ([`PluginError::UnsignedOrUntrustedSignature`]) unless `allow_unsigned`
+//!      is set.
+//!   3. **Checksum (integrity)** — same sha256 pin as before, EXCEPT a
+//!      verified signature from layer 2 already proves integrity+authenticity
+//!      more strongly than a pasted hash could, so it SATISFIES this layer's
+//!      requirement even with neither `sha256` nor `allow_unverified` given
+//!      (an `allow_unsigned` bypass grants no such credit — an unsigned
+//!      install still needs its own sha256/allow_unverified exactly as
+//!      before). See [`fetch_manifest_bundle`] for the precise precedence.
+//!
+//!   A pasted checksum ALONE never establishes source trust — it is circular
+//!   if the attacker controls the page the checksum was copied from — which
+//!   is why layers 1 and 2 exist independently of layer 3.
+//!
+//!   Byte-authenticity note: the host allowlist only vets the FIRST hop's
+//!   `<host><path>`, not wherever an HTTP redirect might lead — a signature
+//!   or checksum is what actually authenticates the downloaded bytes, so
+//!   redirects are followed whenever either will be checked, but disabled
+//!   entirely for the fully-opted-out `allow_unsigned && sha256.is_none()`
+//!   case, where the host allowlist is the sole control (see
+//!   [`http_client_no_redirects`]).
+//!
+//!   THEN, separately, for [`Platform::current`] (if the manifest declares an
 //!   artifact for it), fetches the per-platform binary archive named in
 //!   `manifest.artifacts`, verifies its sha256 BEFORE unpacking (mandatory —
 //!   a URL plugin ships a binary that gets executed), and places the single
 //!   expected executable at `bin/<platform>/<id>[.exe]` per
-//!   [`bamboo_plugin::manifest::PluginArtifact`]'s archive contract. Both
-//!   checks stay: the bundle-sha256 check is the new root-of-trust pin (it
-//!   closes the gap where the artifact's own declared hash lives inside the
-//!   very bundle that could be tampered with); the artifact-sha256 check
-//!   remains as defense in depth for the binary specifically.
+//!   [`bamboo_plugin::manifest::PluginArtifact`]'s archive contract. This
+//!   artifact-sha256 check is unaffected by the host/signature layers above
+//!   (the artifact URL is declared inside a manifest that has ALREADY passed
+//!   all three trust layers) — it remains defense in depth for the binary
+//!   specifically, closing the gap where the artifact's own declared hash
+//!   lives inside the bundle that carries it.
 //!
 //! All three paths run the SAME safety checks: [`PluginManifest::validate`]
 //! before anything is committed to `plugins_dir()`, and path-traversal-safe
@@ -81,14 +110,17 @@
 //!   the URL is ever requested — with [`PluginError::ChecksumRequired`]. A
 //!   URL install can therefore no longer just download-and-trust any
 //!   tar.gz. The verified bundle sha256 (not the binary artifact's) is what
-//!   `PluginSource::Url.sha256` records for provenance/audit. Still
-//!   deferred:
-//!   - **Signature verification.** A sha256 pin only proves "this is the
-//!     bytes the installer expected", not "an entity I trust produced
-//!     them" — the hash itself still has to come from somewhere the caller
-//!     trusts (a release page, a signed index, etc.). A real signature
-//!     scheme (e.g. minisign/sigstore over the bundle) would remove that
-//!     remaining hop.
+//!   `PluginSource::Url.sha256` records for provenance/audit.
+//! - **Source-TRUST layer: IMPLEMENTED** (host allowlist + ed25519 publisher
+//!   signature — see the module-level "three trust layers" summary above and
+//!   [`fetch_manifest_bundle`]). A sha256 pin alone only proves "this is the
+//!   bytes the installer expected", not "an entity I trust produced them" —
+//!   and worse, a checksum pasted from the SAME page as a malicious URL is
+//!   circular, proving nothing about the source. `bamboo_config::PluginTrustConfig`
+//!   (`trusted_hosts` + `trusted_keys`, both user-editable in `config.json`)
+//!   closes that: a URL install now also needs an operator-trusted host and
+//!   (absent `allow_unsigned`) a bundle signature verifying against a trusted
+//!   key. Still deferred:
 //!   - **SSRF guard**, described next.
 //! - **No SSRF guard on URL fetch.** [`download_bytes`] will fetch any URL,
 //!   including `http://169.254.169.254/...` (cloud metadata) or private-range
@@ -118,11 +150,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use bamboo_config::PluginTrustConfig;
 use bamboo_plugin::manifest::Platform;
 use bamboo_plugin::{
     InstallDisposition, InstalledPlugin, PluginError, PluginInstaller, PluginManifest,
     PluginResult, PluginSource,
 };
+use ed25519_dalek::Verifier;
 
 /// What the caller pointed the installer at.
 #[derive(Debug, Clone)]
@@ -133,16 +167,24 @@ pub enum PluginSourceInput {
     /// (at its root, or under a single top-level directory).
     LocalArchive(PathBuf),
     /// A URL to either a bare `plugin.json` or an archive containing one
-    /// (same root-or-single-subdir rule as `LocalArchive`). Secure by
-    /// default: `sha256`, when given, pins the downloaded bundle's exact
-    /// bytes (verified before anything is extracted/parsed — see
-    /// [`fetch_manifest_bundle`]); with no `sha256`, the fetch is refused
-    /// unless `allow_unverified` is `true` (an explicit, logged opt-out of
-    /// verification — see [`PluginError::ChecksumRequired`]).
+    /// (same root-or-single-subdir rule as `LocalArchive`). Three trust
+    /// layers, all enforced in [`fetch_manifest_bundle`] (see the module
+    /// docs' "three trust layers" summary):
+    ///
+    /// - `allow_untrusted_host`: opt out of the host allowlist
+    ///   (`bamboo_config::PluginTrustConfig::trusted_hosts`) — see
+    ///   [`PluginError::UntrustedHost`].
+    /// - `allow_unsigned`: opt out of requiring the bundle's `.sig` to verify
+    ///   against a trusted key — see [`PluginError::UnsignedOrUntrustedSignature`].
+    /// - `sha256`/`allow_unverified`: the checksum layer, unchanged from
+    ///   before EXCEPT a verified signature now also satisfies it (see
+    ///   [`fetch_manifest_bundle`]) — see [`PluginError::ChecksumRequired`].
     Url {
         url: String,
         sha256: Option<String>,
         allow_unverified: bool,
+        allow_untrusted_host: bool,
+        allow_unsigned: bool,
     },
 }
 
@@ -191,8 +233,9 @@ impl StagedPlugin {
 pub async fn stage_plugin_source(
     input: PluginSourceInput,
     plugins_root: &Path,
+    trust: &PluginTrustConfig,
 ) -> PluginResult<StagedPlugin> {
-    stage_plugin_source_inner(input, plugins_root, MAX_DECOMPRESSED_BYTES).await
+    stage_plugin_source_inner(input, plugins_root, trust, MAX_DECOMPRESSED_BYTES).await
 }
 
 /// Test-only seam for [`stage_plugin_source`] that lets a test inject a small
@@ -204,21 +247,23 @@ pub async fn stage_plugin_source(
 pub(crate) async fn stage_plugin_source_with_decompressed_cap(
     input: PluginSourceInput,
     plugins_root: &Path,
+    trust: &PluginTrustConfig,
     max_decompressed_bytes: u64,
 ) -> PluginResult<StagedPlugin> {
-    stage_plugin_source_inner(input, plugins_root, max_decompressed_bytes).await
+    stage_plugin_source_inner(input, plugins_root, trust, max_decompressed_bytes).await
 }
 
 async fn stage_plugin_source_inner(
     input: PluginSourceInput,
     plugins_root: &Path,
+    trust: &PluginTrustConfig,
     max_decompressed_bytes: u64,
 ) -> PluginResult<StagedPlugin> {
     tokio::fs::create_dir_all(plugins_root).await?;
     let staging_dir = plugins_root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&staging_dir).await?;
 
-    let staged = stage_into(&input, &staging_dir, max_decompressed_bytes).await;
+    let staged = stage_into(&input, &staging_dir, trust, max_decompressed_bytes).await;
     let (manifest, source) = match staged {
         Ok(pair) => pair,
         Err(error) => {
@@ -274,9 +319,10 @@ pub async fn install_plugin_from_source(
     installer: &dyn PluginInstaller,
     input: PluginSourceInput,
     plugins_root: &Path,
+    trust: &PluginTrustConfig,
     disposition: InstallDisposition,
 ) -> PluginResult<InstalledPlugin> {
-    let staged = stage_plugin_source(input, plugins_root).await?;
+    let staged = stage_plugin_source(input, plugins_root, trust).await?;
     let manifest = staged.manifest.clone();
     let plugin_dir = staged.plugin_dir.clone();
     let source = staged.source.clone();
@@ -305,6 +351,7 @@ pub async fn install_plugin_from_source(
 async fn stage_into(
     input: &PluginSourceInput,
     staging_dir: &Path,
+    trust: &PluginTrustConfig,
     max_decompressed_bytes: u64,
 ) -> PluginResult<(PluginManifest, PluginSource)> {
     match input {
@@ -336,15 +383,18 @@ async fn stage_into(
             url,
             sha256,
             allow_unverified,
+            allow_untrusted_host,
+            allow_unsigned,
         } => {
-            let (manifest, verified_bundle_sha256) = fetch_manifest_bundle(
-                url,
-                sha256.as_deref(),
-                *allow_unverified,
-                staging_dir,
-                max_decompressed_bytes,
-            )
-            .await?;
+            let flags = UrlTrustFlags {
+                sha256: sha256.as_deref(),
+                allow_unverified: *allow_unverified,
+                allow_untrusted_host: *allow_untrusted_host,
+                allow_unsigned: *allow_unsigned,
+            };
+            let (manifest, verified_bundle_sha256, signed_by) =
+                fetch_manifest_bundle(url, flags, trust, staging_dir, max_decompressed_bytes)
+                    .await?;
             // Binary-artifact verification stays as defense in depth (see
             // the module docs) — its own sha256, declared inside the
             // now-verified manifest, is checked in
@@ -358,6 +408,9 @@ async fn stage_into(
                     url: url.clone(),
                     sha256: verified_bundle_sha256,
                     allow_unverified: *allow_unverified,
+                    allow_untrusted_host: *allow_untrusted_host,
+                    allow_unsigned: *allow_unsigned,
+                    signed_by,
                 },
             ))
         }
@@ -368,34 +421,130 @@ async fn stage_into(
 // Manifest bundle fetch (URL source)
 // ---------------------------------------------------------------------
 
+/// The caller-supplied bits of a [`PluginSourceInput::Url`] that
+/// [`fetch_manifest_bundle`] needs, grouped into one struct purely to keep
+/// that function's parameter count sane (`PluginSourceInput::Url` itself
+/// carries the same four fields, plus `url`, which stays a separate
+/// top-level parameter since [`fetch_and_verify_signature`] and the sha256
+/// helpers all key off it directly).
+struct UrlTrustFlags<'a> {
+    sha256: Option<&'a str>,
+    allow_unverified: bool,
+    allow_untrusted_host: bool,
+    allow_unsigned: bool,
+}
+
 /// Fetch `url`: either a bare `plugin.json` or an archive containing one
 /// (same root-or-single-subdir rule as [`PluginSourceInput::LocalArchive`]).
 /// Populates `staging_dir` with whatever the bundle contains (just
 /// `plugin.json` for a bare manifest; the full skills/prompts/workflows tree
 /// for an archive).
 ///
-/// **Secure by default.** Before the URL is even requested: if `sha256` is
-/// `None` and `allow_unverified` is `false`, refuses with
-/// [`PluginError::ChecksumRequired`] — no network access happens for a
-/// refused install. If `sha256` IS given, the downloaded bytes are hashed
-/// and compared (case-insensitive) BEFORE any extraction/parsing; a
-/// mismatch is [`PluginError::BundleVerificationFailed`] and nothing is
-/// written beyond the (discarded) in-memory bytes. If `allow_unverified` is
-/// `true` and no `sha256` was given, the fetch proceeds but logs a
-/// `tracing::warn!` — an explicit, visible opt-out of verification, never a
-/// silent one.
+/// **Three trust layers, enforced in this order** (see the module docs'
+/// summary):
 ///
-/// Returns the parsed manifest and, when a `sha256` was supplied and
-/// confirmed, that verified hex digest (for [`PluginSource::Url`]
-/// provenance) — `None` only on the `allow_unverified`-with-no-hash path.
+/// 1. **Host allowlist.** Before the URL is even requested: if it is not
+///    `https` with a `<host><path>` matching one of `trust.trusted_hosts` as a
+///    prefix, refuses with [`PluginError::UntrustedHost`] — no network access
+///    happens for a refused install — unless `allow_untrusted_host` is `true`
+///    (logged).
+/// 2. **Signature.** Once the bundle is downloaded, `<url>.sig` is fetched
+///    (a missing/unreachable sidecar is treated identically to a malformed
+///    one — see [`fetch_and_verify_signature`]) and checked against every
+///    `algorithm: "ed25519"` entry in `trust.trusted_keys`. A match records
+///    that key's label; no match refuses with
+///    [`PluginError::UnsignedOrUntrustedSignature`] unless `allow_unsigned`
+///    is `true` (logged).
+/// 3. **Checksum.** If `sha256` is `None`, `allow_unverified` is `false`, AND
+///    the bundle was NOT signature-verified in step 2, refuses with
+///    [`PluginError::ChecksumRequired`] — a verified signature already proves
+///    integrity+authenticity more strongly than a pasted hash, so it
+///    satisfies this layer on its own (an `allow_unsigned` bypass grants no
+///    such credit: an unsigned install still needs its own
+///    `sha256`/`allow_unverified`, exactly as before this branch). If
+///    `sha256` IS given (signed or not), the downloaded bytes are still
+///    hashed and compared (case-insensitive) BEFORE any extraction/parsing —
+///    a mismatch is [`PluginError::BundleVerificationFailed`] regardless of
+///    signature status.
+///
+/// Returns the parsed manifest, the verified bundle sha256 (`None` unless a
+/// `sha256` was supplied and confirmed — for [`PluginSource::Url`]
+/// provenance), and the trusted key label the signature verified against
+/// (`None` if the install proceeded unsigned via `allow_unsigned`).
 async fn fetch_manifest_bundle(
     url: &str,
-    sha256: Option<&str>,
-    allow_unverified: bool,
+    flags: UrlTrustFlags<'_>,
+    trust: &PluginTrustConfig,
     staging_dir: &Path,
     max_decompressed_bytes: u64,
-) -> PluginResult<(PluginManifest, Option<String>)> {
-    if sha256.is_none() && !allow_unverified {
+) -> PluginResult<(PluginManifest, Option<String>, Option<String>)> {
+    let UrlTrustFlags {
+        sha256,
+        allow_unverified,
+        allow_untrusted_host,
+        allow_unsigned,
+    } = flags;
+
+    // Layer 1: host allowlist — refuse BEFORE any network access.
+    if !trust.is_host_trusted(url) {
+        if !allow_untrusted_host {
+            return Err(PluginError::UntrustedHost(format!(
+                "refusing to install plugin bundle from '{url}': its host is not in the \
+                 `plugin_trust.trusted_hosts` allowlist (config.json) — add a matching \
+                 host+path prefix there, or explicitly accept the risk (CLI: \
+                 `--allow-untrusted-host`; HTTP: `\"allow_untrusted_host\": true`)"
+            )));
+        }
+        tracing::warn!(
+            %url,
+            "installing plugin bundle from a host outside `plugin_trust.trusted_hosts` \
+             (allow_untrusted_host opt-out)"
+        );
+    }
+
+    // Redirect policy (BLOCKER 1 fix): whether the downloaded bytes WILL be
+    // cryptographically authenticated determines whether it's safe to follow
+    // a redirect. A signature is REQUIRED whenever `!allow_unsigned` — even
+    // though it hasn't been fetched/checked yet, an unverified-but-required
+    // signature refuses the install below regardless of which host actually
+    // served the bytes, so following a redirect to get here is harmless.
+    // Likewise a supplied `sha256` is checked (and refused on mismatch) below
+    // regardless of the serving host. Only when NEITHER control is in play —
+    // `allow_unsigned` AND no `sha256` — is the host allowlist the SOLE
+    // authority over where these bytes came from; it only vetted this exact
+    // URL, so redirects must be disabled in that case (see
+    // `http_client_no_redirects`). The SAME client is used for both the
+    // bundle fetch and the `.sig` fetch below, for one install.
+    let bytes_will_be_authenticated = !allow_unsigned || sha256.is_some();
+    let client = if bytes_will_be_authenticated {
+        http_client_following_redirects()
+    } else {
+        http_client_no_redirects()
+    };
+
+    let bytes = download_bytes(client, url, MAX_DOWNLOAD_BYTES).await?;
+
+    // Layer 2: signature — a valid signature is a STRONGER integrity +
+    // authenticity guarantee than a pasted checksum (see layer 3 below).
+    let signed_by = fetch_and_verify_signature(client, url, &bytes, &trust.trusted_keys).await;
+    if signed_by.is_none() {
+        if !allow_unsigned {
+            return Err(PluginError::UnsignedOrUntrustedSignature(format!(
+                "refusing to install plugin bundle from '{url}': it is unsigned, or its \
+                 '{url}.sig' does not verify against any key in `plugin_trust.trusted_keys` \
+                 (config.json) — publish a signature from a trusted key, or explicitly accept \
+                 the risk (CLI: `--allow-unsigned`; HTTP: `\"allow_unsigned\": true`)"
+            )));
+        }
+        tracing::warn!(
+            %url,
+            "installing an unsigned (or untrusted-signature) plugin bundle (allow_unsigned opt-out)"
+        );
+    }
+
+    // Layer 3: checksum — superseded by a verified signature (layer 2), but
+    // otherwise unchanged.
+    if sha256.is_none() && !allow_unverified && signed_by.is_none() {
         return Err(PluginError::ChecksumRequired(format!(
             "refusing to install plugin bundle from '{url}' without a checksum — pass the \
              bundle's sha256 (from the release page / a trusted source) to verify it before \
@@ -404,8 +553,6 @@ async fn fetch_manifest_bundle(
              `--allow-unverified`; HTTP: `\"allow_unverified\": true`)"
         )));
     }
-
-    let bytes = download_bytes(url).await?;
 
     let verified_sha256 = match sha256 {
         Some(expected) => {
@@ -420,11 +567,13 @@ async fn fetch_manifest_bundle(
             Some(actual)
         }
         None => {
-            tracing::warn!(
-                %url,
-                "installing plugin bundle from a URL with no checksum verification \
-                 (allow_unverified opt-out) — the download is trusted on HTTPS alone"
-            );
+            if signed_by.is_none() {
+                tracing::warn!(
+                    %url,
+                    "installing plugin bundle from a URL with no checksum verification \
+                     (allow_unverified opt-out) — the download is trusted on HTTPS alone"
+                );
+            }
             None
         }
     };
@@ -448,7 +597,57 @@ async fn fetch_manifest_bundle(
         PluginManifest::parse_str(&raw)?
     };
 
-    Ok((manifest, verified_sha256))
+    Ok((manifest, verified_sha256, signed_by))
+}
+
+/// Fetch `<url>.sig` and verify it against `bundle_bytes` for every
+/// `algorithm: "ed25519"` entry in `trusted_keys`. Returns the label of the
+/// FIRST trusted key the signature verifies against, or `None` if the
+/// sidecar is missing/unfetchable, malformed (not 128 hex chars — a raw
+/// 64-byte ed25519 signature, trailing whitespace trimmed), or does not
+/// verify against any trusted key. All of those failure modes are treated
+/// identically on purpose: an attacker serving a garbage/absent `.sig` must
+/// not be distinguishable from "genuinely unsigned" by anything this
+/// function returns.
+async fn fetch_and_verify_signature(
+    client: &reqwest::Client,
+    url: &str,
+    bundle_bytes: &[u8],
+    trusted_keys: &[bamboo_config::TrustedKey],
+) -> Option<String> {
+    // Plain release-asset URLs (no query string) are the supported case: this
+    // just appends `.sig`, which would misplace the suffix AFTER a query
+    // string on a URL like `.../plugin.json?token=...` (`.../plugin.json?token=....sig`,
+    // not the sidecar). Plugin bundle URLs are typically bare release-asset
+    // URLs with no query string; if that ever needs to change, insert `.sig`
+    // before the `?` instead of blindly appending it.
+    let sig_url = format!("{url}.sig");
+    let sig_bytes = download_bytes(client, &sig_url, MAX_SIGNATURE_DOWNLOAD_BYTES)
+        .await
+        .ok()?;
+    let sig_text = String::from_utf8(sig_bytes).ok()?;
+    let sig_raw = hex::decode(sig_text.trim()).ok()?;
+    let sig_array: [u8; 64] = sig_raw.try_into().ok()?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+
+    for key in trusted_keys {
+        if !key.algorithm.eq_ignore_ascii_case("ed25519") {
+            continue;
+        }
+        let Ok(pub_raw) = hex::decode(&key.public_key) else {
+            continue;
+        };
+        let Ok(pub_array) = <[u8; 32]>::try_from(pub_raw.as_slice()) else {
+            continue;
+        };
+        let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pub_array) else {
+            continue;
+        };
+        if verifying_key.verify(bundle_bytes, &signature).is_ok() {
+            return Some(key.label.clone());
+        }
+    }
+    None
 }
 
 /// Per-platform binary artifact fetch (URL source only). Fetches the
@@ -478,7 +677,16 @@ async fn fetch_and_place_artifact(
         return Ok(());
     };
 
-    let bytes = download_bytes(&artifact.url).await?;
+    // The artifact's sha256 is verified BELOW, unconditionally (no bypass
+    // flag exists for it — see this function's docs) — the downloaded bytes
+    // are always cryptographically authenticated here, so redirects are
+    // always safe to follow for this fetch.
+    let bytes = download_bytes(
+        http_client_following_redirects(),
+        &artifact.url,
+        MAX_DOWNLOAD_BYTES,
+    )
+    .await?;
     let actual_sha256 = sha256_hex(&bytes);
     if !actual_sha256.eq_ignore_ascii_case(&artifact.sha256) {
         return Err(PluginError::ArtifactVerificationFailed(format!(
@@ -544,12 +752,42 @@ async fn move_file(source: &Path, dest: &Path) -> PluginResult<()> {
 // HTTP fetch
 // ---------------------------------------------------------------------
 
-/// One shared `reqwest::Client` for plugin source fetches. Reuses the
-/// workspace's pinned (native-tls) `reqwest` — never construct a second
-/// client/connector here (see `notify_sinks::ntfy`'s identical pattern).
-fn http_client() -> &'static reqwest::Client {
+/// Client used whenever the downloaded bytes WILL be cryptographically
+/// authenticated — a signature is required (`!allow_unsigned`) or a `sha256`
+/// pin was supplied. Following redirects is safe here: whichever host
+/// actually served the final bytes, the signature/checksum check downstream
+/// refuses on a bad result regardless — this is what lets the default
+/// official-signed-via-CDN flow (GitHub Releases 302-redirecting to
+/// `objects.githubusercontent.com`) and the checksummed flow keep working.
+/// Reuses the workspace's pinned (native-tls) `reqwest` — never construct a
+/// second client/connector here (see `notify_sinks::ntfy`'s identical
+/// pattern).
+fn http_client_following_redirects() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .expect("a reqwest client with only a redirect policy set always builds")
+    })
+}
+
+/// Client used whenever NEITHER a signature nor a checksum will authenticate
+/// the downloaded bytes (`allow_unsigned && sha256.is_none()` — the fully
+/// opted-out "host-only trust" case). The host allowlist (layer 1) only
+/// vetted the FIRST hop's `<host><path>`; a transparent redirect would let
+/// the bytes actually come from anywhere, silently defeating the allowlist
+/// as the sole control. Redirects are disabled so a server that tries to
+/// redirect is refused outright (see [`download_bytes`]) rather than quietly
+/// followed — the approved host must serve the bytes directly.
+fn http_client_no_redirects() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a reqwest client with only a redirect policy set always builds")
+    })
 }
 
 /// Hard ceiling on any single plugin download (manifest, bundle, or binary
@@ -557,6 +795,14 @@ fn http_client() -> &'static reqwest::Client {
 /// stream an unbounded body into memory (OOM DoS). 256 MiB is generous for a
 /// plugin bundle + one platform binary while still bounding the worst case.
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Hard ceiling on the `.sig` sidecar fetch specifically ([`fetch_and_verify_signature`]).
+/// A valid signature is exactly 128 hex chars (a raw 64-byte ed25519
+/// signature, hex-encoded) — 4 KiB is already wildly generous. Capping it far
+/// below [`MAX_DOWNLOAD_BYTES`] means a malicious/misconfigured host serving
+/// a `.sig` route can't force multiple hundreds of MiB into memory before the
+/// hex-decode simply fails on the (way too long) body.
+const MAX_SIGNATURE_DOWNLOAD_BYTES: u64 = 4 * 1024;
 
 /// Hard ceiling on the TOTAL decompressed bytes any single archive (zip or
 /// tar.gz) may expand to across ALL of its entries combined. Complements
@@ -573,13 +819,51 @@ const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 /// plus, at most, one platform binary) while still bounding the worst case.
 const MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
+/// Fetch `url` via `client`, capping the body at `max_bytes`. `client`'s
+/// redirect policy is the caller's decision (see
+/// [`http_client_following_redirects`] / [`http_client_no_redirects`]) — this
+/// function additionally refuses outright, with [`PluginError::RedirectRefused`]
+/// (a clean 403-family trust refusal, NOT a 500), if the FINAL response it
+/// receives is itself still a redirect (3xx), which only happens when
+/// `client` was built with `redirect::Policy::none()` and the server actually
+/// tried to redirect: that means the request's trust flags decided the bytes
+/// must come from the vetted host directly (see BLOCKER 1 in the source-trust
+/// review / the module docs), so silently treating the redirect response as
+/// the payload would defeat that decision.
+async fn download_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: u64,
+) -> PluginResult<Vec<u8>> {
     use futures::StreamExt;
 
     let response =
-        http_client().get(url).send().await.map_err(|error| {
+        client.get(url).send().await.map_err(|error| {
             PluginError::Registration(format!("failed to fetch '{url}': {error}"))
         })?;
+
+    if response.status().is_redirection() {
+        let status = response.status();
+        // Surface the redirect TARGET (host) so the caller can decide whether
+        // to trust it / add it to `trusted_hosts` — a redirect with no
+        // `Location`, or one whose value isn't valid UTF-8, degrades to a
+        // generic "(unspecified)" rather than failing differently.
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let target = location.as_deref().unwrap_or("(unspecified)");
+        return Err(PluginError::RedirectRefused(format!(
+            "refused to follow an HTTP redirect ({status}) from '{url}' to '{target}': for an \
+             unverified install (no signature, no checksum) the approved host must serve the \
+             bytes directly, so redirects are not followed — install from the canonical/final \
+             URL, or provide a signature / `--sha256` (which authenticates the bytes regardless \
+             of which host serves them), or add the redirect target's host to \
+             `plugin_trust.trusted_hosts`"
+        )));
+    }
+
     let response = response.error_for_status().map_err(|error| {
         PluginError::Registration(format!("'{url}' returned an error status: {error}"))
     })?;
@@ -587,10 +871,10 @@ async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
     // Reject up front if the server ADVERTISES an over-cap body (cheap, avoids
     // streaming at all)...
     if let Some(len) = response.content_length() {
-        if len > MAX_DOWNLOAD_BYTES {
+        if len > max_bytes {
             return Err(PluginError::Registration(format!(
-                "'{url}' advertises a {len}-byte body, over the {MAX_DOWNLOAD_BYTES}-byte plugin \
-                 download cap; refusing"
+                "'{url}' advertises a {len}-byte body, over the {max_bytes}-byte download cap; \
+                 refusing"
             )));
         }
     }
@@ -603,10 +887,9 @@ async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
         let chunk = chunk.map_err(|error| {
             PluginError::Registration(format!("failed to read response body of '{url}': {error}"))
         })?;
-        if buffer.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+        if buffer.len() as u64 + chunk.len() as u64 > max_bytes {
             return Err(PluginError::Registration(format!(
-                "'{url}' streamed more than the {MAX_DOWNLOAD_BYTES}-byte plugin download cap; \
-                 aborting"
+                "'{url}' streamed more than the {max_bytes}-byte download cap; aborting"
             )));
         }
         buffer.extend_from_slice(&chunk);

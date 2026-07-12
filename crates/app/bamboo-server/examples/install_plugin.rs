@@ -53,10 +53,12 @@ async fn main() {
                 InstallDisposition::FailIfInstalled
             };
             let plugins_root = data_dir.join("plugins");
+            let trust = data.config.read().await.plugin_trust.clone();
             match install_plugin_from_source(
                 &installer,
                 PluginSourceInput::LocalDir(plugin_dir),
                 &plugins_root,
+                &trust,
                 disposition,
             )
             .await

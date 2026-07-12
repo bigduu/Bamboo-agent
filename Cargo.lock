@@ -1059,6 +1059,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1367,6 +1368,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "dashmap",
+ "ed25519-dalek",
  "flate2",
  "futures",
  "globset",

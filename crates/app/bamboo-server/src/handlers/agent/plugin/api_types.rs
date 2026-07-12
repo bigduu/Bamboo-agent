@@ -14,23 +14,38 @@
 //! `SourceSpec` reuses [`bamboo_plugin::PluginSource`]'s own
 //! `#[serde(tag = "type", rename_all = "snake_case")]` wire shape directly —
 //! `{"type":"local_dir","path":...}` / `{"type":"local_archive","path":...}` /
-//! `{"type":"url","url":...,"sha256":...?,"allow_unverified":...?}` — rather
-//! than inventing a parallel request enum: it is already exactly the shape
-//! both the CLI and this HTTP layer need, and it doubles as the provenance
-//! record `install()` persists (see `bamboo_plugin::registry::PluginSource`'s
-//! doc comment).
+//! `{"type":"url","url":...,"sha256":...?,"allow_unverified":...?,
+//! "allow_untrusted_host":...?,"allow_unsigned":...?}` — rather than
+//! inventing a parallel request enum: it is already exactly the shape both
+//! the CLI and this HTTP layer need, and it doubles as the provenance record
+//! `install()` persists (see `bamboo_plugin::registry::PluginSource`'s doc
+//! comment). `signed_by` is also part of that same wire shape but is
+//! response-only in practice — a request-supplied value is ignored (see
+//! `to_source_input`).
 //!
-//! **Secure by default (`url` sources).** `sha256`, when given, pins the
-//! downloaded BUNDLE's exact bytes — verified in
-//! `plugin_source::fetch_manifest_bundle` BEFORE anything is
-//! extracted/parsed, distinct from (and in addition to) the per-platform
-//! *binary artifact*'s own sha256 declared inside the manifest itself
-//! (always verified, regardless of this field — see `plugin_source.rs`'s
-//! module docs on why both checks matter). Without `sha256`, a `url` install
-//! is REFUSED (`PluginError::ChecksumRequired`, mapped to `400`) unless
-//! `allow_unverified: true` is explicitly set — so `POST /install` with a
-//! bare `{"type":"url","url":"..."}` body no longer just downloads and
-//! trusts any tar.gz.
+//! **Three trust layers (`url` sources), enforced together in
+//! `plugin_source::fetch_manifest_bundle`** (see that module's docs for the
+//! full precedence):
+//!
+//! 1. **Host allowlist.** The URL's host+path must match one of
+//!    `plugin_trust.trusted_hosts` (config.json) unless
+//!    `allow_untrusted_host: true` is set — refused with
+//!    `PluginError::UntrustedHost` (`403`) BEFORE any fetch.
+//! 2. **Signature.** The bundle's `<url>.sig` must verify against one of
+//!    `plugin_trust.trusted_keys` unless `allow_unsigned: true` is set —
+//!    refused with `PluginError::UnsignedOrUntrustedSignature` (`403`).
+//! 3. **Checksum.** `sha256`, when given, pins the downloaded BUNDLE's exact
+//!    bytes — verified BEFORE anything is extracted/parsed, distinct from
+//!    (and in addition to) the per-platform *binary artifact*'s own sha256
+//!    declared inside the manifest itself (always verified, regardless of
+//!    this field). Without `sha256`, a `url` install is REFUSED
+//!    (`PluginError::ChecksumRequired`, mapped to `400`) unless
+//!    `allow_unverified: true` is set OR the bundle was verified in step 2
+//!    (a valid signature satisfies the checksum requirement on its own — see
+//!    `plugin_source.rs`'s module docs).
+//!
+//! So `POST /install` with a bare `{"type":"url","url":"..."}` body no
+//! longer just downloads and trusts any tar.gz from any host.
 
 use serde::{Deserialize, Serialize};
 
