@@ -120,6 +120,7 @@ rand = "0.10"
 # exact pin, and cargo refuses to select two versions of the same crate for
 # one dependency graph; matching russh's exact pin keeps a single resolved
 # version (the one already in Cargo.lock, adding no new crate to the tree).
+# TODO: move to a stable release once russh's pin does.
 ed25519-dalek = { version = "=3.0.0-rc.1" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Plugin source staging (`src/plugin_source.rs`): unpacking a local/remote
