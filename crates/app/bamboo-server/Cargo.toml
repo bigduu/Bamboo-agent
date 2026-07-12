@@ -103,6 +103,24 @@ url = "2"
 hex = "0.4"
 sha2 = "0.11"
 rand = "0.10"
+# Plugin source-trust (`src/plugin_source.rs`): ed25519 publisher-signature
+# verification for URL-installed plugin bundles, layered on top of the
+# checksum + host-allowlist checks. Pure-Rust (curve25519-dalek), no TLS/libc
+# crypto backend — must never pull in aws-lc-sys (would break the reqwest
+# native-tls pin; verify with `cargo tree -i aws-lc-sys`). Already resolved
+# transitively via `russh`'s SSH host-key support, so this adds no new crate
+# to the dependency tree, just a direct edge to one already in the lockfile.
+# Default features only: verification uses `VerifyingKey::from_bytes` +
+# `Verifier::verify`, and test keypairs use `SigningKey::from_bytes` (a fixed
+# 32-byte "secret"), so no CSPRNG feature (`rand_core`) is needed anywhere.
+#
+# Pinned to the exact prerelease `russh` (SSH deploy, `bamboo-broker`) already
+# requires (`=3.0.0-rc.1`) — a looser `"3"` requirement lets cargo prefer the
+# stable `3.0.0` release for THIS crate while russh is stuck on the `-rc.1`
+# exact pin, and cargo refuses to select two versions of the same crate for
+# one dependency graph; matching russh's exact pin keeps a single resolved
+# version (the one already in Cargo.lock, adding no new crate to the tree).
+ed25519-dalek = { version = "=3.0.0-rc.1" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Plugin source staging (`src/plugin_source.rs`): unpacking a local/remote
 # `.tar.gz`/`.tgz` plugin bundle or platform-artifact archive. `flate2` is
