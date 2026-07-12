@@ -584,6 +584,106 @@ pub struct NotificationsConfig {
     pub bark: BarkChannelConfig,
 }
 
+/// One publisher key trusted to sign plugin bundles.
+///
+/// `algorithm` is a plain string (not an enum) so an unrecognized future value
+/// in an old/new config just never matches during verification rather than
+/// failing to deserialize — additive/forward-compatible, matching this
+/// crate's other config sections. Only `"ed25519"` is understood today.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedKey {
+    /// Human-readable label (surfaced in logs/CLI output); purely descriptive.
+    pub label: String,
+    /// Signature algorithm. Only `"ed25519"` is currently verified.
+    pub algorithm: String,
+    /// Hex-encoded public key (32 raw bytes for ed25519).
+    pub public_key: String,
+}
+
+/// Nova's official plugin-signing key, trusted by default so an out-of-the-box
+/// `bamboo plugin install <official nova release url>` needs no
+/// `--allow-unsigned` once nova's release CI signs the bundle.
+fn default_trusted_keys() -> Vec<TrustedKey> {
+    vec![TrustedKey {
+        label: "nova (bigduu official)".to_string(),
+        algorithm: "ed25519".to_string(),
+        public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59".to_string(),
+    }]
+}
+
+/// Default trusted host+path prefix: the `bigduu` GitHub org/user's own repos
+/// (e.g. `github.com/bigduu/Nova/releases/...`).
+fn default_trusted_hosts() -> Vec<String> {
+    vec!["github.com/bigduu/".to_string()]
+}
+
+/// Plugin URL-install source-trust policy: a host allowlist (is the SOURCE
+/// authorized?) plus ed25519 publisher keys (is the PUBLISHER authentic?).
+/// This stacks on top of the checksum layer already enforced in
+/// `bamboo_plugin::registry::PluginSource::Url` (are the BYTES what the
+/// caller expected?) — see `bamboo-server`'s `plugin_source.rs` for where all
+/// three layers are enforced together. A pasted checksum alone cannot
+/// establish source trust (an attacker who controls the page a checksum was
+/// copied from can just publish a checksum for their own tampered bundle);
+/// the host allowlist and signature checks close that gap.
+///
+/// Both fields are user-editable (`config.json`, or the config-set HTTP/CLI
+/// path) so an operator can add their own trusted hosts/keys. Additive/
+/// back-compat: an absent `plugin_trust` key deserializes to
+/// [`PluginTrustConfig::default`] (the built-in defaults below), not an empty
+/// policy — so a fresh install can trust the official nova plugin out of the
+/// box.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginTrustConfig {
+    /// Host+path prefixes a `url` plugin source may be fetched from without
+    /// `--allow-untrusted-host`. A URL is host-trusted when its scheme is
+    /// `https` and `<host><path>` (host lowercased) starts with one of these
+    /// entries verbatim — scoped to an org/user path, not just a bare host.
+    #[serde(default = "default_trusted_hosts")]
+    pub trusted_hosts: Vec<String>,
+    /// Publisher keys a bundle's `.sig` signature may verify against without
+    /// `--allow-unsigned`.
+    #[serde(default = "default_trusted_keys")]
+    pub trusted_keys: Vec<TrustedKey>,
+}
+
+impl Default for PluginTrustConfig {
+    fn default() -> Self {
+        Self {
+            trusted_hosts: default_trusted_hosts(),
+            trusted_keys: default_trusted_keys(),
+        }
+    }
+}
+
+impl PluginTrustConfig {
+    /// True when `url` is `https` and its `<host><path>` matches one of
+    /// `trusted_hosts` as a literal prefix (host compared case-insensitively;
+    /// an unparseable URL or a non-`https` scheme is never trusted).
+    pub fn is_host_trusted(&self, url: &str) -> bool {
+        is_host_trusted(url, &self.trusted_hosts)
+    }
+}
+
+/// Free function backing [`PluginTrustConfig::is_host_trusted`] — exposed
+/// separately so callers (and tests) can check a candidate host list without
+/// constructing a full [`PluginTrustConfig`]/[`Config`].
+pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let candidate = format!("{}{}", host.to_ascii_lowercase(), parsed.path());
+    trusted_hosts
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix.as_str()))
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -735,6 +835,12 @@ pub struct Config {
     /// [`Config::refresh_notifications_encrypted`].
     #[serde(default)]
     pub notifications: NotificationsConfig,
+
+    /// Plugin URL-install source-trust policy (host allowlist + ed25519
+    /// publisher keys). See [`PluginTrustConfig`]'s docs for the three-layer
+    /// model this stacks with the checksum layer.
+    #[serde(default)]
+    pub plugin_trust: PluginTrustConfig,
 
     /// Extension fields stored at the root of `config.json`.
     ///
@@ -2253,6 +2359,7 @@ impl Config {
             memory: None,
             mcp: bamboo_domain::mcp_config::McpConfig::default(),
             notifications: NotificationsConfig::default(),
+            plugin_trust: PluginTrustConfig::default(),
             extra: BTreeMap::new(),
         }
     }
