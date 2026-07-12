@@ -23,16 +23,25 @@ fn plugins_root(state: &AppState) -> PathBuf {
     state.app_data_dir.join("plugins")
 }
 
-/// The wire `SourceSpec` (reusing `bamboo_plugin::PluginSource`'s own serde
-/// shape — see `api_types` module docs) carries an optional `sha256` on the
-/// `Url` variant that `PluginSourceInput`/`stage_plugin_source` do not yet
-/// consume (see that module's "Known follow-ups"); dropped here, not lost —
-/// it was never wired to anything to lose.
+/// The wire `SourceSpec` reuses `bamboo_plugin::PluginSource`'s own serde
+/// shape (see `api_types` module docs) directly as the request body — a
+/// `url` source's `sha256`/`allow_unverified` flow straight through to
+/// `PluginSourceInput::Url`, which `plugin_source::fetch_manifest_bundle`
+/// enforces (secure by default: verify-if-given, refuse-if-absent-unless-
+/// explicitly-allowed — see that module's docs).
 fn to_source_input(source: PluginSource) -> PluginSourceInput {
     match source {
         PluginSource::LocalDir { path } => PluginSourceInput::LocalDir(path),
         PluginSource::LocalArchive { path } => PluginSourceInput::LocalArchive(path),
-        PluginSource::Url { url, sha256: _ } => PluginSourceInput::Url(url),
+        PluginSource::Url {
+            url,
+            sha256,
+            allow_unverified,
+        } => PluginSourceInput::Url {
+            url,
+            sha256,
+            allow_unverified,
+        },
     }
 }
 

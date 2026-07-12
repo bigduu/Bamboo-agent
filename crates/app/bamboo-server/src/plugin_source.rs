@@ -11,17 +11,25 @@
 //!   If the archive wraps everything in a single top-level directory (the
 //!   common `tar czf bundle.tar.gz plugin-name/` convention), that directory
 //!   is flattened up so `plugin.json` ends up at the bundle root either way.
-//! - [`PluginSourceInput::Url`] — fetches the manifest, which is either a
-//!   bare `plugin.json` (content-only, typically MCP servers backed entirely
+//! - [`PluginSourceInput::Url`] — fetches the manifest bundle (a bare
+//!   `plugin.json`, content-only and typically an MCP server backed entirely
 //!   by a downloadable binary — e.g. a nova-style plugin with no bundled
-//!   skills/prompts) or an archive containing one (same flattening rule as
-//!   `LocalArchive`). THEN, separately, for [`Platform::current`] (if the
-//!   manifest declares an artifact for it), fetches the per-platform binary
-//!   archive named in `manifest.artifacts`, verifies its sha256 BEFORE
-//!   unpacking (mandatory — a URL plugin ships a binary that gets executed),
-//!   and places the single expected executable at
-//!   `bin/<platform>/<id>[.exe]` per
-//!   [`bamboo_plugin::manifest::PluginArtifact`]'s archive contract.
+//!   skills/prompts — or an archive containing one, same flattening rule as
+//!   `LocalArchive`). **Secure by default**: the downloaded bundle bytes are
+//!   verified against a caller-supplied `sha256` BEFORE anything is
+//!   extracted or parsed; if no `sha256` was given, the fetch is refused
+//!   outright unless the caller explicitly set `allow_unverified` (see
+//!   [`PluginSourceInput::Url`]'s fields and [`fetch_manifest_bundle`]). THEN,
+//!   separately, for [`Platform::current`] (if the manifest declares an
+//!   artifact for it), fetches the per-platform binary archive named in
+//!   `manifest.artifacts`, verifies its sha256 BEFORE unpacking (mandatory —
+//!   a URL plugin ships a binary that gets executed), and places the single
+//!   expected executable at `bin/<platform>/<id>[.exe]` per
+//!   [`bamboo_plugin::manifest::PluginArtifact`]'s archive contract. Both
+//!   checks stay: the bundle-sha256 check is the new root-of-trust pin (it
+//!   closes the gap where the artifact's own declared hash lives inside the
+//!   very bundle that could be tampered with); the artifact-sha256 check
+//!   remains as defense in depth for the binary specifically.
 //!
 //! All three paths run the SAME safety checks: [`PluginManifest::validate`]
 //! before anything is committed to `plugins_dir()`, and path-traversal-safe
@@ -56,15 +64,32 @@
 //!
 //! # Known follow-ups (deferred — tracked here, not fixed on this branch)
 //!
-//! - **No integrity pin on the URL manifest/content bundle.** Only the
-//!   per-platform BINARY artifact is sha256-pinned (`PluginArtifact.sha256`,
-//!   verified in [`fetch_and_place_artifact`]). The `plugin.json` / content
-//!   archive fetched by [`fetch_manifest_bundle`] is trusted on HTTPS alone —
-//!   a MITM or a compromised host could serve a tampered manifest/skills/
-//!   prompts bundle. A proper fix needs a Wave-1 schema addition (a top-level
-//!   bundle sha256, or a signature) so a URL install can pin the whole bundle,
-//!   not just the binary. Until then, prefer local-dir/archive installs or a
-//!   binary-artifact-only URL plugin for anything security-sensitive.
+//! - **URL content-bundle integrity pin: IMPLEMENTED (secure by default).**
+//!   Previously only the per-platform BINARY artifact was sha256-pinned
+//!   (`PluginArtifact.sha256`, verified in [`fetch_and_place_artifact`]),
+//!   while the `plugin.json` / content archive fetched by
+//!   [`fetch_manifest_bundle`] was trusted on HTTPS alone — a MITM or a
+//!   compromised host could serve a tampered bundle, and since the binary's
+//!   sha256 is DECLARED INSIDE that same untrusted manifest, tampering the
+//!   bundle could rewrite the artifact hash too (the trust chain was
+//!   circular). Fixed: [`PluginSourceInput::Url`] now carries a `sha256`
+//!   (the expected hash of the downloaded bundle) and an `allow_unverified`
+//!   opt-out. [`fetch_manifest_bundle`] verifies the bundle's actual sha256
+//!   against it BEFORE any extraction/parsing on a mismatch
+//!   ([`PluginError::BundleVerificationFailed`]); with neither a `sha256`
+//!   nor `allow_unverified: true`, the fetch is refused up front — before
+//!   the URL is ever requested — with [`PluginError::ChecksumRequired`]. A
+//!   URL install can therefore no longer just download-and-trust any
+//!   tar.gz. The verified bundle sha256 (not the binary artifact's) is what
+//!   `PluginSource::Url.sha256` records for provenance/audit. Still
+//!   deferred:
+//!   - **Signature verification.** A sha256 pin only proves "this is the
+//!     bytes the installer expected", not "an entity I trust produced
+//!     them" — the hash itself still has to come from somewhere the caller
+//!     trusts (a release page, a signed index, etc.). A real signature
+//!     scheme (e.g. minisign/sigstore over the bundle) would remove that
+//!     remaining hop.
+//!   - **SSRF guard**, described next.
 //! - **No SSRF guard on URL fetch.** [`download_bytes`] will fetch any URL,
 //!   including `http://169.254.169.254/...` (cloud metadata) or private-range
 //!   / loopback addresses. In a hosted/multi-tenant deployment a plugin-install
@@ -108,8 +133,17 @@ pub enum PluginSourceInput {
     /// (at its root, or under a single top-level directory).
     LocalArchive(PathBuf),
     /// A URL to either a bare `plugin.json` or an archive containing one
-    /// (same root-or-single-subdir rule as `LocalArchive`).
-    Url(String),
+    /// (same root-or-single-subdir rule as `LocalArchive`). Secure by
+    /// default: `sha256`, when given, pins the downloaded bundle's exact
+    /// bytes (verified before anything is extracted/parsed — see
+    /// [`fetch_manifest_bundle`]); with no `sha256`, the fetch is refused
+    /// unless `allow_unverified` is `true` (an explicit, logged opt-out of
+    /// verification — see [`PluginError::ChecksumRequired`]).
+    Url {
+        url: String,
+        sha256: Option<String>,
+        allow_unverified: bool,
+    },
 }
 
 /// The result of staging a [`PluginSourceInput`] into `plugins_dir()/<id>/`:
@@ -298,15 +332,32 @@ async fn stage_into(
             let manifest = read_and_parse_manifest(staging_dir).await?;
             Ok((manifest, PluginSource::LocalArchive { path: path.clone() }))
         }
-        PluginSourceInput::Url(url) => {
-            let manifest = fetch_manifest_bundle(url, staging_dir, max_decompressed_bytes).await?;
-            let sha256 =
-                fetch_and_place_artifact(&manifest, staging_dir, max_decompressed_bytes).await?;
+        PluginSourceInput::Url {
+            url,
+            sha256,
+            allow_unverified,
+        } => {
+            let (manifest, verified_bundle_sha256) = fetch_manifest_bundle(
+                url,
+                sha256.as_deref(),
+                *allow_unverified,
+                staging_dir,
+                max_decompressed_bytes,
+            )
+            .await?;
+            // Binary-artifact verification stays as defense in depth (see
+            // the module docs) — its own sha256, declared inside the
+            // now-verified manifest, is checked in
+            // `fetch_and_place_artifact`, but no longer double-duty as the
+            // `PluginSource::Url` provenance hash: that's the bundle's own
+            // verified sha256 now, computed above.
+            fetch_and_place_artifact(&manifest, staging_dir, max_decompressed_bytes).await?;
             Ok((
                 manifest,
                 PluginSource::Url {
                     url: url.clone(),
-                    sha256,
+                    sha256: verified_bundle_sha256,
+                    allow_unverified: *allow_unverified,
                 },
             ))
         }
@@ -322,14 +373,63 @@ async fn stage_into(
 /// Populates `staging_dir` with whatever the bundle contains (just
 /// `plugin.json` for a bare manifest; the full skills/prompts/workflows tree
 /// for an archive).
+///
+/// **Secure by default.** Before the URL is even requested: if `sha256` is
+/// `None` and `allow_unverified` is `false`, refuses with
+/// [`PluginError::ChecksumRequired`] — no network access happens for a
+/// refused install. If `sha256` IS given, the downloaded bytes are hashed
+/// and compared (case-insensitive) BEFORE any extraction/parsing; a
+/// mismatch is [`PluginError::BundleVerificationFailed`] and nothing is
+/// written beyond the (discarded) in-memory bytes. If `allow_unverified` is
+/// `true` and no `sha256` was given, the fetch proceeds but logs a
+/// `tracing::warn!` — an explicit, visible opt-out of verification, never a
+/// silent one.
+///
+/// Returns the parsed manifest and, when a `sha256` was supplied and
+/// confirmed, that verified hex digest (for [`PluginSource::Url`]
+/// provenance) — `None` only on the `allow_unverified`-with-no-hash path.
 async fn fetch_manifest_bundle(
     url: &str,
+    sha256: Option<&str>,
+    allow_unverified: bool,
     staging_dir: &Path,
     max_decompressed_bytes: u64,
-) -> PluginResult<PluginManifest> {
+) -> PluginResult<(PluginManifest, Option<String>)> {
+    if sha256.is_none() && !allow_unverified {
+        return Err(PluginError::ChecksumRequired(format!(
+            "refusing to install plugin bundle from '{url}' without a checksum — pass the \
+             bundle's sha256 (from the release page / a trusted source) to verify it before \
+             install (CLI: `--sha256 <hex>`; HTTP: `\"sha256\": \"<hex>\"` on the url source), \
+             or explicitly accept the risk of an unverified download (CLI: \
+             `--allow-unverified`; HTTP: `\"allow_unverified\": true`)"
+        )));
+    }
+
     let bytes = download_bytes(url).await?;
 
-    if let Some(kind) = detect_archive_kind(url) {
+    let verified_sha256 = match sha256 {
+        Some(expected) => {
+            let actual = sha256_hex(&bytes);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(PluginError::BundleVerificationFailed(format!(
+                    "sha256 mismatch for plugin bundle '{url}': expected {expected}, downloaded \
+                     bytes hash to {actual} — refusing to unpack (the bundle may be tampered, \
+                     corrupted, or the wrong sha256 was supplied)"
+                )));
+            }
+            Some(actual)
+        }
+        None => {
+            tracing::warn!(
+                %url,
+                "installing plugin bundle from a URL with no checksum verification \
+                 (allow_unverified opt-out) — the download is trusted on HTTPS alone"
+            );
+            None
+        }
+    };
+
+    let manifest = if let Some(kind) = detect_archive_kind(url) {
         extract_archive(
             bytes,
             kind,
@@ -338,34 +438,44 @@ async fn fetch_manifest_bundle(
         )
         .await?;
         flatten_if_single_subdir(staging_dir).await?;
-        read_and_parse_manifest(staging_dir).await
+        read_and_parse_manifest(staging_dir).await?
     } else {
         let raw = String::from_utf8(bytes).map_err(|_| {
             PluginError::InvalidManifest(format!("manifest at '{url}' is not valid UTF-8"))
         })?;
         tokio::fs::create_dir_all(staging_dir).await?;
         tokio::fs::write(staging_dir.join("plugin.json"), &raw).await?;
-        PluginManifest::parse_str(&raw)
-    }
+        PluginManifest::parse_str(&raw)?
+    };
+
+    Ok((manifest, verified_sha256))
 }
 
 /// Per-platform binary artifact fetch (URL source only). Fetches the
 /// artifact declared for [`Platform::current`] (a no-op if the manifest
 /// declares none for this platform — not every plugin needs a binary),
 /// verifies its sha256 BEFORE unpacking, and places the single expected
-/// executable at `<staging_dir>/bin/<platform>/<id>[.exe]`. Returns the
-/// verified sha256 (for [`PluginSource::Url`] provenance), if an artifact
-/// was fetched.
+/// executable at `<staging_dir>/bin/<platform>/<id>[.exe]`.
+///
+/// This stays as defense in depth alongside [`fetch_manifest_bundle`]'s
+/// bundle-sha256 check (see the module docs): the artifact hash is declared
+/// INSIDE the manifest, so on its own it only proves "the binary matches
+/// what this bundle's manifest says", not "this bundle itself is what the
+/// caller expected" — that's what the bundle-level check now provides. The
+/// verified artifact sha256 is therefore no longer surfaced to the caller
+/// (it used to double as [`PluginSource::Url`]'s provenance hash before the
+/// bundle-level check existed); this function's contract is purely
+/// verify-then-place.
 async fn fetch_and_place_artifact(
     manifest: &PluginManifest,
     staging_dir: &Path,
     max_decompressed_bytes: u64,
-) -> PluginResult<Option<String>> {
+) -> PluginResult<()> {
     let Some(platform) = Platform::current() else {
-        return Ok(None);
+        return Ok(());
     };
     let Some(artifact) = manifest.artifacts.get(platform.as_str()) else {
-        return Ok(None);
+        return Ok(());
     };
 
     let bytes = download_bytes(&artifact.url).await?;
@@ -416,7 +526,7 @@ async fn fetch_and_place_artifact(
     }
 
     let _ = tokio::fs::remove_dir_all(&scratch_dir).await;
-    Ok(Some(artifact.sha256.clone()))
+    Ok(())
 }
 
 /// `rename`, falling back to copy+remove across a device boundary.

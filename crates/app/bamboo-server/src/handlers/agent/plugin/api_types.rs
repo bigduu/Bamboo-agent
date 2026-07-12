@@ -14,17 +14,23 @@
 //! `SourceSpec` reuses [`bamboo_plugin::PluginSource`]'s own
 //! `#[serde(tag = "type", rename_all = "snake_case")]` wire shape directly —
 //! `{"type":"local_dir","path":...}` / `{"type":"local_archive","path":...}` /
-//! `{"type":"url","url":...,"sha256":...?}` — rather than inventing a
-//! parallel request enum: it is already exactly the shape both the CLI and
-//! this HTTP layer need, and it doubles as the provenance record `install()`
-//! persists (see `bamboo_plugin::registry::PluginSource`'s doc comment).
+//! `{"type":"url","url":...,"sha256":...?,"allow_unverified":...?}` — rather
+//! than inventing a parallel request enum: it is already exactly the shape
+//! both the CLI and this HTTP layer need, and it doubles as the provenance
+//! record `install()` persists (see `bamboo_plugin::registry::PluginSource`'s
+//! doc comment).
 //!
-//! Known no-op: a client-supplied `sha256` on a `url` source is accepted (for
-//! forward-compat / symmetry with the provenance shape) but not currently
-//! enforced — `plugin_source::stage_plugin_source` only pins the
-//! per-platform *binary artifact*'s sha256 (declared inside the manifest
-//! itself), not the top-level manifest/content bundle fetched from `url`. See
-//! that module's "Known follow-ups" doc comment.
+//! **Secure by default (`url` sources).** `sha256`, when given, pins the
+//! downloaded BUNDLE's exact bytes — verified in
+//! `plugin_source::fetch_manifest_bundle` BEFORE anything is
+//! extracted/parsed, distinct from (and in addition to) the per-platform
+//! *binary artifact*'s own sha256 declared inside the manifest itself
+//! (always verified, regardless of this field — see `plugin_source.rs`'s
+//! module docs on why both checks matter). Without `sha256`, a `url` install
+//! is REFUSED (`PluginError::ChecksumRequired`, mapped to `400`) unless
+//! `allow_unverified: true` is explicitly set — so `POST /install` with a
+//! bare `{"type":"url","url":"..."}` body no longer just downloads and
+//! trusts any tar.gz.
 
 use serde::{Deserialize, Serialize};
 

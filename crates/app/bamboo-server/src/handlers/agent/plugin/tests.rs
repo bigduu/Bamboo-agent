@@ -365,3 +365,170 @@ async fn delete_unknown_id_returns_404() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------
+// URL source: secure-by-default checksum policy, exercised end to end
+// through the real HTTP handlers (unit coverage of the same policy at the
+// `plugin_source::fetch_manifest_bundle` level lives in
+// `plugin_source::tests`).
+// ---------------------------------------------------------------------
+
+/// A minimal, `validate()`-passing manifest with NO declared capabilities —
+/// unlike `plugin_source::tests`' `hello_manifest_json` fixture (which
+/// declares a `hello-world` skill), these tests drive the real
+/// `ServerPluginInstaller::install()` end to end (not just staging), and a
+/// bare `plugin.json` fetched from a URL has no bundled `skills/` directory
+/// alongside it — declaring a skill here would fail registration with "no
+/// SKILL.md", unrelated to the checksum behavior under test.
+fn hello_manifest_json(id: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": "Hello",
+        "version": "0.1.0",
+    })
+    .to_string()
+}
+
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn url_source(url: &str, sha256: Option<&str>, allow_unverified: bool) -> serde_json::Value {
+    let mut source = serde_json::json!({ "type": "url", "url": url });
+    if let Some(sha) = sha256 {
+        source["sha256"] = serde_json::Value::String(sha.to_string());
+    }
+    if allow_unverified {
+        source["allow_unverified"] = serde_json::Value::Bool(true);
+    }
+    serde_json::json!({ "source": source })
+}
+
+/// The core "secure by default" behavior this whole feature is about:
+/// `POST /install` with a bare `{"type":"url","url":"..."}` (no `sha256`, no
+/// `allow_unverified`) must be refused with an actionable 400 — NOT silently
+/// download and trust whatever tar.gz sits at that URL. Uses a `wiremock`
+/// server with no mounted responder at all, so a bug that fetched before
+/// refusing would surface as an unmatched-request panic instead of quietly
+/// passing.
+#[actix_web::test]
+async fn install_url_with_no_checksum_or_allow_unverified_returns_400_before_fetch() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(url_source(&url, None, false))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(resp).await;
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("sha256"), "{message}");
+    assert!(message.contains("allow_unverified"), "{message}");
+
+    // Nothing installed.
+    let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
+    let resp = test::call_service(&app, req).await;
+    let listed = body_json(resp).await;
+    assert!(listed["plugins"].as_array().unwrap().is_empty());
+
+    // The refusal happened before the URL was ever fetched.
+    let received = server.received_requests().await;
+    assert_eq!(received.map(|r| r.len()), Some(0));
+}
+
+#[actix_web::test]
+async fn install_url_with_wrong_bundle_sha256_returns_400_and_installs_nothing() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+    let wrong_sha256 = "b".repeat(64);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(url_source(&url, Some(&wrong_sha256), false))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(resp).await;
+    assert!(
+        error["error"].as_str().unwrap().contains("mismatch"),
+        "{error}"
+    );
+
+    let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
+    let resp = test::call_service(&app, req).await;
+    let listed = body_json(resp).await;
+    assert!(listed["plugins"].as_array().unwrap().is_empty());
+}
+
+#[actix_web::test]
+async fn install_url_with_correct_bundle_sha256_succeeds() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let bundle_sha256 = sha256_hex_of(manifest_body.as_bytes());
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(url_source(&url, Some(&bundle_sha256), false))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view = body_json(resp).await;
+    assert_eq!(view["id"], "hello-plugin");
+    assert_eq!(view["source"]["type"], "url");
+    assert_eq!(view["source"]["sha256"], bundle_sha256);
+}
+
+#[actix_web::test]
+async fn install_url_with_allow_unverified_and_no_sha256_succeeds() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(url_source(&url, None, true))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view = body_json(resp).await;
+    assert_eq!(view["id"], "hello-plugin");
+    assert!(view["source"]["sha256"].is_null());
+}
