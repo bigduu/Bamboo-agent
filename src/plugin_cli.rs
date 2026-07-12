@@ -15,15 +15,27 @@
 //! - `POST /api/v1/plugins/install` -> body `{ "source": <SourceSpec> }`
 //!   (`InstallDisposition::FailIfInstalled`); `SourceSpec` is one of
 //!   `{"type":"local_dir","path":"..."}` / `{"type":"local_archive","path":"..."}`
-//!   / `{"type":"url","url":"...","sha256":"..."?}` — the same tagged shape as
-//!   `bamboo_plugin::registry::PluginSource`'s `#[serde(tag = "type")]` wire
-//!   form, reproduced here by hand (this crate does not depend on
-//!   `bamboo-plugin`, to stay decoupled from the parallel installer-core
-//!   branch).
+//!   / `{"type":"url","url":"...","sha256":"..."?,"allow_unverified":bool?}` —
+//!   the same tagged shape as `bamboo_plugin::registry::PluginSource`'s
+//!   `#[serde(tag = "type")]` wire form, reproduced here by hand (this crate
+//!   does not depend on `bamboo-plugin`, to stay decoupled from the parallel
+//!   installer-core branch).
 //! - `POST /api/v1/plugins/{id}/update` -> same body shape (`Upgrade`).
 //! - `DELETE /api/v1/plugins/{id}` -> uninstall.
 //! - Errors: 409 (Conflict / AlreadyInstalled), 422 (UnsupportedPlatform), 404
-//!   (NotFound), 400 (bad manifest/artifact); body `{"error": "..."}`.
+//!   (NotFound), 400 (bad manifest/artifact/bundle checksum, or a `url`
+//!   install missing both `sha256` and `allow_unverified`); body
+//!   `{"error": "..."}`.
+//!
+//! # URL installs are secure by default
+//!
+//! `sha256` on a `url` source pins the downloaded BUNDLE (the `plugin.json`,
+//! or the archive containing it) — NOT merely the per-platform binary
+//! artifact declared inside the manifest (that is separately, and always,
+//! sha256-verified against the manifest's own declaration). A `url` install
+//! with neither `sha256` nor `allow_unverified: true` is refused by the
+//! server before it ever fetches the URL: `bamboo plugin install <url>`
+//! alone no longer just downloads and trusts any tar.gz.
 
 use std::path::Path;
 use std::time::Duration;
@@ -47,17 +59,27 @@ const PLUGIN_MUTATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// - an existing file ending `.tar.gz`/`.tgz`/`.zip` ->
 ///   `{"type":"local_archive","path":<absolute path>}`
 /// - something starting `http://`/`https://` -> `{"type":"url","url":<as-is>}`
-///   (+ `"sha256"` when `--sha256` was given)
+///   (+ `"sha256"` when `--sha256` was given, `"allow_unverified":true` when
+///   `--allow-unverified` was given)
 ///
 /// Local paths are canonicalized to absolute so the source resolves correctly
 /// even if `bamboo serve` runs with a different working directory than the
-/// CLI invocation (e.g. a long-running sidecar). `--sha256` is rejected for
-/// local sources — it only pins a network download.
-pub(crate) fn detect_source(spec: &str, sha256: Option<&str>) -> anyhow::Result<serde_json::Value> {
+/// CLI invocation (e.g. a long-running sidecar). `--sha256` and
+/// `--allow-unverified` are rejected for local sources — they only apply to a
+/// network download; a local file is already on the user's own disk by their
+/// own choice, nothing to verify.
+pub(crate) fn detect_source(
+    spec: &str,
+    sha256: Option<&str>,
+    allow_unverified: bool,
+) -> anyhow::Result<serde_json::Value> {
     if spec.starts_with("http://") || spec.starts_with("https://") {
         let mut v = serde_json::json!({ "type": "url", "url": spec });
         if let Some(sha) = sha256 {
             v["sha256"] = serde_json::Value::String(sha.to_string());
+        }
+        if allow_unverified {
+            v["allow_unverified"] = serde_json::Value::Bool(true);
         }
         return Ok(v);
     }
@@ -71,6 +93,9 @@ pub(crate) fn detect_source(spec: &str, sha256: Option<&str>) -> anyhow::Result<
         if sha256.is_some() {
             anyhow::bail!("--sha256 only applies to a URL source, not a local directory");
         }
+        if allow_unverified {
+            anyhow::bail!("--allow-unverified only applies to a URL source, not a local directory");
+        }
         return Ok(serde_json::json!({ "type": "local_dir", "path": abs }));
     }
 
@@ -81,6 +106,9 @@ pub(crate) fn detect_source(spec: &str, sha256: Option<&str>) -> anyhow::Result<
         if sha256.is_some() {
             anyhow::bail!("--sha256 only applies to a URL source, not a local archive");
         }
+        if allow_unverified {
+            anyhow::bail!("--allow-unverified only applies to a URL source, not a local archive");
+        }
         return Ok(serde_json::json!({ "type": "local_archive", "path": abs }));
     }
 
@@ -89,15 +117,20 @@ pub(crate) fn detect_source(spec: &str, sha256: Option<&str>) -> anyhow::Result<
     )
 }
 
-/// `bamboo plugin install <path-or-url> [--sha256 <hex>]` —
+/// `bamboo plugin install <path-or-url> [--sha256 <hex>] [--allow-unverified]` —
 /// `POST /api/v1/plugins/install`. On a 409 (already installed) prints a
-/// pointer to `bamboo plugin update` and returns an error (non-zero exit).
+/// pointer to `bamboo plugin update` and returns an error (non-zero exit). A
+/// URL source with neither `--sha256` nor `--allow-unverified` gets a 400
+/// from the server (secure by default — see the module docs); that error's
+/// message is already the actionable "pass --sha256 or --allow-unverified"
+/// guidance, surfaced as-is through the generic HTTP-failure branch below.
 pub async fn install(
     conn: ConnArgs,
     source_spec: &str,
     sha256: Option<&str>,
+    allow_unverified: bool,
 ) -> anyhow::Result<()> {
-    let source = detect_source(source_spec, sha256)?;
+    let source = detect_source(source_spec, sha256, allow_unverified)?;
     let base = conn.api_base();
     let url = format!("{base}/plugins/install");
     let resp = reqwest::Client::new()
@@ -259,16 +292,18 @@ pub async fn remove(conn: ConnArgs, id: &str, yes: bool) -> anyhow::Result<()> {
     }
 }
 
-/// `bamboo plugin update <id> <path-or-url> [--sha256]` —
-/// `POST /api/v1/plugins/{id}/update` (`InstallDisposition::Upgrade`).
+/// `bamboo plugin update <id> <path-or-url> [--sha256] [--allow-unverified]` —
+/// `POST /api/v1/plugins/{id}/update` (`InstallDisposition::Upgrade`). Same
+/// secure-by-default URL policy as `install` (see the module docs).
 pub async fn update(
     conn: ConnArgs,
     id: &str,
     source_spec: &str,
     sha256: Option<&str>,
+    allow_unverified: bool,
 ) -> anyhow::Result<()> {
     guard_id_segment("plugin id", id)?;
-    let source = detect_source(source_spec, sha256)?;
+    let source = detect_source(source_spec, sha256, allow_unverified)?;
     let base = conn.api_base();
     let url = format!("{base}/plugins/{id}/update");
     let resp = reqwest::Client::new()
@@ -301,20 +336,40 @@ mod tests {
 
     #[test]
     fn detect_source_recognizes_http_and_https_urls() {
-        let v = detect_source("https://example.com/plugin.tar.gz", None).unwrap();
+        let v = detect_source("https://example.com/plugin.tar.gz", None, false).unwrap();
         assert_eq!(v["type"], "url");
         assert_eq!(v["url"], "https://example.com/plugin.tar.gz");
         assert!(v.get("sha256").is_none());
+        assert!(v.get("allow_unverified").is_none());
 
-        let v = detect_source("http://example.com/plugin.tar.gz", Some("deadbeef")).unwrap();
+        let v = detect_source("http://example.com/plugin.tar.gz", Some("deadbeef"), false).unwrap();
         assert_eq!(v["type"], "url");
         assert_eq!(v["sha256"], "deadbeef");
+        assert!(v.get("allow_unverified").is_none());
+    }
+
+    #[test]
+    fn detect_source_url_carries_allow_unverified_when_set() {
+        let v = detect_source("https://example.com/plugin.tar.gz", None, true).unwrap();
+        assert_eq!(v["type"], "url");
+        assert!(v.get("sha256").is_none());
+        assert_eq!(v["allow_unverified"], true);
+    }
+
+    #[test]
+    fn detect_source_url_carries_both_sha256_and_allow_unverified() {
+        // Both flags can be set together — the server treats `sha256` as
+        // authoritative when present (verify), so this isn't a conflicting
+        // request, just a redundant one.
+        let v = detect_source("https://example.com/plugin.tar.gz", Some("deadbeef"), true).unwrap();
+        assert_eq!(v["sha256"], "deadbeef");
+        assert_eq!(v["allow_unverified"], true);
     }
 
     #[test]
     fn detect_source_recognizes_local_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let v = detect_source(dir.path().to_str().unwrap(), None).unwrap();
+        let v = detect_source(dir.path().to_str().unwrap(), None, false).unwrap();
         assert_eq!(v["type"], "local_dir");
         assert_eq!(
             v["path"].as_str().unwrap(),
@@ -325,8 +380,15 @@ mod tests {
     #[test]
     fn detect_source_rejects_sha256_for_local_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let err = detect_source(dir.path().to_str().unwrap(), Some("deadbeef")).unwrap_err();
+        let err = detect_source(dir.path().to_str().unwrap(), Some("deadbeef"), false).unwrap_err();
         assert!(err.to_string().contains("--sha256"));
+    }
+
+    #[test]
+    fn detect_source_rejects_allow_unverified_for_local_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = detect_source(dir.path().to_str().unwrap(), None, true).unwrap_err();
+        assert!(err.to_string().contains("--allow-unverified"));
     }
 
     #[test]
@@ -335,7 +397,7 @@ mod tests {
         for name in ["plugin.tar.gz", "plugin.tgz", "plugin.zip"] {
             let path = dir.path().join(name);
             std::fs::write(&path, b"fake archive bytes").unwrap();
-            let v = detect_source(path.to_str().unwrap(), None).unwrap();
+            let v = detect_source(path.to_str().unwrap(), None, false).unwrap();
             assert_eq!(v["type"], "local_archive", "{name}");
         }
     }
@@ -345,8 +407,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plugin.tar.gz");
         std::fs::write(&path, b"fake archive bytes").unwrap();
-        let err = detect_source(path.to_str().unwrap(), Some("deadbeef")).unwrap_err();
+        let err = detect_source(path.to_str().unwrap(), Some("deadbeef"), false).unwrap_err();
         assert!(err.to_string().contains("--sha256"));
+    }
+
+    #[test]
+    fn detect_source_rejects_allow_unverified_for_local_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugin.tar.gz");
+        std::fs::write(&path, b"fake archive bytes").unwrap();
+        let err = detect_source(path.to_str().unwrap(), None, true).unwrap_err();
+        assert!(err.to_string().contains("--allow-unverified"));
     }
 
     #[test]
@@ -354,13 +425,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plugin.txt");
         std::fs::write(&path, b"not an archive").unwrap();
-        let err = detect_source(path.to_str().unwrap(), None).unwrap_err();
+        let err = detect_source(path.to_str().unwrap(), None, false).unwrap_err();
         assert!(err.to_string().contains("neither a directory"));
     }
 
     #[test]
     fn detect_source_rejects_missing_path() {
-        let err = detect_source("/no/such/path/should/exist/anywhere", None).unwrap_err();
+        let err = detect_source("/no/such/path/should/exist/anywhere", None, false).unwrap_err();
         assert!(err.to_string().contains("cannot read"));
     }
 
