@@ -114,6 +114,24 @@ pub enum PluginError {
     #[error("{0}")]
     UnsignedOrUntrustedSignature(String),
 
+    /// A URL plugin install whose bytes will NOT be cryptographically
+    /// authenticated (no signature required AND no `sha256` — the fully
+    /// opted-out `allow_unsigned && allow_unverified`, "host-only trust"
+    /// case) was served an HTTP redirect instead of the bytes. In that case
+    /// the host allowlist is the SOLE control over where the bytes come
+    /// from, and it only vetted the FIRST hop — transparently following the
+    /// redirect would let the bytes come from an unvetted host and silently
+    /// defeat the allowlist, so redirects are not followed and a redirect
+    /// response is refused. A trust/authorization refusal (same 403 family
+    /// as [`Self::UntrustedHost`] / [`Self::UnsignedOrUntrustedSignature`]),
+    /// NOT a server error — it tells the caller how to proceed (install from
+    /// the canonical/final URL, provide a signature/`--sha256`, or trust the
+    /// redirect target). Does not arise once a signature or checksum is in
+    /// play: those authenticate the bytes regardless of which host served
+    /// them, so redirects are followed in that case.
+    #[error("{0}")]
+    RedirectRefused(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

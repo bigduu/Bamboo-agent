@@ -1277,10 +1277,24 @@ async fn host_only_trust_install_refuses_a_redirect_instead_of_following_it() {
         "a redirect must be refused when neither a signature nor a checksum will authenticate \
          the downloaded bytes",
     );
+    // A clean, dedicated trust refusal (maps to a 403, see the HTTP error
+    // status map) — NOT a generic `Registration` (500 "internal error"),
+    // which would make a security-policy refusal look like a server bug. A
+    // regression back to `Registration`/500 fails here.
     assert!(
-        matches!(error, PluginError::Registration(_)),
-        "expected a Registration refusal for the un-followed redirect, got {error:?}"
+        matches!(error, PluginError::RedirectRefused(_)),
+        "expected a RedirectRefused trust refusal for the un-followed redirect, got {error:?}"
     );
+    // The message must be actionable: it names the redirect target and tells
+    // the user the three ways forward (canonical URL, signature/sha256, or
+    // trusting the target host).
+    let message = error.to_string();
+    assert!(message.contains("/elsewhere.json"), "{message}");
+    assert!(
+        message.contains("--sha256") || message.contains("sha256"),
+        "{message}"
+    );
+    assert!(message.contains("trusted_hosts"), "{message}");
     assert!(!plugins_root.join("hello-plugin").exists());
 }
 

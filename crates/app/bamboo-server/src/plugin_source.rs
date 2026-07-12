@@ -822,13 +822,14 @@ const MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Fetch `url` via `client`, capping the body at `max_bytes`. `client`'s
 /// redirect policy is the caller's decision (see
 /// [`http_client_following_redirects`] / [`http_client_no_redirects`]) — this
-/// function additionally refuses outright if the FINAL response it receives
-/// is itself still a redirect (3xx), which only happens when `client` was
-/// built with `redirect::Policy::none()` and the server actually tried to
-/// redirect: that means the request's trust flags decided the bytes must
-/// come from the vetted host directly (see BLOCKER 1 in the source-trust
-/// review / the module docs), so silently treating the redirect response
-/// as the payload would defeat that decision.
+/// function additionally refuses outright, with [`PluginError::RedirectRefused`]
+/// (a clean 403-family trust refusal, NOT a 500), if the FINAL response it
+/// receives is itself still a redirect (3xx), which only happens when
+/// `client` was built with `redirect::Policy::none()` and the server actually
+/// tried to redirect: that means the request's trust flags decided the bytes
+/// must come from the vetted host directly (see BLOCKER 1 in the source-trust
+/// review / the module docs), so silently treating the redirect response as
+/// the payload would defeat that decision.
 async fn download_bytes(
     client: &reqwest::Client,
     url: &str,
@@ -842,12 +843,24 @@ async fn download_bytes(
         })?;
 
     if response.status().is_redirection() {
-        return Err(PluginError::Registration(format!(
-            "'{url}' responded with a redirect ({status}) instead of serving the bytes \
-             directly, and this fetch does not follow redirects — neither a signature nor a \
-             checksum will authenticate these bytes, so the host allowlist is the sole trust \
-             control and must not be defeated by a redirect to an unvetted host; refusing",
-            status = response.status(),
+        let status = response.status();
+        // Surface the redirect TARGET (host) so the caller can decide whether
+        // to trust it / add it to `trusted_hosts` — a redirect with no
+        // `Location`, or one whose value isn't valid UTF-8, degrades to a
+        // generic "(unspecified)" rather than failing differently.
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let target = location.as_deref().unwrap_or("(unspecified)");
+        return Err(PluginError::RedirectRefused(format!(
+            "refused to follow an HTTP redirect ({status}) from '{url}' to '{target}': for an \
+             unverified install (no signature, no checksum) the approved host must serve the \
+             bytes directly, so redirects are not followed — install from the canonical/final \
+             URL, or provide a signature / `--sha256` (which authenticates the bytes regardless \
+             of which host serves them), or add the redirect target's host to \
+             `plugin_trust.trusted_hosts`"
         )));
     }
 
