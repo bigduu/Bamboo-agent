@@ -38,6 +38,38 @@
 //! where there is exactly one `AppState`, this resolves to the identical
 //! path the global helpers would have produced.
 //!
+//! # Concurrency
+//!
+//! Every `install`/`uninstall` runs under a single process-wide async lock
+//! ([`PLUGIN_OP_LOCK`]), held for the ENTIRE operation including rollback, so
+//! the reconcile→mutate→provenance sequence is atomic w.r.t. any other plugin
+//! op. This closes three concurrency gaps at once: the `installed.json` and
+//! `prompt-presets.json` load/modify/save lost-update races, and the MCP
+//! reconcile→config-write TOCTOU. As additional defense against a concurrent
+//! NON-plugin config write (which does not take this lock), the MCP step also
+//! RE-runs its ownership pre-check INSIDE the `update_config` closure, under
+//! `config_io_lock`, and aborts rather than clobbering if a foreign entry
+//! appeared. Lock ordering is `PLUGIN_OP_LOCK` → `config_io_lock` (never the
+//! reverse) — see [`PLUGIN_OP_LOCK`].
+//!
+//! # Crash safety (process killed mid-install)
+//!
+//! In-process rollback (below) only fires on an `Err`. A HARD kill after the
+//! MCP step wrote to `config.json` but before provenance is committed would,
+//! without a journal, leave: `reconcile_exclusive` seeing the orphaned mcp id
+//! as existing-but-not-owned → a false `Conflict` on the retry, AND
+//! `uninstall` returning `NotFound` (no provenance) → the user stuck
+//! hand-editing `config.json`. To prevent that, `install` writes a provenance
+//! row with status [`PluginInstallStatus::Installing`] — recording the
+//! INTENDED ownership set — BEFORE steps 1-4, and flips it to
+//! [`PluginInstallStatus::Installed`] only after step 5 succeeds. On the next
+//! install/upgrade of an id whose row is still `Installing` (a prior crash),
+//! [`load_previous_for_disposition`] returns it as `previous` (it does NOT
+//! trip `AlreadyInstalled`), so its intended set is treated as
+//! this-plugin-owned — the leftover reads as an `OwnedReinstall`, not a
+//! foreign conflict — and is cleaned up as an upgrade-over-incomplete.
+//! `uninstall` works on an `Installing` row too.
+//!
 //! # Atomicity / rollback semantics
 //!
 //! `install()` follows `PLUGIN_PLAN.md`'s numbered sequence exactly:
@@ -104,14 +136,38 @@ use bamboo_domain::mcp_config::McpServerConfig;
 use bamboo_plugin::installer::{load_previous_for_disposition, preflight_install};
 use bamboo_plugin::registry::{reconcile_exclusive, RegisteredCapabilities};
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstaller,
-    PluginManifest, PluginResult, PluginSource,
+    InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
+    PluginInstaller, PluginManifest, PluginResult, PluginSource,
 };
 
 use crate::app_state::{AppState, ConfigUpdateEffects};
+use crate::error::AppError;
+use crate::handlers::agent::mcp::upsert_server_by_id;
 use crate::handlers::agent::prompt_presets::{
     ensure_unique_preset_id, load_store, save_store, store_file_path, StoredPromptPreset,
 };
+
+/// Process-wide serialization of plugin install/uninstall operations.
+///
+/// The whole ownership/upgrade machinery is a read-modify-write over shared
+/// stores (`config.json`, `prompt-presets.json`, `installed.json`) with the
+/// ownership pre-check and the eventual mutation in separate steps. Under
+/// CONCURRENT plugin ops (the HTTP agent will expose exactly that) those
+/// interleave badly: two installs of different ids race `installed.json`'s
+/// load/add/save (last save drops the other's row), `prompt-presets.json`'s
+/// load/save (lost update), and the MCP reconcile→write window (a foreign
+/// entry landing mid-window gets clobbered AND recorded as plugin-owned,
+/// re-opening BLOCKER-1). Plugin installs are rare and not perf-sensitive, so
+/// one coarse process-wide lock held across the ENTIRE `install`/`uninstall`
+/// (including rollback) is the right call — it makes each op's
+/// reconcile→mutate→provenance sequence atomic w.r.t. every other plugin op.
+///
+/// Lock ordering: this lock is acquired at the TOP of `install`/`uninstall`,
+/// OUTSIDE any `AppState::update_config` call (which internally takes
+/// `config_io_lock`). So the order is always `PLUGIN_OP_LOCK` →
+/// `config_io_lock`, never the reverse — no deadlock. Nothing acquires
+/// `PLUGIN_OP_LOCK` while holding `config_io_lock`.
+static PLUGIN_OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// AppState-backed [`PluginInstaller`]. See the module docs for the full
 /// design rationale (borrowing, path derivation, atomicity).
@@ -285,6 +341,52 @@ impl ServerPluginInstaller {
         }
     }
 
+    /// Upsert one provenance row into `installed.json`. Used both for the
+    /// pre-registration `Installing` journal row and the final `Installed`
+    /// commit — the ONLY two writers of `installed.json` in `install`. Both
+    /// run under [`PLUGIN_OP_LOCK`], so the load/add/save is race-free.
+    async fn upsert_provenance(&self, entry: InstalledPlugin, path: &Path) -> PluginResult<()> {
+        let mut store = InstalledPlugins::load(path).await?;
+        store.add(entry);
+        store.save(path).await?;
+        Ok(())
+    }
+
+    /// Abort an in-process `install` failure: best-effort undo of the partial
+    /// registration (steps 1-3), then restore `installed.json` to its
+    /// pre-install state — re-writing the original `previous` row on an
+    /// upgrade/recovery, or removing the id's row entirely on a fresh install
+    /// — so the `Installing` journal row we wrote up front never lingers after
+    /// a clean in-process failure. (A HARD kill is the only path that
+    /// intentionally leaves an `Installing` row, for the next op to recover.)
+    async fn abort_install(
+        &self,
+        rollback: &InstallRollback,
+        previous: &Option<InstalledPlugin>,
+        plugin_id: &str,
+        path: &Path,
+    ) {
+        self.rollback_partial_install(rollback).await;
+        let restore = match previous {
+            Some(prev) => self.upsert_provenance(prev.clone(), path).await,
+            None => match InstalledPlugins::load(path).await {
+                Ok(mut store) => {
+                    store.remove(plugin_id);
+                    store.save(path).await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = restore {
+            tracing::warn!(
+                %plugin_id,
+                %error,
+                "failed to restore provenance after aborting a failed install; a stale \
+                 `installing` row may remain (recoverable by a retry)"
+            );
+        }
+    }
+
     /// Step 1: MCP. Returns the ids actually (re-)registered
     /// (`reconciliation.to_register`), which — once past the conflict gate —
     /// is exactly the declared id set.
@@ -330,15 +432,38 @@ impl ServerPluginInstaller {
             .collect();
 
         let owned_configs = configs_to_register.clone();
+        let declared_for_recheck = declared_ids.clone();
+        let owned_for_recheck: Vec<String> = previously_owned.to_vec();
+        let plugin_id_for_recheck = manifest.id.clone();
         self.state
             .update_config(
                 move |cfg| {
+                    // TOCTOU guard: re-run the ownership pre-check against the
+                    // LIVE config while holding config_io_lock, so a foreign
+                    // entry that landed between our earlier read and now can't
+                    // be silently clobbered (and then recorded as
+                    // plugin-owned, re-opening BLOCKER-1 under a race).
+                    // Concurrent PLUGIN ops are already excluded by
+                    // PLUGIN_OP_LOCK; this closes the residual window against a
+                    // concurrent NON-plugin config write.
+                    let live_existing: Vec<String> =
+                        cfg.mcp.servers.iter().map(|s| s.id.clone()).collect();
+                    let live = reconcile_exclusive(
+                        &declared_for_recheck,
+                        &live_existing,
+                        &owned_for_recheck,
+                    );
+                    if !live.foreign_conflicts.is_empty() {
+                        return Err(AppError::BadRequest(format!(
+                            "mcp server(s) '{}' now conflict with a non-plugin entry (a concurrent \
+                             change landed mid-install); refusing to overwrite for plugin '{}'",
+                            live.foreign_conflicts.join(", "),
+                            plugin_id_for_recheck
+                        )));
+                    }
+                    // Shared by-id merge (same helper import_servers uses).
                     for server in &owned_configs {
-                        if let Some(slot) = cfg.mcp.servers.iter_mut().find(|s| s.id == server.id) {
-                            *slot = server.clone();
-                        } else {
-                            cfg.mcp.servers.push(server.clone());
-                        }
+                        upsert_server_by_id(&mut cfg.mcp.servers, server.clone());
                     }
                     Ok(())
                 },
@@ -480,9 +605,15 @@ impl PluginInstaller for ServerPluginInstaller {
         disposition: InstallDisposition,
         installed_at: DateTime<Utc>,
     ) -> PluginResult<InstalledPlugin> {
+        // Serialize the whole op against every other plugin install/uninstall
+        // (process-wide) — held across all steps AND rollback. See module docs
+        // "Concurrency".
+        let _op_guard = PLUGIN_OP_LOCK.lock().await;
+
         let installed_json_path = self.installed_json_path();
 
-        // Disposition gate (AlreadyInstalled under FailIfInstalled) + the
+        // Disposition gate (AlreadyInstalled only for a COMPLETED prior
+        // install; an `Installing` leftover is returned for recovery) + the
         // rest of the pure, AppState-free validation this crate can already
         // do (manifest shape, platform gate, on-disk skill/workflow
         // existence, `provides.skills` authoritativeness).
@@ -490,36 +621,41 @@ impl PluginInstaller for ServerPluginInstaller {
             load_previous_for_disposition(&installed_json_path, &manifest.id, disposition).await?;
         let resolved_mcp_servers = preflight_install(manifest, plugin_dir).await?;
 
+        // The set this install INTENDS to own, by declaration order. Used both
+        // for the crash-safety journal row (below) and the step-0 drop-diff.
+        let intended = RegisteredCapabilities {
+            mcp_server_ids: manifest
+                .provides
+                .mcp_servers
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect(),
+            skill_dirs: manifest.provides.skills.clone(),
+            preset_ids: manifest
+                .provides
+                .prompts
+                .iter()
+                .map(|preset| preset.id.clone())
+                .collect(),
+            workflow_filenames: manifest.provides.workflows.clone(),
+        };
+
         // Step 0: upgrade drop-diff. Computed from the NEW manifest's plain
         // declared ids (see module docs re: the preset-rename caveat) vs the
-        // OLD install's actual registered set — de-register whatever the new
-        // version no longer declares BEFORE registering anything new
-        // (BLOCKER 2).
+        // OLD install's registered set — de-register whatever the new version
+        // no longer declares BEFORE registering anything new (BLOCKER 2). Also
+        // fires for a recovery over an `Installing` leftover: its intended set
+        // is diffed the same way, so a crashed attempt's extra ids get cleaned.
         if let Some(previous) = &previous {
-            let prospective_new = RegisteredCapabilities {
-                mcp_server_ids: manifest
-                    .provides
-                    .mcp_servers
-                    .iter()
-                    .map(|entry| entry.id.clone())
-                    .collect(),
-                skill_dirs: manifest.provides.skills.clone(),
-                preset_ids: manifest
-                    .provides
-                    .prompts
-                    .iter()
-                    .map(|preset| preset.id.clone())
-                    .collect(),
-                workflow_filenames: manifest.provides.workflows.clone(),
-            };
-            let dropped = prospective_new.removed_since(&previous.registered);
+            let dropped = intended.removed_since(&previous.registered);
             if !dropped.is_empty() {
                 tracing::info!(
                     plugin_id = %manifest.id,
+                    recovering = previous.status == PluginInstallStatus::Installing,
                     dropped_mcp = ?dropped.mcp_server_ids,
                     dropped_presets = ?dropped.preset_ids,
                     dropped_workflows = ?dropped.workflow_filenames,
-                    "upgrade drop-diff: de-registering capabilities the new version no longer declares"
+                    "install drop-diff: de-registering capabilities the new/completed version no longer declares"
                 );
                 self.deregister_capabilities(&dropped).await;
             }
@@ -533,6 +669,25 @@ impl PluginInstaller for ServerPluginInstaller {
             .as_ref()
             .map(|p| p.registered.workflow_filenames.clone())
             .unwrap_or_default();
+
+        // Crash-safety journal: write an `Installing` provenance row recording
+        // the INTENDED ownership set BEFORE mutating any shared store, so a
+        // hard kill mid-install leaves a recoverable marker (see module docs
+        // "Crash safety"). On a fresh install this creates the row; on an
+        // upgrade/recovery it overwrites the prior row.
+        self.upsert_provenance(
+            InstalledPlugin {
+                id: manifest.id.clone(),
+                version: manifest.version.clone(),
+                source: source.clone(),
+                plugin_dir: plugin_dir.to_path_buf(),
+                installed_at,
+                status: PluginInstallStatus::Installing,
+                registered: intended.clone(),
+            },
+            &installed_json_path,
+        )
+        .await?;
 
         let mut rollback = InstallRollback::default();
 
@@ -548,7 +703,8 @@ impl PluginInstaller for ServerPluginInstaller {
         {
             Ok(ids) => ids,
             Err(error) => {
-                self.rollback_partial_install(&rollback).await;
+                self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
+                    .await;
                 return Err(error);
             }
         };
@@ -560,7 +716,8 @@ impl PluginInstaller for ServerPluginInstaller {
                 ids
             }
             Err(error) => {
-                self.rollback_partial_install(&rollback).await;
+                self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
+                    .await;
                 return Err(error);
             }
         };
@@ -580,7 +737,8 @@ impl PluginInstaller for ServerPluginInstaller {
         {
             Ok(files) => files,
             Err(error) => {
-                self.rollback_partial_install(&rollback).await;
+                self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
+                    .await;
                 return Err(error);
             }
         };
@@ -590,7 +748,9 @@ impl PluginInstaller for ServerPluginInstaller {
         // every declared dir exists and that no undeclared dir is present).
         let skill_dirs = manifest.provides.skills.clone();
 
-        // Step 5: commit provenance — only now that 0-4 all succeeded.
+        // Step 5: commit provenance — flip the journal row to `Installed` with
+        // the ACTUAL registered set (renamed preset ids, the to_register mcp/
+        // workflow subsets). Only reached once 0-4 all succeeded.
         let registered = RegisteredCapabilities {
             mcp_server_ids,
             skill_dirs,
@@ -603,19 +763,23 @@ impl PluginInstaller for ServerPluginInstaller {
             source,
             plugin_dir: plugin_dir.to_path_buf(),
             installed_at,
+            status: PluginInstallStatus::Installed,
             registered,
         };
-
-        let mut store = InstalledPlugins::load(&installed_json_path).await?;
-        store.add(entry.clone());
-        store.save(&installed_json_path).await?;
+        self.upsert_provenance(entry.clone(), &installed_json_path)
+            .await?;
 
         Ok(entry)
     }
 
     async fn uninstall(&self, id: &str) -> PluginResult<()> {
+        // Serialize against every other plugin op (see module docs).
+        let _op_guard = PLUGIN_OP_LOCK.lock().await;
+
         let installed_json_path = self.installed_json_path();
         let mut store = InstalledPlugins::load(&installed_json_path).await?;
+        // Works on an `Installing` (crash-leftover) row too, so a crashed
+        // install is never un-uninstallable.
         let Some(entry) = store.get(id).cloned() else {
             return Err(PluginError::NotFound(id.to_string()));
         };

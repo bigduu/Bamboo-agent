@@ -13,6 +13,8 @@ pub use server_handlers::{
     add_server, connect_server, delete_server, disconnect_server, get_server, import_servers,
     list_servers, refresh_tools, update_server,
 };
+// Shared by-id MCP merge helper, re-exported for `crate::plugin_installer`.
+pub(crate) use server_handlers::upsert_server_by_id;
 pub use tool_handlers::{get_server_tools, list_tools};
 
 fn persist_config_error(message: impl Into<String>) -> HttpResponse {

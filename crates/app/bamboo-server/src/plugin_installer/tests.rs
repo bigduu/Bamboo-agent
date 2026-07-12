@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use actix_web::web;
 use bamboo_plugin::{
-    InstallDisposition, McpServerManifestEntry, McpTransportManifest, Platform, PluginError,
-    PluginInstaller, PluginManifest, PluginSource,
+    InstallDisposition, InstalledPlugin, InstalledPlugins, McpServerManifestEntry,
+    McpTransportManifest, Platform, PluginError, PluginInstallStatus, PluginInstaller,
+    PluginManifest, PluginSource, RegisteredCapabilities,
 };
 use chrono::Utc;
 
@@ -516,4 +518,210 @@ async fn partial_workflow_copy_failure_rolls_back_the_files_already_written() {
 
     // And nothing was committed to provenance.
     assert!(installer.list().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------
+// Concurrency: two installs of DIFFERENT ids run concurrently under the
+// process-wide install lock; neither drops the other's provenance row or
+// prompt preset (the load/modify/save lost-update races the lock closes).
+// ---------------------------------------------------------------------
+
+/// Write a plugin bundle declaring one distinct skill + one distinct prompt
+/// preset, so concurrent installs each touch BOTH installed.json AND
+/// prompt-presets.json (the two lost-update-prone stores).
+async fn write_skill_and_preset_plugin(dir: &Path, id: &str, preset_id: &str) -> PluginManifest {
+    tokio::fs::create_dir_all(dir.join("skills").join(id))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        dir.join("skills").join(id).join("SKILL.md"),
+        format!("---\nname: {id}\ndescription: demo\n---\nHi\n"),
+    )
+    .await
+    .unwrap();
+    let manifest_json = serde_json::json!({
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "provides": {
+            "skills": [id],
+            "prompts": [
+                {"id": preset_id, "name": preset_id, "content": "hello from a preset"}
+            ]
+        }
+    })
+    .to_string();
+    tokio::fs::write(dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    PluginManifest::parse_str(&manifest_json).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_installs_of_different_ids_both_persist() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let installer = Arc::new(installer);
+
+    let dir_a = root.path().join("src-a");
+    let dir_b = root.path().join("src-b");
+    let manifest_a = write_skill_and_preset_plugin(&dir_a, "plug-a", "preset_a").await;
+    let manifest_b = write_skill_and_preset_plugin(&dir_b, "plug-b", "preset_b").await;
+
+    let inst_a = installer.clone();
+    let inst_b = installer.clone();
+    let handle_a = tokio::spawn(async move {
+        inst_a
+            .install(
+                &manifest_a,
+                &dir_a,
+                PluginSource::LocalDir {
+                    path: dir_a.clone(),
+                },
+                InstallDisposition::FailIfInstalled,
+                Utc::now(),
+            )
+            .await
+    });
+    let handle_b = tokio::spawn(async move {
+        inst_b
+            .install(
+                &manifest_b,
+                &dir_b,
+                PluginSource::LocalDir {
+                    path: dir_b.clone(),
+                },
+                InstallDisposition::FailIfInstalled,
+                Utc::now(),
+            )
+            .await
+    });
+
+    handle_a.await.unwrap().expect("install plug-a");
+    handle_b.await.unwrap().expect("install plug-b");
+
+    // Neither install dropped the other's provenance row...
+    let mut listed = installer.list().await.unwrap();
+    listed.sort_by(|l, r| l.id.cmp(&r.id));
+    let ids: Vec<&str> = listed.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["plug-a", "plug-b"],
+        "both provenance rows present"
+    );
+    assert!(listed
+        .iter()
+        .all(|p| p.status == PluginInstallStatus::Installed));
+
+    // ...nor the other's prompt preset (no lost update on prompt-presets.json).
+    let presets_raw = tokio::fs::read_to_string(_state.app_data_dir.join("prompt-presets.json"))
+        .await
+        .unwrap();
+    assert!(presets_raw.contains("preset_a"), "preset_a survived");
+    assert!(presets_raw.contains("preset_b"), "preset_b survived");
+}
+
+// ---------------------------------------------------------------------
+// Crash recovery: a prior install killed mid-flight left an `installing`
+// provenance row + a leftover mcp entry in config.json. The next install of
+// that id must recover cleanly (no false Conflict, ends `installed`), not
+// treat the plugin's own leftover as a foreign conflict.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_recovers_from_a_crashed_installing_leftover() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    // Simulate a crashed install: config.json already has the mcp entry the
+    // install had begun to register...
+    let leftover_entry = McpServerManifestEntry {
+        id: "leftover-mcp".to_string(),
+        name: None,
+        enabled: false,
+        transport: McpTransportManifest::Stdio {
+            command: NONEXISTENT_COMMAND.to_string(),
+            args: vec![],
+            cwd: None,
+            env: Default::default(),
+        },
+        allowed_tools: vec![],
+        denied_tools: vec![],
+    };
+    let leftover_cfg = leftover_entry
+        .resolve(
+            Path::new("/tmp"),
+            "crashed-plugin",
+            Platform::current().unwrap_or(Platform::Linux),
+        )
+        .unwrap();
+    state
+        .update_config(
+            move |cfg| {
+                cfg.mcp.servers.push(leftover_cfg.clone());
+                Ok(())
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // ...and installed.json has an `installing` journal row recording that id
+    // as its intended owner (this is what the pre-registration journal write
+    // leaves behind on a hard kill).
+    let installed_json = state.app_data_dir.join("plugins").join("installed.json");
+    let plugin_dir = state.app_data_dir.join("plugins").join("crashed-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let mut store = InstalledPlugins::default();
+    store.add(InstalledPlugin {
+        id: "crashed-plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: plugin_dir.clone(),
+        },
+        plugin_dir: plugin_dir.clone(),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installing,
+        registered: RegisteredCapabilities {
+            mcp_server_ids: vec!["leftover-mcp".to_string()],
+            ..Default::default()
+        },
+    });
+    store.save(&installed_json).await.unwrap();
+
+    // Re-run the install (plain `install` verb → FailIfInstalled). It must NOT
+    // fail AlreadyInstalled (the row is `installing`, not a completed install),
+    // and must NOT false-Conflict on `leftover-mcp` (recorded as the plugin's
+    // own intended entry).
+    let manifest_json = mcp_manifest_json("crashed-plugin", "1.0.0", &["leftover-mcp"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let entry = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("a crashed `installing` leftover must recover, not conflict");
+
+    assert_eq!(entry.status, PluginInstallStatus::Installed);
+    assert_eq!(
+        entry.registered.mcp_server_ids,
+        vec!["leftover-mcp".to_string()]
+    );
+
+    // Provenance flipped to `installed`; the mcp entry is still owned.
+    let listed = installer.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, PluginInstallStatus::Installed);
+    let config = state.config.read().await;
+    assert!(config.mcp.servers.iter().any(|s| s.id == "leftover-mcp"));
 }

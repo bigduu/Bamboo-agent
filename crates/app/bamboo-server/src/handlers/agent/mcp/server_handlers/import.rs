@@ -6,6 +6,30 @@ use crate::app_state::{AppState, ConfigUpdateEffects};
 use super::super::api_types::{ImportServersRequest, ImportServersResponse, ImportStartError};
 use super::super::persist_config_error;
 
+/// Merge one MCP server into a config's server list BY ID: replace an existing
+/// entry with the same id, or append a new one. Returns `true` if the server
+/// was newly ADDED, `false` if it REPLACED an existing entry.
+///
+/// The single by-id merge implementation shared by [`import_servers`] here and
+/// the plugin installer's MCP registration
+/// (`crate::plugin_installer::ServerPluginInstaller::register_mcp`) so the two
+/// can't drift (see PLUGIN_PLAN.md § "MCP registration reuses the existing
+/// merge logic"). NOTE: this is a raw last-writer-wins merge with NO ownership
+/// check — the plugin installer runs `reconcile_exclusive` FIRST and only ever
+/// passes ids it is allowed to (re)register.
+pub(crate) fn upsert_server_by_id(
+    servers: &mut Vec<bamboo_mcp::McpServerConfig>,
+    server: bamboo_mcp::McpServerConfig,
+) -> bool {
+    if let Some(slot) = servers.iter_mut().find(|item| item.id == server.id) {
+        *slot = server;
+        false
+    } else {
+        servers.push(server);
+        true
+    }
+}
+
 /// Bulk import MCP servers from a Claude Desktop-style config chunk.
 ///
 /// # HTTP Route
@@ -66,14 +90,11 @@ pub async fn import_servers(
                         .retain(|server| !incoming_ids.contains(&server.id));
                 }
 
-                for (id, server) in incoming_by_id.iter() {
-                    let slot = root.mcp.servers.iter_mut().find(|item| item.id == *id);
-                    if let Some(existing) = slot {
-                        *existing = server.clone();
-                        updated += 1;
-                    } else {
-                        root.mcp.servers.push(server.clone());
+                for server in incoming_by_id.values() {
+                    if upsert_server_by_id(&mut root.mcp.servers, server.clone()) {
                         added += 1;
+                    } else {
+                        updated += 1;
                     }
                 }
 
