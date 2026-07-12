@@ -636,9 +636,15 @@ fn default_trusted_hosts() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginTrustConfig {
     /// Host+path prefixes a `url` plugin source may be fetched from without
-    /// `--allow-untrusted-host`. A URL is host-trusted when its scheme is
-    /// `https` and `<host><path>` (host lowercased) starts with one of these
-    /// entries verbatim — scoped to an org/user path, not just a bare host.
+    /// `--allow-untrusted-host`, e.g. `"github.com/bigduu/"` (a bare host
+    /// with no `/`, e.g. `"example.com"`, matches any path on that exact
+    /// host). Each entry is split into a host component and a path-prefix
+    /// component and matched on PARSED URL components — whole-host equality
+    /// plus a `/`-boundary path-prefix check, never a raw string
+    /// `starts_with` — see [`is_host_trusted`] for the precise rule and why
+    /// (it closes a domain-gluing bypass like `example.com` matching
+    /// `example.com.evil.com`, and a sibling-path bypass like
+    /// `github.com/bigduu` matching `github.com/bigduu-evil/x`).
     #[serde(default = "default_trusted_hosts")]
     pub trusted_hosts: Vec<String>,
     /// Publisher keys a bundle's `.sig` signature may verify against without
@@ -657,17 +663,85 @@ impl Default for PluginTrustConfig {
 }
 
 impl PluginTrustConfig {
-    /// True when `url` is `https` and its `<host><path>` matches one of
-    /// `trusted_hosts` as a literal prefix (host compared case-insensitively;
-    /// an unparseable URL or a non-`https` scheme is never trusted).
+    /// True when `url` is `https` and its host+path match one of
+    /// `trusted_hosts` on parsed URL components (host compared
+    /// case-insensitively as a WHOLE string, path matched on a `/` boundary
+    /// — see the free function [`is_host_trusted`] for the precise rule; an
+    /// unparseable URL or a non-`https` scheme is never trusted).
     pub fn is_host_trusted(&self, url: &str) -> bool {
         is_host_trusted(url, &self.trusted_hosts)
     }
 }
 
+/// One `trusted_hosts` entry, split into its host and path-prefix
+/// components (see [`is_host_trusted`]). `path_prefix` is empty for a
+/// bare-host entry (e.g. `"example.com"`, meaning "any path on this exact
+/// host") or starts with `/` (e.g. `"/bigduu/"` from `"github.com/bigduu/"`).
+struct TrustedHostEntry<'a> {
+    host: &'a str,
+    path_prefix: &'a str,
+}
+
+/// Split a raw `trusted_hosts` entry at its first `/` into host + path
+/// components. Entries are compared against ALREADY-lowercased input by the
+/// caller ([`is_host_trusted`]), so this does no case normalization itself.
+fn parse_trusted_host_entry(entry: &str) -> TrustedHostEntry<'_> {
+    match entry.find('/') {
+        Some(index) => TrustedHostEntry {
+            host: &entry[..index],
+            path_prefix: &entry[index..],
+        },
+        None => TrustedHostEntry {
+            host: entry,
+            path_prefix: "",
+        },
+    }
+}
+
+/// True when `path` matches `prefix` on a `/` path-component boundary, never
+/// on a raw byte prefix: exactly equal to `prefix`, or `prefix` ends in `/`
+/// and `path` starts with it, or the character in `path` immediately
+/// following `prefix` is `/`. An empty `prefix` (a bare-host trusted_hosts
+/// entry) matches any path.
+///
+/// This is what stops a sibling path from passing as a prefix match — e.g.
+/// entry `github.com/bigduu` (no trailing slash) must NOT match
+/// `github.com/bigduu-evil/x`: `"/bigduu-evil/x"` starts with `"/bigduu"` as
+/// raw bytes, but the character right after the prefix is `-`, not `/`, so
+/// this correctly refuses it.
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || path == prefix {
+        return true;
+    }
+    if prefix.ends_with('/') {
+        return path.starts_with(prefix);
+    }
+    path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
+}
+
 /// Free function backing [`PluginTrustConfig::is_host_trusted`] — exposed
 /// separately so callers (and tests) can check a candidate host list without
 /// constructing a full [`PluginTrustConfig`]/[`Config`].
+///
+/// Matches on PARSED URL COMPONENTS, not a raw string prefix: `url` must be
+/// `https`, its `host_str()` (already correct for userinfo — `user@host` or
+/// `host@evil.com`-style tricks resolve to the real host, not a decoy — and
+/// for an explicit port, which `host_str()` excludes) must EQUAL a
+/// `trusted_hosts` entry's host component (case-insensitively, WHOLE host —
+/// never a `starts_with`), and its (already dot-segment-normalized by
+/// `Url::parse`) path must match that entry's path-prefix component on a `/`
+/// boundary (see [`path_matches_prefix`]). A bare-host entry (no `/` in it)
+/// has an empty path-prefix, so it matches any path but ONLY on that exact
+/// host.
+///
+/// A prior raw-`starts_with` implementation was defeated by (1) gluing a
+/// trusted bare host into a longer attacker-controlled one, e.g.
+/// `trusted.example.com` matching `trusted.example.com.evil.com` /
+/// `trusted.example.comevil.com`, and (2) a sibling path prefix, e.g.
+/// `github.com/bigduu` (no trailing slash) matching
+/// `github.com/bigduu-evil/x`. Component-wise matching closes both: host
+/// comparison is whole-string equality (no gluing possible), and the path
+/// check enforces a `/` boundary (no sibling-prefix bypass possible).
 pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
@@ -678,10 +752,14 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    let candidate = format!("{}{}", host.to_ascii_lowercase(), parsed.path());
-    trusted_hosts
-        .iter()
-        .any(|prefix| candidate.starts_with(prefix.as_str()))
+    let host = host.to_ascii_lowercase();
+    let path = parsed.path();
+
+    trusted_hosts.iter().any(|raw_entry| {
+        let entry = raw_entry.trim().to_ascii_lowercase();
+        let parsed_entry = parse_trusted_host_entry(&entry);
+        host == parsed_entry.host && path_matches_prefix(path, parsed_entry.path_prefix)
+    })
 }
 
 /// Main configuration structure for Bamboo agent
@@ -1694,6 +1772,7 @@ impl Config {
         config.hydrate_notifications_from_encrypted();
         config.normalize_tool_settings();
         config.normalize_skill_settings();
+        config.normalize_plugin_trust_settings();
 
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
         // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
@@ -2267,6 +2346,23 @@ impl Config {
     /// Normalize skill settings (trim / dedupe / sort).
     pub fn normalize_skill_settings(&mut self) {
         self.skills.disabled = self.disabled_skill_ids().into_iter().collect();
+    }
+
+    /// Normalize `plugin_trust.trusted_hosts` entries (trim / lowercase / drop
+    /// empties) so a hand-edited `config.json` doesn't silently accumulate
+    /// mixed-case or whitespace-padded entries. [`is_host_trusted`] itself
+    /// already matches case-insensitively regardless of how an entry is
+    /// stored, so this is defense in depth / a canonical on-disk form, not
+    /// the source of the security fix — that's the host/path-component
+    /// matching in [`is_host_trusted`] itself.
+    pub fn normalize_plugin_trust_settings(&mut self) {
+        self.plugin_trust.trusted_hosts = self
+            .plugin_trust
+            .trusted_hosts
+            .iter()
+            .map(|entry| entry.trim().to_ascii_lowercase())
+            .filter(|entry| !entry.is_empty())
+            .collect();
     }
 
     /// Return the effective default provider key.
@@ -4939,6 +5035,124 @@ mod tests {
         assert_eq!(
             config.get_memory_background_model(),
             Some("legacy-gpt-4o-mini".to_string())
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `is_host_trusted` — plugin source-trust host allowlist (component
+    // matching, not raw string-prefix matching; see the function's own docs
+    // for the bypasses this closes).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_host_trusted_requires_https_scheme() {
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        assert!(!is_host_trusted("http://github.com/bigduu/x", &hosts));
+        assert!(is_host_trusted("https://github.com/bigduu/x", &hosts));
+    }
+
+    #[test]
+    fn is_host_trusted_is_case_insensitive_on_both_sides() {
+        // A lowercase URL host against a mixed-case config entry...
+        let hosts = vec!["GitHub.com/BigDuu/".to_string()];
+        assert!(is_host_trusted("https://github.com/bigduu/x", &hosts));
+        // ...and a mixed-case URL host against a lowercase config entry.
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        assert!(is_host_trusted("https://GitHub.Com/bigduu/x", &hosts));
+    }
+
+    #[test]
+    fn is_host_trusted_refuses_domain_gluing_bypass_of_a_bare_host_entry() {
+        let hosts = vec!["trusted.example.com".to_string()];
+        assert!(is_host_trusted("https://trusted.example.com/x", &hosts));
+        // Both demonstrated bypasses of a raw string-prefix match: gluing a
+        // longer attacker-controlled label onto the trusted host, with or
+        // without a separating dot.
+        assert!(!is_host_trusted(
+            "https://trusted.example.com.evil.com/x",
+            &hosts
+        ));
+        assert!(!is_host_trusted(
+            "https://trusted.example.comevil.com/x",
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn is_host_trusted_refuses_sibling_path_prefix_bypass() {
+        // No trailing slash on the config entry's path component.
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        assert!(is_host_trusted("https://github.com/bigduu/x", &hosts));
+        assert!(!is_host_trusted("https://github.com/bigduu-evil/x", &hosts));
+    }
+
+    #[test]
+    fn is_host_trusted_bare_host_entry_matches_any_path_on_exactly_that_host() {
+        let hosts = vec!["example.com".to_string()];
+        assert!(is_host_trusted("https://example.com/", &hosts));
+        assert!(is_host_trusted("https://example.com/any/deep/path", &hosts));
+        // Still only that exact host — a bare-host entry must not become a
+        // blanket "any host containing this string" match.
+        assert!(!is_host_trusted("https://example.com.evil.com/", &hosts));
+        assert!(!is_host_trusted("https://evil-example.com/", &hosts));
+    }
+
+    #[test]
+    fn is_host_trusted_uses_the_real_host_not_userinfo() {
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        // `user@host` userinfo does not change the actual host.
+        assert!(is_host_trusted(
+            "https://someuser@github.com/bigduu/x",
+            &hosts
+        ));
+        // A decoy host placed in the userinfo position must not be mistaken
+        // for the real host — the real host here is `evil.com`.
+        assert!(!is_host_trusted(
+            "https://github.com@evil.com/bigduu/",
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn is_host_trusted_ignores_an_explicit_port() {
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        assert!(is_host_trusted("https://github.com:443/bigduu/x", &hosts));
+    }
+
+    #[test]
+    fn is_host_trusted_malformed_url_is_refused_without_panicking() {
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        assert!(!is_host_trusted("not a url at all", &hosts));
+        assert!(!is_host_trusted("", &hosts));
+        assert!(!is_host_trusted("github.com/bigduu/x", &hosts)); // no scheme
+    }
+
+    #[test]
+    fn is_host_trusted_normalizes_dot_segments_before_matching() {
+        let hosts = vec!["github.com/bigduu/".to_string()];
+        // `Url::parse` resolves `..` segments before `path()` is ever
+        // consulted, so this cannot be used to escape the trusted prefix.
+        assert!(!is_host_trusted(
+            "https://github.com/bigduu/../evil/x",
+            &hosts
+        ));
+        // A `..` that stays under the trusted prefix once resolved is fine.
+        assert!(is_host_trusted("https://github.com/bigduu/x/../y", &hosts));
+    }
+
+    #[test]
+    fn normalize_plugin_trust_settings_lowercases_and_trims_and_drops_empties() {
+        let mut config = Config::default();
+        config.plugin_trust.trusted_hosts = vec![
+            "  GitHub.com/BigDuu/ ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "Example.COM".to_string(),
+        ];
+        config.normalize_plugin_trust_settings();
+        assert_eq!(
+            config.plugin_trust.trusted_hosts,
+            vec!["github.com/bigduu/".to_string(), "example.com".to_string()]
         );
     }
 }
