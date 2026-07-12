@@ -28,7 +28,7 @@ pub struct ConnArgs {
 
 impl ConnArgs {
     /// Resolve the API base, e.g. `http://127.0.0.1:9562/api/v1`.
-    fn api_base(&self) -> String {
+    pub(crate) fn api_base(&self) -> String {
         if let Some(url) = &self.server_url {
             let url = url.trim_end_matches('/');
             // Tolerate a scheme-less override like `localhost:9562`.
@@ -52,7 +52,7 @@ impl ConnArgs {
     }
 }
 
-fn unreachable(base: &str, e: reqwest::Error) -> anyhow::Error {
+pub(crate) fn unreachable(base: &str, e: reqwest::Error) -> anyhow::Error {
     anyhow::anyhow!("could not reach the server at {base} ({e}). Is `bamboo serve` running?")
 }
 
@@ -60,7 +60,7 @@ fn unreachable(base: &str, e: reqwest::Error) -> anyhow::Error {
 /// ids) are opaque tokens (UUIDs), so reject anything that could traverse or
 /// malform the URL rather than encode it. `kind` names the id in the error,
 /// e.g. "session id".
-fn guard_id_segment(kind: &str, id: &str) -> anyhow::Result<()> {
+pub(crate) fn guard_id_segment(kind: &str, id: &str) -> anyhow::Result<()> {
     if id.is_empty()
         || id == "."
         || id == ".."
@@ -595,7 +595,7 @@ pub async fn session_delete(conn: ConnArgs, session_id: &str, yes: bool) -> anyh
 /// Ask a yes/no question on stdout and read the answer from stdin. Defaults to
 /// "no" on anything but an explicit y/yes — including EOF (non-TTY pipe), so a
 /// script that forgets `--yes` aborts instead of deleting.
-fn confirm(prompt: &str) -> anyhow::Result<bool> {
+pub(crate) fn confirm(prompt: &str) -> anyhow::Result<bool> {
     use std::io::Write as _;
     print!("{prompt} [y/N] ");
     std::io::stdout().flush()?;
@@ -1063,7 +1063,7 @@ fn read_json_payload(source: &str) -> anyhow::Result<serde_json::Value> {
 }
 
 /// Pull the server's `{"error": "..."}` detail out of an error body, if any.
-fn server_error_message(body: &serde_json::Value) -> String {
+pub(crate) fn server_error_message(body: &serde_json::Value) -> String {
     body.get("error")
         .and_then(|e| e.as_str())
         .map(|e| format!("({e})"))
@@ -1474,7 +1474,7 @@ fn count_running(sessions: &[serde_json::Value]) -> usize {
 }
 
 /// Truncate to `max` chars with a trailing ellipsis.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

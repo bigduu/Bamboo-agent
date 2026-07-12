@@ -72,6 +72,10 @@ pub mod setup_cli;
 /// and MCP surfaces offline (straight from `<data_dir>`), no running server.
 pub mod read_cli;
 
+/// The `bamboo plugin install|list|remove|update` CLI: a thin HTTP client over
+/// a running `bamboo serve` instance's `/api/v1/plugins` routes.
+pub mod plugin_cli;
+
 // Server module is now a separate workspace crate
 pub use bamboo_server as server;
 

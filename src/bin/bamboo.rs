@@ -398,6 +398,14 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommands,
     },
+
+    /// Manage plugins (bundled MCP servers/prompt presets/skills/workflows)
+    /// on a running server (`/api/v1/plugins`): `install`/`list`/`remove`/
+    /// `update`.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -524,6 +532,81 @@ enum McpCommands {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// Install a plugin from a local directory, a local `.tar.gz`/`.tgz`/
+    /// `.zip` archive, or an `http(s)://` URL (source kind auto-detected from
+    /// the argument) — `POST /api/v1/plugins/install`. Fails if the plugin id
+    /// is already installed; use `bamboo plugin update` for that case.
+    #[command(after_help = "EXAMPLES:\n  \
+        # From a local directory (development)\n  \
+        bamboo plugin install ./my-plugin\n\n  \
+        # From a packaged archive\n  \
+        bamboo plugin install ./my-plugin.tar.gz\n\n  \
+        # From a URL, pinned by sha256\n  \
+        bamboo plugin install https://example.com/my-plugin.tar.gz \\\n    \
+        --sha256 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1")]
+    Install {
+        /// A local directory, a local `.tar.gz`/`.tgz`/`.zip` archive, or an
+        /// `http(s)://` URL — the source kind is auto-detected.
+        source: String,
+
+        /// Expected sha256 (hex) of the downloaded archive. Only valid with a
+        /// URL source; the server rejects a mismatch.
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// List installed plugins (id, version, status, registered capability
+    /// counts, source) — `GET /api/v1/plugins`.
+    List {
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Print the raw JSON response instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Uninstall a plugin: stops/removes its registered MCP servers, prompt
+    /// presets and workflow files, then deletes its plugin directory
+    /// (`DELETE /api/v1/plugins/{id}`). Asks for confirmation unless --yes.
+    Remove {
+        /// Plugin id (see `bamboo plugin list`).
+        id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Upgrade an installed plugin to a new source (same auto-detect as
+    /// `install`) — `POST /api/v1/plugins/{id}/update`. Drops capabilities the
+    /// new version no longer declares before registering the new set.
+    Update {
+        /// Plugin id (see `bamboo plugin list`).
+        id: String,
+
+        /// A local directory, a local `.tar.gz`/`.tgz`/`.zip` archive, or an
+        /// `http(s)://` URL — the source kind is auto-detected.
+        source: String,
+
+        /// Expected sha256 (hex) of the downloaded archive. Only valid with a
+        /// URL source; the server rejects a mismatch.
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
 
         #[command(flatten)]
         conn: ConnArgs,
@@ -992,6 +1075,7 @@ async fn main() {
         | Some(Commands::Schedules { .. })
         | Some(Commands::Skills { .. })
         | Some(Commands::Mcp { .. })
+        | Some(Commands::Plugin { .. })
         | Some(Commands::Init { .. })
         | Some(Commands::Doctor { .. })
         | Some(Commands::Completions { .. })
@@ -1626,6 +1710,37 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+
+        Commands::Plugin { command } => {
+            let result = match command {
+                PluginCommands::Install {
+                    source,
+                    sha256,
+                    conn,
+                } => {
+                    bamboo_agent::plugin_cli::install(conn.into(), &source, sha256.as_deref()).await
+                }
+                PluginCommands::List { conn, json } => {
+                    bamboo_agent::plugin_cli::list(conn.into(), json).await
+                }
+                PluginCommands::Remove { id, yes, conn } => {
+                    bamboo_agent::plugin_cli::remove(conn.into(), &id, yes).await
+                }
+                PluginCommands::Update {
+                    id,
+                    source,
+                    sha256,
+                    conn,
+                } => {
+                    bamboo_agent::plugin_cli::update(conn.into(), &id, &source, sha256.as_deref())
+                        .await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -1789,5 +1904,98 @@ mod tests {
             panic!("conflicting flags must be rejected");
         };
         assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_tree_includes_plugin_subcommand_with_install_list_remove_update() {
+        use clap::CommandFactory;
+
+        let cmd = super::Cli::command();
+        let plugin = cmd
+            .find_subcommand("plugin")
+            .expect("`plugin` must be in the subcommand tree");
+        let verbs: Vec<&str> = plugin.get_subcommands().map(|c| c.get_name()).collect();
+        for expected in ["install", "list", "remove", "update"] {
+            assert!(verbs.contains(&expected), "missing `plugin {expected}`");
+        }
+    }
+
+    #[test]
+    fn plugin_help_parses_for_top_level_and_each_verb() {
+        use clap::error::ErrorKind;
+        use clap::Parser;
+
+        for args in [
+            vec!["bamboo", "plugin", "--help"],
+            vec!["bamboo", "plugin", "install", "--help"],
+            vec!["bamboo", "plugin", "list", "--help"],
+            vec!["bamboo", "plugin", "remove", "--help"],
+            vec!["bamboo", "plugin", "update", "--help"],
+        ] {
+            let Err(help) = super::Cli::try_parse_from(&args) else {
+                panic!("{args:?} must surface as a DisplayHelp error");
+            };
+            assert_eq!(help.kind(), ErrorKind::DisplayHelp, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn plugin_install_parses_source_and_optional_sha256() {
+        use clap::Parser;
+
+        assert!(super::Cli::try_parse_from(["bamboo", "plugin", "install", "./my-plugin"]).is_ok());
+        assert!(super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "install",
+            "https://example.com/my-plugin.tar.gz",
+            "--sha256",
+            "deadbeef",
+        ])
+        .is_ok());
+        // `source` is required.
+        assert!(super::Cli::try_parse_from(["bamboo", "plugin", "install"]).is_err());
+    }
+
+    #[test]
+    fn plugin_update_parses_id_and_source() {
+        use clap::Parser;
+
+        assert!(super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "update",
+            "hello-plugin",
+            "./my-plugin-v2",
+        ])
+        .is_ok());
+        // Both `id` and `source` are required.
+        assert!(
+            super::Cli::try_parse_from(["bamboo", "plugin", "update", "hello-plugin"]).is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_remove_parses_id_and_yes_flag() {
+        use clap::Parser;
+
+        assert!(super::Cli::try_parse_from(["bamboo", "plugin", "remove", "hello-plugin"]).is_ok());
+        assert!(super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "remove",
+            "hello-plugin",
+            "--yes",
+        ])
+        .is_ok());
+        assert!(super::Cli::try_parse_from(["bamboo", "plugin", "remove"]).is_err());
+    }
+
+    #[test]
+    fn plugin_list_parses_json_flag() {
+        use clap::Parser;
+
+        assert!(super::Cli::try_parse_from(["bamboo", "plugin", "list"]).is_ok());
+        assert!(super::Cli::try_parse_from(["bamboo", "plugin", "list", "--json"]).is_ok());
     }
 }
