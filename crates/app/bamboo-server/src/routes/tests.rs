@@ -21,6 +21,7 @@ async fn configure_routes_registers_expected_api_prefixes() {
         ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
         ("GET", "/v1/bamboo/workflows"),
         ("GET", "/v1/bamboo/access/status"),
+        ("GET", "/api/v1/plugins"),
         ("GET", "/openai/v1/models"),
         ("GET", "/anthropic/v1/models"),
         ("GET", "/gemini/v1beta/models"),
@@ -56,6 +57,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
         ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
         ("GET", "/v1/bamboo/workflows"),
         ("GET", "/v1/bamboo/access/status"),
+        ("GET", "/api/v1/plugins"),
         ("GET", "/openai/v1/models"),
         ("GET", "/anthropic/v1/models"),
         ("GET", "/gemini/v1beta/models"),
@@ -96,6 +98,39 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
 
     let req = test::TestRequest::get()
         .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `/api/v1/plugins` (Wave 2 § HTTP agent, `PLUGIN_PLAN.md`) added no new
+/// auth of its own — it is registered inside `agent_routes`'s `/api/v1`
+/// scope (see `routes::agent::plugin_scope`), so it must be blocked by the
+/// exact same `enforce_access_password_middleware` wrap as every other
+/// mutating route in that scope. Mirrors
+/// `remote_unverified_request_is_blocked_by_access_middleware` above,
+/// pointed at the plugin list route instead of `/v1/bamboo/workflows`.
+#[actix_web::test]
+async fn plugin_routes_are_blocked_by_the_same_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/api/v1/plugins")
         .insert_header((header::HOST, "bamboo.example.com"))
         .to_request();
     let resp = test::call_service(&app, req).await;

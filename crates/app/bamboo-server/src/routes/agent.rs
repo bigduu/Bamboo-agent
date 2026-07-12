@@ -32,6 +32,20 @@ fn mcp_scope() -> impl HttpServiceFactory {
         .route("/tools", web::get().to(agent::mcp::list_tools))
 }
 
+/// `/api/v1/plugins` — install / update / list / remove (Wave 2 § HTTP
+/// agent, `PLUGIN_PLAN.md`). See `handlers::agent::plugin`'s module docs for
+/// the full request/response contract and the auth-gate note (this scope is
+/// registered inside `agent_routes`'s `/api/v1` scope below, so it inherits
+/// the same `enforce_access_password_middleware` wrap as every other
+/// mutating route here — no new auth was added).
+fn plugin_scope() -> impl HttpServiceFactory {
+    web::scope("/plugins")
+        .route("", web::get().to(agent::plugin::list_plugins))
+        .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route("/{id}/update", web::post().to(agent::plugin::update_plugin))
+        .route("/{id}", web::delete().to(agent::plugin::remove_plugin))
+}
+
 /// Configure agent API routes (core agent functionality)
 ///
 /// Routes for chat, execute, events, stop, history, task, respond, delete, health, metrics, mcp
@@ -255,6 +269,16 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         // MCP routes
         .service(mcp_scope());
+
+    // Plugin routes (Wave 2 § HTTP agent, PLUGIN_PLAN.md): install/update/
+    // list/remove over /api/v1/plugins. Appended after the existing service
+    // registrations above (not folded into the same builder chain) per
+    // PLUGIN_PLAN.md's append-only convention for this file, to minimize
+    // cross-branch conflicts with the other Wave-2 branches touching this
+    // same builder. Sits behind the SAME `enforce_access_password_middleware`
+    // wrap as everything else in this scope — see `plugin_scope`'s doc
+    // comment.
+    scope = scope.service(plugin_scope());
 
     // Dev-only endpoints are a greenfield wipe of ALL sessions (`dev_reset`) with
     // no auth. Register them ONLY when explicitly enabled, so a production/Docker
