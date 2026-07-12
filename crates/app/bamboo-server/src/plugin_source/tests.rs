@@ -1230,6 +1230,167 @@ async fn allow_unsigned_bypasses_the_signature_check_but_not_the_checksum_layer(
 }
 
 // ---------------------------------------------------------------------
+// Redirect policy (BLOCKER 1 fix): the host allowlist only vets the FIRST
+// hop's `<host><path>`. Whether it's safe to transparently follow an HTTP
+// redirect to a DIFFERENT host depends on whether the downloaded bytes will
+// be cryptographically authenticated afterward (signature and/or checksum).
+// See `http_client_following_redirects` / `http_client_no_redirects` /
+// `download_bytes` in `plugin_source.rs`.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn host_only_trust_install_refuses_a_redirect_instead_of_following_it() {
+    // allow_unsigned + allow_unverified, no sha256: NEITHER crypto layer will
+    // authenticate the downloaded bytes, so the host allowlist would be the
+    // SOLE control on where they actually come from — which a transparent
+    // redirect defeats. `allow_untrusted_host: true` here isolates the
+    // REDIRECT-POLICY behavior specifically from the host-allowlist layer's
+    // own check, exactly like the checksum/signature sections above isolate
+    // theirs (this wiremock server is plain http, never in `trusted_hosts`
+    // anyway, so it needs the bypass just to reach the fetch at all).
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/elsewhere.json", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    // Deliberately NOT mounting `/elsewhere.json` — if the redirect were
+    // followed despite the no-redirect policy, wiremock itself would 404
+    // rather than this specific refusal firing; either way the install must
+    // not succeed, but asserting the exact error keeps this test honest
+    // about which failure mode it's covering.
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    let error = stage_plugin_source(
+        url_input_full(&url, None, true, true, true),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect_err(
+        "a redirect must be refused when neither a signature nor a checksum will authenticate \
+         the downloaded bytes",
+    );
+    assert!(
+        matches!(error, PluginError::Registration(_)),
+        "expected a Registration refusal for the un-followed redirect, got {error:?}"
+    );
+    assert!(!plugins_root.join("hello-plugin").exists());
+}
+
+#[tokio::test]
+async fn checksummed_install_still_follows_a_redirect() {
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let bundle_sha256 = sha256_hex_of(manifest_body.as_bytes());
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/actual-bundle.json", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/actual-bundle.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    // `url_input` bypasses the host/signature layers (see the checksum
+    // section's docs above) so this test isolates: a sha256 pin means the
+    // bytes are authenticated regardless of which host actually served them,
+    // so the redirect is followed and the install still succeeds.
+    let staged = stage_plugin_source(
+        url_input(&url, Some(&bundle_sha256), false),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect("a checksum-pinned install must still follow a redirect to the real bytes");
+
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    staged.commit().await;
+}
+
+#[tokio::test]
+async fn signed_install_still_follows_a_redirect() {
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let signing_key = test_signing_key(11);
+    let signature = signing_key.sign(manifest_body.as_bytes());
+    let trust = PluginTrustConfig {
+        trusted_hosts: PluginTrustConfig::default().trusted_hosts,
+        trusted_keys: vec![trusted_key_for("test key", &signing_key)],
+    };
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/actual-bundle.json", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/actual-bundle.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()))
+        .mount(&server)
+        .await;
+    // The `.sig` sidecar is derived from the ORIGINAL (pre-redirect) url, not
+    // the redirect target — see `fetch_and_verify_signature`'s doc comment —
+    // and is signed over the bytes actually downloaded (the redirected-to
+    // `manifest_body`).
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json.sig"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(hex::encode(signature.to_bytes())),
+        )
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    // allow_untrusted_host: true isolates the redirect-policy behavior from
+    // the host-allowlist layer (same convention as the other sections);
+    // allow_unsigned: false so the signature is actually REQUIRED here.
+    let staged = stage_plugin_source(
+        url_input_full(&url, None, true, true, false),
+        &plugins_root,
+        &trust,
+    )
+    .await
+    .expect("a signature-verified install must still follow a redirect to the real bytes");
+
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: None,
+            allow_unverified: true,
+            allow_untrusted_host: true,
+            allow_unsigned: false,
+            signed_by: Some("test key".to_string()),
+        }
+    );
+    staged.commit().await;
+}
+
+// ---------------------------------------------------------------------
 // Local sources are UNAFFECTED by the host-allowlist/signature layers — those
 // layers are about remote fetch; a local path is already the user's own file.
 // ---------------------------------------------------------------------

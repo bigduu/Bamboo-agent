@@ -40,6 +40,14 @@
 //!   if the attacker controls the page the checksum was copied from — which
 //!   is why layers 1 and 2 exist independently of layer 3.
 //!
+//!   Byte-authenticity note: the host allowlist only vets the FIRST hop's
+//!   `<host><path>`, not wherever an HTTP redirect might lead — a signature
+//!   or checksum is what actually authenticates the downloaded bytes, so
+//!   redirects are followed whenever either will be checked, but disabled
+//!   entirely for the fully-opted-out `allow_unsigned && sha256.is_none()`
+//!   case, where the host allowlist is the sole control (see
+//!   [`http_client_no_redirects`]).
+//!
 //!   THEN, separately, for [`Platform::current`] (if the manifest declares an
 //!   artifact for it), fetches the per-platform binary archive named in
 //!   `manifest.artifacts`, verifies its sha256 BEFORE unpacking (mandatory —
@@ -494,11 +502,31 @@ async fn fetch_manifest_bundle(
         );
     }
 
-    let bytes = download_bytes(url).await?;
+    // Redirect policy (BLOCKER 1 fix): whether the downloaded bytes WILL be
+    // cryptographically authenticated determines whether it's safe to follow
+    // a redirect. A signature is REQUIRED whenever `!allow_unsigned` — even
+    // though it hasn't been fetched/checked yet, an unverified-but-required
+    // signature refuses the install below regardless of which host actually
+    // served the bytes, so following a redirect to get here is harmless.
+    // Likewise a supplied `sha256` is checked (and refused on mismatch) below
+    // regardless of the serving host. Only when NEITHER control is in play —
+    // `allow_unsigned` AND no `sha256` — is the host allowlist the SOLE
+    // authority over where these bytes came from; it only vetted this exact
+    // URL, so redirects must be disabled in that case (see
+    // `http_client_no_redirects`). The SAME client is used for both the
+    // bundle fetch and the `.sig` fetch below, for one install.
+    let bytes_will_be_authenticated = !allow_unsigned || sha256.is_some();
+    let client = if bytes_will_be_authenticated {
+        http_client_following_redirects()
+    } else {
+        http_client_no_redirects()
+    };
+
+    let bytes = download_bytes(client, url, MAX_DOWNLOAD_BYTES).await?;
 
     // Layer 2: signature — a valid signature is a STRONGER integrity +
     // authenticity guarantee than a pasted checksum (see layer 3 below).
-    let signed_by = fetch_and_verify_signature(url, &bytes, &trust.trusted_keys).await;
+    let signed_by = fetch_and_verify_signature(client, url, &bytes, &trust.trusted_keys).await;
     if signed_by.is_none() {
         if !allow_unsigned {
             return Err(PluginError::UnsignedOrUntrustedSignature(format!(
@@ -582,12 +610,21 @@ async fn fetch_manifest_bundle(
 /// not be distinguishable from "genuinely unsigned" by anything this
 /// function returns.
 async fn fetch_and_verify_signature(
+    client: &reqwest::Client,
     url: &str,
     bundle_bytes: &[u8],
     trusted_keys: &[bamboo_config::TrustedKey],
 ) -> Option<String> {
+    // Plain release-asset URLs (no query string) are the supported case: this
+    // just appends `.sig`, which would misplace the suffix AFTER a query
+    // string on a URL like `.../plugin.json?token=...` (`.../plugin.json?token=....sig`,
+    // not the sidecar). Plugin bundle URLs are typically bare release-asset
+    // URLs with no query string; if that ever needs to change, insert `.sig`
+    // before the `?` instead of blindly appending it.
     let sig_url = format!("{url}.sig");
-    let sig_bytes = download_bytes(&sig_url).await.ok()?;
+    let sig_bytes = download_bytes(client, &sig_url, MAX_SIGNATURE_DOWNLOAD_BYTES)
+        .await
+        .ok()?;
     let sig_text = String::from_utf8(sig_bytes).ok()?;
     let sig_raw = hex::decode(sig_text.trim()).ok()?;
     let sig_array: [u8; 64] = sig_raw.try_into().ok()?;
@@ -640,7 +677,16 @@ async fn fetch_and_place_artifact(
         return Ok(());
     };
 
-    let bytes = download_bytes(&artifact.url).await?;
+    // The artifact's sha256 is verified BELOW, unconditionally (no bypass
+    // flag exists for it — see this function's docs) — the downloaded bytes
+    // are always cryptographically authenticated here, so redirects are
+    // always safe to follow for this fetch.
+    let bytes = download_bytes(
+        http_client_following_redirects(),
+        &artifact.url,
+        MAX_DOWNLOAD_BYTES,
+    )
+    .await?;
     let actual_sha256 = sha256_hex(&bytes);
     if !actual_sha256.eq_ignore_ascii_case(&artifact.sha256) {
         return Err(PluginError::ArtifactVerificationFailed(format!(
@@ -706,12 +752,42 @@ async fn move_file(source: &Path, dest: &Path) -> PluginResult<()> {
 // HTTP fetch
 // ---------------------------------------------------------------------
 
-/// One shared `reqwest::Client` for plugin source fetches. Reuses the
-/// workspace's pinned (native-tls) `reqwest` — never construct a second
-/// client/connector here (see `notify_sinks::ntfy`'s identical pattern).
-fn http_client() -> &'static reqwest::Client {
+/// Client used whenever the downloaded bytes WILL be cryptographically
+/// authenticated — a signature is required (`!allow_unsigned`) or a `sha256`
+/// pin was supplied. Following redirects is safe here: whichever host
+/// actually served the final bytes, the signature/checksum check downstream
+/// refuses on a bad result regardless — this is what lets the default
+/// official-signed-via-CDN flow (GitHub Releases 302-redirecting to
+/// `objects.githubusercontent.com`) and the checksummed flow keep working.
+/// Reuses the workspace's pinned (native-tls) `reqwest` — never construct a
+/// second client/connector here (see `notify_sinks::ntfy`'s identical
+/// pattern).
+fn http_client_following_redirects() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .expect("a reqwest client with only a redirect policy set always builds")
+    })
+}
+
+/// Client used whenever NEITHER a signature nor a checksum will authenticate
+/// the downloaded bytes (`allow_unsigned && sha256.is_none()` — the fully
+/// opted-out "host-only trust" case). The host allowlist (layer 1) only
+/// vetted the FIRST hop's `<host><path>`; a transparent redirect would let
+/// the bytes actually come from anywhere, silently defeating the allowlist
+/// as the sole control. Redirects are disabled so a server that tries to
+/// redirect is refused outright (see [`download_bytes`]) rather than quietly
+/// followed — the approved host must serve the bytes directly.
+fn http_client_no_redirects() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a reqwest client with only a redirect policy set always builds")
+    })
 }
 
 /// Hard ceiling on any single plugin download (manifest, bundle, or binary
@@ -719,6 +795,14 @@ fn http_client() -> &'static reqwest::Client {
 /// stream an unbounded body into memory (OOM DoS). 256 MiB is generous for a
 /// plugin bundle + one platform binary while still bounding the worst case.
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Hard ceiling on the `.sig` sidecar fetch specifically ([`fetch_and_verify_signature`]).
+/// A valid signature is exactly 128 hex chars (a raw 64-byte ed25519
+/// signature, hex-encoded) — 4 KiB is already wildly generous. Capping it far
+/// below [`MAX_DOWNLOAD_BYTES`] means a malicious/misconfigured host serving
+/// a `.sig` route can't force multiple hundreds of MiB into memory before the
+/// hex-decode simply fails on the (way too long) body.
+const MAX_SIGNATURE_DOWNLOAD_BYTES: u64 = 4 * 1024;
 
 /// Hard ceiling on the TOTAL decompressed bytes any single archive (zip or
 /// tar.gz) may expand to across ALL of its entries combined. Complements
@@ -735,13 +819,38 @@ const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 /// plus, at most, one platform binary) while still bounding the worst case.
 const MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
+/// Fetch `url` via `client`, capping the body at `max_bytes`. `client`'s
+/// redirect policy is the caller's decision (see
+/// [`http_client_following_redirects`] / [`http_client_no_redirects`]) — this
+/// function additionally refuses outright if the FINAL response it receives
+/// is itself still a redirect (3xx), which only happens when `client` was
+/// built with `redirect::Policy::none()` and the server actually tried to
+/// redirect: that means the request's trust flags decided the bytes must
+/// come from the vetted host directly (see BLOCKER 1 in the source-trust
+/// review / the module docs), so silently treating the redirect response
+/// as the payload would defeat that decision.
+async fn download_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: u64,
+) -> PluginResult<Vec<u8>> {
     use futures::StreamExt;
 
     let response =
-        http_client().get(url).send().await.map_err(|error| {
+        client.get(url).send().await.map_err(|error| {
             PluginError::Registration(format!("failed to fetch '{url}': {error}"))
         })?;
+
+    if response.status().is_redirection() {
+        return Err(PluginError::Registration(format!(
+            "'{url}' responded with a redirect ({status}) instead of serving the bytes \
+             directly, and this fetch does not follow redirects — neither a signature nor a \
+             checksum will authenticate these bytes, so the host allowlist is the sole trust \
+             control and must not be defeated by a redirect to an unvetted host; refusing",
+            status = response.status(),
+        )));
+    }
+
     let response = response.error_for_status().map_err(|error| {
         PluginError::Registration(format!("'{url}' returned an error status: {error}"))
     })?;
@@ -749,10 +858,10 @@ async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
     // Reject up front if the server ADVERTISES an over-cap body (cheap, avoids
     // streaming at all)...
     if let Some(len) = response.content_length() {
-        if len > MAX_DOWNLOAD_BYTES {
+        if len > max_bytes {
             return Err(PluginError::Registration(format!(
-                "'{url}' advertises a {len}-byte body, over the {MAX_DOWNLOAD_BYTES}-byte plugin \
-                 download cap; refusing"
+                "'{url}' advertises a {len}-byte body, over the {max_bytes}-byte download cap; \
+                 refusing"
             )));
         }
     }
@@ -765,10 +874,9 @@ async fn download_bytes(url: &str) -> PluginResult<Vec<u8>> {
         let chunk = chunk.map_err(|error| {
             PluginError::Registration(format!("failed to read response body of '{url}': {error}"))
         })?;
-        if buffer.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+        if buffer.len() as u64 + chunk.len() as u64 > max_bytes {
             return Err(PluginError::Registration(format!(
-                "'{url}' streamed more than the {MAX_DOWNLOAD_BYTES}-byte plugin download cap; \
-                 aborting"
+                "'{url}' streamed more than the {max_bytes}-byte download cap; aborting"
             )));
         }
         buffer.extend_from_slice(&chunk);
