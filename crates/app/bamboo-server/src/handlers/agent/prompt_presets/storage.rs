@@ -30,6 +30,16 @@ pub(crate) async fn load_store(path: &Path) -> Result<PromptPresetStore, AppErro
     Ok(store)
 }
 
+/// # Non-atomic write (known, deferred gap)
+///
+/// This writes `path` in place (`fs::write`), so a hard kill mid-write can
+/// truncate `prompt-presets.json`. `bamboo_plugin::registry::InstalledPlugins::save`
+/// (`installed.json`) fixed the identical gap by writing to a sibling
+/// `<path>.tmp` then `rename`-ing over the target (atomic on the same
+/// filesystem) — this function should get the same treatment, but that's
+/// deferred here since it's pre-existing behaviour (this crate's plugin
+/// installer now just calls it a lot more often than before, via
+/// `register_prompts`/`remove_prompt_preset`), not new code on this branch.
 pub(crate) async fn save_store(path: &Path, store: &PromptPresetStore) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;

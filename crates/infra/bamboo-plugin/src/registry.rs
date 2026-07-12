@@ -247,12 +247,20 @@ impl InstalledPlugins {
     }
 
     /// Persist to `path`, creating parent directories as needed.
+    ///
+    /// Writes to a sibling `<path>.tmp` first, then `rename`s it over `path`
+    /// — `rename` is atomic on the same filesystem (and `<path>.tmp` sits
+    /// right next to `path`, guaranteeing that), so a hard kill mid-write can
+    /// only ever leave a stray, harmless `.tmp` file behind, never a
+    /// truncated/corrupt `installed.json` a later `load` would choke on.
     pub async fn save(&self, path: &Path) -> PluginResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
         let serialized = serde_json::to_string_pretty(self)?;
-        fs::write(path, serialized).await?;
+        let tmp_path = tmp_path_for(path);
+        fs::write(&tmp_path, serialized).await?;
+        fs::rename(&tmp_path, path).await?;
         Ok(())
     }
 
@@ -278,6 +286,16 @@ impl InstalledPlugins {
     pub fn list(&self) -> &[InstalledPlugin] {
         &self.plugins
     }
+}
+
+/// `<path>` with `.tmp` appended to its file name (e.g. `installed.json` ->
+/// `installed.json.tmp`) — a sibling in the SAME directory as `path`, so the
+/// `rename` in [`InstalledPlugins::save`] is guaranteed same-filesystem and
+/// therefore atomic.
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    path.with_file_name(tmp_name)
 }
 
 #[cfg(test)]
@@ -311,6 +329,34 @@ mod tests {
         let path = dir.path().join("plugins").join("installed.json");
         let loaded = InstalledPlugins::load(&path).await.expect("load");
         assert!(loaded.plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_is_atomic_via_tmp_file_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("installed.json");
+        let tmp_path = tmp_path_for(&path);
+
+        let mut store = InstalledPlugins::default();
+        store.add(sample_plugin("hello-plugin"));
+        store.save(&path).await.expect("save");
+
+        assert!(path.exists(), "installed.json should exist after save");
+        assert!(
+            !tmp_path.exists(),
+            "the .tmp staging file must be renamed over the target, never left behind"
+        );
+
+        // A second save (e.g. an upgrade re-persisting the store) must go
+        // through the same write-tmp-then-rename path and leave no trace
+        // either.
+        let mut reloaded = InstalledPlugins::load(&path).await.expect("load");
+        reloaded.add(sample_plugin("other-plugin"));
+        reloaded.save(&path).await.expect("save again");
+        assert!(!tmp_path.exists());
+
+        let loaded = InstalledPlugins::load(&path).await.expect("load");
+        assert_eq!(loaded.plugins.len(), 2);
     }
 
     #[tokio::test]
