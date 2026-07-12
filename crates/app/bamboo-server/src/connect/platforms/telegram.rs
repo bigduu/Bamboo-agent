@@ -149,6 +149,24 @@ impl TelegramPlatform {
         )
     }
 
+    /// Format a `reqwest::Error` for logs/errors WITHOUT the bot token.
+    ///
+    /// Telegram puts the token in the URL path (`/bot<token>/<method>`), and
+    /// `reqwest::Error`'s `Display` includes the request URL when one is
+    /// attached ("error sending request for url (…)"), so a naive
+    /// `format!("{error}")` on any transient network failure would print the
+    /// live token into ordinary server logs. Strip the URL from the error
+    /// (`without_url`) and, belt-and-braces, redact any literal token
+    /// occurrence in whatever text remains (e.g. proxy errors that embed the
+    /// target URL themselves).
+    fn sanitize_error(&self, error: reqwest::Error) -> String {
+        let text = error.without_url().to_string();
+        if self.token.is_empty() {
+            return text;
+        }
+        text.replace(&self.token, "[REDACTED]")
+    }
+
     async fn get_updates(
         &self,
         offset: i64,
@@ -166,11 +184,19 @@ impl TelegramPlatform {
             .timeout(Duration::from_secs(timeout_secs + 15))
             .send()
             .await
-            .map_err(|error| PlatformError::other(format!("getUpdates request failed: {error}")))?;
+            .map_err(|error| {
+                PlatformError::other(format!(
+                    "getUpdates request failed: {}",
+                    self.sanitize_error(error)
+                ))
+            })?;
 
         let parsed: TelegramResponse<Vec<TelegramUpdate>> =
             response.json().await.map_err(|error| {
-                PlatformError::other(format!("getUpdates response parse failed: {error}"))
+                PlatformError::other(format!(
+                    "getUpdates response parse failed: {}",
+                    self.sanitize_error(error)
+                ))
             })?;
 
         if !parsed.ok {
@@ -299,12 +325,18 @@ impl Platform for TelegramPlatform {
                 .send()
                 .await
                 .map_err(|error| {
-                    PlatformError::other(format!("sendMessage request failed: {error}"))
+                    PlatformError::other(format!(
+                        "sendMessage request failed: {}",
+                        self.sanitize_error(error)
+                    ))
                 })?;
 
             let parsed: TelegramResponse<TelegramMessage> =
                 response.json().await.map_err(|error| {
-                    PlatformError::other(format!("sendMessage response parse failed: {error}"))
+                    PlatformError::other(format!(
+                        "sendMessage response parse failed: {}",
+                        self.sanitize_error(error)
+                    ))
                 })?;
 
             if !parsed.ok {
@@ -582,5 +614,32 @@ mod tests {
         assert!(!caps.edit_message);
         assert!(!caps.images);
         assert!(!caps.files);
+    }
+
+    /// The bot token lives in the request URL path; `reqwest::Error`'s
+    /// `Display` would print it on any transport failure. Force a real
+    /// connection error (port 1 is unroutable/refused) and assert the token
+    /// never appears in the surfaced error text.
+    #[tokio::test]
+    async fn transport_errors_never_leak_the_bot_token() {
+        let token = "123456:SECRET-TOKEN-MUST-NOT-LEAK";
+        let platform = TelegramPlatform::with_options(
+            token.to_string(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(1),
+        );
+        let err = platform
+            .get_updates(0, 0)
+            .await
+            .expect_err("port 1 must refuse the connection");
+        let text = format!("{err}");
+        assert!(
+            !text.contains(token) && !text.contains("SECRET-TOKEN"),
+            "token leaked into error text: {text}"
+        );
+        assert!(
+            text.contains("getUpdates request failed"),
+            "unexpected error shape: {text}"
+        );
     }
 }
