@@ -533,7 +533,7 @@ impl ClaudeCodeExecutor {
         events: &EventSink,
         cancel: &CancellationToken,
     ) -> (ChildOutcome, bool) {
-        let mut child = match self.build_command(resume_id).spawn() {
+        let mut child = match spawn_with_etxtbsy_retry(|| self.build_command(resume_id)).await {
             Ok(c) => c,
             Err(e) => {
                 return (
@@ -721,6 +721,29 @@ impl ChildExecutor for ClaudeCodeExecutor {
         steer_drain.abort();
         outcome
     }
+}
+
+/// Spawn with a short retry on `ETXTBSY` ("text file busy", raw os error 26
+/// on Linux). On Linux, exec-ing an executable that was written moments ago
+/// can transiently fail when ANOTHER thread in this process still holds a
+/// write fd to it at fork time (the fd is inherited across fork until the
+/// exec). In production the `claude` binary is never freshly written, so
+/// this never fires; in the stub-binary test suite, parallel test threads
+/// each writing their own stub make it a real (observed-on-CI) flake. A few
+/// 10ms retries are a complete cure and harmless otherwise.
+async fn spawn_with_etxtbsy_retry(mut build: impl FnMut() -> Command) -> std::io::Result<Child> {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match build().spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.raw_os_error() == Some(26) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("retry loop always records an error before exhausting"))
 }
 
 /// Which signal [`signal_process_group`] sends.
