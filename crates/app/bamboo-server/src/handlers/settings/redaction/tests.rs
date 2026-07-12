@@ -353,6 +353,75 @@ fn redact_config_never_leaks_notification_ciphertext_even_when_client_supplied()
         .is_some_and(|obj| !obj.contains_key("device_key_encrypted")));
 }
 
+// ── bamboo-connect platform token redaction tests ────────────────────
+
+#[test]
+fn redact_config_masks_configured_connect_platform_token() {
+    let mut config = Config::default();
+    config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        platform_type: "telegram".to_string(),
+        token: None,
+        token_encrypted: Some("enc-telegram".to_string()),
+        allow_from: vec!["123".to_string()],
+        admin_from: Vec::new(),
+    }];
+
+    let input = json!({
+        "connect": {
+            "platforms": [
+                { "type": "telegram", "allow_from": ["123"] }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert_eq!(redacted["connect"]["platforms"][0]["token"], "****...****");
+    assert!(redacted["connect"]["platforms"][0]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("token_encrypted")));
+}
+
+#[test]
+fn redact_config_omits_unconfigured_connect_platform_token() {
+    let mut config = Config::default();
+    config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        platform_type: "telegram".to_string(),
+        token: None,
+        token_encrypted: None,
+        allow_from: Vec::new(),
+        admin_from: Vec::new(),
+    }];
+
+    let input = json!({
+        "connect": { "platforms": [ { "type": "telegram" } ] }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert!(redacted["connect"]["platforms"][0]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("token")));
+}
+
+#[test]
+fn redact_config_never_leaks_connect_platform_ciphertext_even_when_client_supplied() {
+    let config = Config::default();
+    let input = json!({
+        "connect": {
+            "platforms": [
+                { "type": "telegram", "token_encrypted": "sneaky-cipher" }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert!(redacted["connect"]["platforms"][0]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("token_encrypted")));
+}
+
 #[test]
 fn redact_config_defaults_secret_false_when_missing() {
     let config = Config::default();

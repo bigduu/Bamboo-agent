@@ -427,6 +427,41 @@ pub fn build_schedule_manager(
     )))
 }
 
+/// Build (and start) the bamboo-connect manager (#452 / epic #447).
+///
+/// Reads `config`'s CURRENT snapshot for `connect.platforms` at construction
+/// time (connect platforms are not hot-reloadable in this MVP — a config
+/// change takes effect on the next restart, same as `subagents.broker`).
+/// Returns a manager with zero background tasks when `connect.platforms` is
+/// empty, so callers can always construct + store it unconditionally (mirrors
+/// [`build_schedule_manager`]'s always-on lifecycle).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_connect_manager(
+    agent: Arc<Agent>,
+    tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+    session_repo: bamboo_engine::SessionRepository,
+    agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+    app_data_dir: Option<PathBuf>,
+    config: Arc<RwLock<Config>>,
+    provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+) -> crate::connect::ConnectManager {
+    let config_snapshot = config.read().await.clone();
+    let ctx = crate::connect::ConnectContext {
+        agent,
+        tools,
+        session_repo,
+        agent_runners,
+        session_event_senders,
+        account_feed_inbox,
+        app_data_dir: app_data_dir.clone(),
+        config,
+        provider_registry,
+    };
+    crate::connect::ConnectManager::start(ctx, &config_snapshot, app_data_dir).await
+}
+
 #[cfg(test)]
 mod eviction_tests {
     use super::*;

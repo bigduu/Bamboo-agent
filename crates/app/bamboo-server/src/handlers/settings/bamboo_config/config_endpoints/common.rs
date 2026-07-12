@@ -113,6 +113,7 @@ pub(super) async fn redacted_config_json(
     // refresh here too so the immediate response's redaction sees it as
     // "configured" (mirrors the provider-API-key refresh above).
     config_for_response.refresh_notifications_encrypted()?;
+    config_for_response.refresh_connect_platform_tokens_encrypted()?;
     let value = serde_json::to_value(&config_for_response)?;
     let mut redacted = redact_config_for_api(value, &config_for_response);
 

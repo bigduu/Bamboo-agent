@@ -612,6 +612,52 @@ pub struct NotificationsConfig {
     pub bark: BarkChannelConfig,
 }
 
+/// One IM-platform bridge configured under `[[connect.platforms]]` —
+/// bamboo-connect (issue #452 / epic #447): drives a bamboo session from an
+/// external chat platform (Telegram first).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConnectPlatformConfig {
+    /// Platform adapter selector, e.g. `"telegram"`. Unrecognized values are
+    /// skipped (with a startup warning) rather than failing config load —
+    /// forward-compatible with future adapters (Feishu/Slack).
+    #[serde(rename = "type")]
+    pub platform_type: String,
+    /// Platform bot/API token.
+    ///
+    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
+    /// never serialized and is hydrated in memory on load (mirrors
+    /// [`NtfyChannelConfig::token`] / [`BarkChannelConfig::device_key`]).
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
+    /// Encrypted ciphertext of `token` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_encrypted: Option<String>,
+    /// Platform-scoped user ids allowed to drive a session. Deliberately
+    /// STRICTER than the general secret-mask precedents: an EMPTY list means
+    /// deny-all (every inbound message is rejected), not allow-all — a
+    /// startup warning is logged when a platform has no allowed users.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    /// User ids allowed to run privileged/admin commands. Parsed from day one
+    /// but UNUSED in the MVP (#452) — no admin commands exist yet; reserved
+    /// for the approvals/admin phase of epic #447.
+    #[serde(default)]
+    pub admin_from: Vec<String>,
+}
+
+/// bamboo-connect platform bridges: drive bamboo sessions from IM platforms.
+/// Additive/back-compat: an absent `connect` key in `config.json`
+/// deserializes to an empty platform list — fully inert (#452).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConnectConfig {
+    #[serde(default)]
+    pub platforms: Vec<ConnectPlatformConfig>,
+}
+
+fn connect_config_is_empty(config: &ConnectConfig) -> bool {
+    config.platforms.is_empty()
+}
+
 /// One publisher key trusted to sign plugin bundles.
 ///
 /// `algorithm` is a plain string (not an enum) so an unrecognized future value
@@ -941,6 +987,13 @@ pub struct Config {
     /// [`Config::refresh_notifications_encrypted`].
     #[serde(default)]
     pub notifications: NotificationsConfig,
+
+    /// bamboo-connect IM-platform bridges (Telegram first, #452 / epic #447).
+    /// Secrets (each platform's `token`) are encrypted at rest — see
+    /// [`Config::hydrate_connect_platform_tokens_from_encrypted`] /
+    /// [`Config::refresh_connect_platform_tokens_encrypted`].
+    #[serde(default, skip_serializing_if = "connect_config_is_empty")]
+    pub connect: ConnectConfig,
 
     /// Plugin URL-install source-trust policy (host allowlist + ed25519
     /// publisher keys). See [`PluginTrustConfig`]'s docs for the three-layer
@@ -1798,6 +1851,8 @@ impl Config {
         config.hydrate_broker_token_from_encrypted();
         // Decrypt encrypted notification-channel secrets into in-memory plaintext.
         config.hydrate_notifications_from_encrypted();
+        // Decrypt encrypted bamboo-connect platform tokens into in-memory plaintext.
+        config.hydrate_connect_platform_tokens_from_encrypted();
         config.normalize_tool_settings();
         config.normalize_skill_settings();
         config.normalize_plugin_trust_settings();
@@ -1947,6 +2002,7 @@ impl Config {
             config.hydrate_cluster_fabric_from_encrypted();
             config.hydrate_broker_token_from_encrypted();
             config.hydrate_notifications_from_encrypted();
+            config.hydrate_connect_platform_tokens_from_encrypted();
             config.normalize_tool_settings();
             config.normalize_skill_settings();
             config
@@ -2483,6 +2539,7 @@ impl Config {
             memory: None,
             mcp: bamboo_domain::mcp_config::McpConfig::default(),
             notifications: NotificationsConfig::default(),
+            connect: ConnectConfig::default(),
             plugin_trust: PluginTrustConfig::default(),
             extra: BTreeMap::new(),
         }
@@ -2524,6 +2581,7 @@ impl Config {
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.refresh_notifications_encrypted()?;
+        to_save.refresh_connect_platform_tokens_encrypted()?;
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
         let content =

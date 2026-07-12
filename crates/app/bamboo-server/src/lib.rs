@@ -107,6 +107,7 @@
 pub mod app_state;
 pub mod config;
 pub mod config_manager;
+pub mod connect;
 pub mod error;
 pub mod events;
 pub mod handlers;

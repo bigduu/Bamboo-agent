@@ -500,6 +500,57 @@ impl Config {
         Ok(())
     }
 
+    // ── bamboo-connect platform tokens (Telegram bot token, etc.) ───────
+
+    /// Decrypt every configured platform's token into in-memory plaintext
+    /// after loading config. Mirrors [`Config::hydrate_notifications_from_encrypted`]:
+    /// `token` is `#[serde(skip_serializing)]` (never on disk), so this is the
+    /// only way it gets populated after a fresh load.
+    pub fn hydrate_connect_platform_tokens_from_encrypted(&mut self) {
+        for platform in &mut self.connect.platforms {
+            let has_plaintext = platform
+                .token
+                .as_deref()
+                .map(str::trim)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if has_plaintext {
+                continue;
+            }
+            if let Some(encrypted) = platform.token_encrypted.as_deref() {
+                match crate::encryption::decrypt(encrypted) {
+                    Ok(value) => platform.token = Some(value),
+                    Err(e) => tracing::warn!(
+                        "Failed to decrypt connect platform '{}' token: {}",
+                        platform.platform_type,
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Re-encrypt every configured platform's token from current in-memory
+    /// plaintext before persisting to disk. Mirrors
+    /// [`Config::refresh_notifications_encrypted`]: an empty/absent plaintext
+    /// leaves any existing ciphertext intact (a redacted round-trip where the
+    /// client never re-sent the secret keeps it).
+    pub fn refresh_connect_platform_tokens_encrypted(&mut self) -> Result<()> {
+        for platform in &mut self.connect.platforms {
+            let token = platform.token.as_deref().unwrap_or("").trim();
+            if !token.is_empty() {
+                platform.token_encrypted =
+                    Some(crate::encryption::encrypt(token).with_context(|| {
+                        format!(
+                            "Failed to encrypt connect platform '{}' token",
+                            platform.platform_type
+                        )
+                    })?);
+            }
+        }
+        Ok(())
+    }
+
     /// Restore env-sourced provider `api_key`s that a serde round-trip dropped.
     ///
     /// `api_key` is `#[serde(skip_serializing)]`, so serializing `previous` and

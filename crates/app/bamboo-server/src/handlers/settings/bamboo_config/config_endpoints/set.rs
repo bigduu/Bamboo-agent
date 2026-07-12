@@ -28,6 +28,7 @@ pub async fn set_bamboo_config(
                 let mut patch_obj = patch_obj;
                 config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
                 config_manager::preserve_masked_notification_secrets(&mut patch_obj, &current);
+                config_manager::preserve_masked_connect_secrets(&mut patch_obj, &current);
                 let mut new_config = config_manager::build_merged_config(&current, patch_obj)?;
                 new_config.extra.remove("model_limits");
                 config_manager::sync_provider_api_keys_encrypted_for_patch(
