@@ -40,6 +40,14 @@ pub struct InstallPluginRequest {
 
 /// `GET /plugins` element, and the body of a successful install/update
 /// response.
+///
+/// Known, accepted gap: `source` (a [`PluginSource`]) echoes back the
+/// caller-supplied `LocalDir`/`LocalArchive` path VERBATIM, including its
+/// absolute filesystem path, to any caller of this authenticated/local-only
+/// HTTP surface. That's a minor local-path disclosure, not a vulnerability on
+/// its own here — this API has no remote/multi-tenant exposure today — but
+/// worth remembering if this surface is ever opened up further (at which
+/// point `to_view` would need to redact/omit `source`'s path for non-owners).
 #[derive(Debug, Clone, Serialize)]
 pub struct InstalledPluginView {
     pub id: String,

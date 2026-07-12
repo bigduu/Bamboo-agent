@@ -52,6 +52,18 @@
 //! appeared. Lock ordering is `PLUGIN_OP_LOCK` → `config_io_lock` (never the
 //! reverse) — see [`PLUGIN_OP_LOCK`].
 //!
+//! Narrower, accepted gap: [`ServerPluginInstaller::register_workflows`] does
+//! NOT get the equivalent live re-check that MCP's step does — there is no
+//! `workflows_io_lock` analogous to `config_io_lock` to re-run
+//! `reconcile_exclusive` inside, because workflow files are plain files under
+//! `workflows_dir()`, not a single locked/rewritten document like
+//! `config.json`. So a concurrent NON-plugin write of a same-named workflow
+//! file landing in the window between `existing_workflow_filenames()` and the
+//! actual `fs::write` below could still be clobbered (and then recorded as
+//! plugin-owned, which a later uninstall would incorrectly delete). Deferred:
+//! this is the same class of race the MCP re-check closes, just for a store
+//! that has no equivalent lock to hook into yet.
+//!
 //! # Crash safety (process killed mid-install)
 //!
 //! In-process rollback (below) only fires on an `Err`. A HARD kill after the
@@ -167,6 +179,19 @@ use crate::handlers::agent::prompt_presets::{
 /// `config_io_lock`). So the order is always `PLUGIN_OP_LOCK` →
 /// `config_io_lock`, never the reverse — no deadlock. Nothing acquires
 /// `PLUGIN_OP_LOCK` while holding `config_io_lock`.
+///
+/// # Single-process assumption (deferred: no cross-process lock)
+///
+/// This is a `tokio::sync::Mutex` — IN-PROCESS only. It serializes plugin ops
+/// within one `bamboo serve` process, but two SEPARATE `bamboo serve`
+/// processes pointed at the same `~/.bamboo` data dir would each get their
+/// own independent `PLUGIN_OP_LOCK` and could race each other's
+/// reconcile→mutate→provenance sequence exactly the way this lock exists to
+/// prevent for concurrent ops WITHIN one process. The plugin system assumes
+/// the normal deployment: a SINGLE `bamboo serve` per data directory. True
+/// multi-process safety would need an OS-level file lock (e.g. `flock` on a
+/// lockfile under `plugins_dir()`) instead of/in addition to this `Mutex`;
+/// that's a documented follow-up, not implemented here.
 static PLUGIN_OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// AppState-backed [`PluginInstaller`]. See the module docs for the full

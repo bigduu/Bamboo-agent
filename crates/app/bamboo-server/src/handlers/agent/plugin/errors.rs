@@ -36,23 +36,60 @@
 //! `NotImplemented` should be unreachable through this HTTP surface (the
 //! installer-core agent's `ServerPluginInstaller` implements every step) but
 //! is mapped defensively rather than left to panic.
+//!
+//! # 500 bodies are sanitized — never `error.to_string()` verbatim
+//!
+//! `PluginError::Io`'s `Display` (via `thiserror`'s `#[from] std::io::Error`)
+//! can embed a raw local filesystem path (e.g. a permission error naming
+//! `/home/alice/.bamboo/plugins/...`), and `Json`'s can embed byte offsets
+//! into a caller-supplied file. Neither is actionable for an HTTP caller and
+//! both are a minor local-path/detail disclosure into a response body, so —
+//! unlike the actionable variants below, whose messages ARE returned as-is —
+//! every variant mapped to 500 gets a fixed, generic body here. The real
+//! detail is still fully preserved, just server-side: logged via `tracing`
+//! before the generic response is built.
 
 use actix_web::HttpResponse;
 use bamboo_plugin::PluginError;
 
+/// Fixed body for every variant that maps to a 500 (see the module docs on
+/// why these are never `error.to_string()` verbatim).
+const GENERIC_INTERNAL_ERROR_MESSAGE: &str = "internal error during plugin operation";
+
 pub fn plugin_error_response(error: &PluginError) -> HttpResponse {
-    let body = serde_json::json!({ "error": error.to_string() });
-    match error {
-        PluginError::Conflict { .. } => HttpResponse::Conflict().json(body),
-        PluginError::AlreadyInstalled(_) => HttpResponse::Conflict().json(body),
-        PluginError::UnsupportedPlatform { .. } => HttpResponse::UnprocessableEntity().json(body),
-        PluginError::NotFound(_) => HttpResponse::NotFound().json(body),
-        PluginError::InvalidManifest(_) => HttpResponse::BadRequest().json(body),
-        PluginError::ArtifactVerificationFailed(_) => HttpResponse::BadRequest().json(body),
+    // Actionable, safe variants: their `Display` text never contains more
+    // than what the caller already supplied (a plugin id/manifest field), so
+    // it's returned to the client as-is.
+    let actionable_status = match error {
+        PluginError::Conflict { .. } => Some(actix_web::http::StatusCode::CONFLICT),
+        PluginError::AlreadyInstalled(_) => Some(actix_web::http::StatusCode::CONFLICT),
+        PluginError::UnsupportedPlatform { .. } => {
+            Some(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        PluginError::NotFound(_) => Some(actix_web::http::StatusCode::NOT_FOUND),
+        PluginError::InvalidManifest(_) => Some(actix_web::http::StatusCode::BAD_REQUEST),
+        PluginError::ArtifactVerificationFailed(_) => {
+            Some(actix_web::http::StatusCode::BAD_REQUEST)
+        }
         PluginError::Registration(_)
         | PluginError::NotImplemented(_)
         | PluginError::Io(_)
-        | PluginError::Json(_) => HttpResponse::InternalServerError().json(body),
+        | PluginError::Json(_) => None,
+    };
+
+    match actionable_status {
+        Some(status) => {
+            let body = serde_json::json!({ "error": error.to_string() });
+            HttpResponse::build(status).json(body)
+        }
+        None => {
+            // Unexpected/internal failures — the detail (which, for Io/Json,
+            // can contain a local filesystem path) is logged server-side
+            // only; the HTTP body is a fixed, generic message.
+            tracing::error!(%error, "plugin operation failed with an internal error");
+            let body = serde_json::json!({ "error": GENERIC_INTERNAL_ERROR_MESSAGE });
+            HttpResponse::InternalServerError().json(body)
+        }
     }
 }
 
@@ -131,5 +168,47 @@ mod tests {
             json,
             serde_json::json!({ "error": "plugin not found: demo" })
         );
+    }
+
+    /// The four variants mapped to 500 (`Registration`/`NotImplemented`/`Io`/
+    /// `Json`) must NEVER leak their raw `Display` text — in particular an
+    /// `Io` error's message, which can embed a local filesystem path — into
+    /// the response body. Every one of them gets the same fixed, generic
+    /// message; the real detail only goes to `tracing`.
+    #[actix_web::test]
+    async fn internal_error_variants_get_a_generic_sanitized_body() {
+        let sensitive_path = "/home/alice/.bamboo/plugins/some-plugin/secret-detail";
+        let cases: Vec<PluginError> = vec![
+            PluginError::Registration(format!("failed touching {sensitive_path}")),
+            PluginError::NotImplemented(format!("not done yet: {sensitive_path}")),
+            PluginError::Io(std::io::Error::other(format!(
+                "permission denied: {sensitive_path}"
+            ))),
+            PluginError::Json(
+                serde_json::from_str::<serde_json::Value>("{ not valid json")
+                    .expect_err("deliberately malformed"),
+            ),
+        ];
+
+        for error in cases {
+            let response = plugin_error_response(&error);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+            let bytes = actix_web::body::to_bytes(response.into_body())
+                .await
+                .expect("read body");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+            assert_eq!(
+                json,
+                serde_json::json!({ "error": "internal error during plugin operation" }),
+                "500 body must be the fixed generic message, not {error}'s own Display text"
+            );
+
+            let body_text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                !body_text.contains("/home/alice"),
+                "500 body must never contain a local filesystem path fragment"
+            );
+        }
     }
 }
