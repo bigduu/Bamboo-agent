@@ -172,6 +172,32 @@ pub fn reconcile_exclusive(
     result
 }
 
+/// Lifecycle status of a provenance row — the crash-safety journal marker.
+///
+/// The installer writes a row as [`Self::Installing`] BEFORE it begins
+/// registering capabilities (MCP into `config.json`, prompts, workflow files),
+/// and flips it to [`Self::Installed`] only after the whole sequence succeeds.
+/// A row left [`Self::Installing`] therefore marks an install that was
+/// interrupted (a hard process kill mid-install): its `registered` set names
+/// what the install INTENDED to own, so on the next install/upgrade of that id
+/// the installer can (a) treat the leftover as this-plugin-owned — so the
+/// ownership pre-check doesn't false-`Conflict` on the plugin's own
+/// half-written entries — and (b) clean it up as an upgrade-over-incomplete.
+/// `uninstall` works on an `Installing` row too, so a user is never stranded
+/// having to hand-edit `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInstallStatus {
+    /// A crash-safety journal marker: capability registration has begun but
+    /// not yet completed. `registered` records the INTENDED ownership set.
+    Installing,
+    /// The steady state: registration completed and provenance is authoritative.
+    /// The [`Default`] so a pre-journal `installed.json` (no `status` field)
+    /// deserializes as a completed install (backward compat).
+    #[default]
+    Installed,
+}
+
 /// A single installed plugin's provenance record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledPlugin {
@@ -185,6 +211,11 @@ pub struct InstalledPlugin {
     /// on why: keeps this crate free of a hidden `Utc::now()` call so tests
     /// and callers stay in full control of "when").
     pub installed_at: DateTime<Utc>,
+    /// Crash-safety journal marker (see [`PluginInstallStatus`]). Defaults to
+    /// [`PluginInstallStatus::Installed`] so an `installed.json` written before
+    /// this field existed loads as a completed install.
+    #[serde(default)]
+    pub status: PluginInstallStatus,
     #[serde(default)]
     pub registered: RegisteredCapabilities,
 }
@@ -264,6 +295,7 @@ mod tests {
             installed_at: DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            status: PluginInstallStatus::Installed,
             registered: RegisteredCapabilities {
                 mcp_server_ids: vec![],
                 skill_dirs: vec!["hello-world".to_string()],

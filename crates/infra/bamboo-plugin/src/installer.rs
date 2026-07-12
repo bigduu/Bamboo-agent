@@ -235,18 +235,32 @@ pub async fn preflight_install(
 
 /// Loads prior provenance for `plugin_id` from `installed_json_path` and
 /// applies the [`InstallDisposition`] gate: [`InstallDisposition::FailIfInstalled`]
-/// errors [`PluginError::AlreadyInstalled`] when an entry already exists;
-/// [`InstallDisposition::Upgrade`] passes through either way. Returns the
-/// previous entry (`None` for a fresh install), which the caller needs for
-/// the upgrade drop-diff (BLOCKER 2).
+/// errors [`PluginError::AlreadyInstalled`] when a COMPLETED entry already
+/// exists; [`InstallDisposition::Upgrade`] passes through either way. Returns
+/// the previous entry (`None` for a fresh install), which the caller needs for
+/// the upgrade drop-diff (BLOCKER 2) and for crash recovery.
+///
+/// Crash-recovery exception: a previous row with
+/// [`crate::registry::PluginInstallStatus::Installing`] is a leftover from an
+/// interrupted install (a hard kill mid-registration), NOT a completed
+/// install — so it does NOT trip `AlreadyInstalled` even under
+/// `FailIfInstalled`. It is returned like any other `previous` so the caller
+/// treats its (intended) `registered` set as this-plugin-owned and cleans it
+/// up as an upgrade-over-incomplete, instead of the leftover's half-written
+/// entries reading as a foreign conflict on retry.
 pub async fn load_previous_for_disposition(
     installed_json_path: &Path,
     plugin_id: &str,
     disposition: InstallDisposition,
 ) -> PluginResult<Option<InstalledPlugin>> {
+    use crate::registry::PluginInstallStatus;
+
     let existing = InstalledPlugins::load(installed_json_path).await?;
     let previous = existing.get(plugin_id).cloned();
-    if previous.is_some() && disposition == InstallDisposition::FailIfInstalled {
+    let is_completed = previous
+        .as_ref()
+        .is_some_and(|plugin| plugin.status == PluginInstallStatus::Installed);
+    if is_completed && disposition == InstallDisposition::FailIfInstalled {
         return Err(PluginError::AlreadyInstalled(plugin_id.to_string()));
     }
     Ok(previous)
@@ -533,6 +547,7 @@ mod tests {
             },
             plugin_dir: bamboo_home.join("plugins").join("hello-plugin"),
             installed_at: Utc::now(),
+            status: crate::registry::PluginInstallStatus::Installed,
             registered: RegisteredCapabilities::default(),
         });
         store
@@ -575,6 +590,7 @@ mod tests {
             },
             plugin_dir: bamboo_home.join("plugins").join("hello-plugin"),
             installed_at: Utc::now(),
+            status: crate::registry::PluginInstallStatus::Installed,
             registered: RegisteredCapabilities::default(),
         });
         store

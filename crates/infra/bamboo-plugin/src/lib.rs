@@ -48,5 +48,5 @@ pub use manifest::{
 };
 pub use registry::{
     classify_ownership, reconcile_exclusive, ExclusiveReconciliation, InstalledPlugin,
-    InstalledPlugins, Ownership, PluginSource, RegisteredCapabilities,
+    InstalledPlugins, Ownership, PluginInstallStatus, PluginSource, RegisteredCapabilities,
 };
