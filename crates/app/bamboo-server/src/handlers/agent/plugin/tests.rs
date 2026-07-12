@@ -396,7 +396,24 @@ fn sha256_hex_of(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Checksum-layer-only test helper (see the module docs on the three trust
+/// layers): bypasses the host-allowlist + signature layers
+/// (`allow_untrusted_host: true, allow_unsigned: true`), since every
+/// `wiremock` server in this file is plain `http://127.0.0.1:<port>` (never
+/// `https`, never in `plugin_trust.trusted_hosts`) and never mounts a `.sig`
+/// route. The host-allowlist layer gets its own dedicated test below using
+/// `url_source_full` (which does NOT bypass it).
 fn url_source(url: &str, sha256: Option<&str>, allow_unverified: bool) -> serde_json::Value {
+    url_source_full(url, sha256, allow_unverified, true, true)
+}
+
+fn url_source_full(
+    url: &str,
+    sha256: Option<&str>,
+    allow_unverified: bool,
+    allow_untrusted_host: bool,
+    allow_unsigned: bool,
+) -> serde_json::Value {
     let mut source = serde_json::json!({ "type": "url", "url": url });
     if let Some(sha) = sha256 {
         source["sha256"] = serde_json::Value::String(sha.to_string());
@@ -404,23 +421,78 @@ fn url_source(url: &str, sha256: Option<&str>, allow_unverified: bool) -> serde_
     if allow_unverified {
         source["allow_unverified"] = serde_json::Value::Bool(true);
     }
+    if allow_untrusted_host {
+        source["allow_untrusted_host"] = serde_json::Value::Bool(true);
+    }
+    if allow_unsigned {
+        source["allow_unsigned"] = serde_json::Value::Bool(true);
+    }
     serde_json::json!({ "source": source })
 }
 
-/// The core "secure by default" behavior this whole feature is about:
-/// `POST /install` with a bare `{"type":"url","url":"..."}` (no `sha256`, no
-/// `allow_unverified`) must be refused with an actionable 400 — NOT silently
-/// download and trust whatever tar.gz sits at that URL. Uses a `wiremock`
-/// server with no mounted responder at all, so a bug that fetched before
-/// refusing would surface as an unmatched-request panic instead of quietly
-/// passing.
+/// Source-TRUST layer 1 (host allowlist): `POST /install` with a `url` source
+/// whose host is not in `plugin_trust.trusted_hosts` (the default is
+/// `["github.com/bigduu/"]`; a local `wiremock` server never matches) must be
+/// refused with an actionable 403 — BEFORE the URL is ever fetched. Uses a
+/// `wiremock` server with no mounted responder at all, so a bug that fetched
+/// before refusing would surface as an unmatched-request panic instead of
+/// quietly passing.
 #[actix_web::test]
-async fn install_url_with_no_checksum_or_allow_unverified_returns_400_before_fetch() {
+async fn install_url_with_untrusted_host_returns_403_before_fetch() {
     let data_dir = tempfile::tempdir().unwrap();
     let state = test_state(data_dir.path()).await;
     let app = test::init_service(plugin_test_app!(state.clone())).await;
 
     let server = wiremock::MockServer::start().await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(url_source_full(&url, None, false, false, false))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let error = body_json(resp).await;
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("trusted_hosts"), "{message}");
+    assert!(
+        message.contains("allow_untrusted_host") || message.contains("allow-untrusted-host"),
+        "{message}"
+    );
+
+    // Nothing installed.
+    let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
+    let resp = test::call_service(&app, req).await;
+    let listed = body_json(resp).await;
+    assert!(listed["plugins"].as_array().unwrap().is_empty());
+
+    // The refusal happened before the URL was ever fetched.
+    let received = server.received_requests().await;
+    assert_eq!(received.map(|r| r.len()), Some(0));
+}
+
+/// Source-TRUST layer 3 (checksum), isolated from layers 1/2 via
+/// `allow_untrusted_host`/`allow_unsigned`: `POST /install` with neither
+/// `sha256` nor `allow_unverified` on a genuinely unsigned bundle must still
+/// be refused with an actionable 400 — the core "secure by default" behavior
+/// this whole feature started with. Unlike the host-layer test above, this
+/// one DOES fetch the bundle (and attempts its `.sig`) before refusing — see
+/// `plugin_source.rs`'s module docs on why the checksum gate can no longer
+/// run before any network access now that a valid signature can supersede it.
+#[actix_web::test]
+async fn install_url_with_no_checksum_or_allow_unverified_returns_400_after_host_and_signature_pass(
+) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
     let url = format!("{}/plugin.json", server.uri());
 
     let req = test::TestRequest::post()
@@ -439,10 +511,6 @@ async fn install_url_with_no_checksum_or_allow_unverified_returns_400_before_fet
     let resp = test::call_service(&app, req).await;
     let listed = body_json(resp).await;
     assert!(listed["plugins"].as_array().unwrap().is_empty());
-
-    // The refusal happened before the URL was ever fetched.
-    let received = server.received_requests().await;
-    assert_eq!(received.map(|r| r.len()), Some(0));
 }
 
 #[actix_web::test]
