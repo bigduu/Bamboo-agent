@@ -850,8 +850,11 @@ impl ConnectBridge {
     /// submitted through `self.responder`, which mirrors
     /// `POST /sessions/{id}/respond`'s exact resolve-then-resume sequence;
     /// the resumed run's fresh broadcast receiver is looped back into
-    /// another `render::stream_execution` call so the SAME chat keeps
-    /// watching the SAME (now-continuing) run.
+    /// another `render::stream_execution` call — together with the streaming
+    /// renderer's carried-over [`render::StreamState`] — so the SAME chat
+    /// keeps watching the SAME (now-continuing) run in the SAME status
+    /// message (one "⏳ Working…" bubble per run, no matter how many times it
+    /// pauses).
     async fn render_until_settled(
         &self,
         key: &str,
@@ -860,10 +863,22 @@ impl ConnectBridge {
         session_id: &str,
         mut rx: broadcast::Receiver<AgentEvent>,
     ) {
+        let mut stream_state: Option<Box<render::StreamState>> = None;
         loop {
-            match render::stream_execution(platform.clone(), reply_ctx.clone(), rx).await {
+            match render::stream_execution(
+                platform.clone(),
+                reply_ctx.clone(),
+                rx,
+                stream_state.take(),
+            )
+            .await
+            {
                 render::RunOutcome::Terminal => return,
-                render::RunOutcome::Paused(ask) => {
+                render::RunOutcome::Paused {
+                    ask,
+                    stream_state: paused_state,
+                } => {
+                    stream_state = paused_state;
                     let caps = platform.capabilities();
                     let parked =
                         ParkedAsk::new(approvals::new_nonce(), session_id.to_string(), &ask);
@@ -961,6 +976,7 @@ mod tests {
         capabilities: super::super::platform::Capabilities,
         sent: TokioMutex<Vec<String>>,
         sent_messages: TokioMutex<Vec<OutboundMessage>>,
+        edits: TokioMutex<Vec<String>>,
         answered_callbacks: TokioMutex<Vec<(String, Option<String>)>>,
     }
 
@@ -978,6 +994,7 @@ mod tests {
                 capabilities,
                 sent: TokioMutex::new(Vec::new()),
                 sent_messages: TokioMutex::new(Vec::new()),
+                edits: TokioMutex::new(Vec::new()),
                 answered_callbacks: TokioMutex::new(Vec::new()),
             })
         }
@@ -1013,8 +1030,9 @@ mod tests {
         async fn edit(
             &self,
             _msg_ref: &super::super::platform::MessageRef,
-            _new: OutboundMessage,
+            new: OutboundMessage,
         ) -> super::super::platform::PlatformResult<()> {
+            self.edits.lock().await.push(new.text);
             Ok(())
         }
         async fn answer_callback(
@@ -1107,20 +1125,21 @@ mod tests {
         }
     }
 
-    /// Polls until `responder` has recorded at least one call (or panics past
-    /// a 5s deadline) — used to synchronize with `FakeResponder::subscribe`
-    /// actually happening inside `render_until_settled`'s spawned task
-    /// BEFORE a test sends an event on the "resumed" broadcast channel
-    /// (`broadcast::Sender::send` errors with zero live subscribers).
-    async fn wait_for_responder_call(responder: &FakeResponder) {
+    /// Polls until `responder` has recorded at least `count` calls (or panics
+    /// past a 5s deadline) — used to synchronize with
+    /// `FakeResponder::subscribe` actually happening inside
+    /// `render_until_settled`'s spawned task BEFORE a test sends an event on
+    /// the "resumed" broadcast channel (`broadcast::Sender::send` errors with
+    /// zero live subscribers).
+    async fn wait_for_responder_calls(responder: &FakeResponder, count: usize) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if !responder.calls.lock().await.is_empty() {
+            if responder.calls.lock().await.len() >= count {
                 return;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "responder was never called"
+                "responder never reached {count} call(s)"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1541,7 +1560,7 @@ mod tests {
         // called through to the responder (and thus subscribed to
         // `resume_tx`) before sending on it — `broadcast::Sender::send`
         // errors out with zero live subscribers.
-        wait_for_responder_call(&responder).await;
+        wait_for_responder_calls(&responder, 1).await;
 
         resume_tx
             .send(AgentEvent::Complete {
@@ -1678,7 +1697,7 @@ mod tests {
         // called through to the responder (and thus subscribed to
         // `resume_tx`) before sending on it — `broadcast::Sender::send`
         // errors out with zero live subscribers.
-        wait_for_responder_call(&responder).await;
+        wait_for_responder_calls(&responder, 1).await;
 
         resume_tx
             .send(AgentEvent::Complete {
@@ -1747,7 +1766,7 @@ mod tests {
         // called through to the responder (and thus subscribed to
         // `resume_tx`) before sending on it — `broadcast::Sender::send`
         // errors out with zero live subscribers.
-        wait_for_responder_call(&responder).await;
+        wait_for_responder_calls(&responder, 1).await;
 
         resume_tx
             .send(AgentEvent::Complete {
@@ -1880,6 +1899,263 @@ mod tests {
             sent.iter()
                 .any(|text| text.contains("Failed to record your answer")),
             "expected an error report, got: {sent:?}"
+        );
+    }
+
+    /// PR #459 review must-fix: a run that pauses (and resumes) MULTIPLE
+    /// times must keep exactly ONE status message — every resumed segment
+    /// keeps EDITING the original "⏳ Working…" bubble via the carried
+    /// `render::StreamState`, never opening a new one.
+    #[tokio::test]
+    async fn run_that_pauses_twice_keeps_a_single_status_message() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        // Segment 1: text + pause #1.
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(AgentEvent::Token {
+            content: "segment one ".to_string(),
+        })
+        .unwrap();
+        tx.send(need_clarification_event(
+            "First?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        let first_ask = wait_for_parked_ask(&bridge, &key).await;
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "a1", "1"),
+        )
+        .await;
+        wait_for_responder_calls(&responder, 1).await;
+
+        // Segment 2 (first resume): text + pause #2.
+        resume_tx
+            .send(AgentEvent::Token {
+                content: "segment two ".to_string(),
+            })
+            .unwrap();
+        resume_tx
+            .send(need_clarification_event(
+                "Second?",
+                vec!["Approve", "Deny"],
+                false,
+            ))
+            .unwrap();
+
+        // Wait until the SECOND ask is parked (a fresh nonce distinguishes
+        // it from the first, already-resolved one).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let parked = {
+                bridge
+                    .chat_state
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|state| state.pending_ask.clone())
+            };
+            if let Some(ask) = parked {
+                if ask.nonce != first_ask.nonce {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second ask was never parked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "a2", "1"),
+        )
+        .await;
+        wait_for_responder_calls(&responder, 2).await;
+
+        // Segment 3 (second resume): text + Complete.
+        resume_tx
+            .send(AgentEvent::Token {
+                content: "segment three".to_string(),
+            })
+            .unwrap();
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+
+        // Exactly ONE "⏳ Working…" status message across the whole
+        // twice-paused run; the other sends are the two ask messages.
+        let sent = platform.sent_texts().await;
+        let status_count = sent.iter().filter(|text| text.contains('⏳')).count();
+        assert_eq!(
+            status_count, 1,
+            "expected exactly one status bubble, got: {sent:?}"
+        );
+        assert_eq!(sent.len(), 3, "status + 2 asks expected, got: {sent:?}");
+
+        // Edits continued across both resumes: the final ✅ edit carries text
+        // from every segment (the buffer survived both pauses).
+        let edits = platform.edits.lock().await;
+        let last = edits.last().expect("expected a final edit");
+        assert!(last.starts_with('✅'), "final edit not a success: {last}");
+        assert!(last.contains("segment one"));
+        assert!(last.contains("segment two"));
+        assert!(last.contains("segment three"));
+    }
+
+    /// PR #459 review item 3: `/stop` while a run is paused on a parked ask
+    /// (no live cancel token — the round already returned) must invalidate
+    /// the ask, unblock the render task, and reply with the dedicated
+    /// "pending question was cancelled" message (the `(None, true)` branch).
+    #[tokio::test]
+    async fn stop_while_paused_cancels_the_pending_question() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "stop-1", "/stop"),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish after /stop invalidates the ask")
+            .unwrap();
+
+        let sent = platform.sent_texts().await;
+        assert!(
+            sent.iter()
+                .any(|text| text == "Stopped — the pending question was cancelled."),
+            "expected the pending-question-cancelled reply, got: {sent:?}"
+        );
+        assert!(!bridge.has_pending_ask(&key).await);
+        assert!(responder.calls.lock().await.is_empty());
+    }
+
+    /// The `(Some(token), true)` `/stop` branch: a parked ask AND a live
+    /// cancel token (e.g. `/stop` racing the pause) — the token is
+    /// cancelled, the ask is invalidated, and the generic "Stopping the
+    /// current run…" reply is used.
+    #[tokio::test]
+    async fn stop_while_paused_with_live_token_cancels_both() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let token = CancellationToken::new();
+        bridge.set_cancel_token(&key, token.clone()).await;
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "stop-1", "/stop"),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish after /stop")
+            .unwrap();
+
+        assert!(token.is_cancelled(), "cancel token must be cancelled");
+        assert!(!bridge.has_pending_ask(&key).await);
+        let sent = platform.sent_texts().await;
+        assert!(
+            sent.iter().any(|text| text == "Stopping the current run…"),
+            "expected the stopping reply, got: {sent:?}"
         );
     }
 }

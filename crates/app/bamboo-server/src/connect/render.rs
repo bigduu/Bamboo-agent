@@ -53,7 +53,30 @@ pub enum RunOutcome {
     Terminal,
     /// Paused on `AgentEvent::NeedClarification` — a human decision is now
     /// required before the run can continue.
-    Paused(PendingAsk),
+    Paused {
+        ask: PendingAsk,
+        /// The streaming renderer's accumulated state (status `MessageRef` +
+        /// text buffers + throttle bookkeeping), handed back so the caller's
+        /// pause/answer/resume loop can pass it into the NEXT
+        /// [`stream_execution`] call — the resumed run keeps EDITING the same
+        /// status message instead of opening a fresh "⏳ Working…" bubble per
+        /// resume. `None` in legacy (non-`edit_message`) mode, which has no
+        /// cross-run state. Boxed to keep the enum's variants close in size
+        /// (clippy `large_enum_variant`).
+        stream_state: Option<Box<StreamState>>,
+    },
+}
+
+/// Opaque carrier for the streaming renderer's state across a pause/resume
+/// boundary (see [`RunOutcome::Paused::stream_state`]). Fields are private —
+/// callers only thread it through, they never inspect it.
+#[derive(Debug)]
+pub struct StreamState {
+    tool_lines: Vec<String>,
+    assistant_text: String,
+    status_ref: Option<MessageRef>,
+    last_edit_at: Option<Instant>,
+    chars_since_edit: usize,
 }
 
 /// The pause-worthy subset of `AgentEvent::NeedClarification`'s fields,
@@ -156,13 +179,19 @@ fn pending_ask_from_event(
 /// `platform.capabilities().edit_message`, else the legacy per-message mode
 /// (issue #452's original behavior, preserved verbatim for adapters that
 /// can't edit).
+///
+/// `prior` is the state a previous `stream_execution` call returned inside
+/// [`RunOutcome::Paused`] when the SAME logical run paused on a question and
+/// is now resuming after the answer — pass it back so the resumed run keeps
+/// editing the same status message. Pass `None` for a fresh run.
 pub async fn stream_execution(
     platform: Arc<dyn Platform>,
     reply_ctx: ReplyCtx,
     rx: broadcast::Receiver<AgentEvent>,
+    prior: Option<Box<StreamState>>,
 ) -> RunOutcome {
     if platform.capabilities().edit_message {
-        stream_execution_streaming(platform, reply_ctx, rx).await
+        stream_execution_streaming(platform, reply_ctx, rx, prior).await
     } else {
         stream_execution_legacy(platform, reply_ctx, rx).await
     }
@@ -198,13 +227,16 @@ async fn stream_execution_legacy(
                 tool_name,
                 allow_custom,
             }) => {
-                return RunOutcome::Paused(pending_ask_from_event(
-                    question,
-                    options,
-                    tool_call_id,
-                    tool_name,
-                    allow_custom,
-                ));
+                return RunOutcome::Paused {
+                    ask: pending_ask_from_event(
+                        question,
+                        options,
+                        tool_call_id,
+                        tool_name,
+                        allow_custom,
+                    ),
+                    stream_state: None,
+                };
             }
             Ok(AgentEvent::Complete { .. }) => break,
             Ok(AgentEvent::Cancelled { message }) => {
@@ -253,6 +285,39 @@ impl StreamingRenderer {
             status_ref: None,
             last_edit_at: None,
             chars_since_edit: 0,
+        }
+    }
+
+    /// Rebuild the renderer from state carried across a pause/resume boundary
+    /// (see [`StreamState`]) — same status message, same accumulated text.
+    fn resume(platform: Arc<dyn Platform>, reply_ctx: ReplyCtx, state: StreamState) -> Self {
+        let StreamState {
+            tool_lines,
+            assistant_text,
+            status_ref,
+            last_edit_at,
+            chars_since_edit,
+        } = state;
+        Self {
+            platform,
+            reply_ctx,
+            tool_lines,
+            assistant_text,
+            status_ref,
+            last_edit_at,
+            chars_since_edit,
+        }
+    }
+
+    /// Extract the carry-across-pause state (drops the platform/ctx handles,
+    /// which the resuming caller supplies again).
+    fn into_state(self) -> StreamState {
+        StreamState {
+            tool_lines: self.tool_lines,
+            assistant_text: self.assistant_text,
+            status_ref: self.status_ref,
+            last_edit_at: self.last_edit_at,
+            chars_since_edit: self.chars_since_edit,
         }
     }
 
@@ -385,14 +450,23 @@ impl StreamingRenderer {
     }
 }
 
-/// Streaming edit-in-place (issue #458 §B) rendering mode.
+/// Streaming edit-in-place (issue #458 §B) rendering mode. `prior`, when
+/// `Some`, resumes an earlier pause's renderer — same status message, no new
+/// "⏳ Working…" bubble.
 async fn stream_execution_streaming(
     platform: Arc<dyn Platform>,
     reply_ctx: ReplyCtx,
     mut rx: broadcast::Receiver<AgentEvent>,
+    prior: Option<Box<StreamState>>,
 ) -> RunOutcome {
-    let mut renderer = StreamingRenderer::new(platform, reply_ctx);
-    renderer.send_initial().await;
+    let mut renderer = match prior {
+        Some(state) => StreamingRenderer::resume(platform, reply_ctx, *state),
+        None => {
+            let mut renderer = StreamingRenderer::new(platform, reply_ctx);
+            renderer.send_initial().await;
+            renderer
+        }
+    };
 
     loop {
         match rx.recv().await {
@@ -419,13 +493,16 @@ async fn stream_execution_streaming(
                 allow_custom,
             }) => {
                 renderer.finalize_paused().await;
-                return RunOutcome::Paused(pending_ask_from_event(
-                    question,
-                    options,
-                    tool_call_id,
-                    tool_name,
-                    allow_custom,
-                ));
+                return RunOutcome::Paused {
+                    ask: pending_ask_from_event(
+                        question,
+                        options,
+                        tool_call_id,
+                        tool_name,
+                        allow_custom,
+                    ),
+                    stream_state: Some(Box::new(renderer.into_state())),
+                };
             }
             Ok(AgentEvent::Complete { .. }) => {
                 renderer.finalize_success().await;
@@ -625,7 +702,7 @@ mod tests {
         })
         .unwrap();
 
-        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
         assert!(matches!(outcome, RunOutcome::Terminal));
 
         let sent = platform.sent.lock().await;
@@ -649,7 +726,7 @@ mod tests {
         })
         .unwrap();
 
-        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
 
         let sent = platform.sent.lock().await;
         assert_eq!(sent.len(), 1);
@@ -666,7 +743,7 @@ mod tests {
         // Must return promptly, not hang, when the sender is dropped.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx),
+            stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None),
         )
         .await
         .expect("stream_execution must not hang on a closed channel");
@@ -683,13 +760,15 @@ mod tests {
         tx.send(ask_event("Pick one", vec!["A", "B"], false))
             .unwrap();
 
-        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
         match outcome {
-            RunOutcome::Paused(ask) => {
+            RunOutcome::Paused { ask, stream_state } => {
                 assert_eq!(ask.question, "Pick one");
                 assert_eq!(ask.options, vec!["A".to_string(), "B".to_string()]);
                 assert_eq!(ask.tool_call_id, "call-1");
                 assert!(!ask.allow_custom);
+                // Legacy mode carries no streaming state.
+                assert!(stream_state.is_none());
             }
             RunOutcome::Terminal => panic!("expected Paused"),
         }
@@ -707,7 +786,7 @@ mod tests {
         let ctx = ReplyCtx(serde_json::json!({"chat_id": "1"}));
         drop(_tx);
 
-        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
 
         let sent = platform.sent.lock().await;
         assert_eq!(sent.len(), 1);
@@ -733,7 +812,7 @@ mod tests {
         })
         .unwrap();
 
-        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
         assert!(matches!(outcome, RunOutcome::Terminal));
 
         // The 9-char token is below the 30-char throttle, so no mid-run edit
@@ -756,7 +835,7 @@ mod tests {
         })
         .unwrap();
 
-        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
 
         let edits = platform.edits.lock().await;
         assert_eq!(edits.last().unwrap(), "❌ Error: boom");
@@ -773,7 +852,7 @@ mod tests {
         })
         .unwrap();
 
-        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
 
         let edits = platform.edits.lock().await;
         assert_eq!(edits.last().unwrap(), "⏹ user requested /stop");
@@ -792,14 +871,76 @@ mod tests {
         tx.send(ask_event("Approve?", vec!["Approve", "Deny"], false))
             .unwrap();
 
-        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
         match outcome {
-            RunOutcome::Paused(ask) => assert_eq!(ask.question, "Approve?"),
+            RunOutcome::Paused { ask, stream_state } => {
+                assert_eq!(ask.question, "Approve?");
+                // Streaming mode DOES carry state across the pause.
+                assert!(stream_state.is_some());
+            }
             RunOutcome::Terminal => panic!("expected Paused"),
         }
 
         let edits = platform.edits.lock().await;
         assert!(edits.last().unwrap().contains("Waiting for your input"));
+    }
+
+    #[tokio::test]
+    async fn streaming_mode_resume_keeps_editing_the_same_status_message() {
+        let platform = RecordingPlatform::new(true);
+        let ctx = ReplyCtx(serde_json::json!({"chat_id": "1"}));
+
+        // Segment 1: some text, then a pause.
+        let (tx1, rx1) = broadcast::channel(16);
+        tx1.send(AgentEvent::Token {
+            content: "Before the question. ".to_string(),
+        })
+        .unwrap();
+        tx1.send(ask_event("Approve?", vec!["Approve", "Deny"], false))
+            .unwrap();
+        let outcome = stream_execution(
+            platform.clone() as Arc<dyn Platform>,
+            ctx.clone(),
+            rx1,
+            None,
+        )
+        .await;
+        let state = match outcome {
+            RunOutcome::Paused { stream_state, .. } => stream_state,
+            RunOutcome::Terminal => panic!("expected Paused"),
+        };
+        assert!(state.is_some());
+
+        // Segment 2 (resumed run): more text, then Complete — passing the
+        // carried state back in.
+        let (tx2, rx2) = broadcast::channel(16);
+        tx2.send(AgentEvent::Token {
+            content: "After the answer.".to_string(),
+        })
+        .unwrap();
+        tx2.send(AgentEvent::Complete {
+            usage: bamboo_agent_core::TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        })
+        .unwrap();
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx2, state).await;
+
+        // Exactly ONE message was ever SENT — the initial "⏳ Working…"
+        // status bubble; the resumed segment kept EDITING it rather than
+        // opening a second one.
+        let sent = platform.sent.lock().await;
+        assert_eq!(sent.len(), 1, "expected a single status message: {sent:?}");
+        assert_eq!(sent[0], "⏳ Working…");
+        // The final edit carries text from BOTH segments (buffer survived
+        // the pause).
+        let edits = platform.edits.lock().await;
+        let last = edits.last().expect("expected a final edit");
+        assert!(last.starts_with('✅'), "final edit not a success: {last}");
+        assert!(last.contains("Before the question."));
+        assert!(last.contains("After the answer."));
     }
 
     #[tokio::test]
@@ -825,7 +966,7 @@ mod tests {
         })
         .unwrap();
 
-        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
 
         // Exactly one edit: the final one.
         assert_eq!(platform.edits.lock().await.len(), 1);
@@ -851,7 +992,7 @@ mod tests {
         })
         .unwrap();
 
-        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
 
         // Final edit is the short "done" marker, not the full 5000 chars.
         let edits = platform.edits.lock().await;
@@ -880,7 +1021,7 @@ mod tests {
         })
         .unwrap();
 
-        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx).await;
+        let outcome = stream_execution(platform.clone() as Arc<dyn Platform>, ctx, rx, None).await;
         assert!(matches!(outcome, RunOutcome::Terminal));
 
         // No successful edits recorded (they all failed) — but the run never

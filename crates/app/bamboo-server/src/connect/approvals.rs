@@ -160,6 +160,14 @@ pub async fn render_ask(
 const AFFIRMATIVE_KEYWORDS: &[&str] = &[
     "允许", "同意", "确定", "是", "yes", "allow", "approve", "ok",
 ];
+/// "stay" comes from plan-mode's decline phrasing — ExitPlanMode's negative
+/// option is literally "Stay in plan mode" (see
+/// `session_app::respond::is_exit_plan_mode_approved`), so a user typing
+/// "stay" declines the plan approval. Safe to keep in this fallback list
+/// because [`match_text_answer`] tries EXACT (case-insensitive) option-text
+/// matching BEFORE the keyword fallback: an ask whose positive option is
+/// literally titled "Stay" resolves on the exact match and never reaches
+/// here.
 const NEGATIVE_KEYWORDS: &[&str] = &["拒绝", "不", "否", "no", "deny", "reject", "stay"];
 
 fn classify_intent(text: &str) -> Option<bool> {
@@ -752,6 +760,26 @@ mod tests {
             Some("Deny".to_string())
         );
         assert_eq!(match_text_answer(&pending, "no"), Some("Deny".to_string()));
+    }
+
+    /// Ordering guarantee documented on [`NEGATIVE_KEYWORDS`]: an option
+    /// literally titled "Stay" — even as the POSITIVE first choice — resolves
+    /// via exact option-text matching BEFORE the keyword fallback, so the
+    /// "stay"-is-negative heuristic can never misroute it.
+    #[test]
+    fn match_text_answer_exact_option_named_stay_beats_negative_keyword_fallback() {
+        let pending = ask(vec!["Stay", "Leave"], false);
+        assert_eq!(
+            match_text_answer(&pending, "stay"),
+            Some("Stay".to_string())
+        );
+        // And the fallback still works as intended for plan-mode phrasing,
+        // where "stay" appears INSIDE the negative option's text.
+        let plan_pending = ask(vec!["Approve", "Stay in plan mode"], false);
+        assert_eq!(
+            match_text_answer(&plan_pending, "stay"),
+            Some("Stay in plan mode".to_string())
+        );
     }
 
     #[test]
