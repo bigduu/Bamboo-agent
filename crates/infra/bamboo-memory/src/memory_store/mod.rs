@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod access_log;
 pub mod embedding;
 pub mod freshness;
 mod lexical_bm25;

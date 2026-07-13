@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -9,6 +9,9 @@ use tokio::sync::Mutex;
 
 use bamboo_agent_core::workspace_state;
 
+use super::access_log::{
+    self, AccessLogEntry, AccessStats, ACCESS_LOG_COMPACT_TRIGGER_BYTES, ACCESS_LOG_FILE,
+};
 use super::lexical_bm25;
 use super::{
     build_dream_view, build_memory_markdown_view, build_recent_markdown_view,
@@ -77,12 +80,24 @@ enum WriteSimilarity {
 }
 
 /// Heuristic "keep value" of a memory for capacity eviction (L5), higher = more
-/// worth keeping. Recency (from `updated_at`) × confidence, with a penalty for
-/// Stale. Access frequency is NOT yet a factor: recall doesn't write back
-/// `last_accessed_at` (doing so on the read path would force an index rebuild per
-/// recall in this file-store), so it is omitted; when a cheap access signal exists
-/// it multiplies in here. Deterministic — no model, no embedding.
-fn memory_value(doc: &DurableMemoryDocument, now: chrono::DateTime<chrono::Utc>) -> f64 {
+/// worth keeping: `recency(updated_at) × confidence × stale_penalty ×
+/// access_multiplier`. Deterministic — no model, no embedding.
+///
+/// `access_multiplier` is the RFC's access-frequency term (#264, follow-up to
+/// #263 which shipped this function without it): recall can't write
+/// `last_accessed_at` back onto the recalled document without forcing a full
+/// per-scope index rebuild on that hot read path, so instead recall appends
+/// `{id, ts}` to a cheap per-scope `access_log.jsonl`
+/// ([`MemoryStore::record_memory_accesses`]) that the capacity gardener
+/// aggregates lazily into this multiplier ([`access_log::access_multiplier`]).
+/// Callers with no access-log data for a doc — or that don't wire the log at all
+/// — pass `1.0`, which is a true no-op here and reproduces the pre-#264 score
+/// exactly (back-compat).
+fn memory_value(
+    doc: &DurableMemoryDocument,
+    now: chrono::DateTime<chrono::Utc>,
+    access_multiplier: f64,
+) -> f64 {
     let confidence = match doc.frontmatter.confidence.as_deref() {
         Some("high") => 1.0,
         Some("low") => 0.25,
@@ -98,7 +113,7 @@ fn memory_value(doc: &DurableMemoryDocument, now: chrono::DateTime<chrono::Utc>)
     } else {
         1.0
     };
-    confidence * recency * stale_penalty
+    confidence * recency * stale_penalty * access_multiplier
 }
 
 /// Projected body length (chars) after appending `content` to `body` with the
@@ -512,6 +527,16 @@ impl MemoryStore {
         let remaining_count = remaining.len().saturating_sub(returned_count);
         let next_cursor =
             (remaining_count > 0).then(|| make_query_cursor(scope, offset + returned_count));
+
+        // L5 access signal (#264): log only the docs actually surfaced by this
+        // recall (the returned page), not every candidate that merely matched.
+        // Best-effort — see `record_memory_accesses` — so a log failure here can
+        // never turn a successful recall into an error.
+        if !items.is_empty() {
+            let accessed_ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+            self.record_memory_accesses(scope, project_key, &accessed_ids)
+                .await;
+        }
 
         Ok(MemoryQueryResult {
             items,
@@ -2024,12 +2049,30 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
 
+        // Lazily aggregate the recall access log (#264) into the access-frequency
+        // multiplier `memory_value` folds in — only read here, on the
+        // infrequent gardener pass, never on the hot recall path. Best-effort: a
+        // read failure (or no log file yet) degrades to an empty map, which
+        // `access_log::access_multiplier` turns into the neutral `1.0` for every
+        // doc, i.e. identical to pre-#264 scoring.
+        let access_stats = self.access_log_stats(scope, project_key).await;
+
         // Lowest keep-value first; within a value tie, evict the OLDEST first (keep
         // the newer restatement). `updated_at` is UTC rfc3339 → string order is
         // chronological.
         evictable.sort_by(|a, b| {
-            memory_value(a, now)
-                .partial_cmp(&memory_value(b, now))
+            let value_a = memory_value(
+                a,
+                now,
+                access_log::access_multiplier(access_stats.get(&a.frontmatter.id)),
+            );
+            let value_b = memory_value(
+                b,
+                now,
+                access_log::access_multiplier(access_stats.get(&b.frontmatter.id)),
+            );
+            value_a
+                .partial_cmp(&value_b)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.frontmatter.updated_at.cmp(&b.frontmatter.updated_at))
         });
@@ -2624,6 +2667,162 @@ impl MemoryStore {
         // `flush()` on a tokio File is a no-op, and the old atomic_write path
         // did fsync. (Matches the store's #166 durability discipline.)
         file.sync_all().await
+    }
+
+    /// Append a `{id, ts}` line per recalled `ids` to the scope's
+    /// `access_log.jsonl` (#264) — the cheap access signal `memory_value` folds
+    /// into capacity-eviction scoring via [`access_log::access_multiplier`],
+    /// standing in for writing `last_accessed_at` back onto every recalled
+    /// document (which would force a full per-scope index rebuild per recall).
+    ///
+    /// Best-effort and O(ids): one file open, one buffered write, no fsync (this
+    /// is a soft signal, not an audit trail — losing a line just makes the access
+    /// signal for that memory slightly stale, whereas blocking or failing recall
+    /// on a log write is never acceptable). Any IO error is logged and swallowed;
+    /// callers on the recall path must be able to call this unconditionally.
+    async fn record_memory_accesses(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        ids: &[String],
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+        let path = self
+            .resolver
+            .logs_dir(scope, project_key)
+            .join(ACCESS_LOG_FILE);
+        if let Err(error) = self.record_memory_accesses_inner(&path, ids).await {
+            tracing::debug!(
+                target: "bamboo_memory::access_log",
+                error = %error,
+                path = %path.display(),
+                "failed to append access log (best-effort; recall is unaffected)"
+            );
+        }
+    }
+
+    async fn record_memory_accesses_inner(&self, path: &Path, ids: &[String]) -> io::Result<()> {
+        // Guards the append + size-check + (rare) compaction as one critical
+        // section, scoped to just this scope's access-log file — NOT the
+        // scope-wide `scope_lock`, so a burst of concurrent recalls never
+        // contends with concurrent writers mutating the scope's memory docs.
+        let lock = self.path_lock(path.to_path_buf());
+        let _guard = lock.lock().await;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let ts = now_rfc3339();
+        let mut buf = String::new();
+        for id in ids {
+            let line = serde_json::to_string(&AccessLogEntry {
+                id: id.clone(),
+                ts: ts.clone(),
+            })
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to serialize access log entry: {error}"),
+                )
+            })?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+
+        use tokio::io::AsyncWriteExt;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(buf.as_bytes()).await?;
+        file.flush().await?;
+        let size = file.metadata().await.map(|meta| meta.len()).unwrap_or(0);
+        drop(file);
+
+        if size > ACCESS_LOG_COMPACT_TRIGGER_BYTES {
+            self.compact_access_log_at(path).await?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the access log at `path` keeping only the entries
+    /// [`access_log::compact_entries`] retains — bounded size, safe under
+    /// concurrent recalls because the caller already holds `path`'s lock.
+    /// Not a hot-path operation: only runs when a scope's log crosses
+    /// [`ACCESS_LOG_COMPACT_TRIGGER_BYTES`], which — given the bound
+    /// `compact_entries` itself enforces — happens on the order of once per
+    /// several thousand recalls to that scope, not once per recall.
+    async fn compact_access_log_at(&self, path: &Path) -> io::Result<()> {
+        let raw = match fs::read_to_string(path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let entries = access_log::parse_access_log(&raw);
+        let compacted = access_log::compact_entries(entries, chrono::Utc::now());
+        let mut out = String::with_capacity(raw.len());
+        for entry in &compacted {
+            let line = serde_json::to_string(entry).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to serialize access log entry: {error}"),
+                )
+            })?;
+            out.push_str(&line);
+            out.push('\n');
+        }
+        crate::atomic_fs::atomic_write(path, out.as_bytes()).await
+    }
+
+    /// Lazily aggregate a scope's `access_log.jsonl` into per-id [`AccessStats`]
+    /// — called only from the (infrequent) capacity gardener pass, never from
+    /// the recall path. Best-effort: any read/parse failure (including "file
+    /// doesn't exist yet", the common case for a scope with no recall history
+    /// since #264 shipped) degrades to an empty map rather than failing the
+    /// caller, which via [`access_log::access_multiplier`] means every doc gets
+    /// the neutral `1.0` multiplier — i.e. scoring identical to before #264.
+    async fn access_log_stats(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> HashMap<String, AccessStats> {
+        let path = self
+            .resolver
+            .logs_dir(scope, project_key)
+            .join(ACCESS_LOG_FILE);
+        match self.read_access_log_stats_at(&path).await {
+            Ok(stats) => stats,
+            Err(error) => {
+                tracing::debug!(
+                    target: "bamboo_memory::access_log",
+                    error = %error,
+                    path = %path.display(),
+                    "failed to read access log (best-effort; scoring falls back to neutral)"
+                );
+                HashMap::new()
+            }
+        }
+    }
+
+    async fn read_access_log_stats_at(
+        &self,
+        path: &Path,
+    ) -> io::Result<HashMap<String, AccessStats>> {
+        let lock = self.path_lock(path.to_path_buf());
+        let _guard = lock.lock().await;
+        let raw = match fs::read_to_string(path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(error),
+        };
+        let entries = access_log::parse_access_log(&raw);
+        Ok(access_log::aggregate_access_stats(
+            &entries,
+            chrono::Utc::now(),
+        ))
     }
 
     async fn write_json_file<T: serde::Serialize>(
@@ -3761,6 +3960,269 @@ mod tests {
         assert!(docs
             .iter()
             .all(|d| d.frontmatter.status == DurableMemoryStatus::Active));
+    }
+
+    /// #264: a successful `query_scope` recall appends a `{id, ts}` line per
+    /// returned item to the scope's `access_log.jsonl` — the cheap signal that
+    /// stands in for writing `last_accessed_at` back onto the document.
+    #[tokio::test]
+    async fn query_scope_appends_access_log_for_returned_items() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+
+        let doc = store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "Release freeze begins next week",
+                "Merge freeze begins on Tuesday for mobile release cut.",
+                &[],
+                Some("session-1"),
+                "main-model",
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let log_path = store
+            .resolver()
+            .logs_dir(MemoryScope::Project, pk)
+            .join(ACCESS_LOG_FILE);
+        assert!(!log_path.exists(), "no access log before any recall");
+
+        let result = store
+            .query_scope(
+                MemoryScope::Project,
+                pk,
+                Some("release freeze"),
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(5),
+                    max_chars: Some(3000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        let raw = fs::read_to_string(&log_path).await.unwrap();
+        let entries = access_log::parse_access_log(&raw);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, doc.frontmatter.id);
+        assert!(parse_rfc3339(&entries[0].ts).is_some());
+
+        // A second recall appends a second line rather than rewriting the file.
+        store
+            .query_scope(
+                MemoryScope::Project,
+                pk,
+                Some("release freeze"),
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(5),
+                    max_chars: Some(3000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .unwrap();
+        let raw = fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(access_log::parse_access_log(&raw).len(), 2);
+    }
+
+    /// #264: recall must never fail because the (best-effort) access log couldn't
+    /// be written. Simulate a write failure by making the log's path itself a
+    /// directory, so `OpenOptions::append().open()` on it errors.
+    #[tokio::test]
+    async fn recall_succeeds_even_if_access_log_write_fails() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+
+        let doc = store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "Deploy pipeline rewritten",
+                "The deploy pipeline was rewritten to use the new build cache.",
+                &[],
+                Some("session-1"),
+                "main-model",
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let log_path = store
+            .resolver()
+            .logs_dir(MemoryScope::Project, pk)
+            .join(ACCESS_LOG_FILE);
+        // Force the append to fail: the log "file" path is actually a directory.
+        fs::create_dir_all(&log_path).await.unwrap();
+
+        let result = store
+            .query_scope(
+                MemoryScope::Project,
+                pk,
+                Some("deploy pipeline"),
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(5),
+                    max_chars: Some(3000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .expect("recall must succeed despite the access-log write failing");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id, doc.frontmatter.id);
+    }
+
+    /// #264: with no access-log data at all (no file written), the multiplier is
+    /// neutral for every id — the exact back-compat guarantee `memory_value`'s
+    /// doc comment promises.
+    #[tokio::test]
+    async fn access_log_stats_defaults_to_empty_without_a_log_file() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let stats = store
+            .access_log_stats(MemoryScope::Project, Some("proj-1"))
+            .await;
+        assert!(stats.is_empty());
+        assert_eq!(access_log::access_multiplier(stats.get("anything")), 1.0);
+    }
+
+    /// L5 (#264): the access-frequency multiplier only ever helps a memory
+    /// survive capacity eviction. Two Project memories written back-to-back are
+    /// otherwise identical (same confidence, same status, same-day recency), so
+    /// with capacity forcing exactly one archival, the one with recall history
+    /// must be the one spared.
+    #[tokio::test]
+    async fn accessed_memory_outscores_unaccessed_peer_in_capacity_eviction() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+
+        let accessed = store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "Frequently recalled fact",
+                "This fact keeps getting pulled into context.",
+                &[],
+                Some("s"),
+                "m",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let unaccessed = store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "Never recalled fact",
+                "This fact has never been looked at since it was written.",
+                &[],
+                Some("s"),
+                "m",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Simulate recall history for `accessed` only, several times over.
+        let ids = vec![accessed.frontmatter.id.clone()];
+        for _ in 0..5 {
+            store
+                .record_memory_accesses(MemoryScope::Project, pk, &ids)
+                .await;
+        }
+
+        // capacity=1 with 2 scorable Project docs forces exactly one archival.
+        let archived = store
+            .enforce_scope_capacity(MemoryScope::Project, pk, 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(archived, vec![unaccessed.frontmatter.id.clone()]);
+
+        let survivor = store
+            .get_memory(&accessed.frontmatter.id, pk)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(survivor.frontmatter.status, DurableMemoryStatus::Active);
+    }
+
+    /// #264: the log auto-compacts once it crosses the byte trigger, so it stays
+    /// bounded instead of growing forever. Seed it with many stale (aged-out)
+    /// entries past the compaction trigger size, then perform one more recall
+    /// access — which appends, checks the size, and (because the file is now
+    /// over the trigger) rewrites it via `compact_entries`, dropping everything
+    /// outside the aging window.
+    #[tokio::test]
+    async fn access_log_auto_compacts_when_over_byte_threshold() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+        let log_path = store
+            .resolver()
+            .logs_dir(MemoryScope::Project, pk)
+            .join(ACCESS_LOG_FILE);
+        fs::create_dir_all(log_path.parent().unwrap())
+            .await
+            .unwrap();
+
+        // Well past both the 90-day aging window and the byte trigger.
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339();
+        let mut raw = String::new();
+        for i in 0..6000 {
+            raw.push_str(
+                &serde_json::to_string(&AccessLogEntry {
+                    id: format!("stale-mem-{i}"),
+                    ts: stale_ts.clone(),
+                })
+                .unwrap(),
+            );
+            raw.push('\n');
+        }
+        assert!(
+            raw.len() as u64 > ACCESS_LOG_COMPACT_TRIGGER_BYTES,
+            "fixture must actually exceed the compaction trigger"
+        );
+        fs::write(&log_path, raw.as_bytes()).await.unwrap();
+
+        // One more access — triggers the size check + compaction inside the same
+        // best-effort append call.
+        store
+            .record_memory_accesses(MemoryScope::Project, pk, &["fresh-mem".to_string()])
+            .await;
+
+        let compacted_raw = fs::read_to_string(&log_path).await.unwrap();
+        assert!(
+            (compacted_raw.len() as u64) < ACCESS_LOG_COMPACT_TRIGGER_BYTES,
+            "compaction must bound the file back under the trigger size, got {} bytes",
+            compacted_raw.len()
+        );
+        let entries = access_log::parse_access_log(&compacted_raw);
+        // Every stale entry aged out; only the fresh one survives.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "fresh-mem");
     }
 
     /// Many `MemoryStore` instances pointed at the SAME data dir (the real
