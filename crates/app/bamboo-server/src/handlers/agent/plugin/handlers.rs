@@ -26,12 +26,18 @@ fn plugins_root(state: &AppState) -> PathBuf {
 /// The wire `SourceSpec` reuses `bamboo_plugin::PluginSource`'s own serde
 /// shape (see `api_types` module docs) directly as the request body — a
 /// `url` source's `sha256`/`allow_unverified`/`allow_untrusted_host`/
-/// `allow_unsigned` flow straight through to `PluginSourceInput::Url`, which
-/// `plugin_source::fetch_manifest_bundle` enforces (the three-layer trust
-/// model: host allowlist, signature, checksum — see that module's docs).
-/// `signed_by` is a RESULT of staging (which key verified), never an input,
-/// so it's dropped here — the request-side `PluginSource::Url` field is
-/// meaningless on the way in and `fetch_manifest_bundle` recomputes it fresh.
+/// `allow_unsigned`/`insecure` flow straight through to
+/// `PluginSourceInput::Url`, which `plugin_source::fetch_manifest_bundle`
+/// enforces (the three-layer trust model: host allowlist, signature,
+/// checksum — plus the `insecure`/`plugin_trust.enforcement` aggregate
+/// escape hatch over all three — see that module's docs). `signed_by` is a
+/// RESULT of staging (which key verified), never an input, so it's dropped
+/// here — the request-side `PluginSource::Url` field is meaningless on the
+/// way in and `fetch_manifest_bundle` recomputes it fresh. `insecure`, by
+/// contrast, genuinely IS an input here (the caller's `--insecure` /
+/// `"insecure": true` opt-in) — this authenticated/local-only HTTP surface
+/// is already behind the access-password middleware (see `routes`), same as
+/// every other `/api/v1/plugins` route.
 fn to_source_input(source: PluginSource) -> PluginSourceInput {
     match source {
         PluginSource::LocalDir { path } => PluginSourceInput::LocalDir(path),
@@ -43,12 +49,14 @@ fn to_source_input(source: PluginSource) -> PluginSourceInput {
             allow_untrusted_host,
             allow_unsigned,
             signed_by: _,
+            insecure,
         } => PluginSourceInput::Url {
             url,
             sha256,
             allow_unverified,
             allow_untrusted_host,
             allow_unsigned,
+            insecure,
         },
     }
 }

@@ -51,6 +51,21 @@ impl AppState {
         // Load config from the specified data directory
         let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
+        // Loud, unmissable startup signal: `plugin_trust.enforcement: off`
+        // silently affects EVERY future `bamboo plugin install`/`update`
+        // (URL sources skip the host allowlist, signature, and checksum
+        // layers with no per-install flag needed — see
+        // `bamboo_server::plugin_source`'s module docs), not just one
+        // command invocation, so it gets its own warning here at boot in
+        // addition to the per-install warning `fetch_manifest_bundle` logs
+        // for each individual insecure install.
+        if config.plugin_trust.enforcement_is_off() {
+            tracing::warn!(
+                "plugin_trust.enforcement is OFF — plugin installs from ANY URL are accepted \
+                 without host/signature/checksum verification (config.json plugin_trust.enforcement)"
+            );
+        }
+
         let provider_registry =
             match bamboo_llm::ProviderRegistry::from_config(&config, bamboo_home_dir.clone()).await
             {

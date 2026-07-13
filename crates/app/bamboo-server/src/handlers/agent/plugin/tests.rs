@@ -600,3 +600,128 @@ async fn install_url_with_allow_unverified_and_no_sha256_succeeds() {
     assert_eq!(view["id"], "hello-plugin");
     assert!(view["source"]["sha256"].is_null());
 }
+
+// ---------------------------------------------------------------------
+// `insecure` — the SourceSpec aggregate — and `plugin_trust.enforcement`
+// (the config-level form), exercised end to end through the real HTTP
+// handlers. Unit coverage of the same aggregate at the
+// `plugin_source::fetch_manifest_bundle` level lives in
+// `plugin_source::tests`.
+// ---------------------------------------------------------------------
+
+/// `SourceSpec` with `"insecure": true` and every individual `allow_*`
+/// omitted — proves the aggregate ALONE (not any per-layer flag) is what
+/// lets an untrusted-host, unsigned, unchecksummed install through.
+fn url_source_insecure(url: &str) -> serde_json::Value {
+    serde_json::json!({ "source": { "type": "url", "url": url, "insecure": true } })
+}
+
+#[actix_web::test]
+async fn install_url_with_insecure_true_bypasses_all_three_layers() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    // A plain wiremock server: never in `plugin_trust.trusted_hosts`, never
+    // https, no `.sig` mounted, no `sha256` given — every one of the three
+    // layers would refuse this under Strict with no flags.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(url_source_insecure(&url))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view = body_json(resp).await;
+    assert_eq!(view["id"], "hello-plugin");
+    assert_eq!(view["source"]["type"], "url");
+    assert!(view["source"]["sha256"].is_null());
+    // Provenance records the aggregate.
+    assert_eq!(view["source"]["insecure"], true);
+}
+
+#[actix_web::test]
+async fn install_url_with_insecure_true_still_refuses_a_wrong_sha256() {
+    // Precedence: `insecure: true` must not downgrade a caller-supplied
+    // checksum — a WRONG sha256 alongside it still refuses the install.
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+    let wrong_sha256 = "d".repeat(64);
+
+    let mut source = url_source_insecure(&url);
+    source["source"]["sha256"] = serde_json::Value::String(wrong_sha256);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(source)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(resp).await;
+    assert!(
+        error["error"].as_str().unwrap().contains("mismatch"),
+        "{error}"
+    );
+
+    let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
+    let resp = test::call_service(&app, req).await;
+    let listed = body_json(resp).await;
+    assert!(listed["plugins"].as_array().unwrap().is_empty());
+}
+
+#[actix_web::test]
+async fn install_url_with_plugin_trust_enforcement_off_needs_no_per_request_flags() {
+    // The PERSISTENT, config-level form: flip `plugin_trust.enforcement` to
+    // `off` on this server's config, then install with a BARE `url` source —
+    // no `insecure`, no individual `allow_*` flags at all.
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    state
+        .update_config(
+            |cfg| {
+                cfg.plugin_trust.enforcement = bamboo_config::PluginTrustEnforcement::Off;
+                Ok(())
+            },
+            Default::default(),
+        )
+        .await
+        .expect("set plugin_trust.enforcement = off");
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(serde_json::json!({ "source": { "type": "url", "url": url } }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view = body_json(resp).await;
+    assert_eq!(view["id"], "hello-plugin");
+    assert_eq!(view["source"]["insecure"], true);
+}
