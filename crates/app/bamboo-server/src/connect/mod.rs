@@ -21,6 +21,7 @@
 //! `config.connect.platforms` is empty: no `[connect]` section in
 //! `config.json` means zero background tasks are spawned.
 
+pub mod approvals;
 pub mod bridge;
 pub mod platform;
 pub mod platforms;
@@ -28,8 +29,8 @@ pub mod render;
 
 pub use bridge::{ConnectBridge, ConnectContext, SessionKey};
 pub use platform::{
-    Capabilities, InboundMessage, MessageRef, OutboundMessage, Platform, PlatformError,
-    PlatformResult, ReplyCtx,
+    Button, CallbackQuery, Capabilities, Inbound, InboundMessage, MessageRef, OutboundMessage,
+    Platform, PlatformError, PlatformResult, ReplyCtx,
 };
 
 use std::path::PathBuf;
@@ -122,19 +123,39 @@ impl Drop for ConnectManager {
     }
 }
 
-/// Pulls inbound messages off a single platform's channel and hands each to
-/// the bridge. Kept as its OWN task per platform (not merged into the
-/// platform's `start()` loop) so a slow/queued chat can never stall the next
-/// `getUpdates` poll — `ConnectBridge::handle_inbound` itself returns quickly
-/// (it spawns the actual run), so this loop only ever blocks briefly.
+/// Pulls inbound events (messages and button-press callbacks, issue #458)
+/// off a single platform's channel and hands each to the bridge. Kept as its
+/// OWN task per platform (not merged into the platform's `start()` loop) so
+/// a slow/queued chat can never stall the next `getUpdates` poll —
+/// `ConnectBridge::handle_inbound`/`handle_callback` themselves return
+/// quickly (a message spawns the actual run; a callback only ever
+/// acks+resolves), so this loop only ever blocks briefly.
 async fn dispatch_loop(
     bridge: Arc<ConnectBridge>,
     platform: Arc<dyn Platform>,
     allow_from: Vec<String>,
-    mut rx: mpsc::Receiver<InboundMessage>,
+    mut rx: mpsc::Receiver<Inbound>,
 ) {
-    while let Some(msg) = rx.recv().await {
-        ConnectBridge::handle_inbound(bridge.clone(), platform.clone(), allow_from.clone(), msg)
-            .await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Inbound::Message(msg) => {
+                ConnectBridge::handle_inbound(
+                    bridge.clone(),
+                    platform.clone(),
+                    allow_from.clone(),
+                    msg,
+                )
+                .await;
+            }
+            Inbound::Callback(callback) => {
+                ConnectBridge::handle_callback(
+                    bridge.clone(),
+                    platform.clone(),
+                    allow_from.clone(),
+                    callback,
+                )
+                .await;
+            }
+        }
     }
 }

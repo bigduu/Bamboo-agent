@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{broadcast, Mutex as AsyncMutex, RwLock as TokioRwLock};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, RwLock as TokioRwLock};
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::tools::ToolExecutor;
@@ -25,7 +25,8 @@ use bamboo_engine::execution::{
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
 
-use super::platform::{InboundMessage, OutboundMessage, Platform, ReplyCtx};
+use super::approvals::{self, ParkedAsk, RespondAndResumeOutcome, Responder};
+use super::platform::{CallbackQuery, InboundMessage, OutboundMessage, Platform, ReplyCtx};
 use super::render;
 
 /// `platform:chat_id:user_id` — the chat-scoped routing key mapping to a
@@ -57,18 +58,48 @@ pub struct ConnectContext {
     pub app_data_dir: Option<PathBuf>,
     pub config: Arc<tokio::sync::RwLock<Config>>,
     pub provider_registry: Arc<ProviderRegistry>,
+    /// Shared with `AppState::permission_checker` — needed so an approved
+    /// permission prompt (a gated tool asked to run, answered through
+    /// connect) actually grants the session permission the re-executed tool
+    /// call is checked against on resume (issue #458; see
+    /// `approvals::EngineResponder`).
+    pub permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
 }
 
 /// Per-chat runtime state: whether a run is currently executing, the FIFO
 /// queue of messages that arrived while busy (drained at run end — mirrors
-/// cc-connect engine.go's `queueMessageForBusySession`), and the cancel token
-/// of the in-flight run (if any) so `/stop` can reach it without waiting in
-/// the queue.
+/// cc-connect engine.go's `queueMessageForBusySession`), the cancel token of
+/// the in-flight run (if any) so `/stop` can reach it without waiting in the
+/// queue, and the chat's one parked ask (if any) — issue #458's
+/// approval/question relay.
 #[derive(Default)]
 struct ChatState {
     busy: bool,
     queue: VecDeque<(Arc<dyn Platform>, InboundMessage)>,
     cancel_token: Option<CancellationToken>,
+    /// The chat's single in-flight pending question, if the current run is
+    /// paused on one (issue #458: "one parked ask per chat").
+    pending_ask: Option<ParkedAsk>,
+    /// Resolver for `pending_ask`, held by the render task
+    /// (`ConnectBridge::render_until_settled`) that's waiting on it.
+    /// `handle_inbound`/`handle_callback` push a resolution here instead of
+    /// queuing a matching reply — this is what lets an answer "jump" the
+    /// busy queue while the run is genuinely suspended waiting for exactly
+    /// this. Buffered at 1 so a resolver can send without the render task
+    /// having reached its `recv().await` yet.
+    ask_resolution: Option<mpsc::Sender<AskResolution>>,
+}
+
+/// What resolved (or invalidated) a chat's parked ask.
+#[derive(Debug, Clone)]
+enum AskResolution {
+    /// A button press or text reply matched the parked ask; submit this as
+    /// the answer.
+    Answer(String),
+    /// `/new`, session rotation, or an explicit clear invalidated the ask
+    /// before it was answered — the waiting render task must stop rendering
+    /// this (now-abandoned) run rather than hang forever.
+    Invalidated,
 }
 
 /// Resolved model/prompt/workspace configuration for a connect-driven run,
@@ -133,10 +164,17 @@ fn resolve_connect_run_config(
 /// Builds a fresh session for a connect chat key. Mirrors
 /// `schedule_app::session_factory::create_schedule_session`.
 ///
-/// Sets `no_human_approver` (like a scheduled run): approvals/buttons are a
-/// later phase of epic #447 (#452 is text-only), so there is no channel to
-/// answer a gated-tool prompt yet — without this flag a gated action would
-/// hang waiting on an approver that can never respond.
+/// `no_human_approver = false` (issue #458, flipped from phase 1's `true`): a
+/// connect-bridged chat now HAS a human attached — the ConnectBridge itself,
+/// relaying questions/approvals to and from the chat platform — so gated
+/// actions and pending questions should escalate normally rather than being
+/// tagged "no interactive approver available" (that tag only actually
+/// changes behavior for out-of-process sub-agent workers routing to an
+/// off-loop model reviewer — see `subagent_worker`'s `ApprovalProxy`; an
+/// in-process run like this one was never auto-decided by it, so this flip
+/// is a correctness/semantics fix for anything that reads the flag — e.g.
+/// child-session inheritance — rather than a change to THIS run's own pause
+/// behavior).
 fn create_connect_session(
     key: &str,
     model: &str,
@@ -170,7 +208,7 @@ fn create_connect_session(
     session
         .agent_runtime_state
         .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-        .no_human_approver = true;
+        .no_human_approver = false;
     session
 }
 
@@ -202,10 +240,28 @@ pub struct ConnectBridge {
     /// single `HashSet::insert`, never held across an `.await`.
     seen_message_ids: StdMutex<HashSet<String>>,
     process_start: DateTime<Utc>,
+    /// The resolution seam (issue #458): `submit_pending_response` +
+    /// `resume_session_execution`, or a fake in tests.
+    responder: Arc<dyn Responder>,
 }
 
 impl ConnectBridge {
+    /// Production constructor: wires up `approvals::EngineResponder` (the
+    /// in-proc respond+resume path) automatically. See [`Self::with_responder`]
+    /// for injecting a fake in tests.
     pub fn new(ctx: ConnectContext, map_path: Option<PathBuf>) -> Self {
+        let responder = Arc::new(approvals::EngineResponder::new(ctx.clone()));
+        Self::with_responder(ctx, map_path, responder)
+    }
+
+    /// Test/advanced constructor: inject a [`Responder`] seam instead of the
+    /// production `EngineResponder` (issue #458: "Design a small Responder
+    /// seam on the bridge so tests inject a fake instead of full AppState").
+    pub fn with_responder(
+        ctx: ConnectContext,
+        map_path: Option<PathBuf>,
+        responder: Arc<dyn Responder>,
+    ) -> Self {
         Self {
             ctx,
             session_map: TokioRwLock::new(HashMap::new()),
@@ -213,6 +269,7 @@ impl ConnectBridge {
             chat_state: AsyncMutex::new(HashMap::new()),
             seen_message_ids: StdMutex::new(HashSet::new()),
             process_start: Utc::now(),
+            responder,
         }
     }
 
@@ -252,12 +309,76 @@ impl ConnectBridge {
         self.persist_session_map().await;
     }
 
+    /// Rotates the chat's session mapping (`/new`). Also invalidates any
+    /// parked ask first (issue #458: "`/new` and session rotation invalidate
+    /// parked asks") — an ask answered after its session has been rotated
+    /// away would resolve a question nobody can see anymore.
     async fn rotate_session(&self, key: &str) {
+        self.invalidate_pending_ask(key).await;
         {
             let mut map = self.session_map.write().await;
             map.remove(key);
         }
         self.persist_session_map().await;
+    }
+
+    /// Whether `key`'s chat currently has a parked ask awaiting resolution.
+    async fn has_pending_ask(&self, key: &str) -> bool {
+        self.chat_state
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(|state| state.pending_ask.is_some())
+    }
+
+    /// If `key` has a parked ask AND `resolve` matches it, atomically clears
+    /// the parked ask + its resolver (so a concurrent duplicate resolution —
+    /// e.g. a button press racing a text reply — finds nothing left to
+    /// match) and returns the answer plus the channel to notify the waiting
+    /// render task on. `resolve` runs while holding the chat-state lock, so
+    /// it must be cheap and non-async (pure pattern matching against the
+    /// parked ask — see `approvals::match_text_answer`/`match_callback_data`).
+    async fn try_resolve_pending_ask(
+        &self,
+        key: &str,
+        resolve: impl FnOnce(&ParkedAsk) -> Option<String>,
+    ) -> Option<(String, mpsc::Sender<AskResolution>)> {
+        let mut guard = self.chat_state.lock().await;
+        let state = guard.get_mut(key)?;
+        let ask_ref = state.pending_ask.as_ref()?;
+        let answer = resolve(ask_ref)?;
+        let sender = state.ask_resolution.take()?;
+        state.pending_ask = None;
+        Some((answer, sender))
+    }
+
+    /// Clears `key`'s parked ask (if any) and wakes its waiting render task
+    /// with [`AskResolution::Invalidated`] instead of an answer.
+    async fn invalidate_pending_ask(&self, key: &str) {
+        let sender = {
+            let mut guard = self.chat_state.lock().await;
+            match guard.get_mut(key) {
+                Some(state) => {
+                    state.pending_ask = None;
+                    state.ask_resolution.take()
+                }
+                None => None,
+            }
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(AskResolution::Invalidated).await;
+        }
+    }
+
+    /// Clears `key`'s parked ask + resolver without sending a resolution —
+    /// used once a render task has already consumed one (whether an answer
+    /// or an invalidation) so a stale entry never lingers.
+    async fn clear_pending_ask(&self, key: &str) {
+        let mut guard = self.chat_state.lock().await;
+        if let Some(state) = guard.get_mut(key) {
+            state.pending_ask = None;
+            state.ask_resolution = None;
+        }
     }
 
     async fn persist_session_map(&self) {
@@ -355,6 +476,30 @@ impl ConnectBridge {
             return;
         }
 
+        // Ask-resolution fast path (issue #458): a parked ask takes priority
+        // over normal busy/queue routing, even while `busy` is still true —
+        // the run backing it is genuinely suspended waiting for exactly this
+        // reply, so it must never sit behind the FIFO queue. A non-matching
+        // reply on a CLOSED ask (no free text allowed) falls through to the
+        // normal busy/queue handling below, exactly like any other message.
+        if let Some((answer, sender)) = self
+            .try_resolve_pending_ask(&key, |ask| approvals::match_text_answer(ask, &msg.text))
+            .await
+        {
+            let _ = sender.send(AskResolution::Answer(answer)).await;
+            return;
+        }
+
+        // `/new` is always an immediate escape hatch out of a parked ask
+        // (bypassing the queue, which would never drain while the chat waits
+        // on an answer nobody typed correctly) — the ordinary `/new` path in
+        // `process_one` still handles the non-paused case unchanged.
+        if command.eq_ignore_ascii_case("/new") && self.has_pending_ask(&key).await {
+            self.rotate_session(&key).await;
+            reply_text(&platform, &msg.reply_ctx, "Started a new session.").await;
+            return;
+        }
+
         let mut guard = self.chat_state.lock().await;
         let state = guard.entry(key.clone()).or_default();
         if state.busy {
@@ -406,6 +551,71 @@ impl ConnectBridge {
         }
     }
 
+    /// Entry point for every inbound button-press callback (issue #458).
+    /// Unlike text messages, a callback NEVER queues and NEVER starts a run —
+    /// it can only ever resolve (or fail to resolve) the chat's parked ask.
+    /// Per the design constraint, the platform is ALWAYS acked
+    /// (`answer_callback`), even for a stale/forged/non-matching one, and a
+    /// non-match is dropped silently rather than ever being forwarded as
+    /// user text.
+    pub async fn handle_callback(
+        self: Arc<Self>,
+        platform: Arc<dyn Platform>,
+        allow_from: Vec<String>,
+        callback: CallbackQuery,
+    ) {
+        if !allow_from
+            .iter()
+            .any(|allowed| allowed == &callback.user_id)
+        {
+            tracing::warn!(
+                platform = %callback.platform,
+                chat_id = %callback.chat_id,
+                user_id = %callback.user_id,
+                "connect: rejected callback query — user not in allow_from"
+            );
+            let _ = platform
+                .answer_callback(&callback.callback_query_id, None)
+                .await;
+            return;
+        }
+
+        let key = SessionKey {
+            platform: callback.platform.clone(),
+            chat_id: callback.chat_id.clone(),
+            user_id: callback.user_id.clone(),
+        }
+        .as_string();
+
+        let resolved = self
+            .try_resolve_pending_ask(&key, |ask| {
+                approvals::match_callback_data(ask, &callback.data)
+            })
+            .await;
+
+        match resolved {
+            Some((answer, sender)) => {
+                let _ = platform
+                    .answer_callback(&callback.callback_query_id, None)
+                    .await;
+                let _ = sender.send(AskResolution::Answer(answer)).await;
+            }
+            None => {
+                tracing::debug!(
+                    platform = %callback.platform,
+                    chat_id = %callback.chat_id,
+                    "connect: dropping stale/forged callback_data"
+                );
+                let _ = platform
+                    .answer_callback(
+                        &callback.callback_query_id,
+                        Some("This action has expired."),
+                    )
+                    .await;
+            }
+        }
+    }
+
     async fn process_one(&self, key: &str, platform: Arc<dyn Platform>, msg: InboundMessage) {
         let command = strip_command_suffix(msg.text.trim());
         if command.eq_ignore_ascii_case("/new") {
@@ -430,12 +640,28 @@ impl ConnectBridge {
                 .get(key)
                 .and_then(|state| state.cancel_token.clone())
         };
-        match token {
-            Some(token) => {
+        // A run paused on a parked ask has no live task for `cancel_token` to
+        // reach (the round that produced the question already returned) — an
+        // ask invalidation is what actually unblocks
+        // `render_until_settled`'s wait in that case.
+        let had_pending_ask = self.has_pending_ask(key).await;
+        if had_pending_ask {
+            self.invalidate_pending_ask(key).await;
+        }
+        match (token, had_pending_ask) {
+            (Some(token), _) => {
                 token.cancel();
                 reply_text(platform, reply_ctx, "Stopping the current run…").await;
             }
-            None => {
+            (None, true) => {
+                reply_text(
+                    platform,
+                    reply_ctx,
+                    "Stopped — the pending question was cancelled.",
+                )
+                .await;
+            }
+            (None, false) => {
                 reply_text(platform, reply_ctx, "Nothing is running.").await;
             }
         }
@@ -608,9 +834,104 @@ impl ConnectBridge {
             on_complete: None,
         });
 
-        render::stream_execution(platform, reply_ctx.clone(), rx).await;
+        self.render_until_settled(key, platform, reply_ctx.clone(), &session_id, rx)
+            .await;
 
         self.clear_cancel_token(key).await;
+    }
+
+    /// Renders one run to completion, looping back for as many
+    /// pause/answer/resume cycles as it takes to reach a genuinely terminal
+    /// state (issue #458). On [`render::RunOutcome::Paused`]: parks the ask,
+    /// renders it (buttons when the platform supports them, always also a
+    /// numbered text list), and waits for a resolution pushed by
+    /// `handle_inbound`'s ask-resolution fast path or `handle_callback` —
+    /// or an invalidation from `/new`/rotation/`/stop`. A resolved answer is
+    /// submitted through `self.responder`, which mirrors
+    /// `POST /sessions/{id}/respond`'s exact resolve-then-resume sequence;
+    /// the resumed run's fresh broadcast receiver is looped back into
+    /// another `render::stream_execution` call — together with the streaming
+    /// renderer's carried-over [`render::StreamState`] — so the SAME chat
+    /// keeps watching the SAME (now-continuing) run in the SAME status
+    /// message (one "⏳ Working…" bubble per run, no matter how many times it
+    /// pauses).
+    async fn render_until_settled(
+        &self,
+        key: &str,
+        platform: Arc<dyn Platform>,
+        reply_ctx: ReplyCtx,
+        session_id: &str,
+        mut rx: broadcast::Receiver<AgentEvent>,
+    ) {
+        let mut stream_state: Option<Box<render::StreamState>> = None;
+        loop {
+            match render::stream_execution(
+                platform.clone(),
+                reply_ctx.clone(),
+                rx,
+                stream_state.take(),
+            )
+            .await
+            {
+                render::RunOutcome::Terminal => return,
+                render::RunOutcome::Paused {
+                    ask,
+                    stream_state: paused_state,
+                } => {
+                    stream_state = paused_state;
+                    let caps = platform.capabilities();
+                    let parked =
+                        ParkedAsk::new(approvals::new_nonce(), session_id.to_string(), &ask);
+
+                    if let Err(error) =
+                        approvals::render_ask(&platform, &reply_ctx, &parked, caps.buttons).await
+                    {
+                        tracing::warn!("connect: failed to render pending ask: {error}");
+                    }
+
+                    let (ask_tx, mut ask_rx) = mpsc::channel(1);
+                    {
+                        let mut guard = self.chat_state.lock().await;
+                        let state = guard.entry(key.to_string()).or_default();
+                        state.pending_ask = Some(parked);
+                        state.ask_resolution = Some(ask_tx);
+                    }
+
+                    match ask_rx.recv().await {
+                        Some(AskResolution::Answer(answer)) => {
+                            match self.responder.respond_and_resume(session_id, answer).await {
+                                Ok(RespondAndResumeOutcome::Resumed(new_rx)) => {
+                                    rx = new_rx;
+                                    continue;
+                                }
+                                Ok(RespondAndResumeOutcome::NotResumed(reason)) => {
+                                    reply_text(&platform, &reply_ctx, format!("({reason})")).await;
+                                    return;
+                                }
+                                Err(error) => {
+                                    reply_text(
+                                        &platform,
+                                        &reply_ctx,
+                                        format!("Failed to record your answer: {error}"),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
+                        Some(AskResolution::Invalidated) | None => {
+                            // Already cleared by the invalidator in the
+                            // common case; clear defensively so a stale entry
+                            // never lingers if the sender was dropped instead
+                            // (e.g. a bug elsewhere) rather than sending
+                            // `Invalidated` explicitly.
+                            self.clear_pending_ask(key).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -646,17 +967,35 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     /// mpsc-backed fake `Platform` (per issue #452's test spec): records every
-    /// `reply()` call instead of talking to a real IM API.
+    /// `reply()`/`edit()`/`answer_callback()` call instead of talking to a
+    /// real IM API. `capabilities` is configurable (issue #458 tests need
+    /// buttons+edit_message; the original #452 tests want the all-`false`
+    /// default).
     struct FakePlatform {
         label: String,
+        capabilities: super::super::platform::Capabilities,
         sent: TokioMutex<Vec<String>>,
+        sent_messages: TokioMutex<Vec<OutboundMessage>>,
+        edits: TokioMutex<Vec<String>>,
+        answered_callbacks: TokioMutex<Vec<(String, Option<String>)>>,
     }
 
     impl FakePlatform {
         fn new(label: &str) -> Arc<Self> {
+            Self::with_capabilities(label, Default::default())
+        }
+
+        fn with_capabilities(
+            label: &str,
+            capabilities: super::super::platform::Capabilities,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 label: label.to_string(),
+                capabilities,
                 sent: TokioMutex::new(Vec::new()),
+                sent_messages: TokioMutex::new(Vec::new()),
+                edits: TokioMutex::new(Vec::new()),
+                answered_callbacks: TokioMutex::new(Vec::new()),
             })
         }
 
@@ -671,11 +1010,11 @@ mod tests {
             &self.label
         }
         fn capabilities(&self) -> super::super::platform::Capabilities {
-            Default::default()
+            self.capabilities
         }
         async fn start(
             &self,
-            _inbound: tokio::sync::mpsc::Sender<InboundMessage>,
+            _inbound: tokio::sync::mpsc::Sender<super::super::platform::Inbound>,
         ) -> super::super::platform::PlatformResult<()> {
             Ok(())
         }
@@ -684,18 +1023,125 @@ mod tests {
             _ctx: &ReplyCtx,
             msg: OutboundMessage,
         ) -> super::super::platform::PlatformResult<super::super::platform::MessageRef> {
-            self.sent.lock().await.push(msg.text);
+            self.sent.lock().await.push(msg.text.clone());
+            self.sent_messages.lock().await.push(msg);
             Ok(super::super::platform::MessageRef(serde_json::Value::Null))
         }
         async fn edit(
             &self,
             _msg_ref: &super::super::platform::MessageRef,
-            _new: OutboundMessage,
+            new: OutboundMessage,
         ) -> super::super::platform::PlatformResult<()> {
+            self.edits.lock().await.push(new.text);
+            Ok(())
+        }
+        async fn answer_callback(
+            &self,
+            callback_query_id: &str,
+            text: Option<&str>,
+        ) -> super::super::platform::PlatformResult<()> {
+            self.answered_callbacks
+                .lock()
+                .await
+                .push((callback_query_id.to_string(), text.map(str::to_string)));
             Ok(())
         }
         async fn stop(&self) -> super::super::platform::PlatformResult<()> {
             Ok(())
+        }
+    }
+
+    /// Fake [`Responder`] (issue #458: "tests inject a fake instead of full
+    /// AppState"): records every submitted answer and hands back a
+    /// broadcast receiver subscribed to a test-controlled sender, so a test
+    /// can drive the "resumed run" by sending events directly.
+    struct FakeResponder {
+        calls: TokioMutex<Vec<(String, String)>>,
+        resume_sender: broadcast::Sender<AgentEvent>,
+        fail_with: Option<String>,
+    }
+
+    impl FakeResponder {
+        fn new(resume_sender: broadcast::Sender<AgentEvent>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: TokioMutex::new(Vec::new()),
+                resume_sender,
+                fail_with: None,
+            })
+        }
+
+        fn failing(resume_sender: broadcast::Sender<AgentEvent>, reason: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: TokioMutex::new(Vec::new()),
+                resume_sender,
+                fail_with: Some(reason.to_string()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Responder for FakeResponder {
+        async fn respond_and_resume(
+            &self,
+            session_id: &str,
+            answer: String,
+        ) -> Result<RespondAndResumeOutcome, super::super::approvals::ResponderError> {
+            self.calls
+                .lock()
+                .await
+                .push((session_id.to_string(), answer));
+            if let Some(reason) = &self.fail_with {
+                return Err(super::super::approvals::ResponderError::Other(
+                    reason.clone(),
+                ));
+            }
+            Ok(RespondAndResumeOutcome::Resumed(
+                self.resume_sender.subscribe(),
+            ))
+        }
+    }
+
+    /// Polls `bridge`'s internal chat state until `key` has a parked ask (or
+    /// panics past a 5s deadline) — used to synchronize with
+    /// `render_until_settled`'s pause branch, which parks the ask
+    /// asynchronously.
+    async fn wait_for_parked_ask(bridge: &ConnectBridge, key: &str) -> ParkedAsk {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(ask) = bridge
+                .chat_state
+                .lock()
+                .await
+                .get(key)
+                .and_then(|state| state.pending_ask.clone())
+            {
+                return ask;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ask was never parked for {key}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls until `responder` has recorded at least `count` calls (or panics
+    /// past a 5s deadline) — used to synchronize with
+    /// `FakeResponder::subscribe` actually happening inside
+    /// `render_until_settled`'s spawned task BEFORE a test sends an event on
+    /// the "resumed" broadcast channel (`broadcast::Sender::send` errors with
+    /// zero live subscribers).
+    async fn wait_for_responder_calls(responder: &FakeResponder, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if responder.calls.lock().await.len() >= count {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "responder never reached {count} call(s)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -739,6 +1185,7 @@ mod tests {
             app_data_dir: Some(state.app_data_dir.clone()),
             config: state.config.clone(),
             provider_registry: state.provider_registry.clone(),
+            permission_checker: state.permission_checker.clone(),
         };
         (ctx, dir)
     }
@@ -1017,6 +1464,698 @@ mod tests {
         assert_eq!(
             bridge2.session_id_for_key("k1").await.as_deref(),
             Some("sess-1")
+        );
+    }
+
+    // ---- Issue #458: approval/question relay ----
+
+    fn buttons_and_edit_capabilities() -> super::super::platform::Capabilities {
+        super::super::platform::Capabilities {
+            buttons: true,
+            edit_message: true,
+            images: false,
+            files: false,
+        }
+    }
+
+    fn need_clarification_event(
+        question: &str,
+        options: Vec<&str>,
+        allow_custom: bool,
+    ) -> AgentEvent {
+        AgentEvent::NeedClarification {
+            question: question.to_string(),
+            options: Some(options.into_iter().map(str::to_string).collect()),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("request_permissions".to_string()),
+            allow_custom,
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_run_renders_buttons_with_nonce_and_resolves_via_callback() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        let parked = wait_for_parked_ask(&bridge, &key).await;
+        assert_eq!(
+            parked.options,
+            vec!["Approve".to_string(), "Deny".to_string()]
+        );
+
+        // Buttons were rendered on the ask message, one per option, callback
+        // data carrying the nonce (never raw option text/user text).
+        let sent = platform.sent_messages.lock().await.clone();
+        let ask_message = sent
+            .iter()
+            .find(|message| message.buttons.is_some())
+            .expect("expected a buttoned ask message");
+        let buttons = ask_message.buttons.as_ref().unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0][0].callback_data, format!("{}:0", parked.nonce));
+        assert_eq!(buttons[1][0].callback_data, format!("{}:1", parked.nonce));
+
+        let callback = CallbackQuery {
+            platform: "fake".to_string(),
+            chat_id: "chat1".to_string(),
+            user_id: "u1".to_string(),
+            callback_query_id: "cbq-1".to_string(),
+            data: format!("{}:0", parked.nonce),
+            reply_ctx: reply_ctx.clone(),
+        };
+        ConnectBridge::handle_callback(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            callback,
+        )
+        .await;
+
+        // Wait for `render_until_settled`'s spawned task to have actually
+        // called through to the responder (and thus subscribed to
+        // `resume_tx`) before sending on it — `broadcast::Sender::send`
+        // errors out with zero live subscribers.
+        wait_for_responder_calls(&responder, 1).await;
+
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+
+        assert_eq!(
+            responder.calls.lock().await.as_slice(),
+            &[("sess-1".to_string(), "Approve".to_string())]
+        );
+        assert_eq!(
+            platform.answered_callbacks.lock().await.as_slice(),
+            &[("cbq-1".to_string(), None)]
+        );
+        assert!(!bridge.has_pending_ask(&key).await);
+    }
+
+    #[tokio::test]
+    async fn stale_callback_nonce_is_dropped_and_acked_without_resolving() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        let stale_callback = CallbackQuery {
+            platform: "fake".to_string(),
+            chat_id: "chat1".to_string(),
+            user_id: "u1".to_string(),
+            callback_query_id: "cbq-stale".to_string(),
+            data: "totally-wrong-nonce:0".to_string(),
+            reply_ctx: reply_ctx.clone(),
+        };
+        ConnectBridge::handle_callback(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            stale_callback,
+        )
+        .await;
+
+        // Acked (Telegram-style — always ack), but with an "expired" style
+        // note, and NOT forwarded as an answer.
+        let acked = platform.answered_callbacks.lock().await.clone();
+        assert_eq!(acked.len(), 1);
+        assert_eq!(acked[0].0, "cbq-stale");
+        assert!(acked[0].1.is_some());
+        assert!(responder.calls.lock().await.is_empty());
+        // The real ask is still parked — the stale callback never touched it.
+        assert!(bridge.has_pending_ask(&key).await);
+
+        bridge.invalidate_pending_ask(&key).await;
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn text_answer_resolves_an_open_question() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Anything else?",
+            vec!["OK", "Need changes"],
+            true,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "answer-1", "please also add tests"),
+        )
+        .await;
+
+        // Wait for `render_until_settled`'s spawned task to have actually
+        // called through to the responder (and thus subscribed to
+        // `resume_tx`) before sending on it — `broadcast::Sender::send`
+        // errors out with zero live subscribers.
+        wait_for_responder_calls(&responder, 1).await;
+
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+
+        assert_eq!(
+            responder.calls.lock().await.as_slice(),
+            &[("sess-1".to_string(), "please also add tests".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_ask_keyword_mapping_resolves_via_text() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        // "允许" (allow) is a first-affirmative keyword — resolves to
+        // whichever option reads as approval, NEVER the raw keyword text.
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "answer-1", "允许"),
+        )
+        .await;
+
+        // Wait for `render_until_settled`'s spawned task to have actually
+        // called through to the responder (and thus subscribed to
+        // `resume_tx`) before sending on it — `broadcast::Sender::send`
+        // errors out with zero live subscribers.
+        wait_for_responder_calls(&responder, 1).await;
+
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+
+        assert_eq!(
+            responder.calls.lock().await.as_slice(),
+            &[("sess-1".to_string(), "Approve".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn new_command_invalidates_a_parked_ask_instead_of_answering_it() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        bridge.set_session_id_for_key(&key, "sess-1").await;
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "new-1", "/new"),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+
+        assert!(responder.calls.lock().await.is_empty());
+        assert!(!bridge.has_pending_ask(&key).await);
+        // Session mapping was rotated away, same as an ordinary `/new`.
+        assert!(bridge.session_id_for_key(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn respond_error_reports_to_the_chat_without_hanging() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::failing(resume_tx.clone(), "boom");
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        let parked = wait_for_parked_ask(&bridge, &key).await;
+        let callback = CallbackQuery {
+            platform: "fake".to_string(),
+            chat_id: "chat1".to_string(),
+            user_id: "u1".to_string(),
+            callback_query_id: "cbq-1".to_string(),
+            data: format!("{}:0", parked.nonce),
+            reply_ctx: reply_ctx.clone(),
+        };
+        ConnectBridge::handle_callback(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            callback,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish even when the responder errors")
+            .unwrap();
+
+        let sent = platform.sent_texts().await;
+        assert!(
+            sent.iter()
+                .any(|text| text.contains("Failed to record your answer")),
+            "expected an error report, got: {sent:?}"
+        );
+    }
+
+    /// PR #459 review must-fix: a run that pauses (and resumes) MULTIPLE
+    /// times must keep exactly ONE status message — every resumed segment
+    /// keeps EDITING the original "⏳ Working…" bubble via the carried
+    /// `render::StreamState`, never opening a new one.
+    #[tokio::test]
+    async fn run_that_pauses_twice_keeps_a_single_status_message() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        // Segment 1: text + pause #1.
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(AgentEvent::Token {
+            content: "segment one ".to_string(),
+        })
+        .unwrap();
+        tx.send(need_clarification_event(
+            "First?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        let first_ask = wait_for_parked_ask(&bridge, &key).await;
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "a1", "1"),
+        )
+        .await;
+        wait_for_responder_calls(&responder, 1).await;
+
+        // Segment 2 (first resume): text + pause #2.
+        resume_tx
+            .send(AgentEvent::Token {
+                content: "segment two ".to_string(),
+            })
+            .unwrap();
+        resume_tx
+            .send(need_clarification_event(
+                "Second?",
+                vec!["Approve", "Deny"],
+                false,
+            ))
+            .unwrap();
+
+        // Wait until the SECOND ask is parked (a fresh nonce distinguishes
+        // it from the first, already-resolved one).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let parked = {
+                bridge
+                    .chat_state
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|state| state.pending_ask.clone())
+            };
+            if let Some(ask) = parked {
+                if ask.nonce != first_ask.nonce {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second ask was never parked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "a2", "1"),
+        )
+        .await;
+        wait_for_responder_calls(&responder, 2).await;
+
+        // Segment 3 (second resume): text + Complete.
+        resume_tx
+            .send(AgentEvent::Token {
+                content: "segment three".to_string(),
+            })
+            .unwrap();
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish")
+            .unwrap();
+
+        // Exactly ONE "⏳ Working…" status message across the whole
+        // twice-paused run; the other sends are the two ask messages.
+        let sent = platform.sent_texts().await;
+        let status_count = sent.iter().filter(|text| text.contains('⏳')).count();
+        assert_eq!(
+            status_count, 1,
+            "expected exactly one status bubble, got: {sent:?}"
+        );
+        assert_eq!(sent.len(), 3, "status + 2 asks expected, got: {sent:?}");
+
+        // Edits continued across both resumes: the final ✅ edit carries text
+        // from every segment (the buffer survived both pauses).
+        let edits = platform.edits.lock().await;
+        let last = edits.last().expect("expected a final edit");
+        assert!(last.starts_with('✅'), "final edit not a success: {last}");
+        assert!(last.contains("segment one"));
+        assert!(last.contains("segment two"));
+        assert!(last.contains("segment three"));
+    }
+
+    /// PR #459 review item 3: `/stop` while a run is paused on a parked ask
+    /// (no live cancel token — the round already returned) must invalidate
+    /// the ask, unblock the render task, and reply with the dedicated
+    /// "pending question was cancelled" message (the `(None, true)` branch).
+    #[tokio::test]
+    async fn stop_while_paused_cancels_the_pending_question() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "stop-1", "/stop"),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish after /stop invalidates the ask")
+            .unwrap();
+
+        let sent = platform.sent_texts().await;
+        assert!(
+            sent.iter()
+                .any(|text| text == "Stopped — the pending question was cancelled."),
+            "expected the pending-question-cancelled reply, got: {sent:?}"
+        );
+        assert!(!bridge.has_pending_ask(&key).await);
+        assert!(responder.calls.lock().await.is_empty());
+    }
+
+    /// The `(Some(token), true)` `/stop` branch: a parked ask AND a live
+    /// cancel token (e.g. `/stop` racing the pause) — the token is
+    /// cancelled, the ask is invalidated, and the generic "Stopping the
+    /// current run…" reply is used.
+    #[tokio::test]
+    async fn stop_while_paused_with_live_token_cancels_both() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let token = CancellationToken::new();
+        bridge.set_cancel_token(&key, token.clone()).await;
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Approve?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        wait_for_parked_ask(&bridge, &key).await;
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "stop-1", "/stop"),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("render task must finish after /stop")
+            .unwrap();
+
+        assert!(token.is_cancelled(), "cancel token must be cancelled");
+        assert!(!bridge.has_pending_ask(&key).await);
+        let sent = platform.sent_texts().await;
+        assert!(
+            sent.iter().any(|text| text == "Stopping the current run…"),
+            "expected the stopping reply, got: {sent:?}"
         );
     }
 }

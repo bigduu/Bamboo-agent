@@ -497,6 +497,7 @@ impl AppState {
                 Some(data_dir.clone()),
                 config.clone(),
                 provider_registry.clone(),
+                permission_checker.clone(),
             )
             .await,
         );

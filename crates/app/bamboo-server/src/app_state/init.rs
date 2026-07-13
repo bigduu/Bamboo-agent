@@ -446,6 +446,7 @@ pub async fn build_connect_manager(
     app_data_dir: Option<PathBuf>,
     config: Arc<RwLock<Config>>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+    permission_checker: Arc<PermissionChecker>,
 ) -> crate::connect::ConnectManager {
     let config_snapshot = config.read().await.clone();
     let ctx = crate::connect::ConnectContext {
@@ -458,6 +459,7 @@ pub async fn build_connect_manager(
         app_data_dir: app_data_dir.clone(),
         config,
         provider_registry,
+        permission_checker,
     };
     crate::connect::ConnectManager::start(ctx, &config_snapshot, app_data_dir).await
 }
