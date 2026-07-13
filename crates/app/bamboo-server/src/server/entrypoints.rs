@@ -12,13 +12,12 @@ use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{
     build_cors, build_rate_limiter, build_security_headers, is_loopback_bind,
-    require_limiter_for_nonloopback,
+    require_limiter_for_nonloopback, wrap_governor_and_cors,
 };
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use crate::services::frontend_package::{
     ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
 };
-use actix_governor::Governor;
 use bamboo_config::TlsConfig;
 
 fn canonicalize_static_dir(path: &Path) -> Result<PathBuf, String> {
@@ -284,6 +283,15 @@ pub async fn run_with_bind_and_static_tls(
 ) -> Result<(), String> {
     info!("Starting unified server on {}:{}...", bind, port);
 
+    // Loopback/desktop binds skip the limiter (see is_loopback_bind): the local
+    // frontend bursts ~45 asset requests on load. Network binds stay throttled.
+    let apply_rate_limit = !is_loopback_bind(bind);
+    // Bind-aware guard: a non-loopback bind must have the limiter applied (it is,
+    // below). Defends against a future edit that disables it for a routable bind.
+    // Checked BEFORE the async app-state/static-dir setup so a bad bind fails fast,
+    // consistent with `start_with_bind_tls`. #169, #428.
+    require_limiter_for_nonloopback(bind, apply_rate_limit)?;
+
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, static_dir)?;
 
     let app_state = web::Data::new(
@@ -300,39 +308,31 @@ pub async fn run_with_bind_and_static_tls(
     // once and shared (Clone) across workers. It is wrapped so that a throttled
     // request is rejected with 429 before any handler work runs.
     let rate_limiter = build_rate_limiter();
-    // Loopback/desktop binds skip the limiter (see is_loopback_bind): the local
-    // frontend bursts ~45 asset requests on load. Network binds stay throttled.
-    let apply_rate_limit = !is_loopback_bind(bind);
-    // Bind-aware guard: a non-loopback bind must have the limiter applied (it is
-    // here). Defends against a future edit that disables it for a routable bind. #169.
-    require_limiter_for_nonloopback(bind, apply_rate_limit)?;
     let bind_for_cors = bind.to_string();
     let app_factory = move || {
         // Request size limits (base64-image chats) come from the one shared
         // factory used by every serve path — same limits everywhere, no drift
         // (#252).
-        let mut app = super::web_service::with_body_limits(App::new())
-            .app_data(app_state.clone())
-            // WRAP ORDER (#169 part 2): Governor is registered BEFORE `build_cors`,
-            // making CORS the OUTER layer and Governor the INNER one. This ordering
-            // is load-bearing: (1) a genuine CORS preflight is short-circuited by
-            // CORS and never reaches Governor, so it is not counted against the
-            // bucket; and (2) a 429 from Governor propagates back OUT through CORS,
-            // which adds `Access-Control-Allow-Origin` so a browser receives a
-            // readable 429 instead of an opaque network error. Reversing the two
-            // wraps regresses both (see config.rs `governor_*_cors_*` tests).
-            .wrap(actix_web::middleware::Condition::new(
-                apply_rate_limit,
-                Governor::new(&rate_limiter),
-            ))
-            .wrap(build_cors(&bind_for_cors, port))
-            .wrap(build_security_headers())
-            // Immutable long-cache for hashed `/assets/*` (Docker / `serve -s`
-            // path, fronted by a proxy/CDN — same fix as the other factories).
-            .wrap(actix_web::middleware::from_fn(
-                crate::config::add_asset_cache_headers,
-            ))
-            .configure(configure_routes_with_rate_limiting);
+        // WRAP ORDER (#169 part 2, #428): Governor + CORS are applied together,
+        // in the fixed order enforced by the shared `wrap_governor_and_cors`
+        // helper (Governor inner, CORS outer) — see its doc comment in
+        // config.rs for why the order is load-bearing, and the
+        // `governor_*_cors_*` regression tests there, which exercise this SAME
+        // helper so a swap can no longer regress in only one call site.
+        let mut app = wrap_governor_and_cors(
+            super::web_service::with_body_limits(App::new()).app_data(app_state.clone()),
+            &rate_limiter,
+            apply_rate_limit,
+            &bind_for_cors,
+            port,
+        )
+        .wrap(build_security_headers())
+        // Immutable long-cache for hashed `/assets/*` (Docker / `serve -s`
+        // path, fronted by a proxy/CDN — same fix as the other factories).
+        .wrap(actix_web::middleware::from_fn(
+            crate::config::add_asset_cache_headers,
+        ))
+        .configure(configure_routes_with_rate_limiting);
 
         if let Some(static_path) = &static_dir {
             let index_file = static_path.join("index.html");

@@ -42,10 +42,9 @@ use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{
     build_cors, build_rate_limiter, build_security_headers, is_loopback_bind,
-    require_limiter_for_nonloopback,
+    require_limiter_for_nonloopback, wrap_governor_and_cors,
 };
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
-use actix_governor::Governor;
 use bamboo_config::TlsConfig;
 
 /// Manageable web service with start/stop lifecycle
@@ -194,6 +193,18 @@ impl WebService {
             return Err("Web service is already running".to_string());
         }
 
+        // Per-IP rate limiter (#13) will be applied below for non-loopback binds.
+        // SKIPPED for loopback/desktop binds: the local frontend legitimately
+        // bursts ~45 hashed `/assets/*` requests on load and would otherwise be
+        // throttled to a 429 (chunk import fails / "Too many requests").
+        let apply_rate_limit = !is_loopback_bind(bind);
+        // Bind-aware guard: a non-loopback bind must have the limiter applied
+        // (it is here for non-loopback binds). Belt-and-suspenders against a
+        // future edit that flips `apply_rate_limit` off for a routable bind.
+        // Checked BEFORE the async app-state setup so a bad bind fails fast,
+        // consistent with `start_with_bind_tls`. #169, #428.
+        require_limiter_for_nonloopback(bind, apply_rate_limit)?;
+
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         self.port = port;
 
@@ -215,51 +226,41 @@ impl WebService {
         // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
         self.app_state = Some(app_state.clone());
         // Per-IP rate limiter for the network-exposed production server (#13).
-        // SKIPPED for loopback/desktop binds: the local frontend legitimately
-        // bursts ~45 hashed `/assets/*` requests on load and would otherwise be
-        // throttled to a 429 (chunk import fails / "Too many requests").
         let rate_limiter = build_rate_limiter();
-        let apply_rate_limit = !is_loopback_bind(bind);
-        // Bind-aware guard: a non-loopback bind must have the limiter applied
-        // (it is here for non-loopback binds). Belt-and-suspenders against a
-        // future edit that flips `apply_rate_limit` off for a routable bind. #169.
-        require_limiter_for_nonloopback(bind, apply_rate_limit)?;
         let bind_addr = bind.to_string();
         let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
 
         let server = HttpServer::new(move || {
-            with_body_limits(App::new())
-                .app_data(app_state.clone())
-                // WRAP ORDER (#169 part 2): Governor is registered BEFORE `build_cors`,
-                // so CORS is the OUTER layer and Governor the INNER one. This is
-                // load-bearing: (1) a genuine CORS preflight is answered by CORS and
-                // never reaches Governor, so it isn't counted against the bucket; and
-                // (2) a 429 from Governor propagates back OUT through CORS, which adds
-                // `Access-Control-Allow-Origin` so a browser sees a readable 429 rather
-                // than an opaque network error. Reversing these two wraps regresses both
-                // (see the config.rs `governor_inside_cors_*` / `governor_outside_cors_*`
-                // tests).
-                .wrap(actix_web::middleware::Condition::new(
-                    apply_rate_limit,
-                    Governor::new(&rate_limiter),
-                ))
-                .wrap(build_cors(&bind_addr, port))
-                .wrap(build_security_headers())
-                // Immutable long-cache for hashed `/assets/*` so a proxy/CDN
-                // (e.g. Cloudflare tunnel) caches chunks at the edge instead of
-                // round-tripping each one to origin (#preload-error fix).
-                .wrap(actix_web::middleware::from_fn(
-                    crate::config::add_asset_cache_headers,
-                ))
-                .configure(configure_routes_with_rate_limiting)
-                .service(
-                    fs::Files::new("/", static_dir.clone())
-                        .index_file("index.html")
-                        .prefer_utf8(true)
-                        .disable_content_disposition()
-                        .disable_content_disposition(),
-                )
+            // WRAP ORDER (#169 part 2, #428): Governor + CORS are applied
+            // together, in the fixed order enforced by the shared
+            // `wrap_governor_and_cors` helper (Governor inner, CORS outer) —
+            // see its doc comment in config.rs for why the order is
+            // load-bearing, and the `governor_*_cors_*` regression tests
+            // there, which exercise this SAME helper so a swap can no longer
+            // regress in only one call site.
+            wrap_governor_and_cors(
+                with_body_limits(App::new()).app_data(app_state.clone()),
+                &rate_limiter,
+                apply_rate_limit,
+                &bind_addr,
+                port,
+            )
+            .wrap(build_security_headers())
+            // Immutable long-cache for hashed `/assets/*` so a proxy/CDN
+            // (e.g. Cloudflare tunnel) caches chunks at the edge instead of
+            // round-tripping each one to origin (#preload-error fix).
+            .wrap(actix_web::middleware::from_fn(
+                crate::config::add_asset_cache_headers,
+            ))
+            .configure(configure_routes_with_rate_limiting)
+            .service(
+                fs::Files::new("/", static_dir.clone())
+                    .index_file("index.html")
+                    .prefer_utf8(true)
+                    .disable_content_disposition()
+                    .disable_content_disposition(),
+            )
         })
         .workers(DEFAULT_WORKER_COUNT);
 

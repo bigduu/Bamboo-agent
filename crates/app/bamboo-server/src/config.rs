@@ -22,12 +22,13 @@
 use actix_cors::Cors;
 use actix_governor::governor::middleware::NoOpMiddleware;
 use actix_governor::{
-    GovernorConfig, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError,
+    Governor, GovernorConfig, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError,
 };
 use actix_web::body::MessageBody;
-use actix_web::dev::{ServiceRequest, ServiceResponse};
+use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::http::header;
-use actix_web::middleware::{DefaultHeaders, Next};
+use actix_web::middleware::{Condition, DefaultHeaders, Next};
+use actix_web::App;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use tracing::info;
@@ -214,8 +215,29 @@ pub fn build_rate_limiter() -> GovernorConfig<ClientIpKeyExtractor, NoOpMiddlewa
 /// hashed `/assets/*` requests on load and would otherwise trip the 429 limit
 /// (`burst` default 20). Mirrors the loopback special-casing already used for
 /// CORS; network binds (`0.0.0.0`) are still throttled.
+///
+/// Classification is via [`IpAddr::is_loopback`] (so the whole `127.0.0.0/8`
+/// range, not just `127.0.0.1`, and a bracketed IPv6 literal like `[::1]` are
+/// correctly recognized) plus a literal `"localhost"` match, since that's a
+/// hostname rather than an address `IpAddr` can parse. #428: previously this
+/// was a strict string allowlist (`127.0.0.1` / `localhost` / `::1`), so e.g.
+/// `127.0.0.2` or `[::1]` were misclassified as non-loopback — which failed
+/// SAFE (the limiter was applied) but was still wrong.
 pub fn is_loopback_bind(bind: &str) -> bool {
-    matches!(bind, "127.0.0.1" | "localhost" | "::1")
+    let candidate = bind.trim();
+    let unbracketed = candidate
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(candidate);
+
+    if unbracketed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    unbracketed
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Bind-aware limiter guard (#169 part 3).
@@ -744,6 +766,59 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
     cors
 }
 
+/// Apply the Governor (rate limiter) + CORS middleware pair to `app`, IN THE
+/// ORDER THAT MATTERS (#169 part 2, #428).
+///
+/// Governor is wrapped first (the INNER layer) and `build_cors` second (the
+/// OUTER layer). This ordering is load-bearing: (1) a genuine CORS preflight
+/// is short-circuited by CORS and never reaches Governor, so it isn't counted
+/// against the rate-limit bucket; and (2) a 429 from Governor propagates back
+/// OUT through CORS, which adds `Access-Control-Allow-Origin` so a browser
+/// receives a readable 429 instead of an opaque network error. Reversing the
+/// two wraps regresses both (see the `governor_inside_cors_*` /
+/// `governor_outside_cors_regression_*` tests below).
+///
+/// This is the ONE place the wrap order is spelled out — every production app
+/// factory (`entrypoints.rs`, `web_service.rs`) AND the ordering-invariant
+/// regression tests call this helper instead of each re-declaring the two
+/// `.wrap()` calls inline. That means a future edit can no longer swap the
+/// order in just one of those call sites without also changing this function,
+/// and changing this function is exactly what the regression tests cover
+/// (#428 — prior to this, the tests built their own hand-rolled `App` with the
+/// order spelled out separately from production, so a production-only swap
+/// would NOT have failed them).
+pub fn wrap_governor_and_cors<T, B>(
+    app: App<T>,
+    rate_limiter: &GovernorConfig<ClientIpKeyExtractor, NoOpMiddleware>,
+    apply_rate_limit: bool,
+    bind_addr: &str,
+    port: u16,
+) -> App<
+    impl ServiceFactory<
+        ServiceRequest,
+        Config = (),
+        Response = ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+>
+where
+    T: ServiceFactory<
+            ServiceRequest,
+            Config = (),
+            Response = ServiceResponse<B>,
+            Error = actix_web::Error,
+            InitError = (),
+        > + 'static,
+    B: MessageBody + 'static,
+{
+    app.wrap(Condition::new(
+        apply_rate_limit,
+        Governor::new(rate_limiter),
+    ))
+    .wrap(build_cors(bind_addr, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +843,16 @@ mod tests {
         }
         for b in ["0.0.0.0", "192.168.1.10", "::"] {
             assert!(!is_loopback_bind(b), "{b} should be throttled");
+        }
+    }
+
+    #[test]
+    fn loopback_binds_recognizes_full_loopback_range_and_bracketed_ipv6() {
+        // #428: a strict `127.0.0.1`/`localhost`/`::1` string allowlist
+        // misclassifies other loopback forms as non-loopback (failing safe,
+        // but wrong). Classifying via `IpAddr::is_loopback` fixes it.
+        for b in ["127.0.0.2", "127.255.255.255", "[::1]", "LOCALHOST"] {
+            assert!(is_loopback_bind(b), "{b} is a loopback address/host");
         }
     }
 
@@ -1055,13 +1140,19 @@ mod tests {
         }};
     }
 
-    /// The production order (`.wrap(Governor).wrap(build_cors(...))` → Governor
-    /// INSIDE CORS) must give a browser a READABLE 429: the throttled response
-    /// carries `Access-Control-Allow-Origin`, and a CORS preflight is NOT counted
+    /// The production order — enforced by the shared [`wrap_governor_and_cors`]
+    /// helper (Governor inner, CORS outer) and used by BOTH the real app
+    /// factories (`entrypoints.rs`, `web_service.rs`) and this test — must give
+    /// a browser a READABLE 429: the throttled response carries
+    /// `Access-Control-Allow-Origin`, and a CORS preflight is NOT counted
     /// against the bucket (CORS answers it before it reaches Governor).
+    ///
+    /// Because this test calls the SAME helper the production factories call
+    /// (rather than hand-rolling the wrap order itself, #428), a future edit
+    /// that swaps the wrap order in `wrap_governor_and_cors` — the only place
+    /// production spells the order out — fails this test.
     #[actix_web::test]
     async fn governor_inside_cors_makes_429_cors_readable_and_exempts_preflight() {
-        use actix_governor::Governor;
         use actix_web::http::StatusCode;
         use actix_web::{test, web, App, HttpResponse};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1069,10 +1160,14 @@ mod tests {
         // burst=1: the 2nd GET from an IP is throttled.
         let conf = rate_limiter_config(1, 1, ClientIpKeyExtractor::peer_ip());
         let app = test::init_service(
-            App::new()
-                .wrap(Governor::new(&conf)) // inner
-                .wrap(build_cors("0.0.0.0", 9562)) // outer
-                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+            wrap_governor_and_cors(
+                App::new(),
+                &conf,
+                /* apply_rate_limit */ true,
+                "0.0.0.0",
+                9562,
+            )
+            .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
         )
         .await;
 
@@ -1100,9 +1195,11 @@ mod tests {
     /// Guards the ordering as load-bearing: the REVERSED order
     /// (`.wrap(build_cors).wrap(Governor)` → Governor OUTSIDE CORS) is the pre-fix
     /// state that motivated #169 — a 429 escapes without CORS headers and the
-    /// preflight is throttled. If a refactor ever flips the wrap order back, the
-    /// positive test above breaks; this test documents *why* by asserting the
-    /// broken behavior of the wrong order.
+    /// preflight is throttled. If a refactor ever flips the wrap order back
+    /// inside [`wrap_governor_and_cors`], the positive test above breaks; this
+    /// test intentionally does NOT use that helper — it hand-rolls the WRONG
+    /// order to document *why* the order matters, by asserting the broken
+    /// behavior that would result.
     #[actix_web::test]
     async fn governor_outside_cors_regression_drops_cors_and_throttles_preflight() {
         use actix_governor::Governor;
