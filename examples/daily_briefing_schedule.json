@@ -1,0 +1,9 @@
+{
+  "name": "daily-briefing",
+  "trigger": { "type": "daily", "hour": 8, "minute": 0 },
+  "enabled": true,
+  "run_config": {
+    "task_message": "You are the user's personal assistant delivering the morning briefing. 1) Call the `ledger` tool with {\"action\": \"agenda\"} to get today's agenda (overdue, next 24 hours, upcoming, undated). 2) Compose a short, scannable briefing: overdue items first (oldest first), then what's due or starts today, then notable upcoming items — title plus time, a handful of lines per section, no filler. If everything is quiet, say so in one sentence. 3) Send the briefing to the user with the `notify` tool (short title like 'Morning briefing', the summary as the body). Do not create, modify, or complete any ledger records during this run.",
+    "auto_execute": true
+  }
+}

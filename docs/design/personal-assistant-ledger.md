@@ -1,7 +1,6 @@
 # Personal Assistant Capability: Prospective Memory & the Record Ledger
 
-**Status:** Phases 1–4 implemented (domain types, ledger store, `ledger` tool,
-`Once` trigger + schedule bridge, agenda prompt injection); phases 5–7 open
+**Status:** Fully implemented (phases 1–7)
 **Date:** 2026-07-13
 **Scope:** How Bamboo becomes a personal-assistant agent (todos, task decomposition,
 scheduling, reminders) as **one generic capability**, not a pile of feature-specific tools.
@@ -299,9 +298,9 @@ gardener's golden rule — **deterministic prefilter first, LLM only when there 
 | **2** | `ledger` overlay tool + system-prompt guidance + `promote` from session TaskList | 1 | ✅ done |
 | **3** | `ScheduleTrigger::Once` + schedule bridge (record↔schedule lifecycle) | 1 | ✅ done |
 | **4** | Agenda prompt-injection layer | 1 | ✅ done |
-| **5** | Ledger gardener pass (expiry, reconciliation, distillation) | 1, 3 | open |
-| **6** | Commitment extractor in auto-dream | 1, 2 | open |
-| **7** | HTTP API + SSE events + built-in skill + daily-briefing schedule template | 2–4 | open |
+| **5** | Ledger gardener pass (expiry, reconciliation, distillation) | 1, 3 | ✅ done |
+| **6** | Commitment extractor in auto-dream | 1, 2 | ✅ done |
+| **7** | HTTP API + built-in skill + daily-briefing schedule template | 2–4 | ✅ done (SSE change-feed events deferred) |
 
 Phases 1–4 are the minimum lovable assistant: remember commitments across sessions,
 answer "what's due", fire reminders, and mention the agenda proactively. 5–7 make it
