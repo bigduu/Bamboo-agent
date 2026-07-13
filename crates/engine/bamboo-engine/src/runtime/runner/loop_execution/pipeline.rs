@@ -322,10 +322,20 @@ async fn maybe_suspend_for_outstanding_bash(
 }
 
 /// Build the guardian reviewer's task brief: the static rubric plus the active
-/// task's completion criteria and the session goal, when present.
+/// task's completion criteria, the session goal, and (issue #400) the agent's
+/// own final assistant message, when present.
+///
+/// `final_assistant_content` is READ-ONLY review context: it is folded into
+/// the prompt text handed to the spawned reviewer, but the caller must NOT
+/// have already persisted it into the session transcript that the reviewer
+/// child forks (see [`maybe_spawn_guardian_review`] and
+/// `handle_no_tool_calls`'s no-goal-loop deferral) — otherwise the reviewer
+/// would see the same content twice. Blank/whitespace-only content is treated
+/// as absent so an empty final turn never adds a stray, empty section.
 fn build_guardian_review_prompt(
     task_context: &Option<TaskLoopContext>,
     config: &AgentLoopConfig,
+    final_assistant_content: Option<&str>,
 ) -> String {
     let mut prompt = String::from(GUARDIAN_REVIEW_RUBRIC);
 
@@ -357,6 +367,25 @@ fn build_guardian_review_prompt(
             "\n\n(No explicit completion criteria or goal were provided; review the diff for correctness, completeness, and obvious bugs.)\n",
         );
     }
+
+    // Issue #400: the agent's own final assistant turn (its summary/handoff)
+    // is not always visible in the forked transcript the reviewer child sees
+    // — in the no-goal-loop configuration it is intentionally deferred out of
+    // the parent session until AFTER the guardian gate, to avoid a resumed
+    // turn re-emitting it (see `handle_no_tool_calls`). Fold it in here as
+    // plain review context so the reviewer still sees what the agent actually
+    // said, without persisting it anywhere.
+    if let Some(content) = final_assistant_content {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            prompt.push_str(
+                "\n\n## Agent's final message (context only — not yet part of the session transcript)\n",
+            );
+            prompt.push_str(trimmed);
+            prompt.push('\n');
+        }
+    }
+
     prompt
 }
 
@@ -372,12 +401,21 @@ fn build_guardian_review_prompt(
 /// verdict); `Reviewed` + approve → complete; `Reviewed` + reject → re-review the
 /// fix until [`GuardianState::budget_exhausted`]. The budget is the hard bound on
 /// the review→fix→review loop, so it always terminates.
+///
+/// `final_assistant_content` (issue #400) is the agent's own final assistant
+/// turn, passed as READ-ONLY review context — folded into the spawned
+/// reviewer's prompt via [`build_guardian_review_prompt`] but never appended
+/// to `session`'s message transcript here. Callers pass `None` when the
+/// content is already present in the transcript the reviewer child forks
+/// (e.g. the goal-loop-active case, which adds the message before this gate
+/// runs), so the reviewer never sees it twice.
 async fn maybe_spawn_guardian_review(
     session: &mut Session,
     config: &AgentLoopConfig,
     task_context: &Option<TaskLoopContext>,
     runtime_state: &mut AgentRuntimeState,
     iteration: u32,
+    final_assistant_content: Option<&str>,
 ) -> Option<TurnOutcome> {
     // Already suspended waiting on a child (orphan gate / explicit wait won).
     if runtime_state.waiting_for_children.is_some() {
@@ -423,7 +461,7 @@ async fn maybe_spawn_guardian_review(
         write_guardian_config(session, guardian_config);
     }
 
-    let review_prompt = build_guardian_review_prompt(task_context, config);
+    let review_prompt = build_guardian_review_prompt(task_context, config, final_assistant_content);
     let Some(model) = config
         .guardian_model()
         .map(str::to_string)
@@ -916,8 +954,26 @@ async fn handle_no_tool_calls(
     // until its verdict returns. `maybe_spawn_guardian_review` returns `Some` when
     // it engages a review (spawn + suspend); it is inert unless a guardian config
     // + spawner are wired (`config.guardian_active()`).
-    if let Some(review) =
-        maybe_spawn_guardian_review(session, config, task_context, runtime_state, iteration).await
+    //
+    // Issue #400: when the assistant message is still deferred (no goal loop —
+    // it was never added to `session` above), hand its content to the guardian
+    // as read-only review context so the reviewer sees the agent's own final
+    // summary/handoff even though the transcript it forks does not contain it
+    // yet. When the message WAS already added (goal loop active), pass `None`
+    // — it is already in the forked transcript, so adding it again here would
+    // duplicate it in the reviewer's context.
+    let final_assistant_content_for_guardian = deferred_assistant_message
+        .as_ref()
+        .map(|message| message.content.as_str());
+    if let Some(review) = maybe_spawn_guardian_review(
+        session,
+        config,
+        task_context,
+        runtime_state,
+        iteration,
+        final_assistant_content_for_guardian,
+    )
+    .await
     {
         // Suspended on the guardian verdict. In the no-goal case the assistant
         // message was intentionally not appended yet (the resumed turn re-emits
@@ -1902,8 +1958,8 @@ fn heuristic_complexity(
 mod tests {
     use super::super::startup::OverflowRecoveryState;
     use super::{
-        is_overflow_recoverable, is_terminal_child_status, map_turn_error_status,
-        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        build_guardian_review_prompt, is_overflow_recoverable, is_terminal_child_status,
+        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
         maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
@@ -1969,7 +2025,7 @@ mod tests {
         let mut runtime_state = AgentRuntimeState::new("s1".to_string());
 
         let outcome =
-            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1)
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1, None)
                 .await
                 .expect("guardian should engage a review and suspend");
 
@@ -1989,11 +2045,16 @@ mod tests {
         let mut session = Session::new("s1", "model");
         let config = AgentLoopConfig::default(); // no guardian config / spawner
         let mut runtime_state = AgentRuntimeState::new("s1".to_string());
-        assert!(
-            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1)
-                .await
-                .is_none()
-        );
+        assert!(maybe_spawn_guardian_review(
+            &mut session,
+            &config,
+            &None,
+            &mut runtime_state,
+            1,
+            None
+        )
+        .await
+        .is_none());
         assert!(runtime_state.waiting_for_children.is_none());
     }
 
@@ -2017,11 +2078,16 @@ mod tests {
         let mut runtime_state = AgentRuntimeState::new("s1".to_string());
         // Skip the review (no spawn, no suspend) rather than spawning a reviewer
         // with an empty model id; the budget is NOT charged.
-        assert!(
-            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 1)
-                .await
-                .is_none()
-        );
+        assert!(maybe_spawn_guardian_review(
+            &mut session,
+            &config,
+            &None,
+            &mut runtime_state,
+            1,
+            None
+        )
+        .await
+        .is_none());
         assert!(runtime_state.waiting_for_children.is_none());
         assert!(
             read_guardian_state(&session).is_none(),
@@ -2040,11 +2106,16 @@ mod tests {
         let config = guardian_enabled_config(2);
         let mut runtime_state = AgentRuntimeState::new("s1".to_string());
         // Reviewed + approved → allow completion (no suspend, no re-spawn).
-        assert!(
-            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 2)
-                .await
-                .is_none()
-        );
+        assert!(maybe_spawn_guardian_review(
+            &mut session,
+            &config,
+            &None,
+            &mut runtime_state,
+            2,
+            None
+        )
+        .await
+        .is_none());
         assert!(runtime_state.waiting_for_children.is_none());
     }
 
@@ -2060,7 +2131,7 @@ mod tests {
         let config = guardian_enabled_config(2);
         let mut runtime_state = AgentRuntimeState::new("s1".to_string());
         let outcome =
-            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 2)
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state, 2, None)
                 .await
                 .expect("rejected within budget → re-review (suspend)");
         assert!(outcome.should_break && !outcome.sent_complete);
@@ -2074,7 +2145,7 @@ mod tests {
         write_guardian_state(&mut session, exhausted);
         let mut runtime_state2 = AgentRuntimeState::new("s1".to_string());
         assert!(
-            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state2, 4)
+            maybe_spawn_guardian_review(&mut session, &config, &None, &mut runtime_state2, 4, None)
                 .await
                 .is_none(),
             "budget exhausted → allow completion despite unresolved findings"
@@ -4507,6 +4578,293 @@ mod tests {
         assert!(
             !gold_completed.load(Ordering::SeqCst),
             "aborted Gold eval must not complete its LLM request"
+        );
+    }
+
+    // ---- Guardian final-message review context (issue #400) ----
+
+    /// A guardian spawner stub that, like [`MockGuardianSpawner`], returns a
+    /// canned child id, but also records every review prompt it was handed —
+    /// letting tests assert on the guardian's review INPUT (what the reviewer
+    /// actually sees) rather than just its spawn/suspend side effects.
+    struct RecordingGuardianSpawner {
+        child_id: String,
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl GuardianSpawner for RecordingGuardianSpawner {
+        async fn spawn_guardian_review(
+            &self,
+            _parent_session: &Session,
+            review_prompt: String,
+            _model: String,
+            _disabled_tools: Option<std::collections::BTreeSet<String>>,
+        ) -> Result<String, String> {
+            self.prompts.lock().unwrap().push(review_prompt);
+            Ok(self.child_id.clone())
+        }
+    }
+
+    /// Guardian-only config (NO goal loop) wired to a [`RecordingGuardianSpawner`]
+    /// so the test can inspect the prompt the reviewer was actually given.
+    fn guardian_only_config_with_recorder(
+        max_reviews: u32,
+    ) -> (AgentLoopConfig, Arc<std::sync::Mutex<Vec<String>>>) {
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner: Arc<dyn GuardianSpawner> = Arc::new(RecordingGuardianSpawner {
+            child_id: "guardian-child".to_string(),
+            prompts: prompts.clone(),
+        });
+        let config = AgentLoopConfig {
+            guardian_config: Some(GuardianConfig {
+                enabled: true,
+                model_name: Some("guardian-test-model".to_string()),
+                max_reviews,
+            }),
+            guardian_spawner: Some(spawner),
+            ..Default::default()
+        };
+        (config, prompts)
+    }
+
+    /// Guardian + autonomous goal loop, wired to a [`RecordingGuardianSpawner`]
+    /// (a peer to [`guardian_and_gold_config`] used elsewhere in this module,
+    /// but with a spawner that records prompts instead of just a canned id).
+    fn guardian_and_gold_config_with_recorder(
+        max_reviews: u32,
+    ) -> (
+        crate::runtime::config::AgentLoopConfig,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner: Arc<dyn GuardianSpawner> = Arc::new(RecordingGuardianSpawner {
+            child_id: "guardian-child".to_string(),
+            prompts: prompts.clone(),
+        });
+        let config = crate::runtime::config::AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("finish the task".to_string()),
+                max_auto_continuations: 3,
+                ..crate::runtime::config::GoldConfig::default()
+            }),
+            guardian_config: Some(GuardianConfig {
+                enabled: true,
+                model_name: Some("guardian-test-model".to_string()),
+                max_reviews,
+            }),
+            guardian_spawner: Some(spawner),
+            ..crate::runtime::config::AgentLoopConfig::default()
+        };
+        (config, prompts)
+    }
+
+    const GUARDIAN_FINAL_MESSAGE_HEADER: &str = "## Agent's final message";
+
+    /// Direct unit coverage of [`build_guardian_review_prompt`]: real content is
+    /// folded into the prompt under its own section.
+    #[test]
+    fn guardian_review_prompt_includes_final_assistant_content() {
+        let config = AgentLoopConfig::default();
+        let prompt = build_guardian_review_prompt(
+            &None,
+            &config,
+            Some("Final handoff: shipped the fix and ran the tests."),
+        );
+        assert!(prompt.contains(GUARDIAN_FINAL_MESSAGE_HEADER));
+        assert!(prompt.contains("Final handoff: shipped the fix and ran the tests."));
+    }
+
+    /// `None` (already-persisted / goal-loop case) adds nothing.
+    #[test]
+    fn guardian_review_prompt_omits_section_when_content_is_none() {
+        let config = AgentLoopConfig::default();
+        let prompt = build_guardian_review_prompt(&None, &config, None);
+        assert!(!prompt.contains(GUARDIAN_FINAL_MESSAGE_HEADER));
+    }
+
+    /// Whitespace-only content must not add a stray, empty context block.
+    #[test]
+    fn guardian_review_prompt_omits_section_when_content_is_blank() {
+        let config = AgentLoopConfig::default();
+        let prompt = build_guardian_review_prompt(&None, &config, Some("   \n\t  "));
+        assert!(!prompt.contains(GUARDIAN_FINAL_MESSAGE_HEADER));
+    }
+
+    /// THE fix (issue #400): in the guardian-only configuration (no goal loop),
+    /// the final assistant message is deferred out of the session transcript to
+    /// avoid a resumed-turn re-emit (see `handle_no_tool_calls`). Before this
+    /// fix the guardian reviewer never saw that content at all. Now it must
+    /// reach the reviewer as read-only review context, while the invariant that
+    /// motivated the deferral — the message is NOT in the transcript at the
+    /// suspend point — must still hold.
+    #[tokio::test]
+    async fn guardian_only_review_context_includes_final_content_without_persisting_it() {
+        let mut session = Session::new("s400-guardian-only", "model");
+        let (config, prompts) = guardian_only_config_with_recorder(2);
+        let mut runtime_state = AgentRuntimeState::new("s400-guardian-only".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let final_text = "Final handoff: implemented the feature and verified with cargo test.";
+        let outcome = super::handle_no_tool_calls(
+            final_text.to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-1",
+            "s400-guardian-only",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(StubProvider),
+        )
+        .await;
+
+        // The guardian engaged: suspended on the reviewer verdict rather than
+        // completing outright.
+        assert!(outcome.should_break);
+        assert!(!outcome.sent_complete);
+        assert!(runtime_state.waiting_for_children.is_some());
+
+        // Invariant preserved: with no goal loop active, the final assistant
+        // message must NOT be appended to the session transcript before/at the
+        // guardian suspend point (this is what avoids the resumed-turn re-emit).
+        assert!(
+            session.messages.is_empty(),
+            "the deferred final message must not be persisted into the transcript \
+             at the guardian suspend point, got {:?}",
+            session.messages
+        );
+
+        // But the guardian's review INPUT must include it as read-only context.
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one review was spawned");
+        assert!(
+            recorded[0].contains(GUARDIAN_FINAL_MESSAGE_HEADER),
+            "guardian review prompt must include the final-message section:\n{}",
+            recorded[0]
+        );
+        assert!(
+            recorded[0].contains(final_text),
+            "guardian review prompt must include the agent's actual final content:\n{}",
+            recorded[0]
+        );
+    }
+
+    /// Counterpart: with an autonomous goal loop ALSO active, the final
+    /// assistant message is already appended to the session transcript before
+    /// the guardian gate runs (see `handle_no_tool_calls`'s
+    /// `add_message_before_gold`), so the transcript the reviewer child forks
+    /// already contains it. The gate must pass `None` in that case so the
+    /// content is not duplicated into the guardian's prompt a second time.
+    #[tokio::test]
+    async fn goal_loop_active_final_content_not_duplicated_in_guardian_prompt() {
+        let mut session = Session::new("s400-goal-loop", "model");
+        let (config, prompts) = guardian_and_gold_config_with_recorder(2);
+        // Agent declared completion; the double-check confirms "achieved", so the
+        // goal gate decides STOP and the guardian gate runs on the final state.
+        let mut goal = ensure_goal_state(&session, "finish the task");
+        goal.declare(GoalDeclaredStatus::Complete, 1);
+        write_goal_state(&mut session, goal);
+        let mut runtime_state = AgentRuntimeState::new("s400-goal-loop".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let final_text = "Done — shipped and verified.";
+        let outcome = super::handle_no_tool_calls(
+            final_text.to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-1",
+            "s400-goal-loop",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "achieved",
+                confidence: "high",
+            }),
+        )
+        .await;
+
+        assert!(outcome.should_break);
+        assert!(!outcome.sent_complete);
+        assert!(runtime_state.waiting_for_children.is_some());
+
+        // The goal-loop path adds the assistant message BEFORE the gate, so it
+        // is already in the transcript the reviewer child forks.
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.content == final_text),
+            "goal-loop path must add the final assistant message to the transcript"
+        );
+
+        // The guardian's prompt must NOT carry a duplicate copy of that content.
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one review was spawned");
+        assert!(
+            !recorded[0].contains(GUARDIAN_FINAL_MESSAGE_HEADER),
+            "goal-loop case must not duplicate the final message into the guardian prompt \
+             (it is already in the forked transcript):\n{}",
+            recorded[0]
+        );
+    }
+
+    /// Empty/whitespace-only final content (e.g. a model turn with no visible
+    /// text) must not add a stray, empty context block to the guardian's
+    /// prompt.
+    #[tokio::test]
+    async fn guardian_only_blank_final_content_adds_no_stray_context_block() {
+        let mut session = Session::new("s400-blank", "model");
+        let (config, prompts) = guardian_only_config_with_recorder(2);
+        let mut runtime_state = AgentRuntimeState::new("s400-blank".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = super::handle_no_tool_calls(
+            "   \n  ".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-1",
+            "s400-blank",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(StubProvider),
+        )
+        .await;
+
+        assert!(outcome.should_break);
+        assert!(!outcome.sent_complete);
+        assert!(session.messages.is_empty());
+
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            !recorded[0].contains(GUARDIAN_FINAL_MESSAGE_HEADER),
+            "blank final content must not add a stray context block:\n{}",
+            recorded[0]
         );
     }
 }
