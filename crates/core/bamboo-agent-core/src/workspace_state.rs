@@ -1,6 +1,4 @@
 use dashmap::DashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -256,6 +254,24 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     }
 }
 
+/// 64-bit FNV-1a over raw bytes: a tiny, fully-specified, version-stable hash
+/// for deriving relocation directory names. Deliberately NOT `DefaultHasher`
+/// (SipHash with an unspecified, rustc-version-dependent algorithm) — the
+/// relocated directory name must stay identical across binary upgrades, or a
+/// confined tenant's relocated workspace silently changes paths after a
+/// rebuild. Not cryptographic; collision resistance here only needs to
+/// separate distinct real-world workspace paths.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// Deterministically relocate an escaping path under `root`.
 ///
 /// The target MUST incorporate the full original path, not just its leaf —
@@ -266,11 +282,12 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 /// always `root/<sanitized-leaf>-<8-hex-hash-of-full-path>` (or a pure
 /// `root/relocated-<hash>` when the leaf is empty/unsafe/reserved) — a short
 /// deterministic hash of `original` suffixed onto a human-readable leaf,
-/// stable across calls/restarts since it's a pure function of the input path.
+/// stable across calls/restarts AND binary upgrades since it's a pure,
+/// fixed-algorithm (FNV-1a, not std's version-unspecified `DefaultHasher`)
+/// function of the input path — a relocated tenant's directory must not
+/// silently move when bamboo is rebuilt with a newer toolchain.
 fn relocate_under_root(root: &Path, original: &Path) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    original.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = fnv1a_64(original.as_os_str().as_encoded_bytes());
     // Truncate to exactly 8 hex chars (32 bits) for the leaf-suffixed form —
     // short enough to stay a readable path component while still being
     // vanishingly unlikely to collide for distinct real-world paths.
