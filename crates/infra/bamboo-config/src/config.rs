@@ -1851,6 +1851,11 @@ impl Config {
         config.hydrate_broker_token_from_encrypted();
         // Decrypt encrypted notification-channel secrets into in-memory plaintext.
         config.hydrate_notifications_from_encrypted();
+        // Merge the standalone connect.json (#455) onto `config.connect`,
+        // migrating a legacy inline `connect` key from config.json (#453
+        // state) when present. MUST run before the token hydration below so
+        // it decrypts the post-merge ciphertext, not a stale/legacy copy.
+        config.merge_connect_config(&data_dir);
         // Decrypt encrypted bamboo-connect platform tokens into in-memory plaintext.
         config.hydrate_connect_platform_tokens_from_encrypted();
         config.normalize_tool_settings();
@@ -1988,6 +1993,75 @@ impl Config {
     /// fallback as the normal load.
     pub fn from_data_dir_without_env(data_dir: Option<PathBuf>) -> Self {
         Self::from_data_dir_impl(data_dir, false, false)
+    }
+
+    /// Merge the standalone `connect.json` (#455) onto `self.connect`, the
+    /// load-side counterpart of [`save_connect_config`]. Called once per load,
+    /// BEFORE [`Config::hydrate_connect_platform_tokens_from_encrypted`] runs,
+    /// so hydration decrypts the POST-merge ciphertext rather than a stale
+    /// copy still embedded in `config.json`.
+    ///
+    /// - `connect.json` present & parseable: authoritative — OVERWRITES
+    ///   whatever `self.connect` currently holds. If `self.connect` was ALSO
+    ///   non-empty (a legacy inline `connect` key still in config.json, e.g.
+    ///   #453-era state, or written by an older binary), that's a stale
+    ///   duplicate: log a warning. connect.json wins; the config.json copy is
+    ///   dropped on the NEXT natural save (this call does not force one).
+    /// - `connect.json` present but corrupt/unparsable: fail SAFE for this
+    ///   security-sensitive feature. Log an error, quarantine the bad file to
+    ///   `connect.json.bak` (best-effort), and continue with an EMPTY
+    ///   `ConnectConfig` — never falls back to a legacy config.json copy.
+    /// - `connect.json` absent & `self.connect` non-empty (pure legacy
+    ///   state): migrate proactively. Adopt the legacy value (already parsed
+    ///   into `self`) and write BOTH files once via a full
+    ///   [`Config::save_to_dir`] (creates connect.json; rewrites config.json
+    ///   without the key), logged at info.
+    /// - `connect.json` absent & `self.connect` empty: nothing to do.
+    fn merge_connect_config(&mut self, data_dir: &std::path::Path) {
+        let connect_path = data_dir.join("connect.json");
+        match std::fs::read_to_string(&connect_path) {
+            Ok(content) => match serde_json::from_str::<ConnectConfig>(&content) {
+                Ok(connect) => {
+                    if !connect_config_is_empty(&self.connect) {
+                        tracing::warn!(
+                            "config.json still has a legacy `connect` key alongside \
+                             connect.json; connect.json takes precedence and the stale \
+                             key will be dropped on the next save"
+                        );
+                    }
+                    self.connect = connect;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse {:?} ({}); continuing with an empty (inert) \
+                         connect config instead of falling back to a legacy config.json copy",
+                        connect_path,
+                        e
+                    );
+                    quarantine_corrupt_connect(&connect_path);
+                    self.connect = ConnectConfig::default();
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !connect_config_is_empty(&self.connect) {
+                    tracing::info!(
+                        "Migrating legacy `connect` config from config.json to a \
+                         standalone connect.json"
+                    );
+                    if let Err(e) = self.save_to_dir(data_dir.to_path_buf()) {
+                        tracing::error!("Failed to write connect.json during migration: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to read {:?} ({}); continuing with an empty (inert) connect config",
+                    connect_path,
+                    e
+                );
+                self.connect = ConnectConfig::default();
+            }
+        }
     }
 
     /// Deserialize config JSON and run the in-memory hydration + normalization
@@ -2584,8 +2658,23 @@ impl Config {
         to_save.refresh_connect_platform_tokens_encrypted()?;
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
-        let content =
-            serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
+
+        // Split `connect` (#455) out of the config.json document: bamboo-connect
+        // platform-bridge credentials (bot tokens, allowlists) get their own
+        // sibling file, connect.json (written below), instead of living in
+        // config.json — different sensitivity/lifecycle. The `connect` FIELD on
+        // `Config` keeps its normal serde shape unchanged (still required by the
+        // settings API / `preserve_masked_connect_secrets`, which operate on the
+        // in-memory struct) — only the serialized DOCUMENT that becomes
+        // config.json's bytes has the key stripped, and that's done on the
+        // `serde_json::Value` here, not via `#[serde(skip)]` on the field.
+        let mut config_value =
+            serde_json::to_value(&to_save).context("Failed to serialize config to JSON")?;
+        if let Some(obj) = config_value.as_object_mut() {
+            obj.remove("connect");
+        }
+        let content = serde_json::to_string_pretty(&config_value)
+            .context("Failed to serialize config to JSON")?;
 
         // Back up the current on-disk config (last-known-good) before overwriting,
         // so corruption (a bad/partial write, external edit, disk issue) stays
@@ -2611,7 +2700,52 @@ impl Config {
         write_atomic(&path, content.as_bytes())
             .with_context(|| format!("Failed to write config file: {:?}", path))?;
 
+        save_connect_config(&to_save.connect, &data_dir)?;
+
         Ok(())
+    }
+}
+
+/// Persist `connect` (#455) to its own sibling file, `connect.json`, next to
+/// config.json — the save-side counterpart of [`Config::merge_connect_config`].
+///
+/// Only writes when the config is non-empty OR the file already exists, so a
+/// fresh/default install with no platforms configured never gets a
+/// `connect.json` littering its data dir. Before an existing file is
+/// overwritten, it's copied aside to a single `connect.json.bak` generation
+/// (best-effort) — connect.json doesn't need config.json's multi-generation
+/// rotation, one last-known-good snapshot is enough.
+fn save_connect_config(connect: &ConnectConfig, data_dir: &std::path::Path) -> Result<()> {
+    let path = data_dir.join("connect.json");
+    if connect_config_is_empty(connect) && !path.exists() {
+        return Ok(());
+    }
+
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        if let Err(e) = std::fs::copy(&path, &backup) {
+            tracing::warn!("Failed to back up connect.json before save: {}", e);
+        }
+    }
+
+    let content = serde_json::to_string_pretty(connect)
+        .context("Failed to serialize connect config to JSON")?;
+    write_atomic(&path, content.as_bytes())
+        .with_context(|| format!("Failed to write connect config file: {:?}", path))?;
+    Ok(())
+}
+
+/// Quarantine an unparsable `connect.json` to a single `connect.json.bak`
+/// generation (best-effort) so the bad content survives for inspection
+/// instead of being silently discarded. Unlike config.json's timestamped,
+/// N-generation quarantine, connect.json only needs one slot — it's a much
+/// smaller, less complex document and this is a fail-SAFE (empty/inert
+/// bridge), not a fail-recover, posture. #455.
+fn quarantine_corrupt_connect(connect_path: &std::path::Path) {
+    let backup = connect_path.with_extension("json.bak");
+    match std::fs::copy(connect_path, &backup) {
+        Ok(_) => tracing::warn!("Quarantined corrupt connect.json to {:?}", backup),
+        Err(e) => tracing::error!("Failed to quarantine corrupt connect.json: {}", e),
     }
 }
 
@@ -3562,6 +3696,279 @@ mod tests {
             backup.contains("http://good-bak"),
             "good last-known-good backup is preserved (not overwritten by corrupt config.json)"
         );
+    }
+
+    // ── connect.json split (#455) ────────────────────────────────────────
+
+    fn connect_platform_with_encrypted(
+        platform_type: &str,
+        token_encrypted: &str,
+    ) -> ConnectPlatformConfig {
+        ConnectPlatformConfig {
+            platform_type: platform_type.to_string(),
+            token: None,
+            token_encrypted: Some(token_encrypted.to_string()),
+            allow_from: vec!["user-1".to_string()],
+            admin_from: Vec::new(),
+        }
+    }
+
+    fn connect_json_path(temp: &TempHome) -> PathBuf {
+        temp.path.join("connect.json")
+    }
+
+    #[test]
+    fn save_splits_connect_into_sibling_connect_json() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![connect_platform_with_encrypted("telegram", "")];
+        config.connect.platforms[0].token = Some("plain-bot-token".to_string());
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let config_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path.join("config.json")).unwrap())
+                .unwrap();
+        assert!(
+            config_json.get("connect").is_none(),
+            "config.json must not carry the `connect` key after a save"
+        );
+
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        assert_eq!(connect_json["platforms"][0]["type"], "telegram");
+        assert!(
+            connect_json["platforms"][0]["token_encrypted"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "the token is persisted in its encrypted form in connect.json"
+        );
+        assert!(
+            connect_json["platforms"][0].get("token").is_none(),
+            "the plaintext token is never persisted (skip_serializing)"
+        );
+    }
+
+    #[test]
+    fn load_merges_connect_json_into_config() {
+        let temp = TempHome::new();
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "cipher-abc", "allow_from": ["u1"] }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(config.connect.platforms.len(), 1);
+        assert_eq!(config.connect.platforms[0].platform_type, "telegram");
+        assert_eq!(
+            config.connect.platforms[0].token_encrypted.as_deref(),
+            Some("cipher-abc")
+        );
+    }
+
+    #[test]
+    fn load_without_connect_json_yields_empty_inert_connect_config() {
+        let temp = TempHome::new();
+        temp.set_config_json(r#"{"http_proxy":"http://x"}"#);
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(
+            config.connect.platforms.is_empty(),
+            "no connect.json and no legacy key -> empty/inert connect config"
+        );
+        assert!(
+            !connect_json_path(&temp).exists(),
+            "load must not create connect.json when there is nothing to migrate"
+        );
+    }
+
+    #[test]
+    fn migration_adopts_legacy_connect_key_and_writes_both_files() {
+        let temp = TempHome::new();
+        // Legacy state (#453): connect lives inline in config.json, no connect.json yet.
+        temp.set_config_json(
+            &serde_json::json!({
+                "http_proxy": "http://keep-me",
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        // In-memory: legacy value adopted.
+        assert_eq!(config.connect.platforms.len(), 1);
+        assert_eq!(
+            config.connect.platforms[0].token_encrypted.as_deref(),
+            Some("legacy-cipher")
+        );
+        // An unrelated field from the same load survives the migration rewrite.
+        assert_eq!(config.http_proxy, "http://keep-me");
+
+        // On disk: connect.json was created...
+        assert!(
+            connect_json_path(&temp).exists(),
+            "migration proactively creates connect.json"
+        );
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        assert_eq!(
+            connect_json["platforms"][0]["token_encrypted"], "legacy-cipher",
+            "the encrypted value is preserved (encrypted form intact) by the migration"
+        );
+
+        // ...and config.json was rewritten without the `connect` key.
+        let config_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path.join("config.json")).unwrap())
+                .unwrap();
+        assert!(
+            config_json.get("connect").is_none(),
+            "config.json is rewritten without the legacy `connect` key"
+        );
+    }
+
+    #[test]
+    fn both_files_present_connect_json_wins() {
+        let temp = TempHome::new();
+        temp.set_config_json(
+            &serde_json::json!({
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "stale-config-json-cipher" }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "authoritative-cipher" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.connect.platforms[0].token_encrypted.as_deref(),
+            Some("authoritative-cipher"),
+            "connect.json wins over a stale legacy config.json key"
+        );
+    }
+
+    #[test]
+    fn corrupt_connect_json_yields_empty_connect_and_is_quarantined() {
+        let temp = TempHome::new();
+        temp.set_config_json("{}");
+        std::fs::write(connect_json_path(&temp), "{ not valid json").unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(
+            config.connect.platforms.is_empty(),
+            "corrupt connect.json fails SAFE to an empty/inert connect config"
+        );
+
+        let backup = connect_json_path(&temp).with_extension("json.bak");
+        assert!(
+            backup.exists(),
+            "the corrupt connect.json is quarantined to connect.json.bak"
+        );
+        assert!(
+            std::fs::read_to_string(backup)
+                .unwrap()
+                .contains("not valid json"),
+            "the quarantined copy holds the bad content"
+        );
+    }
+
+    #[test]
+    fn corrupt_connect_json_does_not_fall_back_to_legacy_config_json_copy() {
+        let temp = TempHome::new();
+        // A legacy inline `connect` key is present too — it must NOT be used as a
+        // fallback when connect.json is corrupt (security-sensitive: fail safe).
+        temp.set_config_json(
+            &serde_json::json!({
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "legacy-should-not-be-used" }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        std::fs::write(connect_json_path(&temp), "{ not valid json").unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(
+            config.connect.platforms.is_empty(),
+            "corrupt connect.json must not fall back to the legacy config.json copy"
+        );
+    }
+
+    #[test]
+    fn empty_connect_config_with_no_existing_file_creates_no_connect_json() {
+        let temp = TempHome::new();
+        let config = Config::create_default();
+        assert!(config.connect.platforms.is_empty());
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        assert!(
+            !connect_json_path(&temp).exists(),
+            "an empty connect config with no pre-existing file must not create one"
+        );
+    }
+
+    #[test]
+    fn connect_json_backed_up_before_overwrite() {
+        let temp = TempHome::new();
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "old-cipher" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![connect_platform_with_encrypted("telegram", "new-cipher")];
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let backup = connect_json_path(&temp).with_extension("json.bak");
+        assert!(
+            std::fs::read_to_string(backup)
+                .unwrap()
+                .contains("old-cipher"),
+            "the previous connect.json is preserved as connect.json.bak before the overwrite"
+        );
+        let current = std::fs::read_to_string(connect_json_path(&temp)).unwrap();
+        assert!(current.contains("new-cipher"));
     }
 
     #[test]
