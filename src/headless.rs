@@ -210,6 +210,21 @@ pub struct HeadlessArgs {
     /// itself `provider:model`, that provider wins and a conflicting `--provider`
     /// errors. Threads into `ExecuteRequest.model_ref` / `.provider`.
     pub provider: Option<String>,
+    /// Cancel the run if it hasn't finished within this many seconds (wall
+    /// clock; counts any permission-gate round trips). `None` never times out.
+    /// This is CLIENT-side only — `ExecuteRequest` has no per-run deadline
+    /// field to delegate to, so this reuses the same cancellation path as
+    /// Ctrl-C rather than inventing server-side behavior.
+    pub timeout_secs: Option<u64>,
+}
+
+/// Validate `--timeout` at the CLI boundary: zero would fire (almost)
+/// immediately, which is never useful and is more likely a typo than intent.
+fn validate_timeout_secs(secs: Option<u64>) -> Result<(), String> {
+    match secs {
+        Some(0) => Err("invalid --timeout '0' (expected a positive number of seconds)".to_string()),
+        _ => Ok(()),
+    }
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
@@ -363,6 +378,8 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         }
     }
 
+    validate_timeout_secs(args.timeout_secs)?;
+
     if args.stream_json {
         println!(
             "{}",
@@ -376,6 +393,16 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         eprintln!("▶ session {session_id}");
     }
     let data = web::Data::new(state);
+    // -p / ExecuteRequest parity (#246 part A): every field `ExecuteRequest`
+    // actually carries (model/provider/model_ref, skill_mode, reasoning_effort)
+    // is threaded through from CLI flags above and below — none are hardcoded
+    // to `None` anymore. `--system-prompt`/`--append-system-prompt`,
+    // per-execute `--allowed-tools`/`--disallowed-tools`, and `--max-turns` are
+    // intentionally NOT exposed as CLI flags: `ExecuteRequest` has no fields
+    // for them today, and adding flags with no server-side effect would be
+    // inventing behavior the API doesn't back. `--timeout` IS added, but as a
+    // client-side wall-clock cutoff (reuses the Ctrl-C cancellation path
+    // below) rather than a request field, for the same reason.
     let response = execute_handler(
         data.clone(),
         web::Path::from(session_id.clone()),
@@ -406,6 +433,11 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     // pending question.
     let mut exit: Result<(), String> = Ok(());
     let mut streamed_tokens = false;
+    // `--timeout`: measured from before the FIRST execute, so it covers the
+    // whole run wall-clock including any permission-gate round trips across
+    // resumed segments below (not reset per segment).
+    let overall_start = Instant::now();
+    let mut timed_out = false;
 
     'run: loop {
         let mut saw_terminal = false;
@@ -453,6 +485,21 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
                     }
                 }
                 _ = poll.tick() => {
+                    // `--timeout`: fire the cancellation once, exactly like Ctrl-C does,
+                    // then fall through to the same terminal-event + quiescence draining
+                    // below so the "cancelled" event is observed and the tree actually
+                    // winds down before we exit.
+                    if !timed_out {
+                        if let Some(secs) = args.timeout_secs {
+                            if overall_start.elapsed() >= Duration::from_secs(secs) {
+                                timed_out = true;
+                                eprintln!("\n⏰ --timeout {secs}s reached — cancelling…");
+                                if let Some(runner) = data.agent_runners.read().await.get(&session_id) {
+                                    runner.cancel_token.cancel();
+                                }
+                            }
+                        }
+                    }
                     // Startup grace: give the spawn a moment to register the runner.
                     if started.elapsed() < Duration::from_secs(2) {
                         continue;
@@ -465,6 +512,13 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
                     }
                 }
             }
+        }
+
+        if timed_out && exit.is_ok() {
+            exit = Err(format!(
+                "timed out after {}s (cancelled)",
+                args.timeout_secs.unwrap_or_default()
+            ));
         }
 
         // Segment quiescent. Stop on error; never prompt in machine (NDJSON) mode.
@@ -954,5 +1008,26 @@ mod tests {
     fn model_selection_bare_model_no_default_errors() {
         let err = resolve_model_selection(&some("gpt-4o"), &None, "   ").unwrap_err();
         assert!(err.contains("no provider"), "got: {err}");
+    }
+
+    /// `--timeout` omitted never times out.
+    #[test]
+    fn timeout_absent_is_valid() {
+        assert!(validate_timeout_secs(None).is_ok());
+    }
+
+    /// Any positive number of seconds is accepted.
+    #[test]
+    fn timeout_positive_is_valid() {
+        assert!(validate_timeout_secs(Some(1)).is_ok());
+        assert!(validate_timeout_secs(Some(3600)).is_ok());
+    }
+
+    /// `--timeout 0` is rejected — it would fire immediately, which is never
+    /// the intent and more likely a typo.
+    #[test]
+    fn timeout_zero_is_rejected() {
+        let err = validate_timeout_secs(Some(0)).unwrap_err();
+        assert!(err.contains("--timeout"), "got: {err}");
     }
 }
