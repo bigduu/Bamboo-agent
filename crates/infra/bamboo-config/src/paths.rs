@@ -176,6 +176,66 @@ pub fn events_dir() -> PathBuf {
     bamboo_dir().join("events")
 }
 
+/// Get the local actor sub-agent state directory (`{bamboo_dir}/subagents`).
+///
+/// Issue #217: the persistent home for the sub-agent discovery fabric +
+/// isolated per-child storage, replacing the old `env::temp_dir()/bamboo-
+/// subagents` default so sub-agent state survives reboots and stays inside
+/// the tenant's data dir instead of scattering into `/tmp`.
+pub fn subagents_dir() -> PathBuf {
+    bamboo_dir().join("subagents")
+}
+
+/// Resolve the workspace root directory from runtime configuration.
+///
+/// Order:
+/// 1) `BAMBOO_WORKSPACE_ROOT` environment variable (an operator-chosen
+///    location — e.g. a mounted volume — that need not live under `bamboo_dir()`)
+/// 2) `{bamboo_dir}/workspaces`
+///
+/// This is the default home for a session's workspace when none is
+/// explicitly configured (issue #217 acceptance criterion 1), and the
+/// confinement root explicit workspace paths are pinned under when
+/// [`workspace_confinement_enforced`] is on (criterion 2).
+///
+/// Note: like [`resolve_bamboo_dir`], this does not consult an in-process
+/// global — it re-reads the environment every call, matching the pattern of
+/// [`resolve_bamboo_dir`] vs [`bamboo_dir`].
+pub fn resolve_workspace_root() -> PathBuf {
+    std::env::var("BAMBOO_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| bamboo_dir().join("workspaces"))
+}
+
+/// Alias for [`resolve_workspace_root`] — the workspaces root under the
+/// stabilized data dir (or its `BAMBOO_WORKSPACE_ROOT` override).
+pub fn workspaces_dir() -> PathBuf {
+    resolve_workspace_root()
+}
+
+/// Whether explicit workspace paths must be canonicalized and confined to
+/// [`resolve_workspace_root`] (issue #217 acceptance criterion 2) —
+/// escapes (`..`, a symlink pointing outside, or an absolute path elsewhere
+/// on disk) get relocated to a deterministic folder under the root instead of
+/// honored as-is.
+///
+/// OFF by default: local single-user back-compat. A session's workspace may
+/// point anywhere on disk exactly as before this issue — e.g. pointing bamboo
+/// at an existing project outside `~/.bamboo`. An orchestrator opts into
+/// "one folder = one tenant's entire state" containment by setting
+/// `BAMBOO_WORKSPACE_CONFINE=1`, or implicitly by setting
+/// `BAMBOO_WORKSPACE_ROOT` (choosing a dedicated workspace root is itself a
+/// signal the deployment wants containment).
+pub fn workspace_confinement_enforced() -> bool {
+    let explicit = std::env::var("BAMBOO_WORKSPACE_CONFINE")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"));
+    match explicit {
+        Some(value) => value,
+        None => std::env::var_os("BAMBOO_WORKSPACE_ROOT").is_some(),
+    }
+}
+
 /// Load JSON config file
 pub fn load_config_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     if !path.exists() {
@@ -324,6 +384,94 @@ mod tests {
     #[test]
     fn test_sessions_dir_is_under_bamboo_dir() {
         assert_eq!(sessions_dir(), bamboo_dir().join("sessions"));
+    }
+
+    #[test]
+    fn test_subagents_dir_is_under_bamboo_dir() {
+        assert_eq!(subagents_dir(), bamboo_dir().join("subagents"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_root_defaults_under_bamboo_dir() {
+        let _guard = crate::test_support::env_cache_lock_acquire();
+        let original = std::env::var_os("BAMBOO_WORKSPACE_ROOT");
+        std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
+
+        assert_eq!(resolve_workspace_root(), bamboo_dir().join("workspaces"));
+        assert_eq!(workspaces_dir(), bamboo_dir().join("workspaces"));
+
+        if let Some(val) = original {
+            std::env::set_var("BAMBOO_WORKSPACE_ROOT", val);
+        }
+    }
+
+    #[test]
+    fn test_resolve_workspace_root_prefers_env_override() {
+        let _guard = crate::test_support::env_cache_lock_acquire();
+        let original = std::env::var_os("BAMBOO_WORKSPACE_ROOT");
+
+        std::env::set_var("BAMBOO_WORKSPACE_ROOT", "/mnt/tenant-workspaces");
+        assert_eq!(
+            resolve_workspace_root(),
+            PathBuf::from("/mnt/tenant-workspaces")
+        );
+
+        if let Some(val) = original {
+            std::env::set_var("BAMBOO_WORKSPACE_ROOT", val);
+        } else {
+            std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
+        }
+    }
+
+    #[test]
+    fn test_workspace_confinement_off_by_default() {
+        let _guard = crate::test_support::env_cache_lock_acquire();
+        let original_confine = std::env::var_os("BAMBOO_WORKSPACE_CONFINE");
+        let original_root = std::env::var_os("BAMBOO_WORKSPACE_ROOT");
+        std::env::remove_var("BAMBOO_WORKSPACE_CONFINE");
+        std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
+
+        assert!(!workspace_confinement_enforced());
+
+        if let Some(val) = original_confine {
+            std::env::set_var("BAMBOO_WORKSPACE_CONFINE", val);
+        }
+        if let Some(val) = original_root {
+            std::env::set_var("BAMBOO_WORKSPACE_ROOT", val);
+        }
+    }
+
+    #[test]
+    fn test_workspace_confinement_enabled_explicitly_or_via_root_override() {
+        let _guard = crate::test_support::env_cache_lock_acquire();
+        let original_confine = std::env::var_os("BAMBOO_WORKSPACE_CONFINE");
+        let original_root = std::env::var_os("BAMBOO_WORKSPACE_ROOT");
+
+        std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
+        std::env::set_var("BAMBOO_WORKSPACE_CONFINE", "1");
+        assert!(workspace_confinement_enforced());
+
+        std::env::remove_var("BAMBOO_WORKSPACE_CONFINE");
+        std::env::set_var("BAMBOO_WORKSPACE_ROOT", "/mnt/tenant-workspaces");
+        assert!(
+            workspace_confinement_enforced(),
+            "setting a dedicated workspace root implicitly opts into confinement"
+        );
+
+        // An explicit `false` wins even when a root override is set.
+        std::env::set_var("BAMBOO_WORKSPACE_CONFINE", "false");
+        assert!(!workspace_confinement_enforced());
+
+        if let Some(val) = original_confine {
+            std::env::set_var("BAMBOO_WORKSPACE_CONFINE", val);
+        } else {
+            std::env::remove_var("BAMBOO_WORKSPACE_CONFINE");
+        }
+        if let Some(val) = original_root {
+            std::env::set_var("BAMBOO_WORKSPACE_ROOT", val);
+        } else {
+            std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
+        }
     }
 
     #[test]

@@ -24,6 +24,13 @@ impl AppState {
     ///   - workflows/: Workflow definitions
     ///   - cache/: Cached data
     ///   - runtime/: Runtime files
+    ///   - workspaces/: Default per-session workspace dirs (issue #217) — a
+    ///     session with no configured/explicit workspace gets
+    ///     `workspaces/{session_id}` here instead of the server process's
+    ///     cwd. Overridable via `BAMBOO_WORKSPACE_ROOT`.
+    ///   - subagents/: Local actor sub-agent fabric discovery + isolated
+    ///     per-child storage (issue #217) — replaces the old
+    ///     `env::temp_dir()/bamboo-subagents` default.
     ///
     /// # Returns
     ///
@@ -150,6 +157,23 @@ impl AppState {
                 },
             ));
         }
+
+        // Issue #217: wire the workspace-root + confinement policy into
+        // agent-core, mirroring the default-workspace provider just above.
+        // This is what lets `workspace_or_process_cwd` default a session with
+        // NO configured/explicit workspace to `data_dir/workspaces/{session}`
+        // instead of falling through to the server process's cwd, and lets
+        // `set_workspace` pin/relocate an explicit path when confinement is
+        // enabled (`BAMBOO_WORKSPACE_CONFINE` / `BAMBOO_WORKSPACE_ROOT`).
+        // Read fresh from the environment on every call (not captured here)
+        // so an operator-set env var is honored the same way `bamboo_dir()`
+        // itself is — no config-file knob needed.
+        bamboo_agent_core::workspace_state::set_workspace_root_provider(Box::new(|| {
+            bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                root: bamboo_config::paths::resolve_workspace_root(),
+                confine: bamboo_config::paths::workspace_confinement_enforced(),
+            }
+        }));
 
         let permission_checker = load_permission_checker(&bamboo_home_dir).await;
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
