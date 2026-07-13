@@ -256,22 +256,43 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     }
 }
 
-/// Deterministically relocate an escaping path under `root`: derive a leaf
-/// name from the original path's last component (or a short hash of the full
-/// path if that's empty/unsafe/reserved) and create `root/<leaf>`.
+/// Deterministically relocate an escaping path under `root`.
+///
+/// The target MUST incorporate the full original path, not just its leaf —
+/// two different escaping paths that happen to share a basename (e.g.
+/// `/mnt/customer-a/project` and `/mnt/customer-b/project`) must land in
+/// DISTINCT directories, or tenant isolation (the entire point of
+/// confinement) collapses into cross-tenant data mixing. So the target is
+/// always `root/<sanitized-leaf>-<8-hex-hash-of-full-path>` (or a pure
+/// `root/relocated-<hash>` when the leaf is empty/unsafe/reserved) — a short
+/// deterministic hash of `original` suffixed onto a human-readable leaf,
+/// stable across calls/restarts since it's a pure function of the input path.
 fn relocate_under_root(root: &Path, original: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    original.hash(&mut hasher);
+    let hash = hasher.finish();
+    // Truncate to exactly 8 hex chars (32 bits) for the leaf-suffixed form —
+    // short enough to stay a readable path component while still being
+    // vanishingly unlikely to collide for distinct real-world paths.
+    let short_hash = hash as u32;
+
     let leaf = original
         .file_name()
         .and_then(|s| s.to_str())
         .map(sanitize_path_component)
         .filter(|s| s != "_");
-    let leaf = leaf.unwrap_or_else(|| {
-        let mut hasher = DefaultHasher::new();
-        original.hash(&mut hasher);
-        format!("relocated-{:x}", hasher.finish())
-    });
-    let target = root.join(leaf);
-    let _ = std::fs::create_dir_all(&target);
+    let dir_name = match leaf {
+        Some(leaf) => format!("{leaf}-{short_hash:08x}"),
+        None => format!("relocated-{hash:x}"),
+    };
+    let target = root.join(dir_name);
+    if let Err(err) = std::fs::create_dir_all(&target) {
+        tracing::warn!(
+            path = %target.display(),
+            error = %err,
+            "relocate_under_root: failed to create relocated workspace directory"
+        );
+    }
     target
 }
 
@@ -300,6 +321,17 @@ pub fn pin_workspace_path(requested: &Path, root: &Path, confine: bool) -> PathB
     if !confine {
         return requested.to_path_buf();
     }
+    // Best-effort: make sure `root` exists before canonicalizing it, so a
+    // root that sits behind a symlink but hasn't been created yet doesn't
+    // silently fall back to its non-canonical form (which would spuriously
+    // fail the `starts_with` containment check below for every request).
+    if let Err(err) = std::fs::create_dir_all(root) {
+        tracing::warn!(
+            path = %root.display(),
+            error = %err,
+            "pin_workspace_path: failed to create workspace root directory"
+        );
+    }
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let canon_requested = canonicalize_best_effort(requested);
     if canon_requested.starts_with(&canon_root) {
@@ -313,7 +345,13 @@ pub fn pin_workspace_path(requested: &Path, root: &Path, confine: bool) -> PathB
 /// missing. Pure/directly-testable, mirroring [`pin_workspace_path`].
 pub fn default_session_workspace_dir(root: &Path, session_id: &str) -> PathBuf {
     let dir = root.join(sanitize_path_component(session_id));
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %err,
+            "default_session_workspace_dir: failed to create session workspace directory"
+        );
+    }
     dir
 }
 
@@ -487,7 +525,14 @@ mod tests {
             pinned.starts_with(&canon_root),
             "escaping `..` path must be relocated under root, got {pinned:?}"
         );
-        assert_eq!(pinned, canon_root.join("escaped-outside"));
+        // The relocated leaf carries a hash suffix of the full original path
+        // (see `relocate_under_root`), not the bare basename.
+        let leaf = pinned.file_name().unwrap().to_str().unwrap();
+        assert!(
+            leaf.starts_with("escaped-outside-"),
+            "expected a hash-suffixed leaf, got {leaf:?}"
+        );
+        assert_eq!(pinned.parent().unwrap(), canon_root);
     }
 
     /// Acceptance criterion 2: an absolute path pointing entirely outside
@@ -508,7 +553,68 @@ mod tests {
             pinned.starts_with(&canon_root),
             "escaping absolute path must be relocated under root, got {pinned:?}"
         );
-        assert_eq!(pinned, canon_root.join("my-real-project"));
+        // The relocated leaf carries a hash suffix of the full original path
+        // (see `relocate_under_root`), not the bare basename.
+        let leaf = pinned.file_name().unwrap().to_str().unwrap();
+        assert!(
+            leaf.starts_with("my-real-project-"),
+            "expected a hash-suffixed leaf, got {leaf:?}"
+        );
+        assert_eq!(pinned.parent().unwrap(), canon_root);
+    }
+
+    /// HIGH finding (PR #467 review): two different escaping paths that
+    /// share the same basename must NOT collapse onto the same relocated
+    /// directory — that would silently mix state across tenants, defeating
+    /// the entire point of confinement. The relocation target must
+    /// incorporate a hash of the FULL original path, not just its leaf.
+    #[test]
+    fn pin_workspace_path_confined_relocates_same_basename_to_distinct_dirs() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().join("workspaces");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let tenant_a = tempfile::tempdir().unwrap();
+        let tenant_b = tempfile::tempdir().unwrap();
+        let path_a = tenant_a.path().join("project");
+        let path_b = tenant_b.path().join("project");
+        std::fs::create_dir_all(&path_a).unwrap();
+        std::fs::create_dir_all(&path_b).unwrap();
+
+        let pinned_a = pin_workspace_path(&path_a, &root, true);
+        let pinned_b = pin_workspace_path(&path_b, &root, true);
+
+        assert_ne!(
+            pinned_a, pinned_b,
+            "escaping paths sharing a basename must relocate to distinct directories, \
+             got {pinned_a:?} and {pinned_b:?}"
+        );
+        let canon_root = root.canonicalize().unwrap();
+        assert!(pinned_a.starts_with(&canon_root));
+        assert!(pinned_b.starts_with(&canon_root));
+    }
+
+    /// HIGH finding (PR #467 review): relocation must be deterministic — the
+    /// same original path pinned twice (e.g. across process restarts) lands
+    /// in the SAME relocated directory, so a session's confined workspace
+    /// stays stable.
+    #[test]
+    fn pin_workspace_path_confined_relocation_is_deterministic() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().join("workspaces");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let escape = elsewhere.path().join("repeatable-project");
+        std::fs::create_dir_all(&escape).unwrap();
+
+        let pinned_first = pin_workspace_path(&escape, &root, true);
+        let pinned_second = pin_workspace_path(&escape, &root, true);
+
+        assert_eq!(
+            pinned_first, pinned_second,
+            "pinning the same original path twice must produce the same relocated target"
+        );
     }
 
     /// Acceptance criterion 2: a symlink that lives inside root but points

@@ -207,12 +207,6 @@ pub fn resolve_workspace_root() -> PathBuf {
         .unwrap_or_else(|_| bamboo_dir().join("workspaces"))
 }
 
-/// Alias for [`resolve_workspace_root`] — the workspaces root under the
-/// stabilized data dir (or its `BAMBOO_WORKSPACE_ROOT` override).
-pub fn workspaces_dir() -> PathBuf {
-    resolve_workspace_root()
-}
-
 /// Whether explicit workspace paths must be canonicalized and confined to
 /// [`resolve_workspace_root`] (issue #217 acceptance criterion 2) —
 /// escapes (`..`, a symlink pointing outside, or an absolute path elsewhere
@@ -398,7 +392,6 @@ mod tests {
         std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
 
         assert_eq!(resolve_workspace_root(), bamboo_dir().join("workspaces"));
-        assert_eq!(workspaces_dir(), bamboo_dir().join("workspaces"));
 
         if let Some(val) = original {
             std::env::set_var("BAMBOO_WORKSPACE_ROOT", val);

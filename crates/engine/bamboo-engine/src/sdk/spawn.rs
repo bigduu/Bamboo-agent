@@ -85,12 +85,17 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     };
 
     // Register the child's workspace in the global state so tools
-    // (Read, Glob, Grep, Bash, etc.) can resolve relative paths.
+    // (Read, Glob, Grep, Bash, etc.) can resolve relative paths. `set_workspace`
+    // returns the FINAL stored path, which may differ from the requested one
+    // when workspace-root confinement (#217) relocated it — store that back
+    // onto the domain field so `session.workspace` never diverges from where
+    // tools actually run.
     if let Some(ref ws) = session.workspace {
-        bamboo_agent_core::workspace_state::set_workspace(
+        let stored = bamboo_agent_core::workspace_state::set_workspace(
             &session.id,
             std::path::PathBuf::from(ws),
         );
+        session.workspace = Some(stored.to_string_lossy().to_string());
     }
 
     if session.kind != SessionKind::Child {
