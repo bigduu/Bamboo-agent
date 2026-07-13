@@ -252,6 +252,15 @@ pub struct MemoryConfig {
     /// large overflow drains gradually instead of in one burst.
     #[serde(default = "default_capacity_max_archivals_per_run")]
     pub capacity_max_archivals_per_run: usize,
+    /// Whether the background freshness gardener may conservatively demote Active
+    /// day/week-granularity memories to Stale once they cross their documented
+    /// staleness window (issue #61 phase 2; see
+    /// `bamboo_memory::memory_store::freshness::granularity_expired`). Default ON,
+    /// matching the other gardener passes: deterministic (no LLM, no cost), and
+    /// non-destructive — it only ever moves Active → Stale, never archives or
+    /// deletes. Set false to opt out.
+    #[serde(default = "default_true_granularity_freshness_gardener_enabled")]
+    pub granularity_freshness_gardener_enabled: bool,
 }
 
 impl Default for MemoryConfig {
@@ -275,8 +284,14 @@ impl Default for MemoryConfig {
             dedup_gardener_max_merges_per_run: default_dedup_gardener_max_merges_per_run(),
             memory_active_capacity: 0,
             capacity_max_archivals_per_run: default_capacity_max_archivals_per_run(),
+            granularity_freshness_gardener_enabled:
+                default_true_granularity_freshness_gardener_enabled(),
         }
     }
+}
+
+fn default_true_granularity_freshness_gardener_enabled() -> bool {
+    true
 }
 
 fn default_capacity_max_archivals_per_run() -> usize {
@@ -4613,6 +4628,7 @@ mod tests {
                 dedup_gardener_max_merges_per_run: 3,
                 memory_active_capacity: 500,
                 capacity_max_archivals_per_run: 10,
+                granularity_freshness_gardener_enabled: false,
             }),
             ..Config::default()
         };
@@ -4637,6 +4653,7 @@ mod tests {
         assert_eq!(memory.dedup_gardener_max_merges_per_run, 3);
         assert_eq!(memory.memory_active_capacity, 500);
         assert_eq!(memory.capacity_max_archivals_per_run, 10);
+        assert!(!memory.granularity_freshness_gardener_enabled);
     }
 
     /// L5: capacity is OFF by default (0 = unbounded) — an opt-in feature.
