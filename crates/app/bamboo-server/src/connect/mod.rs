@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use bamboo_config::ConnectPlatformConfig;
 use bamboo_llm::Config;
 
 /// Owns every configured platform's long-poll/dispatch background task plus
@@ -64,13 +65,35 @@ impl ConnectManager {
         bridge.load_session_map().await;
 
         let mut tasks = Vec::new();
-        for platform_cfg in &config_snapshot.connect.platforms {
+        let telegram_start_ok = telegram_multi_bot_guard(&config_snapshot.connect.platforms);
+        for (index, platform_cfg) in config_snapshot.connect.platforms.iter().enumerate() {
             match platform_cfg.platform_type.as_str() {
                 "telegram" => {
                     let token = platform_cfg.token.clone().unwrap_or_default();
                     if token.trim().is_empty() {
                         tracing::warn!(
                             "connect: telegram platform configured without a token; skipping"
+                        );
+                        continue;
+                    }
+                    // Issue #454 follow-up: `SessionKey`/`InboundMessage.platform`
+                    // hardcode `"telegram"` for every adapter instance, so two
+                    // live telegram bots on one server would collide on
+                    // `telegram:<chat_id>:<user_id>` — a private chat's
+                    // `chat_id` equals the Telegram user id, so a user who
+                    // messages BOTH bots would silently share one bamboo
+                    // session across them. Until per-bot session keys are
+                    // supported, start at most the first validly-configured
+                    // telegram entry and reject the rest with a clear warning
+                    // rather than let them collide.
+                    if !telegram_start_ok[index] {
+                        tracing::warn!(
+                            "connect: multiple telegram platform entries are configured; only \
+                             the FIRST is started. A second telegram bot on this instance would \
+                             collide with the first on the same session-routing key \
+                             (`telegram:<chat_id>:<user_id>`), silently mixing sessions for any \
+                             user who messages both bots. Remove the extra entry, or track \
+                             issue #454 for per-bot session keys."
                         );
                         continue;
                     }
@@ -123,6 +146,54 @@ impl Drop for ConnectManager {
     }
 }
 
+/// Issue #454 follow-up (multi-bot session-key collision): for each entry in
+/// `platforms` (same order/length as the input), returns whether
+/// [`ConnectManager::start`] is allowed to start it as far as the
+/// "at most one live telegram bot" guard is concerned.
+///
+/// `SessionKey`/`InboundMessage.platform` hardcode `"telegram"` — there is no
+/// per-bot/config-index component in the session-routing key — so two
+/// telegram entries running at once would route messages from the SAME
+/// Telegram user (private-chat `chat_id` == user id) to different bots into
+/// the SAME bamboo session key, mixing their conversations. Rather than the
+/// more invasive fix of threading a bot identity through `SessionKey`
+/// (touching the routing key, the persisted session map's key format, and
+/// every call site that builds one), this rejects the collision at the
+/// source: only the FIRST validly-configured (`platform_type == "telegram"`
+/// and a non-empty token) entry is ever started; every other telegram entry
+/// is guarded off here regardless of how many are configured.
+///
+/// Entries with an empty/absent token are left `true` — they're handled by
+/// [`ConnectManager::start`]'s pre-existing "no token configured" skip, which
+/// doesn't count as a "started" telegram bot for this guard's purposes (so a
+/// blank placeholder entry followed by one real entry still starts the real
+/// one). Non-telegram entries are always `true` — this guard doesn't apply to
+/// them.
+fn telegram_multi_bot_guard(platforms: &[ConnectPlatformConfig]) -> Vec<bool> {
+    let mut seen_valid_telegram = false;
+    platforms
+        .iter()
+        .map(|platform_cfg| {
+            if platform_cfg.platform_type != "telegram" {
+                return true;
+            }
+            let has_token = platform_cfg
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty());
+            if !has_token {
+                return true;
+            }
+            if seen_valid_telegram {
+                false
+            } else {
+                seen_valid_telegram = true;
+                true
+            }
+        })
+        .collect()
+}
+
 /// Pulls inbound events (messages and button-press callbacks, issue #458)
 /// off a single platform's channel and hands each to the bridge. Kept as its
 /// OWN task per platform (not merged into the platform's `start()` loop) so
@@ -157,5 +228,71 @@ async fn dispatch_loop(
                 .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform(platform_type: &str, token: Option<&str>) -> ConnectPlatformConfig {
+        ConnectPlatformConfig {
+            platform_type: platform_type.to_string(),
+            token: token.map(str::to_string),
+            token_encrypted: None,
+            allow_from: Vec::new(),
+            admin_from: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn telegram_multi_bot_guard_allows_a_single_telegram_entry() {
+        let platforms = vec![platform("telegram", Some("tok-1"))];
+        assert_eq!(telegram_multi_bot_guard(&platforms), vec![true]);
+    }
+
+    #[test]
+    fn telegram_multi_bot_guard_rejects_every_telegram_entry_after_the_first() {
+        let platforms = vec![
+            platform("telegram", Some("tok-1")),
+            platform("telegram", Some("tok-2")),
+            platform("telegram", Some("tok-3")),
+        ];
+        assert_eq!(
+            telegram_multi_bot_guard(&platforms),
+            vec![true, false, false]
+        );
+    }
+
+    #[test]
+    fn telegram_multi_bot_guard_ignores_non_telegram_entries() {
+        let platforms = vec![
+            platform("telegram", Some("tok-1")),
+            platform("feishu", Some("tok-x")),
+            platform("telegram", Some("tok-2")),
+        ];
+        assert_eq!(
+            telegram_multi_bot_guard(&platforms),
+            vec![true, true, false]
+        );
+    }
+
+    /// A blank/absent-token entry doesn't count as a "started" telegram bot
+    /// for this guard — `ConnectManager::start`'s pre-existing empty-token
+    /// check skips it separately, so the NEXT (real) telegram entry must
+    /// still be allowed to start.
+    #[test]
+    fn telegram_multi_bot_guard_does_not_count_a_tokenless_entry_against_the_budget() {
+        let platforms = vec![
+            platform("telegram", None),
+            platform("telegram", Some("")),
+            platform("telegram", Some("tok-real")),
+        ];
+        assert_eq!(telegram_multi_bot_guard(&platforms), vec![true, true, true]);
+    }
+
+    #[test]
+    fn telegram_multi_bot_guard_handles_an_empty_platform_list() {
+        assert_eq!(telegram_multi_bot_guard(&[]), Vec::<bool>::new());
     }
 }

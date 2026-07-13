@@ -419,6 +419,20 @@ pub fn preserve_masked_notification_secrets(patch_obj: &mut Map<String, Value>, 
 /// `env_vars`' full-array replace relies on) — reordering platforms in the
 /// same request as leaving a token masked is not supported and drops that
 /// entry's token, same as no plaintext being configured yet.
+///
+/// Known limitation (issue #454 follow-up), still present: there is no
+/// stable per-entry id, so reordering two entries of the SAME
+/// `platform_type` (e.g. two `"telegram"` entries, once multi-bot is
+/// supported) at the same time as leaving one masked is indistinguishable
+/// from "not reordered" and can still attach the wrong token to an entry —
+/// fixing that needs a schema change (a stable id field) tracked separately.
+/// What IS fixed here: a reorder is now detected whenever it changes the
+/// `platform_type` at a given index (the common case today, since only one
+/// platform type — `"telegram"` — exists) — `type` is checked against
+/// `current`'s entry at the same index, and a mismatch is treated as
+/// "nothing configured at this position" (the token is dropped, same as no
+/// plaintext existing yet) instead of silently handing one platform's secret
+/// to a different one that happens to now sit at the same index.
 pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, current: &Config) {
     let Some(platforms) = patch_obj
         .get_mut("connect")
@@ -432,11 +446,22 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
         let Some(obj) = platform.as_object_mut() else {
             continue;
         };
-        let existing_plain = current
-            .connect
-            .platforms
-            .get(index)
-            .and_then(|p| p.token.as_deref());
+        let existing = current.connect.platforms.get(index);
+        // A patch entry that names a "type" disagreeing with `current`'s
+        // entry at the same index means the array was reordered (or an
+        // entry was inserted/removed) since the client fetched it — the
+        // position no longer identifies the same logical platform, so don't
+        // resolve the mask against it. A patch entry with no "type" at all
+        // (shouldn't happen with a well-behaved client, which always echoes
+        // the whole object back) can't be checked and falls back to the
+        // pre-existing positional-only behavior.
+        let existing_plain = existing.and_then(|p| {
+            let type_matches = match obj.get("type").and_then(|v| v.as_str()) {
+                Some(patch_type) => patch_type == p.platform_type,
+                None => true,
+            };
+            type_matches.then_some(p).and_then(|p| p.token.as_deref())
+        });
         preserve_masked_secret_field(obj, "token", existing_plain);
     }
 }
@@ -716,6 +741,112 @@ mod tests {
         assert_eq!(
             patch["connect"]["platforms"][0]["token"],
             "tg-real-new-value"
+        );
+    }
+
+    /// Issue #454 follow-up: if the array was reordered/edited since the
+    /// client fetched it — detectable here because the patch entry's "type"
+    /// disagrees with `current`'s entry at the same index — a masked token
+    /// must NOT be resolved against the wrong (now co-located) platform's
+    /// plaintext; it must drop, exactly like "nothing configured yet".
+    #[test]
+    fn preserve_masked_connect_secrets_drops_mask_when_type_at_index_disagrees() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform("telegram", "telegram-secret-token")];
+
+        // The patch's entry at index 0 claims to be a DIFFERENT platform type
+        // than what's actually at `current.connect.platforms[0]` — e.g. a
+        // reorder/insert raced the fetch that pre-filled this mask.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"feishu","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert!(
+            !patch["connect"]["platforms"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("token"),
+            "masked token must not be resolved against a different platform's secret"
+        );
+    }
+
+    /// The type-check is index-scoped, not "does this type appear anywhere
+    /// in current" — a mismatch at index 1 must not fall back to matching
+    /// against a same-typed entry that lives at a different index.
+    #[test]
+    fn preserve_masked_connect_secrets_type_check_does_not_search_other_indices() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform("telegram", "bot-a-token"),
+            connect_platform("feishu", "feishu-token"),
+        ];
+
+        // Patch entry at index 1 claims "telegram" (matches index 0's type,
+        // NOT index 1's) — must still drop, not borrow index 0's token.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[
+                {"type":"telegram","token":"tg-real-value"},
+                {"type":"telegram","token":"****...****"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(patch["connect"]["platforms"][0]["token"], "tg-real-value");
+        assert!(
+            !patch["connect"]["platforms"][1]
+                .as_object()
+                .unwrap()
+                .contains_key("token"),
+            "index 1's mismatched type must not resolve to index 0's token"
+        );
+    }
+
+    /// A patch entry with a matching "type" at its index is unaffected by
+    /// the new guard — this is the common case and must keep working exactly
+    /// as before.
+    #[test]
+    fn preserve_masked_connect_secrets_keeps_plaintext_when_type_at_index_matches() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform("telegram", "bot-a-token"),
+            connect_platform("telegram", "bot-b-token"),
+        ];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[
+                {"type":"telegram","token":"****...****"},
+                {"type":"telegram","token":"****...****"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(patch["connect"]["platforms"][0]["token"], "bot-a-token");
+        assert_eq!(patch["connect"]["platforms"][1]["token"], "bot-b-token");
+    }
+
+    /// A patch entry missing "type" entirely (shouldn't happen with a
+    /// well-behaved client) falls back to the pre-existing positional-only
+    /// behavior rather than being treated as an automatic mismatch.
+    #[test]
+    fn preserve_masked_connect_secrets_falls_back_to_positional_when_type_is_absent() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform("telegram", "existing-bot-token")];
+
+        let mut patch: Map<String, Value> =
+            serde_json::from_str(r#"{"connect":{"platforms":[{"token":"****...****"}]}}"#).unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"],
+            "existing-bot-token"
         );
     }
 }
