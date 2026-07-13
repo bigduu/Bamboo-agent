@@ -47,6 +47,10 @@ impl LedgerPathResolver {
         self.root.clone()
     }
 
+    pub fn projects_root(&self) -> PathBuf {
+        self.root.join(SCOPES_DIR).join(PROJECTS_DIR)
+    }
+
     pub fn scope_root(&self, scope: LedgerScope, project_key: Option<&str>) -> PathBuf {
         let scopes = self.root.join(SCOPES_DIR);
         match scope {

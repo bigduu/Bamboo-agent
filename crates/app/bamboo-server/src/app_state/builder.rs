@@ -474,6 +474,22 @@ impl AppState {
             provider_registry: provider_registry.clone(),
         });
 
+        // Background ledger gardener: expiry + record↔schedule reconciliation
+        // are deterministic and free; distillation uses the background model
+        // and no-ops without one. The bridge handle is already bound above.
+        bamboo_engine::ledger_gardener::spawn_ledger_gardener_task(
+            bamboo_engine::ledger_gardener::LedgerGardenerContext {
+                dream: bamboo_engine::auto_dream::AutoDreamContext {
+                    session_store: session_store.clone(),
+                    storage: storage.clone(),
+                    provider: provider_handle.clone(),
+                    config: config.clone(),
+                    provider_registry: provider_registry.clone(),
+                },
+                schedule_bridge: Some(ledger_schedule_bridge.clone()),
+            },
+        );
+
         let config_for_resolver = config.clone();
         let subagent_model_resolver: OptionalSubagentModelResolver = {
             let registry = provider_registry.clone();

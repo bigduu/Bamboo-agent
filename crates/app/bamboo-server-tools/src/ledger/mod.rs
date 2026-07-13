@@ -35,20 +35,10 @@ const DEFAULT_QUERY_LIMIT: usize = 20;
 const MAX_DECOMPOSE_CHILDREN: usize = 20;
 const DEFAULT_AGENDA_HORIZON_DAYS: i64 = 7;
 
-/// Port through which the ledger keeps real schedules in step with a record's
-/// reminder/recurrence times. Implemented by the server over its schedule
-/// store; absent in embedded/test setups (records still persist, reminders
-/// just don't fire).
-#[async_trait]
-pub trait LedgerScheduleBridge: Send + Sync {
-    /// Make the managed schedules match the record's current `remind_at` and
-    /// `recurrence`. Returns the full set of schedule ids the record now owns.
-    async fn sync_record_schedules(&self, record: &LedgerRecord) -> Result<Vec<String>, String>;
-
-    /// Delete/disable managed schedules (the record went terminal or lost its
-    /// times).
-    async fn release_schedules(&self, schedule_ids: &[String]) -> Result<(), String>;
-}
+// The schedule-bridge port lives beside the store so background maintenance
+// (the engine's ledger gardener) can reconcile schedules through the same
+// seam; re-exported here for existing callers.
+pub use bamboo_memory::ledger_store::LedgerScheduleBridge;
 
 #[derive(Clone)]
 pub struct LedgerTool {

@@ -43,6 +43,22 @@ pub struct LedgerRecordDocument {
     pub path: PathBuf,
 }
 
+/// Port through which ledger writers keep real schedules in step with a
+/// record's `remind_at`/`recurrence` times. Implemented by the server over its
+/// schedule store; the tool layer and background maintenance both talk to this
+/// trait so neither ever sees the scheduler directly. Absent in embedded/test
+/// setups (records still persist, reminders just don't fire).
+#[async_trait::async_trait]
+pub trait LedgerScheduleBridge: Send + Sync {
+    /// Make the managed schedules match the record's current `remind_at` and
+    /// `recurrence`. Returns the full set of schedule ids the record now owns.
+    async fn sync_record_schedules(&self, record: &LedgerRecord) -> Result<Vec<String>, String>;
+
+    /// Delete/disable managed schedules (the record went terminal or lost its
+    /// times).
+    async fn release_schedules(&self, schedule_ids: &[String]) -> Result<(), String>;
+}
+
 pub fn validate_record_id(record_id: &str) -> io::Result<&str> {
     let trimmed = record_id.trim();
     if trimmed.is_empty() {

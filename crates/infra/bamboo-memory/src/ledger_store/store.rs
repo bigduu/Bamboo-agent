@@ -451,6 +451,27 @@ impl LedgerStore {
         }
     }
 
+    /// Project keys that have a ledger scope directory on disk — the iteration
+    /// surface for background maintenance across every scope.
+    pub async fn list_project_keys(&self) -> io::Result<Vec<String>> {
+        let dir = self.resolver.projects_root();
+        let mut reader = match fs::read_dir(&dir).await {
+            Ok(reader) => reader,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut keys = Vec::new();
+        while let Some(entry) = reader.next_entry().await? {
+            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    keys.push(name.to_string());
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
     /// Rebuild every derived artifact for a scope from the record documents.
     pub async fn rebuild_scope(
         &self,

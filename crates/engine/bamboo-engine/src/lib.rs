@@ -6,6 +6,7 @@ pub mod events;
 pub mod external_agents;
 pub mod gardener;
 pub mod gold_auto_answer;
+pub mod ledger_gardener;
 pub mod llm_summarizer;
 pub mod message_hooks;
 pub mod model_areas;
