@@ -20,6 +20,9 @@ pub mod session;
 // From bamboo-domain-schedule
 pub mod schedule;
 
+// Ledger: prospective-memory records (todos, events, reminders, habits)
+pub mod ledger;
+
 // From bamboo-domain-workflow
 pub mod workflow;
 
@@ -30,6 +33,7 @@ pub mod storage;
 pub mod prompt_markers;
 
 // Flat re-exports for backward-compatible access
+pub use ledger::*;
 pub use mcp_config::*;
 pub use prompt_markers::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 pub use provider_catalog::*;

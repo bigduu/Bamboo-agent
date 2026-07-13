@@ -46,6 +46,34 @@ pub struct DurableExtractionCandidate {
     pub confidence: Option<String>,
 }
 
+/// A ledger record candidate (commitment/deadline/appointment the USER stated)
+/// proposed by the same extraction pass that produces durable memory
+/// candidates — no extra LLM call. Every field is defaulted so a partially
+/// malformed item degrades instead of failing the envelope parse.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LedgerExtractionCandidate {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub due_at: Option<String>,
+    #[serde(default)]
+    pub starts_at: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LedgerExtractionEnvelope {
+    #[serde(default)]
+    ledger_candidates: Vec<LedgerExtractionCandidate>,
+}
+
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
@@ -66,6 +94,18 @@ pub fn parse_extraction_candidates(raw: &str) -> Result<Vec<DurableExtractionCan
     let parsed: DurableExtractionEnvelope = serde_json::from_str(payload)
         .map_err(|error| format!("failed to parse durable extraction candidates: {error}"))?;
     Ok(parsed.candidates)
+}
+
+/// Parse the ledger-candidate array out of the extraction response.
+///
+/// Deliberately tolerant: the array is a newer addition to the extraction
+/// output, so an older model output without `ledger_candidates` (or malformed
+/// JSON) yields an empty vec — never an error that kills the auto-dream pass.
+pub fn parse_ledger_candidates(raw: &str) -> Vec<LedgerExtractionCandidate> {
+    let payload = strip_json_fence(raw);
+    serde_json::from_str::<LedgerExtractionEnvelope>(payload)
+        .map(|envelope| envelope.ledger_candidates)
+        .unwrap_or_default()
 }
 
 pub fn parse_candidate_scope(
@@ -345,6 +385,15 @@ pub fn build_extraction_prompt(candidates: &[DreamCandidateInfo]) -> String {
     prompt.push_str("- The title must concisely summarize THAT candidate's own content so it can be found later by keyword search; never use a generic title that does not match the content.\n");
     prompt.push_str("- Skip transient scratch state, code/project structure derivable from tools, and anything low-confidence or secret-like.\n");
     prompt.push_str("- Prefer project scope when the session clearly belongs to a project workspace; otherwise use global.\n\n");
+    prompt.push_str("Ledger candidates (in the SAME JSON object, as a second top-level array):\n");
+    prompt.push_str("- Also extract prospective commitments, deadlines, and appointments the USER stated (e.g. \"I need to renew my passport before August\").\n");
+    prompt.push_str("- Add them under \"ledger_candidates\": [{\"title\":string,\"kind\":\"todo\"|\"event\"|\"reminder\",\"due_at\":string|null,\"starts_at\":string|null,\"excerpt\":string,\"session_id\":string,\"confidence\":\"high\"|\"medium\"|\"low\"}]\n");
+    prompt.push_str("- title must be short and imperative (e.g. \"Renew passport\").\n");
+    prompt.push_str("- due_at and starts_at must be RFC3339 timestamps, or null when the user gave no explicit date/time.\n");
+    prompt.push_str("- excerpt must quote the user's own sentence verbatim.\n");
+    prompt.push_str("- session_id must be the id of the session where the user said it.\n");
+    prompt.push_str("- Only propose items the USER personally committed to or scheduled; never the assistant's own coding or follow-up tasks.\n");
+    prompt.push_str("- Return \"ledger_candidates\": [] when there are none.\n\n");
     prompt.push_str("## Candidate sessions\n\n");
 
     for (index, session) in candidates.iter().enumerate() {
@@ -713,6 +762,70 @@ mod tests {
         assert!(prompt.contains("proj-a"));
         assert!(prompt.contains("Important summary"));
         assert!(prompt.contains("topic-a"));
+    }
+
+    #[test]
+    fn build_extraction_prompt_includes_ledger_candidate_instructions() {
+        let prompt = build_extraction_prompt(&[]);
+        assert!(prompt.contains("ledger_candidates"));
+        assert!(prompt.contains("\"kind\":\"todo\"|\"event\"|\"reminder\""));
+        assert!(prompt.contains("due_at"));
+        assert!(prompt.contains("starts_at"));
+        assert!(prompt.contains("verbatim"));
+        assert!(prompt.contains("Only propose items the USER personally committed to or scheduled"));
+        assert!(prompt.contains("Return \"ledger_candidates\": [] when there are none."));
+    }
+
+    #[test]
+    fn parse_ledger_candidates_reads_present_array() {
+        let raw = "```json\n{\"candidates\":[],\"ledger_candidates\":[{\"title\":\"Renew passport\",\"kind\":\"todo\",\"due_at\":\"2026-08-01T00:00:00Z\",\"starts_at\":null,\"excerpt\":\"I need to renew my passport before August\",\"session_id\":\"session-1\",\"confidence\":\"high\"}]}\n```";
+        let candidates = parse_ledger_candidates(raw);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "Renew passport");
+        assert_eq!(candidates[0].kind, "todo");
+        assert_eq!(
+            candidates[0].due_at.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+        assert_eq!(candidates[0].starts_at, None);
+        assert_eq!(
+            candidates[0].excerpt.as_deref(),
+            Some("I need to renew my passport before August")
+        );
+        assert_eq!(candidates[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(candidates[0].confidence.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_ledger_candidates_tolerates_absent_array() {
+        // Old-model output: only the memory-candidate envelope, no
+        // ledger_candidates key. Must yield an empty vec, not an error.
+        let raw = "{\"candidates\":[{\"title\":\"T\",\"type\":\"user\",\"content\":\"C\"}]}";
+        assert!(parse_ledger_candidates(raw).is_empty());
+        // ...and the memory-candidate parse of the SAME payload keeps working
+        // when ledger_candidates IS present (backward compatibility).
+        let with_ledger = "{\"candidates\":[{\"title\":\"T\",\"type\":\"user\",\"content\":\"C\"}],\"ledger_candidates\":[]}";
+        let memory_candidates =
+            parse_extraction_candidates(with_ledger).expect("memory candidates should parse");
+        assert_eq!(memory_candidates.len(), 1);
+    }
+
+    #[test]
+    fn parse_ledger_candidates_tolerates_malformed_output() {
+        assert!(parse_ledger_candidates("not json at all").is_empty());
+        assert!(parse_ledger_candidates("{\"ledger_candidates\":\"oops\"}").is_empty());
+        assert!(parse_ledger_candidates("").is_empty());
+    }
+
+    #[test]
+    fn parse_ledger_candidates_defaults_missing_fields() {
+        let raw = "{\"ledger_candidates\":[{\"title\":\"Book dentist appointment\"}]}";
+        let candidates = parse_ledger_candidates(raw);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "Book dentist appointment");
+        assert!(candidates[0].kind.is_empty());
+        assert!(candidates[0].due_at.is_none());
+        assert!(candidates[0].confidence.is_none());
     }
 
     #[test]

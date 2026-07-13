@@ -176,7 +176,7 @@ impl Tool for ScheduleTasksTool {
                 "enabled": { "type": "boolean", "description": "Enable/disable schedule (create/patch)." },
                 "trigger": {
                     "type": "object",
-                    "description": "Canonical schedule trigger definition for create/patch. Required for create."
+                    "description": "Canonical schedule trigger definition for create/patch. Required for create. Tagged by 'type': interval {every_seconds}, once {at: RFC3339 UTC instant, fires exactly one time}, daily {hour,minute[,second]}, weekly {weekdays,hour,minute[,second]}, monthly {days,hour,minute[,second]}, cron {expr}."
                 },
                 "timezone": { "type": "string", "description": "Optional IANA timezone for calendar-based triggers." },
                 "start_at": { "type": "string", "description": "Optional RFC3339 inclusive schedule window start." },

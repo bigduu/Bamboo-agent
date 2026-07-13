@@ -189,6 +189,27 @@ pub struct MemoryConfig {
         alias = "memory_project_first_dream"
     )]
     pub project_first_dream: bool,
+    /// Whether the ledger agenda (overdue/upcoming prospective records — todos,
+    /// events, reminders) is injected into the main prompt. Free when the
+    /// ledger is empty: the section is simply omitted.
+    #[serde(
+        default = "default_true_memory_ledger_agenda",
+        alias = "memory_ledger_agenda_injection"
+    )]
+    pub ledger_agenda_injection: bool,
+    /// Whether the background ledger gardener runs (expires past events/reminders,
+    /// reconciles record↔schedule drift, distills completed records into durable
+    /// memory). Expiry and reconciliation are deterministic and free; only
+    /// distillation uses the background model, and it no-ops without one.
+    #[serde(default = "default_true_ledger_gardener_enabled")]
+    pub ledger_gardener_enabled: bool,
+    /// Seconds between ledger gardener runs (default 6 hours).
+    #[serde(default = "default_ledger_gardener_interval_secs")]
+    pub ledger_gardener_interval_secs: u64,
+    /// Whether the ledger gardener's distillation pass (completed records →
+    /// durable memories via the background model) is enabled.
+    #[serde(default = "default_true_ledger_distillation_enabled")]
+    pub ledger_distillation_enabled: bool,
     /// DEPRECATED (memory redesign L3): the "Refine" Dream mode — rewriting the
     /// notebook from its own prior prose — was retired because a self-referential
     /// narrative rewrite drifts from durable truth and silently over-merges. The
@@ -264,6 +285,10 @@ impl Default for MemoryConfig {
             relevant_recall: default_true_memory_relevant_recall(),
             relevant_recall_rerank: false,
             project_first_dream: default_true_memory_project_first_dream(),
+            ledger_agenda_injection: default_true_memory_ledger_agenda(),
+            ledger_gardener_enabled: default_true_ledger_gardener_enabled(),
+            ledger_gardener_interval_secs: default_ledger_gardener_interval_secs(),
+            ledger_distillation_enabled: default_true_ledger_distillation_enabled(),
             dream_refine_mode: false,
             gardener_enabled: default_true_gardener_enabled(),
             gardener_interval_secs: default_gardener_interval_secs(),
@@ -292,6 +317,22 @@ fn default_true_gardener_enabled() -> bool {
 }
 
 fn default_true_dedup_gardener_enabled() -> bool {
+    true
+}
+
+fn default_true_memory_ledger_agenda() -> bool {
+    true
+}
+
+fn default_true_ledger_gardener_enabled() -> bool {
+    true
+}
+
+fn default_ledger_gardener_interval_secs() -> u64 {
+    21_600
+}
+
+fn default_true_ledger_distillation_enabled() -> bool {
     true
 }
 
@@ -4602,6 +4643,10 @@ mod tests {
                 relevant_recall: false,
                 relevant_recall_rerank: true,
                 project_first_dream: false,
+                ledger_agenda_injection: false,
+                ledger_gardener_enabled: false,
+                ledger_gardener_interval_secs: 7_200,
+                ledger_distillation_enabled: false,
                 dream_refine_mode: true,
                 gardener_enabled: true,
                 gardener_interval_secs: 3_600,

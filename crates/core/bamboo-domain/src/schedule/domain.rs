@@ -49,6 +49,10 @@ pub enum ScheduleTrigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         anchor_at: Option<DateTime<Utc>>,
     },
+    /// One-shot trigger: fires exactly once at the given absolute UTC instant.
+    Once {
+        at: DateTime<Utc>,
+    },
     Daily {
         hour: u8,
         minute: u8,
@@ -85,6 +89,7 @@ impl ScheduleTrigger {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Interval { .. } => "interval",
+            Self::Once { .. } => "once",
             Self::Daily { .. } => "daily",
             Self::Weekly { .. } => "weekly",
             Self::Monthly { .. } => "monthly",
@@ -209,6 +214,27 @@ pub struct ScheduleRunRecord {
     pub execution_duration_ms: Option<u64>,
     #[serde(default)]
     pub was_catch_up: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn once_trigger_serializes_with_once_tag_and_round_trips() {
+        let at = DateTime::parse_from_rfc3339("2026-08-01T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let trigger = ScheduleTrigger::Once { at };
+        assert_eq!(trigger.kind_name(), "once");
+
+        let json = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(json["type"], "once");
+        assert_eq!(json["at"], "2026-08-01T09:00:00Z");
+
+        let parsed: ScheduleTrigger = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, trigger);
+    }
 }
 
 /// Runtime configuration for schedule-executed sessions.
