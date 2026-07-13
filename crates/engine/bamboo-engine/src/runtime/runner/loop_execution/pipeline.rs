@@ -2763,6 +2763,7 @@ mod tests {
                 relevant_recall: false,
                 relevant_recall_rerank: false,
                 project_first_dream: false,
+                ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
             max_rounds: 5,
@@ -2900,6 +2901,7 @@ mod tests {
                 relevant_recall: false,
                 relevant_recall_rerank: false,
                 project_first_dream: false,
+                ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
             ..AgentLoopConfig::default()
@@ -4433,6 +4435,7 @@ mod tests {
                 relevant_recall: false,
                 relevant_recall_rerank: false,
                 project_first_dream: false,
+                ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
             max_rounds: 5,

@@ -281,6 +281,7 @@ pub struct PromptMemoryFlags {
     pub relevant_recall: bool,
     pub relevant_recall_rerank: bool,
     pub project_first_dream: bool,
+    pub ledger_agenda: bool,
 }
 
 impl Default for PromptMemoryFlags {
@@ -290,6 +291,7 @@ impl Default for PromptMemoryFlags {
             relevant_recall: true,
             relevant_recall_rerank: false,
             project_first_dream: true,
+            ledger_agenda: true,
         }
     }
 }
@@ -301,6 +303,7 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
             relevant_recall: value.relevant_recall,
             relevant_recall_rerank: value.relevant_recall_rerank,
             project_first_dream: value.project_first_dream,
+            ledger_agenda: value.ledger_agenda_injection,
         }
     }
 }

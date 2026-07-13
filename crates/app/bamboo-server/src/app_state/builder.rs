@@ -256,6 +256,11 @@ impl AppState {
             config: config.clone(),
         };
 
+        // The `ledger` tool needs the schedule store (built further down) to
+        // sync reminders; hand it a late-bound bridge now and bind it below.
+        let ledger_schedule_bridge =
+            Arc::new(crate::schedule_app::LateBoundLedgerBridge::default());
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -268,6 +273,7 @@ impl AppState {
             notification_service.clone(),
             session_event_senders.clone(),
             session_watchers.clone(),
+            ledger_schedule_bridge.clone(),
         );
 
         // Idle-evict completed runners together with their paired session event
@@ -424,6 +430,14 @@ impl AppState {
         let tools_with_task = base_tools.clone();
 
         let schedule_store = init_schedule_store(&data_dir).await?;
+
+        // Bind the ledger's reminder bridge now that the schedule store exists.
+        ledger_schedule_bridge
+            .bind(Arc::new(crate::schedule_app::ScheduleLedgerBridge::new(
+                schedule_store.clone(),
+            )))
+            .await;
+
         let schedule_manager = build_schedule_manager(
             schedule_store.clone(),
             agent.clone(),

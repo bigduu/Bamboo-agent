@@ -137,6 +137,80 @@ async fn external_memory_includes_global_dream_fallback_and_session_note_when_pr
 }
 
 #[tokio::test]
+async fn external_memory_includes_ledger_agenda_when_records_are_open() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+
+    // A colocated ledger with one overdue record and one undated open todo.
+    let ledger = bamboo_memory::ledger_store::LedgerStore::new(temp_dir.path());
+    let mut overdue = bamboo_domain::ledger::LedgerRecord::new(
+        "rec_overdue",
+        bamboo_domain::ledger::RecordKind::Todo,
+        "Send the quarterly report",
+    );
+    overdue.time.due_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    ledger.write_record(overdue, None).await.expect("write overdue record");
+    let undated = bamboo_domain::ledger::LedgerRecord::new(
+        "rec_open",
+        bamboo_domain::ledger::RecordKind::Todo,
+        "Clean the garage",
+    );
+    ledger.write_record(undated, None).await.expect("write undated record");
+
+    let mut session = bamboo_agent_core::Session::new("session-ledger-test", "test-model");
+    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
+
+    super::refresh_external_memory_context_with_store(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
+
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
+    assert!(system_prompt.contains("### Ledger Agenda (prospective records)"));
+    assert!(system_prompt.contains("[OVERDUE] `rec_overdue`"));
+    assert!(system_prompt.contains("Send the quarterly report"));
+    assert!(system_prompt.contains("[OPEN] `rec_open`"));
+    assert!(system_prompt.contains("record it with the `ledger` tool"));
+
+    // Flag off → the section disappears even with open records.
+    let mut flags = crate::runtime::config::PromptMemoryFlags::default();
+    flags.ledger_agenda = false;
+    super::refresh_external_memory_context_with_store(&mut session, &store, flags, None).await;
+    let without = super::render_external_memory_section(&session)
+        .expect("external memory section should still render");
+    assert!(!without.contains("### Ledger Agenda"));
+}
+
+#[tokio::test]
+async fn external_memory_omits_ledger_agenda_when_ledger_is_empty() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    store
+        .write_session_topic("session-empty-ledger", "default", "note")
+        .await
+        .expect("save session note");
+
+    let mut session = bamboo_agent_core::Session::new("session-empty-ledger", "test-model");
+    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
+
+    super::refresh_external_memory_context_with_store(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
+
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
+    assert!(!system_prompt.contains("### Ledger Agenda"));
+}
+
+#[tokio::test]
 async fn external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());

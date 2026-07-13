@@ -59,12 +59,13 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 10] = [
     ("SubSession", "SubAgent"),
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 7] = [
+pub const SERVER_TOOL_NAMES: [&str; 8] = [
     "SubAgent",
     "compact_context",
     "scheduler",
     "session_history",
     "memory",
+    "ledger",
     "load_skill",
     "read_skill_resource",
 ];

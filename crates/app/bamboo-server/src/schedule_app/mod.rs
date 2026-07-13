@@ -6,6 +6,7 @@
 //! `bamboo-server-tools` crate) because it is a facade over this subsystem, not
 //! a subsystem-independent capability.
 
+pub mod ledger_bridge;
 pub mod manager;
 pub mod scheduler_tool;
 pub mod session_factory;
@@ -16,6 +17,7 @@ pub use bamboo_domain::{
     MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleRunRecord, ScheduleRunStatus,
     ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWeekday, ScheduleWindow,
 };
+pub use ledger_bridge::{LateBoundLedgerBridge, ScheduleLedgerBridge};
 pub use manager::{
     build_schedule_context, ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
 };
