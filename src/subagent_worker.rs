@@ -330,9 +330,18 @@ impl BambooRuntimeExecutor {
             spec.capabilities.mcp_proxy.as_ref()
         {
             let proxy_id = format!("{}#mcp", spec.identity.child_id);
+            // Thread this worker's REAL role (issue #54) so the orchestrator's
+            // per-role MCP allowlist — if configured — actually scopes it.
+            // Previously this hardcoded `None`, so the real worker-proxy path
+            // advertised no role and bypassed filtering even when configured.
+            // Blank role (`ChildIdentity::role` defaults to "") is normalized
+            // to `None` (unrestricted), matching the rest of the allowlist's
+            // "no role" semantics.
+            let role = (!spec.identity.role.trim().is_empty()).then(|| spec.identity.role.clone());
             match bamboo_broker::McpProxyExecutor::connect(
                 &proxy.endpoint,
                 proxy_id,
+                role,
                 &proxy.token,
                 &proxy.orchestrator,
                 std::time::Duration::from_secs(30),

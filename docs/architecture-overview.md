@@ -191,11 +191,23 @@ bamboo broker-agent serve --broker ws://host:9600 --token $T \
 ```jsonc
 "subagents": {
   "max_concurrent": 8,
-  "broker": { "endpoint": "ws://broker-host:9600", "token": "…" }   // 启用 broker 工具 + MCP 代理服务
+  "broker": { "endpoint": "ws://broker-host:9600", "token": "…" },  // 启用 broker 工具 + MCP 代理服务
+  "mcp_role_allowlist": [                                          // 可选(issue #54):按角色收窄代理工具面
+    { "role": "researcher", "tools": ["fetch_url"] },
+    { "role": "sandboxed", "tools": [] }                           // 空数组 = 显式锁死(0 工具)
+  ]
 }
 ```
 配了 `subagents.broker` 才会:Root 工具面挂上 `deploy_agent`/`ask_agent`,且 server 启动
 `serve_mcp_proxy`。
+
+`mcp_role_allowlist` 为空(默认)= 每个角色都不受限,行为与 #54 之前完全一致。列出的角色只能
+看到/调用其 `tools` 里的工具(manifest 过滤 + Call 兜底拒绝双重生效);未列出的角色仍不受限。
+**信任边界**:这里的 `role` 取自连接 worker 自报的 `AgentRef.role`(`ChildIdentity.role`),
+**不是**经过 broker 鉴权验证的身份——同一个 bearer token 能连接的 worker 可以自称任意角色。
+所以这个 allowlist 只能防"跑歪了的/幻觉的"worker(它按分配到的角色老实上报),挡不住真正
+恶意、蓄意冒充其他角色的 worker;需要更强边界(per-role broker 凭证、签名 `AgentRef` 等)不在
+本 issue 范围内。
 
 ---
 
