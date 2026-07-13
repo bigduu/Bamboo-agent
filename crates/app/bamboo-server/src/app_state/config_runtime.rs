@@ -148,12 +148,23 @@ impl AppState {
         // effects (provider reload) don't need to block reloads/other updates.
         let snapshot = {
             let _io = self.config_io_lock.lock().await;
-            let snapshot = {
+            let (snapshot, enforcement_newly_off) = {
                 let mut cfg = self.config.write().await;
+                let was_off = cfg.plugin_trust.enforcement_is_off();
                 update(&mut cfg)?;
                 cfg.publish_env_vars();
-                cfg.clone()
+                let newly_off = !was_off && cfg.plugin_trust.enforcement_is_off();
+                (cfg.clone(), newly_off)
             };
+            // Loud signal at the MOMENT plugin_trust.enforcement is flipped off
+            // live (e.g. via `bamboo config set plugin_trust.enforcement off`
+            // over HTTP), mirroring the boot-time warn in `AppState::new` — so
+            // this security-relevant relaxation is never applied silently. Only
+            // on the transition into `Off` (not every unrelated config write
+            // while already off).
+            if enforcement_newly_off {
+                warn_plugin_trust_enforcement_off();
+            }
             self.persist_config_snapshot(snapshot.clone())
                 .await
                 .map_err(|e| {
@@ -176,10 +187,18 @@ impl AppState {
         // config-IO lock so a reload can't interleave; effects run unlocked.
         {
             let _io = self.config_io_lock.lock().await;
-            {
+            let enforcement_newly_off = {
                 let mut cfg = self.config.write().await;
+                let was_off = cfg.plugin_trust.enforcement_is_off();
                 *cfg = new_config.clone();
                 cfg.publish_env_vars();
+                !was_off && cfg.plugin_trust.enforcement_is_off()
+            };
+            // Same live signal as `update_config` — a full-config replace (JSON
+            // merge / PATCH endpoints) that transitions plugin_trust.enforcement
+            // into `Off` must warn just as loudly as a targeted set.
+            if enforcement_newly_off {
+                warn_plugin_trust_enforcement_off();
             }
             self.persist_config_snapshot(new_config.clone())
                 .await
@@ -214,4 +233,20 @@ impl AppState {
 
         Ok(())
     }
+}
+
+/// The prominent warning emitted whenever `plugin_trust.enforcement` is (or
+/// becomes) `Off` — that setting silently downgrades EVERY subsequent `url`
+/// plugin install/update to skip the host allowlist, signature, and
+/// checksum-required-by-default layers, with no per-install flag needed (see
+/// `crate::plugin_source`'s module docs). Factored into one function so the
+/// boot-time signal (`AppState::new`) and the live-apply signal
+/// (`update_config`/`replace_config`, covering the HTTP `config set` / PATCH
+/// paths) emit the EXACT same message — no drift, and no trigger can flip
+/// enforcement off silently.
+pub(crate) fn warn_plugin_trust_enforcement_off() {
+    tracing::warn!(
+        "plugin_trust.enforcement is OFF — plugin installs from ANY URL are accepted \
+         without host/signature/checksum verification (config.json plugin_trust.enforcement)"
+    );
 }

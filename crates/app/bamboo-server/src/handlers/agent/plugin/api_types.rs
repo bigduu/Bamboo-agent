@@ -15,13 +15,14 @@
 //! `#[serde(tag = "type", rename_all = "snake_case")]` wire shape directly —
 //! `{"type":"local_dir","path":...}` / `{"type":"local_archive","path":...}` /
 //! `{"type":"url","url":...,"sha256":...?,"allow_unverified":...?,
-//! "allow_untrusted_host":...?,"allow_unsigned":...?}` — rather than
-//! inventing a parallel request enum: it is already exactly the shape both
-//! the CLI and this HTTP layer need, and it doubles as the provenance record
-//! `install()` persists (see `bamboo_plugin::registry::PluginSource`'s doc
-//! comment). `signed_by` is also part of that same wire shape but is
-//! response-only in practice — a request-supplied value is ignored (see
-//! `to_source_input`).
+//! "allow_untrusted_host":...?,"allow_unsigned":...?,"insecure":...?}` —
+//! rather than inventing a parallel request enum: it is already exactly the
+//! shape both the CLI and this HTTP layer need, and it doubles as the
+//! provenance record `install()` persists (see
+//! `bamboo_plugin::registry::PluginSource`'s doc comment). `signed_by` is
+//! also part of that same wire shape but is response-only in practice — a
+//! request-supplied value is ignored (see `to_source_input`). `insecure`, by
+//! contrast, IS a real request-side input (see below).
 //!
 //! **Three trust layers (`url` sources), enforced together in
 //! `plugin_source::fetch_manifest_bundle`** (see that module's docs for the
@@ -46,6 +47,19 @@
 //!
 //! So `POST /install` with a bare `{"type":"url","url":"..."}` body no
 //! longer just downloads and trusts any tar.gz from any host.
+//!
+//! **`insecure` — the aggregate escape hatch.** `"insecure": true` on a `url`
+//! source is shorthand for setting `allow_untrusted_host`, `allow_unsigned`
+//! AND `allow_unverified` all at once for THIS request — see
+//! `plugin_source.rs`'s "`--insecure` / `plugin_trust.enforcement`" module
+//! docs section. A supplied `sha256` is still verified even with
+//! `insecure: true` (the aggregate only turns default-required checks OFF;
+//! it never turns off a check the caller explicitly opted into). The same
+//! aggregate also applies server-wide, with no per-request field needed, when
+//! `plugin_trust.enforcement` is `"off"` in `config.json`. This route sits
+//! behind the same `enforce_access_password_middleware` wrap as every other
+//! `/api/v1/plugins` route (see `routes::agent::plugin_scope`), so `insecure`
+//! is not an additional unauthenticated surface.
 
 use serde::{Deserialize, Serialize};
 

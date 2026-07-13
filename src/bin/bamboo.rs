@@ -551,7 +551,8 @@ enum PluginCommands {
     /// `--allow-unverified` opts out — waived automatically when the bundle
     /// is signature-verified). The defaults trust nova's official plugin
     /// from its GitHub release, so installing it needs NO flags at all once
-    /// it's signed; any other host/publisher needs the matching opt-out.
+    /// it's signed; any other host/publisher needs the matching opt-out (or
+    /// `--insecure` to waive all three at once).
     #[command(after_help = "EXAMPLES:\n  \
         # From a local directory (development)\n  \
         bamboo plugin install ./my-plugin\n\n  \
@@ -567,7 +568,9 @@ enum PluginCommands {
         --allow-untrusted-host --allow-unsigned\n\n  \
         # From an untrusted host, explicitly accepting the risk\n  \
         bamboo plugin install https://example.com/my-plugin.tar.gz \\\n    \
-        --allow-untrusted-host --allow-unsigned --allow-unverified")]
+        --allow-untrusted-host --allow-unsigned --allow-unverified\n\n  \
+        # Same as above, all at once (dev / self-hosted / custom setups only)\n  \
+        bamboo plugin install https://example.com/my-plugin.tar.gz --insecure")]
     Install {
         /// A local directory, a local `.tar.gz`/`.tgz`/`.zip` archive, or an
         /// `http(s)://` URL — the source kind is auto-detected.
@@ -578,7 +581,10 @@ enum PluginCommands {
         /// source. Only valid with a URL source; the server rejects a
         /// mismatch before unpacking anything. Without this, a URL install
         /// also needs `--allow-unverified` (unless the bundle is
-        /// signature-verified, which satisfies this on its own).
+        /// signature-verified, which satisfies this on its own). Honored even
+        /// alongside `--insecure`: a supplied sha256 is a check you opted
+        /// INTO, so it is still verified (a mismatch still refuses the
+        /// install) — `--insecure` only turns default-required checks off.
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
 
@@ -602,6 +608,17 @@ enum PluginCommands {
         /// official signing key). Only valid with a URL source.
         #[arg(long)]
         allow_unsigned: bool,
+
+        /// Skip ALL plugin trust checks (host allowlist, signature,
+        /// checksum) for this install — use only for sources you fully
+        /// trust; equivalent to --allow-untrusted-host --allow-unsigned
+        /// --allow-unverified. Only valid with a URL source. A `--sha256`
+        /// passed alongside this is still verified (this flag only turns
+        /// checks OFF, never off a check you opted into). The server logs a
+        /// prominent warning naming the source for every insecure install and
+        /// records it in provenance (see `bamboo plugin list --json`).
+        #[arg(long)]
+        insecure: bool,
 
         #[command(flatten)]
         conn: ConnArgs,
@@ -649,7 +666,8 @@ enum PluginCommands {
         /// source. Only valid with a URL source; the server rejects a
         /// mismatch before unpacking anything. Without this, a URL source
         /// also needs `--allow-unverified` (unless the bundle is
-        /// signature-verified, which satisfies this on its own).
+        /// signature-verified, which satisfies this on its own). Honored even
+        /// alongside `--insecure` — see that flag's doc.
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
 
@@ -668,6 +686,15 @@ enum PluginCommands {
         /// URL source.
         #[arg(long)]
         allow_unsigned: bool,
+
+        /// Skip ALL plugin trust checks (host allowlist, signature,
+        /// checksum) for this update — use only for sources you fully trust;
+        /// equivalent to --allow-untrusted-host --allow-unsigned
+        /// --allow-unverified. Only valid with a URL source. A `--sha256`
+        /// passed alongside this is still verified. The server logs a
+        /// prominent warning naming the source and records it in provenance.
+        #[arg(long)]
+        insecure: bool,
 
         #[command(flatten)]
         conn: ConnArgs,
@@ -1780,6 +1807,7 @@ async fn main() {
                     allow_unverified,
                     allow_untrusted_host,
                     allow_unsigned,
+                    insecure,
                     conn,
                 } => {
                     bamboo_agent::plugin_cli::install(
@@ -1789,6 +1817,7 @@ async fn main() {
                         allow_unverified,
                         allow_untrusted_host,
                         allow_unsigned,
+                        insecure,
                     )
                     .await
                 }
@@ -1805,6 +1834,7 @@ async fn main() {
                     allow_unverified,
                     allow_untrusted_host,
                     allow_unsigned,
+                    insecure,
                     conn,
                 } => {
                     bamboo_agent::plugin_cli::update(
@@ -1815,6 +1845,7 @@ async fn main() {
                         allow_unverified,
                         allow_untrusted_host,
                         allow_unsigned,
+                        insecure,
                     )
                     .await
                 }
@@ -2206,6 +2237,77 @@ mod tests {
     }
 
     #[test]
+    fn plugin_install_parses_insecure_flag() {
+        use clap::Parser;
+
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "install",
+            "https://example.com/my-plugin.tar.gz",
+            "--insecure",
+        ])
+        .expect("--insecure should parse");
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Install {
+                    insecure,
+                    allow_unverified,
+                    allow_untrusted_host,
+                    allow_unsigned,
+                    ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(insecure);
+        // `--insecure` alone does NOT flip the individual `allow_*` clap
+        // fields themselves (those stay whatever was literally passed on the
+        // command line) — the aggregate is applied by `detect_source` when
+        // building the JSON request body, exercised in `plugin_cli`'s own
+        // tests (`detect_source_insecure_...`).
+        assert!(!allow_unverified);
+        assert!(!allow_untrusted_host);
+        assert!(!allow_unsigned);
+
+        // `--insecure` combined with an explicit `--sha256` parses too (the
+        // checksum stays honored — see `plugin_cli::detect_source`'s docs).
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "install",
+            "https://example.com/my-plugin.tar.gz",
+            "--insecure",
+            "--sha256",
+            "deadbeef",
+        ])
+        .expect("--insecure with --sha256 should parse");
+        let super::Commands::Plugin {
+            command:
+                super::PluginCommands::Install {
+                    insecure, sha256, ..
+                },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(insecure);
+        assert_eq!(sha256.as_deref(), Some("deadbeef"));
+
+        // Defaults to false when omitted.
+        let parsed =
+            super::Cli::try_parse_from(["bamboo", "plugin", "install", "./my-plugin"]).unwrap();
+        let super::Commands::Plugin {
+            command: super::PluginCommands::Install { insecure, .. },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Install");
+        };
+        assert!(!insecure);
+    }
+
+    #[test]
     fn plugin_update_parses_id_and_source() {
         use clap::Parser;
 
@@ -2298,6 +2400,45 @@ mod tests {
         };
         assert!(!allow_untrusted_host);
         assert!(!allow_unsigned);
+    }
+
+    #[test]
+    fn plugin_update_parses_insecure_flag() {
+        use clap::Parser;
+
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "update",
+            "hello-plugin",
+            "https://example.com/my-plugin.tar.gz",
+            "--insecure",
+        ])
+        .expect("--insecure should parse on update too");
+        let super::Commands::Plugin {
+            command: super::PluginCommands::Update { insecure, .. },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Update");
+        };
+        assert!(insecure);
+
+        // Defaults to false when omitted.
+        let parsed = super::Cli::try_parse_from([
+            "bamboo",
+            "plugin",
+            "update",
+            "hello-plugin",
+            "./my-plugin-v2",
+        ])
+        .unwrap();
+        let super::Commands::Plugin {
+            command: super::PluginCommands::Update { insecure, .. },
+        } = parsed.command.expect("a subcommand was given")
+        else {
+            panic!("expected Plugin::Update");
+        };
+        assert!(!insecure);
     }
 
     #[test]

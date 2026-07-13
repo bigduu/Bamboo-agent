@@ -725,6 +725,21 @@ pub struct PluginTrustConfig {
     /// `--allow-unsigned`.
     #[serde(default = "default_trusted_keys")]
     pub trusted_keys: Vec<TrustedKey>,
+    /// Persistent, config-level escape hatch for the whole three-layer
+    /// policy above: `Off` makes every `url` plugin install/update behave as
+    /// if `--insecure` (equivalently, `--allow-untrusted-host
+    /// --allow-unsigned --allow-unverified`) were passed, WITHOUT needing the
+    /// per-install flag every time — the "I run a private/dev bamboo and
+    /// don't want to pass flags on every install" customization. Defaults to
+    /// [`PluginTrustEnforcement::Strict`] — a fresh config, or one with no
+    /// `plugin_trust.enforcement` key at all, is secure by default; relaxing
+    /// it is always an explicit, user-initiated edit
+    /// (`bamboo config set plugin_trust.enforcement off`), never a silent
+    /// weakening. See `bamboo-server`'s `plugin_source.rs` for where this is
+    /// enforced, and `AppState::new` for the loud startup warning emitted
+    /// whenever a server boots with this set to `Off`.
+    #[serde(default)]
+    pub enforcement: PluginTrustEnforcement,
 }
 
 impl Default for PluginTrustConfig {
@@ -732,6 +747,7 @@ impl Default for PluginTrustConfig {
         Self {
             trusted_hosts: default_trusted_hosts(),
             trusted_keys: default_trusted_keys(),
+            enforcement: PluginTrustEnforcement::default(),
         }
     }
 }
@@ -744,6 +760,68 @@ impl PluginTrustConfig {
     /// unparseable URL or a non-`https` scheme is never trusted).
     pub fn is_host_trusted(&self, url: &str) -> bool {
         is_host_trusted(url, &self.trusted_hosts)
+    }
+
+    /// True when `enforcement` is [`PluginTrustEnforcement::Off`] — every
+    /// `url` plugin install/update should skip the host allowlist, signature,
+    /// and checksum-requirement layers, exactly as if `--insecure` were
+    /// passed to that individual install. See the field's doc comment for
+    /// the full rationale.
+    pub fn enforcement_is_off(&self) -> bool {
+        matches!(self.enforcement, PluginTrustEnforcement::Off)
+    }
+}
+
+/// `plugin_trust.enforcement`: the persistent, config-level form of the
+/// `--insecure` escape hatch (see [`PluginTrustConfig::enforcement`]).
+///
+/// Deserialization accepts either the canonical string form (`"strict"` /
+/// `"off"`, case-insensitive) or a bool-ish alias (`true` == `Strict`,
+/// `false` == `Off`) for a hand-edited `config.json` — `true`/`false` read
+/// naturally as "is enforcement on?". The string form is what
+/// `bamboo config set plugin_trust.enforcement off` writes (and the only
+/// form the generic dot-path setter's round-trip check accepts on write,
+/// since this type always *serializes* back out as a string — see
+/// `bamboo-config`'s `dot_path` module); the bool alias is a read-side
+/// convenience for whoever edits `config.json` directly.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginTrustEnforcement {
+    /// Secure by default: the host allowlist, signature, and checksum layers
+    /// are all enforced (each individually waivable via
+    /// `--allow-untrusted-host` / `--allow-unsigned` / `--allow-unverified`,
+    /// or all at once via `--insecure`).
+    #[default]
+    Strict,
+    /// Every `url` plugin install/update skips all three trust layers,
+    /// without needing any per-install flag. Opt-in only — never the
+    /// default for a fresh or pre-existing config.
+    Off,
+}
+
+impl<'de> Deserialize<'de> for PluginTrustEnforcement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            Str(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Bool(true) => Ok(PluginTrustEnforcement::Strict),
+            Repr::Bool(false) => Ok(PluginTrustEnforcement::Off),
+            Repr::Str(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "strict" => Ok(PluginTrustEnforcement::Strict),
+                "off" => Ok(PluginTrustEnforcement::Off),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid `plugin_trust.enforcement` value '{other}': expected \"strict\" or \
+                     \"off\""
+                ))),
+            },
+        }
     }
 }
 
@@ -5646,6 +5724,141 @@ mod tests {
         assert_eq!(
             config.plugin_trust.trusted_hosts,
             vec!["github.com/bigduu/".to_string(), "example.com".to_string()]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `plugin_trust.enforcement` — the persistent, config-level form of the
+    // `--insecure` escape hatch.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn plugin_trust_enforcement_defaults_to_strict_when_absent() {
+        // A fresh `Config::default()` (nothing on disk at all).
+        let config = Config::default();
+        assert_eq!(
+            config.plugin_trust.enforcement,
+            PluginTrustEnforcement::Strict
+        );
+        assert!(!config.plugin_trust.enforcement_is_off());
+
+        // A `plugin_trust` object present in JSON but with NO `enforcement`
+        // key at all (e.g. a config.json written before this field existed)
+        // must ALSO deserialize to Strict, not fail or silently do something
+        // else — additive/back-compat, matching `trusted_hosts`/
+        // `trusted_keys`'s own `#[serde(default = ...)]` behavior.
+        let json = serde_json::json!({
+            "trusted_hosts": ["example.com"],
+            "trusted_keys": [],
+        });
+        let trust: PluginTrustConfig = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(trust.enforcement, PluginTrustEnforcement::Strict);
+    }
+
+    #[test]
+    fn plugin_trust_enforcement_off_string_parses_case_insensitively() {
+        for raw in ["off", "OFF", "Off", " off "] {
+            let trust: PluginTrustConfig = serde_json::from_value(serde_json::json!({
+                "enforcement": raw,
+            }))
+            .unwrap_or_else(|e| panic!("'{raw}' should parse as Off: {e}"));
+            assert_eq!(trust.enforcement, PluginTrustEnforcement::Off, "{raw}");
+            assert!(trust.enforcement_is_off());
+        }
+        for raw in ["strict", "STRICT", " Strict "] {
+            let trust: PluginTrustConfig = serde_json::from_value(serde_json::json!({
+                "enforcement": raw,
+            }))
+            .unwrap_or_else(|e| panic!("'{raw}' should parse as Strict: {e}"));
+            assert_eq!(trust.enforcement, PluginTrustEnforcement::Strict, "{raw}");
+        }
+
+        let err = serde_json::from_value::<PluginTrustConfig>(serde_json::json!({
+            "enforcement": "nonsense",
+        }))
+        .expect_err("an unrecognized string must be rejected, not silently default");
+        assert!(err.to_string().contains("nonsense"));
+    }
+
+    #[test]
+    fn plugin_trust_enforcement_accepts_a_bool_ish_alias() {
+        // A hand-edited config.json using a plain bool reads naturally: is
+        // enforcement ON (`true`) or OFF (`false`)?
+        let trust: PluginTrustConfig =
+            serde_json::from_value(serde_json::json!({ "enforcement": false })).unwrap();
+        assert_eq!(trust.enforcement, PluginTrustEnforcement::Off);
+
+        let trust: PluginTrustConfig =
+            serde_json::from_value(serde_json::json!({ "enforcement": true })).unwrap();
+        assert_eq!(trust.enforcement, PluginTrustEnforcement::Strict);
+    }
+
+    #[test]
+    fn plugin_trust_enforcement_always_serializes_as_the_canonical_string() {
+        // Regardless of which accepted input form produced it, the
+        // in-memory value always serializes back out as the canonical
+        // string — this is what the dot-path `config set` setter's
+        // round-trip check relies on (see `dot_path.rs`'s module docs).
+        let trust = PluginTrustConfig {
+            enforcement: PluginTrustEnforcement::Off,
+            ..PluginTrustConfig::default()
+        };
+        let json = serde_json::to_value(&trust).unwrap();
+        assert_eq!(json["enforcement"], "off");
+
+        let trust = PluginTrustConfig {
+            enforcement: PluginTrustEnforcement::Strict,
+            ..PluginTrustConfig::default()
+        };
+        let json = serde_json::to_value(&trust).unwrap();
+        assert_eq!(json["enforcement"], "strict");
+    }
+
+    #[test]
+    fn normalize_plugin_trust_settings_does_not_disturb_enforcement() {
+        // `normalize_plugin_trust_settings` only touches `trusted_hosts` —
+        // confirm it's a true no-op on `enforcement` either way.
+        let mut config = Config::default();
+        config.plugin_trust.enforcement = PluginTrustEnforcement::Off;
+        config.normalize_plugin_trust_settings();
+        assert_eq!(config.plugin_trust.enforcement, PluginTrustEnforcement::Off);
+    }
+
+    #[test]
+    fn config_set_plugin_trust_enforcement_off_round_trips_through_the_dot_path_setter() {
+        // Confirms the dot-path `bamboo config set plugin_trust.enforcement
+        // off` path actually works end to end through
+        // `crate::dot_path::apply_dot_path_set` (the generic JSON-patch
+        // setter), not just direct field assignment.
+        let config = Config::from_data_dir_without_env(Some(std::path::PathBuf::from(
+            "/nonexistent-bamboo-plugin-trust-enforcement-test-dir",
+        )));
+        assert_eq!(
+            config.plugin_trust.enforcement,
+            PluginTrustEnforcement::Strict
+        );
+
+        let outcome = crate::dot_path::apply_dot_path_set(
+            &config,
+            "plugin_trust.enforcement",
+            crate::dot_path::parse_cli_value("off"),
+        )
+        .expect("plugin_trust.enforcement should be settable via the generic dot-path setter");
+        assert_eq!(
+            outcome.config.plugin_trust.enforcement,
+            PluginTrustEnforcement::Off
+        );
+
+        // And back to strict.
+        let outcome = crate::dot_path::apply_dot_path_set(
+            &outcome.config,
+            "plugin_trust.enforcement",
+            crate::dot_path::parse_cli_value("strict"),
+        )
+        .expect("setting it back to strict should also round-trip");
+        assert_eq!(
+            outcome.config.plugin_trust.enforcement,
+            PluginTrustEnforcement::Strict
         );
     }
 }

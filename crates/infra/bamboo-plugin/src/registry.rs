@@ -55,6 +55,19 @@ pub enum PluginSource {
     /// rather than silently trusting an unpinned/unsigned download from an
     /// untrusted host, so every `None`/`false` combination here always means
     /// a deliberate, recorded risk acceptance, never an oversight.
+    ///
+    /// `insecure` is the convenience AGGREGATE over the three per-layer
+    /// opt-outs above: `true` when this install waived all three at once,
+    /// either via a per-install `--insecure` flag / `"insecure": true` on the
+    /// request, or because `plugin_trust.enforcement` was `off` at install
+    /// time (see `bamboo-server`'s `plugin_source.rs` module docs). Recorded
+    /// separately from the three individual `allow_*` fields so `plugin
+    /// list`/audit can tell "an operator deliberately accepted ALL risk for
+    /// this source" apart from "these three flags happened to all be set
+    /// individually" — functionally identical, but a meaningfully different
+    /// signal for review. `#[serde(default)]` so a pre-existing
+    /// `installed.json` row (written before this field existed) loads as
+    /// `false` rather than failing to deserialize.
     Url {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,6 +96,13 @@ pub enum PluginSource {
         /// backward compat with rows written before signing existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signed_by: Option<String>,
+        /// True when this install ran with ALL THREE trust layers waived at
+        /// once via the `--insecure` / `"insecure": true` aggregate opt-out,
+        /// or because `plugin_trust.enforcement` was `off` — see this
+        /// variant's doc comment above. `#[serde(default)]` for backward
+        /// compat with rows written before this field existed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        insecure: bool,
     },
 }
 

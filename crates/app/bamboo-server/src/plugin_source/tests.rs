@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use bamboo_config::{PluginTrustConfig, TrustedKey};
+use bamboo_config::{PluginTrustConfig, PluginTrustEnforcement, TrustedKey};
 use bamboo_plugin::{
     InstallDisposition, InstalledPlugin, PluginError, PluginInstaller, PluginManifest,
     PluginResult, PluginSource,
@@ -575,9 +575,11 @@ fn url_input(url: &str, sha256: Option<&str>, allow_unverified: bool) -> PluginS
     url_input_full(url, sha256, allow_unverified, true, true)
 }
 
-/// Full constructor for `PluginSourceInput::Url` exercising all five fields —
-/// used directly by the host-allowlist/signature test sections, which need
-/// per-test control over `allow_untrusted_host`/`allow_unsigned`.
+/// Full constructor for `PluginSourceInput::Url` exercising the four
+/// per-layer fields — used directly by the host-allowlist/signature test
+/// sections, which need per-test control over
+/// `allow_untrusted_host`/`allow_unsigned`. Never sets `insecure` (that
+/// aggregate gets its own dedicated section/helper further down).
 fn url_input_full(
     url: &str,
     sha256: Option<&str>,
@@ -591,6 +593,21 @@ fn url_input_full(
         allow_unverified,
         allow_untrusted_host,
         allow_unsigned,
+        insecure: false,
+    }
+}
+
+/// `--insecure` aggregate test helper: every per-layer flag left `false`,
+/// only `insecure` set — proves the AGGREGATE alone (not any individual
+/// `allow_*`) is what waives all three layers.
+fn url_input_insecure(url: &str, sha256: Option<&str>) -> PluginSourceInput {
+    PluginSourceInput::Url {
+        url: url.to_string(),
+        sha256: sha256.map(|s| s.to_string()),
+        allow_unverified: false,
+        allow_untrusted_host: false,
+        allow_unsigned: false,
+        insecure: true,
     }
 }
 
@@ -631,6 +648,7 @@ async fn stages_bare_manifest_from_url_with_correct_bundle_sha256() {
             allow_untrusted_host: true,
             allow_unsigned: true,
             signed_by: None,
+            insecure: false,
         }
     );
     // No skill files were bundled with a bare manifest fetch.
@@ -767,6 +785,7 @@ async fn url_install_with_allow_unverified_and_no_sha256_succeeds() {
             allow_untrusted_host: true,
             allow_unsigned: true,
             signed_by: None,
+            insecure: false,
         },
         "an allow_unverified install has no bundle sha256 to record"
     );
@@ -883,6 +902,7 @@ async fn fetches_verifies_and_places_platform_artifact_binary() {
             allow_untrusted_host: true,
             allow_unsigned: true,
             signed_by: None,
+            insecure: false,
         }
     );
     staged.commit().await;
@@ -1016,6 +1036,7 @@ async fn allow_untrusted_host_bypasses_the_host_allowlist() {
             allow_untrusted_host: true,
             allow_unsigned: true,
             signed_by: None,
+            insecure: false,
         }
     );
     staged.commit().await;
@@ -1062,6 +1083,7 @@ async fn valid_signature_from_a_trusted_key_verifies_and_supersedes_the_checksum
     let trust = PluginTrustConfig {
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
     };
     let root = tempfile::tempdir().unwrap();
     let plugins_root = root.path().join("plugins");
@@ -1087,6 +1109,7 @@ async fn valid_signature_from_a_trusted_key_verifies_and_supersedes_the_checksum
             allow_untrusted_host: true,
             allow_unsigned: false,
             signed_by: Some("test-key".to_string()),
+            insecure: false,
         },
         "a verified signature is recorded in provenance and needs no bundle sha256"
     );
@@ -1108,6 +1131,7 @@ async fn absent_signature_is_refused_with_unsigned_or_untrusted_signature() {
     let trust = PluginTrustConfig {
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
     };
     let root = tempfile::tempdir().unwrap();
     let plugins_root = root.path().join("plugins");
@@ -1156,6 +1180,7 @@ async fn signature_from_a_non_trusted_key_is_refused() {
     let trust = PluginTrustConfig {
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("other-key", &other_key)],
+        enforcement: PluginTrustEnforcement::Strict,
     };
     let root = tempfile::tempdir().unwrap();
     let plugins_root = root.path().join("plugins");
@@ -1224,6 +1249,7 @@ async fn allow_unsigned_bypasses_the_signature_check_but_not_the_checksum_layer(
             allow_untrusted_host: true,
             allow_unsigned: true,
             signed_by: None,
+            insecure: false,
         }
     );
     staged.commit().await;
@@ -1347,6 +1373,7 @@ async fn signed_install_still_follows_a_redirect() {
     let trust = PluginTrustConfig {
         trusted_hosts: PluginTrustConfig::default().trusted_hosts,
         trusted_keys: vec![trusted_key_for("test key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
     };
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1399,9 +1426,224 @@ async fn signed_install_still_follows_a_redirect() {
             allow_untrusted_host: true,
             allow_unsigned: false,
             signed_by: Some("test key".to_string()),
+            insecure: false,
         }
     );
     staged.commit().await;
+}
+
+// ---------------------------------------------------------------------
+// `--insecure` / `plugin_trust.enforcement`: the convenience aggregate that
+// waives all three trust layers at once, per-install (`PluginSourceInput::
+// Url::insecure`) or persistently (`PluginTrustConfig::enforcement ==
+// PluginTrustEnforcement::Off`). A supplied `sha256` is still verified in
+// either case — the aggregate only turns OFF checks the caller didn't
+// otherwise opt into.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn insecure_flag_bypasses_untrusted_host_unsigned_and_no_checksum_all_at_once() {
+    // An install that would be refused on ALL THREE layers under Strict
+    // (untrusted host, no `.sig` mounted, no `sha256`/`allow_unverified`)
+    // must succeed once `insecure: true` is set — proving the aggregate
+    // really does waive all three, not just one.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let staged = stage_plugin_source(
+        url_input_insecure(&url, None),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect("--insecure must waive the host/signature/checksum layers together");
+
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: None,
+            allow_unverified: false,
+            allow_untrusted_host: false,
+            allow_unsigned: false,
+            signed_by: None,
+            // The AGGREGATE is what gets recorded, distinguishing this from
+            // an install where the three `allow_*` flags happened to be set
+            // individually (those stay `false` here — only `insecure` was
+            // ever set).
+            insecure: true,
+        }
+    );
+    staged.commit().await;
+}
+
+#[tokio::test]
+async fn insecure_flag_still_honors_an_explicit_wrong_sha256() {
+    // Precedence check: `--insecure` never downgrades a checksum the caller
+    // actually supplied — a WRONG `sha256` must still refuse the install,
+    // exactly as it would without `--insecure`.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+    let wrong_sha256 = "c".repeat(64);
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let error = stage_plugin_source(
+        url_input_insecure(&url, Some(&wrong_sha256)),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect_err("--insecure must not waive a caller-supplied, mismatched sha256");
+    assert!(
+        matches!(error, PluginError::BundleVerificationFailed(_)),
+        "{error:?}"
+    );
+
+    // Nothing was left under plugins_root.
+    assert!(!plugins_root.join("hello-plugin").exists());
+}
+
+#[tokio::test]
+async fn insecure_flag_still_verifies_a_correct_explicit_sha256() {
+    // The mirror image of the above: a CORRECT `sha256` alongside `--insecure`
+    // is honored too (not merely tolerated) — it's still what gets recorded
+    // in provenance.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    let bundle_sha256 = sha256_hex_of(manifest_body.as_bytes());
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let staged = stage_plugin_source(
+        url_input_insecure(&url, Some(&bundle_sha256)),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect("a correct sha256 alongside --insecure must still verify and stage");
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: Some(bundle_sha256),
+            allow_unverified: false,
+            allow_untrusted_host: false,
+            allow_unsigned: false,
+            signed_by: None,
+            insecure: true,
+        }
+    );
+    staged.commit().await;
+}
+
+#[tokio::test]
+async fn enforcement_off_bypasses_all_layers_with_no_per_install_flags() {
+    // The PERSISTENT, config-level form: `plugin_trust.enforcement: off`
+    // must waive all three layers for a request that sets NONE of the
+    // per-install flags (not even `insecure`) — proving the config alone
+    // drives the aggregate, no per-call opt-in required.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = hello_manifest_json("hello-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let trust = PluginTrustConfig {
+        enforcement: PluginTrustEnforcement::Off,
+        ..PluginTrustConfig::default()
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    // Every trust flag left at its default (false) — no `--insecure` either.
+    let input = PluginSourceInput::Url {
+        url: url.clone(),
+        sha256: None,
+        allow_unverified: false,
+        allow_untrusted_host: false,
+        allow_unsigned: false,
+        insecure: false,
+    };
+    let staged = stage_plugin_source(input, &plugins_root, &trust)
+        .await
+        .expect("plugin_trust.enforcement: off must waive all layers with no per-call flags");
+
+    assert_eq!(staged.manifest.id, "hello-plugin");
+    assert_eq!(
+        staged.source,
+        PluginSource::Url {
+            url,
+            sha256: None,
+            allow_unverified: false,
+            allow_untrusted_host: false,
+            allow_unsigned: false,
+            signed_by: None,
+            // Recorded true even though NEITHER the request's `insecure` flag
+            // NOR any individual `allow_*` was set — the config drove it.
+            insecure: true,
+        }
+    );
+    staged.commit().await;
+}
+
+#[tokio::test]
+async fn enforcement_strict_is_the_default_and_still_refuses_an_untrusted_host() {
+    // Regression guard: `PluginTrustConfig::default()` (what a fresh/absent
+    // `plugin_trust` config section deserializes to) must remain Strict — an
+    // untrusted-host URL with no flags at all is refused exactly as before
+    // this feature existed.
+    assert_eq!(
+        PluginTrustConfig::default().enforcement,
+        PluginTrustEnforcement::Strict
+    );
+    assert!(!PluginTrustConfig::default().enforcement_is_off());
+
+    let server = wiremock::MockServer::start().await;
+    let url = format!("{}/plugin.json", server.uri());
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let input = PluginSourceInput::Url {
+        url,
+        sha256: None,
+        allow_unverified: false,
+        allow_untrusted_host: false,
+        allow_unsigned: false,
+        insecure: false,
+    };
+    let error = stage_plugin_source(input, &plugins_root, &PluginTrustConfig::default())
+        .await
+        .expect_err("Strict (the default) must still refuse an untrusted host with no flags");
+    assert!(matches!(error, PluginError::UntrustedHost(_)));
+
+    // The refusal happened before the URL was ever fetched.
+    let received = server.received_requests().await;
+    assert_eq!(received.map(|r| r.len()), Some(0));
 }
 
 // ---------------------------------------------------------------------
@@ -1417,6 +1659,7 @@ async fn local_dir_install_ignores_a_hostile_trust_config() {
     let hostile_trust = PluginTrustConfig {
         trusted_hosts: Vec::new(),
         trusted_keys: Vec::new(),
+        enforcement: PluginTrustEnforcement::Strict,
     };
     let root = tempfile::tempdir().unwrap();
     let source_dir = root.path().join("source");

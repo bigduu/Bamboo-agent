@@ -48,6 +48,44 @@
 //!   case, where the host allowlist is the sole control (see
 //!   [`http_client_no_redirects`]).
 //!
+//! # `--insecure` / `plugin_trust.enforcement`: skip ALL three layers at once
+//!
+//! The three `allow_*` opt-outs above are per-layer. On top of them,
+//! [`PluginSourceInput::Url::insecure`] is a convenience AGGREGATE — set it
+//! (CLI: `--insecure`; HTTP: `"insecure": true` on the `url` source) and
+//! [`fetch_manifest_bundle`] treats `allow_untrusted_host`, `allow_unsigned`
+//! AND `allow_unverified` as all `true` for that one install, without the
+//! caller spelling out all three. There is also a PERSISTENT, config-level
+//! form for an operator who never wants to pass flags at all:
+//! `bamboo_config::PluginTrustConfig::enforcement` set to
+//! `PluginTrustEnforcement::Off` makes EVERY `url` install/update behave as
+//! if `--insecure` were passed, with no per-install flag needed. Precedence,
+//! in both cases:
+//!
+//! - The aggregate ONLY turns per-layer checks OFF — it never turns off a
+//!   check the caller opted INTO. A supplied `sha256` is still hashed and
+//!   compared; a mismatch is still [`PluginError::BundleVerificationFailed`],
+//!   `--insecure`/`enforcement: off` or not. So `--insecure --sha256 <hex>`
+//!   means "skip host/signature enforcement AND the bare
+//!   sha256-required-by-default rule, but still verify THIS hash".
+//! - The per-layer flags keep working independently — a caller who wants to
+//!   waive just the host allowlist (say) still passes
+//!   `--allow-untrusted-host` alone; the aggregate is a shortcut for "all
+//!   three", not a replacement for them.
+//! - `plugin_trust.enforcement` defaults to `Strict` (secure by default) for
+//!   both a fresh config and one with no `plugin_trust.enforcement` key at
+//!   all — this is opt-in relaxation, never a silent weakening.
+//!
+//! Every install where the aggregate is active — via `insecure: true` on the
+//! request OR `plugin_trust.enforcement: off` — logs a prominent
+//! `tracing::warn!` naming the source URL, and records `insecure: true` in
+//! the resulting `PluginSource::Url` provenance (`bamboo plugin list`/audit
+//! can then tell these installs apart from ones where the same three
+//! individual `allow_*` flags merely happened to all be set). A server
+//! booting with `plugin_trust.enforcement: off` also logs its own startup
+//! warning (see `AppState::new`), since that setting silently affects EVERY
+//! future install, not just one command invocation.
+//!
 //!   THEN, separately, for [`Platform::current`] (if the manifest declares an
 //!   artifact for it), fetches the per-platform binary archive named in
 //!   `manifest.artifacts`, verifies its sha256 BEFORE unpacking (mandatory —
@@ -179,12 +217,21 @@ pub enum PluginSourceInput {
     /// - `sha256`/`allow_unverified`: the checksum layer, unchanged from
     ///   before EXCEPT a verified signature now also satisfies it (see
     ///   [`fetch_manifest_bundle`]) — see [`PluginError::ChecksumRequired`].
+    ///
+    /// Plus `insecure`: the convenience AGGREGATE opt-out over all three
+    /// above (equivalent to setting `allow_untrusted_host`, `allow_unsigned`
+    /// AND `allow_unverified` together for THIS install) — see the module
+    /// docs' "`--insecure` / `plugin_trust.enforcement`" section. A supplied
+    /// `sha256` is still verified even when `insecure` is set (`insecure`
+    /// only turns checks OFF; it never turns a check the caller opted INTO
+    /// off too).
     Url {
         url: String,
         sha256: Option<String>,
         allow_unverified: bool,
         allow_untrusted_host: bool,
         allow_unsigned: bool,
+        insecure: bool,
     },
 }
 
@@ -385,14 +432,16 @@ async fn stage_into(
             allow_unverified,
             allow_untrusted_host,
             allow_unsigned,
+            insecure,
         } => {
             let flags = UrlTrustFlags {
                 sha256: sha256.as_deref(),
                 allow_unverified: *allow_unverified,
                 allow_untrusted_host: *allow_untrusted_host,
                 allow_unsigned: *allow_unsigned,
+                insecure: *insecure,
             };
-            let (manifest, verified_bundle_sha256, signed_by) =
+            let fetched =
                 fetch_manifest_bundle(url, flags, trust, staging_dir, max_decompressed_bytes)
                     .await?;
             // Binary-artifact verification stays as defense in depth (see
@@ -401,16 +450,25 @@ async fn stage_into(
             // `fetch_and_place_artifact`, but no longer double-duty as the
             // `PluginSource::Url` provenance hash: that's the bundle's own
             // verified sha256 now, computed above.
-            fetch_and_place_artifact(&manifest, staging_dir, max_decompressed_bytes).await?;
+            fetch_and_place_artifact(&fetched.manifest, staging_dir, max_decompressed_bytes)
+                .await?;
             Ok((
-                manifest,
+                fetched.manifest,
                 PluginSource::Url {
                     url: url.clone(),
-                    sha256: verified_bundle_sha256,
+                    sha256: fetched.verified_sha256,
                     allow_unverified: *allow_unverified,
                     allow_untrusted_host: *allow_untrusted_host,
                     allow_unsigned: *allow_unsigned,
-                    signed_by,
+                    signed_by: fetched.signed_by,
+                    // The AGGREGATE, not the raw per-install `insecure` flag:
+                    // recorded `true` whenever ALL three layers were actually
+                    // skipped for this install, whether that came from the
+                    // per-install flag or from `plugin_trust.enforcement:
+                    // off` (see `fetch_manifest_bundle`) — either way, this is
+                    // the single source of truth for "was this install done
+                    // insecurely" that `plugin list`/audit needs.
+                    insecure: fetched.insecure_aggregate,
                 },
             ))
         }
@@ -424,7 +482,7 @@ async fn stage_into(
 /// The caller-supplied bits of a [`PluginSourceInput::Url`] that
 /// [`fetch_manifest_bundle`] needs, grouped into one struct purely to keep
 /// that function's parameter count sane (`PluginSourceInput::Url` itself
-/// carries the same four fields, plus `url`, which stays a separate
+/// carries the same five fields, plus `url`, which stays a separate
 /// top-level parameter since [`fetch_and_verify_signature`] and the sha256
 /// helpers all key off it directly).
 struct UrlTrustFlags<'a> {
@@ -432,6 +490,31 @@ struct UrlTrustFlags<'a> {
     allow_unverified: bool,
     allow_untrusted_host: bool,
     allow_unsigned: bool,
+    /// The per-install `--insecure` / `"insecure": true` aggregate opt-out
+    /// (see the module docs' "`--insecure` / `plugin_trust.enforcement`"
+    /// section). ORed with `trust.enforcement_is_off()` inside
+    /// [`fetch_manifest_bundle`] to compute the EFFECTIVE aggregate for this
+    /// install — a config-level `enforcement: off` has the same effect as
+    /// this flag without the caller having to set it.
+    insecure: bool,
+}
+
+/// Everything [`fetch_manifest_bundle`] hands back to [`stage_into`].
+struct FetchedBundle {
+    manifest: PluginManifest,
+    /// The verified bundle sha256 (`None` unless a `sha256` was supplied and
+    /// confirmed) — for [`PluginSource::Url`] provenance.
+    verified_sha256: Option<String>,
+    /// The trusted key label the signature verified against (`None` if the
+    /// install proceeded unsigned via `allow_unsigned`/the insecure
+    /// aggregate).
+    signed_by: Option<String>,
+    /// The EFFECTIVE aggregate for this install: `true` when ALL three trust
+    /// layers were skipped, whether that came from the per-install
+    /// `insecure` flag or from `plugin_trust.enforcement: off`. This is what
+    /// [`PluginSource::Url::insecure`] provenance records — see
+    /// [`stage_into`].
+    insecure_aggregate: bool,
 }
 
 /// Fetch `url`: either a bare `plugin.json` or an archive containing one
@@ -467,23 +550,53 @@ struct UrlTrustFlags<'a> {
 ///    a mismatch is [`PluginError::BundleVerificationFailed`] regardless of
 ///    signature status.
 ///
-/// Returns the parsed manifest, the verified bundle sha256 (`None` unless a
-/// `sha256` was supplied and confirmed — for [`PluginSource::Url`]
-/// provenance), and the trusted key label the signature verified against
-/// (`None` if the install proceeded unsigned via `allow_unsigned`).
+/// Before any of the three layers run, the EFFECTIVE aggregate is computed:
+/// `flags.insecure || trust.enforcement_is_off()`. When `true`,
+/// `allow_untrusted_host`/`allow_unsigned`/`allow_unverified` are all treated
+/// as `true` for the rest of this call (see the module docs'
+/// "`--insecure` / `plugin_trust.enforcement`" section) and a prominent
+/// `tracing::warn!` names the source URL — this does NOT waive the `sha256`
+/// check itself: a supplied hash is still verified in step 3 below.
+///
+/// Returns a [`FetchedBundle`]: the parsed manifest, the verified bundle
+/// sha256 (`None` unless a `sha256` was supplied and confirmed — for
+/// [`PluginSource::Url`] provenance), the trusted key label the signature
+/// verified against (`None` if the install proceeded unsigned via
+/// `allow_unsigned`/the aggregate), and the effective insecure-aggregate flag
+/// itself (for `PluginSource::Url::insecure` provenance).
 async fn fetch_manifest_bundle(
     url: &str,
     flags: UrlTrustFlags<'_>,
     trust: &PluginTrustConfig,
     staging_dir: &Path,
     max_decompressed_bytes: u64,
-) -> PluginResult<(PluginManifest, Option<String>, Option<String>)> {
+) -> PluginResult<FetchedBundle> {
     let UrlTrustFlags {
         sha256,
         allow_unverified,
         allow_untrusted_host,
         allow_unsigned,
+        insecure,
     } = flags;
+
+    // The convenience aggregate: a per-install `--insecure` flag OR a
+    // config-level `plugin_trust.enforcement: off` both mean "skip all three
+    // layers for this install" — computed once, up front, so every layer
+    // below sees the SAME effective flags regardless of which of the two
+    // triggered it. Shadowing the original `allow_*` bindings means the rest
+    // of this function needs no further special-casing.
+    let insecure_aggregate = insecure || trust.enforcement_is_off();
+    if insecure_aggregate {
+        tracing::warn!(
+            %url,
+            "installing plugin from '{url}' with ALL trust checks disabled (insecure) — host \
+             allowlist, signature and checksum-required-by-default are all skipped for this \
+             install (a supplied --sha256, if any, is still verified)"
+        );
+    }
+    let allow_untrusted_host = allow_untrusted_host || insecure_aggregate;
+    let allow_unsigned = allow_unsigned || insecure_aggregate;
+    let allow_unverified = allow_unverified || insecure_aggregate;
 
     // Layer 1: host allowlist — refuse BEFORE any network access.
     if !trust.is_host_trusted(url) {
@@ -597,7 +710,12 @@ async fn fetch_manifest_bundle(
         PluginManifest::parse_str(&raw)?
     };
 
-    Ok((manifest, verified_sha256, signed_by))
+    Ok(FetchedBundle {
+        manifest,
+        verified_sha256,
+        signed_by,
+        insecure_aggregate,
+    })
 }
 
 /// Fetch `<url>.sig` and verify it against `bundle_bytes` for every
