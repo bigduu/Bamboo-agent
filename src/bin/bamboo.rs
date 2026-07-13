@@ -112,8 +112,21 @@ struct Cli {
 /// since the data directory — not a bare file path — is what actually gates
 /// `config.json` resolution throughout the codebase (see
 /// `bamboo_config::paths::resolve_bamboo_dir`).
+///
+/// A path that doesn't exist is treated as a FILE only when it looks like one
+/// (a `.json` extension); anything else is taken as a not-yet-created data
+/// DIRECTORY and used as-is — `--data-dir` doesn't require its directory to
+/// exist either, and anchoring a nonexistent bare directory on its parent
+/// would land one level too high.
 fn resolve_config_data_dir(path: &std::path::Path) -> Result<PathBuf, String> {
     if path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+    let looks_like_file = path.is_file()
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+    if !looks_like_file {
         return Ok(path.to_path_buf());
     }
     match path.parent() {
@@ -1994,6 +2007,18 @@ mod tests {
     fn resolve_config_data_dir_bare_filename_anchors_on_current_dir() {
         let resolved = resolve_config_data_dir(std::path::Path::new("config.json")).unwrap();
         assert_eq!(resolved, std::path::PathBuf::from("."));
+    }
+
+    /// A not-yet-created path that does NOT look like a config file (no
+    /// `.json` extension) is a data DIRECTORY and is used as-is — anchoring it
+    /// on its parent would land one level too high (`--data-dir` doesn't
+    /// require the directory to exist either).
+    #[test]
+    fn resolve_config_data_dir_nonexistent_bare_directory_used_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir_path = dir.path().join("brand-new-datadir");
+        let resolved = resolve_config_data_dir(&datadir_path).unwrap();
+        assert_eq!(resolved, datadir_path);
     }
 
     // fields set conditionally below

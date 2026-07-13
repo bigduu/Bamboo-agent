@@ -228,6 +228,11 @@ fn validate_timeout_secs(secs: Option<u64>) -> Result<(), String> {
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
+    // Validate cheap argument errors BEFORE any state is booted or a session is
+    // created/persisted — an invalid `--timeout 0` must not leave an orphaned
+    // session on disk.
+    validate_timeout_secs(args.timeout_secs)?;
+
     // Full server assembly — identical to `bamboo serve`, minus the HTTP listener.
     let state = AppState::new(args.data_dir.clone())
         .await
@@ -377,8 +382,6 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             ));
         }
     }
-
-    validate_timeout_secs(args.timeout_secs)?;
 
     if args.stream_json {
         println!(
