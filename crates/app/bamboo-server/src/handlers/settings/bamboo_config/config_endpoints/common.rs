@@ -17,6 +17,13 @@ pub(super) fn model_limits_file_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("model_limits.json")
 }
 
+/// The standalone connect.json sibling of config.json (#455) — bamboo-connect
+/// platform-bridge credentials (bot tokens, allowlists) live here, split out
+/// of config.json by `Config::save_to_dir`/`Config::merge_connect_config`.
+pub(super) fn connect_file_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("connect.json")
+}
+
 pub(super) async fn read_model_limits_file(app_data_dir: &Path) -> Result<Option<Value>, AppError> {
     let path = model_limits_file_path(app_data_dir);
     match tokio::fs::try_exists(&path).await {
