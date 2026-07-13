@@ -105,6 +105,31 @@ pub struct ProxiedResult {
 /// workers; the issue (#54) asks for restricted roles to be filtered while
 /// default/unrestricted roles keep all tools. Restrictions are therefore opt-in
 /// and explicit per role.
+///
+/// # Trust boundary: the role is SELF-ASSERTED, not authenticated
+///
+/// `serve_mcp_proxy` resolves the requesting role from `msg.from.role` — the
+/// `AgentRef` the connecting worker chose to Hello/subscribe with — not from any
+/// identity independently verified against the broker's auth (a shared bearer
+/// token authenticates the *connection*, not a claimed *role* on it). A worker
+/// that connects with a bearer token valid for the broker can claim ANY role
+/// string in its `AgentRef`, including one with a wider (or no) allowlist entry,
+/// and the proxy has no way to tell it apart from a legitimately-deployed worker
+/// of that role.
+///
+/// Concretely, this allowlist is:
+/// - **Adequate** against a confused/hallucinating worker running its assigned
+///   role honestly (the common case this issue targets — least-privilege
+///   scoping so an LLM's tool-call mistake can't reach `nova_screenshot` from a
+///   `researcher` role).
+/// - **Not** a security boundary against a worker that is compromised or
+///   deliberately malicious — such a worker can simply assert a role that is
+///   unrestricted (or has a wider allowlist) and bypass this policy entirely.
+///
+/// Closing that gap needs authenticating the role itself (e.g. per-role broker
+/// credentials, or signing the `AgentRef` at provisioning time) — out of scope
+/// for this issue; deployers who need that guarantee should not rely on this
+/// allowlist as their only control on a genuinely untrusted worker.
 #[derive(Debug, Clone, Default)]
 pub struct RoleToolAllowlist {
     /// role → set of tool names that role is allowed to proxy. A role absent from
@@ -143,6 +168,87 @@ impl RoleToolAllowlist {
         self.by_role
             .insert(role.into(), tools.into_iter().map(Into::into).collect());
         self
+    }
+
+    /// Build from config-sourced `(role, tools)` entries (issue #54), logging
+    /// load-time warnings for likely misconfiguration instead of silently
+    /// failing open. Exact-string matching means a typo'd role or tool name
+    /// has NO other signal: a misspelled role just never matches (looks
+    /// unrestricted to the operator, since the intended role falls through to
+    /// "no entry"), and a misspelled tool name silently grants nothing for the
+    /// tool the deployer actually meant to allow. This is the one point where
+    /// that can be caught.
+    ///
+    /// There is no fixed registry of valid ROLE names in this codebase (roles
+    /// are free-form profile ids assigned at deploy/spawn time), so role
+    /// validation here is structural only:
+    /// - A blank/whitespace-only role is dropped (warned) — it can never match
+    ///   a real `AgentRef.role`.
+    /// - A duplicate role entry: the later one wins (warned) — config authors
+    ///   should not rely on ordering.
+    ///
+    /// TOOL names, by contrast, CAN be checked against a real source of truth:
+    /// pass the backend's currently-registered tool names as `known_tools`
+    /// (empty ⇒ skip this check, e.g. when the backend's tool set is not yet
+    /// known at config-load time). A tool name not in `known_tools` is still
+    /// kept (still enforced — the backend can register tools after this
+    /// policy is built, so absence isn't proof of a typo) but is warned as a
+    /// likely typo.
+    pub fn from_config<R, T, I>(entries: I, known_tools: &HashSet<String>) -> Self
+    where
+        R: Into<String>,
+        T: Into<String>,
+        I: IntoIterator<Item = (R, Vec<T>)>,
+    {
+        let mut by_role: HashMap<String, HashSet<String>> = HashMap::new();
+        for (role, tools) in entries {
+            let role: String = role.into().trim().to_string();
+            if role.is_empty() {
+                tracing::warn!(
+                    "mcp role allowlist config: skipping an entry with a blank role name \
+                     (it could never match a real worker's role)"
+                );
+                continue;
+            }
+            if by_role.contains_key(&role) {
+                tracing::warn!(
+                    role = %role,
+                    "mcp role allowlist config: duplicate entry for this role; \
+                     the later entry replaces the earlier one"
+                );
+            }
+            let tool_set: HashSet<String> = tools
+                .into_iter()
+                .map(Into::into)
+                .filter_map(|t| {
+                    let t = t.trim().to_string();
+                    if t.is_empty() {
+                        tracing::warn!(
+                            role = %role,
+                            "mcp role allowlist config: skipping a blank tool name"
+                        );
+                        None
+                    } else {
+                        Some(t)
+                    }
+                })
+                .collect();
+            if !known_tools.is_empty() {
+                for tool in &tool_set {
+                    if !known_tools.contains(tool) {
+                        tracing::warn!(
+                            role = %role,
+                            tool = %tool,
+                            "mcp role allowlist config: tool name is not in the orchestrator's \
+                             current MCP tool set (check for a typo) — the entry is still \
+                             enforced, so a mistyped name silently grants nothing for it"
+                        );
+                    }
+                }
+            }
+            by_role.insert(role, tool_set);
+        }
+        Self { by_role }
     }
 
     /// Whether `role` is restricted (has an explicit allowlist entry). A `None`
@@ -438,16 +544,27 @@ impl McpProxyExecutor {
     /// Connect (as `proxy_id` — keep it distinct from the worker's main mailbox,
     /// e.g. `<worker-id>#mcp`), fetch the proxiable-tool manifest from
     /// `orchestrator`, and build. Returns a proxy advertising those tools.
+    ///
+    /// `role` is this worker's own role (e.g. `spec.identity.role`), advertised
+    /// on the `AgentRef` this connection Hello/subscribes with so the
+    /// orchestrator's [`RoleToolAllowlist`] (if configured) can scope the
+    /// manifest/calls to it — `None`/empty leaves the worker unrestricted
+    /// (matches pre-#54 behavior and any orchestrator with no allowlist
+    /// configured). Note this is SELF-ASSERTED by the worker, not
+    /// authenticated — see the trust-boundary section on
+    /// [`RoleToolAllowlist`]'s doc comment; do not treat it as a security
+    /// boundary against a malicious worker.
     pub async fn connect(
         endpoint: &str,
         proxy_id: impl Into<String>,
+        role: Option<String>,
         token: &str,
         orchestrator: impl Into<String>,
         timeout: Duration,
     ) -> BrokerResult<Self> {
         let me = AgentRef {
             session_id: proxy_id.into(),
-            role: None,
+            role,
         };
         let orchestrator = orchestrator.into();
         let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
@@ -862,6 +979,66 @@ mod tests {
         assert_eq!(reply.result.expect("result").result, "ran nova_screenshot");
     }
 
+    /// Issue #54 item 3: `from_config` validates at load time — a blank role
+    /// name is dropped, a duplicate role keeps the LATER entry, a blank tool
+    /// name is dropped, and an unknown tool name (vs. `known_tools`, standing
+    /// in for the backend's real tool set) is still KEPT/enforced (it may just
+    /// not be registered yet) rather than silently dropped. None of this
+    /// panics or errors — misconfiguration only warns (fails open per the
+    /// existing unrestricted-by-default posture), which this test asserts by
+    /// checking the resulting allowlist's effective behavior.
+    #[test]
+    fn from_config_validates_and_normalizes_entries() {
+        let known_tools: HashSet<String> = ["fetch_url", "nova_click"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let allowlist = RoleToolAllowlist::from_config(
+            vec![
+                // Blank role: dropped entirely (can never match a real AgentRef.role).
+                ("   ".to_string(), vec!["fetch_url".to_string()]),
+                // Duplicate role "researcher": the second entry wins.
+                ("researcher".to_string(), vec!["nova_click".to_string()]),
+                (
+                    "researcher".to_string(),
+                    vec!["fetch_url".to_string(), "  ".to_string()],
+                ),
+                // Unknown tool name (typo) vs `known_tools`: still enforced.
+                ("typo-role".to_string(), vec!["fetch_urll".to_string()]),
+            ],
+            &known_tools,
+        );
+
+        // Blank role never matches anything, so it is unrestricted (absent),
+        // not restricted-to-nothing.
+        assert!(!allowlist.is_restricted(Some("   ")));
+
+        // The LATER "researcher" entry (fetch_url, blank dropped) won, not the
+        // earlier one (nova_click) — and the blank tool name was dropped.
+        assert!(allowlist.allows(Some("researcher"), "fetch_url"));
+        assert!(!allowlist.allows(Some("researcher"), "nova_click"));
+
+        // A tool name absent from `known_tools` (a likely typo) is still
+        // enforced — presence in `known_tools` is a validation SIGNAL
+        // (warned), not a hard filter.
+        assert!(allowlist.allows(Some("typo-role"), "fetch_urll"));
+        assert!(!allowlist.allows(Some("typo-role"), "fetch_url"));
+    }
+
+    /// `from_config` with an EMPTY `known_tools` set (e.g. the backend's tool
+    /// list is not available yet at config-load time) skips tool-name
+    /// validation entirely rather than flagging every configured tool as
+    /// unknown — the allowlist itself is unaffected either way.
+    #[test]
+    fn from_config_skips_tool_validation_when_known_tools_is_empty() {
+        let allowlist = RoleToolAllowlist::from_config(
+            vec![("researcher", vec!["anything_at_all"])],
+            &HashSet::new(),
+        );
+        assert!(allowlist.allows(Some("researcher"), "anything_at_all"));
+        assert!(!allowlist.allows(Some("researcher"), "other_tool"));
+    }
+
     /// A role mapped to an EMPTY allowlist is an explicit lockout (no tools),
     /// distinct from an absent role (unrestricted).
     #[tokio::test]
@@ -909,6 +1086,7 @@ mod tests {
         let proxy = McpProxyExecutor::connect(
             &endpoint,
             "worker#mcp",
+            None,
             TOKEN,
             "orchestrator",
             Duration::from_secs(5),
@@ -947,6 +1125,114 @@ mod tests {
         ));
     }
 
+    /// Issue #54, REAL path: drives `RoleToolAllowlist` filtering through the
+    /// ACTUAL production wiring — a real broker, `serve_mcp_proxy` reading the
+    /// role off the connecting worker's `AgentRef` (not `handle_mcp_request`
+    /// called directly with an explicit allowlist), and `McpProxyExecutor::
+    /// connect` advertising the worker's real role. Exercising only
+    /// `handle_mcp_request` (as the other unit tests in this module do) would
+    /// mask the exact bug #54 was reopened for: the role never reaching the
+    /// orchestrator-side filter in production because nothing threaded it
+    /// through the real connect/serve path.
+    #[tokio::test]
+    async fn proxy_executor_role_is_filtered_end_to_end_over_the_real_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(core, TOKEN));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let endpoint = format!("ws://{addr}");
+
+        // Orchestrator: "researcher" may only proxy the benign fetch tool.
+        let ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_mcp_proxy(
+                &ep,
+                AgentRef {
+                    session_id: "orchestrator".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(MultiToolMcp),
+                Arc::new(RoleToolAllowlist::unrestricted().with_role("researcher", ["fetch_url"])),
+            )
+            .await;
+        });
+
+        // A worker connecting AS "researcher" — over the real broker, with its
+        // role threaded through `McpProxyExecutor::connect` exactly as
+        // `subagent_worker.rs` does in production — must see only its role's
+        // allowed tool in the manifest it fetches on connect.
+        let restricted = McpProxyExecutor::connect(
+            &endpoint,
+            "worker-researcher#mcp",
+            Some("researcher".to_string()),
+            TOKEN,
+            "orchestrator",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("restricted proxy connects + fetches its role-scoped manifest");
+        let tools = restricted.list_tools();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["fetch_url".to_string()],
+            "a role WITH an allowlist entry must see only its allowed tools over the real path"
+        );
+
+        // The allowed tool executes normally...
+        let ok_call = ToolCall {
+            id: "c1".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "fetch_url".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let result = restricted
+            .execute(&ok_call)
+            .await
+            .expect("allowed tool call succeeds");
+        assert!(result.success);
+
+        // ...but a disallowed tool is invisible in the manifest, so the LOCAL
+        // "not in my manifest" check rejects it before it is even sent —
+        // proving the manifest filtering (not just the orchestrator's
+        // defense-in-depth Call check) actually took effect end-to-end.
+        let denied_call = ToolCall {
+            id: "c2".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "nova_screenshot".into(),
+                arguments: "{}".into(),
+            },
+        };
+        assert!(matches!(
+            restricted.execute(&denied_call).await,
+            Err(ToolError::NotFound(_))
+        ));
+
+        // A worker connecting with NO role (unrestricted, back-compat) still
+        // sees the full tool set over the same real orchestrator/allowlist.
+        let unrestricted = McpProxyExecutor::connect(
+            &endpoint,
+            "worker-unrestricted#mcp",
+            None,
+            TOKEN,
+            "orchestrator",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("unrestricted proxy connects");
+        assert_eq!(unrestricted.list_tools().len(), 3);
+    }
+
     #[tokio::test]
     async fn proxy_handles_concurrent_calls_correctly() {
         let dir = tempfile::tempdir().unwrap();
@@ -978,6 +1264,7 @@ mod tests {
             McpProxyExecutor::connect(
                 &endpoint,
                 "worker#mcp",
+                None,
                 TOKEN,
                 "orchestrator",
                 Duration::from_secs(5),
@@ -1079,6 +1366,7 @@ mod tests {
             McpProxyExecutor::connect(
                 &endpoint,
                 "worker#mcp",
+                None,
                 TOKEN,
                 "orchestrator",
                 Duration::from_secs(5),
@@ -1317,6 +1605,7 @@ mod tests {
         let proxy = McpProxyExecutor::connect(
             &endpoint,
             "worker#mcp",
+            None,
             TOKEN,
             "orchestrator",
             Duration::from_secs(5),

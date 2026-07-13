@@ -339,18 +339,61 @@ impl AppState {
                         mcp_manager.tool_index(),
                     ));
                 let shutdown = mcp_proxy_shutdown.clone();
+
+                // Build the orchestrator-side per-role MCP tool allowlist from
+                // config (issue #54). Enforcement lives HERE — never in the
+                // worker-facing `McpProxyConfig` a deployed worker receives —
+                // because a worker self-declaring its own allowlist would be
+                // insecure (it could simply claim to be unrestricted). Validate
+                // configured tool names against THIS backend's real, live tool
+                // set so a typo in `config.json` is surfaced at boot instead of
+                // silently granting nothing for the intended tool.
+                let role_entries: Vec<(String, Vec<String>)> = config_snapshot
+                    .subagents
+                    .mcp_role_allowlist
+                    .iter()
+                    .map(|e| (e.role.clone(), e.tools.clone()))
+                    .collect();
+                if role_entries.is_empty() {
+                    // Default behavior unchanged (issue #54 item 5): no policy
+                    // configured -> every role sees/can call every proxied
+                    // tool. Logged once here at boot (not per-request) so an
+                    // operator can tell the restriction is opt-in rather than
+                    // silently absent.
+                    tracing::info!(
+                        "mcp proxy: no subagents.mcp_role_allowlist configured — every worker \
+                         role sees/can call the full host-bound MCP tool set (opt in a role \
+                         policy in config.json to scope tools per role; see issue #54)"
+                    );
+                }
+                // NOTE: `init_mcp_manager` connects MCP servers in a background
+                // task so the HTTP API stays responsive at boot — this backend's
+                // `list_tools()` can legitimately be empty here if that task
+                // hasn't finished yet. `from_config` treats an empty set as "skip
+                // tool-name validation" rather than flagging every configured
+                // tool as an unknown typo, so warn separately here when that
+                // race means validation was effectively skipped.
+                let known_tools: std::collections::HashSet<String> = backend
+                    .list_tools()
+                    .into_iter()
+                    .map(|t| t.function.name)
+                    .collect();
+                if !role_entries.is_empty() && known_tools.is_empty() {
+                    tracing::warn!(
+                        "mcp role allowlist: the orchestrator's MCP tool set was empty at \
+                         policy-load time (servers may still be connecting in the background) — \
+                         skipped tool-name typo validation for subagents.mcp_role_allowlist"
+                    );
+                }
+                let allowlist = std::sync::Arc::new(bamboo_broker::RoleToolAllowlist::from_config(
+                    role_entries,
+                    &known_tools,
+                ));
                 tokio::spawn(async move {
                     let me = bamboo_broker::AgentRef {
                         session_id: bamboo_broker::ORCHESTRATOR_ID.to_string(),
                         role: Some("orchestrator".into()),
                     };
-                    // No per-role tool allowlist is configured here yet, so the
-                    // proxy is unrestricted (every role sees/can call all
-                    // host-bound tools) — identical to the pre-#54 behavior.
-                    // Wiring a config-driven allowlist in is a follow-up; the
-                    // filtering mechanism (RoleToolAllowlist) is now in place.
-                    let allowlist =
-                        std::sync::Arc::new(bamboo_broker::RoleToolAllowlist::unrestricted());
                     bamboo_broker::serve_mcp_proxy_supervised(
                         &broker.endpoint,
                         me,

@@ -425,6 +425,49 @@ pub struct SubagentsConfig {
     /// first in `build_spec`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedulable_placements: Vec<SchedulablePlacement>,
+    /// Per-role allowlist scoping which host-bound MCP tools a sub-agent role
+    /// may see/call through the orchestrator's MCP proxy (issue #54;
+    /// `bamboo_broker::RoleToolAllowlist`). Read and enforced
+    /// ORCHESTRATOR-side when wiring `serve_mcp_proxy` — this is deliberately
+    /// NOT part of the worker-facing `McpProxyConfig` a deployed worker
+    /// receives, because a worker self-declaring its own allowlist would be
+    /// insecure (it could simply claim to be unrestricted). A role absent
+    /// from this list is unrestricted (sees/can call every proxiable tool),
+    /// so adding this policy never silently strips tools from an
+    /// already-deployed role you have not listed here. Empty (the default)
+    /// keeps every role unrestricted — fully backward compatible with
+    /// pre-#54 behavior.
+    ///
+    /// Role AND tool names are matched by exact string equality against the
+    /// worker-asserted `AgentRef.role` / the requested tool name — see
+    /// `RoleToolAllowlist`'s doc comment for the resulting self-asserted-role
+    /// caveat (this policy is adequate against a confused/hallucinating
+    /// worker, not a malicious one that lies about its own role).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_role_allowlist: Vec<McpRoleAllowlistEntry>,
+}
+
+/// One role's MCP proxy tool allowlist entry (issue #54). See
+/// [`SubagentsConfig::mcp_role_allowlist`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct McpRoleAllowlistEntry {
+    /// Sub-agent role this entry restricts — matches the worker-asserted
+    /// `AgentRef.role` (itself the child session's `subagent_type` /
+    /// `ChildIdentity.role`). There is no fixed registry of valid roles in
+    /// this codebase (roles are free-form profile ids), so a typo here is
+    /// NOT caught against a "known roles" list — only structurally (blank
+    /// names are dropped, duplicates warn) at load time. Double-check this
+    /// against the role string your profile/deploy config actually uses.
+    pub role: String,
+    /// Tool names this role may see in its manifest / call through the
+    /// proxy, matched by exact string equality against the backend's
+    /// registered tool name. An entry with an EMPTY list is an explicit
+    /// lockout (no tools) for that role, distinct from the role being absent
+    /// from this Vec entirely (unrestricted). Validated at load time against
+    /// the orchestrator's live MCP tool set where available — an unknown
+    /// name is still enforced (kept) but logged as a likely typo.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// Routes a single sub-agent role to a registry-scheduled worker (remote-actor-
@@ -3182,6 +3225,44 @@ mod tests {
         assert_eq!(cfg, reparsed, "round-trip is stable");
         assert!(!back.contains("\"token_env\":null"));
         assert!(!back.contains("\"ca_cert_file\":null"));
+    }
+
+    #[test]
+    fn subagents_config_without_mcp_role_allowlist_deserializes_empty() {
+        // An OLD config (predating #54's wiring) has no `mcp_role_allowlist`
+        // key — it must still deserialize, with an empty list (default =
+        // every role unrestricted, identical to pre-#54 behavior).
+        let json = r#"{ "max_concurrent": 4 }"#;
+        let cfg: SubagentsConfig = serde_json::from_str(json).expect("old config deserializes");
+        assert!(cfg.mcp_role_allowlist.is_empty());
+        // An empty list is omitted on re-serialize (skip_if empty).
+        let back = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !back.contains("mcp_role_allowlist"),
+            "empty vec is skipped: {back}"
+        );
+    }
+
+    #[test]
+    fn mcp_role_allowlist_entry_round_trips() {
+        let json = r#"{
+            "mcp_role_allowlist": [
+                { "role": "researcher", "tools": ["fetch_url"] },
+                { "role": "sandboxed", "tools": [] }
+            ]
+        }"#;
+        let cfg: SubagentsConfig = serde_json::from_str(json).expect("populated config");
+        assert_eq!(cfg.mcp_role_allowlist.len(), 2);
+        assert_eq!(cfg.mcp_role_allowlist[0].role, "researcher");
+        assert_eq!(cfg.mcp_role_allowlist[0].tools, vec!["fetch_url"]);
+        // An empty `tools` list is an explicit lockout, distinct from the role
+        // being absent — it must round-trip as an empty (not omitted) list.
+        assert_eq!(cfg.mcp_role_allowlist[1].role, "sandboxed");
+        assert!(cfg.mcp_role_allowlist[1].tools.is_empty());
+
+        let back = serde_json::to_string(&cfg).unwrap();
+        let reparsed: SubagentsConfig = serde_json::from_str(&back).unwrap();
+        assert_eq!(cfg, reparsed, "round-trip is stable");
     }
 
     #[test]
