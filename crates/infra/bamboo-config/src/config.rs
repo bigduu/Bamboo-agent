@@ -2005,31 +2005,40 @@ impl Config {
     ///   whatever `self.connect` currently holds. If `self.connect` was ALSO
     ///   non-empty (a legacy inline `connect` key still in config.json, e.g.
     ///   #453-era state, or written by an older binary), that's a stale
-    ///   duplicate: log a warning. connect.json wins; the config.json copy is
-    ///   dropped on the NEXT natural save (this call does not force one).
+    ///   duplicate: log a warning and proactively strip the superseded key
+    ///   from config.json now (#457) rather than waiting for the next
+    ///   natural save — cheap, and consistent with not spreading token
+    ///   ciphertext across files.
     /// - `connect.json` present but corrupt/unparsable: fail SAFE for this
     ///   security-sensitive feature. Log an error, quarantine the bad file to
     ///   `connect.json.bak` (best-effort), and continue with an EMPTY
     ///   `ConnectConfig` — never falls back to a legacy config.json copy.
     /// - `connect.json` absent & `self.connect` non-empty (pure legacy
     ///   state): migrate proactively. Adopt the legacy value (already parsed
-    ///   into `self`) and write BOTH files once via a full
-    ///   [`Config::save_to_dir`] (creates connect.json; rewrites config.json
-    ///   without the key), logged at info.
+    ///   into `self`) and persist it: strip the `connect` key from
+    ///   config.json and write connect.json (#457 — NOT a full
+    ///   [`Config::save_to_dir`], which would re-encrypt every OTHER secret
+    ///   in config.json and rotate its backups as a load-time side effect,
+    ///   even for a read-only command like `bamboo config get`), logged at
+    ///   info.
     /// - `connect.json` absent & `self.connect` empty: nothing to do.
     fn merge_connect_config(&mut self, data_dir: &std::path::Path) {
         let connect_path = data_dir.join("connect.json");
         match std::fs::read_to_string(&connect_path) {
             Ok(content) => match serde_json::from_str::<ConnectConfig>(&content) {
                 Ok(connect) => {
-                    if !connect_config_is_empty(&self.connect) {
+                    let legacy_key_present = !connect_config_is_empty(&self.connect);
+                    if legacy_key_present {
                         tracing::warn!(
                             "config.json still has a legacy `connect` key alongside \
-                             connect.json; connect.json takes precedence and the stale \
-                             key will be dropped on the next save"
+                             connect.json; connect.json takes precedence — dropping the \
+                             stale key from config.json now"
                         );
                     }
                     self.connect = connect;
+                    if legacy_key_present {
+                        strip_legacy_connect_key_from_config_json(data_dir);
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -2048,7 +2057,11 @@ impl Config {
                         "Migrating legacy `connect` config from config.json to a \
                          standalone connect.json"
                     );
-                    if let Err(e) = self.save_to_dir(data_dir.to_path_buf()) {
+                    // Narrow migration write (#457): strip only the `connect` key
+                    // from config.json and write connect.json directly, instead of
+                    // routing through a full `save_to_dir` (see doc comment above).
+                    strip_legacy_connect_key_from_config_json(data_dir);
+                    if let Err(e) = save_connect_config(&self.connect, data_dir) {
                         tracing::error!("Failed to write connect.json during migration: {}", e);
                     }
                 }
@@ -2735,17 +2748,109 @@ fn save_connect_config(connect: &ConnectConfig, data_dir: &std::path::Path) -> R
     Ok(())
 }
 
+/// Remove the legacy inline `connect` key from `config.json` on disk, if
+/// present — the narrow, load-side counterpart of the full-document rewrite
+/// [`Config::save_to_dir`] would otherwise perform just to drop one stale
+/// key. Used by [`Config::merge_connect_config`] both when adopting a
+/// pure-legacy `connect` key (migration) and when a stale legacy key lingers
+/// alongside an authoritative connect.json. #457.
+///
+/// Operates on the raw `serde_json::Value` read straight from disk — NOT on
+/// the typed `Config` — so it touches nothing but the one key: no other
+/// secret gets re-encrypted, and no `config.json.bak` generation gets
+/// rotated, as a side effect of a load.
+///
+/// Best-effort: read/parse/write failures are logged, not propagated — this
+/// runs as a side effect of `Config::new()` / load, which has no `Result` to
+/// surface it through. A failure here just leaves the stale key in place
+/// until the next natural save; connect.json (written separately) is already
+/// authoritative in memory either way.
+fn strip_legacy_connect_key_from_config_json(data_dir: &std::path::Path) {
+    let config_path = data_dir.join("config.json");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::error!(
+                "Failed to read config.json to strip legacy `connect` key: {}",
+                e
+            );
+            return;
+        }
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(
+                "Failed to parse config.json to strip legacy `connect` key: {}",
+                e
+            );
+            return;
+        }
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if obj.remove("connect").is_none() {
+        // Nothing to strip (e.g. raced with a concurrent save that already
+        // dropped it) — avoid an unnecessary rewrite.
+        return;
+    }
+    let rewritten = match serde_json::to_string_pretty(&value) {
+        Ok(rewritten) => rewritten,
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize config.json after stripping legacy `connect` key: {}",
+                e
+            );
+            return;
+        }
+    };
+    if let Err(e) = write_atomic(&config_path, rewritten.as_bytes()) {
+        tracing::error!(
+            "Failed to write config.json after stripping legacy `connect` key: {}",
+            e
+        );
+    }
+}
+
 /// Quarantine an unparsable `connect.json` to a single `connect.json.bak`
 /// generation (best-effort) so the bad content survives for inspection
 /// instead of being silently discarded. Unlike config.json's timestamped,
 /// N-generation quarantine, connect.json only needs one slot — it's a much
 /// smaller, less complex document and this is a fail-SAFE (empty/inert
 /// bridge), not a fail-recover, posture. #455.
+///
+/// MOVES the corrupt file rather than copying it (#457): a copy would leave
+/// the same corrupt `connect.json` sitting in the data dir right next to its
+/// own quarantine copy, which reads as confusing/ambiguous mid-incident
+/// (which one is live?). `rename` is used first (atomic, no partial-copy
+/// window); if that fails — e.g. `connect.json.bak` and the data dir are on
+/// different filesystems — fall back to copy-then-remove so the corrupt
+/// original still doesn't linger.
 fn quarantine_corrupt_connect(connect_path: &std::path::Path) {
     let backup = connect_path.with_extension("json.bak");
-    match std::fs::copy(connect_path, &backup) {
-        Ok(_) => tracing::warn!("Quarantined corrupt connect.json to {:?}", backup),
-        Err(e) => tracing::error!("Failed to quarantine corrupt connect.json: {}", e),
+    match std::fs::rename(connect_path, &backup) {
+        Ok(()) => tracing::warn!("Quarantined corrupt connect.json to {:?}", backup),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to rename corrupt connect.json to {:?} ({}); falling back to copy+remove",
+                backup,
+                e
+            );
+            if let Err(e) = std::fs::copy(connect_path, &backup) {
+                tracing::error!("Failed to quarantine corrupt connect.json: {}", e);
+                return;
+            }
+            if let Err(e) = std::fs::remove_file(connect_path) {
+                tracing::error!(
+                    "Quarantined corrupt connect.json to {:?} but failed to remove the \
+                     original {:?}: {}",
+                    backup,
+                    connect_path,
+                    e
+                );
+            }
+        }
     }
 }
 
@@ -3843,6 +3948,65 @@ mod tests {
         );
     }
 
+    /// #457: the legacy-key migration must be a NARROW write (strip `connect`
+    /// from config.json + write connect.json) — not the full `save_to_dir`,
+    /// which would re-encrypt every OTHER secret in config.json and rotate a
+    /// `config.json.bak` generation as a load-time side effect. This matters
+    /// most for a purely READ-ONLY command (e.g. `bamboo config get`) run on a
+    /// machine that still has the legacy `connect` key: it must not silently
+    /// rewrite/re-encrypt unrelated secrets or spin up a backup.
+    #[test]
+    fn migration_write_is_narrow_and_does_not_rewrite_unrelated_secrets_or_backups() {
+        let _key = crate::encryption::set_test_encryption_key([0x77; 32]);
+        let temp = TempHome::new();
+
+        let original_api_key_encrypted =
+            crate::encryption::encrypt("sk-unrelated-secret").expect("encrypt succeeds");
+        temp.set_config_json(
+            &serde_json::json!({
+                "providers": {
+                    "openai": {
+                        "api_key_encrypted": original_api_key_encrypted,
+                    }
+                },
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(config.connect.platforms.len(), 1, "legacy key adopted");
+
+        // No `config.json.bak` — the narrow write does not rotate backups the
+        // way a full `save_to_dir` would.
+        assert!(
+            !temp.path.join("config.json.bak").exists(),
+            "a read-only load migrating a legacy `connect` key must not rotate \
+             config.json backups"
+        );
+
+        // The unrelated provider secret's ciphertext is byte-for-byte
+        // unchanged — proof it was never decrypted+re-encrypted (encryption
+        // uses a random nonce per call, so any re-encryption would change the
+        // bytes even for the same plaintext).
+        let config_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config_json["providers"]["openai"]["api_key_encrypted"], original_api_key_encrypted,
+            "an unrelated secret's ciphertext must not be touched by the connect \
+             migration's narrow write"
+        );
+        assert!(
+            config_json.get("connect").is_none(),
+            "config.json is still rewritten without the legacy `connect` key"
+        );
+    }
+
     #[test]
     fn both_files_present_connect_json_wins() {
         let temp = TempHome::new();
@@ -3875,6 +4039,53 @@ mod tests {
         );
     }
 
+    /// #457: when both files are present, the superseded `connect` key in
+    /// config.json must be stripped PROACTIVELY on load — not left to linger
+    /// until the next natural save, which spreads token ciphertext across two
+    /// files for longer than necessary.
+    #[test]
+    fn both_files_present_strips_stale_legacy_key_from_config_json_immediately() {
+        let temp = TempHome::new();
+        temp.set_config_json(
+            &serde_json::json!({
+                "http_proxy": "http://keep-me",
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "stale-config-json-cipher" }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "authoritative-cipher" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            config.connect.platforms[0].token_encrypted.as_deref(),
+            Some("authoritative-cipher")
+        );
+        // Unrelated field survives the strip.
+        assert_eq!(config.http_proxy, "http://keep-me");
+
+        let config_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path.join("config.json")).unwrap())
+                .unwrap();
+        assert!(
+            config_json.get("connect").is_none(),
+            "the stale legacy `connect` key must be stripped from config.json \
+             immediately on load, not left for the next natural save"
+        );
+    }
+
     #[test]
     fn corrupt_connect_json_yields_empty_connect_and_is_quarantined() {
         let temp = TempHome::new();
@@ -3897,6 +4108,15 @@ mod tests {
                 .unwrap()
                 .contains("not valid json"),
             "the quarantined copy holds the bad content"
+        );
+        // #457: quarantine MOVES the corrupt file rather than copying it, so
+        // the data dir doesn't end up with two copies of the same corrupt
+        // content (the live `connect.json` and its `.bak`) sitting side by
+        // side, which reads as confusing/ambiguous mid-incident.
+        assert!(
+            !connect_json_path(&temp).exists(),
+            "quarantine must MOVE the corrupt connect.json (not copy it) — no \
+             connect.json should remain after quarantine"
         );
     }
 

@@ -6,8 +6,8 @@ use bamboo_config::OpenAIConfig;
 use bamboo_llm::Config;
 
 use super::common::{
-    config_file_path, model_limits_file_path, read_model_limits_file, redacted_config_json,
-    write_model_limits_file,
+    config_file_path, connect_backup_file_path, connect_file_path, model_limits_file_path,
+    read_model_limits_file, redacted_config_json, write_model_limits_file,
 };
 use super::reset::remove_config_file_if_exists;
 
@@ -23,6 +23,24 @@ fn model_limits_file_path_appends_model_limits_json_filename() {
     assert_eq!(
         model_limits_file_path(dir.path()),
         dir.path().join("model_limits.json")
+    );
+}
+
+#[test]
+fn connect_file_path_appends_connect_json_filename() {
+    let dir = tempdir().expect("temp dir should be created");
+    assert_eq!(
+        connect_file_path(dir.path()),
+        dir.path().join("connect.json")
+    );
+}
+
+#[test]
+fn connect_backup_file_path_appends_connect_json_bak_filename() {
+    let dir = tempdir().expect("temp dir should be created");
+    assert_eq!(
+        connect_backup_file_path(dir.path()),
+        dir.path().join("connect.json.bak")
     );
 }
 
@@ -581,5 +599,83 @@ async fn reset_bamboo_config_also_deletes_connect_json() {
             .map(|a| a.is_empty())
             .unwrap_or(true),
         "connect config must be empty after reset, not re-adopted from a stale file"
+    );
+}
+
+/// #457: a full config reset must also clear `connect.json.bak`. Unlike
+/// `config.json.bak` (a low-sensitivity config snapshot intentionally left
+/// alone by reset, for recovery), connect.json(.bak) holds an encrypted IM
+/// bot token — an immediately-usable remote-control credential — that must
+/// not stay recoverable straight off disk after the user asks for a full
+/// reset.
+#[actix_web::test]
+async fn reset_bamboo_config_also_deletes_connect_json_bak() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config))
+            .route(
+                "/bamboo/config/reset",
+                web::post().to(super::reset_bamboo_config),
+            ),
+    )
+    .await;
+
+    // Configure a connect platform, then change it again so a
+    // `connect.json.bak` gets written (the save path backs up the previous
+    // connect.json before overwriting it).
+    for token in ["tg-first-token", "tg-second-token"] {
+        let post = test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token": token, "allow_from": ["u1"] }
+                    ]
+                }
+            }))
+            .to_request();
+        assert!(test::call_service(&app, post).await.status().is_success());
+    }
+
+    let connect_path = data_dir.join("connect.json");
+    let connect_backup_path = data_dir.join("connect.json.bak");
+    assert!(
+        connect_path.exists(),
+        "connect.json should exist before reset"
+    );
+    assert!(
+        connect_backup_path.exists(),
+        "connect.json.bak should exist before reset (written by the second save)"
+    );
+
+    // Reset.
+    let reset = test::TestRequest::post()
+        .uri("/bamboo/config/reset")
+        .to_request();
+    assert!(
+        test::call_service(&app, reset).await.status().is_success(),
+        "reset should succeed"
+    );
+
+    assert!(
+        !connect_path.exists(),
+        "connect.json must be deleted by a full config reset"
+    );
+    assert!(
+        !connect_backup_path.exists(),
+        "connect.json.bak must also be deleted by a full config reset — it holds \
+         a live, immediately-usable bot token"
     );
 }

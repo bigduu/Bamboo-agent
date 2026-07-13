@@ -24,6 +24,18 @@ pub(super) fn connect_file_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("connect.json")
 }
 
+/// The single best-effort backup connect.json's save path creates before an
+/// overwrite (see `bamboo_config::config::save_connect_config`) —
+/// `connect.json.bak`. #457: a full config reset must scrub this too, unlike
+/// `config.json.bak` (which is intentionally left alone — see
+/// `reset_bamboo_config`). connect.json(.bak) holds an encrypted IM bot
+/// token, an immediately-usable remote-control credential; leaving the
+/// backup behind after a reset means that credential stays live and
+/// recoverable even though the user asked for a full reset.
+pub(super) fn connect_backup_file_path(app_data_dir: &Path) -> PathBuf {
+    connect_file_path(app_data_dir).with_extension("json.bak")
+}
+
 pub(super) async fn read_model_limits_file(app_data_dir: &Path) -> Result<Option<Value>, AppError> {
     let path = model_limits_file_path(app_data_dir);
     match tokio::fs::try_exists(&path).await {
