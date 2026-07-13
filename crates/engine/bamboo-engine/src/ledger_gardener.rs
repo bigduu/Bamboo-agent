@@ -358,7 +358,11 @@ async fn run_distillation_pass(
                 "kind={}, completed={}, notes: {}",
                 record.kind.as_str(),
                 record.updated_at.format("%Y-%m-%d"),
-                doc.body.chars().take(200).collect::<String>().replace('\n', " "),
+                doc.body
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+                    .replace('\n', " "),
             );
             (record.title.clone(), detail)
         })
@@ -525,8 +529,14 @@ mod tests {
         assert!(!should_expire(&habit, now));
 
         // Terminal and undated records are untouched.
-        assert!(!should_expire(&record(RecordKind::Todo, RecordStatus::Done), now));
-        assert!(!should_expire(&record(RecordKind::Todo, RecordStatus::Open), now));
+        assert!(!should_expire(
+            &record(RecordKind::Todo, RecordStatus::Done),
+            now
+        ));
+        assert!(!should_expire(
+            &record(RecordKind::Todo, RecordStatus::Open),
+            now
+        ));
     }
 
     #[test]
@@ -596,7 +606,10 @@ mod tests {
         }
 
         async fn release_schedules(&self, schedule_ids: &[String]) -> Result<(), String> {
-            self.released.lock().await.extend(schedule_ids.iter().cloned());
+            self.released
+                .lock()
+                .await
+                .extend(schedule_ids.iter().cloned());
             Ok(())
         }
     }
@@ -676,7 +689,10 @@ mod tests {
             .unwrap();
         assert_eq!(expired.record.status, RecordStatus::Expired);
         assert!(expired.record.schedule_ids.is_empty());
-        assert!(!expired.record.transitions.is_empty(), "history must survive");
+        assert!(
+            !expired.record.transitions.is_empty(),
+            "history must survive"
+        );
         assert_eq!(*bridge.released.lock().await, vec!["sched_old".to_string()]);
 
         let drifted = ledger

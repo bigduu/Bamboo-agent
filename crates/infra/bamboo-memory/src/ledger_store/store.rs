@@ -312,7 +312,11 @@ impl LedgerStore {
             .resolver
             .record_path(scope, project_key.as_deref(), &record.id);
         let existing = self.load_record_at(&path).await?;
-        let action = if existing.is_some() { "update" } else { "create" };
+        let action = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
         let body = match (body, &existing) {
             (Some(body), _) => body,
             (None, Some(existing)) => existing.body.clone(),
@@ -426,7 +430,9 @@ impl LedgerStore {
     ) -> io::Result<AgendaSnapshot> {
         let mut records: Vec<LedgerRecord> = Vec::new();
         for (scope, project_key) in scopes {
-            let docs = self.load_scope_records(*scope, project_key.as_deref()).await?;
+            let docs = self
+                .load_scope_records(*scope, project_key.as_deref())
+                .await?;
             records.extend(docs.into_iter().map(|doc| doc.record));
         }
         Ok(build_agenda_snapshot(&records, now, horizon_days))
@@ -462,7 +468,12 @@ impl LedgerStore {
         };
         let mut keys = Vec::new();
         while let Some(entry) = reader.next_entry().await? {
-            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 if let Some(name) = entry.file_name().to_str() {
                     keys.push(name.to_string());
                 }
@@ -585,7 +596,10 @@ impl LedgerStore {
             record_id: record_id.to_string(),
             summary: summary.chars().take(200).collect(),
         };
-        let path = self.resolver.logs_dir(scope, project_key).join(AUDIT_LOG_FILE);
+        let path = self
+            .resolver
+            .logs_dir(scope, project_key)
+            .join(AUDIT_LOG_FILE);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -630,7 +644,9 @@ mod tests {
             .write_record(record, Some("Bring the old one.".to_string()))
             .await
             .unwrap();
-        assert!(written.path.ends_with("scopes/global/records/rec_passport.md"));
+        assert!(written
+            .path
+            .ends_with("scopes/global/records/rec_passport.md"));
 
         let fetched = store
             .get_record(LedgerScope::Global, None, "rec_passport")
@@ -656,7 +672,13 @@ mod tests {
 
         // No-op transition returns None and records nothing further.
         let noop = store
-            .transition_record(LedgerScope::Global, None, "rec_passport", RecordStatus::Done, None)
+            .transition_record(
+                LedgerScope::Global,
+                None,
+                "rec_passport",
+                RecordStatus::Done,
+                None,
+            )
             .await
             .unwrap();
         assert!(noop.is_none());
@@ -788,8 +810,7 @@ mod tests {
             std::fs::read_to_string(scope_root.join("views").join(AGENDA_VIEW_FILE)).unwrap();
         assert!(agenda_view.contains("Send report"));
 
-        let audit =
-            std::fs::read_to_string(scope_root.join("logs").join(AUDIT_LOG_FILE)).unwrap();
+        let audit = std::fs::read_to_string(scope_root.join("logs").join(AUDIT_LOG_FILE)).unwrap();
         assert!(audit.contains("\"action\":\"create\""));
     }
 
@@ -800,19 +821,31 @@ mod tests {
         let now = utc(2026, 7, 13, 12);
 
         store
-            .write_record(todo("rec_overdue", "Yesterday", Some(utc(2026, 7, 12, 9))), None)
+            .write_record(
+                todo("rec_overdue", "Yesterday", Some(utc(2026, 7, 12, 9))),
+                None,
+            )
             .await
             .unwrap();
         store
-            .write_record(todo("rec_today", "Tonight", Some(utc(2026, 7, 13, 20))), None)
+            .write_record(
+                todo("rec_today", "Tonight", Some(utc(2026, 7, 13, 20))),
+                None,
+            )
             .await
             .unwrap();
         store
-            .write_record(todo("rec_week", "This week", Some(utc(2026, 7, 16, 9))), None)
+            .write_record(
+                todo("rec_week", "This week", Some(utc(2026, 7, 16, 9))),
+                None,
+            )
             .await
             .unwrap();
         store
-            .write_record(todo("rec_far", "Next month", Some(utc(2026, 8, 20, 9))), None)
+            .write_record(
+                todo("rec_far", "Next month", Some(utc(2026, 8, 20, 9))),
+                None,
+            )
             .await
             .unwrap();
         store
@@ -824,9 +857,8 @@ mod tests {
             .agenda(&[(LedgerScope::Global, None)], now, 7)
             .await
             .unwrap();
-        let ids = |items: &[AgendaItem]| {
-            items.iter().map(|item| item.id.clone()).collect::<Vec<_>>()
-        };
+        let ids =
+            |items: &[AgendaItem]| items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&snapshot.overdue), vec!["rec_overdue"]);
         assert_eq!(ids(&snapshot.today), vec!["rec_today"]);
         assert_eq!(ids(&snapshot.upcoming), vec!["rec_week"]);

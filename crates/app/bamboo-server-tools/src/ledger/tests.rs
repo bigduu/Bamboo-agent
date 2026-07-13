@@ -54,7 +54,8 @@ fn build_tool(data_dir: &std::path::Path) -> (LedgerTool, Arc<dyn Storage>) {
     let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
-    let session_repo = bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
+    let session_repo =
+        bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
     (LedgerTool::new(session_repo, data_dir), storage)
 }
 
@@ -87,7 +88,10 @@ async fn upsert_get_transition_lifecycle() {
     )
     .await;
     assert_eq!(created["result"], "create");
-    let id = created["data"]["record"]["id"].as_str().unwrap().to_string();
+    let id = created["data"]["record"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(created["data"]["record"]["scope"], "global");
     assert_eq!(created["data"]["record"]["tags"][0], "errands");
 
@@ -104,7 +108,10 @@ async fn upsert_get_transition_lifecycle() {
     .await;
     assert_eq!(updated["result"], "update");
     assert_eq!(updated["data"]["record"]["title"], "Renew passport");
-    assert_eq!(updated["data"]["body"], "Bring the old passport and two photos.");
+    assert_eq!(
+        updated["data"]["body"],
+        "Bring the old passport and two photos."
+    );
 
     let done = invoke(
         &tool,
@@ -119,7 +126,12 @@ async fn upsert_get_transition_lifecycle() {
     .await;
     assert_eq!(done["data"]["record"]["status"], "done");
 
-    let fetched = invoke(&tool, "session-1", serde_json::json!({"action": "get", "id": id})).await;
+    let fetched = invoke(
+        &tool,
+        "session-1",
+        serde_json::json!({"action": "get", "id": id}),
+    )
+    .await;
     assert_eq!(fetched["data"]["record"]["status"], "done");
 }
 
@@ -286,7 +298,10 @@ impl LedgerScheduleBridge for RecordingBridge {
     }
 
     async fn release_schedules(&self, schedule_ids: &[String]) -> Result<(), String> {
-        self.released.lock().await.extend(schedule_ids.iter().cloned());
+        self.released
+            .lock()
+            .await
+            .extend(schedule_ids.iter().cloned());
         Ok(())
     }
 }
@@ -312,7 +327,10 @@ async fn schedule_bridge_syncs_on_upsert_and_releases_on_terminal_transition() {
         }),
     )
     .await;
-    let id = created["data"]["record"]["id"].as_str().unwrap().to_string();
+    let id = created["data"]["record"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
         created["data"]["record"]["schedule_ids"],
         serde_json::json!([format!("sched_for_{id}")])
@@ -331,7 +349,12 @@ async fn schedule_bridge_syncs_on_upsert_and_releases_on_terminal_transition() {
     );
 
     // The record's schedule ids are cleared after release.
-    let fetched = invoke(&tool, "session-1", serde_json::json!({"action": "get", "id": id})).await;
+    let fetched = invoke(
+        &tool,
+        "session-1",
+        serde_json::json!({"action": "get", "id": id}),
+    )
+    .await;
     assert!(fetched["data"]["record"]["schedule_ids"]
         .as_array()
         .map(|ids| ids.is_empty())

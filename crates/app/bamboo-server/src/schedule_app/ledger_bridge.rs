@@ -225,6 +225,9 @@ mod tests {
         handle
             .bind(Arc::new(ScheduleLedgerBridge::new(store)))
             .await;
-        assert_eq!(handle.sync_record_schedules(&record).await.unwrap().len(), 1);
+        assert_eq!(
+            handle.sync_record_schedules(&record).await.unwrap().len(),
+            1
+        );
     }
 }

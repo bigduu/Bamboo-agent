@@ -16,19 +16,14 @@ use crate::session::task::TaskPriority;
 /// unknown kinds round-trip through persistence instead of failing to parse,
 /// so a newer Bamboo (or a skill that invents a kind) never corrupts an older
 /// store's reads.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum RecordKind {
+    #[default]
     Todo,
     Event,
     Reminder,
     Habit,
     Custom(String),
-}
-
-impl Default for RecordKind {
-    fn default() -> Self {
-        Self::Todo
-    }
 }
 
 impl RecordKind {
@@ -66,8 +61,7 @@ impl Serialize for RecordKind {
 impl<'de> Deserialize<'de> for RecordKind {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        Self::parse(&raw)
-            .ok_or_else(|| serde::de::Error::custom("record kind cannot be empty"))
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("record kind cannot be empty"))
     }
 }
 
@@ -449,7 +443,10 @@ mod tests {
         assert!(record.is_overdue_at(now));
 
         record.transition_to(RecordStatus::Done, None);
-        assert!(!record.is_overdue_at(now), "terminal records are never overdue");
+        assert!(
+            !record.is_overdue_at(now),
+            "terminal records are never overdue"
+        );
     }
 
     #[test]

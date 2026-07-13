@@ -68,7 +68,12 @@ pub async fn delete_record(
     path: web::Path<String>,
     query: web::Query<LocateRecordQuery>,
 ) -> Result<HttpResponse> {
-    delete_record_core(&ledger_store(&state), &path.into_inner(), query.into_inner()).await
+    delete_record_core(
+        &ledger_store(&state),
+        &path.into_inner(),
+        query.into_inner(),
+    )
+    .await
 }
 
 /// `GET /api/v1/ledger/agenda`
@@ -283,7 +288,12 @@ pub(super) async fn upsert_record_core(
     store: &LedgerStore,
     req: UpsertRecordRequest,
 ) -> Result<HttpResponse> {
-    let explicit_scope = match req.scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let explicit_scope = match req
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(raw) => match LedgerScope::parse(raw) {
             Some(scope) => Some(scope),
             None => {
@@ -368,7 +378,11 @@ pub(super) async fn upsert_record_core(
         return Ok(response);
     }
 
-    let result = if existing.is_some() { "update" } else { "create" };
+    let result = if existing.is_some() {
+        "update"
+    } else {
+        "create"
+    };
     let doc = store
         .write_record(record, req.body)
         .await
@@ -394,7 +408,8 @@ pub(super) async fn patch_record_core(
     req: PatchRecordRequest,
 ) -> Result<HttpResponse> {
     let project_key = normalize_opt(query.project_key.as_deref());
-    let Some(existing) = locate_record(store, record_id, None, project_key.as_deref()).await? else {
+    let Some(existing) = locate_record(store, record_id, None, project_key.as_deref()).await?
+    else {
         return Ok(record_not_found(record_id));
     };
 
@@ -490,7 +505,8 @@ pub(super) async fn delete_record_core(
     query: LocateRecordQuery,
 ) -> Result<HttpResponse> {
     let project_key = normalize_opt(query.project_key.as_deref());
-    let Some(existing) = locate_record(store, record_id, None, project_key.as_deref()).await? else {
+    let Some(existing) = locate_record(store, record_id, None, project_key.as_deref()).await?
+    else {
         return Ok(record_not_found(record_id));
     };
 

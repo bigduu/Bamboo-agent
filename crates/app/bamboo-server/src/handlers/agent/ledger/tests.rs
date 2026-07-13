@@ -155,7 +155,13 @@ async fn list_filters_by_status_and_reports_matched() {
     create_record(&store, upsert("Second")).await;
     let first_id = first["record"]["id"].as_str().unwrap();
     store
-        .transition_record(LedgerScope::Global, None, first_id, RecordStatus::Done, None)
+        .transition_record(
+            LedgerScope::Global,
+            None,
+            first_id,
+            RecordStatus::Done,
+            None,
+        )
         .await
         .expect("transition")
         .expect("record exists");
@@ -363,7 +369,10 @@ async fn delete_cancels_instead_of_removing() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["success"], true);
     assert_eq!(body["record"]["status"], "cancelled");
-    assert_eq!(body["record"]["transitions"][0]["reason"], "deleted via API");
+    assert_eq!(
+        body["record"]["transitions"][0]["reason"],
+        "deleted via API"
+    );
 
     // The document survives (never hard-deleted).
     let doc = store

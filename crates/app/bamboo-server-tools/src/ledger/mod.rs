@@ -17,9 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
-use bamboo_domain::ledger::{
-    LedgerRecord, LedgerScope, RecordActor, RecordKind, RecordStatus,
-};
+use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind, RecordStatus};
 use bamboo_domain::schedule::ScheduleTrigger;
 use bamboo_domain::{TaskItemStatus, TaskPriority};
 use bamboo_memory::ledger_store::store::new_record_id;
@@ -248,7 +246,10 @@ impl LedgerTool {
     /// any change to the record's `schedule_ids`. Bridge failures degrade to a
     /// warning string instead of failing the mutation: the record write
     /// already succeeded, and losing it over a scheduler hiccup would be worse.
-    async fn sync_schedules(&self, doc: LedgerRecordDocument) -> (LedgerRecordDocument, Vec<String>) {
+    async fn sync_schedules(
+        &self,
+        doc: LedgerRecordDocument,
+    ) -> (LedgerRecordDocument, Vec<String>) {
         let Some(bridge) = &self.schedule_bridge else {
             return (doc, Vec::new());
         };
@@ -280,7 +281,11 @@ impl LedgerTool {
         }
         let mut updated = doc.record.clone();
         updated.schedule_ids = new_ids;
-        match self.store.write_record(updated, Some(doc.body.clone())).await {
+        match self
+            .store
+            .write_record(updated, Some(doc.body.clone()))
+            .await
+        {
             Ok(rewritten) => (rewritten, warnings),
             Err(error) => {
                 warnings.push(format!("failed to persist schedule ids: {error}"));
@@ -346,7 +351,12 @@ impl LedgerTool {
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await;
 
-        let existing = match args.id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        let existing = match args
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
             Some(id) => {
                 self.locate_record(id, explicit_scope, project_key.as_deref())
                     .await?
@@ -399,7 +409,12 @@ impl LedgerTool {
 
         // Field updates apply to both paths; on update, absent args leave the
         // existing value untouched.
-        if let Some(title) = args.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(title) = args
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             record.title = title.to_string();
         }
         if existing.is_some() {
@@ -433,7 +448,11 @@ impl LedgerTool {
         Self::apply_time_args(&mut record, args)?;
 
         let body = args.body.clone();
-        let action = if existing.is_some() { "update" } else { "create" };
+        let action = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
         let doc = self
             .store
             .write_record(record, body)
@@ -667,11 +686,15 @@ impl LedgerTool {
             .ok_or_else(|| {
                 ToolError::InvalidArguments("decompose requires a parent_id".to_string())
             })?;
-        let children = args.children.as_ref().filter(|c| !c.is_empty()).ok_or_else(|| {
-            ToolError::InvalidArguments(
-                "decompose requires a non-empty children array".to_string(),
-            )
-        })?;
+        let children = args
+            .children
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                ToolError::InvalidArguments(
+                    "decompose requires a non-empty children array".to_string(),
+                )
+            })?;
         if children.len() > MAX_DECOMPOSE_CHILDREN {
             return Err(ToolError::InvalidArguments(format!(
                 "decompose supports at most {MAX_DECOMPOSE_CHILDREN} children per call"
@@ -746,7 +769,10 @@ impl LedgerTool {
         } else {
             session
         };
-        let Some(task_list) = root.task_list.as_ref().filter(|list| !list.items.is_empty())
+        let Some(task_list) = root
+            .task_list
+            .as_ref()
+            .filter(|list| !list.items.is_empty())
         else {
             return Err(ToolError::Execution(
                 "the session has no task list to promote".to_string(),
@@ -912,12 +938,17 @@ impl Tool for LedgerTool {
         }
     }
 
-    async fn invoke(&self, args: serde_json::Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
         let session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("ledger requires a session_id in tool context".to_string())
         })?;
-        let parsed: LedgerArgs = serde_json::from_value(args)
-            .map_err(|error| ToolError::InvalidArguments(format!("Invalid ledger args: {error}")))?;
+        let parsed: LedgerArgs = serde_json::from_value(args).map_err(|error| {
+            ToolError::InvalidArguments(format!("Invalid ledger args: {error}"))
+        })?;
 
         let value = match parsed.action.trim().to_ascii_lowercase().as_str() {
             "upsert" => self.handle_upsert(&parsed, session_id).await?,

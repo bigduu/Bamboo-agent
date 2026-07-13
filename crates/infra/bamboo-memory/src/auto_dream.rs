@@ -783,7 +783,10 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "Renew passport");
         assert_eq!(candidates[0].kind, "todo");
-        assert_eq!(candidates[0].due_at.as_deref(), Some("2026-08-01T00:00:00Z"));
+        assert_eq!(
+            candidates[0].due_at.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
         assert_eq!(candidates[0].starts_at, None);
         assert_eq!(
             candidates[0].excerpt.as_deref(),

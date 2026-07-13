@@ -17,9 +17,8 @@ use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
     derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
     parse_candidate_type, parse_extraction_candidates, parse_last_consolidated_at,
-    parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild,
-    truncate_chars, ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
-    LedgerExtractionCandidate,
+    parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild, truncate_chars,
+    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, LedgerExtractionCandidate,
 };
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
@@ -1318,7 +1317,10 @@ mod tests {
         assert_eq!(record.scope, LedgerScope::Global);
         assert_eq!(record.tags, vec!["suggested".to_string()]);
         assert_eq!(record.source.created_by, RecordActor::Extractor);
-        assert_eq!(record.source.session_id.as_deref(), Some("session-dream-run"));
+        assert_eq!(
+            record.source.session_id.as_deref(),
+            Some("session-dream-run")
+        );
         assert_eq!(
             record.source.excerpt.as_deref(),
             Some("I need to renew my passport before August")
@@ -1381,7 +1383,13 @@ mod tests {
             // Skipped: in-batch duplicate (case-insensitive, trimmed).
             candidate("  RENEW PASSPORT  ", "todo", None, None, Some("high")),
             // Written despite malformed timestamps (they parse to None).
-            candidate("Call the bank", "reminder", Some("next week"), None, Some("medium")),
+            candidate(
+                "Call the bank",
+                "reminder",
+                Some("next week"),
+                None,
+                Some("medium"),
+            ),
         ];
 
         let writes = persist_ledger_candidates(&ledger, candidates)
@@ -1408,7 +1416,10 @@ mod tests {
             assert_eq!(doc.record.scope, LedgerScope::Global);
             assert_eq!(doc.record.tags, vec!["suggested".to_string()]);
             assert_eq!(doc.record.source.created_by, RecordActor::Extractor);
-            assert_eq!(doc.record.source.session_id.as_deref(), Some("session-ledger"));
+            assert_eq!(
+                doc.record.source.session_id.as_deref(),
+                Some("session-ledger")
+            );
             assert!(doc.record.source.excerpt.is_some());
             assert!(doc.record.schedule_ids.is_empty());
         }
@@ -1478,7 +1489,10 @@ mod tests {
         let writes = persist_ledger_candidates(&ledger, candidates)
             .await
             .expect("persist should succeed");
-        assert_eq!(writes, 1, "duplicate of existing open record must be skipped");
+        assert_eq!(
+            writes, 1,
+            "duplicate of existing open record must be skipped"
+        );
 
         let records = ledger
             .list_records(LedgerScope::Global, None, &RecordFilter::default())

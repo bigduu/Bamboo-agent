@@ -149,13 +149,19 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
         "Send the quarterly report",
     );
     overdue.time.due_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
-    ledger.write_record(overdue, None).await.expect("write overdue record");
+    ledger
+        .write_record(overdue, None)
+        .await
+        .expect("write overdue record");
     let undated = bamboo_domain::ledger::LedgerRecord::new(
         "rec_open",
         bamboo_domain::ledger::RecordKind::Todo,
         "Clean the garage",
     );
-    ledger.write_record(undated, None).await.expect("write undated record");
+    ledger
+        .write_record(undated, None)
+        .await
+        .expect("write undated record");
 
     let mut session = bamboo_agent_core::Session::new("session-ledger-test", "test-model");
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
