@@ -44,6 +44,58 @@ impl SessionKey {
     }
 }
 
+/// Max entries [`BoundedSeenSet`] retains before evicting the oldest
+/// (issue #454 follow-up). This is defense-in-depth dedup, layered on top
+/// of each adapter's own transport-level dedup (e.g. Telegram's offset
+/// advance) — it only needs to cover the realistic in-flight
+/// redelivery/retry window, not serve as a permanent audit log. A few
+/// thousand entries comfortably covers any plausible burst across every
+/// configured chat while keeping memory bounded for the life of the
+/// process.
+const DEDUP_CAPACITY: usize = 10_000;
+
+/// A `HashSet` bounded to at most `capacity` entries via FIFO eviction:
+/// once full, inserting a new key evicts the oldest still-tracked key.
+/// Used for [`ConnectBridge::seen_message_ids`] — a plain `HashSet` there
+/// would gain one entry per distinct `platform:message_id` for the life of
+/// the process (issue #454 follow-up).
+struct BoundedSeenSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl BoundedSeenSet {
+    fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Inserts `key`, evicting the oldest tracked key(s) if this pushes the
+    /// set past capacity. Returns `true` if `key` was newly inserted (i.e.
+    /// not a duplicate) — same contract as `HashSet::insert`.
+    fn insert(&mut self, key: String) -> bool {
+        if !self.set.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 /// Shared dependencies the bridge needs to run sessions through the
 /// canonical execution path. Cheap to clone (every field is an `Arc`, or
 /// small/`Clone`).
@@ -236,9 +288,11 @@ pub struct ConnectBridge {
     chat_state: AsyncMutex<HashMap<String, ChatState>>,
     /// `platform:message_id` seen so far — dedup defense-in-depth alongside
     /// each adapter's own transport-level dedup (e.g. Telegram's offset
-    /// advance). A `std::sync::Mutex` is fine here: only ever locked for a
-    /// single `HashSet::insert`, never held across an `.await`.
-    seen_message_ids: StdMutex<HashSet<String>>,
+    /// advance). Bounded (issue #454 follow-up: see [`BoundedSeenSet`]) so
+    /// it never grows without limit for the life of the process. A
+    /// `std::sync::Mutex` is fine here: only ever locked for a single
+    /// insert, never held across an `.await`.
+    seen_message_ids: StdMutex<BoundedSeenSet>,
     process_start: DateTime<Utc>,
     /// The resolution seam (issue #458): `submit_pending_response` +
     /// `resume_session_execution`, or a fake in tests.
@@ -267,7 +321,7 @@ impl ConnectBridge {
             session_map: TokioRwLock::new(HashMap::new()),
             map_path,
             chat_state: AsyncMutex::new(HashMap::new()),
-            seen_message_ids: StdMutex::new(HashSet::new()),
+            seen_message_ids: StdMutex::new(BoundedSeenSet::new(DEDUP_CAPACITY)),
             process_start: Utc::now(),
             responder,
         }
@@ -1219,6 +1273,45 @@ mod tests {
             user_id: "7".to_string(),
         };
         assert_eq!(key.as_string(), "telegram:42:7");
+    }
+
+    // ---- Issue #454 follow-up: bounded dedup set ----
+
+    #[test]
+    fn bounded_seen_set_evicts_the_oldest_entry_once_over_capacity() {
+        let mut set = BoundedSeenSet::new(2);
+        assert!(set.insert("a".to_string()));
+        assert!(set.insert("b".to_string()));
+        assert_eq!(set.len(), 2);
+
+        // Pushes past capacity: "a" (oldest) is evicted; "b" and "c" remain
+        // tracked as seen.
+        assert!(set.insert("c".to_string()));
+        assert_eq!(set.len(), 2);
+        assert!(!set.insert("b".to_string()), "b must still be tracked");
+        assert!(!set.insert("c".to_string()), "c must still be tracked");
+
+        // "a" was evicted — re-inserting it is treated as new, not a
+        // duplicate (which in turn evicts "b", the now-oldest entry).
+        assert!(set.insert("a".to_string()));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn bounded_seen_set_still_dedups_within_capacity() {
+        let mut set = BoundedSeenSet::new(10);
+        assert!(set.insert("x".to_string()));
+        assert!(!set.insert("x".to_string()), "duplicate must be rejected");
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn bounded_seen_set_never_grows_past_capacity() {
+        let mut set = BoundedSeenSet::new(50);
+        for i in 0..5_000 {
+            set.insert(format!("msg-{i}"));
+        }
+        assert_eq!(set.len(), 50);
     }
 
     #[tokio::test]

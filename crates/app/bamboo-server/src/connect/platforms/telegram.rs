@@ -118,11 +118,27 @@ impl RateLimiter {
             let earliest = guard.get(key).copied().unwrap_or(now);
             let scheduled = earliest.max(now);
             guard.insert(key.to_string(), scheduled + self.min_interval);
+            // Bound growth (issue #454 follow-up): without this, the map
+            // gains one entry per distinct chat id for the life of the
+            // process, even after a chat goes permanently idle. Sweep out
+            // every entry whose reserved slot has ALREADY elapsed — safe
+            // because a swept key's next `wait()` falls back to `now` via
+            // `unwrap_or(now)` above, i.e. exactly the value we're
+            // discarding, so this never changes scheduling behavior. The
+            // entry this call just inserted is always `> now` (it's
+            // `scheduled + min_interval` with `scheduled >= now`), so it
+            // always survives its own sweep.
+            guard.retain(|_, next_allowed| *next_allowed > now);
             scheduled
         };
         if scheduled > now {
             tokio::time::sleep(scheduled - now).await;
         }
+    }
+
+    #[cfg(test)]
+    async fn tracked_chat_count(&self) -> usize {
+        self.next_allowed.lock().await.len()
     }
 }
 
@@ -771,6 +787,44 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "sends to DIFFERENT chats must not share a rate-limit slot, elapsed={elapsed:?}"
         );
+    }
+
+    /// Issue #454 follow-up: `RateLimiter::next_allowed` must not grow one
+    /// entry per distinct chat for the life of the process — a chat's entry
+    /// is swept once its reserved slot has elapsed, rather than lingering
+    /// forever.
+    #[tokio::test]
+    async fn rate_limiter_sweeps_stale_entries_instead_of_growing_unbounded() {
+        let limiter = RateLimiter::new(Duration::from_millis(20));
+
+        limiter.wait("chat-1").await;
+        assert_eq!(limiter.tracked_chat_count().await, 1);
+
+        // Let chat-1's reserved slot fully elapse before any other chat is
+        // seen.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // A wait for a DIFFERENT chat must sweep chat-1's now-stale entry
+        // out rather than accumulate it forever.
+        limiter.wait("chat-2").await;
+        assert_eq!(
+            limiter.tracked_chat_count().await,
+            1,
+            "stale chat-1 entry must have been swept when chat-2 was scheduled"
+        );
+
+        // Simulate many distinct, one-shot chats spaced far enough apart
+        // that each previous entry is stale by the time the next arrives —
+        // the tracked count must stay bounded to the currently-relevant
+        // entry/entries, not grow to the number of chats ever seen.
+        for i in 0..50 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            limiter.wait(&format!("burst-chat-{i}")).await;
+            assert!(
+                limiter.tracked_chat_count().await <= 2,
+                "map grew unbounded after {i} one-shot chats"
+            );
+        }
     }
 
     #[tokio::test]
