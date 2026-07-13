@@ -1363,6 +1363,7 @@ dependencies = [
  "bamboo-storage",
  "bamboo-subagent",
  "bamboo-tools",
+ "base64",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -1377,6 +1378,7 @@ dependencies = [
  "mockall",
  "notify-rust",
  "parking_lot",
+ "prost",
  "rand 0.10.2",
  "regex",
  "reqwest 0.13.4",
@@ -1395,6 +1397,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -4993,6 +4996,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "ptr_meta"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6813,7 +6839,9 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "tokio",
+ "tokio-native-tls",
  "tungstenite 0.29.0",
 ]
 
@@ -7094,6 +7122,7 @@ dependencies = [
  "http 1.4.2",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.9.4",
  "sha1 0.10.6",
  "thiserror 2.0.18",

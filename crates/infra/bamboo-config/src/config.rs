@@ -716,6 +716,27 @@ pub struct ConnectPlatformConfig {
     /// Encrypted ciphertext of `token` (the at-rest representation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_encrypted: Option<String>,
+    /// Platform app id (Feishu `app_id`). Not a secret — serialized normally.
+    /// Unused by the Telegram adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// Platform app secret (Feishu `app_secret`).
+    ///
+    /// Secret: encrypted at rest in `app_secret_encrypted`; this plaintext
+    /// field is never serialized and is hydrated in memory on load (mirrors
+    /// `token` above).
+    #[serde(default, skip_serializing)]
+    pub app_secret: Option<String>,
+    /// Encrypted ciphertext of `app_secret` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_secret_encrypted: Option<String>,
+    /// Platform domain/base-URL selector (Feishu-only today). Not a secret —
+    /// serialized normally. `None`/`"feishu"` -> open.feishu.cn, `"lark"` ->
+    /// open.larksuite.com, an `https://` value -> a private-deployment base
+    /// URL used verbatim. Validation happens in the server registration arm,
+    /// not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     /// Platform-scoped user ids allowed to drive a session. Deliberately
     /// STRICTER than the general secret-mask precedents: an EMPTY list means
     /// deny-all (every inbound message is rejected), not allow-all — a
@@ -4013,6 +4034,10 @@ mod tests {
             platform_type: platform_type.to_string(),
             token: None,
             token_encrypted: Some(token_encrypted.to_string()),
+            app_id: None,
+            app_secret: None,
+            app_secret_encrypted: None,
+            domain: None,
             allow_from: vec!["user-1".to_string()],
             admin_from: Vec::new(),
         }
@@ -4389,6 +4414,117 @@ mod tests {
         );
         let current = std::fs::read_to_string(connect_json_path(&temp)).unwrap();
         assert!(current.contains("new-cipher"));
+    }
+
+    // ── Feishu adapter config fields (epic #447 phase 3, §2a) ───────────
+
+    #[test]
+    fn save_splits_feishu_app_secret_into_connect_json_encrypted_alongside_app_id_and_domain() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![ConnectPlatformConfig {
+            platform_type: "feishu".to_string(),
+            token: None,
+            token_encrypted: None,
+            app_id: Some("cli_real_app_id".to_string()),
+            app_secret: Some("plain-app-secret".to_string()),
+            app_secret_encrypted: None,
+            domain: Some("lark".to_string()),
+            allow_from: vec!["ou_1".to_string()],
+            admin_from: Vec::new(),
+        }];
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        assert_eq!(connect_json["platforms"][0]["type"], "feishu");
+        assert_eq!(connect_json["platforms"][0]["app_id"], "cli_real_app_id");
+        assert_eq!(connect_json["platforms"][0]["domain"], "lark");
+        assert!(
+            connect_json["platforms"][0]["app_secret_encrypted"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "app_secret is persisted in its encrypted form in connect.json"
+        );
+        assert!(
+            connect_json["platforms"][0].get("app_secret").is_none(),
+            "the plaintext app_secret is never persisted (skip_serializing)"
+        );
+    }
+
+    #[test]
+    fn load_hydrates_feishu_app_secret_from_encrypted() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![ConnectPlatformConfig {
+            platform_type: "feishu".to_string(),
+            token: None,
+            token_encrypted: None,
+            app_id: Some("cli_real_app_id".to_string()),
+            app_secret: Some("plain-app-secret".to_string()),
+            app_secret_encrypted: None,
+            domain: Some("lark".to_string()),
+            allow_from: vec!["ou_1".to_string()],
+            admin_from: Vec::new(),
+        }];
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let reloaded = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(reloaded.connect.platforms.len(), 1);
+        assert_eq!(
+            reloaded.connect.platforms[0].app_secret.as_deref(),
+            Some("plain-app-secret"),
+            "reload hydrates app_secret from app_secret_encrypted"
+        );
+        assert_eq!(
+            reloaded.connect.platforms[0].app_id.as_deref(),
+            Some("cli_real_app_id")
+        );
+        assert_eq!(
+            reloaded.connect.platforms[0].domain.as_deref(),
+            Some("lark")
+        );
+    }
+
+    #[test]
+    fn legacy_telegram_only_connect_entry_without_feishu_fields_still_deserializes() {
+        let temp = TempHome::new();
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        assert_eq!(config.connect.platforms.len(), 1);
+        assert_eq!(config.connect.platforms[0].platform_type, "telegram");
+        assert_eq!(
+            config.connect.platforms[0].token_encrypted.as_deref(),
+            Some("legacy-cipher")
+        );
+        assert_eq!(
+            config.connect.platforms[0].app_id, None,
+            "a legacy entry with no Feishu fields deserializes them as None"
+        );
+        assert_eq!(config.connect.platforms[0].app_secret, None);
+        assert_eq!(config.connect.platforms[0].app_secret_encrypted, None);
+        assert_eq!(config.connect.platforms[0].domain, None);
     }
 
     #[test]
