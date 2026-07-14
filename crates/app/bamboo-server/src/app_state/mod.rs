@@ -305,6 +305,12 @@ pub struct AppState {
     /// including initialization, tool discovery, and shutdown.
     pub mcp_manager: Arc<McpServerManager>,
 
+    /// Supervises long-running "service" plugins (issue #479, prereq for
+    /// epic #477). Always constructed, fully inert until a plugin install
+    /// (or the boot-time reconcile) calls `start_service`. See
+    /// `crate::service_manager`'s module docs.
+    pub service_manager: Arc<crate::service_manager::ServiceManager>,
+
     /// Metrics collection and persistence service
     ///
     /// Tracks token usage, costs, and performance metrics

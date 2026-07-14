@@ -628,6 +628,25 @@ impl AppState {
         // `Unreachable` so the UI/agent see reality (a redeploy brings it back).
         reconcile_fabric_on_boot(&config, &bamboo_home_dir).await;
 
+        // `ServiceManager` (issue #479 / epic #477 prereq): supervises
+        // long-running "service" plugins. Always constructed — fully inert
+        // until a plugin install or the boot-time reconcile below starts
+        // something — mirrors `mcp_manager`/`connect_manager`'s
+        // always-alive lifecycle.
+        let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
+        {
+            // Backgrounded (mirrors `init_mcp_manager`'s background MCP
+            // bootstrap): a service that `installed.json` says should be
+            // running but isn't (the previous `bamboo serve` process, if
+            // any, died with everything it supervised) is started fresh.
+            let service_manager = service_manager.clone();
+            let app_data_dir = bamboo_home_dir.clone();
+            tokio::spawn(async move {
+                crate::plugin_installer::boot_reconcile_services(&app_data_dir, &service_manager)
+                    .await;
+            });
+        }
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -657,6 +676,7 @@ impl AppState {
             mcp_proxy_shutdown,
             skill_manager,
             mcp_manager,
+            service_manager,
             metrics_service,
             agent_runners,
             session_event_senders,

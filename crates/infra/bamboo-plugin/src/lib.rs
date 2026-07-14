@@ -43,8 +43,9 @@ pub use installer::{
     LocalPluginInstaller, PluginInstaller,
 };
 pub use manifest::{
-    McpServerManifestEntry, McpTransportManifest, Platform, PluginArtifact, PluginManifest,
-    PluginPromptPreset, PluginProvides,
+    platform_bin_path, GracefulShutdown, HealthCheckKind, HealthCheckSpec, McpServerManifestEntry,
+    McpTransportManifest, Platform, PluginArtifact, PluginManifest, PluginPromptPreset,
+    PluginProvides, ResolvedServiceEntry, ServiceManifestEntry, ShutdownSignal, PLATFORM_BIN_TOKEN,
 };
 pub use registry::{
     classify_ownership, reconcile_exclusive, ExclusiveReconciliation, InstalledPlugin,
