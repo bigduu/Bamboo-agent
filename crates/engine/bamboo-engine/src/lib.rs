@@ -12,6 +12,7 @@ pub mod message_hooks;
 pub mod model_areas;
 pub mod model_config_helper;
 pub mod prompt_defaults;
+pub mod resolved_defaults;
 pub mod runtime;
 pub mod sdk;
 pub mod session_app;

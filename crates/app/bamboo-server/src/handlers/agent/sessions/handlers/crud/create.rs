@@ -7,6 +7,19 @@ use bamboo_engine::model_config_helper::normalize_gold_config_json;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};
 
+/// Sync runtime workspace so tools can resolve the working directory. Mirrors
+/// `chat::handler::sync_runtime_workspace` — #480 gives `POST /sessions` the
+/// same `workspace_path` semantics as `POST /chat`.
+fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
+    let preferred = workspace_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
+        .filter(|path| path.is_dir());
+    let _ = bamboo_tools::tools::workspace_state::ensure_session_workspace(session_id, preferred);
+}
+
 /// `POST /api/v1/sessions`
 pub async fn create_session(
     state: web::Data<AppState>,
@@ -38,6 +51,10 @@ pub async fn create_session(
         global_default_prompt.as_str(),
         &config_snapshot,
     );
+
+    // Sync the runtime workspace directory on disk when the request set one
+    // (metadata-only write happened inside `build_new_session`).
+    sync_runtime_workspace(&id, req.workspace_path.as_deref());
 
     state
         .storage
@@ -98,6 +115,7 @@ fn build_new_session(
         model_ref: req.model_ref.clone(),
         reasoning_effort: req.reasoning_effort,
         gold_config_json,
+        workspace_path: req.workspace_path.clone(),
     };
     let create_config = CreateSessionConfig {
         default_model: config.get_model(),
@@ -155,5 +173,88 @@ mod tests {
             body["session"]["id"].as_str().is_some(),
             "response should carry the created session summary"
         );
+    }
+
+    /// #480: `POST /sessions` gets the same `workspace_path` semantics as
+    /// `POST /chat` — the created session's metadata carries the resolved
+    /// workspace path.
+    #[actix_web::test]
+    async fn create_session_with_workspace_path_sets_it() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let workspace_dir = tempdir().expect("workspace tempdir");
+        let workspace_path = workspace_dir.path().to_string_lossy().to_string();
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Session with workspace",
+                    "workspace_path": workspace_path,
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        let session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let session = state
+            .storage
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(workspace_path.as_str())
+        );
+    }
+
+    /// Omitting `workspace_path` must NOT set any workspace metadata.
+    #[actix_web::test]
+    async fn create_session_without_workspace_path_leaves_it_unset() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({ "title": "No workspace" }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        let session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let session = state
+            .storage
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert!(session.workspace_path_meta().is_none());
     }
 }
