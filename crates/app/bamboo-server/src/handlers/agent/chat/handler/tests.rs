@@ -1,4 +1,4 @@
-use super::request::{optional_non_empty, resolve_session_id, validate_and_normalize_model};
+use super::request::{optional_non_empty, resolve_model, resolve_session_id};
 use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
 
@@ -75,15 +75,36 @@ async fn goal_off_and_clear_remove_stale_goal_state() {
 }
 
 #[test]
-fn validate_and_normalize_model_rejects_empty_values() {
-    let response = validate_and_normalize_model("   ").expect_err("model should be required");
+fn resolve_model_errors_when_neither_request_nor_default_resolve() {
+    let response = resolve_model(Some("   "), None).expect_err("no model should be required error");
     assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
 }
 
 #[test]
-fn validate_and_normalize_model_trims_whitespace() {
-    let model = validate_and_normalize_model("  gpt-5  ").expect("model should be accepted");
+fn resolve_model_trims_whitespace_from_request_model() {
+    let model = resolve_model(Some("  gpt-5  "), None).expect("model should be accepted");
     assert_eq!(model, "gpt-5");
+}
+
+/// #480: an absent/blank request model falls back to the server's resolved
+/// default rather than erroring, as long as a default is available.
+#[test]
+fn resolve_model_falls_back_to_default_when_request_model_absent() {
+    let model = resolve_model(None, Some("gpt-default")).expect("default should be used");
+    assert_eq!(model, "gpt-default");
+}
+
+#[test]
+fn resolve_model_falls_back_to_default_when_request_model_blank() {
+    let model = resolve_model(Some("   "), Some("gpt-default")).expect("default should be used");
+    assert_eq!(model, "gpt-default");
+}
+
+#[test]
+fn resolve_model_prefers_explicit_request_model_over_default() {
+    let model =
+        resolve_model(Some("gpt-explicit"), Some("gpt-default")).expect("request model wins");
+    assert_eq!(model, "gpt-explicit");
 }
 
 #[test]
@@ -299,4 +320,141 @@ fn clear_skill_runtime_state_removes_loaded_skill_markers() {
     assert!(!session
         .metadata
         .contains_key("skill_runtime_last_loaded_skill_id"));
+}
+
+// ---- #480: POST /chat with an omitted `model` end-to-end ----
+
+mod optional_model_e2e {
+    use actix_web::{http::StatusCode, test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    async fn new_state() -> web::Data<AppState> {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        )
+    }
+
+    /// #480: omitting `model` on `POST /chat` falls back to the server's
+    /// resolved default (the same resolution `GET /execute/defaults` and the
+    /// connect bridge use) — the session ends up with the CONFIGURED default
+    /// model, not an error and not an empty model.
+    #[actix_web::test]
+    async fn chat_without_model_uses_resolved_default_model() {
+        let state = new_state().await;
+        {
+            let mut config = state.config.write().await;
+            config.provider = "openai".to_string();
+            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+                model: Some("gpt-configured-default".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({ "message": "hello" }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        let session_id = body["session_id"].as_str().expect("session_id").to_string();
+
+        let session = state
+            .storage
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(session.model, "gpt-configured-default");
+    }
+
+    /// An explicit `model` on `POST /chat` is unchanged by #480 — it is used
+    /// as-is even when a different server default is configured.
+    #[actix_web::test]
+    async fn chat_with_explicit_model_is_unchanged() {
+        let state = new_state().await;
+        {
+            let mut config = state.config.write().await;
+            config.provider = "openai".to_string();
+            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+                model: Some("gpt-configured-default".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "message": "hello",
+                    "model": "gpt-explicit-override"
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        let session_id = body["session_id"].as_str().expect("session_id").to_string();
+
+        let session = state
+            .storage
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(session.model, "gpt-explicit-override");
+    }
+
+    /// No request model AND no server default configured → 400, not a silent
+    /// empty-model session.
+    #[actix_web::test]
+    async fn chat_without_model_and_without_default_errors() {
+        let state = new_state().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({ "message": "hello" }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

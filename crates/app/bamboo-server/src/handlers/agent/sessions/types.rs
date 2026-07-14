@@ -202,6 +202,12 @@ pub struct CreateSessionRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub gold_config: Option<serde_json::Value>,
+    /// Optional workspace path, same semantics as `POST /chat`'s
+    /// `workspace_path` (#480): sets the session's default working directory
+    /// at creation time (connect sets workspace this way — see
+    /// `connect::bridge::create_connect_session`).
+    #[serde(default)]
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -333,6 +339,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             gold_config: None,
+            workspace_path: None,
         };
 
         let debug_str = format!("{:?}", req);

@@ -192,6 +192,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::schedules::list_runs_for_schedule),
         )
         // New separated execute + events endpoints
+        // `/execute/defaults` MUST be registered before the `/execute/{session_id}`
+        // dynamic route below (same precedent as `/sessions/cleanup` vs
+        // `/sessions/{session_id}` above) so a literal `defaults` path segment
+        // isn't swallowed as a session id.
+        .route(
+            "/execute/defaults",
+            web::get().to(agent::execute::defaults_handler),
+        )
         .route(
             "/execute/{session_id}",
             web::post().to(agent::execute::handler),
