@@ -278,11 +278,17 @@ async fn supervise_running_child(
 /// number, mirroring `bamboo_mcp::manager::reconnect::attempt_reconnection`'s
 /// exponential-doubling-with-ceiling.
 fn compute_backoff_ms(policy: &bamboo_domain::mcp_config::ReconnectConfig, attempt: u32) -> u64 {
-    let mut backoff = policy.initial_backoff_ms.max(1);
+    // The first attempt is clamped too: a manifest declaring
+    // initial_backoff_ms > max_backoff_ms (nothing validates against it)
+    // must not exceed the configured ceiling on attempt 1.
+    let mut backoff = policy
+        .initial_backoff_ms
+        .max(1)
+        .min(policy.max_backoff_ms.max(1));
     for _ in 1..attempt {
         backoff = backoff.saturating_mul(2).min(policy.max_backoff_ms);
     }
-    backoff.min(policy.max_backoff_ms.max(backoff))
+    backoff
 }
 
 /// After a crash/unhealthy exit: decide whether to restart, and if so, sleep
@@ -387,5 +393,38 @@ pub(super) async fn run_supervisor(runtime: Arc<ServiceRuntime>) {
             set_state(&runtime, ServiceState::Stopped).await;
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::compute_backoff_ms;
+    use bamboo_domain::mcp_config::ReconnectConfig;
+
+    fn policy(initial: u64, max: u64) -> ReconnectConfig {
+        ReconnectConfig {
+            initial_backoff_ms: initial,
+            max_backoff_ms: max,
+            ..ReconnectConfig::default()
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_and_clamps_to_ceiling() {
+        let p = policy(100, 500);
+        assert_eq!(compute_backoff_ms(&p, 1), 100);
+        assert_eq!(compute_backoff_ms(&p, 2), 200);
+        assert_eq!(compute_backoff_ms(&p, 3), 400);
+        assert_eq!(compute_backoff_ms(&p, 4), 500);
+        assert_eq!(compute_backoff_ms(&p, 10), 500);
+    }
+
+    /// A misconfigured manifest with initial > max must be clamped on the
+    /// FIRST attempt too (review finding on #482).
+    #[test]
+    fn backoff_first_attempt_is_clamped_when_initial_exceeds_max() {
+        let p = policy(10_000, 500);
+        assert_eq!(compute_backoff_ms(&p, 1), 500);
+        assert_eq!(compute_backoff_ms(&p, 2), 500);
     }
 }

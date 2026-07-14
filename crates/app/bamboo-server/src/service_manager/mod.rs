@@ -191,9 +191,6 @@ impl ServiceManager {
         config: ServiceRuntimeConfig,
     ) -> Result<(), ServiceManagerError> {
         let id = config.id.clone();
-        if self.runtimes.contains_key(&id) {
-            return Err(ServiceManagerError::AlreadyRunning(id));
-        }
         let runtime = Arc::new(ServiceRuntime {
             config,
             state: RwLock::new(ServiceState::Starting),
@@ -204,7 +201,22 @@ impl ServiceManager {
             stop_token: CancellationToken::new(),
             supervisor: RwLock::new(None),
         });
-        self.runtimes.insert(id, runtime.clone());
+        // Atomic check-and-insert via the entry API: a plain
+        // contains_key→insert would let two racing callers (boot reconcile —
+        // spawned outside PLUGIN_OP_LOCK — vs a concurrent install of the
+        // same plugin) both pass the check, the second overwriting the
+        // first's runtime and orphaning its supervisor task + child process
+        // beyond stop_service's reach.
+        match self.runtimes.entry(id) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                return Err(ServiceManagerError::AlreadyRunning(
+                    occupied.key().clone(),
+                ));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(runtime.clone());
+            }
+        }
         let handle = tokio::spawn(lifecycle::run_supervisor(runtime.clone()));
         *runtime.supervisor.write().await = Some(handle);
         Ok(())
