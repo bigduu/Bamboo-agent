@@ -779,15 +779,27 @@ pub struct TrustedKey {
     pub public_key: String,
 }
 
-/// Nova's official plugin-signing key, trusted by default so an out-of-the-box
-/// `bamboo plugin install <official nova release url>` needs no
-/// `--allow-unsigned` once nova's release CI signs the bundle.
+/// The official plugin-signing keys trusted by default, so an out-of-the-box
+/// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
+/// for a bundle those repos' release CI signed. One entry per first-party
+/// plugin publisher; each repo commits its public half as
+/// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
+/// (magpie) for cross-checking.
 fn default_trusted_keys() -> Vec<TrustedKey> {
-    vec![TrustedKey {
-        label: "nova (bigduu official)".to_string(),
-        algorithm: "ed25519".to_string(),
-        public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59".to_string(),
-    }]
+    vec![
+        TrustedKey {
+            label: "nova (bigduu official)".to_string(),
+            algorithm: "ed25519".to_string(),
+            public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59"
+                .to_string(),
+        },
+        TrustedKey {
+            label: "magpie (bigduu official)".to_string(),
+            algorithm: "ed25519".to_string(),
+            public_key: "47e971c39cd93adb18cff50e097cb387df49e9c4d33b0ed62f693eabbe7fc66e"
+                .to_string(),
+        },
+    ]
 }
 
 /// Default trusted host+path prefix: the `bigduu` GitHub org/user's own repos
