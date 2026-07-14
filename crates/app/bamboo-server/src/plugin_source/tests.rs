@@ -1256,6 +1256,132 @@ async fn allow_unsigned_bypasses_the_signature_check_but_not_the_checksum_layer(
 }
 
 // ---------------------------------------------------------------------
+// Issue #479 §4 / open question 6: a `provides.services`-declaring manifest
+// is NEVER installable from a URL source unless its bundle is
+// signature-verified — `allow_unsigned`/`--insecure`/
+// `plugin_trust.enforcement: off` are all NOT honoured for this artifact
+// kind (unlike every other capability). See `stage_into`'s services check.
+// ---------------------------------------------------------------------
+
+fn service_manifest_json(id: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": "Service Plugin",
+        "version": "0.1.0",
+        "provides": {
+            "services": [
+                {"id": "svc", "command": "${platform_bin}"}
+            ]
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn services_manifest_with_allow_unsigned_is_refused_even_with_every_other_bypass() {
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = service_manifest_json("svc-plugin");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+    // Deliberately no `.sig` route mounted — this bundle is unsigned.
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    // Every per-layer bypass set AND allow_unverified — proves the refusal
+    // is specific to `provides.services`, not just a re-run of the ordinary
+    // signature-required check (which `allow_unsigned` alone would satisfy).
+    let error = stage_plugin_source(
+        url_input_full(&url, None, true, true, true),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect_err("a services-declaring manifest must refuse an unsigned URL install");
+    assert!(
+        matches!(error, PluginError::UnsignedOrUntrustedSignature(_)),
+        "expected UnsignedOrUntrustedSignature, got {error:?}"
+    );
+    assert!(error.to_string().contains("provides.services"));
+    assert!(!plugins_root.join("svc-plugin").exists());
+}
+
+#[tokio::test]
+async fn services_manifest_with_insecure_aggregate_is_refused() {
+    // Same as above but via the `--insecure` aggregate rather than the
+    // individual `allow_unsigned` flag — the issue calls out BOTH must be
+    // refused for a services-declaring manifest.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = service_manifest_json("svc-plugin-2");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    let error = stage_plugin_source(
+        url_input_insecure(&url, None),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect_err("a services-declaring manifest must refuse `--insecure` too");
+    assert!(matches!(
+        error,
+        PluginError::UnsignedOrUntrustedSignature(_)
+    ));
+}
+
+#[tokio::test]
+async fn services_manifest_with_a_valid_trusted_signature_is_accepted() {
+    // The refusal is specifically about being UNSIGNED — a genuinely
+    // signature-verified services bundle must install normally.
+    let server = wiremock::MockServer::start().await;
+    let manifest_body = service_manifest_json("svc-plugin-signed");
+    let signing_key = test_signing_key(42);
+    let signature = signing_key.sign(manifest_body.as_bytes());
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body.clone()))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/plugin.json.sig"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(hex::encode(signature.to_bytes())),
+        )
+        .mount(&server)
+        .await;
+
+    let trust = PluginTrustConfig {
+        trusted_hosts: Vec::new(),
+        trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
+        enforcement: PluginTrustEnforcement::Strict,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let url = format!("{}/plugin.json", server.uri());
+
+    let staged = stage_plugin_source(
+        url_input_full(&url, None, false, true, false),
+        &plugins_root,
+        &trust,
+    )
+    .await
+    .expect("a signature-verified services manifest must install normally");
+    assert_eq!(staged.manifest.id, "svc-plugin-signed");
+    staged.commit().await;
+}
+
+// ---------------------------------------------------------------------
 // Redirect policy (BLOCKER 1 fix): the host allowlist only vets the FIRST
 // hop's `<host><path>`. Whether it's safe to transparently follow an HTTP
 // redirect to a DIFFERENT host depends on whether the downloaded bytes will

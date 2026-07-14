@@ -133,6 +133,11 @@ pub struct RegisteredCapabilities {
     /// Filenames copied into `bamboo_config::paths::workflows_dir()`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_filenames: Vec<String>,
+    /// Ids started via bamboo-server's `ServiceManager` (issue #479, prereq
+    /// for epic #477). `#[serde(default)]` so an `installed.json` written
+    /// before services existed loads with an empty set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_ids: Vec<String>,
 }
 
 impl RegisteredCapabilities {
@@ -141,6 +146,7 @@ impl RegisteredCapabilities {
             && self.skill_dirs.is_empty()
             && self.preset_ids.is_empty()
             && self.workflow_filenames.is_empty()
+            && self.service_ids.is_empty()
     }
 
     /// The capabilities present in `old` (a prior install's registered set)
@@ -159,6 +165,7 @@ impl RegisteredCapabilities {
             skill_dirs: subtract(&old.skill_dirs, &self.skill_dirs),
             preset_ids: subtract(&old.preset_ids, &self.preset_ids),
             workflow_filenames: subtract(&old.workflow_filenames, &self.workflow_filenames),
+            service_ids: subtract(&old.service_ids, &self.service_ids),
         }
     }
 }
@@ -393,6 +400,7 @@ mod tests {
                 skill_dirs: vec!["hello-world".to_string()],
                 preset_ids: vec!["hello_preset".to_string()],
                 workflow_filenames: vec![],
+                service_ids: vec![],
             },
         }
     }
@@ -543,13 +551,15 @@ mod tests {
             skill_dirs: vec!["skill-a".to_string()],
             preset_ids: vec!["preset-a".to_string(), "preset-b".to_string()],
             workflow_filenames: vec!["wf-a.md".to_string()],
+            service_ids: vec!["svc-a".to_string(), "svc-b".to_string()],
         };
-        // New version drops srv-b and preset-a, keeps the rest, adds srv-c.
+        // New version drops srv-b, preset-a, and svc-b; keeps the rest; adds srv-c.
         let new = RegisteredCapabilities {
             mcp_server_ids: vec!["srv-a".to_string(), "srv-c".to_string()],
             skill_dirs: vec!["skill-a".to_string()],
             preset_ids: vec!["preset-b".to_string()],
             workflow_filenames: vec!["wf-a.md".to_string()],
+            service_ids: vec!["svc-a".to_string()],
         };
 
         let removed = new.removed_since(&old);
@@ -557,6 +567,21 @@ mod tests {
         assert!(removed.skill_dirs.is_empty());
         assert_eq!(removed.preset_ids, vec!["preset-a".to_string()]);
         assert!(removed.workflow_filenames.is_empty());
+        assert_eq!(removed.service_ids, vec!["svc-b".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_exclusive_covers_service_ids_same_as_other_kinds() {
+        // `reconcile_exclusive` is capability-kind-agnostic (plain `Vec<String>`
+        // in/out), but exercise it explicitly against service ids since
+        // that's a new call site (issue #479's install step).
+        let declared = vec!["svc-a".to_string(), "svc-b".to_string()];
+        let existing = vec!["svc-b".to_string(), "other-plugins-svc".to_string()];
+        let owned_previously: Vec<String> = vec![];
+
+        let reconciliation = reconcile_exclusive(&declared, &existing, &owned_previously);
+        assert_eq!(reconciliation.to_register, vec!["svc-a".to_string()]);
+        assert_eq!(reconciliation.foreign_conflicts, vec!["svc-b".to_string()]);
     }
 
     #[tokio::test]

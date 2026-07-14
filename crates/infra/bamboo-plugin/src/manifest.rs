@@ -277,6 +277,197 @@ pub fn platform_bin_path(plugin_dir: &Path, plugin_id: &str, platform: Platform)
         .join(filename)
 }
 
+/// Literal token a [`ServiceManifestEntry::command`] must equal EXACTLY (no
+/// PATH resolution, no ambient binaries — see [`ServiceManifestEntry`]'s
+/// docs and `PluginManifest::validate`). Also used by
+/// [`PluginManifest::uses_platform_bin_token`].
+pub const PLATFORM_BIN_TOKEN: &str = "${platform_bin}";
+
+/// How [`ServiceManager`](../../bamboo_server/service_manager/index.html)
+/// (bamboo-server) should poll a running service for liveness. `ProcessAlive`
+/// is the v1 default (no `target`); `Tcp`/`Http` additionally require a
+/// `target` (validated in [`PluginManifest::validate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCheckKind {
+    ProcessAlive,
+    Tcp,
+    Http,
+}
+
+fn default_health_interval_ms() -> u64 {
+    15_000
+}
+
+fn default_health_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Health-check policy for a [`ServiceManifestEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckSpec {
+    pub kind: HealthCheckKind,
+    /// Required (non-empty) for `Tcp` (`host:port`) / `Http` (a URL);
+    /// unused for `ProcessAlive`. Validated in [`PluginManifest::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default = "default_health_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_health_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for HealthCheckSpec {
+    fn default() -> Self {
+        Self {
+            kind: HealthCheckKind::ProcessAlive,
+            target: None,
+            interval_ms: default_health_interval_ms(),
+            timeout_ms: default_health_timeout_ms(),
+        }
+    }
+}
+
+/// Signal a service's graceful shutdown sends before escalating to a hard
+/// kill. `Term` (SIGTERM on unix; a best-effort equivalent request on
+/// Windows before `TerminateProcess`) is the default; `None` skips the
+/// graceful signal entirely and kills immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownSignal {
+    #[default]
+    Term,
+    None,
+}
+
+fn default_shutdown_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Graceful-shutdown policy for a [`ServiceManifestEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GracefulShutdown {
+    #[serde(default)]
+    pub signal: ShutdownSignal,
+    /// How long to wait after `signal` before escalating to SIGKILL /
+    /// `TerminateProcess`.
+    #[serde(default = "default_shutdown_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for GracefulShutdown {
+    fn default() -> Self {
+        Self {
+            signal: ShutdownSignal::default(),
+            timeout_ms: default_shutdown_timeout_ms(),
+        }
+    }
+}
+
+/// A long-running service this plugin wants supervised (issue #479, prereq
+/// for epic #477 — standalone connectors distributed as plugins). The
+/// highest-trust artifact kind a plugin can declare: unlike an MCP stdio
+/// server (whose `command` is free-form — see [`McpServerManifestEntry`]), a
+/// service's `command` MUST be exactly [`PLATFORM_BIN_TOKEN`] — no PATH
+/// resolution, no ambient binaries. It may only ever execute the plugin's
+/// own verified, sha256-pinned per-platform binary (see
+/// [`PluginArtifact`]'s archive contract) resolved via
+/// [`platform_bin_path`].
+///
+/// `args`/`cwd`/`env` (values only) accept the same `${plugin_dir}`/
+/// `${platform_bin}` substitution as MCP stdio entries — see
+/// [`substitute_tokens`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceManifestEntry {
+    /// Service id — becomes the key bamboo-server's `ServiceManager` and
+    /// provenance (`RegisteredCapabilities::service_ids`) key off.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// MUST validate as exactly [`PLATFORM_BIN_TOKEN`] — see the type docs.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// May contain `${plugin_dir}` / `${platform_bin}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Values (not keys) may contain `${plugin_dir}` / `${platform_bin}`.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub health_check: HealthCheckSpec,
+    /// Reuses [`bamboo_domain::mcp_config::ReconnectConfig`]'s shape
+    /// (enabled/initial_backoff_ms/max_backoff_ms/max_attempts) per the
+    /// issue's design.
+    #[serde(default)]
+    pub restart_policy: bamboo_domain::mcp_config::ReconnectConfig,
+    #[serde(default)]
+    pub graceful_shutdown: GracefulShutdown,
+}
+
+/// A [`ServiceManifestEntry`] with all `${...}` tokens substituted and
+/// `command` resolved to the concrete per-platform binary path — pure, ready
+/// for bamboo-server's `ServiceManager` to spawn. Analogous to
+/// [`McpServerManifestEntry::resolve`]'s `McpServerConfig` output.
+#[derive(Debug, Clone)]
+pub struct ResolvedServiceEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub enabled: bool,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub health_check: HealthCheckSpec,
+    pub restart_policy: bamboo_domain::mcp_config::ReconnectConfig,
+    pub graceful_shutdown: GracefulShutdown,
+}
+
+impl ServiceManifestEntry {
+    /// Resolve this manifest entry against a concrete `plugin_dir`/platform.
+    /// Pure — does not touch disk, does not spawn anything. `command` is
+    /// always [`platform_bin_path`] (never `substitute_tokens`'d from
+    /// `self.command`) — validation already pins `self.command` to exactly
+    /// [`PLATFORM_BIN_TOKEN`], and `platform_bin_path` IS that token's
+    /// resolution.
+    pub fn resolve(
+        &self,
+        plugin_dir: &Path,
+        plugin_id: &str,
+        platform: Platform,
+    ) -> ResolvedServiceEntry {
+        ResolvedServiceEntry {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            enabled: self.enabled,
+            command: platform_bin_path(plugin_dir, plugin_id, platform),
+            args: self
+                .args
+                .iter()
+                .map(|value| substitute_tokens(value, plugin_dir, plugin_id, platform))
+                .collect(),
+            cwd: self.cwd.as_deref().map(|value| {
+                PathBuf::from(substitute_tokens(value, plugin_dir, plugin_id, platform))
+            }),
+            env: self
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        substitute_tokens(value, plugin_dir, plugin_id, platform),
+                    )
+                })
+                .collect(),
+            health_check: self.health_check.clone(),
+            restart_policy: self.restart_policy.clone(),
+            graceful_shutdown: self.graceful_shutdown.clone(),
+        }
+    }
+}
+
 /// Inline prompt preset, mirroring bamboo-server's
 /// `StoredPromptPreset { id, name, description?, content }` (see
 /// `crates/app/bamboo-server/src/handlers/agent/prompt_presets/types.rs`).
@@ -339,6 +530,10 @@ pub struct PluginProvides {
     /// (workflows have no discovery-dir mechanism, unlike skills).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<String>,
+    /// Long-running services this plugin wants supervised — see
+    /// [`ServiceManifestEntry`]. Issue #479 (prereq for epic #477).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceManifestEntry>,
 }
 
 impl PluginProvides {
@@ -347,6 +542,7 @@ impl PluginProvides {
             && self.skills.is_empty()
             && self.prompts.is_empty()
             && self.workflows.is_empty()
+            && self.services.is_empty()
     }
 }
 
@@ -515,6 +711,56 @@ impl PluginManifest {
             }
         }
 
+        let mut seen_service_ids = std::collections::HashSet::new();
+        for entry in &self.provides.services {
+            if entry.id.trim().is_empty() {
+                return Err(PluginError::InvalidManifest(
+                    "service entries must have a non-empty id".to_string(),
+                ));
+            }
+            if !seen_service_ids.insert(entry.id.clone()) {
+                return Err(PluginError::InvalidManifest(format!(
+                    "duplicate service id '{}' in provides.services",
+                    entry.id
+                )));
+            }
+            if entry.command.trim().is_empty() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "service '{}' has an empty command",
+                    entry.id
+                )));
+            }
+            // Services are the highest-trust artifact kind: no PATH
+            // resolution, no ambient binaries. `command` must be EXACTLY the
+            // substitution token, never a literal path or shell command —
+            // stricter than MCP's free-form stdio `command`.
+            if entry.command != PLATFORM_BIN_TOKEN {
+                return Err(PluginError::InvalidManifest(format!(
+                    "service '{}' command must be exactly '{PLATFORM_BIN_TOKEN}' — services may \
+                     only execute the plugin's own verified per-platform binary, never an \
+                     arbitrary command",
+                    entry.id
+                )));
+            }
+            match entry.health_check.kind {
+                HealthCheckKind::Tcp | HealthCheckKind::Http => {
+                    let target_ok = entry
+                        .health_check
+                        .target
+                        .as_deref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false);
+                    if !target_ok {
+                        return Err(PluginError::InvalidManifest(format!(
+                            "service '{}' health_check.kind={:?} requires a non-empty target",
+                            entry.id, entry.health_check.kind
+                        )));
+                    }
+                }
+                HealthCheckKind::ProcessAlive => {}
+            }
+        }
+
         for skill_dir in &self.provides.skills {
             if !is_safe_relative_name(skill_dir) {
                 return Err(PluginError::InvalidManifest(format!(
@@ -640,8 +886,8 @@ impl PluginManifest {
     /// whether this plugin needs a per-platform binary to run. Drives the
     /// artifacts/platform cross-check in [`Self::validate`].
     pub fn uses_platform_bin_token(&self) -> bool {
-        const TOKEN: &str = "${platform_bin}";
-        self.provides.mcp_servers.iter().any(|entry| {
+        const TOKEN: &str = PLATFORM_BIN_TOKEN;
+        let mcp_uses = self.provides.mcp_servers.iter().any(|entry| {
             let McpTransportManifest::Stdio {
                 command,
                 args,
@@ -655,7 +901,22 @@ impl PluginManifest {
                 || args.iter().any(|value| value.contains(TOKEN))
                 || cwd.as_deref().is_some_and(|value| value.contains(TOKEN))
                 || env.values().any(|value| value.contains(TOKEN))
-        })
+        });
+        // Services validate to command == PLATFORM_BIN_TOKEN exactly, but
+        // this helper must stay correct even against a not-yet-validated
+        // manifest (it feeds the artifacts/platform cross-check inside
+        // `validate()` itself), so check `.contains` the same way MCP does
+        // rather than assuming validity.
+        let service_uses = self.provides.services.iter().any(|entry| {
+            entry.command.contains(TOKEN)
+                || entry.args.iter().any(|value| value.contains(TOKEN))
+                || entry
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|value| value.contains(TOKEN))
+                || entry.env.values().any(|value| value.contains(TOKEN))
+        });
+        mcp_uses || service_uses
     }
 }
 
@@ -973,6 +1234,175 @@ mod tests {
         assert!(!is_plausible_semver("latest"));
         assert!(!is_plausible_semver(""));
         assert!(!is_plausible_semver("v1.2.3"));
+    }
+
+    fn service_manifest_json(id: &str, command: &str) -> String {
+        serde_json::json!({
+            "id": "svc-plugin",
+            "name": "Svc Plugin",
+            "version": "1.0.0",
+            "provides": {
+                "services": [
+                    {"id": id, "command": command}
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parses_and_validates_minimal_service_entry() {
+        let json = service_manifest_json("svc", PLATFORM_BIN_TOKEN);
+        let manifest = PluginManifest::parse_str(&json).unwrap();
+        manifest.validate().expect("minimal service entry is valid");
+        let entry = &manifest.provides.services[0];
+        assert!(entry.enabled);
+        assert_eq!(entry.health_check.kind, HealthCheckKind::ProcessAlive);
+        assert_eq!(entry.graceful_shutdown.signal, ShutdownSignal::Term);
+        assert!(manifest.uses_platform_bin_token());
+    }
+
+    #[test]
+    fn rejects_service_command_that_is_not_exactly_the_platform_bin_token() {
+        for bad_command in ["/usr/bin/env", "nova", "${platform_bin} --serve", ""] {
+            let json = service_manifest_json("svc", bad_command);
+            let manifest = PluginManifest::parse_str(&json).unwrap();
+            let error = manifest
+                .validate()
+                .expect_err("non-token service command must be rejected");
+            assert!(matches!(error, PluginError::InvalidManifest(_)));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_service_ids() {
+        let json = serde_json::json!({
+            "id": "svc-plugin",
+            "name": "Svc",
+            "version": "1.0.0",
+            "provides": {
+                "services": [
+                    {"id": "a", "command": PLATFORM_BIN_TOKEN},
+                    {"id": "a", "command": PLATFORM_BIN_TOKEN}
+                ]
+            }
+        })
+        .to_string();
+        let manifest = PluginManifest::parse_str(&json).unwrap();
+        let error = manifest
+            .validate()
+            .expect_err("duplicate service id should fail");
+        assert!(error.to_string().contains("duplicate service id"));
+    }
+
+    #[test]
+    fn rejects_tcp_and_http_health_check_missing_target() {
+        for kind in ["tcp", "http"] {
+            let json = serde_json::json!({
+                "id": "svc-plugin",
+                "name": "Svc",
+                "version": "1.0.0",
+                "provides": {
+                    "services": [
+                        {"id": "a", "command": PLATFORM_BIN_TOKEN, "health_check": {"kind": kind}}
+                    ]
+                }
+            })
+            .to_string();
+            let manifest = PluginManifest::parse_str(&json).unwrap();
+            let error = manifest
+                .validate()
+                .expect_err("tcp/http health_check without a target should fail");
+            assert!(error.to_string().contains("target"));
+        }
+    }
+
+    #[test]
+    fn accepts_tcp_health_check_with_target() {
+        let json = serde_json::json!({
+            "id": "svc-plugin",
+            "name": "Svc",
+            "version": "1.0.0",
+            "provides": {
+                "services": [
+                    {"id": "a", "command": PLATFORM_BIN_TOKEN, "health_check": {"kind": "tcp", "target": "127.0.0.1:9000"}}
+                ]
+            }
+        })
+        .to_string();
+        let manifest = PluginManifest::parse_str(&json).unwrap();
+        manifest
+            .validate()
+            .expect("tcp health_check with target is valid");
+    }
+
+    #[test]
+    fn services_missing_artifact_for_a_supported_platform_is_rejected() {
+        // Mirrors `rejects_platform_bin_plugin_missing_an_artifact_for_a_supported_platform`
+        // but via `provides.services` instead of `provides.mcp_servers` — the
+        // artifacts/platform cross-check must cover services too (issue #479).
+        let json = serde_json::json!({
+            "id": "svc-plugin",
+            "name": "Svc",
+            "version": "1.0.0",
+            "provides": {
+                "services": [
+                    {"id": "a", "command": PLATFORM_BIN_TOKEN}
+                ]
+            },
+            "artifacts": {
+                "macos": {"url": "https://example.com/x-macos.tar.gz", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "windows": {"url": "https://example.com/x-windows.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+            }
+        })
+        .to_string();
+        let manifest = PluginManifest::parse_str(&json).unwrap();
+        let error = manifest
+            .validate()
+            .expect_err("missing linux artifact for a service-only plugin should fail");
+        assert!(error.to_string().contains("linux"));
+    }
+
+    #[test]
+    fn resolve_service_entry_substitutes_tokens_and_pins_command_to_platform_bin() {
+        let json = serde_json::json!({
+            "id": "svc-plugin",
+            "name": "Svc",
+            "version": "1.0.0",
+            "provides": {
+                "services": [
+                    {
+                        "id": "a",
+                        "command": PLATFORM_BIN_TOKEN,
+                        "args": ["--config", "${plugin_dir}/data"],
+                        "cwd": "${plugin_dir}",
+                        "env": {"HOME_DIR": "${plugin_dir}/home"}
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let manifest = PluginManifest::parse_str(&json).unwrap();
+        manifest.validate().expect("valid");
+        let entry = &manifest.provides.services[0];
+        let plugin_dir = Path::new("/home/user/.bamboo/plugins/svc-plugin");
+        let resolved = entry.resolve(plugin_dir, &manifest.id, Platform::Linux);
+        assert_eq!(
+            resolved.command,
+            PathBuf::from("/home/user/.bamboo/plugins/svc-plugin/bin/linux/svc-plugin")
+        );
+        assert_eq!(
+            resolved.args,
+            vec![
+                "--config".to_string(),
+                "/home/user/.bamboo/plugins/svc-plugin/data".to_string()
+            ]
+        );
+        assert_eq!(resolved.cwd, Some(plugin_dir.to_path_buf()));
+        assert_eq!(
+            resolved.env.get("HOME_DIR").map(String::as_str),
+            Some("/home/user/.bamboo/plugins/svc-plugin/home")
+        );
     }
 
     #[test]

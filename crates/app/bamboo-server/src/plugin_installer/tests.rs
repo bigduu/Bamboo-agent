@@ -48,6 +48,32 @@ fn mcp_manifest_json(id: &str, version: &str, mcp_ids: &[&str]) -> String {
     .to_string()
 }
 
+/// `command: "${platform_bin}"` resolves to `<plugin_dir>/bin/<platform>/<id>`,
+/// which none of these tests ever create on disk — `ServiceManager::start_service`
+/// therefore fails fast (`ENOENT`) exactly like `NONEXISTENT_COMMAND` does for
+/// MCP above, exercising the same "best-effort start, ownership still
+/// recorded" contract without spawning a real long-running process.
+fn service_manifest_json(id: &str, version: &str, service_ids: &[&str]) -> String {
+    let services: Vec<serde_json::Value> = service_ids
+        .iter()
+        .map(|service_id| {
+            serde_json::json!({
+                "id": service_id,
+                "command": "${platform_bin}"
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": id,
+        "name": "Test Service Plugin",
+        "version": version,
+        "provides": {
+            "services": services,
+        }
+    })
+    .to_string()
+}
+
 fn hello_plugin_example_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../infra/bamboo-plugin/examples/hello-plugin")
 }
@@ -724,4 +750,343 @@ async fn install_recovers_from_a_crashed_installing_leftover() {
     assert_eq!(listed[0].status, PluginInstallStatus::Installed);
     let config = state.config.read().await;
     assert!(config.mcp.servers.iter().any(|s| s.id == "leftover-mcp"));
+}
+
+// ---------------------------------------------------------------------
+// Services (issue #479, prereq for epic #477). Same shapes as the MCP
+// section above: REFUSE-on-foreign-conflict, best-effort start, upgrade
+// drop-diff — but reconciled against `installed.json` (via
+// `existing_service_ids`) rather than `config.json`, since there is no
+// single shared document for services. See `register_services`'s doc
+// comment.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_registers_service_with_provenance_even_when_the_binary_is_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    let plugin_dir = root.path().join("plugins").join("svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = service_manifest_json("svc-plugin", "1.0.0", &["svc"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let entry = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install with a service entry (binary missing) must still succeed");
+
+    // Ownership recorded regardless of the (missing-binary) start outcome —
+    // matches `register_mcp`'s best-effort contract.
+    assert_eq!(entry.registered.service_ids, vec!["svc".to_string()]);
+
+    let listed = installer.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].registered.service_ids, vec!["svc".to_string()]);
+}
+
+#[tokio::test]
+async fn foreign_service_conflict_refuses_install_and_does_not_touch_the_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    // Seed provenance for a DIFFERENT, already-installed plugin that owns
+    // service id "shared-svc" (the services analog of "config.json already
+    // has this mcp server id" — there is no shared config document for
+    // services, so ownership lives entirely in `installed.json`).
+    let installed_json = root
+        .path()
+        .join("bamboo-home")
+        .join("plugins")
+        .join("installed.json");
+    let mut store = InstalledPlugins::default();
+    store.add(InstalledPlugin {
+        id: "owner-plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: PathBuf::from("/tmp/owner"),
+        },
+        plugin_dir: root.path().join("plugins").join("owner-plugin"),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities {
+            service_ids: vec!["shared-svc".to_string()],
+            ..Default::default()
+        },
+    });
+    store.save(&installed_json).await.unwrap();
+
+    let plugin_dir = root.path().join("plugins").join("conflicting-svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = service_manifest_json("conflicting-svc-plugin", "1.0.0", &["shared-svc"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let error = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect_err("a foreign service id collision must refuse the install");
+    assert!(matches!(
+        error,
+        PluginError::Conflict {
+            kind: "service",
+            ..
+        }
+    ));
+
+    // The original owner's provenance is untouched; the conflicting install
+    // never got recorded.
+    let listed = installer.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "owner-plugin");
+    assert_eq!(
+        listed[0].registered.service_ids,
+        vec!["shared-svc".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn upgrade_deregisters_service_dropped_by_the_new_version_and_frees_the_id() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    let plugin_dir = root.path().join("plugins").join("multi-svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+    let v1_json = service_manifest_json("multi-svc-plugin", "1.0.0", &["alpha", "beta"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &v1_json)
+        .await
+        .unwrap();
+    let v1_manifest = PluginManifest::parse_str(&v1_json).unwrap();
+
+    let v1_entry = installer
+        .install(
+            &v1_manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install v1");
+    assert_eq!(
+        v1_entry.registered.service_ids,
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+
+    // "Upgrade" to v2, which only declares alpha.
+    let v2_json = service_manifest_json("multi-svc-plugin", "2.0.0", &["alpha"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &v2_json)
+        .await
+        .unwrap();
+    let v2_manifest = PluginManifest::parse_str(&v2_json).unwrap();
+
+    let v2_entry = installer
+        .install(
+            &v2_manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::Upgrade,
+            Utc::now(),
+        )
+        .await
+        .expect("upgrade to v2");
+    assert_eq!(v2_entry.registered.service_ids, vec!["alpha".to_string()]);
+
+    // `beta` was dropped and de-registered — a DIFFERENT plugin can now
+    // claim that id without a foreign conflict, proving it was actually
+    // freed (not just absent from THIS plugin's own provenance row).
+    let other_plugin_dir = root.path().join("plugins").join("other-plugin");
+    tokio::fs::create_dir_all(&other_plugin_dir).await.unwrap();
+    let other_json = service_manifest_json("other-plugin", "1.0.0", &["beta"]);
+    tokio::fs::write(other_plugin_dir.join("plugin.json"), &other_json)
+        .await
+        .unwrap();
+    let other_manifest = PluginManifest::parse_str(&other_json).unwrap();
+    let other_entry = installer
+        .install(
+            &other_manifest,
+            &other_plugin_dir,
+            PluginSource::LocalDir {
+                path: other_plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("beta must be free for a different plugin to claim after the upgrade dropped it");
+    assert_eq!(other_entry.registered.service_ids, vec!["beta".to_string()]);
+}
+
+// ---------------------------------------------------------------------
+// Same-id upgrade ordering (issue #479): `stop_services_for_upgrade` /
+// `restart_services_after_failed_upgrade` are the seam the HTTP
+// `update_plugin` handler uses to stop a plugin's services BEFORE
+// `stage_plugin_source` swaps `plugin_dir`, and to restart them if the
+// upgrade subsequently fails and rolls back to the old bundle. Unit-tested
+// directly here (rather than only through the full HTTP+staging pipeline)
+// so the ordering contract is pinned precisely.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn stop_services_for_upgrade_stops_the_running_service_and_returns_its_id() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    let plugin_dir = root.path().join("plugins").join("svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = service_manifest_json("svc-plugin", "1.0.0", &["svc"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+    installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install");
+    assert!(
+        state.service_manager.is_running("svc"),
+        "start_service must have registered a runtime even though the binary is missing \
+         (best-effort start, matches mcp)"
+    );
+
+    let stopped = installer.stop_services_for_upgrade("svc-plugin").await;
+    assert_eq!(stopped, vec!["svc".to_string()]);
+    assert!(
+        !state.service_manager.is_running("svc"),
+        "stop_services_for_upgrade must have actually stopped it before returning"
+    );
+}
+
+#[tokio::test]
+async fn stop_services_for_upgrade_on_a_plugin_with_no_services_is_a_harmless_noop() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let stopped = installer.stop_services_for_upgrade("never-installed").await;
+    assert!(stopped.is_empty());
+}
+
+#[tokio::test]
+async fn restart_services_after_failed_upgrade_restarts_from_the_still_installed_manifest() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    let plugin_dir = root.path().join("plugins").join("svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = service_manifest_json("svc-plugin", "1.0.0", &["svc"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+    installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install");
+
+    // Simulate the handler's pre-stage stop (see `update_plugin`).
+    let stopped = installer.stop_services_for_upgrade("svc-plugin").await;
+    assert_eq!(stopped, vec!["svc".to_string()]);
+    assert!(!state.service_manager.is_running("svc"));
+
+    // Simulate a FAILED upgrade whose `StagedPlugin::rollback()` restored
+    // `plugin_dir` to the pre-upgrade bundle (here: nothing ever changed
+    // `plugin_dir`'s on-disk `plugin.json`, which is exactly what a
+    // successful rollback leaves behind).
+    installer
+        .restart_services_after_failed_upgrade("svc-plugin", &stopped)
+        .await;
+    assert!(
+        state.service_manager.is_running("svc"),
+        "the previously-stopped service must be running again after a failed upgrade"
+    );
+}
+
+#[tokio::test]
+async fn restart_services_after_failed_upgrade_skips_a_service_the_rolled_back_manifest_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    let plugin_dir = root.path().join("plugins").join("svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    // Declare "svc" as DISABLED from the start.
+    let manifest_json = serde_json::json!({
+        "id": "svc-plugin",
+        "name": "Svc",
+        "version": "1.0.0",
+        "provides": {
+            "services": [{"id": "svc", "command": "${platform_bin}", "enabled": false}]
+        }
+    })
+    .to_string();
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+    installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install");
+    assert!(!state.service_manager.is_running("svc"));
+
+    // Nothing was running to begin with, so `stopped` is empty here — but
+    // exercise `restart_services_after_failed_upgrade` with a fabricated
+    // non-empty `stopped` list to prove it still respects `enabled: false`
+    // in the manifest it reads back, rather than blindly restarting
+    // whatever it's told.
+    installer
+        .restart_services_after_failed_upgrade("svc-plugin", &["svc".to_string()])
+        .await;
+    assert!(
+        !state.service_manager.is_running("svc"),
+        "a disabled service must never be started by the restart-after-rollback path"
+    );
 }
