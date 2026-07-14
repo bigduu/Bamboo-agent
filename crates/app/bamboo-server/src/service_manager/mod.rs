@@ -209,9 +209,7 @@ impl ServiceManager {
         // beyond stop_service's reach.
         match self.runtimes.entry(id) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                return Err(ServiceManagerError::AlreadyRunning(
-                    occupied.key().clone(),
-                ));
+                return Err(ServiceManagerError::AlreadyRunning(occupied.key().clone()));
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 vacant.insert(runtime.clone());
