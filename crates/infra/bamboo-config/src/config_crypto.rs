@@ -502,10 +502,11 @@ impl Config {
 
     // ── bamboo-connect platform tokens (Telegram bot token, etc.) ───────
 
-    /// Decrypt every configured platform's token into in-memory plaintext
-    /// after loading config. Mirrors [`Config::hydrate_notifications_from_encrypted`]:
-    /// `token` is `#[serde(skip_serializing)]` (never on disk), so this is the
-    /// only way it gets populated after a fresh load.
+    /// Decrypt every configured platform's token (and Feishu `app_secret`)
+    /// into in-memory plaintext after loading config. Mirrors
+    /// [`Config::hydrate_notifications_from_encrypted`]: both fields are
+    /// `#[serde(skip_serializing)]` (never on disk), so this is the only way
+    /// they get populated after a fresh load.
     pub fn hydrate_connect_platform_tokens_from_encrypted(&mut self) {
         for platform in &mut self.connect.platforms {
             let has_plaintext = platform
@@ -514,24 +515,42 @@ impl Config {
                 .map(str::trim)
                 .map(|value| !value.is_empty())
                 .unwrap_or(false);
-            if has_plaintext {
-                continue;
+            if !has_plaintext {
+                if let Some(encrypted) = platform.token_encrypted.as_deref() {
+                    match crate::encryption::decrypt(encrypted) {
+                        Ok(value) => platform.token = Some(value),
+                        Err(e) => tracing::warn!(
+                            "Failed to decrypt connect platform '{}' token: {}",
+                            platform.platform_type,
+                            e
+                        ),
+                    }
+                }
             }
-            if let Some(encrypted) = platform.token_encrypted.as_deref() {
-                match crate::encryption::decrypt(encrypted) {
-                    Ok(value) => platform.token = Some(value),
-                    Err(e) => tracing::warn!(
-                        "Failed to decrypt connect platform '{}' token: {}",
-                        platform.platform_type,
-                        e
-                    ),
+
+            let has_app_secret_plaintext = platform
+                .app_secret
+                .as_deref()
+                .map(str::trim)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if !has_app_secret_plaintext {
+                if let Some(encrypted) = platform.app_secret_encrypted.as_deref() {
+                    match crate::encryption::decrypt(encrypted) {
+                        Ok(value) => platform.app_secret = Some(value),
+                        Err(e) => tracing::warn!(
+                            "Failed to decrypt connect platform '{}' app_secret: {}",
+                            platform.platform_type,
+                            e
+                        ),
+                    }
                 }
             }
         }
     }
 
-    /// Re-encrypt every configured platform's token from current in-memory
-    /// plaintext before persisting to disk. Mirrors
+    /// Re-encrypt every configured platform's token (and Feishu `app_secret`)
+    /// from current in-memory plaintext before persisting to disk. Mirrors
     /// [`Config::refresh_notifications_encrypted`]: an empty/absent plaintext
     /// leaves any existing ciphertext intact (a redacted round-trip where the
     /// client never re-sent the secret keeps it).
@@ -543,6 +562,17 @@ impl Config {
                     Some(crate::encryption::encrypt(token).with_context(|| {
                         format!(
                             "Failed to encrypt connect platform '{}' token",
+                            platform.platform_type
+                        )
+                    })?);
+            }
+
+            let app_secret = platform.app_secret.as_deref().unwrap_or("").trim();
+            if !app_secret.is_empty() {
+                platform.app_secret_encrypted =
+                    Some(crate::encryption::encrypt(app_secret).with_context(|| {
+                        format!(
+                            "Failed to encrypt connect platform '{}' app_secret",
                             platform.platform_type
                         )
                     })?);

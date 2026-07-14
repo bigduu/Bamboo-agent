@@ -216,8 +216,8 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
         }
     }
 
-    // Never allow clients to set encrypted bamboo-connect platform tokens
-    // directly.
+    // Never allow clients to set encrypted bamboo-connect platform secrets
+    // (token, Feishu app_secret) directly.
     if let Some(platforms) = patch_obj
         .get_mut("connect")
         .and_then(|c| c.get_mut("platforms"))
@@ -226,6 +226,7 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
         for platform in platforms.iter_mut() {
             if let Some(obj) = platform.as_object_mut() {
                 obj.remove("token_encrypted");
+                obj.remove("app_secret_encrypted");
             }
         }
     }
@@ -455,14 +456,16 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
         // (shouldn't happen with a well-behaved client, which always echoes
         // the whole object back) can't be checked and falls back to the
         // pre-existing positional-only behavior.
-        let existing_plain = existing.and_then(|p| {
-            let type_matches = match obj.get("type").and_then(|v| v.as_str()) {
-                Some(patch_type) => patch_type == p.platform_type,
-                None => true,
-            };
-            type_matches.then_some(p).and_then(|p| p.token.as_deref())
+        let guarded = existing.filter(|p| match obj.get("type").and_then(|v| v.as_str()) {
+            Some(patch_type) => patch_type == p.platform_type,
+            None => true,
         });
-        preserve_masked_secret_field(obj, "token", existing_plain);
+        preserve_masked_secret_field(obj, "token", guarded.and_then(|p| p.token.as_deref()));
+        preserve_masked_secret_field(
+            obj,
+            "app_secret",
+            guarded.and_then(|p| p.app_secret.as_deref()),
+        );
     }
 }
 
@@ -669,6 +672,10 @@ mod tests {
             platform_type: platform_type.to_string(),
             token: Some(token.to_string()),
             token_encrypted: None,
+            app_id: None,
+            app_secret: None,
+            app_secret_encrypted: None,
+            domain: None,
             allow_from: Vec::new(),
             admin_from: Vec::new(),
         }
@@ -692,6 +699,33 @@ mod tests {
             .unwrap()
             .contains_key("token_encrypted"));
         assert_eq!(platform["token"], "new-token");
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_connect_platform_app_secret_encrypted_field() {
+        let mut patch = json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_x",
+                        "app_secret": "new-secret",
+                        "app_secret_encrypted": "client-supplied-cipher",
+                        "domain": "feishu"
+                    }
+                ]
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        let platform = &obj["connect"]["platforms"][0];
+        assert!(!platform
+            .as_object()
+            .unwrap()
+            .contains_key("app_secret_encrypted"));
+        assert_eq!(platform["app_secret"], "new-secret");
+        assert_eq!(platform["app_id"], "cli_x");
     }
 
     #[test]
@@ -847,6 +881,97 @@ mod tests {
         assert_eq!(
             patch["connect"]["platforms"][0]["token"],
             "existing-bot-token"
+        );
+    }
+
+    fn feishu_platform(app_secret: &str) -> crate::ConnectPlatformConfig {
+        crate::ConnectPlatformConfig {
+            platform_type: "feishu".to_string(),
+            token: None,
+            token_encrypted: None,
+            app_id: Some("cli_x".to_string()),
+            app_secret: Some(app_secret.to_string()),
+            app_secret_encrypted: None,
+            domain: Some("lark".to_string()),
+            allow_from: Vec::new(),
+            admin_from: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preserve_masked_connect_secrets_keeps_existing_app_secret_by_position() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![feishu_platform("existing-app-secret")];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"feishu","app_id":"cli_x","app_secret":"****...****","domain":"lark"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["app_secret"],
+            "existing-app-secret"
+        );
+        // app_id/domain are untouched by the secret-preserve pass.
+        assert_eq!(patch["connect"]["platforms"][0]["app_id"], "cli_x");
+        assert_eq!(patch["connect"]["platforms"][0]["domain"], "lark");
+    }
+
+    #[test]
+    fn preserve_masked_connect_secrets_drops_app_secret_mask_when_nothing_configured() {
+        let current = Config::default();
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"feishu","app_secret":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert!(!patch["connect"]["platforms"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("app_secret"));
+    }
+
+    #[test]
+    fn preserve_masked_connect_secrets_leaves_real_app_secret_untouched() {
+        let current = Config::default();
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"feishu","app_secret":"feishu-real-new-value"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["app_secret"],
+            "feishu-real-new-value"
+        );
+    }
+
+    /// The #454 type-at-index guard applies to app_secret exactly as it does
+    /// to token: a reordered array must not resolve a masked app_secret
+    /// against whatever platform now sits at that index.
+    #[test]
+    fn preserve_masked_connect_secrets_drops_app_secret_mask_when_type_at_index_disagrees() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![feishu_platform("feishu-secret")];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"telegram","app_secret":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert!(
+            !patch["connect"]["platforms"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("app_secret"),
+            "masked app_secret must not be resolved against a different platform's secret"
         );
     }
 }
