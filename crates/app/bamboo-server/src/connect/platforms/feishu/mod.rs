@@ -455,6 +455,12 @@ fn strip_mentions(text: &str, mentions: &[EventMention], bot_open_id: Option<&st
 /// it @-mentions this bot (found in `mentions[].id.open_id`) or is an
 /// `@所有人`/`@_all` broadcast (`mentions` is empty for those — a literal
 /// substring check on the raw text is the documented way to detect it).
+/// KNOWN LIMITATION: the wire format makes a real `@所有人` mention
+/// indistinguishable from a member literally typing the characters `@_all`
+/// (both arrive as `{"text":"…@_all…"}` with zero mention entries), so the
+/// latter also passes this gate. Accepted: it only widens "processed vs
+/// ignored", never authorization — `allow_from` still gates the sender's
+/// identity downstream in the bridge.
 /// `bot_open_id: None` (the startup `bot/v3/info` fetch failed) means every
 /// group message is treated as unmentioned and dropped.
 fn passes_group_gate(

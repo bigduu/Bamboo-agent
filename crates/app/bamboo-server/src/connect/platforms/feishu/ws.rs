@@ -313,6 +313,17 @@ impl Reassembler {
                 received: std::collections::HashMap::new(),
                 first_seen: now,
             });
+        // Out-of-range `seq` must not count toward completion, or a malformed
+        // frame could inflate `received.len()` past `total` and "complete"
+        // the group with a truncated payload (the assembly loop below only
+        // reads indices 0..total).
+        if seq >= entry.total {
+            tracing::warn!(
+                "connect: feishu ws frame with out-of-range seq {seq} (sum {}); dropping part",
+                entry.total
+            );
+            return None;
+        }
         entry.received.insert(seq, payload);
 
         if entry.received.len() >= entry.total {
@@ -337,10 +348,18 @@ impl Reassembler {
 // Reconnect backoff
 // ---------------------------------------------------------------------
 
+/// Floor on the server-supplied fixed reconnect interval: a bootstrap
+/// response carrying `ReconnectInterval: 0` (buggy endpoint, or a tampered
+/// bootstrap) must not turn the reconnect loop into a tight
+/// bootstrap→connect→fail busy loop. Same defensive posture as the 1s
+/// ping-interval floor in `run_once`.
+const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// `attempt` is the count of consecutive failed reconnect tries SINCE the
 /// last successful connection (0 = the first try right after a disconnect).
 /// Per spec: the first attempt waits a one-time random jitter in
-/// `[0, nonce]`; every attempt after that waits the fixed `interval`.
+/// `[0, nonce]`; every attempt after that waits the fixed `interval`
+/// (floored to [`MIN_RECONNECT_INTERVAL`]).
 pub(super) fn reconnect_delay(attempt: u32, nonce: Duration, interval: Duration) -> Duration {
     if attempt == 0 {
         let millis = nonce.as_millis() as u64;
@@ -351,7 +370,7 @@ pub(super) fn reconnect_delay(attempt: u32, nonce: Duration, interval: Duration)
             Duration::from_millis(rand::rng().random_range(0..=millis))
         }
     } else {
-        interval
+        interval.max(MIN_RECONNECT_INTERVAL)
     }
 }
 
@@ -862,6 +881,40 @@ mod tests {
         let interval = Duration::from_secs(120);
         assert_eq!(reconnect_delay(1, nonce, interval), interval);
         assert_eq!(reconnect_delay(5, nonce, interval), interval);
+    }
+
+    /// A server-supplied `ReconnectInterval: 0` (or any sub-floor value) must
+    /// not produce a tight reconnect busy loop.
+    #[test]
+    fn reconnect_delay_floors_a_zero_server_interval() {
+        let nonce = Duration::from_secs(30);
+        assert_eq!(
+            reconnect_delay(1, nonce, Duration::ZERO),
+            MIN_RECONNECT_INTERVAL
+        );
+        assert_eq!(
+            reconnect_delay(3, nonce, Duration::from_millis(10)),
+            MIN_RECONNECT_INTERVAL
+        );
+    }
+
+    /// A malformed/adversarial part with `seq >= sum` must be dropped, not
+    /// counted toward completion — otherwise the group could "complete" with
+    /// a truncated payload.
+    #[test]
+    fn reassembler_drops_out_of_range_seq_instead_of_completing_truncated() {
+        let mut reassembler = Reassembler::new(Duration::from_secs(5));
+        let now = Instant::now();
+
+        let part0 = data_frame("msg-oob", Some(2), Some(0), b"hello ");
+        let bogus = data_frame("msg-oob", Some(2), Some(7), b"evil");
+        assert_eq!(reassembler.feed(&part0, now), None);
+        // Out-of-range part: dropped, group must still be incomplete.
+        assert_eq!(reassembler.feed(&bogus, now), None);
+
+        // The real second part completes the group with the full payload.
+        let part1 = data_frame("msg-oob", Some(2), Some(1), b"world");
+        assert_eq!(reassembler.feed(&part1, now), Some(b"hello world".to_vec()));
     }
 
     #[test]

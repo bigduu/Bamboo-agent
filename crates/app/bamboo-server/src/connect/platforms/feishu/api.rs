@@ -11,13 +11,24 @@ use tokio::time::Instant;
 
 use super::super::super::platform::{PlatformError, PlatformResult};
 
+/// Hard per-request deadline for every Feishu REST call. This matters more
+/// here than in `telegram.rs`: `TokenCache::get` holds its mutex across the
+/// token-refresh round-trip, so ONE hung response without a timeout would
+/// serialize (wedge) every outbound call for the adapter's lifetime.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One shared `reqwest::Client` for every Feishu REST call (bootstrap POST
 /// included — `ws.rs` reuses this too). Mirrors `telegram.rs`'s
 /// `http_client()` — the workspace's pinned (native-tls) `reqwest`, never a
-/// second connector.
+/// second connector — plus a client-wide [`HTTP_REQUEST_TIMEOUT`].
 pub(super) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Formats a `reqwest::Error` for logs/errors WITHOUT `app_secret` or the
@@ -49,6 +60,11 @@ const RATE_LIMIT_HEADER: &str = "x-ogw-ratelimit-reset";
 /// documented limits reset in low single-digit seconds, so this is generous.
 const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(1);
+/// Cap on a single server-instructed rate-limit wait. The reset header is
+/// server-supplied input — without a cap, one bogus/hostile `…-reset: 999999`
+/// makes a send block for an effectively unbounded wall-clock time. Feishu's
+/// documented limits reset within seconds; a minute is already extreme.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 struct TokenState {
@@ -205,7 +221,8 @@ struct SendMessageData {
 
 /// `x-ogw-ratelimit-reset` is documented as the number of seconds until the
 /// limit resets. Parsed defensively — an absent/unparseable header falls
-/// back to [`DEFAULT_RATE_LIMIT_WAIT`] rather than failing the send.
+/// back to [`DEFAULT_RATE_LIMIT_WAIT`], and the server-supplied value is
+/// clamped to [`MAX_RATE_LIMIT_WAIT`] so it can't stall a send indefinitely.
 fn rate_limit_wait_from_headers(headers: &reqwest::header::HeaderMap) -> Duration {
     headers
         .get(RATE_LIMIT_HEADER)
@@ -213,6 +230,7 @@ fn rate_limit_wait_from_headers(headers: &reqwest::header::HeaderMap) -> Duratio
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_RATE_LIMIT_WAIT)
+        .min(MAX_RATE_LIMIT_WAIT)
 }
 
 /// `POST /open-apis/im/v1/messages?receive_id_type=chat_id`. `content` is
@@ -415,4 +433,30 @@ pub(super) async fn fetch_bot_open_id(
         .data
         .and_then(|d| d.open_id)
         .ok_or_else(|| PlatformError::other("bot/v3/info response missing open_id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_wait_clamps_a_huge_server_supplied_reset() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(RATE_LIMIT_HEADER, "999999".parse().unwrap());
+        assert_eq!(rate_limit_wait_from_headers(&headers), MAX_RATE_LIMIT_WAIT);
+    }
+
+    #[test]
+    fn rate_limit_wait_uses_sane_server_values_and_default_when_absent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(RATE_LIMIT_HEADER, "3".parse().unwrap());
+        assert_eq!(
+            rate_limit_wait_from_headers(&headers),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            rate_limit_wait_from_headers(&reqwest::header::HeaderMap::new()),
+            DEFAULT_RATE_LIMIT_WAIT
+        );
+    }
 }
