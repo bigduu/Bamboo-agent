@@ -1354,6 +1354,20 @@ impl Storage for SessionStoreV2 {
             .open(&path)
             .await?;
         file.write_all(line.as_bytes()).await?;
+        // `flush` is LOAD-BEARING, not cosmetic (issues #378/#486):
+        // `tokio::fs::File::write_all` only copies the bytes into the File's
+        // internal buffer and schedules the actual OS write on the blocking
+        // thread pool — it does NOT wait for it. Dropping the File does not
+        // wait either (the write still happens "eventually" on the pool, and
+        // any error is silently discarded). So without this flush a caller
+        // that appends and then promptly reads the file back — exactly what
+        // `append_token_usage_record_writes_jsonl_in_session_dir` does — can
+        // observe the file BEFORE a still-in-flight append lands, which on a
+        // loaded CI runner (saturated blocking pool) manifested as the
+        // one-off "1 line instead of 2 / lost second append" failure.
+        // `flush().await` drives the pending background write to completion
+        // (and surfaces its error) before we return.
+        file.flush().await?;
         Ok(())
     }
 }
