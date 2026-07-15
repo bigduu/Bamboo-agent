@@ -658,18 +658,25 @@ impl AppState {
         // something — mirrors `mcp_manager`/`connect_manager`'s
         // always-alive lifecycle.
         let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
-        {
-            // Backgrounded (mirrors `init_mcp_manager`'s background MCP
-            // bootstrap): a service that `installed.json` says should be
-            // running but isn't (the previous `bamboo serve` process, if
-            // any, died with everything it supervised) is started fresh.
+        // Backgrounded (mirrors `init_mcp_manager`'s background MCP
+        // bootstrap): a service that `installed.json` says should be
+        // running but isn't (the previous `bamboo serve` process, if
+        // any, died with everything it supervised) is started fresh.
+        //
+        // The `JoinHandle` is kept (not discarded) purely so tests can
+        // deterministically wait it out via
+        // `AppState::wait_for_boot_reconcile_services` instead of racing
+        // this unsynchronized pass — see that method's doc comment and issue
+        // #486. Production code never awaits it; server startup is never
+        // blocked on plugin service spawns.
+        let boot_reconcile_services_handle = {
             let service_manager = service_manager.clone();
             let app_data_dir = bamboo_home_dir.clone();
             tokio::spawn(async move {
                 crate::plugin_installer::boot_reconcile_services(&app_data_dir, &service_manager)
                     .await;
-            });
-        }
+            })
+        };
 
         Ok(Self {
             app_data_dir: bamboo_home_dir,
@@ -701,6 +708,9 @@ impl AppState {
             skill_manager,
             mcp_manager,
             service_manager,
+            boot_reconcile_services_handle: tokio::sync::Mutex::new(Some(
+                boot_reconcile_services_handle,
+            )),
             metrics_service,
             agent_runners,
             session_event_senders,

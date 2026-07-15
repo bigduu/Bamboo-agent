@@ -1302,15 +1302,37 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_proxy_calls_overlap_at_the_orchestrator() {
-        use std::time::Instant;
-
-        // A host-bound backend where each call takes 200ms. Serial handling of N
-        // calls would take N*200ms; concurrent handling overlaps to ~200ms.
-        struct SlowMcp;
+        // Prove overlap DIRECTLY (issue #486) instead of inferring it from
+        // wall-clock duration: earlier this asserted `elapsed < N ms`
+        // against a `sleep(200ms)` backend, which raced CI load — a loaded
+        // runner can push even genuinely-concurrent calls past any fixed
+        // real-ms bound, producing a one-off failure with no code
+        // regression. (A `tokio::time::pause()` virtual-clock variant was
+        // tried and discarded: it doesn't compose safely with this test's
+        // REAL TCP/WebSocket IO — auto-advance raced the broker
+        // connect/handshake against the proxy's timeout-and-reconnect path,
+        // spuriously triggering reconnect/backoff and making the measured
+        // "elapsed" worse, not more deterministic.)
+        //
+        // Instead, `SlowMcp` tracks its own instantaneous concurrency: bump
+        // `in_flight` before the (still real, still 200ms — exercising the
+        // exact same overlap window) sleep, record the high-water mark via
+        // `fetch_max`, then decrement after. Serial handling could never
+        // observe more than 1 in flight at a time; genuine overlap of the 4
+        // spawned calls must observe all 4 at some point. Zero dependency on
+        // how fast or slow the host happens to be.
+        struct SlowMcp {
+            in_flight: AtomicU32,
+            max_in_flight: AtomicU32,
+        }
         #[async_trait]
         impl ToolExecutor for SlowMcp {
             async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+                let now_in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight
+                    .fetch_max(now_in_flight, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(200)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 Ok(ToolResult {
                     success: true,
                     result: format!("done {}", call.function.arguments),
@@ -1336,6 +1358,10 @@ mod tests {
                 }]
             }
         }
+        let slow_mcp = Arc::new(SlowMcp {
+            in_flight: AtomicU32::new(0),
+            max_in_flight: AtomicU32::new(0),
+        });
 
         let dir = tempfile::tempdir().unwrap();
         let core = Arc::new(BrokerCore::new(dir.path()));
@@ -1348,6 +1374,7 @@ mod tests {
         let endpoint = format!("ws://{addr}");
 
         let ep = endpoint.clone();
+        let mcp_for_server = slow_mcp.clone();
         tokio::spawn(async move {
             let _ = serve_mcp_proxy(
                 &ep,
@@ -1356,7 +1383,7 @@ mod tests {
                     role: None,
                 },
                 TOKEN,
-                Arc::new(SlowMcp),
+                mcp_for_server,
                 Arc::new(RoleToolAllowlist::unrestricted()),
             )
             .await;
@@ -1375,8 +1402,8 @@ mod tests {
             .expect("proxy connects"),
         );
 
-        // 4 concurrent 200ms calls: serial would be ~800ms, concurrent ~200ms.
-        let start = Instant::now();
+        // 4 concurrent 200ms calls; `SlowMcp::max_in_flight` records the
+        // high-water mark of calls it observed simultaneously in progress.
         let mut handles = Vec::new();
         for i in 0..4u32 {
             let p = proxy.clone();
@@ -1395,17 +1422,12 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        let elapsed = start.elapsed();
-        // Serial execution is unavoidably >= 4 * 200ms = 800ms, so any bound safely
-        // below 800ms proves the calls overlapped. Use 700ms (not a tight 500ms):
-        // overlapping calls take ~200ms + proxy/bus + scheduling overhead, which a
-        // loaded CI runner can push past 500ms — the gap to the 800ms serial floor
-        // is what matters, not a tight absolute time. Keeps the overlap assertion
-        // meaningful while removing the timing flake.
-        assert!(
-            elapsed < Duration::from_millis(700),
-            "4 concurrent 200ms proxy calls must OVERLAP at the orchestrator \
-             (serial would be >= 800ms); took {elapsed:?}"
+        let max_in_flight = slow_mcp.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(
+            max_in_flight, 4,
+            "4 concurrent proxy calls must OVERLAP at the orchestrator (serial handling \
+             could never observe more than 1 in flight at once); observed max_in_flight = \
+             {max_in_flight}"
         );
     }
 
