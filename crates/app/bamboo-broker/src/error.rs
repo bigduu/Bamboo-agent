@@ -16,6 +16,13 @@ pub enum BrokerError {
     /// WebSocket / IO transport failure.
     #[error("transport: {0}")]
     Transport(String),
+    /// `deliver` refused: the target session's mailbox already holds
+    /// `limit` pending (undelivered-or-unacked) messages — a backlog cap
+    /// against a flood aimed at an offline/never-draining mailbox filling
+    /// disk (#53). The sender should back off; this is not a transport or
+    /// auth failure.
+    #[error("mailbox '{session}' is full ({limit} pending messages)")]
+    MailboxFull { session: String, limit: usize },
 }
 
 pub type BrokerResult<T> = Result<T, BrokerError>;

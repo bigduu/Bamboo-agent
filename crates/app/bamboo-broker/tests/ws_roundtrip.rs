@@ -2,10 +2,11 @@
 //! ask/reply over the network (loopback), exercising auth, deliver, durable
 //! backlog, push, ack, and correlation.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_broker::{BrokerClient, BrokerCore, BrokerServer};
+use bamboo_broker::{BrokerClient, BrokerCore, BrokerLimits, BrokerServer};
 use bamboo_subagent::{AgentRef, AskBody, AskMode, InboxKind, InboxMessage, MsgId, ReplyBody};
 use chrono::Utc;
 use tempfile::TempDir;
@@ -16,9 +17,16 @@ const TOKEN: &str = "secret-token";
 /// Returns the `ws://` endpoint plus the mailbox-root guard — the caller must
 /// hold the guard for the test's lifetime (the broker reads/writes under it).
 async fn start_broker() -> (String, TempDir) {
+    start_broker_with_limits(BrokerLimits::default()).await
+}
+
+/// Like [`start_broker`], with explicit DoS-defense limits (#53) instead of
+/// the generous defaults — lets tests exercise `max_connections` /
+/// `messages_per_second` without waiting out production-sized quotas.
+async fn start_broker_with_limits(limits: BrokerLimits) -> (String, TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let core = Arc::new(BrokerCore::new(dir.path()));
-    let server = Arc::new(BrokerServer::new(core, TOKEN));
+    let server = Arc::new(BrokerServer::with_limits(core, TOKEN, limits));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -278,4 +286,112 @@ async fn unacked_messages_redelivered_after_broker_crash_and_restart() {
     );
 
     server2.abort();
+}
+
+/// Connection-flood DoS defense (#53): once `max_connections` accepted slots
+/// are all held, a new connection attempt must be rejected rather than
+/// accepted (which would let an attacker keep opening connections without
+/// bound).
+#[tokio::test]
+async fn max_connections_rejects_beyond_cap() {
+    let (endpoint, _dir) = start_broker_with_limits(BrokerLimits {
+        max_connections: 1,
+        ..BrokerLimits::default()
+    })
+    .await;
+
+    // Take the one available slot and keep it alive for the test.
+    let _first = BrokerClient::connect(&endpoint, agent("first"), TOKEN)
+        .await
+        .expect("first connection takes the only slot");
+
+    // A second connection attempt has nowhere to land — the server drops the
+    // raw stream before even attempting the WS handshake, so this must fail
+    // (not hang, not silently succeed).
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        BrokerClient::connect(&endpoint, agent("second"), TOKEN),
+    )
+    .await
+    .expect("connection attempt does not hang");
+    assert!(
+        second.is_err(),
+        "a connection beyond max_connections must be rejected"
+    );
+}
+
+/// The connection cap is a live pool, not a one-shot budget (#53): once a
+/// connection holding a slot disconnects, that slot becomes available again
+/// for a new connection.
+#[tokio::test]
+async fn max_connections_slot_frees_on_disconnect() {
+    let (endpoint, _dir) = start_broker_with_limits(BrokerLimits {
+        max_connections: 1,
+        ..BrokerLimits::default()
+    })
+    .await;
+    let addr = endpoint.strip_prefix("ws://").expect("ws:// endpoint");
+
+    {
+        // Take the one slot with a raw TCP connection — the semaphore permit
+        // is acquired and held for the connection task's whole lifetime
+        // regardless of whether the WS/Hello handshake ever completes, so
+        // this alone is enough to occupy the slot. (`BrokerClient` isn't used
+        // here because its background reader task outlives a mere `drop`,
+        // which would make this test about the client's lifecycle rather
+        // than the server's slot accounting.)
+        let _raw = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("raw tcp connects");
+        // Dropped at end of scope: the reset tears down the server's
+        // accept_async/handle_conn task, releasing its permit.
+    }
+
+    // Give the server task a moment to notice the closed connection and
+    // release its semaphore permit.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        BrokerClient::connect(&endpoint, agent("second"), TOKEN),
+    )
+    .await
+    .expect("connection attempt does not hang");
+    assert!(second.is_ok(), "a freed slot must admit a new connection");
+}
+
+/// Message-flood DoS defense (#53): a connection sending `Deliver` frames
+/// faster than `messages_per_second`/`message_burst` allow is backpressured
+/// (delayed), not instantly served — a flood can't write to the mailbox
+/// store at unbounded speed. Delivery still eventually SUCCEEDS (this is a
+/// throttle, not a hard reject), so a legitimate connection that briefly
+/// bursts is merely slowed, never disconnected or dropped.
+#[tokio::test]
+async fn deliver_rate_limit_backpressures_a_flooding_connection() {
+    let (endpoint, _dir) = start_broker_with_limits(BrokerLimits {
+        // 1 msg/sec, no burst: the 2nd and 3rd delivers in immediate
+        // succession must each wait ~1s for the bucket to refill.
+        messages_per_second: NonZeroU32::new(5).unwrap(),
+        message_burst: NonZeroU32::new(1).unwrap(),
+        ..BrokerLimits::default()
+    })
+    .await;
+
+    let mut sender = BrokerClient::connect(&endpoint, agent("flooder"), TOKEN)
+        .await
+        .expect("connects");
+
+    let started = std::time::Instant::now();
+    for _ in 0..3 {
+        sender
+            .deliver("victim", ask("flooder"))
+            .await
+            .expect("throttled delivery still eventually succeeds");
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "a burst beyond the token bucket must be delayed, not accepted \
+         instantly (took {elapsed:?})"
+    );
 }

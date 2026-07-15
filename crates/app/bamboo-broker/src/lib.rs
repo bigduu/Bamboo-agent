@@ -40,7 +40,7 @@ pub const ORCHESTRATOR_ID: &str = "bamboo-orchestrator";
 pub use crate::ask::{ask_agent, ask_over, request_over};
 pub use crate::child_link::BrokerChildLink;
 pub use crate::client::BrokerClient;
-pub use crate::core::BrokerCore;
+pub use crate::core::{BrokerCore, DEFAULT_MAX_PENDING_PER_MAILBOX};
 pub use crate::deploy::{
     AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer,
     RemoteDeployment, SshDeployer, UploadSpec,
@@ -54,5 +54,5 @@ pub use crate::mcp::{
 pub use crate::mux::MultiplexedClient;
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
-pub use crate::server::BrokerServer;
+pub use crate::server::{BrokerLimits, BrokerServer};
 pub use bamboo_subagent::AgentRef;

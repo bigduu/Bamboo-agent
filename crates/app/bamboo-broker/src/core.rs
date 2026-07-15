@@ -21,7 +21,15 @@ use std::time::Duration;
 use bamboo_subagent::{InboxMessage, Mailbox, MsgId};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::error::BrokerResult;
+use crate::error::{BrokerError, BrokerResult};
+
+/// Default cap on a single mailbox's pending (undelivered-or-unacked) message
+/// count (#53). Generous: a live streaming Run can legitimately push
+/// hundreds of `Event`s while its subscriber briefly lags, and this only
+/// bites when nobody is draining at all (offline/never-subscribed session) —
+/// so it exists to bound worst-case disk use from a flood, not to throttle
+/// normal traffic. Override via [`BrokerCore::with_max_pending_per_mailbox`].
+pub const DEFAULT_MAX_PENDING_PER_MAILBOX: usize = 50_000;
 
 /// An item pushed to a live subscriber's sink: either a durable mailbox message
 /// or an ephemeral out-of-band control signal. Both ride the same subscriber
@@ -51,6 +59,9 @@ pub struct BrokerCore {
     root: PathBuf,
     /// session_id -> live subscriber. Present only while a client is subscribed.
     subscribers: Mutex<HashMap<String, Subscriber>>,
+    /// Per-mailbox pending-message cap (#53); see
+    /// [`DEFAULT_MAX_PENDING_PER_MAILBOX`].
+    max_pending_per_mailbox: usize,
 }
 
 impl BrokerCore {
@@ -58,7 +69,16 @@ impl BrokerCore {
         Self {
             root: root.into(),
             subscribers: Mutex::new(HashMap::new()),
+            max_pending_per_mailbox: DEFAULT_MAX_PENDING_PER_MAILBOX,
         }
+    }
+
+    /// Override the per-mailbox pending-message cap (#53) from
+    /// [`DEFAULT_MAX_PENDING_PER_MAILBOX`]. Builder-style — chain onto
+    /// [`Self::new`] before wrapping in `Arc`.
+    pub fn with_max_pending_per_mailbox(mut self, max: usize) -> Self {
+        self.max_pending_per_mailbox = max;
+        self
     }
 
     /// Mailbox for one session: `<root>/mailboxes/<session_id>`.
@@ -68,8 +88,23 @@ impl BrokerCore {
 
     /// Durably enqueue `msg` into `to`'s mailbox, then — if `to` is currently
     /// subscribed — claim and push it immediately. Returns the stored [`MsgId`].
+    ///
+    /// Rejects with [`BrokerError::MailboxFull`] once `to`'s mailbox already
+    /// holds `max_pending_per_mailbox` pending messages (#53) — a backlog cap
+    /// against a flood aimed at an offline/never-draining mailbox. The check
+    /// races benignly with concurrent delivers (worst case a few messages
+    /// over the cap land before the count is next observed); it is a
+    /// best-effort bound, not a hard invariant.
     pub async fn deliver(&self, to: &str, msg: &InboxMessage) -> BrokerResult<MsgId> {
-        let id = self.mailbox(to).deliver(msg).await?;
+        let mailbox = self.mailbox(to);
+        let pending = mailbox.pending_count().await?;
+        if pending >= self.max_pending_per_mailbox {
+            return Err(BrokerError::MailboxFull {
+                session: to.to_string(),
+                limit: self.max_pending_per_mailbox,
+            });
+        }
+        let id = mailbox.deliver(msg).await?;
         self.push_new(to).await?;
         Ok(id)
     }
@@ -451,5 +486,64 @@ mod tests {
         assert_eq!(c.gc_empty_mailboxes().await, 1);
         // pending (non-empty) + live (subscribed) survive a second sweep.
         assert_eq!(c.gc_empty_mailboxes().await, 0);
+    }
+
+    /// Mailbox-flood DoS defense (#53): once a session's mailbox holds
+    /// `max_pending_per_mailbox` pending messages, further `deliver`s are
+    /// rejected with [`BrokerError::MailboxFull`] rather than accepted
+    /// unboundedly — the concrete vector is a client delivering to an
+    /// offline/never-draining session to fill disk.
+    #[tokio::test]
+    async fn deliver_rejects_once_pending_cap_reached() {
+        let d = TempDir::new().unwrap();
+        let c = BrokerCore::new(d.path()).with_max_pending_per_mailbox(2);
+
+        // No subscriber for "hoard" -> messages accumulate in new/, uncapped
+        // until the cap check kicks in.
+        c.deliver("hoard", &msg(1)).await.expect("1st under cap");
+        c.deliver("hoard", &msg(2)).await.expect("2nd reaches cap");
+
+        let err = c.deliver("hoard", &msg(3)).await;
+        assert!(
+            matches!(
+                err,
+                Err(BrokerError::MailboxFull {
+                    ref session,
+                    limit: 2
+                }) if session == "hoard"
+            ),
+            "delivery beyond the cap must be rejected: {err:?}"
+        );
+
+        // A different session's mailbox is unaffected — the cap is per-session.
+        c.deliver("other", &msg(4))
+            .await
+            .expect("cap is per-mailbox, not global");
+    }
+
+    /// The cap tracks the LIVE pending count, not a one-shot budget (#53):
+    /// once a message is claimed+acked (freeing a slot), `deliver` succeeds
+    /// again.
+    #[tokio::test]
+    async fn deliver_succeeds_again_after_ack_frees_a_slot() {
+        let d = TempDir::new().unwrap();
+        let c = BrokerCore::new(d.path()).with_max_pending_per_mailbox(1);
+
+        let m1 = msg(1);
+        c.deliver("hoard", &m1).await.expect("1st reaches cap");
+        assert!(
+            c.deliver("hoard", &msg(2)).await.is_err(),
+            "2nd delivery is over the cap"
+        );
+
+        // Claim + ack the pending message, freeing its slot.
+        let mut rx = c.subscribe("hoard", None).await.unwrap();
+        let got = expect_message(rx.recv().await.unwrap());
+        assert_eq!(got.id, m1.id);
+        c.ack("hoard", &got.id).await.unwrap();
+
+        c.deliver("hoard", &msg(3))
+            .await
+            .expect("delivery succeeds again once a slot is freed");
     }
 }

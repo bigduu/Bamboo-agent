@@ -290,6 +290,17 @@ impl Mailbox {
         Ok(self.sorted_json_names(&self.new_dir()).await?.is_empty())
     }
 
+    /// Count of messages currently pending in this mailbox: not-yet-claimed
+    /// (`new/`) plus claimed-but-unacked (`cur/`). A real reader claims (drain)
+    /// and acks promptly, so this only grows unbounded when nobody is
+    /// consuming — used to cap a session's backlog against a `deliver` flood
+    /// aimed at an offline/never-draining mailbox (disk-exhaustion DoS
+    /// defense, #53).
+    pub async fn pending_count(&self) -> Result<usize> {
+        Ok(self.sorted_json_names(&self.new_dir()).await?.len()
+            + self.sorted_json_names(&self.cur_dir()).await?.len())
+    }
+
     async fn sorted_json_names(&self, dir: &std::path::Path) -> Result<Vec<String>> {
         let mut rd = match tokio::fs::read_dir(dir).await {
             Ok(rd) => rd,
