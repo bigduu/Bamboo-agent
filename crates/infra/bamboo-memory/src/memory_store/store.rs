@@ -12,6 +12,7 @@ use bamboo_agent_core::workspace_state;
 use super::access_log::{
     self, AccessLogEntry, AccessStats, ACCESS_LOG_COMPACT_TRIGGER_BYTES, ACCESS_LOG_FILE,
 };
+use super::freshness;
 use super::lexical_bm25;
 use super::{
     build_dream_view, build_memory_markdown_view, build_recent_markdown_view,
@@ -204,9 +205,27 @@ impl MemoryStore {
     /// (never evicted), which is negligible: a scope root is global / sessions /
     /// per-project, so the set is tiny and bounded in practice.
     ///
-    /// Each mutating public method acquires AT MOST this one lock and never holds
-    /// it while calling another lock-acquiring public method, so there is no lock
-    /// nesting and deadlock is structurally impossible.
+    /// Each mutating public method acquires AT MOST this one `scope_lock` and
+    /// never holds it while calling another lock-acquiring PUBLIC method, so there
+    /// is no lock nesting across the public API and deadlock is structurally
+    /// impossible there.
+    ///
+    /// One documented exception: `enforce_scope_capacity` (the L5 capacity
+    /// gardener) holds `scope_lock` for its whole read-modify-write critical
+    /// section and, while holding it, calls the private `access_log_stats` →
+    /// `read_access_log_stats_at`, which acquires a SEPARATE `path_lock` scoped to
+    /// that scope's `access_log.jsonl` file (see `record_memory_accesses_inner`'s
+    /// doc comment for why the access log gets its own lock instead of reusing
+    /// `scope_lock`: so a burst of concurrent recalls appending access-log entries
+    /// never contends with concurrent scope writers). This IS lock nesting, but it
+    /// is deadlock-safe because the acquisition order is fixed and never reversed
+    /// anywhere in this file: every path that needs both locks takes `scope_lock`
+    /// first and an access-log `path_lock` second; nothing acquires an access-log
+    /// `path_lock` and then tries to acquire a `scope_lock` while still holding it
+    /// (`record_memory_accesses`, the other access-log caller, never touches
+    /// `scope_lock` at all — it's invoked from the lock-free `query_scope` read
+    /// path). A fixed, never-reversed acquisition order rules out the circular
+    /// wait a deadlock requires.
     fn scope_lock(&self, scope: MemoryScope, project_key: Option<&str>) -> Arc<Mutex<()>> {
         self.path_lock(self.resolver.scope_root(scope, project_key))
     }
@@ -457,6 +476,7 @@ impl MemoryStore {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_scope(
         &self,
         scope: MemoryScope,
@@ -464,6 +484,7 @@ impl MemoryStore {
         query: Option<&str>,
         filter_types: Option<&HashSet<DurableMemoryType>>,
         filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+        filter_granularity: Option<&HashSet<TemporalGranularity>>,
         options: &MemoryQueryOptions,
     ) -> io::Result<MemoryQueryResult> {
         let project_key = self.require_project_key(scope, project_key)?;
@@ -481,7 +502,13 @@ impl MemoryStore {
         let mut matches = docs
             .into_iter()
             .filter_map(|doc| {
-                let relevance = match_memory_query(&doc, query, filter_types, filter_statuses)?;
+                let relevance = match_memory_query(
+                    &doc,
+                    query,
+                    filter_types,
+                    filter_statuses,
+                    filter_granularity,
+                )?;
                 Some((doc, relevance))
             })
             .collect::<Vec<_>>();
@@ -1541,12 +1568,14 @@ impl MemoryStore {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn purge_memories(
         &self,
         scope: MemoryScope,
         project_key: Option<&str>,
         filter_types: Option<&HashSet<DurableMemoryType>>,
         filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+        filter_granularity: Option<&HashSet<TemporalGranularity>>,
         mode: DurableMemoryStatus,
         reason: Option<&str>,
     ) -> io::Result<MemoryPurgeResult> {
@@ -1556,7 +1585,9 @@ impl MemoryStore {
         let mut docs = self.list_memory_documents(scope, project_key).await?;
         let mut updated_ids = Vec::new();
         for doc in &mut docs {
-            if match_memory_query(doc, None, filter_types, filter_statuses).is_none() {
+            if match_memory_query(doc, None, filter_types, filter_statuses, filter_granularity)
+                .is_none()
+            {
                 continue;
             }
             let changed = self
@@ -1586,6 +1617,7 @@ impl MemoryStore {
                     "updated_ids": updated_ids_for_audit,
                     "type_filters": filter_types.map(|values| values.iter().map(|value| value.as_str()).collect::<Vec<_>>()),
                     "status_filters": filter_statuses.map(|values| values.iter().map(|value| value.as_str()).collect::<Vec<_>>()),
+                    "granularity_filters": filter_granularity.map(|values| values.iter().map(|value| value.as_str()).collect::<Vec<_>>()),
                 })),
             },
         )
@@ -2126,6 +2158,75 @@ impl MemoryStore {
             self.refresh_scope_artifacts(scope, project_key).await?;
         }
         Ok(archived)
+    }
+
+    /// Freshness gardener (issue #61 phase 2, follow-up to L5/#263's capacity
+    /// gardener): conservatively demotes Active day/week-granularity memories to
+    /// Stale once they cross the documented staleness window
+    /// ([`freshness::granularity_expired`]) — never Archived, never deleted, so a
+    /// Stale memory stays recallable (just lower-confidence, see `memory_value`'s
+    /// `stale_penalty`) and reversible. Memories with no granularity, or a coarse
+    /// one (month/quarter/year), are never touched: the issue explicitly scopes
+    /// this to the "high churn" granularities, so nothing is silently
+    /// reclassified just for lacking the dimension. Already-Stale/Superseded/
+    /// Contradicted/Archived memories are left alone (this pass only ever moves
+    /// Active → Stale, once).
+    pub async fn expire_stale_granularity(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Vec<String>> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
+
+        let mut docs = self.list_memory_documents(scope, project_key).await?;
+        let mut expired = Vec::new();
+        for doc in docs
+            .iter_mut()
+            .filter(|doc| doc.frontmatter.status == DurableMemoryStatus::Active)
+            .filter(|doc| {
+                freshness::granularity_expired(
+                    doc.frontmatter.granularity,
+                    &doc.frontmatter.updated_at,
+                )
+            })
+        {
+            let changed = self
+                .set_memory_status(
+                    doc,
+                    DurableMemoryStatus::Stale,
+                    "granularity_expiry",
+                    "gardener",
+                )
+                .await?;
+            if changed {
+                self.append_audit(
+                    scope,
+                    project_key,
+                    PURGE_AUDIT_LOG,
+                    AuditLogEntry {
+                        timestamp: now_rfc3339(),
+                        action: DurableMemoryStatus::Stale.as_str().to_string(),
+                        scope,
+                        memory_id: Some(doc.frontmatter.id.clone()),
+                        session_id: None,
+                        topic: None,
+                        summary: "Marked stale: fine-grained (day/week) memory aged past its temporal-granularity freshness window.".to_string(),
+                        metadata: Some(serde_json::json!({
+                            "reason": "granularity_expiry",
+                            "granularity": doc.frontmatter.granularity.map(TemporalGranularity::as_str),
+                        })),
+                    },
+                )
+                .await?;
+                expired.push(doc.frontmatter.id.clone());
+            }
+        }
+        if !expired.is_empty() {
+            self.refresh_scope_artifacts(scope, project_key).await?;
+        }
+        Ok(expired)
     }
 
     /// Classify how an incoming write relates to the scope's existing memories,
@@ -3498,6 +3599,7 @@ mod tests {
                 Some("release freeze"),
                 None,
                 None,
+                None,
                 &MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(3000),
@@ -4000,6 +4102,7 @@ mod tests {
                 Some("release freeze"),
                 None,
                 None,
+                None,
                 &MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(3000),
@@ -4023,6 +4126,7 @@ mod tests {
                 MemoryScope::Project,
                 pk,
                 Some("release freeze"),
+                None,
                 None,
                 None,
                 &MemoryQueryOptions {
@@ -4075,6 +4179,7 @@ mod tests {
                 MemoryScope::Project,
                 pk,
                 Some("deploy pipeline"),
+                None,
                 None,
                 None,
                 &MemoryQueryOptions {
@@ -4529,6 +4634,7 @@ mod tests {
                 Some("release freeze"),
                 None,
                 None,
+                None,
                 &MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(3000),
@@ -4612,6 +4718,7 @@ mod tests {
                 Some("proj-1"),
                 Some(&type_filters),
                 Some(&status_filters),
+                None,
                 DurableMemoryStatus::Archived,
                 Some("archive stale references"),
             )
@@ -4868,6 +4975,7 @@ mod tests {
                 Some("多租户"),
                 None,
                 None,
+                None,
                 &MemoryQueryOptions {
                     limit: Some(10),
                     max_chars: Some(5000),
@@ -4913,6 +5021,7 @@ mod tests {
                 Some("release"),
                 None,
                 None,
+                None,
                 &MemoryQueryOptions {
                     limit: Some(2),
                     max_chars: Some(3000),
@@ -4933,6 +5042,7 @@ mod tests {
                 MemoryScope::Project,
                 Some("proj-1"),
                 Some("release"),
+                None,
                 None,
                 None,
                 &MemoryQueryOptions {
@@ -5133,6 +5243,246 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(doc.frontmatter.granularity, None);
+    }
+
+    /// Backdate a memory's `updated_at` in place (test-only helper) by re-reading
+    /// it, rewriting the timestamp, and calling the private `write_document` —
+    /// mirrors the pattern already used by the merge/contradiction paths above.
+    async fn backdate_memory(store: &MemoryStore, id: &str, project_key: Option<&str>, days: i64) {
+        let mut doc = store
+            .get_memory(id, project_key)
+            .await
+            .unwrap()
+            .expect("memory should exist");
+        doc.frontmatter.updated_at =
+            (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        store.write_document(&doc).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expire_stale_granularity_marks_only_expired_day_and_week_memories() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+
+        let write = |title: &'static str, granularity: Option<TemporalGranularity>| {
+            let store = &store;
+            async move {
+                store
+                    .write_memory(
+                        MemoryScope::Project,
+                        pk,
+                        DurableMemoryType::Project,
+                        title,
+                        "body content for the memory",
+                        &[],
+                        Some("s"),
+                        "m",
+                        false,
+                        granularity,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let expired_day = write("Old day note", Some(TemporalGranularity::Day)).await;
+        let fresh_day = write("Fresh day note", Some(TemporalGranularity::Day)).await;
+        let expired_week = write("Old week note", Some(TemporalGranularity::Week)).await;
+        let fresh_week = write("Fresh week note", Some(TemporalGranularity::Week)).await;
+        let old_year = write("Old year note", Some(TemporalGranularity::Year)).await;
+        let old_untagged = write("Old untagged note", None).await;
+
+        backdate_memory(
+            &store,
+            &expired_day.frontmatter.id,
+            pk,
+            freshness::DAY_GRANULARITY_STALE_AFTER_DAYS + 1,
+        )
+        .await;
+        backdate_memory(
+            &store,
+            &expired_week.frontmatter.id,
+            pk,
+            freshness::WEEK_GRANULARITY_STALE_AFTER_DAYS + 1,
+        )
+        .await;
+        // Old enough to expire a `day` memory, but NOT a `year` or untagged one —
+        // those granularities never auto-expire regardless of age.
+        backdate_memory(
+            &store,
+            &old_year.frontmatter.id,
+            pk,
+            freshness::WEEK_GRANULARITY_STALE_AFTER_DAYS + 100,
+        )
+        .await;
+        backdate_memory(
+            &store,
+            &old_untagged.frontmatter.id,
+            pk,
+            freshness::WEEK_GRANULARITY_STALE_AFTER_DAYS + 100,
+        )
+        .await;
+
+        let expired_ids = store
+            .expire_stale_granularity(MemoryScope::Project, pk)
+            .await
+            .unwrap();
+
+        let mut expired_ids_sorted = expired_ids.clone();
+        expired_ids_sorted.sort();
+        let mut expected = vec![
+            expired_day.frontmatter.id.clone(),
+            expired_week.frontmatter.id.clone(),
+        ];
+        expected.sort();
+        assert_eq!(expired_ids_sorted, expected);
+
+        async fn status_of(store: &MemoryStore, id: &str, pk: Option<&str>) -> DurableMemoryStatus {
+            store
+                .get_memory(id, pk)
+                .await
+                .unwrap()
+                .unwrap()
+                .frontmatter
+                .status
+        }
+        assert_eq!(
+            status_of(&store, &expired_day.frontmatter.id, pk).await,
+            DurableMemoryStatus::Stale
+        );
+        assert_eq!(
+            status_of(&store, &expired_week.frontmatter.id, pk).await,
+            DurableMemoryStatus::Stale
+        );
+        // Never touched: still fresh, still coarse/untagged.
+        assert_eq!(
+            status_of(&store, &fresh_day.frontmatter.id, pk).await,
+            DurableMemoryStatus::Active
+        );
+        assert_eq!(
+            status_of(&store, &fresh_week.frontmatter.id, pk).await,
+            DurableMemoryStatus::Active
+        );
+        assert_eq!(
+            status_of(&store, &old_year.frontmatter.id, pk).await,
+            DurableMemoryStatus::Active,
+            "year granularity must never auto-expire, however old"
+        );
+        assert_eq!(
+            status_of(&store, &old_untagged.frontmatter.id, pk).await,
+            DurableMemoryStatus::Active,
+            "untagged memories must never be silently reclassified"
+        );
+
+        // Non-destructive: nothing was deleted, all 6 documents remain on disk.
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, pk)
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 6);
+
+        // A second run is a no-op: Stale docs are not re-processed (Active only).
+        let second_run = store
+            .expire_stale_granularity(MemoryScope::Project, pk)
+            .await
+            .unwrap();
+        assert!(second_run.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_scope_filters_by_granularity_and_absent_filter_is_back_compat() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let pk = Some("proj-1");
+
+        store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "This week's priorities",
+                "Ship the granularity filter.",
+                &[],
+                Some("s"),
+                "m",
+                false,
+                Some(TemporalGranularity::Week),
+            )
+            .await
+            .unwrap();
+        store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "Long-term direction",
+                "Move to a modular workspace layout.",
+                &[],
+                Some("s"),
+                "m",
+                false,
+                Some(TemporalGranularity::Year),
+            )
+            .await
+            .unwrap();
+        store
+            .write_memory(
+                MemoryScope::Project,
+                pk,
+                DurableMemoryType::Project,
+                "Untagged note",
+                "No temporal dimension set.",
+                &[],
+                Some("s"),
+                "m",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut week_only = HashSet::new();
+        week_only.insert(TemporalGranularity::Week);
+        let filtered = store
+            .query_scope(
+                MemoryScope::Project,
+                pk,
+                None,
+                None,
+                None,
+                Some(&week_only),
+                &MemoryQueryOptions {
+                    limit: Some(10),
+                    max_chars: Some(3000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.matched_count, 1);
+        assert_eq!(filtered.items[0].title, "This week's priorities");
+
+        // Absent filter (`None`) = old behavior: every memory matches.
+        let unfiltered = store
+            .query_scope(
+                MemoryScope::Project,
+                pk,
+                None,
+                None,
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(10),
+                    max_chars: Some(3000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(unfiltered.matched_count, 3);
     }
 
     #[tokio::test]
