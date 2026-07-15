@@ -229,6 +229,7 @@ pub(super) fn build_root_tools(
                         b.token,
                         bamboo_bin,
                         fabric_deployer.registry(),
+                        config.clone(),
                     )),
                 ));
             // `cluster`: progressive-disclosure inventory (list/describe/status)
