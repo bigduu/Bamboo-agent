@@ -421,37 +421,31 @@ fn resolve_remote_placements(
 }
 
 /// Snapshot per-provider credentials from the parent config for actor
-/// provisioning. Serialized generically so this code does not chase the
-/// per-provider config struct shapes — any slot with a non-empty `api_key`
-/// yields a scoped credential (plus `base_url` when present).
+/// provisioning.
+///
+/// `api_key` on every typed provider-config struct (both the legacy
+/// single-instance `config.providers.*` slots and `config.provider_instances`
+/// entries) is plaintext-in-memory but `#[serde(skip_serializing)]` — on disk
+/// it lives as `api_key_encrypted` and gets hydrated into `api_key` on load.
+/// A `serde_json::to_value` projection therefore never observes it (#495);
+/// every typed slot below is read via direct field access instead, the way
+/// `provider_instances` already was.
+///
+/// Precedence when a legacy slot and a `provider_instances` entry share the
+/// same routing key (e.g. a hand-authored instance id of `"anthropic"`):
+/// the explicit `provider_instances` entry wins and the legacy slot is
+/// dropped, not merged. This mirrors the only other place the codebase
+/// reconciles the two config shapes —
+/// [`bamboo_config::synthesize_legacy_instances`], reused here — and the
+/// provider registry's "explicit instance takes precedence" rule
+/// (`bamboo-llm/src/provider_registry.rs`).
 pub fn extract_provider_credentials(
     config: &Config,
 ) -> Vec<bamboo_subagent::provision::ScopedCredential> {
     let mut out = Vec::new();
 
-    // Legacy single-instance slots: providers.anthropic / openai / …
-    if let Ok(serde_json::Value::Object(providers)) = serde_json::to_value(&config.providers) {
-        out.extend(providers.into_iter().filter_map(|(name, slot)| {
-            let api_key = slot.get("api_key")?.as_str()?.trim().to_string();
-            if api_key.is_empty() {
-                return None;
-            }
-            Some(bamboo_subagent::provision::ScopedCredential {
-                provider: name.clone(),
-                api_key,
-                base_url: slot
-                    .get("base_url")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                provider_type: Some(name),
-            })
-        }));
-    }
-
     // Multi-instance providers: provider_instances keyed by instance id; the
     // child routes by instance id, the worker constructs by provider_type.
-    // Read the typed struct directly — `api_key` is hydrated in memory but
-    // deliberately `skip_serializing`, so a serde projection would miss it.
     out.extend(config.provider_instances.iter().filter_map(|(id, inst)| {
         let api_key = inst.api_key.trim().to_string();
         if api_key.is_empty() {
@@ -462,6 +456,55 @@ pub fn extract_provider_credentials(
             api_key,
             base_url: inst.base_url.clone(),
             provider_type: Some(inst.provider_type.clone()),
+        })
+    }));
+
+    // Legacy single-instance slots: providers.anthropic / openai / gemini /
+    // bodhi (copilot has no api_key — device auth, so it never contributes).
+    // `synthesize_legacy_instances` already turns each populated slot into a
+    // `ProviderInstanceConfig` keyed by provider-type name via typed field
+    // access, and already skips any id present in `provider_instances`; the
+    // `contains_key` check here is the same defensive belt-and-suspenders
+    // the provider registry does at its equivalent call site.
+    let legacy = bamboo_config::synthesize_legacy_instances(config);
+    out.extend(legacy.into_iter().filter_map(|(id, inst)| {
+        if config.provider_instances.contains_key(&id) {
+            return None;
+        }
+        let api_key = inst.api_key.trim().to_string();
+        if api_key.is_empty() {
+            return None;
+        }
+        Some(bamboo_subagent::provision::ScopedCredential {
+            provider: id,
+            api_key,
+            base_url: inst.base_url,
+            provider_type: Some(inst.provider_type),
+        })
+    }));
+
+    // Forward-compat: provider keys unknown to this binary are preserved
+    // verbatim as raw JSON in `ProviderConfigs::extra` (flattened). These
+    // were never subject to the `skip_serializing` problem above — they're
+    // plain `serde_json::Value`, not a typed struct — so a direct scan for
+    // `api_key` is safe and keeps this path working for the same shapes the
+    // old generic projection used to (accidentally) cover.
+    out.extend(config.providers.extra.iter().filter_map(|(name, slot)| {
+        if config.provider_instances.contains_key(name) {
+            return None;
+        }
+        let api_key = slot.get("api_key")?.as_str()?.trim().to_string();
+        if api_key.is_empty() {
+            return None;
+        }
+        Some(bamboo_subagent::provision::ScopedCredential {
+            provider: name.clone(),
+            api_key,
+            base_url: slot
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            provider_type: Some(name.clone()),
         })
     }));
 
@@ -567,5 +610,181 @@ mod placement_resolver_tests {
                 .host_label,
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod extract_provider_credentials_tests {
+    use super::extract_provider_credentials;
+    use bamboo_config::{
+        AnthropicConfig, Config, OpenAIConfig, ProviderConfigs, ProviderInstanceConfig,
+    };
+
+    /// `Config::default()` is in-memory only (#38, see `impl Default for
+    /// Config`) — no filesystem/env bleed — so we can build straight on top
+    /// of it, but pin `providers` / `provider_instances` explicitly anyway
+    /// so these tests can't be affected by future default-config changes.
+    fn base_config() -> Config {
+        Config {
+            providers: ProviderConfigs::default(),
+            provider_instances: std::collections::HashMap::new(),
+            ..Config::default()
+        }
+    }
+
+    fn instance(provider_type: &str, api_key: &str) -> ProviderInstanceConfig {
+        ProviderInstanceConfig {
+            provider_type: provider_type.to_string(),
+            label: None,
+            api_key: api_key.to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            enabled: true,
+            extra: Default::default(),
+        }
+    }
+
+    /// #495: `providers.anthropic.api_key` is `#[serde(skip_serializing)]`
+    /// (plaintext, in-memory only — on disk it's `api_key_encrypted`,
+    /// hydrated on load). The old `serde_json::to_value(&config.providers)`
+    /// projection never observed it, so a worker deployed from a
+    /// legacy-only config got zero credentials and failed at first LLM
+    /// call with no deploy-time error.
+    #[test]
+    fn legacy_only_config_yields_credential() {
+        let mut config = base_config();
+        config.providers.anthropic = Some(AnthropicConfig {
+            api_key: "sk-ant-legacy".into(),
+            base_url: Some("https://api.anthropic.com".into()),
+            ..Default::default()
+        });
+
+        let creds = extract_provider_credentials(&config);
+        assert_eq!(creds.len(), 1, "expected exactly one credential: {creds:?}");
+        assert_eq!(creds[0].provider, "anthropic");
+        assert_eq!(creds[0].api_key, "sk-ant-legacy");
+        assert_eq!(creds[0].provider_type.as_deref(), Some("anthropic"));
+        assert_eq!(
+            creds[0].base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn legacy_slot_with_empty_api_key_yields_nothing() {
+        let mut config = base_config();
+        config.providers.anthropic = Some(AnthropicConfig::default());
+        assert!(extract_provider_credentials(&config).is_empty());
+    }
+
+    #[test]
+    fn no_providers_configured_yields_nothing() {
+        let config = base_config();
+        assert!(extract_provider_credentials(&config).is_empty());
+    }
+
+    /// `provider_instances`-only configs already worked before #495 (typed
+    /// field access); this pins that behavior stays unchanged.
+    #[test]
+    fn instances_only_config_unchanged() {
+        let mut config = base_config();
+        config.provider_instances.insert(
+            "anthropic-work".to_string(),
+            instance("anthropic", "sk-instance"),
+        );
+
+        let creds = extract_provider_credentials(&config);
+        assert_eq!(creds.len(), 1, "expected exactly one credential: {creds:?}");
+        assert_eq!(creds[0].provider, "anthropic-work");
+        assert_eq!(creds[0].api_key, "sk-instance");
+        assert_eq!(creds[0].provider_type.as_deref(), Some("anthropic"));
+    }
+
+    /// Both configured, distinct routing keys: neither shape clobbers the
+    /// other; both credentials are present.
+    #[test]
+    fn legacy_and_instances_with_different_keys_both_present() {
+        let mut config = base_config();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "sk-oa-legacy".into(),
+            ..Default::default()
+        });
+        config.provider_instances.insert(
+            "anthropic-work".to_string(),
+            instance("anthropic", "sk-instance"),
+        );
+
+        let creds = extract_provider_credentials(&config);
+        let mut providers: Vec<&str> = creds.iter().map(|c| c.provider.as_str()).collect();
+        providers.sort_unstable();
+        assert_eq!(providers, vec!["anthropic-work", "openai"]);
+    }
+
+    /// Documented precedence (#495): when a `provider_instances` entry and a
+    /// legacy `providers.*` slot share the same routing key, the explicit
+    /// instance wins outright — the legacy credential is dropped, not
+    /// merged and not duplicated. This mirrors
+    /// `bamboo_config::synthesize_legacy_instances` (which already skips
+    /// synthesizing a legacy id present in `provider_instances`) and the
+    /// provider registry's "explicit instance takes precedence" comment in
+    /// `bamboo-llm/src/provider_registry.rs`.
+    #[test]
+    fn instance_takes_precedence_over_legacy_slot_with_same_key() {
+        let mut config = base_config();
+        config.providers.anthropic = Some(AnthropicConfig {
+            api_key: "sk-ant-legacy".into(),
+            ..Default::default()
+        });
+        config.provider_instances.insert(
+            "anthropic".to_string(),
+            instance("anthropic", "sk-ant-instance"),
+        );
+
+        let creds = extract_provider_credentials(&config);
+        assert_eq!(
+            creds.len(),
+            1,
+            "instance and legacy slot must not both appear: {creds:?}"
+        );
+        assert_eq!(creds[0].provider, "anthropic");
+        assert_eq!(creds[0].api_key, "sk-ant-instance");
+    }
+
+    /// Forward-compat: provider keys unknown to this binary are preserved
+    /// verbatim as raw JSON (`ProviderConfigs::extra`, flattened). These
+    /// were never subject to the `skip_serializing` bug — plain
+    /// `serde_json::Value`, not a typed struct — so the fix keeps scanning
+    /// them the way the old generic projection (accidentally) did.
+    #[test]
+    fn forward_compat_unknown_provider_extra_key_still_extracted() {
+        let mut config = base_config();
+        config.providers.extra.insert(
+            "mistral".to_string(),
+            serde_json::json!({ "api_key": "sk-mistral", "base_url": "https://api.mistral.ai" }),
+        );
+
+        let creds = extract_provider_credentials(&config);
+        assert_eq!(creds.len(), 1, "expected exactly one credential: {creds:?}");
+        assert_eq!(creds[0].provider, "mistral");
+        assert_eq!(creds[0].api_key, "sk-mistral");
+        assert_eq!(creds[0].base_url.as_deref(), Some("https://api.mistral.ai"));
+    }
+
+    /// Copilot has no `api_key` field at all (device auth) — it must never
+    /// contribute a credential.
+    #[test]
+    fn copilot_without_api_key_yields_nothing() {
+        let mut config = base_config();
+        config.providers.copilot = Some(bamboo_config::CopilotConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(extract_provider_credentials(&config).is_empty());
     }
 }
