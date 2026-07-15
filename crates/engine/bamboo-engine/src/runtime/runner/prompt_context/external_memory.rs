@@ -5,11 +5,13 @@ use crate::runtime::config::PromptMemoryFlags;
 use bamboo_agent_core::{PromptMemoryObservability, Session};
 use bamboo_domain::ledger::LedgerScope;
 use bamboo_llm::LLMProvider;
+use bamboo_memory::budget::{segment_by_granularity_budget, GranularityBudgetItem};
 use bamboo_memory::ledger_store::{AgendaItem, AgendaSnapshot, LedgerStore};
 use bamboo_memory::memory_store::{
     project_key_from_path, render_memory_freshness_note, select_relevant_memories,
     truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
     MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallStrategy, MemoryScope, MemoryStore,
+    TemporalGranularity,
 };
 use bamboo_tools::tools::workspace_state;
 
@@ -84,12 +86,18 @@ struct ProjectDreamSnippet {
 
 #[derive(Debug, Clone)]
 struct RelevantMemorySnippet {
+    id: String,
     title: String,
     scope: MemoryScope,
     status: String,
     score: f64,
     summary: String,
     freshness_note: Option<String>,
+    /// Temporal granularity of the source memory, carried through so the render
+    /// step can route this item into the coarse (prefix) or fine (suffix)
+    /// prompt-cache-stability segment (see `budget::segment_by_granularity_budget`,
+    /// issue #61).
+    granularity: Option<TemporalGranularity>,
 }
 
 #[derive(Clone)]
@@ -617,6 +625,7 @@ fn build_relevant_memory_snippet(
     }
 
     Some(RelevantMemorySnippet {
+        id: candidate.id,
         title: candidate.title,
         scope: candidate.scope,
         status: candidate.status.as_str().to_string(),
@@ -626,6 +635,7 @@ fn build_relevant_memory_snippet(
             &candidate.updated_at,
             FreshnessKind::RecalledMemory,
         ),
+        granularity: candidate.granularity,
     })
 }
 
@@ -994,6 +1004,40 @@ fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
     section
 }
 
+/// Render a single recalled memory's bullet block, in the same per-item format
+/// used before granularity segmentation was wired in. Only the ORDERING of items
+/// within the section changed (coarse-before-fine, see below) — this per-item
+/// format is unchanged.
+fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
+    let mut item = String::new();
+    item.push_str(&format!(
+        "- [{}][{}] {} (score {:.2})\n",
+        snippet.status,
+        snippet.scope.as_str(),
+        snippet.title,
+        snippet.score
+    ));
+    item.push_str(&format!("  Summary: {}\n", snippet.summary));
+    if let Some(note) = snippet.freshness_note.as_deref() {
+        item.push_str(&format!("  {}\n", note));
+    }
+    item
+}
+
+/// Render the "Relevant Durable Memories" section body. Recalled items are routed
+/// through [`segment_by_granularity_budget`] (issue #61 phase 2) so coarse
+/// (untagged/month/quarter/year) memories always render before fine (week/day)
+/// ones, keeping the coarse content's bytes stable against fine-grained churn for
+/// prompt-prefix-cache friendliness. `RELEVANT_MEMORY_TOTAL_MAX_CHARS` is reused
+/// as-is as the segmentation's `total_budget_chars` rather than inventing a new
+/// limit — it is the same budget `load_relevant_memory_snippets` already targets
+/// when shortlisting candidates.
+///
+/// Back-compat: when every item is coarse (the common case for memories written
+/// before granularity existed — `None` is coarse per
+/// `TemporalGranularity::is_high_churn`), the suffix segment is empty and
+/// `segments.combined()` degenerates to exactly the old flat concatenation in the
+/// same relative order, with no separator inserted.
 fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
     let mut section = String::new();
     section.push_str("### Relevant Durable Memories\n");
@@ -1001,19 +1045,21 @@ fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String 
         "Turn-specific historical memories shortlisted for the latest user request. Verify them against current tools/files before treating them as live state.\n",
     );
 
-    for snippet in snippets {
-        section.push_str(&format!(
-            "- [{}][{}] {} (score {:.2})\n",
-            snippet.status,
-            snippet.scope.as_str(),
-            snippet.title,
-            snippet.score
-        ));
-        section.push_str(&format!("  Summary: {}\n", snippet.summary));
-        if let Some(note) = snippet.freshness_note.as_deref() {
-            section.push_str(&format!("  {}\n", note));
-        }
-    }
+    let items: Vec<GranularityBudgetItem> = snippets
+        .iter()
+        .map(|snippet| {
+            GranularityBudgetItem::new(
+                snippet.id.clone(),
+                snippet.granularity,
+                render_relevant_memory_item(snippet),
+            )
+        })
+        .collect();
+    let segments = segment_by_granularity_budget(&items, RELEVANT_MEMORY_TOTAL_MAX_CHARS);
+    // `combined()` is prefix followed by suffix with no separator — for the
+    // all-coarse case the suffix is empty and this is byte-identical to the old
+    // flat per-snippet loop.
+    section.push_str(&segments.combined());
     section.push('\n');
     section
 }
@@ -1107,4 +1153,167 @@ fn render_context_pressure_warning(session: &Session) -> Option<String> {
     Some(format!(
         "\n> ⚠️ **Context window filling up (~{pct:.0}% used).** Older messages will soon be compressed and summarized. Save any important context (key decisions, file paths, architecture notes, progress state) to `{EXTERNAL_MEMORY_TOOL_NAME}` now so it persists across the compression boundary.\n"
     ))
+}
+
+#[cfg(test)]
+mod granularity_prompt_wiring_tests {
+    use super::*;
+
+    fn snippet(
+        id: &str,
+        granularity: Option<TemporalGranularity>,
+        title: &str,
+        summary: &str,
+    ) -> RelevantMemorySnippet {
+        RelevantMemorySnippet {
+            id: id.to_string(),
+            title: title.to_string(),
+            scope: MemoryScope::Project,
+            status: "active".to_string(),
+            score: 0.5,
+            summary: summary.to_string(),
+            freshness_note: None,
+            granularity,
+        }
+    }
+
+    /// Faithful copy of `render_relevant_memory_section`'s pre-#497 body (flat,
+    /// unsegmented render loop) — kept only in this test to pin the exact
+    /// byte-for-byte output the all-coarse case must still produce.
+    fn old_style_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+        let mut section = String::new();
+        section.push_str("### Relevant Durable Memories\n");
+        section.push_str(
+            "Turn-specific historical memories shortlisted for the latest user request. Verify them against current tools/files before treating them as live state.\n",
+        );
+        for snippet in snippets {
+            section.push_str(&format!(
+                "- [{}][{}] {} (score {:.2})\n",
+                snippet.status,
+                snippet.scope.as_str(),
+                snippet.title,
+                snippet.score
+            ));
+            section.push_str(&format!("  Summary: {}\n", snippet.summary));
+            if let Some(note) = snippet.freshness_note.as_deref() {
+                section.push_str(&format!("  {}\n", note));
+            }
+        }
+        section.push('\n');
+        section
+    }
+
+    #[test]
+    fn all_untagged_memories_render_identically_to_pre_segmentation_format() {
+        let snippets = vec![
+            snippet("a", None, "Alpha decision", "alpha summary"),
+            snippet("b", None, "Beta preference", "beta summary"),
+            snippet("c", None, "Gamma reference", "gamma summary"),
+        ];
+
+        assert_eq!(
+            render_relevant_memory_section(&snippets),
+            old_style_relevant_memory_section(&snippets),
+            "an all-coarse (untagged) config must render byte-identical to the pre-#497 flat format"
+        );
+    }
+
+    #[test]
+    fn mixed_coarse_and_fine_renders_coarse_before_fine() {
+        // Day placed first in priority/input order — output must still group
+        // coarse (year) ahead of fine (day) regardless of input order.
+        let day = snippet(
+            "day-1",
+            Some(TemporalGranularity::Day),
+            "Day Title Marker",
+            "day summary",
+        );
+        let year = snippet(
+            "year-1",
+            Some(TemporalGranularity::Year),
+            "Year Title Marker",
+            "year summary",
+        );
+
+        let section = render_relevant_memory_section(&[day, year]);
+
+        let day_pos = section
+            .find("Day Title Marker")
+            .expect("day item should still render");
+        let year_pos = section
+            .find("Year Title Marker")
+            .expect("year item should still render");
+        assert!(
+            year_pos < day_pos,
+            "coarse (year) memory must render before fine (day) memory"
+        );
+    }
+
+    #[test]
+    fn changing_or_adding_a_day_memory_leaves_prefix_segment_bytes_unchanged() {
+        let year = snippet(
+            "year-1",
+            Some(TemporalGranularity::Year),
+            "Year Title",
+            "year summary",
+        );
+        let quarter = snippet(
+            "quarter-1",
+            Some(TemporalGranularity::Quarter),
+            "Quarter Title",
+            "quarter summary",
+        );
+        let day_before = snippet(
+            "day-1",
+            Some(TemporalGranularity::Day),
+            "Day Title",
+            "day summary before",
+        );
+        let day_after = snippet(
+            "day-1",
+            Some(TemporalGranularity::Day),
+            "Day Title",
+            "day summary after, rewritten with more detail",
+        );
+        let day_new = snippet(
+            "day-2",
+            Some(TemporalGranularity::Day),
+            "Brand New Day Title",
+            "brand new day summary",
+        );
+
+        let before = render_relevant_memory_section(&[year.clone(), quarter.clone(), day_before]);
+        let after_changed =
+            render_relevant_memory_section(&[year.clone(), quarter.clone(), day_after]);
+        let after_added = render_relevant_memory_section(&[year.clone(), quarter.clone(), day_new]);
+
+        let mut expected_prefix = String::new();
+        expected_prefix.push_str("### Relevant Durable Memories\n");
+        expected_prefix.push_str(
+            "Turn-specific historical memories shortlisted for the latest user request. Verify them against current tools/files before treating them as live state.\n",
+        );
+        expected_prefix.push_str(&render_relevant_memory_item(&year));
+        expected_prefix.push_str(&render_relevant_memory_item(&quarter));
+
+        assert!(
+            before.starts_with(&expected_prefix),
+            "prefix segment bytes must match the coarse items' rendered form exactly"
+        );
+        assert!(
+            after_changed.starts_with(&expected_prefix),
+            "prefix segment must be unaffected by rewriting a day memory"
+        );
+        assert!(
+            after_added.starts_with(&expected_prefix),
+            "prefix segment must be unaffected by adding a new day memory"
+        );
+        assert_ne!(
+            before, after_changed,
+            "the suffix (day) content is expected to change"
+        );
+        assert_ne!(
+            before, after_added,
+            "the suffix (day) content is expected to change"
+        );
+    }
 }

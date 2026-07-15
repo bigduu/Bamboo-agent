@@ -33,6 +33,16 @@ impl MemoryScope {
 /// coarser-grained memories (year/quarter) are low-frequency and cache-friendly and
 /// sort earlier (toward the stable prefix); finer-grained memories (day/week) change
 /// more often and sort later (toward the volatile suffix). See issue #61.
+///
+/// This warning is specifically about the passive recall-into-prompt path (auto-
+/// injected "Relevant Durable Memories" in the system prompt, ranked/segmented by
+/// `budget::segment_by_granularity_budget`) — that subset must stay prefix-cache
+/// stable across turns, so it is never hard-filtered by granularity. It does NOT
+/// apply to the explicit `filters.granularity` query path (the `memory` tool's
+/// `query`/`purge` actions): when a user or the LLM deliberately asks to see only
+/// e.g. this week's memories, that is a one-shot, caller-driven request outside the
+/// auto-injected prompt prefix, so hard-filtering there is fine and expected — see
+/// `bamboo-server-tools`' `MemoryTool::parse_query_filters`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporalGranularity {
