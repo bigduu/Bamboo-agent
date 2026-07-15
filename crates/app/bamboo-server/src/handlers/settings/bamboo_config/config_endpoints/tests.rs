@@ -674,6 +674,120 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
     );
 }
 
+/// #490 end-to-end: the settings PATCH surface must preserve a masked secret
+/// even when a preceding platform entry is removed in the same request,
+/// shifting the kept entry's array index. Stored platforms are
+/// `[telegram, feishu]`; the client disables telegram and re-POSTs only the
+/// (still-masked) feishu entry, which now lands at index 0 instead of 1.
+/// Before the #490 fix, the positional type-guard (added for #454) saw
+/// telegram≠feishu at index 0 and silently dropped the feishu app_secret.
+#[actix_web::test]
+async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_removed() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+    use bamboo_config::encryption;
+
+    // See the long NOTE on the Telegram test above for why the process-global
+    // (not thread-local) encryption key is relied on here.
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    // 1) Set both a Telegram bot token and a Feishu app_secret, in that order.
+    let post = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    { "type": "telegram", "token": "tg-real-secret", "allow_from": ["u1"] },
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "feishu-real-secret",
+                        "domain": "lark",
+                        "allow_from": ["ou_1"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post_resp = test::call_service(&app, post).await;
+    assert!(post_resp.status().is_success(), "set config should succeed");
+
+    // 2) GET, confirm both entries round-trip masked, in stored order.
+    let get = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(body["connect"]["platforms"][0]["type"], "telegram");
+    assert_eq!(body["connect"]["platforms"][1]["type"], "feishu");
+    assert_eq!(body["connect"]["platforms"][1]["app_secret"], "****...****");
+
+    // 3) Re-POST with telegram removed — the UI's echoed feishu entry (still
+    // masked) now sits at index 0, not index 1 where it was stored.
+    let post2 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "****...****",
+                        "domain": "lark",
+                        "allow_from": ["ou_1"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post2_resp = test::call_service(&app, post2).await;
+    assert!(
+        post2_resp.status().is_success(),
+        "second set config should succeed"
+    );
+
+    // The feishu app_secret must still read as configured, not wiped.
+    let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body2: serde_json::Value = test::call_and_read_body_json(&app, get2).await;
+    assert_eq!(
+        body2["connect"]["platforms"][0]["type"], "feishu",
+        "telegram entry should be gone, feishu now at index 0"
+    );
+    assert_eq!(
+        body2["connect"]["platforms"][0]["app_secret"], "****...****",
+        "app_secret must still read as configured after the index shift"
+    );
+
+    // And the plaintext on disk (encrypted at rest) must be unchanged, not
+    // wiped by the removed-entry-shifted-index case.
+    let connect_path = data_dir.join("connect.json");
+    let connect_text_after = tokio::fs::read_to_string(&connect_path)
+        .await
+        .expect("connect.json should still exist");
+    let connect_json_after: serde_json::Value =
+        serde_json::from_str(&connect_text_after).expect("connect.json should parse");
+    assert_eq!(connect_json_after["platforms"].as_array().unwrap().len(), 1);
+    let app_secret_encrypted_after = connect_json_after["platforms"][0]["app_secret_encrypted"]
+        .as_str()
+        .expect("app_secret_encrypted should still be present")
+        .to_string();
+    assert_eq!(
+        encryption::decrypt(&app_secret_encrypted_after).expect("app_secret should decrypt"),
+        "feishu-real-secret",
+        "masked secret must resolve by type after a preceding entry was removed, not be dropped"
+    );
+}
+
 /// #455 gap: a full config reset must also clear `connect.json`, or a
 /// bamboo-connect bot token would silently survive `POST
 /// /bamboo/config/reset` and get re-merged back onto the freshly-defaulted

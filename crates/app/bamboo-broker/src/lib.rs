@@ -53,6 +53,9 @@ pub use crate::mcp::{
 };
 pub use crate::mux::MultiplexedClient;
 pub use crate::proto::{BrokerFrame, ClientFrame};
-pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
+pub use crate::serve::{
+    serve_executor, serve_executor_with_shutdown, serve_loop, serve_mailbox,
+    serve_mailbox_with_shutdown, serve_with, Handled,
+};
 pub use crate::server::{BrokerLimits, BrokerServer};
 pub use bamboo_subagent::AgentRef;

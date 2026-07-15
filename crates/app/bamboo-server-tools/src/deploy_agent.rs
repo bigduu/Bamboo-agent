@@ -190,12 +190,16 @@ impl DeployAgentTool {
     }
 
     async fn stop(&self, id: String) -> Result<ToolResult, ToolError> {
-        match self
+        // Take the entry out FIRST, then shut down without holding the registry
+        // lock: shutdown is now graceful (SIGTERM + drain grace window, #49), so
+        // it can take seconds — other deploy/stop/list calls must not serialize
+        // behind it.
+        let removed = self
             .registry
             .lock()
             .await
-            .remove(&crate::registry_keys::agent_key(&id))
-        {
+            .remove(&crate::registry_keys::agent_key(&id));
+        match removed {
             Some(d) => {
                 d.handle.shutdown().await;
                 Ok(tool_json(json!({ "id": id, "status": "stopped" })))

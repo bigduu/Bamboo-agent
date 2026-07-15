@@ -1,12 +1,48 @@
 use chrono::Utc;
 
 use super::parse_rfc3339;
+use super::TemporalGranularity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshnessKind {
     Index,
     RecalledMemory,
     StateLikeClaim,
+}
+
+/// Age (days, based on `updated_at`) after which a `day`-granularity memory is
+/// conservatively marked Stale by the freshness gardener (issue #61 phase 2).
+/// Day-level memories are meant to capture today's working context, so roughly a
+/// week without a touch is a reasonable, conservative staleness signal — long
+/// enough to survive a normal weekend gap, short enough that genuinely stale
+/// day-level context doesn't linger in recall for weeks.
+pub const DAY_GRANULARITY_STALE_AFTER_DAYS: i64 = 7;
+
+/// Age (days, based on `updated_at`) after which a `week`-granularity memory is
+/// conservatively marked Stale. Sprint-level content is expected to stay relevant
+/// roughly a month, so this is looser than the day threshold — weekly memories
+/// shouldn't be churned as aggressively as daily ones.
+pub const WEEK_GRANULARITY_STALE_AFTER_DAYS: i64 = 30;
+
+/// Whether a memory with the given (optional) granularity has crossed its
+/// conservative auto-staleness window, based on `updated_at` age. Only `day` and
+/// `week` — the two granularities the issue's Prefix Cache Friendly constraint
+/// calls "high churn" (see [`TemporalGranularity::is_high_churn`]) — ever expire
+/// here; `None` and month/quarter/year never do, since those are meant to be
+/// long-lived by design and the freshness gardener must stay conservative (no
+/// silent reclassification of memories that were never tagged with a temporal
+/// dimension). Callers are expected to additionally gate on
+/// `frontmatter.status == Active` before acting — this is purely the time-based
+/// predicate.
+pub fn granularity_expired(granularity: Option<TemporalGranularity>, updated_at: &str) -> bool {
+    let Some(age_days) = memory_age_days(updated_at) else {
+        return false;
+    };
+    match granularity {
+        Some(TemporalGranularity::Day) => age_days > DAY_GRANULARITY_STALE_AFTER_DAYS,
+        Some(TemporalGranularity::Week) => age_days > WEEK_GRANULARITY_STALE_AFTER_DAYS,
+        _ => false,
+    }
 }
 
 pub fn memory_age_days(updated_at: &str) -> Option<i64> {
@@ -114,6 +150,65 @@ mod tests {
         assert_eq!(memory_age_days(&timestamp), Some(0));
         assert_eq!(memory_age_label(&timestamp).as_deref(), Some("today"));
         assert!(memory_freshness_text(&timestamp, FreshnessKind::Index).is_none());
+    }
+
+    #[test]
+    fn day_granularity_expires_after_its_window_not_before() {
+        let just_under =
+            (Utc::now() - Duration::days(DAY_GRANULARITY_STALE_AFTER_DAYS)).to_rfc3339();
+        let just_over =
+            (Utc::now() - Duration::days(DAY_GRANULARITY_STALE_AFTER_DAYS + 1)).to_rfc3339();
+        assert!(!granularity_expired(
+            Some(TemporalGranularity::Day),
+            &just_under
+        ));
+        assert!(granularity_expired(
+            Some(TemporalGranularity::Day),
+            &just_over
+        ));
+    }
+
+    #[test]
+    fn week_granularity_uses_a_longer_window_than_day() {
+        let mid_window =
+            (Utc::now() - Duration::days(DAY_GRANULARITY_STALE_AFTER_DAYS + 1)).to_rfc3339();
+        // Past the day threshold but still inside the week threshold.
+        assert!(!granularity_expired(
+            Some(TemporalGranularity::Week),
+            &mid_window
+        ));
+        let past_week_window =
+            (Utc::now() - Duration::days(WEEK_GRANULARITY_STALE_AFTER_DAYS + 1)).to_rfc3339();
+        assert!(granularity_expired(
+            Some(TemporalGranularity::Week),
+            &past_week_window
+        ));
+    }
+
+    #[test]
+    fn coarse_and_unset_granularity_never_expire() {
+        let ancient = (Utc::now() - Duration::days(10_000)).to_rfc3339();
+        assert!(!granularity_expired(None, &ancient));
+        assert!(!granularity_expired(
+            Some(TemporalGranularity::Month),
+            &ancient
+        ));
+        assert!(!granularity_expired(
+            Some(TemporalGranularity::Quarter),
+            &ancient
+        ));
+        assert!(!granularity_expired(
+            Some(TemporalGranularity::Year),
+            &ancient
+        ));
+    }
+
+    #[test]
+    fn invalid_timestamp_never_expires() {
+        assert!(!granularity_expired(
+            Some(TemporalGranularity::Day),
+            "not-a-timestamp"
+        ));
     }
 
     #[test]

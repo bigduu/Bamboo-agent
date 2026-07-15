@@ -510,6 +510,7 @@ pub fn match_memory_query(
     query: Option<&str>,
     filter_types: Option<&HashSet<DurableMemoryType>>,
     filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+    filter_granularity: Option<&HashSet<TemporalGranularity>>,
 ) -> Option<f64> {
     if let Some(types) = filter_types {
         if !types.contains(&doc.frontmatter.r#type) {
@@ -519,6 +520,19 @@ pub fn match_memory_query(
     if let Some(statuses) = filter_statuses {
         if !statuses.contains(&doc.frontmatter.status) {
             return None;
+        }
+    }
+    // Absent filter (`None`) = no filtering, matching every existing memory
+    // regardless of whether it carries a granularity — back-compat with pre-#61
+    // callers and with memories written before the dimension existed. An ACTIVE
+    // filter (issue #61 phase 2, "只看本周的 memory") only matches memories that
+    // carry one of the requested granularities; an untagged memory (`None`) never
+    // matches an active granularity filter, since the caller asked for a specific
+    // time horizon and an untagged memory doesn't claim one.
+    if let Some(granularities) = filter_granularity {
+        match doc.frontmatter.granularity {
+            Some(granularity) if granularities.contains(&granularity) => {}
+            _ => return None,
         }
     }
 
