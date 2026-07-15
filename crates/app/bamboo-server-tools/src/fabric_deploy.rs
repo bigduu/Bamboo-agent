@@ -203,13 +203,15 @@ impl FabricDeployer {
         };
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker
-        // port before the new deploy requests the same forward.
-        if let Some(prev) = self
+        // port before the new deploy requests the same forward. Remove under the
+        // lock, shut down outside it: shutdown is graceful now (SIGTERM + drain
+        // grace, #49) and must not hold the shared registry for its duration.
+        let prev = self
             .registry
             .lock()
             .await
-            .remove(&crate::registry_keys::node_key(node_id))
-        {
+            .remove(&crate::registry_keys::node_key(node_id));
+        if let Some(prev) = prev {
             prev.handle.shutdown().await;
         }
 
@@ -280,12 +282,13 @@ impl FabricDeployer {
         };
         if let Err(e) = verify {
             // Tear the half-dead worker down and report the real failure.
-            if let Some(d) = self
+            // (Remove under the lock, shut down outside it — see deploy above.)
+            let dead = self
                 .registry
                 .lock()
                 .await
-                .remove(&crate::registry_keys::node_key(node_id))
-            {
+                .remove(&crate::registry_keys::node_key(node_id));
+            if let Some(d) = dead {
                 d.handle.shutdown().await;
             }
             let msg = format!(
@@ -337,12 +340,14 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             self.node_snapshot(&cfg, node_id)?;
         }
-        if let Some(d) = self
+        // Remove under the lock, shut down outside it: shutdown is graceful now
+        // (SIGTERM + drain grace, #49) and must not hold the shared registry.
+        let removed = self
             .registry
             .lock()
             .await
-            .remove(&crate::registry_keys::node_key(node_id))
-        {
+            .remove(&crate::registry_keys::node_key(node_id));
+        if let Some(d) = removed {
             d.handle.shutdown().await;
         }
         tracing::info!(
