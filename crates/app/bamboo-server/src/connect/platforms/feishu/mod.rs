@@ -341,7 +341,11 @@ fn build_card(text: &str, buttons: Option<&[Vec<Button>]>) -> serde_json::Value 
     serde_json::json!({
         "schema": "2.0",
         "config": { "update_multi": true },
-        "elements": elements,
+        // Schema 2.0 nests `elements` under `body` — a top-level `elements`
+        // key is the v1 location and the real API rejects the card with
+        // `200621 parse card json err: unknown property "elements"` (caught
+        // in Magpie's 2026-07-15 real-device e2e; same builder, same bug).
+        "body": { "elements": elements },
     })
 }
 
@@ -756,7 +760,7 @@ mod tests {
                 .unwrap();
         assert_eq!(content["schema"], serde_json::json!("2.0"));
         assert_eq!(content["config"]["update_multi"], serde_json::json!(true));
-        let markdown_content = content["elements"][0]["content"].as_str().unwrap();
+        let markdown_content = content["body"]["elements"][0]["content"].as_str().unwrap();
         assert!(
             markdown_content.contains("\\*world\\*"),
             "got: {markdown_content}"
@@ -795,7 +799,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&send_request.body).unwrap();
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-        let action = &content["elements"][1];
+        let action = &content["body"]["elements"][1];
         assert_eq!(action["tag"], serde_json::json!("action"));
         assert_eq!(
             action["actions"][0]["behaviors"][0]["value"]["cb"],
@@ -866,7 +870,7 @@ mod tests {
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
         assert_eq!(
-            content["elements"][0]["content"],
+            content["body"]["elements"][0]["content"],
             serde_json::json!("updated")
         );
     }
