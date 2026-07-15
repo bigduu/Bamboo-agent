@@ -825,3 +825,180 @@ async fn reset_bamboo_config_also_deletes_connect_json_bak() {
          a live, immediately-usable bot token"
     );
 }
+
+// ── config-corruption recovery status + confirm API (#153) ─────────────────
+
+/// GET /bamboo/config/recovery-status reports no pending recovery on a clean
+/// config.json, and a full pending status (source + quarantine path) after
+/// booting against a corrupt one.
+#[actix_web::test]
+async fn get_config_recovery_status_reports_pending_state_after_corrupt_boot() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    // No pending recovery on a totally fresh data dir.
+    let clean_dir = tempdir().expect("temp dir should be created");
+    let clean_state = AppState::new(clean_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let clean_app = test::init_service(App::new().app_data(web::Data::new(clean_state)).route(
+        "/bamboo/config/recovery-status",
+        web::get().to(super::get_config_recovery_status),
+    ))
+    .await;
+    let get = test::TestRequest::get()
+        .uri("/bamboo/config/recovery-status")
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&clean_app, get).await;
+    assert_eq!(body["pending"], false);
+
+    // Boot against a corrupt config.json (no .bak) -> defaults + pending recovery.
+    let corrupt_dir = tempdir().expect("temp dir should be created");
+    std::fs::write(corrupt_dir.path().join("config.json"), "}}} broken").unwrap();
+    let corrupt_state = AppState::new(corrupt_dir.path().to_path_buf())
+        .await
+        .expect("app state should still initialize");
+    let corrupt_app = test::init_service(App::new().app_data(web::Data::new(corrupt_state)).route(
+        "/bamboo/config/recovery-status",
+        web::get().to(super::get_config_recovery_status),
+    ))
+    .await;
+    let get = test::TestRequest::get()
+        .uri("/bamboo/config/recovery-status")
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&corrupt_app, get).await;
+    assert_eq!(body["pending"], true);
+    assert_eq!(body["status"]["confirmed"], false);
+    assert_eq!(body["status"]["source"]["kind"], "defaults");
+    assert!(
+        body["status"]["quarantine_path"].is_string(),
+        "quarantine_path should point at the preserved corrupt original"
+    );
+}
+
+/// POST /bamboo/config/recovery/confirm with `{"accept": true}` persists the
+/// recovered config and flips `pending` to `false`; a subsequent GET agrees.
+#[actix_web::test]
+async fn confirm_config_recovery_endpoint_accept_clears_pending_state() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    std::fs::write(
+        temp_dir.path().join("config.json"),
+        r#"{"http_proxy":"http://salvaged","env_vars":"bad-type"}"#,
+    )
+    .unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route(
+                "/bamboo/config/recovery-status",
+                web::get().to(super::get_config_recovery_status),
+            )
+            .route(
+                "/bamboo/config/recovery/confirm",
+                web::post().to(super::confirm_config_recovery),
+            ),
+    )
+    .await;
+
+    let confirm = test::TestRequest::post()
+        .uri("/bamboo/config/recovery/confirm")
+        .set_json(serde_json::json!({ "accept": true }))
+        .to_request();
+    let confirm_resp = test::call_service(&app, confirm).await;
+    assert!(
+        confirm_resp.status().is_success(),
+        "accepting a pending recovery should succeed"
+    );
+    let body: serde_json::Value = test::read_body_json(confirm_resp).await;
+    assert_eq!(body["pending"], false);
+
+    let get = test::TestRequest::get()
+        .uri("/bamboo/config/recovery-status")
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(
+        body["pending"], false,
+        "a follow-up GET agrees the recovery is resolved"
+    );
+
+    let on_disk = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist");
+    assert!(
+        on_disk.contains("http://salvaged"),
+        "the recovered state was actually persisted to config.json"
+    );
+}
+
+/// POST with `{"accept": false}` leaves config.json untouched and `pending`
+/// still `true`.
+#[actix_web::test]
+async fn confirm_config_recovery_endpoint_reject_leaves_pending_state() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let corrupt_bytes = "}}} broken";
+    std::fs::write(temp_dir.path().join("config.json"), corrupt_bytes).unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(App::new().app_data(web::Data::new(state)).route(
+        "/bamboo/config/recovery/confirm",
+        web::post().to(super::confirm_config_recovery),
+    ))
+    .await;
+
+    let confirm = test::TestRequest::post()
+        .uri("/bamboo/config/recovery/confirm")
+        .set_json(serde_json::json!({ "accept": false }))
+        .to_request();
+    let confirm_resp = test::call_service(&app, confirm).await;
+    assert!(confirm_resp.status().is_success());
+    let body: serde_json::Value = test::read_body_json(confirm_resp).await;
+    assert_eq!(body["pending"], true, "reject leaves the recovery pending");
+
+    let on_disk = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist");
+    assert_eq!(
+        on_disk, corrupt_bytes,
+        "reject must not touch the on-disk corrupt original"
+    );
+}
+
+/// POST /bamboo/config/recovery/confirm with nothing pending is a 400, not a
+/// silent success.
+#[actix_web::test]
+async fn confirm_config_recovery_endpoint_errors_when_nothing_pending() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app = test::init_service(App::new().app_data(web::Data::new(state)).route(
+        "/bamboo/config/recovery/confirm",
+        web::post().to(super::confirm_config_recovery),
+    ))
+    .await;
+
+    let confirm = test::TestRequest::post()
+        .uri("/bamboo/config/recovery/confirm")
+        .set_json(serde_json::json!({ "accept": true }))
+        .to_request();
+    let confirm_resp = test::call_service(&app, confirm).await;
+    assert_eq!(
+        confirm_resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
+    );
+}
