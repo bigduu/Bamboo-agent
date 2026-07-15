@@ -59,7 +59,7 @@ pub struct CapacityGardenerRunResult {
     pub archived: usize,
 }
 
-async fn collect_model_json(
+pub(crate) async fn collect_model_json(
     provider: Arc<dyn LLMProvider>,
     model: &str,
     system_instruction: &str,
@@ -100,7 +100,7 @@ async fn collect_model_json(
 /// Mirrors auto_dream's background-model resolution (ProviderModelRef when enabled,
 /// else `memory.background_model` / provider fast model). Returns `None` when no
 /// background model is configured — the gardener then skips without spending tokens.
-fn resolve_background_model(
+pub(crate) fn resolve_background_model(
     ctx: &AutoDreamContext,
     config_snapshot: &Config,
 ) -> Option<(Arc<dyn LLMProvider>, String)> {

@@ -480,6 +480,18 @@ bamboo serve --port 9562 --data-dir ~/.local/share/bamboo
 - `BAMBOO_PORT` - Server port (default: 9562)
 - `BAMBOO_DATA_DIR` - Data directory
 - `BAMBOO_BIND` - Bind address (default: 127.0.0.1)
+- `BAMBOO_WORKSPACE_ROOT` - Root directory for session workspaces that have no
+  explicit path (default: `<data-dir>/workspaces`). A session with no
+  configured/explicit workspace gets `<workspace-root>/<session-id>` instead
+  of the server process's working directory.
+- `BAMBOO_WORKSPACE_CONFINE` - Set to `1`/`true` to require every explicit
+  workspace path to be canonicalized and confined under
+  `BAMBOO_WORKSPACE_ROOT` (escapes via `..`, a symlink, or an absolute path
+  elsewhere are relocated under the root instead of honored as-is). Off by
+  default for local single-user use, where pointing bamboo at an existing
+  project directory anywhere on disk must keep working; implicitly enabled
+  when `BAMBOO_WORKSPACE_ROOT` is set explicitly. Intended for orchestrated /
+  multi-tenant deployments that want "one folder = one tenant's entire state".
 
 ---
 

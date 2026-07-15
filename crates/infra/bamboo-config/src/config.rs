@@ -189,6 +189,27 @@ pub struct MemoryConfig {
         alias = "memory_project_first_dream"
     )]
     pub project_first_dream: bool,
+    /// Whether the ledger agenda (overdue/upcoming prospective records — todos,
+    /// events, reminders) is injected into the main prompt. Free when the
+    /// ledger is empty: the section is simply omitted.
+    #[serde(
+        default = "default_true_memory_ledger_agenda",
+        alias = "memory_ledger_agenda_injection"
+    )]
+    pub ledger_agenda_injection: bool,
+    /// Whether the background ledger gardener runs (expires past events/reminders,
+    /// reconciles record↔schedule drift, distills completed records into durable
+    /// memory). Expiry and reconciliation are deterministic and free; only
+    /// distillation uses the background model, and it no-ops without one.
+    #[serde(default = "default_true_ledger_gardener_enabled")]
+    pub ledger_gardener_enabled: bool,
+    /// Seconds between ledger gardener runs (default 6 hours).
+    #[serde(default = "default_ledger_gardener_interval_secs")]
+    pub ledger_gardener_interval_secs: u64,
+    /// Whether the ledger gardener's distillation pass (completed records →
+    /// durable memories via the background model) is enabled.
+    #[serde(default = "default_true_ledger_distillation_enabled")]
+    pub ledger_distillation_enabled: bool,
     /// DEPRECATED (memory redesign L3): the "Refine" Dream mode — rewriting the
     /// notebook from its own prior prose — was retired because a self-referential
     /// narrative rewrite drifts from durable truth and silently over-merges. The
@@ -264,6 +285,10 @@ impl Default for MemoryConfig {
             relevant_recall: default_true_memory_relevant_recall(),
             relevant_recall_rerank: false,
             project_first_dream: default_true_memory_project_first_dream(),
+            ledger_agenda_injection: default_true_memory_ledger_agenda(),
+            ledger_gardener_enabled: default_true_ledger_gardener_enabled(),
+            ledger_gardener_interval_secs: default_ledger_gardener_interval_secs(),
+            ledger_distillation_enabled: default_true_ledger_distillation_enabled(),
             dream_refine_mode: false,
             gardener_enabled: default_true_gardener_enabled(),
             gardener_interval_secs: default_gardener_interval_secs(),
@@ -292,6 +317,22 @@ fn default_true_gardener_enabled() -> bool {
 }
 
 fn default_true_dedup_gardener_enabled() -> bool {
+    true
+}
+
+fn default_true_memory_ledger_agenda() -> bool {
+    true
+}
+
+fn default_true_ledger_gardener_enabled() -> bool {
+    true
+}
+
+fn default_ledger_gardener_interval_secs() -> u64 {
+    21_600
+}
+
+fn default_true_ledger_distillation_enabled() -> bool {
     true
 }
 
@@ -675,6 +716,27 @@ pub struct ConnectPlatformConfig {
     /// Encrypted ciphertext of `token` (the at-rest representation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_encrypted: Option<String>,
+    /// Platform app id (Feishu `app_id`). Not a secret — serialized normally.
+    /// Unused by the Telegram adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// Platform app secret (Feishu `app_secret`).
+    ///
+    /// Secret: encrypted at rest in `app_secret_encrypted`; this plaintext
+    /// field is never serialized and is hydrated in memory on load (mirrors
+    /// `token` above).
+    #[serde(default, skip_serializing)]
+    pub app_secret: Option<String>,
+    /// Encrypted ciphertext of `app_secret` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_secret_encrypted: Option<String>,
+    /// Platform domain/base-URL selector (Feishu-only today). Not a secret —
+    /// serialized normally. `None`/`"feishu"` -> open.feishu.cn, `"lark"` ->
+    /// open.larksuite.com, an `https://` value -> a private-deployment base
+    /// URL used verbatim. Validation happens in the server registration arm,
+    /// not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     /// Platform-scoped user ids allowed to drive a session. Deliberately
     /// STRICTER than the general secret-mask precedents: an EMPTY list means
     /// deny-all (every inbound message is rejected), not allow-all — a
@@ -717,15 +779,27 @@ pub struct TrustedKey {
     pub public_key: String,
 }
 
-/// Nova's official plugin-signing key, trusted by default so an out-of-the-box
-/// `bamboo plugin install <official nova release url>` needs no
-/// `--allow-unsigned` once nova's release CI signs the bundle.
+/// The official plugin-signing keys trusted by default, so an out-of-the-box
+/// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
+/// for a bundle those repos' release CI signed. One entry per first-party
+/// plugin publisher; each repo commits its public half as
+/// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
+/// (magpie) for cross-checking.
 fn default_trusted_keys() -> Vec<TrustedKey> {
-    vec![TrustedKey {
-        label: "nova (bigduu official)".to_string(),
-        algorithm: "ed25519".to_string(),
-        public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59".to_string(),
-    }]
+    vec![
+        TrustedKey {
+            label: "nova (bigduu official)".to_string(),
+            algorithm: "ed25519".to_string(),
+            public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59"
+                .to_string(),
+        },
+        TrustedKey {
+            label: "magpie (bigduu official)".to_string(),
+            algorithm: "ed25519".to_string(),
+            public_key: "47e971c39cd93adb18cff50e097cb387df49e9c4d33b0ed62f693eabbe7fc66e"
+                .to_string(),
+        },
+    ]
 }
 
 /// Default trusted host+path prefix: the `bigduu` GitHub org/user's own repos
@@ -3972,6 +4046,10 @@ mod tests {
             platform_type: platform_type.to_string(),
             token: None,
             token_encrypted: Some(token_encrypted.to_string()),
+            app_id: None,
+            app_secret: None,
+            app_secret_encrypted: None,
+            domain: None,
             allow_from: vec!["user-1".to_string()],
             admin_from: Vec::new(),
         }
@@ -4350,6 +4428,117 @@ mod tests {
         assert!(current.contains("new-cipher"));
     }
 
+    // ── Feishu adapter config fields (epic #447 phase 3, §2a) ───────────
+
+    #[test]
+    fn save_splits_feishu_app_secret_into_connect_json_encrypted_alongside_app_id_and_domain() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![ConnectPlatformConfig {
+            platform_type: "feishu".to_string(),
+            token: None,
+            token_encrypted: None,
+            app_id: Some("cli_real_app_id".to_string()),
+            app_secret: Some("plain-app-secret".to_string()),
+            app_secret_encrypted: None,
+            domain: Some("lark".to_string()),
+            allow_from: vec!["ou_1".to_string()],
+            admin_from: Vec::new(),
+        }];
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        assert_eq!(connect_json["platforms"][0]["type"], "feishu");
+        assert_eq!(connect_json["platforms"][0]["app_id"], "cli_real_app_id");
+        assert_eq!(connect_json["platforms"][0]["domain"], "lark");
+        assert!(
+            connect_json["platforms"][0]["app_secret_encrypted"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "app_secret is persisted in its encrypted form in connect.json"
+        );
+        assert!(
+            connect_json["platforms"][0].get("app_secret").is_none(),
+            "the plaintext app_secret is never persisted (skip_serializing)"
+        );
+    }
+
+    #[test]
+    fn load_hydrates_feishu_app_secret_from_encrypted() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![ConnectPlatformConfig {
+            platform_type: "feishu".to_string(),
+            token: None,
+            token_encrypted: None,
+            app_id: Some("cli_real_app_id".to_string()),
+            app_secret: Some("plain-app-secret".to_string()),
+            app_secret_encrypted: None,
+            domain: Some("lark".to_string()),
+            allow_from: vec!["ou_1".to_string()],
+            admin_from: Vec::new(),
+        }];
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let reloaded = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(reloaded.connect.platforms.len(), 1);
+        assert_eq!(
+            reloaded.connect.platforms[0].app_secret.as_deref(),
+            Some("plain-app-secret"),
+            "reload hydrates app_secret from app_secret_encrypted"
+        );
+        assert_eq!(
+            reloaded.connect.platforms[0].app_id.as_deref(),
+            Some("cli_real_app_id")
+        );
+        assert_eq!(
+            reloaded.connect.platforms[0].domain.as_deref(),
+            Some("lark")
+        );
+    }
+
+    #[test]
+    fn legacy_telegram_only_connect_entry_without_feishu_fields_still_deserializes() {
+        let temp = TempHome::new();
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        assert_eq!(config.connect.platforms.len(), 1);
+        assert_eq!(config.connect.platforms[0].platform_type, "telegram");
+        assert_eq!(
+            config.connect.platforms[0].token_encrypted.as_deref(),
+            Some("legacy-cipher")
+        );
+        assert_eq!(
+            config.connect.platforms[0].app_id, None,
+            "a legacy entry with no Feishu fields deserializes them as None"
+        );
+        assert_eq!(config.connect.platforms[0].app_secret, None);
+        assert_eq!(config.connect.platforms[0].app_secret_encrypted, None);
+        assert_eq!(config.connect.platforms[0].domain, None);
+    }
+
     #[test]
     fn config_new_ignores_proxy_env_vars_when_proxy_fields_omitted() {
         let _lock = env_lock_acquire();
@@ -4602,6 +4791,10 @@ mod tests {
                 relevant_recall: false,
                 relevant_recall_rerank: true,
                 project_first_dream: false,
+                ledger_agenda_injection: false,
+                ledger_gardener_enabled: false,
+                ledger_gardener_interval_secs: 7_200,
+                ledger_distillation_enabled: false,
                 dream_refine_mode: true,
                 gardener_enabled: true,
                 gardener_interval_secs: 3_600,

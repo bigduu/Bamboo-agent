@@ -528,6 +528,152 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
     );
 }
 
+/// Feishu adapter config plumbing (epic #447 phase 3, §2a): `app_id`/`domain`
+/// are plain fields, `app_secret` follows the exact same encrypted-at-rest +
+/// masked-GET + masked-preserve-on-PATCH contract as the Telegram `token`
+/// above.
+#[actix_web::test]
+async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_masked_value() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+    use bamboo_config::encryption;
+
+    // See the long NOTE on the Telegram equivalent above for why the
+    // process-global (not thread-local) encryption key is relied on here.
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    // 1) Set a Feishu entry with app_id, app_secret, domain via the settings
+    // PATCH surface.
+    let post = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "feishu-real-secret",
+                        "domain": "lark",
+                        "allow_from": ["ou_1"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post_resp = test::call_service(&app, post).await;
+    assert!(post_resp.status().is_success(), "set config should succeed");
+
+    // config.json must NOT carry the `connect` key at all (#455 split).
+    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist after set");
+    assert!(
+        !config_text.contains("\"connect\""),
+        "config.json must not persist the connect key"
+    );
+    assert!(
+        !config_text.contains("feishu-real-secret"),
+        "plaintext app_secret must never be persisted anywhere"
+    );
+
+    // connect.json holds app_id/domain in plain and app_secret encrypted.
+    let connect_path = data_dir.join("connect.json");
+    let connect_text = tokio::fs::read_to_string(&connect_path)
+        .await
+        .expect("connect.json should exist after set");
+    assert!(
+        connect_text.contains("app_secret_encrypted"),
+        "app_secret must be persisted encrypted in connect.json"
+    );
+    assert!(
+        !connect_text.contains("feishu-real-secret"),
+        "plaintext app_secret must never be persisted in connect.json"
+    );
+    let connect_json: serde_json::Value =
+        serde_json::from_str(&connect_text).expect("connect.json should parse");
+    assert_eq!(connect_json["platforms"][0]["app_id"], "cli_real_app_id");
+    assert_eq!(connect_json["platforms"][0]["domain"], "lark");
+    let app_secret_encrypted = connect_json["platforms"][0]["app_secret_encrypted"]
+        .as_str()
+        .expect("app_secret_encrypted should be present")
+        .to_string();
+    assert_eq!(
+        encryption::decrypt(&app_secret_encrypted).expect("app_secret should decrypt"),
+        "feishu-real-secret"
+    );
+
+    // 2) GET masks app_secret but leaves app_id/domain visible.
+    let get = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(body["connect"]["platforms"][0]["app_secret"], "****...****");
+    assert_eq!(body["connect"]["platforms"][0]["app_id"], "cli_real_app_id");
+    assert_eq!(body["connect"]["platforms"][0]["domain"], "lark");
+
+    // 3) Re-POST with the masked placeholder plus an unrelated field change —
+    // the secret must survive untouched.
+    let post2 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "****...****",
+                        "domain": "lark",
+                        "allow_from": ["ou_1", "ou_2"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post2_resp = test::call_service(&app, post2).await;
+    assert!(
+        post2_resp.status().is_success(),
+        "second set config should succeed"
+    );
+
+    let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body2: serde_json::Value = test::call_and_read_body_json(&app, get2).await;
+    assert_eq!(
+        body2["connect"]["platforms"][0]["app_secret"], "****...****",
+        "app_secret must still read as configured"
+    );
+    assert_eq!(
+        body2["connect"]["platforms"][0]["allow_from"],
+        serde_json::json!(["ou_1", "ou_2"]),
+        "unrelated field change must apply"
+    );
+
+    let connect_text_after = tokio::fs::read_to_string(&connect_path)
+        .await
+        .expect("connect.json should still exist");
+    let connect_json_after: serde_json::Value =
+        serde_json::from_str(&connect_text_after).expect("connect.json should parse");
+    let app_secret_encrypted_after = connect_json_after["platforms"][0]["app_secret_encrypted"]
+        .as_str()
+        .expect("app_secret_encrypted should still be present")
+        .to_string();
+    assert_eq!(
+        encryption::decrypt(&app_secret_encrypted_after).expect("app_secret should decrypt"),
+        "feishu-real-secret",
+        "masked round-trip preserves the real app_secret across the split files"
+    );
+}
+
 /// #455 gap: a full config reset must also clear `connect.json`, or a
 /// bamboo-connect bot token would silently survive `POST
 /// /bamboo/config/reset` and get re-merged back onto the freshly-defaulted

@@ -16,13 +16,12 @@ use tokio_util::sync::CancellationToken;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::runner_state::AgentRunner;
 use bamboo_engine::execution::{
     create_event_forwarder, get_or_create_event_sender, spawn_session_execution,
     try_reserve_runner, SessionExecutionArgs,
 };
-use bamboo_engine::{AuxiliaryModelConfig, ModelRoster, SessionRepository};
+use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
 
 use super::approvals::{self, ParkedAsk, RespondAndResumeOutcome, Responder};
@@ -155,62 +154,20 @@ enum AskResolution {
 }
 
 /// Resolved model/prompt/workspace configuration for a connect-driven run,
-/// derived from the live global config. Mirrors
-/// `schedule_app::manager::ResolvedRunConfig`, minus the per-job overrides a
-/// scheduled run supports (a chat message has none).
-struct ResolvedConnectRunConfig {
-    model_roster: ModelRoster,
-    reasoning_effort: Option<ReasoningEffort>,
-    gold_config: Option<GoldConfig>,
-    system_prompt: String,
-    base_system_prompt: String,
-    workspace_path: Option<String>,
-}
+/// derived from the live global config.
+///
+/// This is a thin alias over [`bamboo_engine::resolved_defaults::ResolvedDefaultRunConfig`]
+/// — the SOLE implementation of this resolution cascade, shared with the
+/// public `GET /api/v1/execute/defaults` handler (issue #480). Do not
+/// reimplement the model/prompt/workspace cascade here; extend the shared
+/// helper instead.
+type ResolvedConnectRunConfig = bamboo_engine::resolved_defaults::ResolvedDefaultRunConfig;
 
 fn resolve_connect_run_config(
     config_snapshot: &Config,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> ResolvedConnectRunConfig {
-    let model = config_snapshot.get_model().unwrap_or_default();
-    let provider_name = Some(config_snapshot.effective_default_provider().to_string());
-    let provider_type = provider_name.as_deref().and_then(|name| {
-        bamboo_engine::model_config_helper::resolve_provider_type(
-            config_snapshot,
-            name,
-            provider_registry,
-        )
-    });
-    let capability_provider_name = provider_name
-        .as_deref()
-        .unwrap_or(config_snapshot.effective_default_provider());
-    // Auxiliary models are global (config-derived), never session-bound —
-    // same rationale as `schedule_app::manager::resolve_run_config_from_config`.
-    let areas = bamboo_engine::model_areas::resolve_global_area_models(
-        config_snapshot,
-        capability_provider_name,
-        provider_registry,
-    );
-    let reasoning_effort = config_snapshot.get_reasoning_effort();
-    let base_system_prompt =
-        bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
-    let workspace_path = config_snapshot
-        .get_default_work_area_path()
-        .map(|path| bamboo_config::paths::path_to_display_string(&path));
-    let system_prompt = bamboo_engine::context::assemble_system_prompt(
-        &base_system_prompt,
-        None,
-        workspace_path.as_deref(),
-    );
-    let model_roster = ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
-
-    ResolvedConnectRunConfig {
-        model_roster,
-        reasoning_effort,
-        gold_config: bamboo_engine::model_config_helper::resolve_gold_config(config_snapshot, None),
-        system_prompt,
-        base_system_prompt,
-        workspace_path,
-    }
+    bamboo_engine::resolved_defaults::resolve_default_run_config(config_snapshot, provider_registry)
 }
 
 /// Builds a fresh session for a connect chat key. Mirrors

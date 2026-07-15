@@ -154,8 +154,9 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
             depth: 0,
         },
         ExecutorSpec::BambooRuntime,
-        std::env::temp_dir()
-            .join("bamboo-broker-agents")
+        // #217: the persistent data-dir subagents home, not `env::temp_dir()`.
+        bamboo_config::paths::subagents_dir()
+            .join("broker-agents")
             .join(&args.id)
             .to_string_lossy()
             .into_owned(),

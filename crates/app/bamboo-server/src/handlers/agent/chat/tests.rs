@@ -11,16 +11,20 @@ fn chat_request_deserialization_with_model() {
     let request: ChatRequest = serde_json::from_str(json).expect("chat request should deserialize");
     assert_eq!(request.message, "Hello");
     assert_eq!(request.session_id, Some("test-session".to_string()));
-    assert_eq!(request.model, "gpt-5");
+    assert_eq!(request.model.as_deref(), Some("gpt-5"));
 }
 
+/// #480: `model` is optional on `POST /chat` — omitting it must deserialize
+/// successfully (not error), leaving `model: None` for the handler to resolve
+/// against the server's default via `bamboo_engine::resolved_defaults`.
 #[test]
-fn chat_request_deserialization_without_model() {
+fn chat_request_deserialization_without_model_defaults_to_none() {
     let json = r#"{
             "message": "Hello"
         }"#;
-    let result: Result<ChatRequest, _> = serde_json::from_str(json);
-    assert!(result.is_err());
+    let request: ChatRequest =
+        serde_json::from_str(json).expect("model-less chat request should deserialize");
+    assert!(request.model.is_none());
 }
 
 #[test]
@@ -39,19 +43,21 @@ fn session_model_round_trip() {
     assert_eq!(deserialized.model, "gpt-5");
 }
 
+/// #480: `ChatRequest.model` is `Option<String>` (not a bare `String`) so a
+/// request can omit it and let the server resolve a default.
 #[test]
-fn chat_request_model_type_is_string_not_option() {
+fn chat_request_model_field_is_optional_string() {
     let json = r#"{
             "message": "Hello",
             "model": "claude-3-opus"
         }"#;
     let request: ChatRequest = serde_json::from_str(json).expect("chat request should deserialize");
-    let _model_str: &str = &request.model;
-    assert_eq!(request.model, "claude-3-opus");
+    let _model_opt: &Option<String> = &request.model;
+    assert_eq!(request.model.as_deref(), Some("claude-3-opus"));
 }
 
 #[test]
-fn chat_request_empty_model_fails_validation() {
+fn chat_request_blank_model_trims_to_empty() {
     let request = ChatRequest {
         message: "Hello".to_string(),
         session_id: None,
@@ -61,12 +67,14 @@ fn chat_request_empty_model_fails_validation() {
         workspace_path: None,
         selected_skill_ids: None,
         images: None,
-        model: "   ".to_string(),
+        model: Some("   ".to_string()),
         provider: None,
         model_ref: None,
     };
-    let model = request.model.trim();
-    assert!(model.is_empty(), "Empty model should fail validation");
+    // A whitespace-only model is treated the same as an absent one by the
+    // handler's `request::resolve_model` (falls back to the server default).
+    let model = request.model.as_deref().unwrap_or_default().trim();
+    assert!(model.is_empty(), "Blank model should be treated as absent");
 }
 
 #[test]

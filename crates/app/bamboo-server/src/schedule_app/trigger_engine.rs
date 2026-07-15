@@ -75,7 +75,7 @@ pub enum TriggerComputationError {
 
 /// Minimal built-in trigger engine used as the default interface implementation.
 ///
-/// It owns Bamboo's native recurrence logic for interval/daily/weekly/monthly.
+/// It owns Bamboo's native recurrence logic for interval/once/daily/weekly/monthly.
 #[derive(Debug, Default)]
 pub struct NativeTriggerEngine;
 
@@ -130,6 +130,18 @@ impl TriggerEngine for NativeTriggerEngine {
                     return Err(TriggerComputationError::UnsupportedTimezone(self.kind()));
                 }
                 compute_interval_next(*every_seconds, *anchor_at, after)?
+            }
+            ScheduleTrigger::Once { at } => {
+                // `at` is already an absolute UTC instant, so a timezone is
+                // meaningless here — reject it, mirroring Interval's policy.
+                if timezone.is_some() {
+                    return Err(TriggerComputationError::UnsupportedTimezone(self.kind()));
+                }
+                if *at > after {
+                    Some(*at)
+                } else {
+                    None
+                }
             }
             ScheduleTrigger::Daily {
                 hour,
@@ -498,6 +510,85 @@ mod tests {
         assert_eq!(due[0], anchor + Duration::seconds(60));
         assert_eq!(due[1], anchor + Duration::seconds(120));
         assert_eq!(due[2], anchor + Duration::seconds(180));
+    }
+
+    #[test]
+    fn once_next_fires_exactly_once() {
+        let engine = NativeTriggerEngine::new();
+        let at = DateTime::parse_from_rfc3339("2026-04-04T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Before `at`: the single occurrence is still ahead.
+        let before = at - Duration::seconds(60);
+        let next = engine
+            .next_after(
+                &ScheduleTrigger::Once { at },
+                None,
+                before,
+                &ScheduleWindow::default(),
+            )
+            .unwrap();
+        assert_eq!(next, Some(at));
+
+        // Exactly at `at` (the claim advances past it): no further occurrence.
+        let next = engine
+            .next_after(
+                &ScheduleTrigger::Once { at },
+                None,
+                at,
+                &ScheduleWindow::default(),
+            )
+            .unwrap();
+        assert_eq!(next, None);
+
+        // After `at`: still no further occurrence.
+        let next = engine
+            .next_after(
+                &ScheduleTrigger::Once { at },
+                None,
+                at + Duration::seconds(60),
+                &ScheduleWindow::default(),
+            )
+            .unwrap();
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn once_next_rejects_timezone_like_interval() {
+        let engine = NativeTriggerEngine::new();
+        let at = DateTime::parse_from_rfc3339("2026-04-04T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let error = engine
+            .next_after(
+                &ScheduleTrigger::Once { at },
+                Some("Asia/Shanghai"),
+                at - Duration::seconds(60),
+                &ScheduleWindow::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TriggerComputationError::UnsupportedTimezone(TriggerEngineKind::Native)
+        );
+    }
+
+    #[test]
+    fn composite_routes_once_to_native_engine() {
+        let engine = CompositeTriggerEngine::new();
+        let at = DateTime::parse_from_rfc3339("2026-04-04T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = engine
+            .next_after(
+                &ScheduleTrigger::Once { at },
+                None,
+                at - Duration::seconds(60),
+                &ScheduleWindow::default(),
+            )
+            .unwrap();
+        assert_eq!(next, Some(at));
     }
 
     #[test]
