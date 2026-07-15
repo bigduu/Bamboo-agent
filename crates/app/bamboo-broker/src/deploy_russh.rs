@@ -12,11 +12,15 @@
 //! 5. `exec` the worker pointed at the tunnel mouth.
 //!
 //! The returned [`DeployedAgent`] owns the live `russh` session: keeping it
-//! alive keeps the tunnel + worker up; `shutdown` kills the remote worker and
-//! disconnects (session-bound lifetime, like the system-ssh path — true
-//! survive-restart durability is a later phase).
+//! alive keeps the tunnel + worker up; `shutdown`/`shutdown_with_timeout`
+//! signal the remote worker and POLL for it to exit — keeping the session and
+//! reverse tunnel up throughout, so an in-flight reply can drain through it —
+//! before hard-killing and disconnecting (session-bound lifetime, like the
+//! system-ssh path — true survive-restart durability is a later phase). #489.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use russh::client::{self, Handle, Msg};
@@ -33,6 +37,11 @@ use crate::deploy::{
     UploadSpec,
 };
 use crate::error::{BrokerError, BrokerResult};
+
+/// Interval between `pgrep` liveness polls during the graceful-drain window in
+/// [`RusshHandle::shutdown_with_timeout`]. Short enough to notice a fast exit
+/// promptly, long enough not to hammer the SSH connection with exec requests.
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Decrypted SSH credentials for the russh path (the fabric layer decrypts the
 /// at-rest ciphertext before constructing the deployer).
@@ -215,7 +224,8 @@ impl client::Handler for FabricHandler {
 }
 
 /// Live remote handle: owns the `russh` session (keeping the tunnel + worker
-/// alive). `shutdown` kills the worker by id and disconnects.
+/// alive). `shutdown`/`shutdown_with_timeout` signal the worker by id, poll for
+/// its exit through the still-open tunnel, then hard-kill + disconnect (#489).
 struct RusshHandle {
     session: Mutex<Option<Handle<FabricHandler>>>,
     worker_id: String,
@@ -227,15 +237,57 @@ struct RusshHandle {
 
 #[async_trait]
 impl RemoteDeployment for RusshHandle {
-    async fn shutdown(&self) {
+    /// #489: `pkill` only SIGNALS the worker — it does not wait for it to
+    /// exit. The previous implementation disconnected (tearing down the SSH
+    /// session and, with it, the reverse tunnel the worker drains its
+    /// in-flight Ask/Task/Run reply through) immediately after issuing the
+    /// signal, severing the graceful drain #488 added mid-reply. Fix: signal,
+    /// then POLL the remote for the worker's exit — keeping the session/tunnel
+    /// alive — for up to `timeout` (mirrors `DeployedAgent::shutdown_with_timeout`'s
+    /// local-process SIGTERM-then-poll pattern), THEN hard-kill as a fallback
+    /// and only then disconnect.
+    async fn shutdown_with_timeout(&self, timeout: Duration) {
         let Some(session) = self.session.lock().await.take() else {
             return;
         };
-        // Best-effort: kill the worker (anchored on its unique spec path when
-        // present — the truncated worker_id can substring-collide), remove the
-        // creds-bearing spec file, then disconnect (tears down the reverse tunnel).
+        // Anchored on the unique spec path when present — the truncated
+        // worker_id can substring-collide across nodes.
         let kill_anchor = self.remote_spec_path.as_deref().unwrap_or(&self.worker_id);
-        let mut cmd = format!("pkill -f {}", sh_quote(kill_anchor));
+
+        // 1. SIGTERM (pkill's default signal): give the worker's own shutdown
+        //    handler a chance to drain cleanly, same as the local-process path.
+        let term_cmd = format!("pkill -f {}", sh_quote(kill_anchor));
+        if let Ok(channel) = session.channel_open_session().await {
+            let _ = channel.exec(false, term_cmd).await;
+        }
+
+        // 2. Poll for the worker's exit within the grace window. The session
+        //    (and therefore the reverse tunnel) stays open the entire time, so
+        //    a reply the worker is still draining through it can complete.
+        //    Best-effort: a poll that errors (e.g. a transient exec hiccup) is
+        //    treated as "still alive" rather than aborting the wait early.
+        poll_until_exited(
+            || async {
+                exec_capture(
+                    &session,
+                    &format!(
+                        "pgrep -f {} >/dev/null 2>&1 && echo 1 || echo 0",
+                        sh_quote(kill_anchor)
+                    ),
+                )
+                .await
+                .map(|out| out.trim() == "1")
+                .unwrap_or(true)
+            },
+            timeout,
+            POLL_INTERVAL,
+        )
+        .await;
+
+        // 3. Hard-kill fallback (harmless no-op if it already exited above) +
+        //    remove the creds-bearing spec file, THEN disconnect — only now is
+        //    the reverse tunnel torn down.
+        let mut cmd = format!("pkill -9 -f {}", sh_quote(kill_anchor));
         if let Some(spec) = &self.remote_spec_path {
             cmd.push_str(&format!("; rm -f {}", sh_quote(spec)));
         }
@@ -245,6 +297,32 @@ impl RemoteDeployment for RusshHandle {
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "", "")
             .await;
+    }
+}
+
+/// Poll `is_alive` every `interval` until it reports `false` (exited on its
+/// own) or `timeout` elapses (still alive at the deadline — caller should
+/// escalate to a hard kill). Returns `true` iff it exited within the window.
+///
+/// Factored out of [`RusshHandle::shutdown_with_timeout`] so the bounded-grace
+/// polling behavior is unit-testable without a live SSH session — see the
+/// `poll_until_exited_*` tests below. Mirrors the shape of the local-process
+/// poll loop in [`DeployedAgent::shutdown_with_timeout`], just driven by an
+/// arbitrary async liveness check instead of `Child::try_wait`.
+async fn poll_until_exited<F, Fut>(mut is_alive: F, timeout: Duration, interval: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !is_alive().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -618,5 +696,81 @@ mod tests {
     #[test]
     fn parse_private_key_rejects_garbage() {
         assert!(parse_private_key("not a key", None).is_err());
+    }
+
+    // #489: `poll_until_exited` backs `RusshHandle::shutdown_with_timeout`'s
+    // grace-window wait. It can't be exercised against a real remote without a
+    // live SSH session (see `tests/russh_live.rs`, gated behind
+    // `BAMBOO_RUSSH_LIVE=1`), so these tests drive it directly with a fake
+    // liveness check instead — the polling/timeout behavior is identical
+    // either way, since `poll_until_exited` doesn't know or care that the real
+    // liveness check is an SSH `pgrep` exec.
+
+    /// A worker that exits partway through the grace window: `is_alive` flips
+    /// to `false` after a couple of polls. Must return `true` (exited on its
+    /// own) well before the timeout elapses.
+    #[tokio::test]
+    async fn poll_until_exited_returns_true_once_alive_check_goes_false() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let start = tokio::time::Instant::now();
+        let exited = poll_until_exited(
+            move || {
+                let calls = calls2.clone();
+                async move {
+                    // Alive for the first two checks, exited by the third.
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(exited, "must report exited once is_alive returns false");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "must have polled past the two `alive` responses"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must return promptly once the worker exits, not wait out the full timeout"
+        );
+    }
+
+    /// A worker that never exits (e.g. ignores the signal, mirroring the
+    /// SIGTERM-ignoring case #49 tests for the local-process path): the poll
+    /// must be BOUNDED — return `false` once `timeout` elapses rather than
+    /// hanging forever — so the caller's hard-kill fallback always runs.
+    #[tokio::test]
+    async fn poll_until_exited_returns_false_when_still_alive_at_deadline() {
+        let exited = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_until_exited(
+                || async { true }, // always "still alive"
+                Duration::from_millis(150),
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("poll_until_exited must be bounded by its own timeout");
+        assert!(!exited, "must report NOT exited once the deadline elapses");
+    }
+
+    /// A worker that's already gone by the first check: must return
+    /// immediately without waiting a full `interval`.
+    #[tokio::test]
+    async fn poll_until_exited_returns_true_immediately_when_already_dead() {
+        let start = tokio::time::Instant::now();
+        let exited = poll_until_exited(
+            || async { false },
+            Duration::from_secs(5),
+            Duration::from_secs(10), // deliberately long — must not be waited on
+        )
+        .await;
+        assert!(exited);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "first is_alive()==false must short-circuit, not wait an interval"
+        );
     }
 }
