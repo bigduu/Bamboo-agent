@@ -24,6 +24,13 @@ impl AppState {
     ///   - workflows/: Workflow definitions
     ///   - cache/: Cached data
     ///   - runtime/: Runtime files
+    ///   - workspaces/: Default per-session workspace dirs (issue #217) — a
+    ///     session with no configured/explicit workspace gets
+    ///     `workspaces/{session_id}` here instead of the server process's
+    ///     cwd. Overridable via `BAMBOO_WORKSPACE_ROOT`.
+    ///   - subagents/: Local actor sub-agent fabric discovery + isolated
+    ///     per-child storage (issue #217) — replaces the old
+    ///     `env::temp_dir()/bamboo-subagents` default.
     ///
     /// # Returns
     ///
@@ -165,6 +172,23 @@ impl AppState {
                 },
             ));
         }
+
+        // Issue #217: wire the workspace-root + confinement policy into
+        // agent-core, mirroring the default-workspace provider just above.
+        // This is what lets `workspace_or_process_cwd` default a session with
+        // NO configured/explicit workspace to `data_dir/workspaces/{session}`
+        // instead of falling through to the server process's cwd, and lets
+        // `set_workspace` pin/relocate an explicit path when confinement is
+        // enabled (`BAMBOO_WORKSPACE_CONFINE` / `BAMBOO_WORKSPACE_ROOT`).
+        // Read fresh from the environment on every call (not captured here)
+        // so an operator-set env var is honored the same way `bamboo_dir()`
+        // itself is — no config-file knob needed.
+        bamboo_agent_core::workspace_state::set_workspace_root_provider(Box::new(|| {
+            bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                root: bamboo_config::paths::resolve_workspace_root(),
+                confine: bamboo_config::paths::workspace_confinement_enforced(),
+            }
+        }));
 
         let permission_checker = load_permission_checker(&bamboo_home_dir).await;
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
@@ -628,6 +652,25 @@ impl AppState {
         // `Unreachable` so the UI/agent see reality (a redeploy brings it back).
         reconcile_fabric_on_boot(&config, &bamboo_home_dir).await;
 
+        // `ServiceManager` (issue #479 / epic #477 prereq): supervises
+        // long-running "service" plugins. Always constructed — fully inert
+        // until a plugin install or the boot-time reconcile below starts
+        // something — mirrors `mcp_manager`/`connect_manager`'s
+        // always-alive lifecycle.
+        let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
+        {
+            // Backgrounded (mirrors `init_mcp_manager`'s background MCP
+            // bootstrap): a service that `installed.json` says should be
+            // running but isn't (the previous `bamboo serve` process, if
+            // any, died with everything it supervised) is started fresh.
+            let service_manager = service_manager.clone();
+            let app_data_dir = bamboo_home_dir.clone();
+            tokio::spawn(async move {
+                crate::plugin_installer::boot_reconcile_services(&app_data_dir, &service_manager)
+                    .await;
+            });
+        }
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -657,6 +700,7 @@ impl AppState {
             mcp_proxy_shutdown,
             skill_manager,
             mcp_manager,
+            service_manager,
             metrics_service,
             agent_runners,
             session_event_senders,

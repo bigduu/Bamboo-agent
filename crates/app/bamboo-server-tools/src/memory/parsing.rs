@@ -71,7 +71,14 @@ impl MemoryTool {
     pub(super) fn parse_query_filters(
         filters: Option<&QueryFilters>,
     ) -> Result<FilterTypeSet, ToolError> {
+        // Each sub-filter is gated on ITS OWN list being non-empty, not merely on
+        // `filters` being present. Without the `filter(...)` guard, a caller that
+        // sets e.g. `{"filters":{"granularity":["week"]}}` (leaving `type`/
+        // `status` at their empty-vec defaults) would turn the omitted fields into
+        // `Some(<empty set>)`, which matches NOTHING — silently filtering out
+        // every memory instead of leaving those two dimensions unfiltered.
         let filter_types = filters
+            .filter(|value| !value.r#type.is_empty())
             .map(|value| {
                 value
                     .r#type
@@ -81,6 +88,7 @@ impl MemoryTool {
             })
             .transpose()?;
         let filter_statuses = filters
+            .filter(|value| !value.status.is_empty())
             .map(|value| {
                 value
                     .status
@@ -89,7 +97,27 @@ impl MemoryTool {
                     .collect::<Result<HashSet<_>, _>>()
             })
             .transpose()?;
-        Ok((filter_types, filter_statuses))
+        // Empty/omitted granularity list stays `None` (no filtering, back-compat)
+        // rather than an empty set (which would match nothing) — same convention
+        // as `filter_types`/`filter_statuses` above. Each entry must be a concrete
+        // granularity token (typos surface as errors, same as the other filters).
+        let filter_granularity = filters
+            .filter(|value| !value.granularity.is_empty())
+            .map(|value| {
+                value
+                    .granularity
+                    .iter()
+                    .map(|item| {
+                        TemporalGranularity::parse(item).ok_or_else(|| {
+                            ToolError::InvalidArguments(format!(
+                                "invalid granularity filter '{item}'; expected one of: day, week, month, quarter, year"
+                            ))
+                        })
+                    })
+                    .collect::<Result<HashSet<_>, _>>()
+            })
+            .transpose()?;
+        Ok((filter_types, filter_statuses, filter_granularity))
     }
 
     pub(super) fn parse_merge_mode(value: Option<&str>) -> Result<Option<String>, ToolError> {

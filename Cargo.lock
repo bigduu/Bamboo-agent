@@ -1001,6 +1001,7 @@ dependencies = [
  "bamboo-subagent",
  "chrono",
  "futures-util",
+ "governor",
  "russh",
  "russh-sftp",
  "serde",

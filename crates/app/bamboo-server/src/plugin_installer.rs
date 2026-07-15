@@ -146,6 +146,7 @@ use tokio::fs;
 
 use bamboo_domain::mcp_config::McpServerConfig;
 use bamboo_plugin::installer::{load_previous_for_disposition, preflight_install};
+use bamboo_plugin::manifest::{Platform, ServiceManifestEntry};
 use bamboo_plugin::registry::{reconcile_exclusive, RegisteredCapabilities};
 use bamboo_plugin::{
     InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
@@ -158,6 +159,7 @@ use crate::handlers::agent::mcp::upsert_server_by_id;
 use crate::handlers::agent::prompt_presets::{
     ensure_unique_preset_id, load_store, save_store, store_file_path, StoredPromptPreset,
 };
+use crate::service_manager::{ServiceManager, ServiceRuntimeConfig};
 
 /// Process-wide serialization of plugin install/uninstall operations.
 ///
@@ -209,6 +211,14 @@ struct InstallRollback {
     mcp_ids_started: Vec<String>,
     preset_ids_added: Vec<String>,
     workflow_files_added: Vec<String>,
+    /// Service ids this install claimed ownership of (whether or not the
+    /// actual `start_service` call succeeded — best-effort, same contract as
+    /// `mcp_ids_added`/`mcp_ids_started`).
+    service_ids_added: Vec<String>,
+    /// Subset of `service_ids_added` that actually got a running
+    /// `ServiceManager` runtime started — only these need `stop_service` on
+    /// rollback.
+    service_ids_started: Vec<String>,
 }
 
 impl ServerPluginInstaller {
@@ -230,6 +240,83 @@ impl ServerPluginInstaller {
 
     fn prompt_presets_path(&self) -> PathBuf {
         store_file_path(&self.state.app_data_dir)
+    }
+
+    /// `<data_dir>/plugin_service_config/<plugin_id>/config.json` — the
+    /// per-service user config path passed to services as
+    /// `BAMBOO_PLUGIN_SERVICE_CONFIG` (issue #479 open question 2).
+    ///
+    /// Deliberately NOT under `plugins_dir()/<plugin_id>/` (the
+    /// swap-managed `plugin_dir`): `plugin_source::stage_plugin_source`
+    /// upgrades a plugin by renaming the ENTIRE old `plugin_dir` aside and
+    /// swapping a freshly-staged directory into its place — any file living
+    /// inside `plugin_dir` would be swept away with the old bundle on
+    /// upgrade (or deleted outright on uninstall) unless bamboo specifically
+    /// carried it forward, which it does not. A sibling directory, named
+    /// only by `plugin_id`, is untouched by that swap and by
+    /// `uninstall`'s `remove_dir_all(plugin_dir)` — so a service's own
+    /// config (which may carry tokens/secrets a connector needs) survives
+    /// both an upgrade and an uninstall. bamboo only ever creates the PARENT
+    /// directory here (see [`Self::ensure_service_config_parent_dir`]) —
+    /// never writes or deletes `config.json` itself; on uninstall it is
+    /// deliberately left in place (not part of `remove_dir_all`), so a
+    /// later re-install of the same plugin id picks its old config back up
+    /// automatically.
+    fn service_config_path(&self, plugin_id: &str) -> PathBuf {
+        service_config_path_under(&self.state.app_data_dir, plugin_id)
+    }
+
+    async fn ensure_service_config_parent_dir(&self, plugin_id: &str) -> PluginResult<()> {
+        let path = self.service_config_path(plugin_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        Ok(())
+    }
+
+    /// Every service id currently owned by any OTHER installed plugin — the
+    /// "existing" side of [`reconcile_exclusive`] for services. There is no
+    /// single shared document analogous to `config.json` for services, so
+    /// provenance itself is the source of truth for "who owns this id".
+    ///
+    /// `exclude_plugin_id` MUST be the id of the plugin currently being
+    /// installed/upgraded and is always excluded — NOT an optional
+    /// nicety: by the time [`Self::register_services`] calls this,
+    /// `install()`'s crash-safety journal write has ALREADY upserted THIS
+    /// plugin's `Installing` row into `installed.json` with its full
+    /// INTENDED `service_ids` (see `install()`'s "Crash-safety journal"
+    /// step, which runs before every registration step). Without excluding
+    /// it, a plain fresh install would see its own not-yet-committed row as
+    /// a foreign owner of its own declared ids and refuse itself.
+    /// `previously_owned` (computed separately, from `previous` BEFORE that
+    /// journal write) is what still correctly classifies an upgrade's
+    /// re-declared ids as `OwnedReinstall` rather than `New`.
+    async fn existing_service_ids(&self, exclude_plugin_id: &str) -> PluginResult<Vec<String>> {
+        let store = InstalledPlugins::load(&self.installed_json_path()).await?;
+        Ok(store
+            .list()
+            .iter()
+            .filter(|plugin| plugin.id != exclude_plugin_id)
+            .flat_map(|plugin| plugin.registered.service_ids.iter().cloned())
+            .collect())
+    }
+
+    /// Resolve one manifest-declared service entry into a
+    /// [`ServiceRuntimeConfig`] ready for `ServiceManager::start_service`.
+    fn resolve_service_config(
+        &self,
+        plugin_id: &str,
+        entry: &ServiceManifestEntry,
+        plugin_dir: &Path,
+        platform: Platform,
+    ) -> ServiceRuntimeConfig {
+        resolve_service_config_under(
+            &self.state.app_data_dir,
+            plugin_id,
+            entry,
+            plugin_dir,
+            platform,
+        )
     }
 
     /// Every `.md` filename directly under `workflows_dir()` (created if
@@ -319,6 +406,16 @@ impl ServerPluginInstaller {
         }
     }
 
+    async fn remove_service(&self, id: &str) {
+        if let Err(error) = self.state.service_manager.stop_service(id).await {
+            tracing::warn!(
+                service_id = %id,
+                %error,
+                "failed to stop plugin-owned service; continuing"
+            );
+        }
+    }
+
     async fn remove_workflow_file(&self, filename: &str) {
         let path = self.workflows_dir().join(filename);
         match fs::remove_file(&path).await {
@@ -347,6 +444,9 @@ impl ServerPluginInstaller {
         for workflow_filename in &registered.workflow_filenames {
             self.remove_workflow_file(workflow_filename).await;
         }
+        for service_id in &registered.service_ids {
+            self.remove_service(service_id).await;
+        }
     }
 
     /// Best-effort undo of an `install()` that failed partway through steps
@@ -363,6 +463,9 @@ impl ServerPluginInstaller {
         }
         for file in &rollback.workflow_files_added {
             self.remove_workflow_file(file).await;
+        }
+        for id in &rollback.service_ids_started {
+            let _ = self.state.service_manager.stop_service(id).await;
         }
     }
 
@@ -524,6 +627,79 @@ impl ServerPluginInstaller {
         Ok(reconciliation.to_register)
     }
 
+    /// Step 1b: Services (issue #479, prereq for epic #477). Same
+    /// REFUSE-on-conflict + best-effort-start shape as [`Self::register_mcp`],
+    /// against [`Self::existing_service_ids`] instead of `config.json` (there
+    /// is no shared config document for services — provenance itself is the
+    /// ownership store, see that method's doc comment).
+    async fn register_services(
+        &self,
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        previously_owned: &[String],
+        rollback: &mut InstallRollback,
+    ) -> PluginResult<Vec<String>> {
+        if manifest.provides.services.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let declared_ids: Vec<String> = manifest
+            .provides
+            .services
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        let existing_ids = self.existing_service_ids(&manifest.id).await?;
+        let reconciliation = reconcile_exclusive(&declared_ids, &existing_ids, previously_owned);
+        if !reconciliation.foreign_conflicts.is_empty() {
+            return Err(PluginError::Conflict {
+                kind: "service",
+                name: reconciliation.foreign_conflicts.join(", "),
+                plugin_id: manifest.id.clone(),
+            });
+        }
+
+        // Ownership is claimed regardless of individual start outcomes below
+        // (matches `register_mcp`'s "config write succeeded, so record
+        // ownership" contract — here there is no config write, so this is
+        // simply claimed up front).
+        rollback.service_ids_added = reconciliation.to_register.clone();
+
+        self.ensure_service_config_parent_dir(&manifest.id).await?;
+        let platform = Platform::current().unwrap_or(Platform::Linux);
+        let to_register: HashSet<&str> = reconciliation
+            .to_register
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        for entry in &manifest.provides.services {
+            if !to_register.contains(entry.id.as_str()) {
+                continue;
+            }
+            // Stop any stale running instance first — covers a leftover
+            // from a crashed install/upgrade recovery (a genuine same-id
+            // upgrade already had its old service stopped BEFORE staging by
+            // `stop_services_for_upgrade`, see the module docs' "Same-id
+            // upgrade ordering").
+            let _ = self.state.service_manager.stop_service(&entry.id).await;
+            if !entry.enabled {
+                continue;
+            }
+            let config = self.resolve_service_config(&manifest.id, entry, plugin_dir, platform);
+            match self.state.service_manager.start_service(config).await {
+                Ok(()) => rollback.service_ids_started.push(entry.id.clone()),
+                Err(error) => tracing::warn!(
+                    service_id = %entry.id,
+                    %error,
+                    "plugin-registered service failed to start; ownership kept (best-effort, matches mcp)"
+                ),
+            }
+        }
+
+        Ok(reconciliation.to_register)
+    }
+
     /// Step 2: Prompts. Rename-on-collision (never refuses) — returns the
     /// ACTUAL ids used (after any rename), which is what provenance must
     /// record.
@@ -618,6 +794,119 @@ impl ServerPluginInstaller {
 
         Ok(reconciliation.to_register)
     }
+
+    /// **Same-id upgrade ordering** (issue #479 "Install-flow deltas" /
+    /// "Same-id upgrade ordering bug risk"): `plugin_source::stage_plugin_source`
+    /// swaps `plugin_dir`'s ENTIRE contents (old bundle moved to a
+    /// `.backup-*` dir, staged bundle renamed into place) BEFORE
+    /// `install()` — and therefore [`Self::register_services`] — ever runs.
+    /// A still-running old service process holding the old binary open
+    /// during that swap is at best running stale code post-swap and at
+    /// worst (Windows) blocks the rename outright. The minimal seam that
+    /// fixes the ordering without restructuring `stage_plugin_source`/
+    /// `install()`: the HTTP `update_plugin` handler calls this BEFORE
+    /// `stage_plugin_source`, using the URL path's target id (known up
+    /// front for an upgrade, unlike a fresh `install`) to look up the
+    /// CURRENTLY-installed row's `registered.service_ids` and stop each one.
+    /// Net effect: stop (old binary) → swap (new binary) → start (new
+    /// binary, via `register_services` inside `install()`), exactly the
+    /// sequencing the issue calls for.
+    ///
+    /// Best-effort: returns exactly the ids that were actually running and
+    /// got stopped (not e.g. an already-stopped or unknown id), so a
+    /// subsequently-failed upgrade can restart precisely those — see
+    /// [`Self::restart_services_after_failed_upgrade`]. A plugin with no
+    /// prior install (or no services) returns an empty vec and stops
+    /// nothing.
+    pub async fn stop_services_for_upgrade(&self, plugin_id: &str) -> Vec<String> {
+        let store = match InstalledPlugins::load(&self.installed_json_path()).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    %plugin_id,
+                    %error,
+                    "stop_services_for_upgrade: failed to load installed.json; skipping"
+                );
+                return Vec::new();
+            }
+        };
+        let Some(entry) = store.get(plugin_id) else {
+            return Vec::new();
+        };
+        let mut stopped = Vec::with_capacity(entry.registered.service_ids.len());
+        for service_id in &entry.registered.service_ids {
+            match self.state.service_manager.stop_service(service_id).await {
+                Ok(()) => stopped.push(service_id.clone()),
+                Err(error) => tracing::debug!(
+                    service_id = %service_id,
+                    %error,
+                    "stop_services_for_upgrade: service was not running; nothing to stop"
+                ),
+            }
+        }
+        stopped
+    }
+
+    /// Counterpart to [`Self::stop_services_for_upgrade`]: called after a
+    /// FAILED upgrade whose `StagedPlugin::rollback()` already restored
+    /// `plugin_dir` to the pre-upgrade bundle's bytes — re-reads that
+    /// (now-restored) OLD `plugin.json` and restarts exactly the services in
+    /// `stopped` that it still declares as `enabled`. Best-effort/
+    /// log-and-continue: a failure here leaves the affected service stopped
+    /// (a degraded-but-safe outcome — never silently double-runs an old and
+    /// a new instance) rather than panicking the request.
+    pub async fn restart_services_after_failed_upgrade(&self, plugin_id: &str, stopped: &[String]) {
+        if stopped.is_empty() {
+            return;
+        }
+        let store = match InstalledPlugins::load(&self.installed_json_path()).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    %plugin_id,
+                    %error,
+                    "restart_services_after_failed_upgrade: failed to load installed.json"
+                );
+                return;
+            }
+        };
+        let Some(entry) = store.get(plugin_id) else {
+            return;
+        };
+        let manifest_path = entry.plugin_dir.join("plugin.json");
+        let manifest = match fs::read_to_string(&manifest_path)
+            .await
+            .ok()
+            .and_then(|raw| PluginManifest::parse_str(&raw).ok())
+        {
+            Some(manifest) => manifest,
+            None => {
+                tracing::warn!(
+                    %plugin_id,
+                    path = %manifest_path.display(),
+                    "restart_services_after_failed_upgrade: failed to read/parse the \
+                     rolled-back plugin.json; affected service(s) remain stopped"
+                );
+                return;
+            }
+        };
+        let platform = Platform::current().unwrap_or(Platform::Linux);
+        for svc in &manifest.provides.services {
+            if !stopped.contains(&svc.id) || !svc.enabled {
+                continue;
+            }
+            let config = self.resolve_service_config(plugin_id, svc, &entry.plugin_dir, platform);
+            if let Err(error) = self.state.service_manager.start_service(config).await {
+                tracing::warn!(
+                    service_id = %svc.id,
+                    %plugin_id,
+                    %error,
+                    "failed to restart service after a failed upgrade rolled back to the \
+                     previous plugin bundle; service remains stopped"
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -663,6 +952,12 @@ impl PluginInstaller for ServerPluginInstaller {
                 .map(|preset| preset.id.clone())
                 .collect(),
             workflow_filenames: manifest.provides.workflows.clone(),
+            service_ids: manifest
+                .provides
+                .services
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect(),
         };
 
         // Step 0: upgrade drop-diff. Computed from the NEW manifest's plain
@@ -680,6 +975,7 @@ impl PluginInstaller for ServerPluginInstaller {
                     dropped_mcp = ?dropped.mcp_server_ids,
                     dropped_presets = ?dropped.preset_ids,
                     dropped_workflows = ?dropped.workflow_filenames,
+                    dropped_services = ?dropped.service_ids,
                     "install drop-diff: de-registering capabilities the new/completed version no longer declares"
                 );
                 self.deregister_capabilities(&dropped).await;
@@ -693,6 +989,10 @@ impl PluginInstaller for ServerPluginInstaller {
         let previously_owned_workflows = previous
             .as_ref()
             .map(|p| p.registered.workflow_filenames.clone())
+            .unwrap_or_default();
+        let previously_owned_services = previous
+            .as_ref()
+            .map(|p| p.registered.service_ids.clone())
             .unwrap_or_default();
 
         // Crash-safety journal: write an `Installing` provenance row recording
@@ -722,6 +1022,30 @@ impl PluginInstaller for ServerPluginInstaller {
                 manifest,
                 resolved_mcp_servers,
                 &previously_owned_mcp,
+                &mut rollback,
+            )
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
+                    .await;
+                return Err(error);
+            }
+        };
+
+        // Step 1b: Services (issue #479). Runs right after MCP, before the
+        // never-refusing Prompts step, so a services conflict fails the
+        // install as early as the other REFUSE-on-conflict kinds do. Note:
+        // for a same-id UPGRADE, the OLD service (if any) was already
+        // stopped by `stop_services_for_upgrade` before `stage_plugin_source`
+        // swapped `plugin_dir` — see that method's doc comment on the
+        // stop→swap→start sequencing.
+        let service_ids = match self
+            .register_services(
+                manifest,
+                plugin_dir,
+                &previously_owned_services,
                 &mut rollback,
             )
             .await
@@ -781,6 +1105,7 @@ impl PluginInstaller for ServerPluginInstaller {
             skill_dirs,
             preset_ids,
             workflow_filenames,
+            service_ids,
         };
         let entry = InstalledPlugin {
             id: manifest.id.clone(),
@@ -835,6 +1160,142 @@ impl PluginInstaller for ServerPluginInstaller {
     async fn list(&self) -> PluginResult<Vec<InstalledPlugin>> {
         let store = InstalledPlugins::load(&self.installed_json_path()).await?;
         Ok(store.plugins)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Free helpers shared between `ServerPluginInstaller` (instance methods
+// above, which delegate here) and `boot_reconcile_services` (which has no
+// `ServerPluginInstaller`/`AppState` handle to call instance methods on —
+// see `app_state::builder`, which calls it before `AppState` finishes
+// constructing).
+// ---------------------------------------------------------------------
+
+/// See `ServerPluginInstaller::service_config_path`'s doc comment for the
+/// full rationale (kept there since that's the reader's first encounter).
+fn service_config_path_under(app_data_dir: &Path, plugin_id: &str) -> PathBuf {
+    app_data_dir
+        .join("plugin_service_config")
+        .join(plugin_id)
+        .join("config.json")
+}
+
+fn resolve_service_config_under(
+    app_data_dir: &Path,
+    plugin_id: &str,
+    entry: &ServiceManifestEntry,
+    plugin_dir: &Path,
+    platform: Platform,
+) -> ServiceRuntimeConfig {
+    let resolved = entry.resolve(plugin_dir, plugin_id, platform);
+    ServiceRuntimeConfig {
+        id: resolved.id,
+        plugin_id: plugin_id.to_string(),
+        name: resolved.name,
+        command: resolved.command,
+        args: resolved.args,
+        cwd: resolved.cwd,
+        env: resolved.env,
+        health_check: resolved.health_check,
+        restart_policy: resolved.restart_policy,
+        graceful_shutdown: resolved.graceful_shutdown,
+        user_config_path: service_config_path_under(app_data_dir, plugin_id),
+    }
+}
+
+/// Boot-time reconcile (issue #479): start every ENABLED, plugin-owned
+/// service that `installed.json` says should be running but has no live
+/// [`ServiceManager`] runtime — the previous `bamboo serve` process (if any)
+/// died along with every service it supervised (child processes are spawned
+/// `kill_on_drop`, and nothing about a running service persists
+/// cross-process). Called from `app_state::builder` the same way
+/// `app_state::init::init_mcp_manager` kicks off its background MCP
+/// bootstrap — the caller is expected to `tokio::spawn` this, NOT await it
+/// inline, so server startup is never blocked on plugin service spawns.
+///
+/// Deliberately reads `installed.json` + each plugin's on-disk
+/// `plugin.json` directly rather than going through `ServerPluginInstaller`
+/// (which needs a fully-built `web::Data<AppState>` this runs before).
+pub async fn boot_reconcile_services(app_data_dir: &Path, service_manager: &ServiceManager) {
+    let installed_json_path = app_data_dir.join("plugins").join("installed.json");
+    let store = match InstalledPlugins::load(&installed_json_path).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "service boot-reconcile: failed to load installed.json; skipping"
+            );
+            return;
+        }
+    };
+
+    let platform = Platform::current().unwrap_or(Platform::Linux);
+    for plugin in store.list() {
+        if plugin.registered.service_ids.is_empty() {
+            continue;
+        }
+        let manifest_path = plugin.plugin_dir.join("plugin.json");
+        let manifest = match fs::read_to_string(&manifest_path)
+            .await
+            .ok()
+            .and_then(|raw| PluginManifest::parse_str(&raw).ok())
+        {
+            Some(manifest) => manifest,
+            None => {
+                tracing::warn!(
+                    plugin_id = %plugin.id,
+                    path = %manifest_path.display(),
+                    "service boot-reconcile: failed to read/parse plugin.json; skipping this \
+                     plugin's services"
+                );
+                continue;
+            }
+        };
+
+        let owned: HashSet<&str> = plugin
+            .registered
+            .service_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for entry in &manifest.provides.services {
+            if !entry.enabled || !owned.contains(entry.id.as_str()) {
+                continue;
+            }
+            if service_manager.is_running(&entry.id) {
+                continue;
+            }
+            let config = resolve_service_config_under(
+                app_data_dir,
+                &plugin.id,
+                entry,
+                &plugin.plugin_dir,
+                platform,
+            );
+            if let Some(parent) = config.user_config_path.parent() {
+                if let Err(error) = fs::create_dir_all(parent).await {
+                    tracing::warn!(
+                        service_id = %entry.id,
+                        plugin_id = %plugin.id,
+                        %error,
+                        "service boot-reconcile: failed to create service config parent dir"
+                    );
+                }
+            }
+            match service_manager.start_service(config).await {
+                Ok(()) => tracing::info!(
+                    service_id = %entry.id,
+                    plugin_id = %plugin.id,
+                    "service boot-reconcile: started"
+                ),
+                Err(error) => tracing::warn!(
+                    service_id = %entry.id,
+                    plugin_id = %plugin.id,
+                    %error,
+                    "service boot-reconcile: failed to start"
+                ),
+            }
+        }
     }
 }
 

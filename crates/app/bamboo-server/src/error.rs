@@ -49,6 +49,12 @@ pub enum AppError {
     #[error("Proxy authentication required")]
     ProxyAuthRequired,
 
+    /// config.json was recovered from a corrupt file (#153) and the recovery
+    /// hasn't been confirmed yet — writes are refused until the caller
+    /// confirms (or rejects) via the recovery-confirm API.
+    #[error("Config recovery pending confirmation: {0}")]
+    ConfigRecoveryPending(String),
+
     #[error("Internal server error: {0}")]
     InternalError(#[from] anyhow::Error),
 
@@ -83,6 +89,7 @@ impl ResponseError for AppError {
             AppError::ToolApprovalRequired(_) => StatusCode::FORBIDDEN,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::ProxyAuthRequired => StatusCode::PRECONDITION_REQUIRED,
+            AppError::ConfigRecoveryPending(_) => StatusCode::CONFLICT,
             AppError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::SerializationError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,6 +104,9 @@ impl ResponseError for AppError {
                 r#type: "api_error".to_string(),
                 code: match self {
                     AppError::ProxyAuthRequired => Some("proxy_auth_required".to_string()),
+                    AppError::ConfigRecoveryPending(_) => {
+                        Some("config_recovery_pending".to_string())
+                    }
                     _ => None,
                 },
             },

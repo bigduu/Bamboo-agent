@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[command(version)]
 #[command(about = "A fully self-contained AI agent backend framework", long_about = None)]
 #[command(
-    after_help = "QUICK RUN (headless server):\n  bamboo -p \"your task\"               full agent run (incl. sub-agents), print result, exit\n  bamboo -p \"next step\" -s <session>  continue an existing session's loop\n  bamboo -p \"...\" -m provider:model   pin the model\n  bamboo -p \"ping\" --echo             no-key smoke of the actor chain (no server)"
+    after_help = "QUICK RUN (headless server):\n  bamboo -p \"your task\"               full agent run (incl. sub-agents), print result, exit\n  bamboo -p \"next step\" -s <session>  continue an existing session's loop\n  bamboo -p \"...\" -m provider:model   pin the model\n  bamboo -p \"ping\" --echo             no-key smoke of the actor chain (no server)\n  echo \"your task\" | bamboo -p -      read the prompt from stdin\n  bamboo completions zsh > ~/.zfunc/_bamboo   shell completions"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -76,10 +76,81 @@ struct Cli {
     #[arg(long = "skill-mode")]
     skill_mode: Option<String>,
 
+    /// With -p: cancel the run if it hasn't finished within this many seconds
+    /// (wall clock; counts any permission-gate round trips). Cancels the same
+    /// way Ctrl-C does, then exits non-zero. Client-side only — there is no
+    /// server-side per-run deadline in `ExecuteRequest` (yet) to delegate to.
+    #[arg(long = "timeout", value_name = "SECONDS")]
+    timeout: Option<u64>,
+
     /// Default log level when `RUST_LOG` is unset: error | warn | info | debug | trace.
-    /// `RUST_LOG` still takes precedence when set.
+    /// `RUST_LOG` still takes precedence when set. Takes priority over `-v`/`--verbose`.
     #[arg(long = "log-level", global = true)]
     log_level: Option<String>,
+
+    /// Increase log verbosity when `--log-level`/`RUST_LOG` are unset: `-v` = debug,
+    /// `-vv` (or more) = trace. Ignored if `--log-level` is given (more specific);
+    /// `RUST_LOG` still wins over both when set.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Path to a `config.json` file, or its containing directory, to use
+    /// instead of the default `<data-dir>/config.json`. Internally this
+    /// resolves to a data directory exactly like `--data-dir` does, and is
+    /// applied by seeding `BAMBOO_DATA_DIR` for this process (only when that
+    /// env var isn't already set — same "explicit env wins" precedent as
+    /// `--log-level`/`RUST_LOG`). Boundary: an explicit `--data-dir` (or
+    /// `--conn.data-dir`) on a specific subcommand still wins over this,
+    /// since it is passed directly rather than through the env fallback.
+    #[arg(long = "config", value_name = "PATH", global = true)]
+    config: Option<PathBuf>,
+}
+
+/// Resolve `--config <PATH>` to a data directory. A directory is used as-is
+/// (matches `--data-dir` semantics: the dir that holds `config.json`). A file
+/// path (existing or not-yet-created) is anchored on its parent directory,
+/// since the data directory — not a bare file path — is what actually gates
+/// `config.json` resolution throughout the codebase (see
+/// `bamboo_config::paths::resolve_bamboo_dir`).
+///
+/// A path that doesn't exist is treated as a FILE only when it looks like one
+/// (a `.json` extension); anything else is taken as a not-yet-created data
+/// DIRECTORY and used as-is — `--data-dir` doesn't require its directory to
+/// exist either, and anchoring a nonexistent bare directory on its parent
+/// would land one level too high.
+fn resolve_config_data_dir(path: &std::path::Path) -> Result<PathBuf, String> {
+    if path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+    let looks_like_file = path.is_file()
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+    if !looks_like_file {
+        return Ok(path.to_path_buf());
+    }
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => Ok(parent.to_path_buf()),
+        // A bare filename with no parent component: anchor on the current dir.
+        _ => Ok(PathBuf::from(".")),
+    }
+}
+
+/// `clap` `value_parser` for `broker serve --messages-per-second` /
+/// `--message-burst`: rejects `0` with a clear CLI error instead of letting
+/// it through and silently falling back to the default deep inside
+/// `BrokerLimits` construction (review finding on #491/#53) — an operator
+/// passing `0` almost certainly wants a hard error, not a quiet no-op.
+fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|e| format!("invalid number: {e}"))?;
+    if n == 0 {
+        return Err(
+            "must be greater than 0 (0 would silently fall back to the default, not enforce \
+             a stricter limit)"
+                .to_string(),
+        );
+    }
+    Ok(n)
 }
 
 /// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
@@ -918,6 +989,34 @@ enum BrokerCommands {
         /// Durable mailbox storage root. Defaults to `<bamboo_dir>/broker`.
         #[arg(long)]
         root: Option<PathBuf>,
+
+        /// Max concurrent WebSocket connections (#53 DoS defense). Beyond
+        /// this, new connections are dropped immediately. Default is
+        /// generous — sized well above a normal multi-worker fabric.
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().max_connections)]
+        max_connections: usize,
+
+        /// Sustained per-connection `Deliver`-frame rate, frames/sec (#53).
+        /// Exceeding it delays (not disconnects) the connection. Default is
+        /// well above a single live event-streaming Run's normal rate. Must
+        /// be nonzero — `0` is rejected outright rather than silently
+        /// falling back to the default, since a `0` is almost certainly a
+        /// misconfiguration (an operator trying to be maximally strict, or a
+        /// scripting bug), not an intentional "block everything".
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().messages_per_second.get(), value_parser = parse_nonzero_u32)]
+        messages_per_second: u32,
+
+        /// Burst allowance layered on `--messages-per-second` (#53). Must be
+        /// nonzero (see `--messages-per-second`).
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().message_burst.get(), value_parser = parse_nonzero_u32)]
+        message_burst: u32,
+
+        /// Max pending (undelivered-or-unacked) messages a single session's
+        /// mailbox may hold before `deliver` starts refusing more (#53) — a
+        /// backlog cap against a flood aimed at an offline/never-draining
+        /// mailbox.
+        #[arg(long, default_value_t = bamboo_broker::DEFAULT_MAX_PENDING_PER_MAILBOX)]
+        max_pending_per_mailbox: usize,
     },
 }
 
@@ -1099,11 +1198,43 @@ enum ActorCommands {
 async fn main() {
     let cli = Cli::parse();
 
-    // `--log-level` seeds `RUST_LOG` (only when unset) so every logging path —
-    // the fmt subscribers below AND `serve`'s file logging — honors it uniformly.
-    // An explicit `RUST_LOG` still wins. Validated to a plain level here (use
-    // `RUST_LOG` directly for target-scoped directives).
-    if let Some(level) = cli.log_level.as_deref() {
+    // `--config <path>` seeds `BAMBOO_DATA_DIR` (only when unset) with the data
+    // directory it resolves to, so every flow that falls back to
+    // `bamboo_config::paths::resolve_bamboo_dir()` (i.e. did not receive its own
+    // explicit `--data-dir` / `ConnArgs::data_dir`) picks it up — that covers
+    // `-p`, `serve`, `init`, `doctor`, `config`, `actor`, `mcp list`/`skills list`,
+    // and every admin verb's `ConnArgs`. A subcommand's own explicit `--data-dir`
+    // still wins (it's passed directly, not through the env fallback), and an
+    // already-set `BAMBOO_DATA_DIR` wins over `--config` too — same
+    // "explicit env wins" precedent as `--log-level`/`RUST_LOG` below.
+    if let Some(path) = cli.config.as_deref() {
+        match resolve_config_data_dir(path) {
+            Ok(dir) => {
+                if std::env::var_os("BAMBOO_DATA_DIR").is_none() {
+                    // SAFETY: main thread, before any async runtime work reads the env.
+                    unsafe {
+                        std::env::set_var("BAMBOO_DATA_DIR", dir.as_os_str());
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("invalid --config '{}': {e}", path.display());
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // `--log-level` (or `-v`/`-vv` when `--log-level` is absent) seeds `RUST_LOG`
+    // (only when unset) so every logging path — the fmt subscribers below AND
+    // `serve`'s file logging — honors it uniformly. An explicit `RUST_LOG` still
+    // wins. Validated to a plain level here (use `RUST_LOG` directly for
+    // target-scoped directives).
+    let verbose_level = match cli.verbose {
+        0 => None,
+        1 => Some("debug"),
+        _ => Some("trace"),
+    };
+    if let Some(level) = cli.log_level.as_deref().or(verbose_level) {
         const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
         if !LEVELS.contains(&level.to_ascii_lowercase().as_str()) {
             eprintln!(
@@ -1250,6 +1381,7 @@ async fn main() {
                 reasoning_effort: cli.reasoning_effort,
                 skill_mode: cli.skill_mode,
                 provider: cli.provider,
+                timeout_secs: cli.timeout,
             };
             if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");
@@ -1465,7 +1597,15 @@ async fn main() {
         }
 
         Commands::Broker { command } => {
-            let BrokerCommands::Serve { bind, token, root } = command;
+            let BrokerCommands::Serve {
+                bind,
+                token,
+                root,
+                max_connections,
+                messages_per_second,
+                message_burst,
+                max_pending_per_mailbox,
+            } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
                 .filter(|t| !t.is_empty())
@@ -1491,13 +1631,36 @@ async fn main() {
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| bind.clone());
-            tracing::info!(%addr, root = %root.display(), "bamboo broker serving");
-            let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(root));
+            tracing::info!(
+                %addr,
+                root = %root.display(),
+                max_connections,
+                messages_per_second,
+                message_burst,
+                max_pending_per_mailbox,
+                "bamboo broker serving"
+            );
+            let core = std::sync::Arc::new(
+                bamboo_broker::BrokerCore::new(root)
+                    .with_max_pending_per_mailbox(max_pending_per_mailbox),
+            );
             // Reclaim empty, unsubscribed mailbox dirs every 5 minutes.
             let _gc = core
                 .clone()
                 .spawn_mailbox_gc(std::time::Duration::from_secs(300));
-            let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, token));
+            let limits = bamboo_broker::BrokerLimits {
+                max_connections,
+                // `parse_nonzero_u32` (the clap `value_parser` on both flags)
+                // already rejected `0` at CLI-parse time, so these are
+                // infallible here — no silent fallback needed.
+                messages_per_second: std::num::NonZeroU32::new(messages_per_second)
+                    .expect("clap value_parser rejects 0"),
+                message_burst: std::num::NonZeroU32::new(message_burst)
+                    .expect("clap value_parser rejects 0"),
+            };
+            let server = std::sync::Arc::new(bamboo_broker::BrokerServer::with_limits(
+                core, token, limits,
+            ));
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
                 std::process::exit(1);
@@ -1876,11 +2039,63 @@ fn serialize_config_for_cli(
 
 #[cfg(test)]
 mod tests {
-    use super::serialize_config_for_cli;
+    use super::{resolve_config_data_dir, serialize_config_for_cli};
     use bamboo_config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
+
+    /// `--config <dir>` pointing at an existing directory is used as-is (same
+    /// semantics as `--data-dir`).
+    #[test]
+    fn resolve_config_data_dir_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_config_data_dir(dir.path()).unwrap();
+        assert_eq!(resolved, dir.path());
+    }
+
+    /// `--config <dir>/config.json` (an existing file) resolves to the file's
+    /// parent directory — the data dir is what actually gates `config.json`
+    /// resolution downstream.
+    #[test]
+    fn resolve_config_data_dir_existing_file_uses_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let resolved = resolve_config_data_dir(&config_path).unwrap();
+        assert_eq!(resolved, dir.path());
+    }
+
+    /// A not-yet-created file path (common for a fresh `bamboo init --config
+    /// <path>`-style flow) still resolves via its parent — existence is not
+    /// required.
+    #[test]
+    fn resolve_config_data_dir_nonexistent_file_uses_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("nested").join("config.json");
+        let resolved = resolve_config_data_dir(&config_path).unwrap();
+        assert_eq!(resolved, dir.path().join("nested"));
+    }
+
+    /// A bare filename with no parent component anchors on the current dir
+    /// rather than erroring.
+    #[test]
+    fn resolve_config_data_dir_bare_filename_anchors_on_current_dir() {
+        let resolved = resolve_config_data_dir(std::path::Path::new("config.json")).unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from("."));
+    }
+
+    /// A not-yet-created path that does NOT look like a config file (no
+    /// `.json` extension) is a data DIRECTORY and is used as-is — anchoring it
+    /// on its parent would land one level too high (`--data-dir` doesn't
+    /// require the directory to exist either).
+    #[test]
+    fn resolve_config_data_dir_nonexistent_bare_directory_used_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir_path = dir.path().join("brand-new-datadir");
+        let resolved = resolve_config_data_dir(&datadir_path).unwrap();
+        assert_eq!(resolved, datadir_path);
+    }
 
     // fields set conditionally below
     #[allow(clippy::field_reassign_with_default)]

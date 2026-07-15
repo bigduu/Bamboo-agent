@@ -203,13 +203,15 @@ impl FabricDeployer {
         };
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker
-        // port before the new deploy requests the same forward.
-        if let Some(prev) = self
+        // port before the new deploy requests the same forward. Remove under the
+        // lock, shut down outside it: shutdown is graceful now (SIGTERM + drain
+        // grace, #49) and must not hold the shared registry for its duration.
+        let prev = self
             .registry
             .lock()
             .await
-            .remove(&crate::registry_keys::node_key(node_id))
-        {
+            .remove(&crate::registry_keys::node_key(node_id));
+        if let Some(prev) = prev {
             prev.handle.shutdown().await;
         }
 
@@ -280,12 +282,13 @@ impl FabricDeployer {
         };
         if let Err(e) = verify {
             // Tear the half-dead worker down and report the real failure.
-            if let Some(d) = self
+            // (Remove under the lock, shut down outside it — see deploy above.)
+            let dead = self
                 .registry
                 .lock()
                 .await
-                .remove(&crate::registry_keys::node_key(node_id))
-            {
+                .remove(&crate::registry_keys::node_key(node_id));
+            if let Some(d) = dead {
                 d.handle.shutdown().await;
             }
             let msg = format!(
@@ -337,12 +340,14 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             self.node_snapshot(&cfg, node_id)?;
         }
-        if let Some(d) = self
+        // Remove under the lock, shut down outside it: shutdown is graceful now
+        // (SIGTERM + drain grace, #49) and must not hold the shared registry.
+        let removed = self
             .registry
             .lock()
             .await
-            .remove(&crate::registry_keys::node_key(node_id))
-        {
+            .remove(&crate::registry_keys::node_key(node_id));
+        if let Some(d) = removed {
             d.handle.shutdown().await;
         }
         tracing::info!(
@@ -752,19 +757,66 @@ fn build_resident_spec(
     echo: bool,
     worker_id: &str,
 ) -> Option<String> {
+    build_ondemand_provision_spec(
+        worker_id,
+        node.deploy.default_role.as_deref(),
+        node.deploy.model.as_deref(),
+        node.deploy.workspace.as_deref(),
+        std::env::temp_dir()
+            .join("bamboo-fabric-agents")
+            .join(worker_id),
+        broker_endpoint,
+        broker_token,
+        config,
+        echo,
+    )
+}
+
+/// Build a parent-resolved `ProvisionSpec` (model + creds + MCP-proxy + bus +
+/// identity), serialized as JSON, for an on-demand worker deploy. Shared by
+/// [`build_resident_spec`] (cluster-fabric nodes) and `deploy_agent`'s
+/// `env=docker` path (#46: Docker used to bind-mount the orchestrator's ENTIRE
+/// `~/.bamboo` — including `config.json` and the master
+/// `.bamboo_encryption_key` — into the worker container; this spec ships only
+/// the credentials the assigned model actually needs, over a one-shot stdin
+/// pipe, with no encryption key and no home mount at all). `None` when there
+/// are no credentials to ship and this is not an echo deploy — the caller then
+/// falls back to legacy self-resolve rather than deploying a real worker with
+/// no model/creds.
+///
+/// Credential scoping mirrors `ActorChildRunner::build_spec`
+/// (`external_agents/actor_adapter.rs`): `extract_provider_credentials`
+/// returns every configured provider's key, so it is filtered down to the
+/// single credential matching `spec.model.provider` *after* the model is
+/// resolved — never the raw unfiltered list. This applies to both callers
+/// (cluster-fabric node deploys and the AI-triggered docker path), for the
+/// same least-privilege reason `ActorChildRunner` already scopes its own
+/// workers: a review bot flagged a prior version of this helper for shipping
+/// every configured provider's key regardless of which model was pinned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ondemand_provision_spec(
+    worker_id: &str,
+    role: Option<&str>,
+    pinned_model: Option<&str>,
+    workspace: Option<&str>,
+    storage_dir: PathBuf,
+    broker_endpoint: &str,
+    broker_token: &str,
+    config: &Config,
+    echo: bool,
+) -> Option<String> {
     use bamboo_subagent::provision::{
         BusEndpoint, ChildIdentity, ExecutorSpec, McpProxyConfig, ModelRefSpec, ProvisionSpec,
     };
 
-    let credentials = bamboo_engine::external_agents::runtime::extract_provider_credentials(config);
-    if credentials.is_empty() && !echo {
+    let all_credentials =
+        bamboo_engine::external_agents::runtime::extract_provider_credentials(config);
+    if all_credentials.is_empty() && !echo {
         return None;
     }
 
-    let role = node
-        .deploy
-        .default_role
-        .clone()
+    let role = role
+        .map(str::to_string)
         .unwrap_or_else(|| "general-purpose".to_string());
     let mut spec = ProvisionSpec::new(
         ChildIdentity {
@@ -779,39 +831,57 @@ fn build_resident_spec(
         } else {
             ExecutorSpec::BambooRuntime
         },
-        std::env::temp_dir()
-            .join("bamboo-fabric-agents")
-            .join(worker_id)
-            .to_string_lossy()
-            .into_owned(),
+        storage_dir.to_string_lossy().into_owned(),
     );
     spec.bus = Some(BusEndpoint {
         endpoint: broker_endpoint.to_string(),
         token: broker_token.to_string(),
     });
-    // Model: the node's pinned `provider:model`, else the configured sub-agent /
-    // chat default (resolved HERE, on the orchestrator, not on the remote).
-    spec.model = node
-        .deploy
-        .model
-        .as_deref()
-        .and_then(parse_provider_model)
-        .or_else(|| {
-            config.defaults.as_ref().and_then(|d| {
-                // sub_agent default, else chat. Guard emptiness so we never ship an
-                // invalid `{provider:"", model:""}` spec — a modelless non-echo worker
-                // then fails the presence verify at deploy instead of at first task.
-                let r = d.sub_agent.as_ref().unwrap_or(&d.chat);
-                (!r.provider.trim().is_empty() && !r.model.trim().is_empty()).then(|| {
-                    ModelRefSpec {
-                        provider: r.provider.clone(),
-                        model: r.model.clone(),
-                    }
-                })
+    // Model: the caller's pinned `provider:model`, else the configured
+    // sub-agent / chat default (resolved HERE, on the orchestrator, never on
+    // the worker).
+    spec.model = pinned_model.and_then(parse_provider_model).or_else(|| {
+        config.defaults.as_ref().and_then(|d| {
+            // sub_agent default, else chat. Guard emptiness so we never ship an
+            // invalid `{provider:"", model:""}` spec — a modelless non-echo worker
+            // then fails the presence verify at deploy instead of at first task.
+            let r = d.sub_agent.as_ref().unwrap_or(&d.chat);
+            (!r.provider.trim().is_empty() && !r.model.trim().is_empty()).then(|| ModelRefSpec {
+                provider: r.provider.clone(),
+                model: r.model.clone(),
             })
-        });
-    spec.workspace = node.deploy.workspace.clone();
-    spec.secrets.provider_credentials = credentials;
+        })
+    });
+    spec.workspace = workspace.map(str::to_string);
+    // Least-privilege secrets: only the credential for the resolved model's
+    // provider ships — never the full `all_credentials` set (#46 follow-up).
+    match spec
+        .model
+        .as_ref()
+        .map(|m| m.provider.as_str())
+        .filter(|p| !p.trim().is_empty())
+    {
+        Some(provider) => match all_credentials.into_iter().find(|c| c.provider == provider) {
+            Some(cred) => spec.secrets.provider_credentials = vec![cred],
+            None => {
+                tracing::warn!(
+                    "ondemand spec for worker {}: no credential found for provider '{}'; \
+                         shipping none",
+                    worker_id,
+                    provider
+                );
+            }
+        },
+        None => {
+            if !echo {
+                tracing::warn!(
+                    "ondemand spec for worker {}: no model provider resolved to scope \
+                     credentials to; shipping none",
+                    worker_id
+                );
+            }
+        }
+    }
     // Deployed workers proxy ALL MCP to the orchestrator (single MCP host).
     spec.capabilities.mcp_proxy = Some(McpProxyConfig {
         orchestrator: ORCHESTRATOR_ID.to_string(),
@@ -1047,7 +1117,8 @@ fn build_russh(node: &Node, target: &SshTarget) -> Result<RusshDeployer, String>
 
 #[cfg(test)]
 mod resident_spec_tests {
-    use super::parse_provider_model;
+    use super::{build_ondemand_provision_spec, parse_provider_model};
+    use bamboo_config::Config;
 
     #[test]
     fn parse_provider_model_splits_and_guards() {
@@ -1059,6 +1130,201 @@ mod resident_spec_tests {
         assert!(parse_provider_model(":m").is_none());
         assert!(parse_provider_model("p:").is_none());
         assert!(parse_provider_model("  ").is_none());
+    }
+
+    /// A single `anthropic` provider instance carrying `key` — the
+    /// actually-live credential path `extract_provider_credentials` reads
+    /// (unlike the legacy `providers.anthropic` slot, whose `api_key` is
+    /// `#[serde(skip_serializing)]` and so never round-trips through the
+    /// generic serde projection that function uses for legacy slots).
+    fn config_with_anthropic_key(key: &str) -> Config {
+        let mut cfg = Config::default();
+        let instance: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "api_key": key,
+            }))
+            .expect("minimal ProviderInstanceConfig JSON");
+        cfg.provider_instances
+            .insert("anthropic".to_string(), instance);
+        cfg
+    }
+
+    /// Two provider instances configured (`anthropic` + `openai`) — the
+    /// multi-provider setup the review on #494 flagged: with more than one
+    /// provider configured, the ondemand spec must still carry only the ONE
+    /// credential backing the pinned model, not every configured provider.
+    fn config_with_two_providers(anthropic_key: &str, openai_key: &str) -> Config {
+        let mut cfg = config_with_anthropic_key(anthropic_key);
+        let openai: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "api_key": openai_key,
+            }))
+            .expect("minimal ProviderInstanceConfig JSON");
+        cfg.provider_instances.insert("openai".to_string(), openai);
+        cfg
+    }
+
+    /// #46 — a real (non-echo) on-demand deploy with no configured credentials
+    /// must fall back to `None` (caller then declines to hand a worker nothing
+    /// to authenticate with) rather than shipping an empty/invalid spec.
+    #[test]
+    fn ondemand_spec_is_none_without_credentials_and_not_echo() {
+        let cfg = Config::default();
+        let spec = build_ondemand_provision_spec(
+            "w1",
+            Some("researcher"),
+            Some("anthropic:claude-opus-4-8"),
+            None,
+            std::env::temp_dir().join("bamboo-test-agents").join("w1"),
+            "ws://broker:9600",
+            "tok",
+            &cfg,
+            false,
+        );
+        assert!(spec.is_none());
+    }
+
+    /// echo deploys never need credentials — always produce a spec so the
+    /// connectivity smoke test can proceed.
+    #[test]
+    fn ondemand_spec_is_some_for_echo_even_without_credentials() {
+        let cfg = Config::default();
+        let spec = build_ondemand_provision_spec(
+            "w1",
+            None,
+            None,
+            None,
+            std::env::temp_dir().join("bamboo-test-agents").join("w1"),
+            "ws://broker:9600",
+            "tok",
+            &cfg,
+            true,
+        );
+        assert!(spec.is_some());
+    }
+
+    /// The core #46 regression guard: the serialized spec carries ONLY the
+    /// configured provider credential (here `anthropic`) — never the
+    /// `.bamboo_encryption_key` string, a raw `config.json` blob, or any
+    /// unrelated provider ("openai" is unset here and must not appear).
+    #[test]
+    fn ondemand_spec_carries_only_configured_provider_credential() {
+        let cfg = config_with_anthropic_key("sk-ant-super-secret");
+        let spec_json = build_ondemand_provision_spec(
+            "w1",
+            Some("researcher"),
+            Some("anthropic:claude-opus-4-8"),
+            Some("/workspace"),
+            std::env::temp_dir().join("bamboo-test-agents").join("w1"),
+            "ws://broker:9600",
+            "tok",
+            &cfg,
+            false,
+        )
+        .expect("credentials configured — spec must be built");
+
+        assert!(spec_json.contains("sk-ant-super-secret"));
+        assert!(spec_json.contains("anthropic"));
+        // No encryption key, no on-disk config dump, no other provider.
+        assert!(!spec_json.contains("bamboo_encryption_key"));
+        assert!(!spec_json.contains("openai"));
+        assert!(!spec_json.contains("gemini"));
+
+        let parsed: bamboo_subagent::provision::ProvisionSpec =
+            serde_json::from_str(&spec_json).expect("valid ProvisionSpec JSON");
+        assert_eq!(parsed.secrets.provider_credentials.len(), 1);
+        assert_eq!(parsed.secrets.provider_credentials[0].provider, "anthropic");
+        assert_eq!(
+            parsed.secrets.provider_credentials[0].api_key,
+            "sk-ant-super-secret"
+        );
+        assert_eq!(parsed.workspace.as_deref(), Some("/workspace"));
+    }
+
+    /// #494 review finding: with TWO providers configured, a deploy pinned to
+    /// `anthropic:...` must ship ONLY the anthropic credential — the prior
+    /// version unconditionally assigned the entire `extract_provider_credentials`
+    /// output (every configured provider) regardless of which model was
+    /// pinned, so this would previously have leaked the openai key too.
+    #[test]
+    fn ondemand_spec_scopes_credentials_to_pinned_model_provider_only() {
+        let cfg = config_with_two_providers("sk-ant-secret", "sk-oai-secret");
+        let spec_json = build_ondemand_provision_spec(
+            "w1",
+            Some("researcher"),
+            Some("anthropic:claude-opus-4-8"),
+            None,
+            std::env::temp_dir().join("bamboo-test-agents").join("w1"),
+            "ws://broker:9600",
+            "tok",
+            &cfg,
+            false,
+        )
+        .expect("credentials configured — spec must be built");
+
+        let parsed: bamboo_subagent::provision::ProvisionSpec =
+            serde_json::from_str(&spec_json).expect("valid ProvisionSpec JSON");
+        assert_eq!(parsed.secrets.provider_credentials.len(), 1);
+        assert_eq!(parsed.secrets.provider_credentials[0].provider, "anthropic");
+        assert_eq!(
+            parsed.secrets.provider_credentials[0].api_key,
+            "sk-ant-secret"
+        );
+        // The unrelated, but CONFIGURED, openai key must not ship.
+        assert!(!spec_json.contains("sk-oai-secret"));
+
+        // Pin the other provider instead — only ITS credential should ship.
+        let spec_json_openai = build_ondemand_provision_spec(
+            "w2",
+            Some("researcher"),
+            Some("openai:gpt-5"),
+            None,
+            std::env::temp_dir().join("bamboo-test-agents").join("w2"),
+            "ws://broker:9600",
+            "tok",
+            &cfg,
+            false,
+        )
+        .expect("credentials configured — spec must be built");
+        let parsed_openai: bamboo_subagent::provision::ProvisionSpec =
+            serde_json::from_str(&spec_json_openai).expect("valid ProvisionSpec JSON");
+        assert_eq!(parsed_openai.secrets.provider_credentials.len(), 1);
+        assert_eq!(
+            parsed_openai.secrets.provider_credentials[0].provider,
+            "openai"
+        );
+        assert!(!spec_json_openai.contains("sk-ant-secret"));
+    }
+
+    /// A pinned model whose provider has no matching configured credential
+    /// (e.g. typo'd provider id, or a provider that was since removed) must
+    /// still build a spec — with an EMPTY credential list, not a fallback to
+    /// every other configured provider's key. Mirrors the idiom already used
+    /// by `ActorChildRunner::build_spec` (warn + ship nothing) rather than
+    /// failing the whole deploy.
+    #[test]
+    fn ondemand_spec_has_no_credentials_when_pinned_provider_has_no_match() {
+        let cfg = config_with_two_providers("sk-ant-secret", "sk-oai-secret");
+        let spec_json = build_ondemand_provision_spec(
+            "w1",
+            Some("researcher"),
+            Some("gemini:gemini-3-pro"),
+            None,
+            std::env::temp_dir().join("bamboo-test-agents").join("w1"),
+            "ws://broker:9600",
+            "tok",
+            &cfg,
+            false,
+        )
+        .expect("at least one provider configured overall — spec must be built");
+
+        let parsed: bamboo_subagent::provision::ProvisionSpec =
+            serde_json::from_str(&spec_json).expect("valid ProvisionSpec JSON");
+        assert!(parsed.secrets.provider_credentials.is_empty());
+        assert!(!spec_json.contains("sk-ant-secret"));
+        assert!(!spec_json.contains("sk-oai-secret"));
     }
 }
 

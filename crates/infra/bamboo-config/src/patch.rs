@@ -427,13 +427,17 @@ pub fn preserve_masked_notification_secrets(patch_obj: &mut Map<String, Value>, 
 /// supported) at the same time as leaving one masked is indistinguishable
 /// from "not reordered" and can still attach the wrong token to an entry —
 /// fixing that needs a schema change (a stable id field) tracked separately.
-/// What IS fixed here: a reorder is now detected whenever it changes the
-/// `platform_type` at a given index (the common case today, since only one
-/// platform type — `"telegram"` — exists) — `type` is checked against
-/// `current`'s entry at the same index, and a mismatch is treated as
-/// "nothing configured at this position" (the token is dropped, same as no
-/// plaintext existing yet) instead of silently handing one platform's secret
-/// to a different one that happens to now sit at the same index.
+/// What IS fixed here: a reorder is detected whenever it changes the
+/// `platform_type` at a given index — `type` is checked against `current`'s
+/// entry at the same index, and a mismatch (or an index beyond
+/// `current.connect.platforms`, e.g. a preceding entry was removed) no
+/// longer drops the secret outright. Instead (issue #490) it falls back to a
+/// type-based lookup: `current.connect.platforms.iter().find(|p|
+/// p.platform_type == patch_type)`. This is safe because `multi_bot_guard`
+/// (#462) means only the FIRST entry of a given type is ever started, so
+/// resolving to any same-typed entry is strictly better than silently
+/// wiping the secret. Only when no entry of that type exists anywhere in
+/// `current` does the mask get dropped, same as "nothing configured yet".
 pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, current: &Config) {
     let Some(platforms) = patch_obj
         .get_mut("connect")
@@ -447,19 +451,31 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
         let Some(obj) = platform.as_object_mut() else {
             continue;
         };
+        let patch_type = obj.get("type").and_then(|v| v.as_str());
         let existing = current.connect.platforms.get(index);
         // A patch entry that names a "type" disagreeing with `current`'s
-        // entry at the same index means the array was reordered (or an
-        // entry was inserted/removed) since the client fetched it — the
-        // position no longer identifies the same logical platform, so don't
-        // resolve the mask against it. A patch entry with no "type" at all
-        // (shouldn't happen with a well-behaved client, which always echoes
-        // the whole object back) can't be checked and falls back to the
-        // pre-existing positional-only behavior.
-        let guarded = existing.filter(|p| match obj.get("type").and_then(|v| v.as_str()) {
-            Some(patch_type) => patch_type == p.platform_type,
-            None => true,
-        });
+        // entry at the same index (or an index beyond `current`'s array)
+        // means the array was reordered/shrunk since the client fetched it
+        // — the position no longer identifies the same logical platform, so
+        // don't resolve the mask against it positionally. A patch entry with
+        // no "type" at all (shouldn't happen with a well-behaved client,
+        // which always echoes the whole object back) can't be checked and
+        // falls back to the pre-existing positional-only behavior (no
+        // type-based fallback either, since there's no type to search by).
+        let guarded = existing
+            .filter(|p| match patch_type {
+                Some(patch_type) => patch_type == p.platform_type,
+                None => true,
+            })
+            .or_else(|| {
+                patch_type.and_then(|patch_type| {
+                    current
+                        .connect
+                        .platforms
+                        .iter()
+                        .find(|p| p.platform_type == patch_type)
+                })
+            });
         preserve_masked_secret_field(obj, "token", guarded.and_then(|p| p.token.as_deref()));
         preserve_masked_secret_field(
             obj,
@@ -807,19 +823,23 @@ mod tests {
         );
     }
 
-    /// The type-check is index-scoped, not "does this type appear anywhere
-    /// in current" — a mismatch at index 1 must not fall back to matching
-    /// against a same-typed entry that lives at a different index.
+    /// #490: when the type at an index mismatches, the guard now falls back
+    /// to a type-based lookup across all of `current.connect.platforms`
+    /// rather than dropping outright. Here index 1's patch entry claims
+    /// "telegram" (matching index 0's type, not index 1's) — the mismatch at
+    /// index 1 is detected, but since a "telegram" entry DOES exist
+    /// elsewhere in `current` (at index 0), the mask resolves to it. This is
+    /// safe because `multi_bot_guard` (#462) only ever starts the first
+    /// entry of a given type, so resolving to any same-typed entry is
+    /// strictly better than wiping the secret.
     #[test]
-    fn preserve_masked_connect_secrets_type_check_does_not_search_other_indices() {
+    fn preserve_masked_connect_secrets_type_mismatch_falls_back_to_type_lookup() {
         let mut current = Config::default();
         current.connect.platforms = vec![
             connect_platform("telegram", "bot-a-token"),
             connect_platform("feishu", "feishu-token"),
         ];
 
-        // Patch entry at index 1 claims "telegram" (matches index 0's type,
-        // NOT index 1's) — must still drop, not borrow index 0's token.
         let mut patch: Map<String, Value> = serde_json::from_str(
             r#"{"connect":{"platforms":[
                 {"type":"telegram","token":"tg-real-value"},
@@ -831,12 +851,9 @@ mod tests {
         preserve_masked_connect_secrets(&mut patch, &current);
 
         assert_eq!(patch["connect"]["platforms"][0]["token"], "tg-real-value");
-        assert!(
-            !patch["connect"]["platforms"][1]
-                .as_object()
-                .unwrap()
-                .contains_key("token"),
-            "index 1's mismatched type must not resolve to index 0's token"
+        assert_eq!(
+            patch["connect"]["platforms"][1]["token"], "bot-a-token",
+            "index 1's mismatched type must fall back to the same-typed entry found elsewhere in current"
         );
     }
 
@@ -972,6 +989,99 @@ mod tests {
                 .unwrap()
                 .contains_key("app_secret"),
             "masked app_secret must not be resolved against a different platform's secret"
+        );
+    }
+
+    /// #490 regression: the exact scenario from the issue. Stored platforms
+    /// are `[telegram, feishu]`; the client disables telegram and echoes
+    /// back only the (still-masked) feishu entry, which now shifts to index
+    /// 0. The positional guard sees telegram≠feishu at index 0 and used to
+    /// drop the mask outright, silently wiping the feishu app_secret on
+    /// save. It must now fall back to a type-based lookup and resolve to the
+    /// stored feishu plaintext.
+    #[test]
+    fn preserve_masked_connect_secrets_resolves_by_type_when_preceding_entry_removed() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform("telegram", "telegram-token"),
+            feishu_platform("existing-app-secret"),
+        ];
+
+        // telegram was removed client-side; only the feishu entry (still
+        // masked) is echoed back, now at index 0.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[
+                {"type":"feishu","app_id":"cli_x","app_secret":"****...****","domain":"lark"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["app_secret"], "existing-app-secret",
+            "masked app_secret must resolve via type fallback after a preceding entry was removed"
+        );
+    }
+
+    /// #490: an index beyond `current.connect.platforms` (the patch array
+    /// grew, e.g. a new platform was added client-side before saving) must
+    /// also fall back to the type-based lookup rather than dropping the mask
+    /// when a same-typed entry exists elsewhere in `current`.
+    #[test]
+    fn preserve_masked_connect_secrets_resolves_by_type_when_index_out_of_range() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform("telegram", "telegram-token"),
+            feishu_platform("existing-app-secret"),
+        ];
+
+        // Patch has 3 entries; index 2 is beyond `current`'s 2-entry array
+        // (a new telegram entry was inserted at index 1 client-side), but
+        // its masked feishu app_secret should still resolve by type.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[
+                {"type":"telegram","token":"tg-real-value"},
+                {"type":"telegram","token":"new-bot-token"},
+                {"type":"feishu","app_id":"cli_x","app_secret":"****...****","domain":"lark"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][2]["app_secret"], "existing-app-secret",
+            "masked app_secret at an out-of-range index must resolve via type fallback"
+        );
+    }
+
+    /// #490: the type-based fallback only searches by type — if the patched
+    /// type doesn't exist anywhere in `current`, the mask still drops, same
+    /// as before. Unchanged behavior, exercised here with a multi-entry
+    /// `current` (not just the empty-config case already covered above).
+    #[test]
+    fn preserve_masked_connect_secrets_drops_mask_when_type_absent_from_current_entirely() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform("telegram", "telegram-token")];
+
+        // No feishu entry exists anywhere in `current` — the type-based
+        // fallback has nothing to resolve against.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[
+                {"type":"feishu","app_id":"cli_x","app_secret":"****...****","domain":"lark"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert!(
+            !patch["connect"]["platforms"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("app_secret"),
+            "mask must still drop when no entry of that type exists anywhere in current"
         );
     }
 }

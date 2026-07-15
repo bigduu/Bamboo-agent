@@ -253,7 +253,8 @@ impl Tool for MemoryTool {
                         .and_then(|value| value.include_related)
                         .unwrap_or(false),
                 };
-                let (filter_types, filter_statuses) = Self::parse_query_filters(filters.as_ref())?;
+                let (filter_types, filter_statuses, filter_granularity) =
+                    Self::parse_query_filters(filters.as_ref())?;
                 let result = self
                     .memory_store
                     .query_scope(
@@ -262,6 +263,7 @@ impl Tool for MemoryTool {
                         query.as_deref(),
                         filter_types.as_ref(),
                         filter_statuses.as_ref(),
+                        filter_granularity.as_ref(),
                         &options,
                     )
                     .await
@@ -759,7 +761,7 @@ impl Tool for MemoryTool {
                             "purge supports durable scopes only in v1".to_string(),
                         ));
                     }
-                    let (filter_types, filter_statuses) =
+                    let (filter_types, filter_statuses, filter_granularity) =
                         Self::parse_query_filters(filters.as_ref())?;
                     let result = self
                         .memory_store
@@ -768,6 +770,7 @@ impl Tool for MemoryTool {
                             project_key.as_deref(),
                             filter_types.as_ref(),
                             filter_statuses.as_ref(),
+                            filter_granularity.as_ref(),
                             mode,
                             reason.as_deref(),
                         )

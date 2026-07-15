@@ -1118,6 +1118,7 @@ mod tests {
                 Some("terse recap"),
                 None,
                 None,
+                None,
                 &bamboo_memory::memory_store::MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(2000),
@@ -1288,6 +1289,7 @@ mod tests {
                 MemoryScope::Project,
                 Some(&project_key),
                 Some("concise answers"),
+                None,
                 None,
                 None,
                 &bamboo_memory::memory_store::MemoryQueryOptions {
@@ -1626,6 +1628,7 @@ mod tests {
                 MemoryScope::Project,
                 Some(&project_key_a),
                 Some("concise planning"),
+                None,
                 None,
                 None,
                 &bamboo_memory::memory_store::MemoryQueryOptions {

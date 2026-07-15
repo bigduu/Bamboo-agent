@@ -16,6 +16,24 @@ pub enum BrokerError {
     /// WebSocket / IO transport failure.
     #[error("transport: {0}")]
     Transport(String),
+    /// `deliver` refused: the target session's mailbox already holds
+    /// `limit` pending (undelivered-or-unacked) messages — a backlog cap
+    /// against a flood aimed at an offline/never-draining mailbox filling
+    /// disk (#53). The sender should back off; this is not a transport or
+    /// auth failure.
+    #[error("mailbox '{session}' is full ({limit} pending messages)")]
+    MailboxFull { session: String, limit: usize },
+    /// The broker explicitly REJECTED a request (e.g. [`Self::MailboxFull`])
+    /// and told the caller so via a correlated [`crate::proto::BrokerFrame::Error`]
+    /// — as opposed to [`Self::Transport`], which means the RPC never got a
+    /// definitive answer at all (network stall, broker crash, timeout). This
+    /// distinction is the point: `BrokerClient::deliver` returns this the
+    /// instant the broker's rejection arrives, instead of the caller burning
+    /// the full receipt timeout to learn the same thing. `reason` is the
+    /// broker's stringified error (client-side; the original `BrokerError`
+    /// variant on the broker doesn't cross the wire, only its `Display`).
+    #[error("broker rejected the request: {0}")]
+    Rejected(String),
 }
 
 pub type BrokerResult<T> = Result<T, BrokerError>;

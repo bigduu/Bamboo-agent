@@ -50,8 +50,9 @@ pub async fn run() -> std::result::Result<(), String> {
 
     // Best-effort housekeeping while we boot: expire stale sibling storage
     // dirs (default retention 7 days) and stale fabric records.
+    // #217: the persistent data-dir subagents home, not `env::temp_dir()`.
     tokio::spawn(gc_stale_storage(
-        std::env::temp_dir().join("bamboo-subagents"),
+        bamboo_config::paths::subagents_dir(),
         STORAGE_RETENTION,
     ));
     {
@@ -199,15 +200,14 @@ impl BambooRuntimeExecutor {
     /// isolated storage/skills/metrics, builtin tools — never touching the user's
     /// `~/.bamboo` or persisting any secret.
     pub async fn build(spec: &ProvisionSpec) -> std::result::Result<Self, String> {
+        // #217: default under the persistent data-dir subagents home instead
+        // of `env::temp_dir()` (mirrors `resolve_claude_code_state_dir` in
+        // `claude_code_executor.rs`, which the doc comment there points at).
         let storage_dir = spec
             .storage_dir
             .clone()
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir()
-                    .join("bamboo-subagents")
-                    .join(&spec.identity.child_id)
-            });
+            .unwrap_or_else(|| bamboo_config::paths::subagents_dir().join(&spec.identity.child_id));
         tokio::fs::create_dir_all(&storage_dir)
             .await
             .map_err(|e| format!("create storage dir: {e}"))?;
