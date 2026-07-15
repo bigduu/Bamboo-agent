@@ -1218,6 +1218,61 @@ pub struct Config {
     /// typed (de)serialization.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+
+    /// In-memory-only marker set when this `Config` was recovered from a
+    /// corrupt `config.json` at load time (salvage / `.bak` / defaults) and
+    /// has not yet been confirmed. Never persisted (`#[serde(skip)]`), so
+    /// every clean load starts at `None` and a fresh process only ever sees
+    /// it populated right after `Config::from_data_dir` hit corruption.
+    ///
+    /// [`Config::save_to_dir`] refuses to overwrite `config.json` while this
+    /// is `Some` and not `confirmed` — the corrupt original stays exactly as
+    /// it was on disk until [`Config::confirm_recovery`] (or
+    /// [`Config::confirm_recovery_and_save_to_dir`]) is called. #153.
+    #[serde(skip)]
+    pub recovery_status: Option<ConfigRecoveryStatus>,
+}
+
+/// Where a [`ConfigRecoveryStatus`]'s recovered values came from. #153.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigRecoverySource {
+    /// Field-by-field salvage from the corrupt file itself
+    /// ([`Config::salvage_partial`]); `fields` lists the top-level keys that
+    /// were recovered from the corrupt document (any other field fell back to
+    /// the backup/default baseline instead).
+    Salvaged { fields: Vec<String> },
+    /// Recovered wholesale from a `config.json.bak[.N]` generation
+    /// (`generation` 0 == `.bak`, 1 == `.bak.1`, …).
+    Backup { generation: usize },
+    /// No usable salvage or backup; fell back to built-in defaults.
+    Defaults,
+}
+
+/// Describes a pending config-corruption recovery (#153, following on from
+/// #37/#135's quarantine + salvage/backup chain): `config.json` failed to
+/// parse at load time, the corrupt original was quarantined (copied aside,
+/// not deleted) to `quarantine_path`, and the owning [`Config`] holds the
+/// recovered in-memory state instead.
+///
+/// [`Config::save_to_dir`] refuses to overwrite `config.json` while
+/// `confirmed` is `false`, so a user who would rather hand-fix the original
+/// isn't surprised by an automatic overwrite on the next save. Call
+/// [`Config::confirm_recovery`] (or [`Config::confirm_recovery_and_save_to_dir`])
+/// to allow the next save through.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConfigRecoveryStatus {
+    /// Where the recovered values came from.
+    pub source: ConfigRecoverySource,
+    /// Absolute path of the preserved copy of the corrupt original
+    /// (`config.json.corrupted.<nanos>`), or `None` if even the quarantine
+    /// copy failed (the corrupt original still remains in place at
+    /// `config.json` itself either way — quarantining copies, it doesn't
+    /// move — so the guard below still applies).
+    pub quarantine_path: Option<PathBuf>,
+    /// Set `true` once the user has explicitly confirmed the recovery; only
+    /// then may `save_to_dir` persist over the original `config.json`.
+    pub confirmed: bool,
 }
 
 /// Container for provider-specific configurations
@@ -2023,20 +2078,34 @@ impl Config {
                     // intent in order: (1) SALVAGE the still-valid fields from the
                     // corrupt file (a single bad field shouldn't drop everything),
                     // (2) the last-known-good config.json.bak, (3) defaults.
-                    // #37 / #135.
+                    // #37 / #135. Tag the recovered config with a
+                    // ConfigRecoveryStatus (unconfirmed) so save_to_dir refuses to
+                    // overwrite config.json until the caller confirms — the
+                    // quarantined original stays hand-recoverable until then. #153.
                     tracing::warn!(
                         "Failed to parse config.json ({}); quarantining it and attempting recovery",
                         e
                     );
-                    quarantine_corrupt_config(&config_path);
-                    Self::salvage_partial(&content, &data_dir)
-                        .or_else(|| Self::load_backup(&data_dir))
+                    let quarantine_path = quarantine_corrupt_config(&config_path);
+                    let (mut recovered, source) = Self::salvage_partial(&content, &data_dir)
+                        .map(|(cfg, fields)| (cfg, ConfigRecoverySource::Salvaged { fields }))
+                        .or_else(|| {
+                            Self::load_backup(&data_dir).map(|(cfg, generation)| {
+                                (cfg, ConfigRecoverySource::Backup { generation })
+                            })
+                        })
                         .unwrap_or_else(|| {
                             tracing::warn!(
                                 "Could not salvage and no usable config.json.bak; using defaults"
                             );
-                            Self::create_default()
-                        })
+                            (Self::create_default(), ConfigRecoverySource::Defaults)
+                        });
+                    recovered.recovery_status = Some(ConfigRecoveryStatus {
+                        source,
+                        quarantine_path,
+                        confirmed: false,
+                    });
+                    recovered
                 })
             } else {
                 Self::create_default()
@@ -2308,9 +2377,10 @@ impl Config {
 
     /// Try to recover from the rotated `config.json.bak[.N]` generations (each a
     /// last-known-good written before a save) when the primary `config.json` is
-    /// corrupt. Walks newest -> oldest and returns the first that parses; `None`
-    /// if every generation is missing or also unparseable. #37 / #135.
-    fn load_backup(data_dir: &std::path::Path) -> Option<Self> {
+    /// corrupt. Walks newest -> oldest and returns the first that parses (paired
+    /// with its generation index, 0 == `.bak`, for [`ConfigRecoverySource::Backup`]);
+    /// `None` if every generation is missing or also unparseable. #37 / #135.
+    fn load_backup(data_dir: &std::path::Path) -> Option<(Self, usize)> {
         let config_path = data_dir.join("config.json");
         for gen in 0..BAK_GENERATIONS {
             let backup = backup_path_for(&config_path, gen);
@@ -2320,7 +2390,7 @@ impl Config {
             match Self::parse_and_hydrate(&content) {
                 Ok(config) => {
                     tracing::info!("Recovered configuration from {:?}", backup);
-                    return Some(config);
+                    return Some((config, gen));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -2363,7 +2433,11 @@ impl Config {
     /// BTreeMap-backed, no `preserve_order`) means a rename/alias pair like
     /// `mcp`/`mcpServers` can drop the second-seen even if it'd be valid alone — the
     /// outcome is still a valid config, just not necessarily the richest possible.
-    fn salvage_partial(content: &str, data_dir: &std::path::Path) -> Option<Self> {
+    ///
+    /// Returns the hydrated salvaged config paired with the top-level keys that
+    /// were actually recovered from the corrupt document (used to populate
+    /// [`ConfigRecoverySource::Salvaged`]).
+    fn salvage_partial(content: &str, data_dir: &std::path::Path) -> Option<(Self, Vec<String>)> {
         // Must at least be a JSON object; otherwise there's nothing field-wise to
         // salvage (a truncated/garbage file just falls through to .bak/defaults).
         let corrupt: serde_json::Value = serde_json::from_str(content).ok()?;
@@ -2381,7 +2455,7 @@ impl Config {
         // if it parses, else a fresh default. This makes salvage >= the plain .bak
         // fallback in every case.
         let mut base = Self::load_backup(data_dir)
-            .and_then(|backup| serde_json::to_value(backup).ok())
+            .and_then(|(backup, _generation)| serde_json::to_value(backup).ok())
             .or_else(|| serde_json::to_value(Self::create_default()).ok())?;
         let base_obj = base.as_object_mut()?;
 
@@ -2416,7 +2490,9 @@ impl Config {
         // normal parse+hydrate path so secret-decryption / normalization match a
         // clean load exactly.
         let rebuilt = serde_json::to_string(&base).ok()?;
-        Self::parse_and_hydrate(&rebuilt).ok()
+        Self::parse_and_hydrate(&rebuilt)
+            .ok()
+            .map(|config| (config, salvaged))
     }
 
     /// Get the effective default model for the currently active provider.
@@ -2839,6 +2915,7 @@ impl Config {
             connect: ConnectConfig::default(),
             plugin_trust: PluginTrustConfig::default(),
             extra: BTreeMap::new(),
+            recovery_status: None,
         }
     }
 
@@ -2852,10 +2929,62 @@ impl Config {
         self.save_to_dir(default_data_dir())
     }
 
+    /// The pending config-corruption recovery, if `config.json` failed to
+    /// parse on load and the recovery hasn't been confirmed yet. `None` on
+    /// every clean load. #153.
+    pub fn recovery_status(&self) -> Option<&ConfigRecoveryStatus> {
+        self.recovery_status.as_ref()
+    }
+
+    /// Confirm a pending recovery, allowing the next [`Config::save`] /
+    /// [`Config::save_to_dir`] to overwrite the quarantined-corrupt
+    /// `config.json` with this recovered state. No-op if there's no pending
+    /// recovery. Prefer [`Config::confirm_recovery_and_save_to_dir`], which
+    /// also persists and clears the flag in one step. #153.
+    pub fn confirm_recovery(&mut self) {
+        if let Some(status) = self.recovery_status.as_mut() {
+            status.confirmed = true;
+        }
+    }
+
+    /// Confirm a pending recovery AND persist it in one step: marks it
+    /// confirmed (satisfying the [`Config::save_to_dir`] guard), writes the
+    /// recovered state to `config.json`, then clears `recovery_status`
+    /// entirely — once this succeeds the config is no longer "pending
+    /// confirmation", it's just the normal on-disk config. Errors (and
+    /// leaves `recovery_status` untouched) if there's nothing pending, or if
+    /// the save itself fails. #153.
+    pub fn confirm_recovery_and_save_to_dir(&mut self, data_dir: PathBuf) -> Result<()> {
+        if self.recovery_status.is_none() {
+            anyhow::bail!("No pending config-corruption recovery to confirm");
+        }
+        self.confirm_recovery();
+        self.save_to_dir(data_dir)?;
+        self.recovery_status = None;
+        Ok(())
+    }
+
     /// Save configuration to disk under the provided data directory.
     ///
     /// Configuration is always stored as `{data_dir}/config.json`.
+    ///
+    /// Refuses to write when this config carries an unconfirmed
+    /// [`ConfigRecoveryStatus`] (#153) — i.e. it was recovered from a corrupt
+    /// `config.json` and the recovery hasn't been confirmed — so a corrupt
+    /// original a user might want to hand-fix is never silently clobbered by
+    /// an auto-persisted recovery. Call [`Config::confirm_recovery`] (or
+    /// [`Config::confirm_recovery_and_save_to_dir`]) first.
     pub fn save_to_dir(&self, data_dir: PathBuf) -> Result<()> {
+        if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
+            anyhow::bail!(
+                "refusing to overwrite config.json: it was recovered from corruption ({:?}) and \
+                 has not been confirmed; the corrupt original is preserved at {:?}. Call \
+                 Config::confirm_recovery (or the recovery-confirm API) first. (#153)",
+                status.source,
+                status.quarantine_path,
+            );
+        }
+
         let path = data_dir.join("config.json");
 
         if let Some(parent) = path.parent() {
@@ -3071,7 +3200,12 @@ const QUARANTINE_KEEP: usize = 5;
 /// Copy a corrupt config file aside to `config.json.corrupted.<nanos>` so the
 /// user's (unparseable) configuration is preserved for inspection/recovery
 /// instead of being silently discarded and then overwritten by defaults. #37.
-fn quarantine_corrupt_config(config_path: &std::path::Path) {
+///
+/// Returns the quarantine path on success, so the caller can attach it to a
+/// [`ConfigRecoveryStatus`] (#153); `None` if even the copy failed (the
+/// corrupt original is still left in place at `config_path` regardless, since
+/// this only ever copies, never moves/deletes).
+fn quarantine_corrupt_config(config_path: &std::path::Path) -> Option<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -3085,11 +3219,18 @@ fn quarantine_corrupt_config(config_path: &std::path::Path) {
         quarantine = config_path.with_extension(format!("json.corrupted.{nanos}.{dedup}"));
         dedup += 1;
     }
-    match std::fs::copy(config_path, &quarantine) {
-        Ok(_) => tracing::warn!("Quarantined corrupt config.json to {:?}", quarantine),
-        Err(e) => tracing::error!("Failed to quarantine corrupt config.json: {}", e),
-    }
+    let result = match std::fs::copy(config_path, &quarantine) {
+        Ok(_) => {
+            tracing::warn!("Quarantined corrupt config.json to {:?}", quarantine);
+            Some(quarantine)
+        }
+        Err(e) => {
+            tracing::error!("Failed to quarantine corrupt config.json: {}", e);
+            None
+        }
+    };
     prune_quarantine_files(config_path, QUARANTINE_KEEP);
+    result
 }
 
 /// Keep only the newest `keep` `config.json.corrupted.*` files next to
@@ -4048,6 +4189,211 @@ mod tests {
         assert!(
             backup.contains("http://good-bak"),
             "good last-known-good backup is preserved (not overwritten by corrupt config.json)"
+        );
+    }
+
+    // ── config-corruption recovery confirmation gate (#153) ───────────────
+
+    #[test]
+    fn recovery_status_set_from_backup_and_quarantine_preserves_corrupt_bytes() {
+        let temp = TempHome::new();
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({ "http_proxy": "http://from-backup" }).to_string(),
+        )
+        .unwrap();
+        let corrupt_bytes = "{ not valid json ";
+        std::fs::write(temp.path.join("config.json"), corrupt_bytes).unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        let status = config
+            .recovery_status()
+            .expect("a corrupt load must set a pending recovery status");
+        assert!(!status.confirmed, "a fresh recovery starts unconfirmed");
+        assert_eq!(
+            status.source,
+            ConfigRecoverySource::Backup { generation: 0 },
+            "recovered from generation-0 (.bak)"
+        );
+        let quarantine_path = status
+            .quarantine_path
+            .as_ref()
+            .expect("quarantine copy should have succeeded");
+        assert_eq!(
+            std::fs::read_to_string(quarantine_path).unwrap(),
+            corrupt_bytes,
+            "the quarantine copy preserves the corrupt original BYTE FOR BYTE"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path.join("config.json")).unwrap(),
+            corrupt_bytes,
+            "the original config.json itself is untouched by the load (only copied, not moved)"
+        );
+    }
+
+    #[test]
+    fn recovery_status_set_from_salvage_lists_recovered_fields() {
+        let temp = TempHome::new();
+        temp.set_config_json(
+            r#"{"http_proxy":"http://salvaged","env_vars":"this-should-be-an-array"}"#,
+        );
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        let status = config.recovery_status().expect("pending recovery");
+        assert!(!status.confirmed);
+        match &status.source {
+            ConfigRecoverySource::Salvaged { fields } => {
+                assert!(
+                    fields.iter().any(|f| f == "http_proxy"),
+                    "salvaged fields should list the recovered key: {fields:?}"
+                );
+            }
+            other => panic!("expected Salvaged source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_status_set_from_defaults_when_nothing_salvageable() {
+        let temp = TempHome::new();
+        // Not a JSON object at all -> salvage impossible; no .bak -> defaults.
+        std::fs::write(temp.path.join("config.json"), "}}} broken").unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        let status = config.recovery_status().expect("pending recovery");
+        assert!(!status.confirmed);
+        assert_eq!(status.source, ConfigRecoverySource::Defaults);
+    }
+
+    #[test]
+    fn clean_load_never_sets_recovery_status() {
+        let temp = TempHome::new();
+        temp.set_config_json(r#"{"http_proxy":"http://clean"}"#);
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(
+            config.recovery_status().is_none(),
+            "a config.json that parses cleanly must never carry a pending recovery status"
+        );
+    }
+
+    #[test]
+    fn save_to_dir_refuses_to_overwrite_until_recovery_confirmed() {
+        let temp = TempHome::new();
+        let corrupt_bytes = "}}} broken";
+        std::fs::write(temp.path.join("config.json"), corrupt_bytes).unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(config.recovery_status().is_some());
+
+        let err = config
+            .save_to_dir(temp.path.clone())
+            .expect_err("save must refuse while recovery is unconfirmed");
+        assert!(
+            err.to_string().contains("recovered from corruption")
+                || err.to_string().contains("confirm"),
+            "error should explain the refused overwrite: {err}"
+        );
+
+        // The corrupt original on disk must be BYTE FOR BYTE unchanged — the
+        // refused save must not have touched it at all.
+        assert_eq!(
+            std::fs::read_to_string(temp.path.join("config.json")).unwrap(),
+            corrupt_bytes,
+            "a refused save must leave the corrupt original untouched"
+        );
+    }
+
+    #[test]
+    fn half_written_truncated_config_is_quarantined_byte_for_byte_and_blocks_overwrite() {
+        let temp = TempHome::new();
+        // Simulates a crash mid-write: valid JSON prefix, abruptly cut off.
+        let truncated = r#"{"http_proxy":"http://partial","providers":{"anthro"#;
+        std::fs::write(temp.path.join("config.json"), truncated).unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        let status = config.recovery_status().expect("pending recovery");
+        let quarantine_path = status.quarantine_path.as_ref().expect("quarantined");
+        assert_eq!(
+            std::fs::read_to_string(quarantine_path).unwrap(),
+            truncated,
+            "truncated original preserved byte for byte in quarantine"
+        );
+
+        let err = config.save_to_dir(temp.path.clone());
+        assert!(err.is_err(), "unconfirmed recovery must refuse to save");
+        assert_eq!(
+            std::fs::read_to_string(temp.path.join("config.json")).unwrap(),
+            truncated,
+            "the half-written original stays exactly as it was after a refused save"
+        );
+    }
+
+    #[test]
+    fn confirm_recovery_allows_the_next_save() {
+        let temp = TempHome::new();
+        std::fs::write(temp.path.join("config.json"), "}}} broken").unwrap();
+
+        let mut config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(config.recovery_status().is_some());
+
+        config.confirm_recovery();
+        assert!(
+            config.recovery_status().is_some_and(|s| s.confirmed),
+            "confirm_recovery flips the flag but keeps the status around"
+        );
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save must succeed once the recovery is confirmed");
+    }
+
+    #[test]
+    fn confirm_recovery_and_save_to_dir_persists_and_clears_status() {
+        let temp = TempHome::new();
+        std::fs::write(
+            temp.path.join("config.json"),
+            r#"{"http_proxy":"http://recovered","env_vars":"bad-type"}"#,
+        )
+        .unwrap();
+
+        let mut config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(config.recovery_status().is_some());
+        let quarantine_path = config
+            .recovery_status()
+            .unwrap()
+            .quarantine_path
+            .clone()
+            .unwrap();
+
+        config
+            .confirm_recovery_and_save_to_dir(temp.path.clone())
+            .expect("confirm+save should succeed");
+
+        assert!(
+            config.recovery_status().is_none(),
+            "the pending flag is cleared once the recovery is confirmed and persisted"
+        );
+        let on_disk = std::fs::read_to_string(temp.path.join("config.json")).unwrap();
+        assert!(
+            on_disk.contains("http://recovered"),
+            "config.json now holds the recovered (salvaged) state"
+        );
+        // The quarantine copy of the original corrupt file must still exist,
+        // untouched, even after the recovery is confirmed and persisted.
+        assert!(
+            quarantine_path.exists(),
+            "the quarantined original survives confirmation — it's never deleted"
+        );
+    }
+
+    #[test]
+    fn confirm_recovery_and_save_to_dir_errors_when_nothing_pending() {
+        let temp = TempHome::new();
+        let mut config = Config::create_default();
+        let err = config.confirm_recovery_and_save_to_dir(temp.path.clone());
+        assert!(
+            err.is_err(),
+            "confirming a recovery that was never pending must error, not silently succeed"
         );
     }
 

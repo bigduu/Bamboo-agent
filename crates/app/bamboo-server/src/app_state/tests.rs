@@ -811,3 +811,143 @@ async fn app_state_uses_persisted_permission_config_in_data_dir() {
     assert!(matches!(result, Err(ToolError::Execution(_))));
     assert!(!target.exists());
 }
+
+// ── config-corruption recovery confirmation gate (#153) ────────────────────
+
+mod config_recovery_gate {
+    use super::AppState;
+    use crate::{app_state::ConfigUpdateEffects, error::AppError};
+
+    #[tokio::test]
+    async fn update_config_refuses_while_recovery_is_pending_and_unconfirmed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // A corrupt config.json (with no .bak) makes AppState::new's load fall
+        // back to defaults AND set a pending, unconfirmed recovery status.
+        std::fs::write(temp_dir.path().join("config.json"), "}}} broken").unwrap();
+
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should still initialize (defaults + quarantine)");
+
+        assert!(
+            state.config.read().await.recovery_status().is_some(),
+            "boot should have picked up the pending recovery from the corrupt config.json"
+        );
+
+        let result = state
+            .update_config(
+                |cfg| {
+                    cfg.http_proxy = "http://should-not-be-applied".to_string();
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AppError::ConfigRecoveryPending(_))),
+            "settings writes must be refused while a recovery is unconfirmed, got {result:?}"
+        );
+        // The refusal must happen BEFORE the in-memory mutation runs.
+        assert!(
+            state.config.read().await.http_proxy.is_empty(),
+            "the update closure must never have run"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_config_recovery_reject_is_a_no_op() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let corrupt_bytes = "}}} broken";
+        std::fs::write(temp_dir.path().join("config.json"), corrupt_bytes).unwrap();
+
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+
+        let resolved = state
+            .confirm_config_recovery(false)
+            .await
+            .expect("rejecting a pending recovery should succeed (it's a no-op)");
+        assert!(
+            resolved.recovery_status().is_some_and(|s| !s.confirmed),
+            "reject must leave the pending flag exactly as it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("config.json")).unwrap(),
+            corrupt_bytes,
+            "reject must not touch config.json at all"
+        );
+
+        // A settings write is still refused after a reject.
+        let result = state
+            .update_config(
+                |cfg| {
+                    cfg.http_proxy = "http://nope".to_string();
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::ConfigRecoveryPending(_))));
+    }
+
+    #[tokio::test]
+    async fn confirm_config_recovery_accept_persists_and_unblocks_future_writes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            r#"{"http_proxy":"http://salvaged","env_vars":"bad-type"}"#,
+        )
+        .unwrap();
+
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        assert!(state.config.read().await.recovery_status().is_some());
+
+        let resolved = state
+            .confirm_config_recovery(true)
+            .await
+            .expect("accepting the pending recovery should succeed");
+        assert!(
+            resolved.recovery_status().is_none(),
+            "accept clears the pending flag once persisted"
+        );
+        assert!(
+            state.config.read().await.recovery_status().is_none(),
+            "AppState's in-memory config reflects the cleared flag too"
+        );
+
+        let on_disk = std::fs::read_to_string(temp_dir.path().join("config.json")).unwrap();
+        assert!(
+            on_disk.contains("http://salvaged"),
+            "config.json now holds the recovered state"
+        );
+
+        // Settings writes work normally again.
+        state
+            .update_config(
+                |cfg| {
+                    cfg.http_proxy = "http://after-confirm".to_string();
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .expect("writes should succeed once the recovery is confirmed");
+    }
+
+    #[tokio::test]
+    async fn confirm_config_recovery_errors_when_nothing_pending() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+
+        let result = state.confirm_config_recovery(true).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        let result = state.confirm_config_recovery(false).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+}
