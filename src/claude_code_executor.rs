@@ -88,10 +88,11 @@ const ENV_ALLOWLIST: &[&str] = &[
 /// [`ClaudeCodeExecutor::new`]'s `state_dir` a location the resumed-session
 /// state file (issue #444) survives in.
 pub fn resolve_claude_code_state_dir(storage_dir: &Option<String>, child_id: &str) -> PathBuf {
+    // #217: the persistent data-dir subagents home, not `env::temp_dir()`.
     storage_dir
         .clone()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents").join(child_id))
+        .unwrap_or_else(|| bamboo_config::paths::subagents_dir().join(child_id))
 }
 
 /// State file name inside a child's stable storage dir (issue #444). Holds the

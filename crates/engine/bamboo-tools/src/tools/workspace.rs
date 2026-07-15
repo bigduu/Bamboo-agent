@@ -110,15 +110,25 @@ impl Tool for WorkspaceTool {
                     ToolError::Execution(format!("Failed to canonicalize path: {e}"))
                 })?;
 
-                workspace_state::set_workspace(session_id, absolute_path.clone());
+                // `set_workspace` returns the FINAL stored path, which may
+                // differ from `absolute_path` when workspace-root
+                // confinement (#217) relocated it — report the truth rather
+                // than the pre-relocation request.
+                let stored = workspace_state::set_workspace(session_id, absolute_path.clone());
+                let relocated = stored != absolute_path;
+
+                let mut payload = json!({
+                    "session_id": session_id,
+                    "workspace": bamboo_config::paths::path_to_display_string(&stored)
+                });
+                if relocated {
+                    payload["relocated_from"] =
+                        json!(bamboo_config::paths::path_to_display_string(&absolute_path));
+                }
 
                 Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
-                    result: json!({
-                        "session_id": session_id,
-                        "workspace": bamboo_config::paths::path_to_display_string(&absolute_path)
-                    })
-                    .to_string(),
+                    result: payload.to_string(),
                     display_preference: Some("json".to_string()),
                     images: Vec::new(),
                 }))
@@ -301,4 +311,16 @@ mod tests {
             .expect_err("missing session should fail");
         assert!(matches!(err, ToolError::Execution(msg) if msg.contains("session_id")));
     }
+
+    // NOTE: the end-to-end test exercising `set_workspace_root_provider`
+    // (issue #217) lives in `tests/workspace_root_provider.rs`, NOT here.
+    // That `OnceLock` is process-global and first-registration-wins across
+    // this ENTIRE lib's unit-test binary (bash/glob/grep/slash_command/
+    // workspace tests all share one process) — registering it in-line here
+    // would non-deterministically poison every other test in the binary that
+    // assumes the pre-#217 unconfined default (e.g.
+    // `workspace_set_changes_session_workspace` below, which sets an
+    // arbitrary outside-any-root tempdir and expects it stored verbatim). A
+    // separate `tests/*.rs` integration file compiles to its own process, so
+    // it can safely register the provider without affecting anything here.
 }
