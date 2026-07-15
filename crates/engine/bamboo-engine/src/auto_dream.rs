@@ -8,6 +8,7 @@ use futures::StreamExt;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::{Message, SessionKind};
+use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_llm::Config;
 use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
@@ -16,9 +17,11 @@ use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
     derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
     parse_candidate_type, parse_extraction_candidates, parse_last_consolidated_at,
-    parse_last_full_rebuild_at, should_force_full_rebuild, truncate_chars,
-    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
+    parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild, truncate_chars,
+    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, LedgerExtractionCandidate,
 };
+use bamboo_memory::ledger_store::store::new_record_id;
+use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
 use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
 use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 
@@ -61,6 +64,11 @@ pub struct AutoDreamContext {
 
 fn memory_store_for_context(ctx: &AutoDreamContext) -> MemoryStore {
     MemoryStore::new(ctx.session_store.bamboo_home_dir())
+}
+
+fn ledger_store_for_context(ctx: &AutoDreamContext) -> LedgerStore {
+    // Anchored on the same data dir the MemoryStore uses (bamboo home dir).
+    LedgerStore::new(ctx.session_store.bamboo_home_dir())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,14 +234,23 @@ async fn collect_candidate_session_contexts_for_project(
     .await
 }
 
+/// Counts of records persisted from one extraction response: durable memory
+/// candidates and ledger (commitment) candidates share a single LLM call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExtractionWrites {
+    memory: usize,
+    ledger: usize,
+}
+
 async fn extract_and_persist_durable_candidates(
     provider: &Arc<dyn LLMProvider>,
     memory: &MemoryStore,
+    ledger: &LedgerStore,
     model: &str,
     sessions: &[CandidateSessionContext],
-) -> Result<usize, String> {
+) -> Result<ExtractionWrites, String> {
     if sessions.is_empty() {
-        return Ok(0);
+        return Ok(ExtractionWrites::default());
     }
 
     let candidates_info: Vec<DreamCandidateInfo> = sessions
@@ -250,8 +267,10 @@ async fn extract_and_persist_durable_candidates(
     let prompt = build_extraction_prompt(&candidates_info);
     let raw = collect_stream_text(provider.clone(), model, prompt).await?;
     let candidates = parse_extraction_candidates(&raw)?;
-    if candidates.is_empty() {
-        return Ok(0);
+    // Tolerant by design: absent/malformed ledger array → empty vec.
+    let ledger_candidates = parse_ledger_candidates(&raw);
+    if candidates.is_empty() && ledger_candidates.is_empty() {
+        return Ok(ExtractionWrites::default());
     }
 
     let mut session_project_keys = std::collections::HashMap::new();
@@ -316,6 +335,102 @@ async fn extract_and_persist_durable_candidates(
             .map_err(|error| {
                 format!("failed to update session extraction state for {session_id}: {error}")
             })?;
+    }
+
+    let ledger_writes = persist_ledger_candidates(ledger, ledger_candidates).await?;
+
+    Ok(ExtractionWrites {
+        memory: writes,
+        ledger: ledger_writes,
+    })
+}
+
+fn normalized_ledger_title(title: &str) -> String {
+    title.trim().to_lowercase()
+}
+
+fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
+    value
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+/// Persist extractor-proposed ledger candidates as `suggested` Global records.
+///
+/// Rules (Phase 6 of the personal-assistant ledger design):
+/// - only `high`/`medium` confidence candidates are written; `low` (or
+///   missing) confidence is skipped;
+/// - empty or over-long titles are skipped;
+/// - a candidate whose normalized (case-insensitive, trimmed) title matches an
+///   existing open Global record — or an earlier candidate in the same batch —
+///   is skipped (dedup guard);
+/// - records are created `Open`, tagged `suggested`, attributed to
+///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
+///   reminders are created for suggested records (no schedule-bridge
+///   involvement) — the agenda renders them for confirmation.
+async fn persist_ledger_candidates(
+    ledger: &LedgerStore,
+    candidates: Vec<LedgerExtractionCandidate>,
+) -> Result<usize, String> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let existing = ledger
+        .list_records(LedgerScope::Global, None, &RecordFilter::default())
+        .await
+        .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
+    let mut seen_titles: HashSet<String> = existing
+        .iter()
+        .map(|doc| normalized_ledger_title(&doc.record.title))
+        .collect();
+
+    let mut writes = 0usize;
+    for candidate in candidates {
+        let confidence = candidate
+            .confidence
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if confidence != "high" && confidence != "medium" {
+            continue;
+        }
+        let title = candidate.title.trim().to_string();
+        if title.is_empty() || title.chars().count() > MAX_RECORD_TITLE_LEN {
+            continue;
+        }
+        if !seen_titles.insert(normalized_ledger_title(&title)) {
+            continue;
+        }
+
+        let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
+        let mut record = LedgerRecord::new(new_record_id(), kind, title);
+        record.scope = LedgerScope::Global;
+        record.source.session_id = candidate
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        record.source.created_by = RecordActor::Extractor;
+        record.source.excerpt = candidate
+            .excerpt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        record.tags = vec!["suggested".to_string()];
+        record.time.due_at = parse_candidate_timestamp(candidate.due_at.as_deref());
+        record.time.starts_at = parse_candidate_timestamp(candidate.starts_at.as_deref());
+
+        let title_for_error = record.title.clone();
+        ledger.write_record(record, None).await.map_err(|error| {
+            format!("failed to persist ledger candidate '{title_for_error}': {error}")
+        })?;
+        writes += 1;
     }
 
     Ok(writes)
@@ -691,9 +806,15 @@ async fn run_auto_dream_once_for_scope(
         }
         MemoryScope::Session => unreachable!("session scope handled above"),
     };
-    let extracted_count =
-        extract_and_persist_durable_candidates(&bg_provider, memory, &model, &extraction_sessions)
-            .await?;
+    let ledger = ledger_store_for_context(ctx);
+    let extraction_writes = extract_and_persist_durable_candidates(
+        &bg_provider,
+        memory,
+        &ledger,
+        &model,
+        &extraction_sessions,
+    )
+    .await?;
     let notebook_chars = final_note.chars().count();
 
     tracing::info!(
@@ -710,7 +831,8 @@ async fn run_auto_dream_once_for_scope(
             DreamGenerationMode::Rebuild => "rebuild",
         },
         notebook_chars = notebook_chars,
-        durable_candidates_persisted = extracted_count,
+        durable_candidates_persisted = extraction_writes.memory,
+        ledger_candidates_persisted = extraction_writes.ledger,
         note_path = %note_path.display(),
         "Dream generation run completed"
     );
@@ -973,11 +1095,18 @@ mod tests {
         .await;
         assert_eq!(contexts.len(), 1);
 
-        let writes =
-            extract_and_persist_durable_candidates(&provider, &memory, "fast-model", &contexts)
-                .await
-                .expect("extraction should succeed");
-        assert_eq!(writes, 1);
+        let ledger = LedgerStore::new(temp_dir.path());
+        let writes = extract_and_persist_durable_candidates(
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("extraction should succeed");
+        assert_eq!(writes.memory, 1);
+        assert_eq!(writes.ledger, 0);
 
         let project_key = bamboo_memory::memory_store::project_key_from_path(
             &temp_dir.path().join("workspace-a"),
@@ -987,6 +1116,7 @@ mod tests {
                 MemoryScope::Project,
                 Some(&project_key),
                 Some("terse recap"),
+                None,
                 None,
                 None,
                 &bamboo_memory::memory_store::MemoryQueryOptions {
@@ -1058,15 +1188,17 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
+        let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
             &context.provider,
             &memory,
+            &ledger,
             "fast-model",
             &sessions,
         )
         .await
         .expect("empty extraction should succeed");
-        assert_eq!(writes, 0);
+        assert_eq!(writes, ExtractionWrites::default());
 
         let state = memory
             .read_session_state("session-empty")
@@ -1088,7 +1220,7 @@ mod tests {
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
             "## Current durable context\n- Durable signal found\n\n## Cross-session patterns\n- Prefer concise answers\n\n## Active threads to remember\n- Memory extraction\n\n## Stable constraints and preferences\n- Terse replies\n\n## Open risks or questions\n- None".to_string(),
-            "{\"candidates\":[{\"title\":\"User prefers concise answers\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers concise answers and minimal recap.\",\"tags\":[\"preference\"],\"session_id\":\"session-dream-run\"}]}".to_string(),
+            "{\"candidates\":[{\"title\":\"User prefers concise answers\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers concise answers and minimal recap.\",\"tags\":[\"preference\"],\"session_id\":\"session-dream-run\"}],\"ledger_candidates\":[{\"title\":\"Renew passport\",\"kind\":\"todo\",\"due_at\":\"2026-08-01T00:00:00Z\",\"starts_at\":null,\"excerpt\":\"I need to renew my passport before August\",\"session_id\":\"session-dream-run\",\"confidence\":\"high\"}]}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(Config {
             memory: Some(bamboo_config::MemoryConfig {
@@ -1159,6 +1291,7 @@ mod tests {
                 Some("concise answers"),
                 None,
                 None,
+                None,
                 &bamboo_memory::memory_store::MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(2000),
@@ -1170,6 +1303,214 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(results.matched_count, 1);
         assert_eq!(results.items[0].title, "User prefers concise answers");
+
+        // The SAME extraction call also proposed a ledger candidate — it must
+        // land as a suggested Global record attributed to the extractor.
+        let ledger = LedgerStore::new(temp_dir.path());
+        let records = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list ledger records");
+        assert_eq!(records.len(), 1);
+        let record = &records[0].record;
+        assert_eq!(record.title, "Renew passport");
+        assert_eq!(record.kind, RecordKind::Todo);
+        assert_eq!(record.status, bamboo_domain::ledger::RecordStatus::Open);
+        assert_eq!(record.scope, LedgerScope::Global);
+        assert_eq!(record.tags, vec!["suggested".to_string()]);
+        assert_eq!(record.source.created_by, RecordActor::Extractor);
+        assert_eq!(
+            record.source.session_id.as_deref(),
+            Some("session-dream-run")
+        );
+        assert_eq!(
+            record.source.excerpt.as_deref(),
+            Some("I need to renew my passport before August")
+        );
+        assert_eq!(
+            record.time.due_at.map(|at| at.to_rfc3339()),
+            Some("2026-08-01T00:00:00+00:00".to_string())
+        );
+        assert!(
+            record.schedule_ids.is_empty(),
+            "suggested records must not get schedules"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_ledger_candidates_writes_suggested_records_and_skips_unusable_ones() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let ledger = LedgerStore::new(temp_dir.path());
+
+        let candidate = |title: &str,
+                         kind: &str,
+                         due_at: Option<&str>,
+                         starts_at: Option<&str>,
+                         confidence: Option<&str>| {
+            LedgerExtractionCandidate {
+                title: title.to_string(),
+                kind: kind.to_string(),
+                due_at: due_at.map(ToString::to_string),
+                starts_at: starts_at.map(ToString::to_string),
+                excerpt: Some(format!("The user said: {title}")),
+                session_id: Some("session-ledger".to_string()),
+                confidence: confidence.map(ToString::to_string),
+            }
+        };
+
+        let long_title = "x".repeat(MAX_RECORD_TITLE_LEN + 1);
+        let candidates = vec![
+            candidate(
+                "Renew passport",
+                "todo",
+                Some("2026-08-01T00:00:00Z"),
+                None,
+                Some("high"),
+            ),
+            candidate(
+                "Dentist appointment",
+                "event",
+                None,
+                Some("2026-07-20T09:00:00+02:00"),
+                Some("medium"),
+            ),
+            // Skipped: low confidence.
+            candidate("Maybe buy a boat", "todo", None, None, Some("low")),
+            // Skipped: missing confidence.
+            candidate("Water the plants", "todo", None, None, None),
+            // Skipped: empty title.
+            candidate("   ", "todo", None, None, Some("high")),
+            // Skipped: title longer than the record title cap.
+            candidate(&long_title, "todo", None, None, Some("high")),
+            // Skipped: in-batch duplicate (case-insensitive, trimmed).
+            candidate("  RENEW PASSPORT  ", "todo", None, None, Some("high")),
+            // Written despite malformed timestamps (they parse to None).
+            candidate(
+                "Call the bank",
+                "reminder",
+                Some("next week"),
+                None,
+                Some("medium"),
+            ),
+        ];
+
+        let writes = persist_ledger_candidates(&ledger, candidates)
+            .await
+            .expect("persist should succeed");
+        assert_eq!(writes, 3);
+
+        let records = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list records");
+        let mut titles: Vec<&str> = records
+            .iter()
+            .map(|doc| doc.record.title.as_str())
+            .collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            vec!["Call the bank", "Dentist appointment", "Renew passport"]
+        );
+
+        for doc in &records {
+            assert_eq!(doc.record.status, bamboo_domain::ledger::RecordStatus::Open);
+            assert_eq!(doc.record.scope, LedgerScope::Global);
+            assert_eq!(doc.record.tags, vec!["suggested".to_string()]);
+            assert_eq!(doc.record.source.created_by, RecordActor::Extractor);
+            assert_eq!(
+                doc.record.source.session_id.as_deref(),
+                Some("session-ledger")
+            );
+            assert!(doc.record.source.excerpt.is_some());
+            assert!(doc.record.schedule_ids.is_empty());
+        }
+
+        let passport = records
+            .iter()
+            .find(|doc| doc.record.title == "Renew passport")
+            .expect("passport record");
+        assert_eq!(passport.record.kind, RecordKind::Todo);
+        assert_eq!(
+            passport.record.time.due_at.map(|at| at.to_rfc3339()),
+            Some("2026-08-01T00:00:00+00:00".to_string())
+        );
+
+        let dentist = records
+            .iter()
+            .find(|doc| doc.record.title == "Dentist appointment")
+            .expect("dentist record");
+        assert_eq!(dentist.record.kind, RecordKind::Event);
+        // Offset timestamps normalize to UTC.
+        assert_eq!(
+            dentist.record.time.starts_at.map(|at| at.to_rfc3339()),
+            Some("2026-07-20T07:00:00+00:00".to_string())
+        );
+
+        let bank = records
+            .iter()
+            .find(|doc| doc.record.title == "Call the bank")
+            .expect("bank record");
+        assert_eq!(bank.record.kind, RecordKind::Reminder);
+        assert!(bank.record.time.due_at.is_none(), "malformed due_at → None");
+    }
+
+    #[tokio::test]
+    async fn persist_ledger_candidates_dedups_against_existing_open_records() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let ledger = LedgerStore::new(temp_dir.path());
+
+        // Pre-existing OPEN record with the same normalized title → skip.
+        ledger
+            .write_record(
+                LedgerRecord::new(new_record_id(), RecordKind::Todo, "Renew passport"),
+                None,
+            )
+            .await
+            .expect("seed existing record");
+
+        let candidates = vec![
+            LedgerExtractionCandidate {
+                title: "  renew PASSPORT ".to_string(),
+                kind: "todo".to_string(),
+                excerpt: Some("I need to renew my passport before August".to_string()),
+                session_id: Some("session-dup".to_string()),
+                confidence: Some("high".to_string()),
+                ..LedgerExtractionCandidate::default()
+            },
+            LedgerExtractionCandidate {
+                title: "Book flight to Munich".to_string(),
+                kind: "todo".to_string(),
+                excerpt: Some("I still have to book my flight to Munich".to_string()),
+                session_id: Some("session-dup".to_string()),
+                confidence: Some("high".to_string()),
+                ..LedgerExtractionCandidate::default()
+            },
+        ];
+
+        let writes = persist_ledger_candidates(&ledger, candidates)
+            .await
+            .expect("persist should succeed");
+        assert_eq!(
+            writes, 1,
+            "duplicate of existing open record must be skipped"
+        );
+
+        let records = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list records");
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .any(|doc| doc.record.title == "Book flight to Munich"));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|doc| doc.record.title.eq_ignore_ascii_case("renew passport"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1287,6 +1628,7 @@ mod tests {
                 MemoryScope::Project,
                 Some(&project_key_a),
                 Some("concise planning"),
+                None,
                 None,
                 None,
                 &bamboo_memory::memory_store::MemoryQueryOptions {

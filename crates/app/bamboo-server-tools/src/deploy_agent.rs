@@ -15,12 +15,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_broker::{
     AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
 };
+use bamboo_config::Config;
 
 /// Keeps deployed workers alive (the handles are kill-on-drop) and lets `stop`
 /// tear them down. Shared for the server's lifetime.
@@ -38,6 +39,10 @@ pub struct DeployAgentTool {
     /// Path to the `bamboo` binary used for local subprocess deploys.
     bamboo_bin: PathBuf,
     registry: DeployedRegistry,
+    /// Live config, read (never written) to resolve a scoped `ProvisionSpec`
+    /// for `env=docker` deploys — the assigned model's credential only, never
+    /// the whole config or the master encryption key (#46).
+    config: Arc<RwLock<Config>>,
 }
 
 impl DeployAgentTool {
@@ -46,12 +51,14 @@ impl DeployAgentTool {
         broker_token: impl Into<String>,
         bamboo_bin: impl Into<PathBuf>,
         registry: DeployedRegistry,
+        config: Arc<RwLock<Config>>,
     ) -> Self {
         Self {
             broker_endpoint: broker_endpoint.into(),
             broker_token: broker_token.into(),
             bamboo_bin: bamboo_bin.into(),
             registry,
+            config,
         }
     }
 }
@@ -111,23 +118,54 @@ impl DeployAgentTool {
         });
         let env = env.unwrap_or_else(|| "local".to_string());
 
+        // A container cannot reach the host's loopback; for docker, address the
+        // broker via host.docker.internal (the deployer maps it to the host
+        // gateway). local/ssh keep the configured endpoint as-is. Computed
+        // before the docker spec build below, which also ships this endpoint
+        // (as the worker's `bus` target) inside the ProvisionSpec.
+        let broker_endpoint = if env == "docker" {
+            self.broker_endpoint
+                .replace("127.0.0.1", "host.docker.internal")
+                .replace("localhost", "host.docker.internal")
+        } else {
+            self.broker_endpoint.clone()
+        };
+
+        // docker=only: a parent-resolved ProvisionSpec (assigned model's
+        // credential, no encryption key, no full config) shipped over a
+        // one-shot stdin pipe — NOT the orchestrator's whole `~/.bamboo` home
+        // (#46). `None` falls back to a homeless, credential-less container
+        // (fine for `echo=true` smoke tests; a real worker then has nothing to
+        // authenticate with, which surfaces at the presence-verify/first-task
+        // step rather than silently handing over every provider key).
+        let mut spec_json: Option<String> = None;
+
         let deployer: Box<dyn Deployer> = match env.as_str() {
             "local" => Box::new(LocalProcessDeployer::new(self.bamboo_bin.clone())),
             "docker" => {
                 let image = image.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
                     ToolError::InvalidArguments("env=docker requires `image`".to_string())
                 })?;
+                {
+                    let cfg = self.config.read().await;
+                    spec_json = crate::fabric_deploy::build_ondemand_provision_spec(
+                        &id,
+                        role.as_deref(),
+                        model.as_deref(),
+                        workspace.as_deref(),
+                        std::env::temp_dir().join("bamboo-docker-agents").join(&id),
+                        &broker_endpoint,
+                        &self.broker_token,
+                        &cfg,
+                        echo,
+                    );
+                }
                 // No `--network host`: the worker stays on an isolated bridge
                 // network and reaches the host broker via host.docker.internal
-                // (DockerDeployer adds the host-gateway alias + the endpoint is
-                // rewritten below). Seed the worker from the orchestrator's
-                // bamboo home (mounted read-only, copied into the container's
-                // writable data dir) so it reads the same config (MCP servers +
-                // skills + provider creds).
-                Box::new(
-                    DockerDeployer::new(image)
-                        .mount_home(bamboo_config::paths::resolve_bamboo_dir()),
-                )
+                // (DockerDeployer adds the host-gateway alias above). No home
+                // mount either — the spec built above is the worker's only
+                // source of model/creds/MCP-proxy.
+                Box::new(DockerDeployer::new(image))
             }
             "ssh" => {
                 let host = host.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
@@ -142,17 +180,6 @@ impl DeployAgentTool {
             }
         };
 
-        // A container cannot reach the host's loopback; for docker, address the
-        // broker via host.docker.internal (the deployer maps it to the host
-        // gateway). local/ssh keep the configured endpoint as-is.
-        let broker_endpoint = if env == "docker" {
-            self.broker_endpoint
-                .replace("127.0.0.1", "host.docker.internal")
-                .replace("localhost", "host.docker.internal")
-        } else {
-            self.broker_endpoint.clone()
-        };
-
         let deployment = AgentDeployment {
             id: id.clone(),
             role,
@@ -164,7 +191,7 @@ impl DeployAgentTool {
             // Deployed workers proxy MCP to the orchestrator (single MCP host).
             mcp_proxy: Some(bamboo_broker::ORCHESTRATOR_ID.to_string()),
             log_path: None,
-            spec_json: None,
+            spec_json,
         };
         let handle = deployer
             .deploy(&deployment)
@@ -190,12 +217,16 @@ impl DeployAgentTool {
     }
 
     async fn stop(&self, id: String) -> Result<ToolResult, ToolError> {
-        match self
+        // Take the entry out FIRST, then shut down without holding the registry
+        // lock: shutdown is now graceful (SIGTERM + drain grace window, #49), so
+        // it can take seconds — other deploy/stop/list calls must not serialize
+        // behind it.
+        let removed = self
             .registry
             .lock()
             .await
-            .remove(&crate::registry_keys::agent_key(&id))
-        {
+            .remove(&crate::registry_keys::agent_key(&id));
+        match removed {
             Some(d) => {
                 d.handle.shutdown().await;
                 Ok(tool_json(json!({ "id": id, "status": "stopped" })))
@@ -249,8 +280,9 @@ impl Tool for DeployAgentTool {
          THREE PLACEMENTS (action=deploy, pick with `env`):\n\
          - env=local (default) — a subprocess on THIS machine. Fastest; use for extra parallel \
          hands here.\n\
-         - env=docker — a container (requires `image`, e.g. \"bamboo:latest\"). Isolated; your \
-         bamboo home is mounted so it shares your config. Use for sandboxed or clean-env work.\n\
+         - env=docker — a container (requires `image`, e.g. \"bamboo:latest\"). Isolated; it gets \
+         only the assigned model's credential (via a one-shot handoff, not your whole config) plus \
+         your MCP servers proxied through you. Use for sandboxed or clean-env work.\n\
          - env=ssh — a process on a REMOTE host (requires `host`, e.g. \"user@box\"). Use to run \
          work near other machines/data or to borrow remote compute.\n\
          \n\
@@ -318,7 +350,13 @@ mod tests {
 
     fn tool_with(registry: DeployedRegistry) -> DeployAgentTool {
         // bamboo_bin is never spawned in these tests (we don't drive deploy()).
-        DeployAgentTool::new("ws://localhost:0", "test-token", "/bin/true", registry)
+        DeployAgentTool::new(
+            "ws://localhost:0",
+            "test-token",
+            "/bin/true",
+            registry,
+            std::sync::Arc::new(tokio::sync::RwLock::new(bamboo_config::Config::default())),
+        )
     }
 
     /// A trivial long-running child so the kill/wait path is genuinely exercised.

@@ -528,6 +528,266 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
     );
 }
 
+/// Feishu adapter config plumbing (epic #447 phase 3, §2a): `app_id`/`domain`
+/// are plain fields, `app_secret` follows the exact same encrypted-at-rest +
+/// masked-GET + masked-preserve-on-PATCH contract as the Telegram `token`
+/// above.
+#[actix_web::test]
+async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_masked_value() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+    use bamboo_config::encryption;
+
+    // See the long NOTE on the Telegram equivalent above for why the
+    // process-global (not thread-local) encryption key is relied on here.
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    // 1) Set a Feishu entry with app_id, app_secret, domain via the settings
+    // PATCH surface.
+    let post = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "feishu-real-secret",
+                        "domain": "lark",
+                        "allow_from": ["ou_1"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post_resp = test::call_service(&app, post).await;
+    assert!(post_resp.status().is_success(), "set config should succeed");
+
+    // config.json must NOT carry the `connect` key at all (#455 split).
+    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist after set");
+    assert!(
+        !config_text.contains("\"connect\""),
+        "config.json must not persist the connect key"
+    );
+    assert!(
+        !config_text.contains("feishu-real-secret"),
+        "plaintext app_secret must never be persisted anywhere"
+    );
+
+    // connect.json holds app_id/domain in plain and app_secret encrypted.
+    let connect_path = data_dir.join("connect.json");
+    let connect_text = tokio::fs::read_to_string(&connect_path)
+        .await
+        .expect("connect.json should exist after set");
+    assert!(
+        connect_text.contains("app_secret_encrypted"),
+        "app_secret must be persisted encrypted in connect.json"
+    );
+    assert!(
+        !connect_text.contains("feishu-real-secret"),
+        "plaintext app_secret must never be persisted in connect.json"
+    );
+    let connect_json: serde_json::Value =
+        serde_json::from_str(&connect_text).expect("connect.json should parse");
+    assert_eq!(connect_json["platforms"][0]["app_id"], "cli_real_app_id");
+    assert_eq!(connect_json["platforms"][0]["domain"], "lark");
+    let app_secret_encrypted = connect_json["platforms"][0]["app_secret_encrypted"]
+        .as_str()
+        .expect("app_secret_encrypted should be present")
+        .to_string();
+    assert_eq!(
+        encryption::decrypt(&app_secret_encrypted).expect("app_secret should decrypt"),
+        "feishu-real-secret"
+    );
+
+    // 2) GET masks app_secret but leaves app_id/domain visible.
+    let get = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(body["connect"]["platforms"][0]["app_secret"], "****...****");
+    assert_eq!(body["connect"]["platforms"][0]["app_id"], "cli_real_app_id");
+    assert_eq!(body["connect"]["platforms"][0]["domain"], "lark");
+
+    // 3) Re-POST with the masked placeholder plus an unrelated field change —
+    // the secret must survive untouched.
+    let post2 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "****...****",
+                        "domain": "lark",
+                        "allow_from": ["ou_1", "ou_2"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post2_resp = test::call_service(&app, post2).await;
+    assert!(
+        post2_resp.status().is_success(),
+        "second set config should succeed"
+    );
+
+    let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body2: serde_json::Value = test::call_and_read_body_json(&app, get2).await;
+    assert_eq!(
+        body2["connect"]["platforms"][0]["app_secret"], "****...****",
+        "app_secret must still read as configured"
+    );
+    assert_eq!(
+        body2["connect"]["platforms"][0]["allow_from"],
+        serde_json::json!(["ou_1", "ou_2"]),
+        "unrelated field change must apply"
+    );
+
+    let connect_text_after = tokio::fs::read_to_string(&connect_path)
+        .await
+        .expect("connect.json should still exist");
+    let connect_json_after: serde_json::Value =
+        serde_json::from_str(&connect_text_after).expect("connect.json should parse");
+    let app_secret_encrypted_after = connect_json_after["platforms"][0]["app_secret_encrypted"]
+        .as_str()
+        .expect("app_secret_encrypted should still be present")
+        .to_string();
+    assert_eq!(
+        encryption::decrypt(&app_secret_encrypted_after).expect("app_secret should decrypt"),
+        "feishu-real-secret",
+        "masked round-trip preserves the real app_secret across the split files"
+    );
+}
+
+/// #490 end-to-end: the settings PATCH surface must preserve a masked secret
+/// even when a preceding platform entry is removed in the same request,
+/// shifting the kept entry's array index. Stored platforms are
+/// `[telegram, feishu]`; the client disables telegram and re-POSTs only the
+/// (still-masked) feishu entry, which now lands at index 0 instead of 1.
+/// Before the #490 fix, the positional type-guard (added for #454) saw
+/// telegram≠feishu at index 0 and silently dropped the feishu app_secret.
+#[actix_web::test]
+async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_removed() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+    use bamboo_config::encryption;
+
+    // See the long NOTE on the Telegram test above for why the process-global
+    // (not thread-local) encryption key is relied on here.
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    // 1) Set both a Telegram bot token and a Feishu app_secret, in that order.
+    let post = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    { "type": "telegram", "token": "tg-real-secret", "allow_from": ["u1"] },
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "feishu-real-secret",
+                        "domain": "lark",
+                        "allow_from": ["ou_1"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post_resp = test::call_service(&app, post).await;
+    assert!(post_resp.status().is_success(), "set config should succeed");
+
+    // 2) GET, confirm both entries round-trip masked, in stored order.
+    let get = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(body["connect"]["platforms"][0]["type"], "telegram");
+    assert_eq!(body["connect"]["platforms"][1]["type"], "feishu");
+    assert_eq!(body["connect"]["platforms"][1]["app_secret"], "****...****");
+
+    // 3) Re-POST with telegram removed — the UI's echoed feishu entry (still
+    // masked) now sits at index 0, not index 1 where it was stored.
+    let post2 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "app_secret": "****...****",
+                        "domain": "lark",
+                        "allow_from": ["ou_1"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post2_resp = test::call_service(&app, post2).await;
+    assert!(
+        post2_resp.status().is_success(),
+        "second set config should succeed"
+    );
+
+    // The feishu app_secret must still read as configured, not wiped.
+    let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
+    let body2: serde_json::Value = test::call_and_read_body_json(&app, get2).await;
+    assert_eq!(
+        body2["connect"]["platforms"][0]["type"], "feishu",
+        "telegram entry should be gone, feishu now at index 0"
+    );
+    assert_eq!(
+        body2["connect"]["platforms"][0]["app_secret"], "****...****",
+        "app_secret must still read as configured after the index shift"
+    );
+
+    // And the plaintext on disk (encrypted at rest) must be unchanged, not
+    // wiped by the removed-entry-shifted-index case.
+    let connect_path = data_dir.join("connect.json");
+    let connect_text_after = tokio::fs::read_to_string(&connect_path)
+        .await
+        .expect("connect.json should still exist");
+    let connect_json_after: serde_json::Value =
+        serde_json::from_str(&connect_text_after).expect("connect.json should parse");
+    assert_eq!(connect_json_after["platforms"].as_array().unwrap().len(), 1);
+    let app_secret_encrypted_after = connect_json_after["platforms"][0]["app_secret_encrypted"]
+        .as_str()
+        .expect("app_secret_encrypted should still be present")
+        .to_string();
+    assert_eq!(
+        encryption::decrypt(&app_secret_encrypted_after).expect("app_secret should decrypt"),
+        "feishu-real-secret",
+        "masked secret must resolve by type after a preceding entry was removed, not be dropped"
+    );
+}
+
 /// #455 gap: a full config reset must also clear `connect.json`, or a
 /// bamboo-connect bot token would silently survive `POST
 /// /bamboo/config/reset` and get re-merged back onto the freshly-defaulted
@@ -677,5 +937,182 @@ async fn reset_bamboo_config_also_deletes_connect_json_bak() {
         !connect_backup_path.exists(),
         "connect.json.bak must also be deleted by a full config reset — it holds \
          a live, immediately-usable bot token"
+    );
+}
+
+// ── config-corruption recovery status + confirm API (#153) ─────────────────
+
+/// GET /bamboo/config/recovery-status reports no pending recovery on a clean
+/// config.json, and a full pending status (source + quarantine path) after
+/// booting against a corrupt one.
+#[actix_web::test]
+async fn get_config_recovery_status_reports_pending_state_after_corrupt_boot() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    // No pending recovery on a totally fresh data dir.
+    let clean_dir = tempdir().expect("temp dir should be created");
+    let clean_state = AppState::new(clean_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let clean_app = test::init_service(App::new().app_data(web::Data::new(clean_state)).route(
+        "/bamboo/config/recovery-status",
+        web::get().to(super::get_config_recovery_status),
+    ))
+    .await;
+    let get = test::TestRequest::get()
+        .uri("/bamboo/config/recovery-status")
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&clean_app, get).await;
+    assert_eq!(body["pending"], false);
+
+    // Boot against a corrupt config.json (no .bak) -> defaults + pending recovery.
+    let corrupt_dir = tempdir().expect("temp dir should be created");
+    std::fs::write(corrupt_dir.path().join("config.json"), "}}} broken").unwrap();
+    let corrupt_state = AppState::new(corrupt_dir.path().to_path_buf())
+        .await
+        .expect("app state should still initialize");
+    let corrupt_app = test::init_service(App::new().app_data(web::Data::new(corrupt_state)).route(
+        "/bamboo/config/recovery-status",
+        web::get().to(super::get_config_recovery_status),
+    ))
+    .await;
+    let get = test::TestRequest::get()
+        .uri("/bamboo/config/recovery-status")
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&corrupt_app, get).await;
+    assert_eq!(body["pending"], true);
+    assert_eq!(body["status"]["confirmed"], false);
+    assert_eq!(body["status"]["source"]["kind"], "defaults");
+    assert!(
+        body["status"]["quarantine_path"].is_string(),
+        "quarantine_path should point at the preserved corrupt original"
+    );
+}
+
+/// POST /bamboo/config/recovery/confirm with `{"accept": true}` persists the
+/// recovered config and flips `pending` to `false`; a subsequent GET agrees.
+#[actix_web::test]
+async fn confirm_config_recovery_endpoint_accept_clears_pending_state() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    std::fs::write(
+        temp_dir.path().join("config.json"),
+        r#"{"http_proxy":"http://salvaged","env_vars":"bad-type"}"#,
+    )
+    .unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route(
+                "/bamboo/config/recovery-status",
+                web::get().to(super::get_config_recovery_status),
+            )
+            .route(
+                "/bamboo/config/recovery/confirm",
+                web::post().to(super::confirm_config_recovery),
+            ),
+    )
+    .await;
+
+    let confirm = test::TestRequest::post()
+        .uri("/bamboo/config/recovery/confirm")
+        .set_json(serde_json::json!({ "accept": true }))
+        .to_request();
+    let confirm_resp = test::call_service(&app, confirm).await;
+    assert!(
+        confirm_resp.status().is_success(),
+        "accepting a pending recovery should succeed"
+    );
+    let body: serde_json::Value = test::read_body_json(confirm_resp).await;
+    assert_eq!(body["pending"], false);
+
+    let get = test::TestRequest::get()
+        .uri("/bamboo/config/recovery-status")
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
+    assert_eq!(
+        body["pending"], false,
+        "a follow-up GET agrees the recovery is resolved"
+    );
+
+    let on_disk = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist");
+    assert!(
+        on_disk.contains("http://salvaged"),
+        "the recovered state was actually persisted to config.json"
+    );
+}
+
+/// POST with `{"accept": false}` leaves config.json untouched and `pending`
+/// still `true`.
+#[actix_web::test]
+async fn confirm_config_recovery_endpoint_reject_leaves_pending_state() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let corrupt_bytes = "}}} broken";
+    std::fs::write(temp_dir.path().join("config.json"), corrupt_bytes).unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(App::new().app_data(web::Data::new(state)).route(
+        "/bamboo/config/recovery/confirm",
+        web::post().to(super::confirm_config_recovery),
+    ))
+    .await;
+
+    let confirm = test::TestRequest::post()
+        .uri("/bamboo/config/recovery/confirm")
+        .set_json(serde_json::json!({ "accept": false }))
+        .to_request();
+    let confirm_resp = test::call_service(&app, confirm).await;
+    assert!(confirm_resp.status().is_success());
+    let body: serde_json::Value = test::read_body_json(confirm_resp).await;
+    assert_eq!(body["pending"], true, "reject leaves the recovery pending");
+
+    let on_disk = tokio::fs::read_to_string(config_file_path(&data_dir))
+        .await
+        .expect("config.json should exist");
+    assert_eq!(
+        on_disk, corrupt_bytes,
+        "reject must not touch the on-disk corrupt original"
+    );
+}
+
+/// POST /bamboo/config/recovery/confirm with nothing pending is a 400, not a
+/// silent success.
+#[actix_web::test]
+async fn confirm_config_recovery_endpoint_errors_when_nothing_pending() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app = test::init_service(App::new().app_data(web::Data::new(state)).route(
+        "/bamboo/config/recovery/confirm",
+        web::post().to(super::confirm_config_recovery),
+    ))
+    .await;
+
+    let confirm = test::TestRequest::post()
+        .uri("/bamboo/config/recovery/confirm")
+        .set_json(serde_json::json!({ "accept": true }))
+        .to_request();
+    let confirm_resp = test::call_service(&app, confirm).await;
+    assert_eq!(
+        confirm_resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
     );
 }

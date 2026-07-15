@@ -195,6 +195,30 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                 obj.remove("token");
             }
             obj.remove("token_encrypted");
+
+            // Feishu `app_secret` — same masking pattern; `app_id`/`domain`
+            // are not secrets and are left visible untouched.
+            let app_secret_configured = config
+                .connect
+                .platforms
+                .get(index)
+                .map(|p| {
+                    p.app_secret
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                        || p.app_secret_encrypted.is_some()
+                })
+                .unwrap_or(false);
+            if app_secret_configured {
+                obj.insert(
+                    "app_secret".to_string(),
+                    Value::String("****...****".to_string()),
+                );
+            } else {
+                obj.remove("app_secret");
+            }
+            obj.remove("app_secret_encrypted");
         }
     }
 

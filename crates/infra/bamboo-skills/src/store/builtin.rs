@@ -105,4 +105,27 @@ mod tests {
             .files
             .contains_key("eval-viewer/generate_review.py"));
     }
+
+    #[test]
+    fn builtin_personal_assistant_bundle_carries_assistant_tool_refs() {
+        let bundles = load_builtin_skill_bundles().expect("load builtin bundles");
+        let assistant = bundles
+            .iter()
+            .find(|bundle| bundle.skill.id == "personal-assistant")
+            .expect("personal-assistant bundle");
+
+        assert_eq!(assistant.skill.name, "personal-assistant");
+        assert!(!assistant.skill.description.is_empty());
+        for tool in ["ledger", "scheduler", "memory", "notify"] {
+            assert!(
+                assistant
+                    .skill
+                    .tool_refs
+                    .iter()
+                    .any(|tool_ref| tool_ref == tool),
+                "personal-assistant must allow the {tool} tool, got {:?}",
+                assistant.skill.tool_refs
+            );
+        }
+    }
 }

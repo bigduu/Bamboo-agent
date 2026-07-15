@@ -67,6 +67,8 @@ use bamboo_plugin::{
     InstalledPlugin, PluginInstallStatus, PluginManifest, PluginSource, RegisteredCapabilities,
 };
 
+use crate::service_manager::{ServiceManager, ServiceState};
+
 /// Shared body for `POST /install` and `POST /{id}/update`.
 #[derive(Debug, Deserialize)]
 pub struct InstallPluginRequest {
@@ -93,6 +95,28 @@ pub struct InstalledPluginView {
     pub source: PluginSource,
     pub status: PluginInstallStatus,
     pub registered: RegisteredCapabilities,
+    /// Live `ServiceManager` status for each id in `registered.service_ids`
+    /// (issue #479). Populated from the SAME `ServiceManager` snapshot the
+    /// list handler reads — see [`to_view`]. Empty for a plugin with no
+    /// services (the common case), same shape/emptiness convention as
+    /// `registered`'s other `Vec` fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_status: Vec<ServiceStatusView>,
+}
+
+/// Wire projection of [`crate::service_manager::ServiceStatusSnapshot`] —
+/// kept as a separate type (rather than reusing the internal snapshot
+/// directly) so this HTTP contract doesn't silently change shape if the
+/// internal one grows a field later.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceStatusView {
+    pub id: String,
+    pub state: ServiceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub restart_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// `GET /api/v1/plugins` response body.
@@ -110,8 +134,35 @@ pub struct PluginListResponse {
 /// a successful install/update) to recover it; `None` if that file is
 /// missing or fails to parse (e.g. hand-deleted out from under bamboo),
 /// matching the contract's optional `name?`.
-pub async fn to_view(entry: InstalledPlugin) -> InstalledPluginView {
+pub async fn to_view(
+    entry: InstalledPlugin,
+    service_manager: &ServiceManager,
+) -> InstalledPluginView {
     let name = read_manifest_name(&entry.plugin_dir).await;
+    let mut service_status = Vec::with_capacity(entry.registered.service_ids.len());
+    for service_id in &entry.registered.service_ids {
+        let view = match service_manager.status(service_id).await {
+            Some(snapshot) => ServiceStatusView {
+                id: snapshot.id,
+                state: snapshot.state,
+                pid: snapshot.pid,
+                restart_count: snapshot.restart_count,
+                last_error: snapshot.last_error,
+            },
+            // Not currently supervised (disabled in the manifest, or its
+            // supervisor task already unwound e.g. after `stop_service`) —
+            // still surface the id as `Stopped` rather than silently
+            // dropping it, so a caller sees every service this plugin owns.
+            None => ServiceStatusView {
+                id: service_id.clone(),
+                state: ServiceState::Stopped,
+                pid: None,
+                restart_count: 0,
+                last_error: None,
+            },
+        };
+        service_status.push(view);
+    }
     InstalledPluginView {
         id: entry.id,
         name,
@@ -119,6 +170,7 @@ pub async fn to_view(entry: InstalledPlugin) -> InstalledPluginView {
         source: entry.source,
         status: entry.status,
         registered: entry.registered,
+        service_status,
     }
 }
 

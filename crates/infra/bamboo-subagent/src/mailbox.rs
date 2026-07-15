@@ -242,15 +242,21 @@ impl Mailbox {
         }
     }
 
-    /// Acknowledge a processed message by id: delete it from `cur/`.
+    /// Acknowledge a processed message by id: delete it from `cur/`. Returns
+    /// `true` if a message was actually found and removed, `false` if it was
+    /// already gone (idempotent no-op — a double-ack, or an id that was never
+    /// claimed into `cur/`) — a caller that keeps a live pending-count
+    /// alongside the mailbox (e.g. `bamboo-broker`'s `BrokerCore`, #53
+    /// follow-up) needs this to decrement exactly once per message actually
+    /// removed, not once per `ack` call.
     /// O(n) directory scan — prefer [`ack_delivered`](Self::ack_delivered)
     /// when you still hold the [`Delivered`]. Idempotent (no-op if gone).
-    pub async fn ack(&self, id: &MsgId) -> Result<()> {
+    pub async fn ack(&self, id: &MsgId) -> Result<bool> {
         let needle = format!("-{}.json", id.0);
         let cur = self.cur_dir();
         let mut rd = match tokio::fs::read_dir(&cur).await {
             Ok(rd) => rd,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(StoreError::io(&cur, e)),
         };
         while let Some(ent) = rd.next_entry().await.map_err(|e| StoreError::io(&cur, e))? {
@@ -259,10 +265,10 @@ impl Mailbox {
                 tokio::fs::remove_file(ent.path())
                     .await
                     .map_err(|e| StoreError::io(ent.path(), e))?;
-                return Ok(());
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Re-yield messages left in `cur/` by a previous (crashed) activation, in order.
@@ -288,6 +294,17 @@ impl Mailbox {
     /// True if `new/` has no pending messages.
     pub async fn is_empty(&self) -> Result<bool> {
         Ok(self.sorted_json_names(&self.new_dir()).await?.is_empty())
+    }
+
+    /// Count of messages currently pending in this mailbox: not-yet-claimed
+    /// (`new/`) plus claimed-but-unacked (`cur/`). A real reader claims (drain)
+    /// and acks promptly, so this only grows unbounded when nobody is
+    /// consuming — used to cap a session's backlog against a `deliver` flood
+    /// aimed at an offline/never-draining mailbox (disk-exhaustion DoS
+    /// defense, #53).
+    pub async fn pending_count(&self) -> Result<usize> {
+        Ok(self.sorted_json_names(&self.new_dir()).await?.len()
+            + self.sorted_json_names(&self.cur_dir()).await?.len())
     }
 
     async fn sorted_json_names(&self, dir: &std::path::Path) -> Result<Vec<String>> {

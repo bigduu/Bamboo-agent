@@ -20,6 +20,13 @@ pub struct CreateSessionInput {
     pub model_ref: Option<ProviderModelRef>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub gold_config_json: Option<String>,
+    /// Optional workspace path, same semantics as `ChatTurnInput::workspace_path`
+    /// (#480: connect bridge sets workspace at session-creation; an external
+    /// connector using `POST /sessions` should be able to as well). Only the
+    /// metadata write happens here — syncing the runtime workspace directory
+    /// on disk (`ensure_session_workspace`) is a handler-layer concern, same
+    /// split as the chat turn use case.
+    pub workspace_path: Option<String>,
 }
 
 /// Configuration defaults for session creation.
@@ -52,6 +59,9 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
         session
             .metadata
             .insert(GOLD_CONFIG_METADATA_KEY.to_string(), gold_config_json);
+    }
+    if let Some(workspace_path) = trimmed_non_empty(input.workspace_path.as_deref()) {
+        session.set_workspace_path_meta(workspace_path);
     }
 
     if let Some(title) = trimmed_non_empty(input.title.as_deref()) {
@@ -163,6 +173,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: Some(ReasoningEffort::High),
             gold_config_json: None,
+            workspace_path: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -191,6 +202,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             gold_config_json: None,
+            workspace_path: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -218,6 +230,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             gold_config_json: None,
+            workspace_path: None,
         };
         let session = build_new_session(&input, &config);
 
@@ -240,6 +253,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             gold_config_json: None,
+            workspace_path: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -259,6 +273,7 @@ mod tests {
             model_ref: Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet")),
             reasoning_effort: None,
             gold_config_json: None,
+            workspace_path: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -271,5 +286,44 @@ mod tests {
             session.metadata.get("provider_name").map(String::as_str),
             Some("anthropic")
         );
+    }
+
+    /// #480: `POST /sessions` gets the same `workspace_path` semantics as
+    /// `POST /chat`'s `ChatTurnInput.workspace_path` — set at session creation.
+    #[test]
+    fn build_new_session_with_workspace_path_sets_workspace_metadata() {
+        let input = CreateSessionInput {
+            id: "session-6".to_string(),
+            title: None,
+            system_prompt: None,
+            model: Some("gpt-5".to_string()),
+            model_ref: None,
+            reasoning_effort: None,
+            gold_config_json: None,
+            workspace_path: Some("  /tmp/my-workspace  ".to_string()),
+        };
+        let session = build_new_session(&input, &default_config());
+
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some("/tmp/my-workspace")
+        );
+    }
+
+    #[test]
+    fn build_new_session_without_workspace_path_leaves_metadata_unset() {
+        let input = CreateSessionInput {
+            id: "session-7".to_string(),
+            title: None,
+            system_prompt: None,
+            model: Some("gpt-5".to_string()),
+            model_ref: None,
+            reasoning_effort: None,
+            gold_config_json: None,
+            workspace_path: None,
+        };
+        let session = build_new_session(&input, &default_config());
+
+        assert!(session.workspace_path_meta().is_none());
     }
 }

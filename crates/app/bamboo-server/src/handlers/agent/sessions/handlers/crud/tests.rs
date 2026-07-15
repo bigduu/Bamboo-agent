@@ -50,6 +50,7 @@ fn build_new_session_applies_title_and_system_prompt_metadata() {
         model_ref: None,
         reasoning_effort: Some(ReasoningEffort::High),
         gold_config_json: None,
+        workspace_path: None,
     };
 
     let session = build_new_session(&input, &config_from_server(&config));
@@ -95,6 +96,7 @@ fn build_new_session_uses_global_default_template_when_request_prompt_is_missing
         model_ref: None,
         reasoning_effort: None,
         gold_config_json: None,
+        workspace_path: None,
     };
 
     let session = build_new_session(&input, &config_from_server(&config));

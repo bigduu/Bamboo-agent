@@ -95,11 +95,14 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
                 );
                 continue;
             };
+            // #217: default under the persistent data-dir subagents home
+            // instead of `env::temp_dir()`, so fabric discovery state
+            // survives reboots and stays inside the tenant's data dir.
             let fabric_dir = profile
                 .fabric_dir
                 .clone()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+                .unwrap_or_else(bamboo_config::paths::subagents_dir);
             let executor = match profile.executor.as_deref() {
                 Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
                 Some("bamboo_runtime") | None => {
@@ -214,11 +217,13 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
         ),
     };
 
+    // #217: default under the persistent data-dir subagents home instead of
+    // `env::temp_dir()` (mirrors the `build_external_child_runner` arm above).
     let fabric_dir = sub
         .fabric_dir
         .clone()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+        .unwrap_or_else(bamboo_config::paths::subagents_dir);
 
     let executor = match sub.executor.as_deref() {
         Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
@@ -416,31 +421,43 @@ fn resolve_remote_placements(
 }
 
 /// Snapshot per-provider credentials from the parent config for actor
-/// provisioning. Serialized generically so this code does not chase the
-/// per-provider config struct shapes — any slot with a non-empty `api_key`
-/// yields a scoped credential (plus `base_url` when present).
+/// provisioning. `api_key` (plaintext, in-memory only) is `#[serde(skip_serializing)]`
+/// on every legacy single-instance provider struct — it's hydrated from
+/// `api_key_encrypted` at load time but deliberately never round-tripped
+/// through serde, so a `serde_json::to_value` projection of `config.providers`
+/// sees none of it (#495). Read each typed struct's `api_key` field directly
+/// instead, mirroring how `provider_instances` below already has to.
 pub fn extract_provider_credentials(
     config: &Config,
 ) -> Vec<bamboo_subagent::provision::ScopedCredential> {
     let mut out = Vec::new();
 
-    // Legacy single-instance slots: providers.anthropic / openai / …
-    if let Ok(serde_json::Value::Object(providers)) = serde_json::to_value(&config.providers) {
-        out.extend(providers.into_iter().filter_map(|(name, slot)| {
-            let api_key = slot.get("api_key")?.as_str()?.trim().to_string();
-            if api_key.is_empty() {
-                return None;
-            }
-            Some(bamboo_subagent::provision::ScopedCredential {
-                provider: name.clone(),
-                api_key,
-                base_url: slot
-                    .get("base_url")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                provider_type: Some(name),
-            })
-        }));
+    // Legacy single-instance slots: providers.anthropic / openai / gemini /
+    // bodhi. `copilot` is intentionally omitted — it authenticates via device
+    // flow and has no `api_key` field to extract.
+    let mut push_legacy = |name: &str, api_key: &str, base_url: Option<String>| {
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            return;
+        }
+        out.push(bamboo_subagent::provision::ScopedCredential {
+            provider: name.to_string(),
+            api_key,
+            base_url,
+            provider_type: Some(name.to_string()),
+        });
+    };
+    if let Some(c) = &config.providers.openai {
+        push_legacy("openai", &c.api_key, c.base_url.clone());
+    }
+    if let Some(c) = &config.providers.anthropic {
+        push_legacy("anthropic", &c.api_key, c.base_url.clone());
+    }
+    if let Some(c) = &config.providers.gemini {
+        push_legacy("gemini", &c.api_key, c.base_url.clone());
+    }
+    if let Some(c) = &config.providers.bodhi {
+        push_legacy("bodhi", &c.api_key, c.base_url.clone());
     }
 
     // Multi-instance providers: provider_instances keyed by instance id; the
@@ -461,6 +478,114 @@ pub fn extract_provider_credentials(
     }));
 
     out
+}
+
+#[cfg(test)]
+mod extract_provider_credentials_tests {
+    use super::extract_provider_credentials;
+    use bamboo_config::{
+        AnthropicConfig, BodhiConfig, Config, OpenAIConfig, ProviderInstanceConfig,
+    };
+
+    fn instance(provider_type: &str, api_key: &str) -> ProviderInstanceConfig {
+        ProviderInstanceConfig {
+            provider_type: provider_type.to_string(),
+            label: None,
+            api_key: api_key.to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: Vec::new(),
+            request_overrides: None,
+            enabled: true,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn no_config_yields_no_credentials() {
+        let config = Config::default();
+        assert!(extract_provider_credentials(&config).is_empty());
+    }
+
+    /// #495 — a legacy single-instance provider (`config.providers.anthropic`
+    /// etc.) must yield its `api_key` even though the field is
+    /// `#[serde(skip_serializing)]`, because the extraction now reads the
+    /// typed struct instead of projecting through `serde_json::to_value`.
+    #[test]
+    fn legacy_only_config_yields_credential() {
+        let mut config = Config::default();
+        config.providers.anthropic = Some(AnthropicConfig {
+            api_key: "sk-ant-legacy".to_string(),
+            base_url: Some("https://api.anthropic.com".to_string()),
+            ..Default::default()
+        });
+
+        let creds = extract_provider_credentials(&config);
+        assert_eq!(creds.len(), 1);
+        let c = &creds[0];
+        assert_eq!(c.provider, "anthropic");
+        assert_eq!(c.api_key, "sk-ant-legacy");
+        assert_eq!(c.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(c.provider_type.as_deref(), Some("anthropic"));
+    }
+
+    /// `bodhi` doesn't derive `Default`, so it's exercised separately —
+    /// covers the last of the four legacy structs the fix touches
+    /// (openai/anthropic/gemini already share the `Default`-derive path).
+    #[test]
+    fn legacy_bodhi_config_yields_credential() {
+        let mut config = Config::default();
+        config.providers.bodhi = Some(BodhiConfig {
+            api_key: "bhi_sk_legacy".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            target_provider: None,
+            reasoning_effort: None,
+            extra: Default::default(),
+        });
+
+        let creds = extract_provider_credentials(&config);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].provider, "bodhi");
+        assert_eq!(creds[0].api_key, "bhi_sk_legacy");
+    }
+
+    /// A legacy slot with an empty `api_key` (struct present but never
+    /// configured) must not produce a bogus empty credential.
+    #[test]
+    fn legacy_config_with_empty_api_key_is_skipped() {
+        let mut config = Config::default();
+        config.providers.openai = Some(OpenAIConfig::default());
+        assert!(extract_provider_credentials(&config).is_empty());
+    }
+
+    /// Legacy + `provider_instances` coexisting: both must surface, with no
+    /// duplication/clobbering between the two sources.
+    #[test]
+    fn legacy_and_instances_both_present_no_duplicates() {
+        let mut config = Config::default();
+        config.providers.anthropic = Some(AnthropicConfig {
+            api_key: "sk-ant-legacy".to_string(),
+            ..Default::default()
+        });
+        config
+            .provider_instances
+            .insert("openai-work".to_string(), instance("openai", "sk-oai-work"));
+
+        let mut creds = extract_provider_credentials(&config);
+        creds.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0].provider, "anthropic");
+        assert_eq!(creds[0].api_key, "sk-ant-legacy");
+        assert_eq!(creds[1].provider, "openai-work");
+        assert_eq!(creds[1].api_key, "sk-oai-work");
+        assert_eq!(creds[1].provider_type.as_deref(), Some("openai"));
+    }
 }
 
 #[cfg(test)]

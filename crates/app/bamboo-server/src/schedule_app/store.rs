@@ -348,7 +348,9 @@ fn compute_initial_next_run_at(
 ) -> io::Result<DateTime<Utc>> {
     let engine = default_trigger_engine();
     let runtime_timezone = match trigger {
-        ScheduleTrigger::Interval { .. } => None,
+        // Interval and Once are defined on absolute UTC instants; the engine
+        // rejects a timezone for them, so never pass one through.
+        ScheduleTrigger::Interval { .. } | ScheduleTrigger::Once { .. } => None,
         _ => timezone,
     };
     engine
@@ -415,7 +417,11 @@ fn normalize_loaded_schedule_entry(entry: &mut ScheduleEntry) -> bool {
         }
     }
 
-    if entry.state.next_fire_at.is_none() {
+    // A `next_fire_at: None` on a one-shot trigger is terminal state (the
+    // single occurrence was already claimed), not missing data — re-arming it
+    // here would make a fired Once schedule fire a second time on reload.
+    if entry.state.next_fire_at.is_none() && !matches!(entry.trigger, ScheduleTrigger::Once { .. })
+    {
         entry.state.next_fire_at = Some(entry.created_at);
         changed = true;
     }
@@ -494,7 +500,9 @@ fn runtime_trigger(entry: &ScheduleEntry) -> ScheduleTrigger {
 
 fn runtime_timezone<'a>(entry: &'a ScheduleEntry, trigger: &ScheduleTrigger) -> Option<&'a str> {
     match trigger {
-        ScheduleTrigger::Interval { .. } => None,
+        // Interval and Once are defined on absolute UTC instants; the engine
+        // rejects a timezone for them, so never pass one through.
+        ScheduleTrigger::Interval { .. } | ScheduleTrigger::Once { .. } => None,
         _ => entry.timezone.as_deref(),
     }
 }
@@ -1505,6 +1513,128 @@ mod tests {
             .state
             .next_fire_at
             .is_some_and(|next| next > created.created_at));
+    }
+
+    #[tokio::test]
+    async fn create_schedule_with_definition_initializes_once_next_run_at_trigger_instant() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+
+        let at = Utc::now() + Duration::seconds(600);
+        let created = store
+            .create_schedule_with_definition(
+                "once".to_string(),
+                true,
+                ScheduleRunConfig::default(),
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::Once { at }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(created.trigger, ScheduleTrigger::Once { at: t } if t == at));
+        assert_eq!(created.state.next_fire_at, Some(at));
+    }
+
+    #[tokio::test]
+    async fn claimed_once_run_does_not_produce_a_second_due_run() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+
+        let at = Utc::now() + Duration::seconds(600);
+        let created = store
+            .create_schedule_with_definition(
+                "once".to_string(),
+                true,
+                ScheduleRunConfig::default(),
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::Once { at }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.state.next_fire_at, Some(at));
+
+        let engine = default_trigger_engine();
+
+        // Not due yet: nothing is claimed before `at`.
+        let claimed = store
+            .claim_due_runs_with_engine(at - Duration::seconds(1), engine.as_ref())
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
+
+        // Due: the single occurrence is claimed exactly once, and the
+        // schedule terminates (no next fire, disabled).
+        let claimed = store
+            .claim_due_runs_with_engine(at, engine.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].scheduled_for, at);
+
+        let updated = store.get_schedule(&created.id).await.unwrap();
+        assert_eq!(updated.state.next_fire_at, None);
+        assert!(!updated.enabled);
+
+        // Subsequent ticks never claim the fired one-shot again.
+        let claimed = store
+            .claim_due_runs_with_engine(at + Duration::seconds(60), engine.as_ref())
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
+        let claimed = store
+            .claim_due_runs_with_engine(at + Duration::seconds(3600), engine.as_ref())
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fired_once_schedule_is_not_rearmed_on_reload() {
+        let dir = tempdir().unwrap();
+        let at = Utc::now() + Duration::seconds(600);
+        let created_id;
+        {
+            let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+            let created = store
+                .create_schedule_with_definition(
+                    "once".to_string(),
+                    true,
+                    ScheduleRunConfig::default(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::Once { at }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            created_id = created.id.clone();
+
+            let engine = default_trigger_engine();
+            let claimed = store
+                .claim_due_runs_with_engine(at, engine.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 1);
+        }
+
+        // Reload from disk: the load-time backfill must not re-arm the fired
+        // one-shot (`next_fire_at: None` is its terminal state).
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let reloaded = store.get_schedule(&created_id).await.unwrap();
+        assert_eq!(reloaded.state.next_fire_at, None);
+        assert!(!reloaded.enabled);
+
+        let engine = default_trigger_engine();
+        let claimed = store
+            .claim_due_runs_with_engine(at + Duration::seconds(60), engine.as_ref())
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
     }
 
     #[tokio::test]

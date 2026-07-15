@@ -68,7 +68,7 @@ pub async fn list_plugins(state: web::Data<AppState>) -> impl Responder {
         Ok(entries) => {
             let mut plugins = Vec::with_capacity(entries.len());
             for entry in entries {
-                plugins.push(to_view(entry).await);
+                plugins.push(to_view(entry, &state.service_manager).await);
             }
             HttpResponse::Ok().json(PluginListResponse { plugins })
         }
@@ -97,7 +97,7 @@ pub async fn install_plugin(
     )
     .await
     {
-        Ok(entry) => HttpResponse::Created().json(to_view(entry).await),
+        Ok(entry) => HttpResponse::Created().json(to_view(entry, &state.service_manager).await),
         Err(error) => plugin_error_response(&error),
     }
 }
@@ -122,13 +122,34 @@ pub async fn update_plugin(
     let input = to_source_input(body.into_inner().source);
     let trust = state.config.read().await.plugin_trust.clone();
 
+    // Same-id upgrade ordering (issue #479): `stage_plugin_source` below
+    // swaps `plugin_dir`'s ENTIRE contents (old bundle -> `.backup-*`,
+    // staged bundle -> `plugin_dir`) BEFORE `install()` ever runs — so any
+    // service this plugin currently owns must be stopped BEFORE staging,
+    // not after `install()`'s own `register_services` step, or the old
+    // process could still be holding the about-to-be-replaced binary open
+    // (and would otherwise briefly run stale code post-swap either way).
+    // `path_id` is the ONLY point in this flow where the target id is known
+    // up front (a fresh `install_plugin` has no prior id to look up). See
+    // `ServerPluginInstaller::stop_services_for_upgrade`'s doc comment for
+    // the full stop -> swap -> start sequencing this establishes.
+    let stopped_services = installer.stop_services_for_upgrade(&path_id).await;
+
     let staged = match stage_plugin_source(input, &root, &trust).await {
         Ok(staged) => staged,
-        Err(error) => return plugin_error_response(&error),
+        Err(error) => {
+            installer
+                .restart_services_after_failed_upgrade(&path_id, &stopped_services)
+                .await;
+            return plugin_error_response(&error);
+        }
     };
     if staged.manifest.id != path_id {
         let manifest_id = staged.manifest.id.clone();
         staged.rollback().await;
+        installer
+            .restart_services_after_failed_upgrade(&path_id, &stopped_services)
+            .await;
         return plugin_error_response(&PluginError::InvalidManifest(format!(
             "path id '{path_id}' does not match the source's manifest id '{manifest_id}'"
         )));
@@ -149,10 +170,15 @@ pub async fn update_plugin(
     {
         Ok(entry) => {
             staged.commit().await;
-            HttpResponse::Ok().json(to_view(entry).await)
+            HttpResponse::Ok().json(to_view(entry, &state.service_manager).await)
         }
         Err(error) => {
             staged.rollback().await;
+            // `plugin_dir` is now back to the pre-upgrade bundle's bytes —
+            // restart exactly what `stop_services_for_upgrade` stopped.
+            installer
+                .restart_services_after_failed_upgrade(&path_id, &stopped_services)
+                .await;
             plugin_error_response(&error)
         }
     }

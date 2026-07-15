@@ -46,11 +46,13 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
     // The AI-callable deploy tool, wired to the REAL bamboo binary + this broker.
     // Holding `tool` keeps its registry (and the deployed handle) alive.
     let registry = Arc::new(Mutex::new(HashMap::new()));
+    let config = Arc::new(tokio::sync::RwLock::new(bamboo_config::Config::default()));
     let tool = DeployAgentTool::new(
         endpoint.clone(),
         TOKEN,
         env!("CARGO_BIN_EXE_bamboo"),
         registry,
+        config,
     );
 
     // 1. The agent deploys a worker (local subprocess, echo executor).

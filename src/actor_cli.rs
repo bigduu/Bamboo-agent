@@ -26,8 +26,12 @@ use bamboo_subagent::transport::{ChildClient, WsServer};
 use crate::subagent_worker::BambooRuntimeExecutor;
 
 /// Default fabric directory shared by all local actors.
+///
+/// #217: lives under the persistent data dir (`~/.bamboo/subagents` by
+/// default, or `BAMBOO_DATA_DIR`/`BAMBOO_WORKSPACE_ROOT`'s sibling) instead
+/// of `env::temp_dir()`, so actor discovery/storage state survives reboots.
 pub fn default_fabric_dir() -> PathBuf {
-    std::env::temp_dir().join("bamboo-subagents")
+    bamboo_config::paths::subagents_dir()
 }
 
 pub struct ActorRunArgs {

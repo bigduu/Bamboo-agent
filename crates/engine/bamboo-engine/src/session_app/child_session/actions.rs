@@ -89,11 +89,15 @@ pub async fn create_child_action(
             .no_human_approver = true;
     }
 
-    child.workspace = Some(input.workspace.clone());
-    bamboo_agent_core::workspace_state::set_workspace(
+    // `set_workspace` returns the FINAL stored path, which may differ from
+    // the requested one when workspace-root confinement (#217) relocated it —
+    // store that back onto the domain field so `child.workspace` never
+    // diverges from where tools actually run.
+    let stored_workspace = bamboo_agent_core::workspace_state::set_workspace(
         &child.id,
         std::path::PathBuf::from(&input.workspace),
     );
+    child.workspace = Some(stored_workspace.to_string_lossy().to_string());
 
     child
         .metadata

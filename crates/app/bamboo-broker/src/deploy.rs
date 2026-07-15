@@ -11,9 +11,19 @@
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{BrokerError, BrokerResult};
+
+/// Default grace window between SIGTERM and the hard `SIGKILL`/`TerminateProcess`
+/// fallback when stopping a locally-deployed worker: long enough for
+/// `serve_loop`'s drain (finish whatever Ask is in flight, deliver + ack its
+/// reply) to complete under normal load, bounded so a wedged/unresponsive
+/// worker can't hang `action=stop` forever. `shutdown()` uses this; tests use
+/// [`DeployedAgent::shutdown_with_timeout`] with a short one instead of a
+/// real-time wait. #49.
+pub const DEFAULT_GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What to deploy: one broker-agent's identity + how it reaches the broker.
 #[derive(Debug, Clone)]
@@ -38,10 +48,12 @@ pub struct AgentDeployment {
     /// A parent-resolved `ProvisionSpec` (serialized JSON) the orchestrator ships
     /// to the worker — model/creds/MCP/bus all decided here, so the worker stops
     /// self-resolving from its host config (a remote node needs no bamboo config
-    /// of its own). Delivery is per-deployer: Local pipes it to stdin
+    /// of its own, and a Docker worker needs no mount of the orchestrator's home
+    /// — #46). Delivery is per-deployer: Local and Docker pipe it to stdin
     /// (`--spec-stdin`); Ssh/Russh upload it to a remote file (`--spec-file`).
-    /// `None` keeps the legacy argv+env self-resolve bootstrap (Docker still
-    /// self-resolves via its mounted home).
+    /// `None` keeps the legacy argv+env self-resolve bootstrap (Docker then
+    /// falls back to `DockerDeployer::mount_home` if set, or a homeless
+    /// container otherwise).
     pub spec_json: Option<String>,
 }
 
@@ -128,11 +140,52 @@ impl DeployedAgent {
         }
     }
 
-    /// Stop the deployment: kill the launched process / remote worker, then run
-    /// cleanup if any.
+    /// Stop the deployment: SIGTERM the launched process / remote worker, then
+    /// run cleanup if any. Uses [`DEFAULT_GRACEFUL_STOP_TIMEOUT`] as the grace
+    /// window before falling back to a hard kill; see
+    /// [`Self::shutdown_with_timeout`] for the full behavior.
     pub async fn shutdown(self) {
+        self.shutdown_with_timeout(DEFAULT_GRACEFUL_STOP_TIMEOUT)
+            .await
+    }
+
+    /// Stop the deployment with an explicit grace window: for a local process,
+    /// send SIGTERM and poll for up to `timeout` for it to exit on its own —
+    /// giving a worker built on [`crate::serve::serve_executor_with_shutdown`]
+    /// a chance to drain its in-flight Ask/Task/Run and reply cleanly — before
+    /// falling back to a hard `SIGKILL` (`Child::start_kill`). A worker with no
+    /// signal handler (e.g. an old binary) or one that's genuinely wedged still
+    /// gets killed once `timeout` elapses, so `action=stop` is always bounded.
+    /// Remote deployments delegate to [`RemoteDeployment::shutdown`] unchanged
+    /// (out of scope for #49 — see the issue's evidence, which is specific to
+    /// the local-process `start_kill()` path). #49.
+    pub async fn shutdown_with_timeout(self, timeout: Duration) {
         match self.inner {
             DeployedInner::Process { mut child, cleanup } => {
+                if let Some(pid) = child.id() {
+                    send_sigterm(pid).await;
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    loop {
+                        match child.try_wait() {
+                            // Exited on its own within the grace window — done,
+                            // no need for the SIGKILL fallback below.
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if tokio::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            // wait() error (e.g. already reaped elsewhere): stop
+                            // polling and let the fallback below settle it.
+                            Err(_) => break,
+                        }
+                    }
+                }
+                // Still alive after the grace window (or no pid captured, or the
+                // process never had a chance to install a handler) — escalate.
+                // A no-op if it already exited above (start_kill/wait on an
+                // exited child just observe the cached status).
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 if let Some(args) = cleanup {
@@ -145,6 +198,27 @@ impl DeployedAgent {
         }
     }
 }
+
+/// Send SIGTERM to `pid` by shelling out to `kill -TERM` — deliberately NOT
+/// `libc::kill`/`nix` (mirrors the precedent in
+/// `bamboo_server::service_manager::lifecycle::send_graceful_signal`, which
+/// notes this avoids adding a new dependency for one best-effort signal). A
+/// failure (e.g. the process already exited) just means the polling loop
+/// above falls straight through to the hard-kill fallback.
+#[cfg(not(target_os = "windows"))]
+async fn send_sigterm(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await;
+}
+
+/// No SIGTERM equivalent on Windows worth shelling out for here; the grace
+/// window in `shutdown_with_timeout` still elapses before the hard-kill
+/// fallback (`Child::start_kill` → `TerminateProcess`). Mirrors
+/// `lifecycle::send_graceful_signal`'s Windows arm.
+#[cfg(target_os = "windows")]
+async fn send_sigterm(_pid: u32) {}
 
 /// The `broker-agent serve …` argv (token is NOT here — it rides the env).
 pub(crate) fn agent_argv(d: &AgentDeployment) -> Vec<String> {
@@ -261,13 +335,16 @@ pub struct DockerDeployer {
     pub bamboo_in_image: String,
     /// e.g. `Some("host")` so the container can reach a `127.0.0.1` broker.
     pub network: Option<String>,
-    /// Host bamboo home dir to seed the worker from: mounted read-only at
-    /// `/seed`, then config + encryption key + skills are copied into the
-    /// container's writable data dir at startup, so the worker reads the
-    /// orchestrator's config (MCP servers + skills + provider creds) while
-    /// keeping an isolated, writable data dir. (Trusted-local convenience; it
-    /// also exposes the config's secrets to the container — P3 will scope this
-    /// down.)
+    /// LEGACY fallback: host bamboo home dir to seed the worker from — mounted
+    /// read-only at `/seed`, then config + encryption key + skills copied into
+    /// the container's writable data dir at startup. This exposes **every**
+    /// provider credential in the orchestrator's config to the container (#46)
+    /// and is only still consulted when `AgentDeployment::spec_json` is unset
+    /// (e.g. a caller with no configured credentials). The normal path —
+    /// `deploy_agent`'s `env=docker` — ships a parent-resolved `ProvisionSpec`
+    /// (just the assigned model's credential, no encryption key, no full
+    /// config) over stdin instead; see `spec_json` below, which takes
+    /// precedence over this field whenever both are set.
     pub mount_home: Option<PathBuf>,
 }
 
@@ -311,7 +388,21 @@ impl DockerDeployer {
             a.push("--network".into());
             a.push(net.clone());
         }
-        if let Some(home) = &self.mount_home {
+        if d.spec_json.is_some() {
+            // Parent-resolved spec rides the container's stdin — no home mount,
+            // no on-disk config/encryption-key copy (#46). `-i` keeps stdin
+            // open for the pipe; `deploy()` writes the spec and closes it right
+            // after spawn, mirroring `LocalProcessDeployer`. Takes precedence
+            // over `mount_home` (same "spec is authoritative" rule as the CLI's
+            // `--spec-stdin`/`--spec-file`).
+            a.push("-i".into());
+            a.push("--entrypoint".into());
+            a.push(self.bamboo_in_image.clone());
+            a.push(self.image.clone());
+            let mut argv = agent_argv(d);
+            argv.push("--spec-stdin".to_string());
+            a.extend(argv);
+        } else if let Some(home) = &self.mount_home {
             // Seed the worker from the orchestrator's home, but DON'T run on a
             // read-only mount of it: the worker writes the moment it starts
             // (skill-store builtin sync, session/event persistence), so a
@@ -365,7 +456,25 @@ impl Deployer for DockerDeployer {
         let container = format!("bamboo-agent-{}", d.id);
         let mut cmd = Command::new(&self.docker_bin);
         cmd.args(self.argv(d, &container)).kill_on_drop(true);
-        let child = cmd.spawn().map_err(spawn_err)?;
+        if d.spec_json.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        let mut child = cmd.spawn().map_err(spawn_err)?;
+        // Feed the spec, then close stdin so the worker reads to EOF (same
+        // handshake as `LocalProcessDeployer`).
+        if let Some(spec_json) = &d.spec_json {
+            use tokio::io::AsyncWriteExt;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(spec_json.as_bytes())
+                    .await
+                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
+            }
+        }
         Ok(DeployedAgent::from_parts(
             d.id.clone(),
             child,
@@ -882,6 +991,93 @@ mod tests {
         );
     }
 
+    /// Graceful stop (#49): a worker that handles SIGTERM gets to exit on its
+    /// own terms — shutdown sends TERM first and waits, rather than opening
+    /// with SIGKILL. The child traps TERM and touches a marker before exiting;
+    /// the marker existing after shutdown proves the graceful path ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_sends_sigterm_before_hard_kill() {
+        let marker = std::env::temp_dir().join(format!(
+            "bamboo_deploy_sigterm_{}_{:?}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ready = marker.with_extension("ready");
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&ready);
+
+        // The child touches a READY file only after its TERM trap is installed;
+        // the test waits for that before shutting down, so the SIGTERM can never
+        // race the trap installation (which would take the default kill path
+        // and fail the assertion spuriously).
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap 'touch {m}; exit 0' TERM; touch {r}; while :; do sleep 0.05; done",
+                m = marker.display(),
+                r = ready.display()
+            ))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-trapping child");
+        let agent = DeployedAgent::from_parts("graceful", child, None);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child never signalled readiness"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        agent.shutdown_with_timeout(Duration::from_secs(5)).await;
+
+        assert!(
+            marker.exists(),
+            "child must have received SIGTERM and exited gracefully (marker written by its TERM trap)"
+        );
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&ready);
+    }
+
+    /// Graceful stop is BOUNDED (#49): a worker that ignores SIGTERM is still
+    /// hard-killed once the grace window elapses — `action=stop` can never hang
+    /// on a wedged worker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_hard_kills_after_grace_window_when_sigterm_ignored() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 0.05; done")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-ignoring child");
+        let pid = child.id().expect("child has a pid");
+        let agent = DeployedAgent::from_parts("wedged", child, None);
+
+        // Short grace so the test stays fast; the child ignores TERM, so this
+        // must fall through to the SIGKILL path and still return.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.shutdown_with_timeout(Duration::from_millis(300)),
+        )
+        .await
+        .expect("shutdown must be bounded even when SIGTERM is ignored");
+
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "TERM-ignoring worker must be hard-killed");
+    }
+
     #[tokio::test]
     async fn tail_local_file_returns_last_lines() {
         let path = std::env::temp_dir().join("bamboo-tail-test.log");
@@ -912,5 +1108,132 @@ mod tests {
         assert!(!a
             .iter()
             .any(|x| x.contains("tok") && !x.starts_with("BAMBOO_BROKER_TOKEN=")));
+    }
+
+    /// #46 — a `spec_json` deploy must NOT mount the orchestrator's home (no
+    /// `/seed` volume, no config/encryption-key copy script): the worker gets
+    /// only the parent-resolved spec, piped over stdin.
+    #[test]
+    fn docker_argv_uses_spec_stdin_and_never_mounts_home() {
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1}"#.to_string());
+        let deployer = DockerDeployer::new("img");
+        let a = deployer.argv(&d, "c");
+
+        // No home mount at all — no `-v`, no `/seed`.
+        assert!(!a.contains(&"-v".to_string()));
+        assert!(!a.iter().any(|x| x.contains("/seed")));
+        // No shell-wrapped copy script — direct entrypoint on the bamboo binary.
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--entrypoint".to_string(), "bamboo".to_string()]));
+        assert!(!a.iter().any(|x| x == "/bin/sh"));
+        assert!(!a.iter().any(|x| x.contains("config.json")));
+        assert!(!a.iter().any(|x| x.contains(".bamboo_encryption_key")));
+        // stdin stays open for the piped spec, and the worker is told to read it.
+        assert!(a.contains(&"-i".to_string()));
+        assert!(a.contains(&"--spec-stdin".to_string()));
+        // The broker token must never appear on argv (it rides as -e env).
+        assert!(!a
+            .iter()
+            .any(|x| x.contains("tok") && !x.starts_with("BAMBOO_BROKER_TOKEN=")));
+    }
+
+    /// `spec_json` is authoritative even when a caller also set `mount_home` —
+    /// mirrors the CLI's "spec is authoritative" rule for `--spec-stdin`.
+    #[test]
+    fn docker_argv_spec_json_takes_precedence_over_mount_home() {
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1}"#.to_string());
+        let deployer = DockerDeployer::new("img").mount_home("/home/u/.bamboo");
+        let a = deployer.argv(&d, "c");
+        assert!(!a.iter().any(|x| x.contains("/seed")));
+        assert!(a.contains(&"--spec-stdin".to_string()));
+    }
+
+    /// The docker e2e networking path (`host.docker.internal` + host-gateway
+    /// alias) must survive spec_json delivery unchanged (#46 must not regress
+    /// the existing docker deploy path).
+    #[test]
+    fn docker_argv_spec_json_still_wires_host_docker_internal() {
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1}"#.to_string());
+        let deployer = DockerDeployer::new("img");
+        let a = deployer.argv(&d, "c");
+        assert!(a.windows(2).any(|w| w
+            == [
+                "--add-host".to_string(),
+                "host.docker.internal:host-gateway".to_string()
+            ]));
+    }
+
+    /// End-to-end (no real `docker` binary): `deploy()` must actually pipe the
+    /// spec JSON to the child's stdin and close it, exactly like
+    /// `LocalProcessDeployer`. Stand in `cat` for `docker` so the "container"
+    /// just echoes stdin back to a marker file we can assert on.
+    #[tokio::test]
+    async fn docker_deploy_pipes_spec_json_to_stdin() {
+        let marker = std::env::temp_dir().join(format!(
+            "bamboo_docker_spec_stdin_{}_{:?}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        // A fake "docker" that just `cat`s its stdin to the marker file,
+        // ignoring all the run/--rm/etc. argv (it never touches a real image).
+        let fake_docker = std::env::temp_dir().join(format!(
+            "bamboo_fake_docker_{}_{:?}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &fake_docker,
+            format!("#!/bin/sh\ncat > {}\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1,"secret":"do-not-mount-whole-home"}"#.to_string());
+        let mut deployer = DockerDeployer::new("img");
+        deployer.docker_bin = fake_docker.to_string_lossy().into_owned();
+
+        let agent = deployer.deploy(&d).await.expect("fake docker deploy");
+        // The fake "docker" is `cat`, which finishes writing the marker once
+        // stdin (closed by `deploy()` right after writing the spec) hits EOF.
+        // Poll the marker's CONTENT rather than the child's liveness: an
+        // unreaped exited child still answers `kill -0` (zombie) until
+        // something calls `wait()` on it, which would race this assertion. We
+        // deliberately never call `shutdown()` here — it would re-invoke the
+        // same fake binary as a `rm -f` cleanup command and clobber the marker
+        // with an empty write.
+        let expected = r#"{"version":1,"secret":"do-not-mount-whole-home"}"#;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut written = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&marker) {
+                if s == expected {
+                    written = s;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(written, expected, "fake docker never wrote the piped spec");
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake_docker);
+        drop(agent);
     }
 }

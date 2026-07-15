@@ -150,6 +150,13 @@ impl AppState {
             let _io = self.config_io_lock.lock().await;
             let (snapshot, enforcement_newly_off) = {
                 let mut cfg = self.config.write().await;
+                // Refuse the whole operation (no in-memory mutation, no disk
+                // write) while a config-corruption recovery is pending
+                // confirmation (#153) — `save_to_dir` would reject the persist
+                // anyway, but checking here BEFORE `update()` runs keeps the
+                // in-memory config frozen exactly at the recovered state
+                // instead of silently drifting further from what's on disk.
+                reject_if_recovery_pending(&cfg)?;
                 let was_off = cfg.plugin_trust.enforcement_is_off();
                 update(&mut cfg)?;
                 cfg.publish_env_vars();
@@ -189,6 +196,9 @@ impl AppState {
             let _io = self.config_io_lock.lock().await;
             let enforcement_newly_off = {
                 let mut cfg = self.config.write().await;
+                // Same guard as `update_config` (#153): a full-config replace
+                // must not silently blow away an unconfirmed recovery either.
+                reject_if_recovery_pending(&cfg)?;
                 let was_off = cfg.plugin_trust.enforcement_is_off();
                 *cfg = new_config.clone();
                 cfg.publish_env_vars();
@@ -233,6 +243,90 @@ impl AppState {
 
         Ok(())
     }
+
+    /// Resolve a pending config-corruption recovery (#153; see
+    /// [`bamboo_config::ConfigRecoveryStatus`]).
+    ///
+    /// - `accept = true`: confirms the recovery and persists it to
+    ///   `config.json` in the same step ([`Config::confirm_recovery_and_save_to_dir`]),
+    ///   then clears the pending flag — the config is no longer "pending
+    ///   confirmation" once this returns `Ok`.
+    /// - `accept = false`: a no-op that leaves everything untouched — disk,
+    ///   in-memory config, and the pending flag are all left exactly as they
+    ///   were. `config.json` stays refused-to-write (see `save_to_dir`) until
+    ///   either a later `accept = true` call or the user hand-fixes
+    ///   `config.json` and the process reloads/restarts.
+    ///
+    /// Errors with [`AppError::BadRequest`] if there's no pending recovery to
+    /// resolve.
+    pub async fn confirm_config_recovery(&self, accept: bool) -> Result<Config, AppError> {
+        let _io = self.config_io_lock.lock().await;
+
+        if !accept {
+            let cfg = self.config.read().await;
+            return match cfg.recovery_status() {
+                Some(_) => Ok(cfg.clone()),
+                None => Err(AppError::BadRequest(
+                    "No pending config-corruption recovery to resolve".to_string(),
+                )),
+            };
+        }
+
+        let mut candidate = {
+            let cfg = self.config.read().await;
+            match cfg.recovery_status() {
+                Some(_) => cfg.clone(),
+                None => {
+                    return Err(AppError::BadRequest(
+                        "No pending config-corruption recovery to resolve".to_string(),
+                    ))
+                }
+            }
+        };
+
+        let data_dir = self.app_data_dir.clone();
+        candidate = tokio::task::spawn_blocking(move || {
+            candidate
+                .confirm_recovery_and_save_to_dir(data_dir)
+                .map(|_| candidate)
+        })
+        .await
+        .map_err(|e| {
+            AppError::InternalError(anyhow::anyhow!("Config recovery-confirm task failed: {e}"))
+        })?
+        .map_err(|e| {
+            AppError::InternalError(anyhow::anyhow!("Failed to save recovered config: {e}"))
+        })?;
+
+        {
+            let mut cfg = self.config.write().await;
+            *cfg = candidate.clone();
+            cfg.publish_env_vars();
+        }
+
+        Ok(candidate)
+    }
+}
+
+/// Short-circuit config-mutating entrypoints while a config-corruption
+/// recovery is pending confirmation (#153): `save_to_dir` would refuse the
+/// disk write anyway, but rejecting here — before any in-memory mutation
+/// runs — keeps the in-memory config frozen at exactly the recovered state
+/// instead of drifting further out of sync with what's actually on disk.
+/// Resolve the pending recovery via `AppState::confirm_config_recovery`
+/// first.
+fn reject_if_recovery_pending(cfg: &Config) -> Result<(), AppError> {
+    if let Some(status) = cfg.recovery_status() {
+        if !status.confirmed {
+            return Err(AppError::ConfigRecoveryPending(format!(
+                "config.json was recovered from corruption ({:?}) and is awaiting \
+                 confirmation; confirm or reject the recovery (see /bamboo/config/recovery-status \
+                 and /bamboo/config/recovery/confirm) before changing settings",
+                status.source
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The prominent warning emitted whenever `plugin_trust.enforcement` is (or

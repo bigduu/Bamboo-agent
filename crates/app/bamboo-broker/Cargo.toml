@@ -22,6 +22,12 @@ tokio-tungstenite = "0.29"
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3.0"
 sha2 = "0.11"
+# Per-connection message-rate limiting (#53). Raw `governor`, not
+# `actix-governor` (bamboo-server's HTTP dep) — the broker is a plain
+# WebSocket/tokio server, not actix. Pinned to the same major/minor already
+# resolved transitively via bamboo-server's actix-governor so the workspace
+# doesn't grow a second `governor` semver line in Cargo.lock.
+governor = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

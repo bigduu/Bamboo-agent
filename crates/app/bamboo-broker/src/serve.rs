@@ -43,9 +43,31 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
+    // A fresh, never-cancelled token: identical behavior to before graceful
+    // shutdown existed — no external caller of this entry point can trip it.
+    serve_mailbox_with_shutdown(endpoint, me, token, handler, CancellationToken::new()).await
+}
+
+/// Like [`serve_mailbox`], but stops pulling NEW inbound messages once
+/// `shutdown` is cancelled — any handlers already in flight still run to
+/// completion and their replies are still delivered + acked (via the same
+/// drain [`serve_loop`] performs on connection close) before this returns.
+/// This is the hook a process-level signal handler (SIGTERM/ctrl_c) wires
+/// into, so stopping a worker doesn't have to hard-kill it mid-Ask. #49.
+pub async fn serve_mailbox_with_shutdown<H, Fut>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    handler: H,
+    shutdown: CancellationToken,
+) -> BrokerResult<()>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
     let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
     client.subscribe().await?;
-    serve_loop(&mut client, &me, handler).await
+    serve_loop(&mut client, &me, handler, shutdown).await
 }
 
 /// One finished handler routed back to the single client owner for delivery+ack.
@@ -73,10 +95,17 @@ struct Completion {
 /// run: each run still gets its own token (now tracked in a live map so a cancel
 /// can find it after we've moved on to the next message), and ack still happens
 /// only AFTER the reply is delivered. #45.
+///
+/// `shutdown`: once cancelled, the loop stops pulling new inbound messages
+/// (same as a closed connection) but keeps draining in-flight handlers through
+/// arm A until they've all completed, THEN returns — so a graceful stop lets
+/// the current Ask finish and its reply get delivered+acked instead of being
+/// abandoned. #49.
 pub async fn serve_loop<H, Fut>(
     client: &mut BrokerClient,
     me: &AgentRef,
     handler: H,
+    shutdown: CancellationToken,
 ) -> BrokerResult<()>
 where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
@@ -100,12 +129,14 @@ where
     let mut messages_open = true;
     loop {
         tokio::select! {
-            // `biased`: drain finished handlers (arm A) ahead of pulling new
-            // work/cancels (arm B) so completed replies are delivered+acked and
-            // their in-flight entries cleared promptly, bounding memory under load.
-            // (#144's serve_mcp_proxy is unbiased; here arm B internally biases the
-            // cancel lane, so cancel latency stays prompt — completions are gated by
-            // real agent work, so arm B is always reached between them.)
+            // `biased`: drain finished handlers (arm A) ahead of a graceful-stop
+            // signal (arm B) ahead of pulling new work/cancels (arm C), so
+            // completed replies are delivered+acked and their in-flight entries
+            // cleared promptly (bounding memory under load), and a shutdown
+            // request is noticed before another inbound message is pulled.
+            // (#144's serve_mcp_proxy is unbiased; here arm C internally biases
+            // the cancel lane, so cancel latency stays prompt — completions are
+            // gated by real agent work, so arm C is always reached between them.)
             biased;
             // A. A finished handler: deliver its reply (if any) then ack — the ack
             //    still strictly follows a delivered reply, as before. Done on the
@@ -133,7 +164,17 @@ where
                     Handled::Leave => {}
                 }
             }
-            // B. The next inbound message OR out-of-band cancel (demuxed over one
+            // B. Graceful stop requested (#49): stop pulling new work — mirrors
+            //    the `Message(None)` connection-closed case below — but leave
+            //    the connection open so arm A can keep delivering+acking
+            //    replies for handlers already in flight. Guarded on
+            //    `messages_open` so a signal that fires more than once (or
+            //    after we've already stopped pulling) doesn't re-trigger.
+            _ = shutdown.cancelled(), if messages_open => {
+                tracing::info!("broker worker: graceful shutdown requested — draining in-flight work");
+                messages_open = false;
+            }
+            // C. The next inbound message OR out-of-band cancel (demuxed over one
             //    `&mut client` borrow). A cancel trips the matching in-flight run's
             //    token (#50); a new message registers a fresh token and spawns the
             //    handler on its own task — so concurrent Asks overlap their work and
@@ -229,6 +270,26 @@ pub async fn serve_executor<E>(
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
+    // A fresh, never-cancelled token: identical behavior to before graceful
+    // shutdown existed — no external caller of this entry point can trip it.
+    serve_executor_with_shutdown(endpoint, me, token, executor, CancellationToken::new()).await
+}
+
+/// Like [`serve_executor`], but stops accepting new Ask/Task/Run work once
+/// `shutdown` is cancelled while letting whatever is already in flight finish
+/// and reply normally (see [`serve_mailbox_with_shutdown`]). Wire this to a
+/// process-level SIGTERM/ctrl_c handler so `deploy_agent action=stop` (or an
+/// orchestrator exit) doesn't abandon an in-progress Ask. #49.
+pub async fn serve_executor_with_shutdown<E>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    executor: Arc<E>,
+    shutdown: CancellationToken,
+) -> BrokerResult<()>
+where
+    E: bamboo_subagent::ChildExecutor + ?Sized,
+{
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Per-run coordination so a SEPARATE Steer / ApprovalReply mailbox message can
@@ -239,70 +300,76 @@ where
     let endpoint_owned = endpoint.to_string();
     let token_owned = token.to_string();
     let me_owned = me.clone();
-    serve_mailbox(endpoint, me, token, move |msg, cancel| {
-        let executor = Arc::clone(&executor);
-        let context = Arc::clone(&context);
-        let coords = Arc::clone(&coords);
-        let waiters = Arc::clone(&waiters);
-        let endpoint = endpoint_owned.clone();
-        let token = token_owned.clone();
-        let me = me_owned.clone();
-        async move {
-            match msg.kind {
-                // A full child session over the bus (the actor-over-mailbox path):
-                // stream events back to the parent live, then the terminal outcome.
-                InboxKind::Run => {
-                    handle_run(
-                        executor.as_ref(),
-                        &endpoint,
-                        &token,
-                        &me,
-                        msg,
-                        cancel,
-                        &coords,
-                        &waiters,
-                    )
-                    .await
-                }
-                // In-band steer for a running Run: route to its steer inbox.
-                InboxKind::Steer => {
-                    if let Some(run_id) = &msg.correlation_id {
-                        let text = msg
+    serve_mailbox_with_shutdown(
+        endpoint,
+        me,
+        token,
+        move |msg, cancel| {
+            let executor = Arc::clone(&executor);
+            let context = Arc::clone(&context);
+            let coords = Arc::clone(&coords);
+            let waiters = Arc::clone(&waiters);
+            let endpoint = endpoint_owned.clone();
+            let token = token_owned.clone();
+            let me = me_owned.clone();
+            async move {
+                match msg.kind {
+                    // A full child session over the bus (the actor-over-mailbox path):
+                    // stream events back to the parent live, then the terminal outcome.
+                    InboxKind::Run => {
+                        handle_run(
+                            executor.as_ref(),
+                            &endpoint,
+                            &token,
+                            &me,
+                            msg,
+                            cancel,
+                            &coords,
+                            &waiters,
+                        )
+                        .await
+                    }
+                    // In-band steer for a running Run: route to its steer inbox.
+                    InboxKind::Steer => {
+                        if let Some(run_id) = &msg.correlation_id {
+                            let text = msg
+                                .body
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if let Some(coord) = coords.lock().await.get(run_id) {
+                                let _ = coord.steer_tx.send(text);
+                            }
+                        }
+                        Handled::Ack
+                    }
+                    // Approval decision for a gated tool a Run proxied up: wake the
+                    // waiting tool call, keyed by the approval-request id in the body.
+                    InboxKind::ApprovalReply => {
+                        let id = msg
                             .body
-                            .get("text")
+                            .get("id")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string();
-                        if let Some(coord) = coords.lock().await.get(run_id) {
-                            let _ = coord.steer_tx.send(text);
+                        let approved = msg
+                            .body
+                            .get("approved")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(tx) = waiters.lock().await.remove(&id) {
+                            let _ = tx.send(approved);
                         }
+                        Handled::Ack
                     }
-                    Handled::Ack
+                    // Ask/Task: the conversational query/steer path (unchanged).
+                    _ => handle_with_executor(executor.as_ref(), &context, msg, cancel).await,
                 }
-                // Approval decision for a gated tool a Run proxied up: wake the
-                // waiting tool call, keyed by the approval-request id in the body.
-                InboxKind::ApprovalReply => {
-                    let id = msg
-                        .body
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let approved = msg
-                        .body
-                        .get("approved")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if let Some(tx) = waiters.lock().await.remove(&id) {
-                        let _ = tx.send(approved);
-                    }
-                    Handled::Ack
-                }
-                // Ask/Task: the conversational query/steer path (unchanged).
-                _ => handle_with_executor(executor.as_ref(), &context, msg, cancel).await,
             }
-        }
-    })
+        },
+        shutdown,
+    )
     .await
 }
 
@@ -1081,6 +1148,146 @@ mod tests {
         assert!(events >= 1, "expected streamed events, got {events}");
         let oc: bamboo_subagent::ChildOutcome = serde_json::from_value(outcome.body).unwrap();
         assert_eq!(oc.result.as_deref(), Some("echo: ping pong"));
+    }
+
+    /// Graceful shutdown (#49): tripping the shutdown token while an Ask is in
+    /// flight must NOT abandon it — the worker finishes the run, delivers the
+    /// reply (delivered + acked), and only THEN does the serve future return.
+    #[tokio::test]
+    async fn graceful_shutdown_drains_in_flight_ask_then_exits() {
+        use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
+
+        // An executor slow enough that the shutdown signal provably lands while
+        // the run is still in flight.
+        struct SlowEcho;
+        #[async_trait::async_trait]
+        impl ChildExecutor for SlowEcho {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> ChildOutcome {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                ChildOutcome::completed(format!("echo: {}", spec.assignment))
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let shutdown = CancellationToken::new();
+        let worker_ep = endpoint.clone();
+        let worker_shutdown = shutdown.clone();
+        let worker = tokio::spawn(async move {
+            serve_executor_with_shutdown(
+                &worker_ep,
+                AgentRef {
+                    session_id: "worker".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(SlowEcho),
+                worker_shutdown,
+            )
+            .await
+        });
+
+        let mut orch = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        orch.subscribe().await.unwrap();
+
+        // Probe round-trip so the worker is provably subscribed before the
+        // in-flight ask + shutdown race begins.
+        let probe = ask("orch", "ping");
+        let probe_id = probe.id.clone();
+        orch.deliver("worker", probe).await.unwrap();
+        let r0 = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+            .await
+            .expect("probe reply")
+            .expect("present");
+        assert_eq!(r0.correlation_id, Some(probe_id));
+
+        // Fire the slow ask, then request graceful shutdown while it's running.
+        let q = ask("orch", "slow one");
+        let qid = q.id.clone();
+        orch.deliver("worker", q).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await; // let the run start
+        shutdown.cancel();
+
+        // The in-flight ask still completes and its reply is delivered — a
+        // graceful stop is a drain, not an abandonment.
+        let reply = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+            .await
+            .expect("in-flight ask must be drained, not lost")
+            .expect("present");
+        assert_eq!(reply.correlation_id, Some(qid));
+        let body: ReplyBody = serde_json::from_value(reply.body).unwrap();
+        assert_eq!(body.answer, "echo: slow one");
+
+        // And the serve future itself returns (cleanly) once drained.
+        let served = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("serve_executor_with_shutdown returns after the drain")
+            .expect("worker task not panicked");
+        assert!(served.is_ok(), "graceful shutdown exits Ok: {served:?}");
+    }
+
+    /// Graceful shutdown with an idle worker: no in-flight work means the serve
+    /// future returns promptly on cancel (no wedge waiting for work that will
+    /// never arrive). #49.
+    #[tokio::test]
+    async fn graceful_shutdown_idle_worker_exits_promptly() {
+        let (endpoint, _dir) = start().await;
+        let shutdown = CancellationToken::new();
+        let worker_shutdown = shutdown.clone();
+        let worker_ep = endpoint.clone();
+        let worker = tokio::spawn(async move {
+            serve_executor_with_shutdown(
+                &worker_ep,
+                AgentRef {
+                    session_id: "idle".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(bamboo_subagent::EchoExecutor),
+                worker_shutdown,
+            )
+            .await
+        });
+
+        // Prove it's up (subscribed) with a probe round-trip.
+        let mut orch = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        orch.subscribe().await.unwrap();
+        let probe = ask("orch", "ping");
+        orch.deliver("idle", probe).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+            .await
+            .expect("probe reply")
+            .expect("present");
+
+        shutdown.cancel();
+        let served = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("idle worker exits promptly on graceful shutdown")
+            .expect("worker task not panicked");
+        assert!(served.is_ok(), "graceful shutdown exits Ok: {served:?}");
     }
 
     /// The bus answers "who's connected serving role X" over the WS protocol — the

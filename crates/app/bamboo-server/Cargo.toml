@@ -103,6 +103,7 @@ url = "2"
 hex = "0.4"
 sha2 = "0.11"
 rand = "0.10"
+base64 = "0.22"
 # Plugin source-trust (`src/plugin_source.rs`): ed25519 publisher-signature
 # verification for URL-installed plugin bundles, layered on top of the
 # checksum + host-allowlist checks. Pure-Rust (curve25519-dalek), no TLS/libc
@@ -131,6 +132,16 @@ flate2 = "1"
 tar = "0.4"
 actix-governor = "0.10.0"
 notify-rust = "4.18"
+# Feishu/Lark connect adapter (`src/connect/platforms/feishu/`): the
+# `pbbp2.Frame`/`Header` wire types are hand-derived `prost::Message` impls
+# (no build.rs/protoc — see `feishu/pbbp2.rs`'s module doc), and the event
+# long-connection is a plain WS client. `native-tls` (NOT the default
+# rustls/aws-lc-rs feature set) to match this crate's reqwest pin — verify
+# with `cargo tree -i aws-lc-sys` after any version bump. `connect` pulls in
+# `connect_async` (TCP dialing) — `native-tls` alone only adds the TLS
+# stream wrapper, not dialing.
+prost = "0.13"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -66,6 +66,14 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             web::post().to(settings::reset_bamboo_config),
         )
         .route(
+            "/bamboo/config/recovery-status",
+            web::get().to(settings::get_config_recovery_status),
+        )
+        .route(
+            "/bamboo/config/recovery/confirm",
+            web::post().to(settings::confirm_config_recovery),
+        )
+        .route(
             "/bamboo/proxy-auth",
             web::post().to(settings::set_proxy_auth),
         )

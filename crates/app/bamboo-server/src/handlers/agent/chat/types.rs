@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// * `copilot_conclusion_with_options_enhancement_enabled` - Optional flag for enabling copilot conclusion-with-options conclusion flow
 /// * `workspace_path` - Optional workspace path to include in the system prompt
 /// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
-/// * `model` - Required model identifier (e.g., "gpt-4o-mini", "claude-3-opus")
+/// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
+///   When absent or empty, the server falls back to its resolved default model
+///   (issue #480) — the same resolution `GET /api/v1/execute/defaults` reports.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -30,7 +32,8 @@ pub struct ChatRequest {
     /// Optional image attachments (data URLs) associated with this message.
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -78,7 +81,7 @@ mod tests {
         let json = r#"{"message":"Hello","model":"gpt-4"}"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.message, "Hello");
-        assert_eq!(req.model, "gpt-4");
+        assert_eq!(req.model.as_deref(), Some("gpt-4"));
         assert!(req.session_id.is_none());
         assert!(req.system_prompt.is_none());
         assert!(req
@@ -113,7 +116,7 @@ mod tests {
             req.selected_skill_ids,
             Some(vec!["pdf".to_string(), "skill-creator".to_string()])
         );
-        assert_eq!(req.model, "claude-3");
+        assert_eq!(req.model.as_deref(), Some("claude-3"));
     }
 
     #[test]
@@ -154,7 +157,7 @@ mod tests {
             workspace_path: None,
             selected_skill_ids: None,
             images: None,
-            model: "gpt-4".to_string(),
+            model: Some("gpt-4".to_string()),
             provider: None,
             model_ref: None,
         };

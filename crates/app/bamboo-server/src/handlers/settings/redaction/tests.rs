@@ -362,6 +362,10 @@ fn redact_config_masks_configured_connect_platform_token() {
         platform_type: "telegram".to_string(),
         token: None,
         token_encrypted: Some("enc-telegram".to_string()),
+        app_id: None,
+        app_secret: None,
+        app_secret_encrypted: None,
+        domain: None,
         allow_from: vec!["123".to_string()],
         admin_from: Vec::new(),
     }];
@@ -389,6 +393,10 @@ fn redact_config_omits_unconfigured_connect_platform_token() {
         platform_type: "telegram".to_string(),
         token: None,
         token_encrypted: None,
+        app_id: None,
+        app_secret: None,
+        app_secret_encrypted: None,
+        domain: None,
         allow_from: Vec::new(),
         admin_from: Vec::new(),
     }];
@@ -420,6 +428,89 @@ fn redact_config_never_leaks_connect_platform_ciphertext_even_when_client_suppli
     assert!(redacted["connect"]["platforms"][0]
         .as_object()
         .is_some_and(|obj| !obj.contains_key("token_encrypted")));
+}
+
+// ── Feishu app_secret redaction tests (epic #447 phase 3) ────────────
+
+#[test]
+fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_domain() {
+    let mut config = Config::default();
+    config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        platform_type: "feishu".to_string(),
+        token: None,
+        token_encrypted: None,
+        app_id: Some("cli_x".to_string()),
+        app_secret: None,
+        app_secret_encrypted: Some("enc-feishu".to_string()),
+        domain: Some("lark".to_string()),
+        allow_from: vec!["ou_1".to_string()],
+        admin_from: Vec::new(),
+    }];
+
+    let input = json!({
+        "connect": {
+            "platforms": [
+                { "type": "feishu", "app_id": "cli_x", "domain": "lark", "allow_from": ["ou_1"] }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert_eq!(
+        redacted["connect"]["platforms"][0]["app_secret"],
+        "****...****"
+    );
+    assert!(redacted["connect"]["platforms"][0]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("app_secret_encrypted")));
+    // Not secrets — left visible.
+    assert_eq!(redacted["connect"]["platforms"][0]["app_id"], "cli_x");
+    assert_eq!(redacted["connect"]["platforms"][0]["domain"], "lark");
+}
+
+#[test]
+fn redact_config_omits_unconfigured_connect_platform_app_secret() {
+    let mut config = Config::default();
+    config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        platform_type: "feishu".to_string(),
+        token: None,
+        token_encrypted: None,
+        app_id: Some("cli_x".to_string()),
+        app_secret: None,
+        app_secret_encrypted: None,
+        domain: None,
+        allow_from: Vec::new(),
+        admin_from: Vec::new(),
+    }];
+
+    let input = json!({
+        "connect": { "platforms": [ { "type": "feishu", "app_id": "cli_x" } ] }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert!(redacted["connect"]["platforms"][0]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("app_secret")));
+}
+
+#[test]
+fn redact_config_never_leaks_connect_platform_app_secret_ciphertext_even_when_client_supplied() {
+    let config = Config::default();
+    let input = json!({
+        "connect": {
+            "platforms": [
+                { "type": "feishu", "app_secret_encrypted": "sneaky-cipher" }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+
+    assert!(redacted["connect"]["platforms"][0]
+        .as_object()
+        .is_some_and(|obj| !obj.contains_key("app_secret_encrypted")));
 }
 
 #[test]
