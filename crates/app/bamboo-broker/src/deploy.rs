@@ -11,9 +11,19 @@
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{BrokerError, BrokerResult};
+
+/// Default grace window between SIGTERM and the hard `SIGKILL`/`TerminateProcess`
+/// fallback when stopping a locally-deployed worker: long enough for
+/// `serve_loop`'s drain (finish whatever Ask is in flight, deliver + ack its
+/// reply) to complete under normal load, bounded so a wedged/unresponsive
+/// worker can't hang `action=stop` forever. `shutdown()` uses this; tests use
+/// [`DeployedAgent::shutdown_with_timeout`] with a short one instead of a
+/// real-time wait. #49.
+pub const DEFAULT_GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What to deploy: one broker-agent's identity + how it reaches the broker.
 #[derive(Debug, Clone)]
@@ -128,11 +138,52 @@ impl DeployedAgent {
         }
     }
 
-    /// Stop the deployment: kill the launched process / remote worker, then run
-    /// cleanup if any.
+    /// Stop the deployment: SIGTERM the launched process / remote worker, then
+    /// run cleanup if any. Uses [`DEFAULT_GRACEFUL_STOP_TIMEOUT`] as the grace
+    /// window before falling back to a hard kill; see
+    /// [`Self::shutdown_with_timeout`] for the full behavior.
     pub async fn shutdown(self) {
+        self.shutdown_with_timeout(DEFAULT_GRACEFUL_STOP_TIMEOUT)
+            .await
+    }
+
+    /// Stop the deployment with an explicit grace window: for a local process,
+    /// send SIGTERM and poll for up to `timeout` for it to exit on its own —
+    /// giving a worker built on [`crate::serve::serve_executor_with_shutdown`]
+    /// a chance to drain its in-flight Ask/Task/Run and reply cleanly — before
+    /// falling back to a hard `SIGKILL` (`Child::start_kill`). A worker with no
+    /// signal handler (e.g. an old binary) or one that's genuinely wedged still
+    /// gets killed once `timeout` elapses, so `action=stop` is always bounded.
+    /// Remote deployments delegate to [`RemoteDeployment::shutdown`] unchanged
+    /// (out of scope for #49 — see the issue's evidence, which is specific to
+    /// the local-process `start_kill()` path). #49.
+    pub async fn shutdown_with_timeout(self, timeout: Duration) {
         match self.inner {
             DeployedInner::Process { mut child, cleanup } => {
+                if let Some(pid) = child.id() {
+                    send_sigterm(pid).await;
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    loop {
+                        match child.try_wait() {
+                            // Exited on its own within the grace window — done,
+                            // no need for the SIGKILL fallback below.
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if tokio::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            // wait() error (e.g. already reaped elsewhere): stop
+                            // polling and let the fallback below settle it.
+                            Err(_) => break,
+                        }
+                    }
+                }
+                // Still alive after the grace window (or no pid captured, or the
+                // process never had a chance to install a handler) — escalate.
+                // A no-op if it already exited above (start_kill/wait on an
+                // exited child just observe the cached status).
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 if let Some(args) = cleanup {
@@ -145,6 +196,27 @@ impl DeployedAgent {
         }
     }
 }
+
+/// Send SIGTERM to `pid` by shelling out to `kill -TERM` — deliberately NOT
+/// `libc::kill`/`nix` (mirrors the precedent in
+/// `bamboo_server::service_manager::lifecycle::send_graceful_signal`, which
+/// notes this avoids adding a new dependency for one best-effort signal). A
+/// failure (e.g. the process already exited) just means the polling loop
+/// above falls straight through to the hard-kill fallback.
+#[cfg(not(target_os = "windows"))]
+async fn send_sigterm(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await;
+}
+
+/// No SIGTERM equivalent on Windows worth shelling out for here; the grace
+/// window in `shutdown_with_timeout` still elapses before the hard-kill
+/// fallback (`Child::start_kill` → `TerminateProcess`). Mirrors
+/// `lifecycle::send_graceful_signal`'s Windows arm.
+#[cfg(target_os = "windows")]
+async fn send_sigterm(_pid: u32) {}
 
 /// The `broker-agent serve …` argv (token is NOT here — it rides the env).
 pub(crate) fn agent_argv(d: &AgentDeployment) -> Vec<String> {
@@ -880,6 +952,93 @@ mod tests {
                 .ends_with("> '.bamboo-deploy/node-x.log' 2>&1"),
             "got: {remote}"
         );
+    }
+
+    /// Graceful stop (#49): a worker that handles SIGTERM gets to exit on its
+    /// own terms — shutdown sends TERM first and waits, rather than opening
+    /// with SIGKILL. The child traps TERM and touches a marker before exiting;
+    /// the marker existing after shutdown proves the graceful path ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_sends_sigterm_before_hard_kill() {
+        let marker = std::env::temp_dir().join(format!(
+            "bamboo_deploy_sigterm_{}_{:?}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ready = marker.with_extension("ready");
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&ready);
+
+        // The child touches a READY file only after its TERM trap is installed;
+        // the test waits for that before shutting down, so the SIGTERM can never
+        // race the trap installation (which would take the default kill path
+        // and fail the assertion spuriously).
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap 'touch {m}; exit 0' TERM; touch {r}; while :; do sleep 0.05; done",
+                m = marker.display(),
+                r = ready.display()
+            ))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-trapping child");
+        let agent = DeployedAgent::from_parts("graceful", child, None);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child never signalled readiness"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        agent.shutdown_with_timeout(Duration::from_secs(5)).await;
+
+        assert!(
+            marker.exists(),
+            "child must have received SIGTERM and exited gracefully (marker written by its TERM trap)"
+        );
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&ready);
+    }
+
+    /// Graceful stop is BOUNDED (#49): a worker that ignores SIGTERM is still
+    /// hard-killed once the grace window elapses — `action=stop` can never hang
+    /// on a wedged worker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_hard_kills_after_grace_window_when_sigterm_ignored() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 0.05; done")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-ignoring child");
+        let pid = child.id().expect("child has a pid");
+        let agent = DeployedAgent::from_parts("wedged", child, None);
+
+        // Short grace so the test stays fast; the child ignores TERM, so this
+        // must fall through to the SIGKILL path and still return.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.shutdown_with_timeout(Duration::from_millis(300)),
+        )
+        .await
+        .expect("shutdown must be bounded even when SIGTERM is ignored");
+
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "TERM-ignoring worker must be hard-killed");
     }
 
     #[tokio::test]

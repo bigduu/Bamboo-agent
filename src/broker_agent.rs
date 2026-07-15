@@ -11,8 +11,60 @@ use std::sync::Arc;
 
 use bamboo_subagent::provision::{ChildIdentity, ExecutorSpec, ModelRefSpec, ProvisionSpec};
 use bamboo_subagent::{AgentRef, EchoExecutor};
+use tokio_util::sync::CancellationToken;
 
 use crate::subagent_worker::BambooRuntimeExecutor;
+
+/// Install a graceful-stop signal handler and return the [`CancellationToken`]
+/// it trips: SIGTERM (or ctrl_c, if SIGTERM can't be installed / on non-unix)
+/// wired into [`bamboo_broker::serve_executor_with_shutdown`] so the worker
+/// stops pulling new Ask/Task/Run work and drains whatever's in flight instead
+/// of being hard-killed mid-answer when `deploy_agent action=stop` (or an
+/// orchestrator exit) sends SIGTERM. #49.
+fn install_shutdown_signal() -> CancellationToken {
+    let token = CancellationToken::new();
+    let tripped = token.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = term.recv() => {
+                            tracing::info!("broker-agent: SIGTERM received — draining in-flight work before exit");
+                        }
+                        r = tokio::signal::ctrl_c() => {
+                            if r.is_ok() {
+                                tracing::info!("broker-agent: ctrl-c received — draining in-flight work before exit");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "broker-agent: failed to install SIGTERM handler ({e}); falling back to ctrl-c only"
+                    );
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        tracing::info!(
+                            "broker-agent: ctrl-c received — draining in-flight work before exit"
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!(
+                    "broker-agent: ctrl-c received — draining in-flight work before exit"
+                );
+            }
+        }
+        tripped.cancel();
+    });
+    token
+}
 
 /// Parameters for `broker-agent serve`.
 pub struct BrokerAgentArgs {
@@ -44,8 +96,14 @@ pub struct BrokerAgentArgs {
     pub spec_file: Option<String>,
 }
 
-/// Connect to the broker and serve until the connection drops.
+/// Connect to the broker and serve until the connection drops or a graceful
+/// stop signal (SIGTERM/ctrl_c) has been received and in-flight work drained.
 pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
+    // Graceful stop (#49): SIGTERM/ctrl_c trips this token; the serve loop then
+    // stops pulling new work, finishes + replies to the in-flight Ask/Task/Run,
+    // and returns — instead of the process dying mid-answer.
+    let shutdown = install_shutdown_signal();
+
     // Parent-shipped bootstrap: read the authoritative ProvisionSpec the
     // orchestrator resolved (identity, bus, model, creds, MCP) — from an uploaded
     // file (remote deploy) or stdin (local). Unifies the deployed-actor path with
@@ -100,9 +158,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
             )),
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };
-        return bamboo_broker::serve_executor(&endpoint, me, &token, executor)
-            .await
-            .map_err(|e| format!("broker-agent (spec) failed: {e}"));
+        return bamboo_broker::serve_executor_with_shutdown(
+            &endpoint, me, &token, executor, shutdown,
+        )
+        .await
+        .map_err(|e| format!("broker-agent (spec) failed: {e}"));
     }
 
     // Legacy self-resolve path: build the spec from local config + CLI args.
@@ -113,11 +173,12 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
     tracing::info!(id = %args.id, broker = %args.broker, echo = args.echo, "broker-agent connecting");
 
     if args.echo {
-        return bamboo_broker::serve_executor(
+        return bamboo_broker::serve_executor_with_shutdown(
             &args.broker,
             me,
             &args.token,
             Arc::new(EchoExecutor),
+            shutdown,
         )
         .await
         .map_err(|e| format!("broker-agent (echo) failed: {e}"));
@@ -125,9 +186,15 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
 
     let spec = build_spec(&args)?;
     let executor = BambooRuntimeExecutor::build(&spec).await?;
-    bamboo_broker::serve_executor(&args.broker, me, &args.token, Arc::new(executor))
-        .await
-        .map_err(|e| format!("broker-agent failed: {e}"))
+    bamboo_broker::serve_executor_with_shutdown(
+        &args.broker,
+        me,
+        &args.token,
+        Arc::new(executor),
+        shutdown,
+    )
+    .await
+    .map_err(|e| format!("broker-agent failed: {e}"))
 }
 
 /// Build a `ProvisionSpec` from the local config + CLI args — the standalone
