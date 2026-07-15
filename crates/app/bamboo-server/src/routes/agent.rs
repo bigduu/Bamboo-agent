@@ -46,6 +46,29 @@ fn plugin_scope() -> impl HttpServiceFactory {
         .route("/{id}", web::delete().to(agent::plugin::remove_plugin))
 }
 
+/// `/api/v1/ledger` — HTTP surface over the prospective-record ledger
+/// (Phase 7 of `docs/design/personal-assistant-ledger.md`): list/upsert/
+/// patch/cancel records plus the time-bucketed agenda, so a UI can render a
+/// real todo/calendar over the same store the `ledger` agent tool uses.
+/// Registered inside `agent_routes`'s `/api/v1` scope below, so it inherits
+/// the same `enforce_access_password_middleware` wrap as every other route
+/// here. DELETE is a cancel transition — ledger records are never
+/// hard-deleted.
+fn ledger_scope() -> impl HttpServiceFactory {
+    web::scope("/ledger")
+        .route("/records", web::get().to(agent::ledger::list_records))
+        .route("/records", web::post().to(agent::ledger::upsert_record))
+        .route(
+            "/records/{record_id}",
+            web::patch().to(agent::ledger::patch_record),
+        )
+        .route(
+            "/records/{record_id}",
+            web::delete().to(agent::ledger::delete_record),
+        )
+        .route("/agenda", web::get().to(agent::ledger::agenda))
+}
+
 /// Configure agent API routes (core agent functionality)
 ///
 /// Routes for chat, execute, events, stop, history, task, respond, delete, health, metrics, mcp
@@ -169,6 +192,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::schedules::list_runs_for_schedule),
         )
         // New separated execute + events endpoints
+        // `/execute/defaults` MUST be registered before the `/execute/{session_id}`
+        // dynamic route below (same precedent as `/sessions/cleanup` vs
+        // `/sessions/{session_id}` above) so a literal `defaults` path segment
+        // isn't swallowed as a session id.
+        .route(
+            "/execute/defaults",
+            web::get().to(agent::execute::defaults_handler),
+        )
         .route(
             "/execute/{session_id}",
             web::post().to(agent::execute::handler),
@@ -279,6 +310,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     // wrap as everything else in this scope — see `plugin_scope`'s doc
     // comment.
     scope = scope.service(plugin_scope());
+
+    // Ledger routes (personal-assistant ledger, Phase 7): appended after the
+    // existing registrations per this file's append-only convention. Same
+    // access-password middleware as everything else in this scope — see
+    // `ledger_scope`'s doc comment.
+    scope = scope.service(ledger_scope());
 
     // Dev-only endpoints are a greenfield wipe of ALL sessions (`dev_reset`) with
     // no auth. Register them ONLY when explicitly enabled, so a production/Docker

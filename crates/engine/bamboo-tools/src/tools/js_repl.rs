@@ -7,6 +7,8 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
+use super::workspace_state;
+
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -126,7 +128,7 @@ impl Tool for JsReplTool {
     async fn invoke(
         &self,
         args: serde_json::Value,
-        _ctx: ToolCtx,
+        ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
         let parsed: JsReplArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid js_repl args: {}", e)))?;
@@ -154,12 +156,23 @@ impl Tool for JsReplTool {
             code
         );
 
+        // #217: run in the session's workspace (falls back to the process cwd
+        // when no workspace is tracked — see `workspace_state::workspace_or_
+        // process_cwd`) instead of silently inheriting whatever directory the
+        // host process happens to be in. This is the same shared cwd
+        // resolution `Bash`/`Glob`/`Grep`/`Workspace`/`slash_command` already
+        // use, so relative paths in REPL code (`fs.writeFileSync('out.txt',
+        // ...)`) land in the same place a Bash command run in this session
+        // would land them.
+        let cwd = workspace_state::workspace_or_process_cwd(ctx.session_id());
+
         // `kill_on_drop(true)` ensures the child is killed when it goes out of
         // scope (i.e. on timeout). `wait_with_output()` takes ownership, so on
         // timeout the future is dropped and the child is killed automatically.
         let child = Command::new(&node_path)
             .arg("-e")
             .arg(&wrapper)
+            .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -266,6 +279,43 @@ mod tests {
         assert_eq!(payload["timed_out"], false);
         assert_eq!(payload["exit_code"], 0);
         assert!(payload["stdout"].as_str().unwrap().contains("4"));
+    }
+
+    /// Issue #217: `js_repl` must run in the session's tracked workspace, not
+    /// silently inherit the host process's cwd — the same shared cwd
+    /// resolution Bash/Glob/Grep/Workspace already use.
+    #[tokio::test]
+    async fn test_runs_in_session_workspace_not_process_cwd() {
+        if !has_node() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let session = format!("session_{}", uuid::Uuid::new_v4());
+        workspace_state::set_workspace(&session, workspace.clone());
+
+        let tool = JsReplTool::new();
+        let ctx = ToolCtx {
+            session_id: Some(std::sync::Arc::from(session.as_str())),
+            tool_call_id: std::sync::Arc::from("call_1"),
+            event_tx: None,
+            available_tool_schemas: std::sync::Arc::from(Vec::new()),
+            bypass_permissions: false,
+            can_async_resume: false,
+            async_completion_sink: None,
+            bash_completion_sink: None,
+        };
+        let out = tool
+            .invoke(json!({ "code": "console.log(process.cwd())" }), ctx)
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
+        assert!(result.success);
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let stdout = payload["stdout"].as_str().unwrap().trim();
+        assert_eq!(PathBuf::from(stdout), workspace);
     }
 
     #[tokio::test]

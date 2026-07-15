@@ -38,6 +38,7 @@ pub(super) fn build_base_tools(
     notification_service: Arc<bamboo_notification::NotificationService>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     session_watchers: Arc<SessionWatchers>,
+    ledger_schedule_bridge: Arc<crate::schedule_app::LateBoundLedgerBridge>,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -76,13 +77,26 @@ pub(super) fn build_base_tools(
     let with_memory: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(base, memory_tool));
 
+    // `ledger` sits in the base layer (not root-only) so headless reminder
+    // sessions fired by the schedule manager can read and transition the very
+    // record that woke them. The schedule bridge is late-bound: the scheduler
+    // is built after the tool chain, and the builder binds it once it's up.
+    let ledger_tool = Arc::new(
+        crate::tools::LedgerTool::new(session_repo.clone(), app_data_dir.clone())
+            .with_schedule_bridge(ledger_schedule_bridge),
+    );
+    let with_ledger: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_memory,
+        ledger_tool,
+    ));
+
     let load_skill_tool = Arc::new(crate::tools::LoadSkillTool::new(
         skill_manager.clone(),
         config.clone(),
         session_repo.clone(),
     ));
     let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_memory,
+        with_ledger,
         load_skill_tool,
     ));
 

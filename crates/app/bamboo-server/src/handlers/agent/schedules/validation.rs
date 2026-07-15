@@ -32,6 +32,18 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
         ScheduleTrigger::Interval { every_seconds, .. } => {
             validate_interval_seconds(*every_seconds)
         }
+        ScheduleTrigger::Once { at } => {
+            // A one-shot whose instant already passed has no next occurrence,
+            // so the store would fail computing the initial next run
+            // (compute_initial_next_run_at) and surface a 500. Reject it here
+            // with a 400 instead, mirroring the cron/timezone pre-checks.
+            if *at <= Utc::now() {
+                return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": "trigger.at must be in the future"
+                })));
+            }
+            Ok(())
+        }
         ScheduleTrigger::Daily {
             hour,
             minute,
@@ -388,6 +400,23 @@ mod tests {
             Some(ScheduleTrigger::Cron { .. })
         ));
         assert_eq!(resolved.definition.timezone.as_deref(), Some("UTC"));
+    }
+
+    #[test]
+    fn validate_schedule_trigger_accepts_future_once() {
+        validate_schedule_trigger(&ScheduleTrigger::Once {
+            at: Utc::now() + chrono::Duration::seconds(600),
+        })
+        .expect("a one-shot trigger in the future should pass validation");
+    }
+
+    #[test]
+    fn validate_schedule_trigger_rejects_past_once() {
+        let response = validate_schedule_trigger(&ScheduleTrigger::Once {
+            at: Utc::now() - chrono::Duration::seconds(600),
+        })
+        .expect_err("a one-shot trigger in the past must be a 400, not a later 500");
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

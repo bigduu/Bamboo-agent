@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use crate::runtime::config::PromptMemoryFlags;
 use bamboo_agent_core::{PromptMemoryObservability, Session};
+use bamboo_domain::ledger::LedgerScope;
 use bamboo_llm::LLMProvider;
+use bamboo_memory::ledger_store::{AgendaItem, AgendaSnapshot, LedgerStore};
 use bamboo_memory::memory_store::{
     project_key_from_path, render_memory_freshness_note, select_relevant_memories,
     truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
@@ -35,6 +37,12 @@ const RELEVANT_MEMORY_TOTAL_MAX_CHARS: usize = 1_600;
 const RELEVANT_MEMORY_PER_ITEM_MAX_CHARS: usize = 220;
 /// Max chars injected from the global Dream notebook fallback.
 const GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 1_500;
+/// Max chars for the ledger agenda section.
+const LEDGER_AGENDA_PROMPT_MAX_CHARS: usize = 1_200;
+/// Max items rendered per agenda bucket (overdue/today/upcoming/undated).
+const LEDGER_AGENDA_ITEMS_PER_BUCKET: usize = 5;
+/// Days ahead the injected agenda looks.
+const LEDGER_AGENDA_HORIZON_DAYS: i64 = 7;
 const EXTERNAL_MEMORY_TOOL_NAME: &str = "session_note";
 pub(crate) const PROMPT_MEMORY_OBSERVABILITY_KEY: &str = "runtime_prompt_memory_observability";
 
@@ -90,6 +98,12 @@ struct RelevantMemoryLoadResult {
     strategy: MemoryRecallStrategy,
 }
 
+#[derive(Debug, Clone)]
+struct LedgerAgendaSnippet {
+    content: String,
+    item_count: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct PromptMemoryRuntimeContext {
     pub llm: Arc<dyn LLMProvider>,
@@ -99,6 +113,8 @@ pub(crate) struct PromptMemoryRuntimeContext {
 #[derive(Debug, Clone)]
 struct ExternalMemoryRenderParts {
     session_note_section: String,
+    #[allow(dead_code)]
+    ledger_agenda_section: String,
     relevant_memory_section: String,
     project_memory_index_section: String,
     project_dream_section: String,
@@ -177,6 +193,11 @@ pub(super) async fn refresh_external_memory_context_with_store(
     let session_id = session.id.clone();
     let resolved_project_key = resolve_prompt_project_key(session);
     let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
+    let ledger_agenda = if prompt_memory_flags.ledger_agenda {
+        load_ledger_agenda_snippet(memory, resolved_project_key.as_deref()).await
+    } else {
+        None
+    };
     let project_memory_index = if prompt_memory_flags.project_prompt_injection {
         load_project_memory_index_snippet(
             memory,
@@ -224,11 +245,20 @@ pub(super) async fn refresh_external_memory_context_with_store(
     let render_parts = build_external_memory_render_parts(
         session,
         &session_note_snippets,
+        ledger_agenda.as_ref(),
         project_memory_index.as_ref(),
         &relevant_memory_snippets,
         project_dream.as_ref(),
         global_dream_fallback.as_ref(),
     );
+    if let Some(agenda) = &ledger_agenda {
+        tracing::debug!(
+            "[{}] Ledger agenda injected: items={}, chars={}",
+            session_id,
+            agenda.item_count,
+            count_chars(&agenda.content),
+        );
+    }
     let observability = build_prompt_memory_observability(
         prompt_memory_flags,
         resolved_project_key.clone(),
@@ -285,6 +315,81 @@ pub(super) async fn refresh_external_memory_context_with_store(
         observability.dream_source,
         observability.external_memory_section_chars,
     );
+}
+
+/// Load the agenda from the ledger store colocated with the memory store's
+/// data dir (global scope + the resolved project scope). Pure index/file
+/// reads — no LLM cost. `None` when the ledger has nothing open.
+async fn load_ledger_agenda_snippet(
+    memory: &MemoryStore,
+    project_key: Option<&str>,
+) -> Option<LedgerAgendaSnippet> {
+    let store = LedgerStore::new(memory.resolver().data_dir());
+    let mut scopes: Vec<(LedgerScope, Option<String>)> = vec![(LedgerScope::Global, None)];
+    if let Some(project_key) = project_key {
+        scopes.push((LedgerScope::Project, Some(project_key.to_string())));
+    }
+    let snapshot = store
+        .agenda(&scopes, chrono::Utc::now(), LEDGER_AGENDA_HORIZON_DAYS)
+        .await
+        .ok()?;
+    if snapshot.is_empty() {
+        return None;
+    }
+    let item_count = snapshot.overdue.len()
+        + snapshot.today.len()
+        + snapshot.upcoming.len()
+        + snapshot.undated.len();
+    Some(LedgerAgendaSnippet {
+        content: render_ledger_agenda_lines(&snapshot),
+        item_count,
+    })
+}
+
+fn render_ledger_agenda_lines(snapshot: &AgendaSnapshot) -> String {
+    fn push_bucket(out: &mut String, label: &str, items: &[AgendaItem]) {
+        for item in items.iter().take(LEDGER_AGENDA_ITEMS_PER_BUCKET) {
+            let when = item
+                .anchor_at
+                .map(|at| format!(" — {}", at.format("%Y-%m-%d %H:%M UTC")))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- [{label}] `{}` ({}) {}{}\n",
+                item.id,
+                item.kind.as_str(),
+                item.title,
+                when,
+            ));
+        }
+        let hidden = items.len().saturating_sub(LEDGER_AGENDA_ITEMS_PER_BUCKET);
+        if hidden > 0 {
+            out.push_str(&format!("- [{label}] …and {hidden} more\n"));
+        }
+    }
+
+    let mut out = String::new();
+    push_bucket(&mut out, "OVERDUE", &snapshot.overdue);
+    push_bucket(&mut out, "NEXT 24H", &snapshot.today);
+    push_bucket(&mut out, "UPCOMING", &snapshot.upcoming);
+    push_bucket(&mut out, "OPEN", &snapshot.undated);
+    out
+}
+
+fn render_ledger_agenda_section(snippet: &LedgerAgendaSnippet) -> String {
+    let mut section = String::new();
+    section.push_str("### Ledger Agenda (prospective records)\n");
+    section.push_str(
+        "The user's open commitments from the persistent ledger — surface anything urgent \
+         proactively when relevant. Times are UTC.\n",
+    );
+    let (content, truncated) =
+        memory_truncate_chars(&snippet.content, LEDGER_AGENDA_PROMPT_MAX_CHARS);
+    section.push_str(&content);
+    if truncated {
+        section.push_str("\n_(agenda truncated; use `ledger` action=agenda for the full view)_\n");
+    }
+    section.push('\n');
+    section
 }
 
 fn resolve_prompt_project_key(session: &Session) -> Option<String> {
@@ -595,12 +700,16 @@ fn extract_latest_updated_at_from_memory_view(content: &str) -> Option<String> {
 fn build_external_memory_render_parts(
     session: &Session,
     session_note_snippets: &[TopicSnippet],
+    ledger_agenda: Option<&LedgerAgendaSnippet>,
     project_memory_index: Option<&ProjectMemoryIndexSnippet>,
     relevant_memory_snippets: &[RelevantMemorySnippet],
     project_dream: Option<&ProjectDreamSnippet>,
     global_dream_fallback: Option<&LoadedSnippet>,
 ) -> ExternalMemoryRenderParts {
     let session_note_section = render_session_note_section(session_note_snippets);
+    let ledger_agenda_section = ledger_agenda
+        .map(render_ledger_agenda_section)
+        .unwrap_or_default();
     let relevant_memory_section = if relevant_memory_snippets.is_empty() {
         String::new()
     } else {
@@ -627,6 +736,9 @@ fn build_external_memory_render_parts(
         "- **Session Memory Note**: current-session continuity for this session/workstream\n",
     );
     section.push_str(
+        "- **Ledger Agenda**: the user's open prospective records (todos, events, reminders) that are overdue or coming up\n",
+    );
+    section.push_str(
         "- **Relevant Durable Memories**: turn-specific historical memories shortlisted for the current user request\n",
     );
     section.push_str(
@@ -639,7 +751,7 @@ fn build_external_memory_render_parts(
         "- **Global Dream Summary (fallback)**: synthesized auxiliary orientation, lower-trust than durable memory and current observed state\n\n",
     );
     section.push_str(
-        "Priority order for decisions: current observed state from tools/files > session note > relevant durable memories > project durable memory index > project Dream > global Dream fallback. This order reflects working-context recency, not factual authority: a session note ranks high because it is the live workstream, so if it conflicts with canonical durable/project memory on an established fact, verify before preferring the note.\n",
+        "Priority order for decisions: current observed state from tools/files > session note > ledger agenda > relevant durable memories > project durable memory index > project Dream > global Dream fallback. This order reflects working-context recency, not factual authority: a session note ranks high because it is the live workstream, so if it conflicts with canonical durable/project memory on an established fact, verify before preferring the note.\n",
     );
     section.push_str(
         "If indexed or recalled memory appears to describe files, symbols, configs, or runtime state, verify it against current tools/files before asserting it as fact.\n\n",
@@ -648,6 +760,7 @@ fn build_external_memory_render_parts(
         "Two distinct surfaces: use the `session_note` tool for current-session notes (usage shown below), and the `memory` tool only for durable project/global knowledge that should persist across sessions.\n\n",
     );
     section.push_str("- If you learn durable information that will help later in other sessions (preferences, confirmed project decisions, stable references, non-derivable context), store it with the `memory` tool instead of only leaving it in session_note.\n");
+    section.push_str("- When the user states a commitment, deadline, appointment, or recurring routine, record it with the `ledger` tool (action=upsert; set due_at/remind_at so reminders actually fire) instead of keeping it only in the session task list. Mark records done/cancelled with action=transition, and answer \"what's on my plate\" questions from action=agenda/query.\n");
     section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know about the user's own preferences, history, or prior decisions without first querying memory; the auto-injected memories above are only a keyword-matched shortlist and may have missed it.\n");
     section.push_str("- For durable memory, prefer `memory` action=query first, then `memory` action=get for the specific item you need, and use `memory` action=write/merge only when the fact should become canonical memory.\n");
     section.push_str("- One memory = one fact/decision/preference. Do not bundle unrelated facts into a single memory.\n");
@@ -675,6 +788,7 @@ fn build_external_memory_render_parts(
     ));
 
     section.push_str(&session_note_section);
+    section.push_str(&ledger_agenda_section);
     section.push_str(&relevant_memory_section);
     section.push_str(&project_memory_index_section);
     section.push_str(&project_dream_section);
@@ -685,6 +799,7 @@ fn build_external_memory_render_parts(
 
     ExternalMemoryRenderParts {
         session_note_section,
+        ledger_agenda_section,
         relevant_memory_section,
         project_memory_index_section,
         project_dream_section,

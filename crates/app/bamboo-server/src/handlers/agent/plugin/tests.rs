@@ -725,3 +725,71 @@ async fn install_url_with_plugin_trust_enforcement_off_needs_no_per_request_flag
     assert_eq!(view["id"], "hello-plugin");
     assert_eq!(view["source"]["insecure"], true);
 }
+
+// ---------------------------------------------------------------------
+// Status surface (issue #479): `InstalledPluginView.service_status` is
+// populated from the live `ServiceManager`, keyed off
+// `registered.service_ids`.
+// ---------------------------------------------------------------------
+
+fn service_plugin_manifest_json(id: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": "Service Plugin",
+        "version": "1.0.0",
+        "provides": {
+            "services": [{"id": "svc", "command": "${platform_bin}"}]
+        }
+    })
+    .to_string()
+}
+
+async fn write_service_plugin_dir(dir: &Path, id: &str) {
+    tokio::fs::create_dir_all(dir).await.unwrap();
+    tokio::fs::write(dir.join("plugin.json"), service_plugin_manifest_json(id))
+        .await
+        .unwrap();
+}
+
+#[actix_web::test]
+async fn install_and_list_surface_service_status() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let source_dir = data_dir.path().join("svc-plugin-source");
+    write_service_plugin_dir(&source_dir, "svc-plugin").await;
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(local_dir_source(&source_dir))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view = body_json(resp).await;
+    assert_eq!(
+        view["registered"]["service_ids"],
+        serde_json::json!(["svc"])
+    );
+    let service_status = view["service_status"]
+        .as_array()
+        .expect("service_status array");
+    assert_eq!(service_status.len(), 1);
+    assert_eq!(service_status[0]["id"], "svc");
+    // The binary doesn't exist on disk in this fixture, so the runtime
+    // never reaches `running` — but it MUST be present (best-effort start,
+    // ownership recorded regardless — matches the mcp contract) and report
+    // SOME state, not be silently absent from the response.
+    assert!(service_status[0]["state"].is_string());
+
+    // GET /plugins reflects the same live status.
+    let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
+    let resp = test::call_service(&app, req).await;
+    let listed = body_json(resp).await;
+    let plugins = listed["plugins"].as_array().unwrap();
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(
+        plugins[0]["service_status"][0]["id"],
+        serde_json::json!("svc")
+    );
+}

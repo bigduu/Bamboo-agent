@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-const BUILTIN_SKILL_WHITELIST: &[&str] = &["skill-creator"];
+const BUILTIN_SKILL_WHITELIST: &[&str] = &["personal-assistant", "skill-creator"];
 
 fn is_builtin_skill_enabled(name: &str) -> bool {
     BUILTIN_SKILL_WHITELIST.contains(&name)

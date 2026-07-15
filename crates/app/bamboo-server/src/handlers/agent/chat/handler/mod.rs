@@ -40,7 +40,23 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         parse_goal_command(&req.message).is_some(),
         req.images.as_ref().map(|i| i.len()).unwrap_or(0),
     );
-    let model = match request::validate_and_normalize_model(req.model.as_str()) {
+    // Only resolve the server-side default (a config read + the shared
+    // resolution cascade) when the request omitted `model` — the common case
+    // (an explicit model) pays none of that cost. #480: fall back to the SAME
+    // resolved default the connect bridge and `GET /execute/defaults` use, so
+    // there is one implementation of "what model does this server default to".
+    let default_model = if request::optional_non_empty(req.model.as_deref()).is_some() {
+        None
+    } else {
+        let config_snapshot = state.config.read().await.clone();
+        bamboo_engine::resolved_defaults::resolve_default_run_config(
+            &config_snapshot,
+            &state.provider_registry,
+        )
+        .model_roster
+        .model
+    };
+    let model = match request::resolve_model(req.model.as_deref(), default_model.as_deref()) {
         Ok(model) => model,
         Err(response) => return response,
     };

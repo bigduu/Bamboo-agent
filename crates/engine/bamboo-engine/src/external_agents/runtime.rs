@@ -95,11 +95,14 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
                 );
                 continue;
             };
+            // #217: default under the persistent data-dir subagents home
+            // instead of `env::temp_dir()`, so fabric discovery state
+            // survives reboots and stays inside the tenant's data dir.
             let fabric_dir = profile
                 .fabric_dir
                 .clone()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+                .unwrap_or_else(bamboo_config::paths::subagents_dir);
             let executor = match profile.executor.as_deref() {
                 Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
                 Some("bamboo_runtime") | None => {
@@ -214,11 +217,13 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
         ),
     };
 
+    // #217: default under the persistent data-dir subagents home instead of
+    // `env::temp_dir()` (mirrors the `build_external_child_runner` arm above).
     let fabric_dir = sub
         .fabric_dir
         .clone()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+        .unwrap_or_else(bamboo_config::paths::subagents_dir);
 
     let executor = match sub.executor.as_deref() {
         Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,

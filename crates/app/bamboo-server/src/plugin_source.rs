@@ -444,6 +444,34 @@ async fn stage_into(
             let fetched =
                 fetch_manifest_bundle(url, flags, trust, staging_dir, max_decompressed_bytes)
                     .await?;
+
+            // Security (issue #479 §4 / open question 6): a manifest
+            // declaring `provides.services` is the highest-trust plugin
+            // artifact kind — a resident, unconstrained process — so it may
+            // NEVER install from a URL source whose bytes weren't
+            // cryptographically signed by a trusted key, no matter which
+            // opt-out flag got it this far (`allow_unsigned` explicitly, or
+            // the `--insecure`/`plugin_trust.enforcement: off` aggregate).
+            // `fetched.signed_by.is_none()` is exactly that "unsigned"
+            // signal regardless of WHY (genuinely unsigned bundle, or an
+            // opt-out that let an unsigned/mismatched one through) — see
+            // `fetch_manifest_bundle`'s layer-2 doc comment. Checked here
+            // (not in `PluginManifest::validate`, which has no visibility
+            // into install-time trust flags/signature results) and BEFORE
+            // the per-platform binary artifact is fetched, so a refused
+            // install downloads no executable at all.
+            if !fetched.manifest.provides.services.is_empty() && fetched.signed_by.is_none() {
+                return Err(PluginError::UnsignedOrUntrustedSignature(format!(
+                    "refusing to install plugin '{}' from '{url}': it declares `provides.services` \
+                     (long-running service plugins are the highest-trust artifact kind) but its \
+                     bundle is unsigned or its signature does not verify against a trusted key — \
+                     `--allow-unsigned`/`--insecure` and `plugin_trust.enforcement: off` are NOT \
+                     honoured for a services-declaring manifest; publish a signature from a \
+                     trusted key instead",
+                    fetched.manifest.id
+                )));
+            }
+
             // Binary-artifact verification stays as defense in depth (see
             // the module docs) — its own sha256, declared inside the
             // now-verified manifest, is checked in
