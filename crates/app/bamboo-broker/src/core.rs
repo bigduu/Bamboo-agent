@@ -21,7 +21,15 @@ use std::time::Duration;
 use bamboo_subagent::{InboxMessage, Mailbox, MsgId};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::error::BrokerResult;
+use crate::error::{BrokerError, BrokerResult};
+
+/// Default cap on a single mailbox's pending (undelivered-or-unacked) message
+/// count (#53). Generous: a live streaming Run can legitimately push
+/// hundreds of `Event`s while its subscriber briefly lags, and this only
+/// bites when nobody is draining at all (offline/never-subscribed session) —
+/// so it exists to bound worst-case disk use from a flood, not to throttle
+/// normal traffic. Override via [`BrokerCore::with_max_pending_per_mailbox`].
+pub const DEFAULT_MAX_PENDING_PER_MAILBOX: usize = 50_000;
 
 /// An item pushed to a live subscriber's sink: either a durable mailbox message
 /// or an ephemeral out-of-band control signal. Both ride the same subscriber
@@ -51,6 +59,19 @@ pub struct BrokerCore {
     root: PathBuf,
     /// session_id -> live subscriber. Present only while a client is subscribed.
     subscribers: Mutex<HashMap<String, Subscriber>>,
+    /// Per-mailbox pending-message cap (#53); see
+    /// [`DEFAULT_MAX_PENDING_PER_MAILBOX`].
+    max_pending_per_mailbox: usize,
+    /// Live per-mailbox pending-message counter, seeded from a single
+    /// directory scan the first time a session is touched by THIS
+    /// `BrokerCore` (via [`pending_count_for`](Self::pending_count_for)),
+    /// then kept current in-memory on every `deliver` (+1) / `ack` that
+    /// actually removes a message (-1) — instead of rescanning `new/` +
+    /// `cur/` on every single `deliver` call. The scan-per-call design was
+    /// O(backlog) work on every write, so a legitimate burst against a
+    /// lagging subscriber paid ~O(backlog²) total directory-scan work
+    /// climbing toward the cap (review finding #2 on #491/#53).
+    pending_counts: Mutex<HashMap<String, usize>>,
 }
 
 impl BrokerCore {
@@ -58,7 +79,17 @@ impl BrokerCore {
         Self {
             root: root.into(),
             subscribers: Mutex::new(HashMap::new()),
+            max_pending_per_mailbox: DEFAULT_MAX_PENDING_PER_MAILBOX,
+            pending_counts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Override the per-mailbox pending-message cap (#53) from
+    /// [`DEFAULT_MAX_PENDING_PER_MAILBOX`]. Builder-style — chain onto
+    /// [`Self::new`] before wrapping in `Arc`.
+    pub fn with_max_pending_per_mailbox(mut self, max: usize) -> Self {
+        self.max_pending_per_mailbox = max;
+        self
     }
 
     /// Mailbox for one session: `<root>/mailboxes/<session_id>`.
@@ -68,10 +99,53 @@ impl BrokerCore {
 
     /// Durably enqueue `msg` into `to`'s mailbox, then — if `to` is currently
     /// subscribed — claim and push it immediately. Returns the stored [`MsgId`].
+    ///
+    /// Rejects with [`BrokerError::MailboxFull`] once `to`'s mailbox already
+    /// holds `max_pending_per_mailbox` pending messages (#53) — a backlog cap
+    /// against a flood aimed at an offline/never-draining mailbox. The check
+    /// races benignly with concurrent delivers (worst case a few messages
+    /// over the cap land before the count is next observed); it is a
+    /// best-effort bound, not a hard invariant.
     pub async fn deliver(&self, to: &str, msg: &InboxMessage) -> BrokerResult<MsgId> {
+        let pending = self.pending_count_for(to).await?;
+        if pending >= self.max_pending_per_mailbox {
+            return Err(BrokerError::MailboxFull {
+                session: to.to_string(),
+                limit: self.max_pending_per_mailbox,
+            });
+        }
         let id = self.mailbox(to).deliver(msg).await?;
+        *self
+            .pending_counts
+            .lock()
+            .await
+            .entry(to.to_string())
+            .or_insert(0) += 1;
         self.push_new(to).await?;
         Ok(id)
+    }
+
+    /// Current pending count for `session_id`'s mailbox — an in-memory
+    /// HashMap lookup after the first call for that session, not a directory
+    /// scan (see [`Self::pending_counts`]). The first call for a given
+    /// session performs the ONE directory scan (via
+    /// [`Mailbox::pending_count`]) that seeds its baseline, deliberately done
+    /// OFF the map lock (it's the only await here that touches disk) so a
+    /// slow scan for one mailbox never stalls lookups for others.
+    ///
+    /// Concurrent first-touches of the same never-before-seen mailbox can
+    /// race this seed — both scan, both see the same pre-write disk state,
+    /// and `or_insert` keeps whichever wins, while EVERY caller still applies
+    /// its own subsequent `+1`/`-1` on top — so the final count stays
+    /// correct regardless of which scan wins. No less precise than the
+    /// scan-per-call design's own already-documented benign races.
+    async fn pending_count_for(&self, session_id: &str) -> BrokerResult<usize> {
+        if let Some(&c) = self.pending_counts.lock().await.get(session_id) {
+            return Ok(c);
+        }
+        let scanned = self.mailbox(session_id).pending_count().await?;
+        let mut counts = self.pending_counts.lock().await;
+        Ok(*counts.entry(session_id.to_string()).or_insert(scanned))
     }
 
     /// Register a subscriber for `session_id` and return the stream of pushed
@@ -126,9 +200,22 @@ impl BrokerCore {
         self.subscribers.lock().await.remove(session_id);
     }
 
-    /// Acknowledge a processed message: delete it from `session_id`'s mailbox.
+    /// Acknowledge a processed message: delete it from `session_id`'s mailbox,
+    /// and — if it was actually removed — decrement the live pending counter
+    /// (#53 follow-up; see [`Self::pending_counts`]).
     pub async fn ack(&self, session_id: &str, id: &MsgId) -> BrokerResult<()> {
-        self.mailbox(session_id).ack(id).await?;
+        // Seed the counter from a scan BEFORE the delete below if this
+        // session hasn't been touched by this `BrokerCore` yet — the
+        // baseline must include the message we're about to remove, or the
+        // decrement would double-count it (seeding AFTER the delete would
+        // scan a count that already excludes it).
+        let _ = self.pending_count_for(session_id).await;
+        let removed = self.mailbox(session_id).ack(id).await?;
+        if removed {
+            if let Some(c) = self.pending_counts.lock().await.get_mut(session_id) {
+                *c = c.saturating_sub(1);
+            }
+        }
         Ok(())
     }
 
@@ -204,6 +291,14 @@ impl BrokerCore {
             .await
             .unwrap_or(false);
             if removed {
+                // Drop the stale counter entry too, so `pending_counts` doesn't
+                // grow unbounded in lockstep with the mailbox dirs it just
+                // stopped tracking (#53 follow-up). The dir was confirmed
+                // empty immediately before removal, so its live count (if
+                // seeded at all) is 0 — nothing here relies on that, but it
+                // means dropping the entry loses no information; the next
+                // deliver/ack for this id re-seeds fresh from disk.
+                self.pending_counts.lock().await.remove(&id);
                 purged += 1;
             }
         }
@@ -451,5 +546,141 @@ mod tests {
         assert_eq!(c.gc_empty_mailboxes().await, 1);
         // pending (non-empty) + live (subscribed) survive a second sweep.
         assert_eq!(c.gc_empty_mailboxes().await, 0);
+    }
+
+    /// Mailbox-flood DoS defense (#53): once a session's mailbox holds
+    /// `max_pending_per_mailbox` pending messages, further `deliver`s are
+    /// rejected with [`BrokerError::MailboxFull`] rather than accepted
+    /// unboundedly — the concrete vector is a client delivering to an
+    /// offline/never-draining session to fill disk.
+    #[tokio::test]
+    async fn deliver_rejects_once_pending_cap_reached() {
+        let d = TempDir::new().unwrap();
+        let c = BrokerCore::new(d.path()).with_max_pending_per_mailbox(2);
+
+        // No subscriber for "hoard" -> messages accumulate in new/, uncapped
+        // until the cap check kicks in.
+        c.deliver("hoard", &msg(1)).await.expect("1st under cap");
+        c.deliver("hoard", &msg(2)).await.expect("2nd reaches cap");
+
+        let err = c.deliver("hoard", &msg(3)).await;
+        assert!(
+            matches!(
+                err,
+                Err(BrokerError::MailboxFull {
+                    ref session,
+                    limit: 2
+                }) if session == "hoard"
+            ),
+            "delivery beyond the cap must be rejected: {err:?}"
+        );
+
+        // A different session's mailbox is unaffected — the cap is per-session.
+        c.deliver("other", &msg(4))
+            .await
+            .expect("cap is per-mailbox, not global");
+    }
+
+    /// The cap tracks the LIVE pending count, not a one-shot budget (#53):
+    /// once a message is claimed+acked (freeing a slot), `deliver` succeeds
+    /// again.
+    #[tokio::test]
+    async fn deliver_succeeds_again_after_ack_frees_a_slot() {
+        let d = TempDir::new().unwrap();
+        let c = BrokerCore::new(d.path()).with_max_pending_per_mailbox(1);
+
+        let m1 = msg(1);
+        c.deliver("hoard", &m1).await.expect("1st reaches cap");
+        assert!(
+            c.deliver("hoard", &msg(2)).await.is_err(),
+            "2nd delivery is over the cap"
+        );
+
+        // Claim + ack the pending message, freeing its slot.
+        let mut rx = c.subscribe("hoard", None).await.unwrap();
+        let got = expect_message(rx.recv().await.unwrap());
+        assert_eq!(got.id, m1.id);
+        c.ack("hoard", &got.id).await.unwrap();
+
+        c.deliver("hoard", &msg(3))
+            .await
+            .expect("delivery succeeds again once a slot is freed");
+    }
+
+    /// The pending counter's baseline for a session is SCANNED from disk on
+    /// first touch (#53 follow-up: an in-memory counter replacing the old
+    /// per-call directory rescan), not assumed to start at 0 — so a mailbox
+    /// that already has a backlog when this `BrokerCore` starts (e.g. after a
+    /// broker restart) is correctly capped from the very first `deliver`
+    /// call, not just after enough in-process deliveries accumulate.
+    #[tokio::test]
+    async fn pending_count_seeds_from_preexisting_disk_backlog_on_first_touch() {
+        let d = TempDir::new().unwrap();
+        // Simulate pre-existing backlog: deliver 2 messages directly via a raw
+        // `Mailbox` handle, bypassing `BrokerCore` entirely — as if a PRIOR
+        // broker process wrote them before this `BrokerCore` ever started.
+        let raw = Mailbox::at(d.path().join("mailboxes").join("hoard"));
+        raw.deliver(&msg(1)).await.unwrap();
+        raw.deliver(&msg(2)).await.unwrap();
+
+        let c = BrokerCore::new(d.path()).with_max_pending_per_mailbox(2);
+        // First-ever `deliver` call from THIS `BrokerCore` must already see
+        // the 2 pre-existing messages and reject — not treat its in-memory
+        // count as starting fresh at 0.
+        let err = c.deliver("hoard", &msg(3)).await;
+        assert!(
+            matches!(err, Err(BrokerError::MailboxFull { limit: 2, .. })),
+            "the cap must account for backlog that predates this BrokerCore, got {err:?}"
+        );
+    }
+
+    /// The live in-memory counter (#53 follow-up, replacing a per-call
+    /// directory rescan) must stay a FAITHFUL count under concurrent
+    /// deliveries — not drift from the on-disk truth, and not corrupt itself
+    /// (lost updates / double counts) under concurrent map access. Fires
+    /// many concurrent `deliver`s at the same never-subscribed (so nothing
+    /// drains it) mailbox and checks the in-memory count agrees with a
+    /// fresh, direct on-disk scan afterward.
+    ///
+    /// NOTE: this deliberately does NOT assert on how many of the 100 calls
+    /// succeeded vs. were `MailboxFull`-rejected. The cap's check-then-write
+    /// is, and always has been, a documented BEST-EFFORT race, not a hard
+    /// invariant (see `deliver`'s doc comment) — under enough concurrency,
+    /// many callers can observe the same under-cap count before any of
+    /// their writes lands, so "how many landed over the cap" is inherently
+    /// a race outcome, not a fixed number this test can pin down. What
+    /// MUST hold unconditionally is that the counter tracking whatever DID
+    /// land is accurate.
+    #[tokio::test]
+    async fn pending_count_stays_consistent_with_disk_under_concurrent_delivers() {
+        let d = TempDir::new().unwrap();
+        let c = Arc::new(BrokerCore::new(d.path()).with_max_pending_per_mailbox(20));
+
+        let mut handles = Vec::new();
+        for i in 0..100u32 {
+            let c = c.clone();
+            handles.push(tokio::spawn(
+                async move { c.deliver("hoard", &msg(i)).await },
+            ));
+        }
+        let mut succeeded = 0usize;
+        for h in handles {
+            if h.await.unwrap().is_ok() {
+                succeeded += 1;
+            }
+        }
+        assert!(succeeded > 0, "at least some concurrent deliveries land");
+
+        // The in-memory count must match reality: a direct on-disk scan (the
+        // OLD, ground-truth mechanism) agrees with what the new in-memory
+        // counter believes — no lost updates, no double counts.
+        let on_disk = Mailbox::at(d.path().join("mailboxes").join("hoard"))
+            .pending_count()
+            .await
+            .unwrap();
+        assert_eq!(
+            on_disk, succeeded,
+            "the in-memory counter must not drift from the on-disk message count"
+        );
     }
 }

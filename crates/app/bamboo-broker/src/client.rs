@@ -42,6 +42,11 @@ pub struct BrokerClient {
     sink: WsSink,
     messages: mpsc::UnboundedReceiver<InboxMessage>,
     delivered: mpsc::UnboundedReceiver<MsgId>,
+    /// Correlated rejections for an in-flight `Deliver` (e.g. `MailboxFull`),
+    /// demuxed independently of `delivered` so `deliver()` can distinguish
+    /// "the broker turned this down" from "no receipt arrived in time" — see
+    /// [`BrokerClient::deliver_with_receipt_timeout`]. #491/#53.
+    errors: mpsc::UnboundedReceiver<(MsgId, String)>,
     /// Out-of-band cancel signals (the timed-out ask's correlation id), demuxed
     /// by the background reader independently of `messages` — so a Cancel reaches
     /// the worker even while its work loop is blocked on an in-flight run. #50.
@@ -85,7 +90,7 @@ impl BrokerClient {
             match source.next().await {
                 Some(Ok(Message::Text(t))) => match BrokerFrame::from_text(&t) {
                     Ok(BrokerFrame::Welcome) => break,
-                    Ok(BrokerFrame::Error { reason }) => return Err(BrokerError::Auth(reason)),
+                    Ok(BrokerFrame::Error { reason, .. }) => return Err(BrokerError::Auth(reason)),
                     Ok(_) => continue,
                     Err(e) => return Err(BrokerError::Protocol(format!("bad broker frame: {e}"))),
                 },
@@ -97,10 +102,12 @@ impl BrokerClient {
 
         let (msg_tx, messages) = mpsc::unbounded_channel();
         let (del_tx, delivered) = mpsc::unbounded_channel();
+        let (err_tx, errors) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
         let (conn_tx, connected) = mpsc::unbounded_channel();
-        // The demux loop pushes `Message`/`Delivered`/`Cancel` frames into their
-        // respective channels and ends when the stream closes or errors.
+        // The demux loop pushes `Message`/`Delivered`/`Cancel`/`Error` frames
+        // into their respective channels and ends when the stream closes or
+        // errors.
         let reader = tokio::spawn(async move {
             while let Some(frame) = source.next().await {
                 match frame {
@@ -110,6 +117,24 @@ impl BrokerClient {
                         }
                         Ok(BrokerFrame::Delivered { id }) => {
                             let _ = del_tx.send(id);
+                        }
+                        // Correlated to a specific `Deliver` (e.g.
+                        // `MailboxFull`) — route it to `errors` so the waiting
+                        // `deliver()` call can see the REASON instead of just
+                        // timing out. An uncorrelated `Error` (id: None) post-
+                        // handshake has no in-flight waiter to route to (the
+                        // handshake is the only pre-`Welcome` request); log it
+                        // rather than silently dropping it. #491/#53.
+                        Ok(BrokerFrame::Error {
+                            reason,
+                            id: Some(id),
+                        }) => {
+                            let _ = err_tx.send((id, reason));
+                        }
+                        Ok(BrokerFrame::Error { reason, id: None }) => {
+                            tracing::warn!(
+                                "broker sent an uncorrelated error frame post-handshake: {reason}"
+                            );
                         }
                         Ok(BrokerFrame::Cancel { correlation_id }) => {
                             let _ = cancel_tx.send(correlation_id);
@@ -138,6 +163,7 @@ impl BrokerClient {
             sink,
             messages,
             delivered,
+            errors,
             cancels,
             connected,
             reader_alive,
@@ -171,30 +197,53 @@ impl BrokerClient {
             message,
         })
         .await?;
-        // CORRELATE the receipt to THIS message's id. `delivered` is a shared
-        // receipt stream on a reused connection: a late `Delivered` from a PRIOR
-        // deliver() that timed out (broker stalled but stayed connected) can still
-        // be sitting in the channel, and returning it would hand back a stale,
-        // wrong id. So skip any receipt that isn't ours. Deliver is `&mut self`, so
-        // only one deliver awaits at a time — every non-matching id is therefore a
-        // stale prior receipt, safe to drop. The single timeout bounds the whole
-        // correlation loop (deadline, not per-recv). #114.
+        // CORRELATE the outcome to THIS message's id, racing TWO lanes: the
+        // `delivered` receipt (success) and the `errors` lane (an explicit
+        // broker rejection, e.g. `MailboxFull` — #491/#53). Both are shared
+        // streams on a reused connection: a late arrival from a PRIOR
+        // deliver() that already timed out (broker stalled but stayed
+        // connected) can still be sitting in either channel, and returning it
+        // would hand back a stale, wrong outcome. So skip anything that isn't
+        // ours. Deliver is `&mut self`, so only one deliver awaits at a time —
+        // every non-matching id is therefore a stale prior outcome, safe to
+        // drop. The single timeout bounds the whole correlation loop
+        // (deadline, not per-recv). #114.
         let deadline = tokio::time::Instant::now() + receipt_timeout;
-        loop {
-            match tokio::time::timeout_at(deadline, self.delivered.recv()).await {
-                Ok(Some(id)) if id == expected => return Ok(id),
-                Ok(Some(_stale)) => continue,
-                Ok(None) => {
-                    return Err(BrokerError::Transport(
-                        "connection closed before delivery receipt".into(),
-                    ))
-                }
-                Err(_) => {
-                    return Err(BrokerError::Transport(
-                        "timed out waiting for delivery receipt from broker".into(),
-                    ))
+        let correlate = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    // Bias the rejection lane: an explicit "no" is a clear,
+                    // actionable signal (back off) and should win a race
+                    // against a coincidentally-arriving stale receipt.
+                    err = self.errors.recv() => match err {
+                        Some((id, reason)) if id == expected => {
+                            return Err(BrokerError::Rejected(reason));
+                        }
+                        Some(_stale) => continue,
+                        None => {
+                            return Err(BrokerError::Transport(
+                                "connection closed before delivery receipt".into(),
+                            ));
+                        }
+                    },
+                    id = self.delivered.recv() => match id {
+                        Some(id) if id == expected => return Ok(id),
+                        Some(_stale) => continue,
+                        None => {
+                            return Err(BrokerError::Transport(
+                                "connection closed before delivery receipt".into(),
+                            ));
+                        }
+                    },
                 }
             }
+        };
+        match tokio::time::timeout_at(deadline, correlate).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(BrokerError::Transport(
+                "timed out waiting for delivery receipt from broker".into(),
+            )),
         }
     }
 
@@ -592,6 +641,162 @@ mod tests {
             res_b.expect("deliver(B) succeeds"),
             id_b,
             "deliver(B) returns its own id, not A's stale receipt"
+        );
+    }
+
+    /// A broker that completes the handshake then, for every `Deliver`, replies
+    /// with a correlated `Error` frame (as `BrokerServer` now does for
+    /// `MailboxFull`, #491/#53) instead of `Delivered` — never acking the
+    /// message. The connection is held open so the client can only learn the
+    /// outcome from the `Error` frame, never a `recv() -> None`.
+    async fn broker_that_rejects_every_deliver(reason: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = accept_async(stream).await.expect("ws upgrade");
+            let (mut sink, mut source) = ws.split();
+            if let Some(Ok(Message::Text(_))) = source.next().await {
+                let _ = sink
+                    .send(Message::text(BrokerFrame::Welcome.to_text()))
+                    .await;
+            }
+            while let Some(Ok(Message::Text(txt))) = source.next().await {
+                if let Ok(ClientFrame::Deliver { message, .. }) = ClientFrame::from_text(&txt) {
+                    let _ = sink
+                        .send(Message::text(
+                            BrokerFrame::Error {
+                                reason: reason.to_string(),
+                                id: Some(message.id),
+                            }
+                            .to_text(),
+                        ))
+                        .await;
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Regression for the review finding on #491/#53: a `MailboxFull` (or any
+    /// other) rejection of a `Deliver` must reach the CALLER of `deliver()` as
+    /// a distinct, fast `BrokerError::Rejected` — not get silently dropped by
+    /// the post-handshake demux, leaving the caller to burn the full receipt
+    /// timeout and see a misleading `BrokerError::Transport("timed out...")`
+    /// that looks like a lost/stalled connection rather than an explicit "no".
+    #[tokio::test]
+    async fn deliver_returns_rejected_when_broker_sends_a_correlated_error() {
+        let endpoint =
+            broker_that_rejects_every_deliver("mailbox 'child' is full (2 pending messages)").await;
+        let mut client = BrokerClient::connect(&endpoint, test_agent("parent"), "ignored")
+            .await
+            .expect("handshake completes");
+
+        let started = std::time::Instant::now();
+        // Real (non-test-only) `deliver()`, with the production 30s timeout —
+        // if the rejection were still being swallowed, this would hang for the
+        // full 30s instead of returning promptly.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.deliver("child", test_ask("parent")),
+        )
+        .await
+        .expect("deliver() resolves promptly instead of hanging out the receipt timeout");
+
+        match outcome {
+            Err(BrokerError::Rejected(reason)) => {
+                assert!(
+                    reason.contains("full"),
+                    "rejection reason should be the broker's verbatim message, got: {reason}"
+                );
+            }
+            other => panic!("expected BrokerError::Rejected, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the rejection must reach the caller fast, not via the receipt timeout, took {:?}",
+            started.elapsed(),
+        );
+    }
+
+    /// Mirrors #114 (stale-receipt skip) for the new rejection lane: after a
+    /// `deliver()` times out, a LATE `Error` for that same timed-out call must
+    /// not be mistaken for the outcome of a SUBSEQUENT `deliver()` on the reused
+    /// client.
+    #[tokio::test]
+    async fn deliver_skips_a_stale_error_from_a_prior_timed_out_deliver() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let endpoint = format!("ws://{addr}");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = accept_async(stream).await.expect("ws upgrade");
+            let (mut sink, mut source) = ws.split();
+            if let Some(Ok(Message::Text(_))) = source.next().await {
+                let _ = sink
+                    .send(Message::text(BrokerFrame::Welcome.to_text()))
+                    .await;
+            }
+            // First Deliver (A): reply with its Error only after a delay, so
+            // deliver(A)'s tiny timeout expires first and the Error lands late.
+            if let Some(Ok(Message::Text(txt))) = source.next().await {
+                if let Ok(ClientFrame::Deliver { message, .. }) = ClientFrame::from_text(&txt) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = sink
+                        .send(Message::text(
+                            BrokerFrame::Error {
+                                reason: "stale rejection for A".into(),
+                                id: Some(message.id),
+                            }
+                            .to_text(),
+                        ))
+                        .await;
+                }
+            }
+            // Second Deliver (B): reply promptly with a real Delivered receipt.
+            if let Some(Ok(Message::Text(txt))) = source.next().await {
+                if let Ok(ClientFrame::Deliver { message, .. }) = ClientFrame::from_text(&txt) {
+                    let _ = sink
+                        .send(Message::text(
+                            BrokerFrame::Delivered { id: message.id }.to_text(),
+                        ))
+                        .await;
+                }
+            }
+            // Hold the connection open (as `broker_that_never_acks` above
+            // does, for the same reason): dropping `sink`/`source` here would
+            // close the socket right after the send, racing the client's
+            // demux for no reason this test cares about. Just drain.
+            while let Some(Ok(_)) = source.next().await {}
+        });
+
+        let mut client = BrokerClient::connect(&endpoint, test_agent("parent"), "ignored")
+            .await
+            .expect("connect");
+
+        let msg_a = test_ask("a");
+        let id_a = msg_a.id.clone();
+        let res_a = client
+            .deliver_with_receipt_timeout("target", msg_a, Duration::from_millis(10))
+            .await;
+        assert!(res_a.is_err(), "deliver(A) times out before its rejection");
+
+        // Let A's late Error arrive and buffer in the errors channel.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let msg_b = test_ask("b");
+        let id_b = msg_b.id.clone();
+        assert_ne!(id_a, id_b);
+        let res_b = client
+            .deliver_with_receipt_timeout("target", msg_b, Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            res_b.expect("deliver(B) succeeds, not misrouted to A's stale rejection"),
+            id_b,
         );
     }
 }

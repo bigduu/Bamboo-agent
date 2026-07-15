@@ -136,6 +136,23 @@ fn resolve_config_data_dir(path: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
+/// `clap` `value_parser` for `broker serve --messages-per-second` /
+/// `--message-burst`: rejects `0` with a clear CLI error instead of letting
+/// it through and silently falling back to the default deep inside
+/// `BrokerLimits` construction (review finding on #491/#53) — an operator
+/// passing `0` almost certainly wants a hard error, not a quiet no-op.
+fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|e| format!("invalid number: {e}"))?;
+    if n == 0 {
+        return Err(
+            "must be greater than 0 (0 would silently fall back to the default, not enforce \
+             a stricter limit)"
+                .to_string(),
+        );
+    }
+    Ok(n)
+}
+
 /// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
 /// when the shell that spawned us goes away.
 ///
@@ -972,6 +989,34 @@ enum BrokerCommands {
         /// Durable mailbox storage root. Defaults to `<bamboo_dir>/broker`.
         #[arg(long)]
         root: Option<PathBuf>,
+
+        /// Max concurrent WebSocket connections (#53 DoS defense). Beyond
+        /// this, new connections are dropped immediately. Default is
+        /// generous — sized well above a normal multi-worker fabric.
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().max_connections)]
+        max_connections: usize,
+
+        /// Sustained per-connection `Deliver`-frame rate, frames/sec (#53).
+        /// Exceeding it delays (not disconnects) the connection. Default is
+        /// well above a single live event-streaming Run's normal rate. Must
+        /// be nonzero — `0` is rejected outright rather than silently
+        /// falling back to the default, since a `0` is almost certainly a
+        /// misconfiguration (an operator trying to be maximally strict, or a
+        /// scripting bug), not an intentional "block everything".
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().messages_per_second.get(), value_parser = parse_nonzero_u32)]
+        messages_per_second: u32,
+
+        /// Burst allowance layered on `--messages-per-second` (#53). Must be
+        /// nonzero (see `--messages-per-second`).
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().message_burst.get(), value_parser = parse_nonzero_u32)]
+        message_burst: u32,
+
+        /// Max pending (undelivered-or-unacked) messages a single session's
+        /// mailbox may hold before `deliver` starts refusing more (#53) — a
+        /// backlog cap against a flood aimed at an offline/never-draining
+        /// mailbox.
+        #[arg(long, default_value_t = bamboo_broker::DEFAULT_MAX_PENDING_PER_MAILBOX)]
+        max_pending_per_mailbox: usize,
     },
 }
 
@@ -1552,7 +1597,15 @@ async fn main() {
         }
 
         Commands::Broker { command } => {
-            let BrokerCommands::Serve { bind, token, root } = command;
+            let BrokerCommands::Serve {
+                bind,
+                token,
+                root,
+                max_connections,
+                messages_per_second,
+                message_burst,
+                max_pending_per_mailbox,
+            } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
                 .filter(|t| !t.is_empty())
@@ -1578,13 +1631,36 @@ async fn main() {
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| bind.clone());
-            tracing::info!(%addr, root = %root.display(), "bamboo broker serving");
-            let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(root));
+            tracing::info!(
+                %addr,
+                root = %root.display(),
+                max_connections,
+                messages_per_second,
+                message_burst,
+                max_pending_per_mailbox,
+                "bamboo broker serving"
+            );
+            let core = std::sync::Arc::new(
+                bamboo_broker::BrokerCore::new(root)
+                    .with_max_pending_per_mailbox(max_pending_per_mailbox),
+            );
             // Reclaim empty, unsubscribed mailbox dirs every 5 minutes.
             let _gc = core
                 .clone()
                 .spawn_mailbox_gc(std::time::Duration::from_secs(300));
-            let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, token));
+            let limits = bamboo_broker::BrokerLimits {
+                max_connections,
+                // `parse_nonzero_u32` (the clap `value_parser` on both flags)
+                // already rejected `0` at CLI-parse time, so these are
+                // infallible here — no silent fallback needed.
+                messages_per_second: std::num::NonZeroU32::new(messages_per_second)
+                    .expect("clap value_parser rejects 0"),
+                message_burst: std::num::NonZeroU32::new(message_burst)
+                    .expect("clap value_parser rejects 0"),
+            };
+            let server = std::sync::Arc::new(bamboo_broker::BrokerServer::with_limits(
+                core, token, limits,
+            ));
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
                 std::process::exit(1);
