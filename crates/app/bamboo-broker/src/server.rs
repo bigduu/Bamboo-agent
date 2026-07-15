@@ -164,6 +164,7 @@ impl BrokerServer {
                         &mut sink,
                         BrokerFrame::Error {
                             reason: "invalid token".into(),
+                            id: None,
                         },
                     )
                     .await;
@@ -178,6 +179,7 @@ impl BrokerServer {
                     &mut sink,
                     BrokerFrame::Error {
                         reason: "expected hello".into(),
+                        id: None,
                     },
                 )
                 .await;
@@ -199,7 +201,26 @@ impl BrokerServer {
                             // (delay) rather than drop/disconnect, so a legitimate
                             // burst (e.g. overlapping event streams) just waits
                             // instead of losing the connection or the message.
+                            //
+                            // NOTE: this `.await` runs inside the `select!`'s
+                            // frame-read arm, so while it's pending the sibling
+                            // `pushed = next_pushed(...)` arm is NOT polled — a
+                            // connection that is BOTH delivering and subscribed
+                            // (the protocol allows one connection to do both)
+                            // has its own inbound pushes queue in the unbounded
+                            // channel for the throttle's duration. Given the
+                            // generous defaults and the "backpressure, don't
+                            // punish" intent this is an accepted tradeoff, not a
+                            // bug — flagged here so it isn't rediscovered as a
+                            // surprise (review finding on #491/#53).
                             deliver_limiter.until_ready().await;
+                            // Keep the id BEFORE `core.deliver` takes `&message`,
+                            // so a rejection (e.g. `MailboxFull`) can be
+                            // correlated back to THIS `Deliver` — otherwise the
+                            // sender only ever sees a generic receipt timeout,
+                            // never the specific reason (review finding #1 on
+                            // #491/#53).
+                            let msg_id = message.id.clone();
                             match self.core.deliver(&to, &message).await {
                                 Ok(id) => {
                                     if send(&mut sink, BrokerFrame::Delivered { id }).await.is_err() {
@@ -207,19 +228,26 @@ impl BrokerServer {
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string() }).await;
+                                    let _ = send(
+                                        &mut sink,
+                                        BrokerFrame::Error {
+                                            reason: e.to_string(),
+                                            id: Some(msg_id),
+                                        },
+                                    )
+                                    .await;
                                 }
                             }
                         }
                         Ok(Some(ClientFrame::Subscribe)) => match self.core.subscribe(&session_id, role.as_deref()).await {
                             Ok(rx) => sub_rx = Some(rx),
                             Err(e) => {
-                                let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string() }).await;
+                                let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string(), id: None }).await;
                             }
                         },
                         Ok(Some(ClientFrame::Ack { id })) => {
                             if let Err(e) = self.core.ack(&session_id, &id).await {
-                                let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string() }).await;
+                                let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string(), id: None }).await;
                             }
                         }
                         // A second Hello is meaningless mid-session; ignore.

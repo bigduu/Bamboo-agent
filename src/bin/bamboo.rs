@@ -136,6 +136,23 @@ fn resolve_config_data_dir(path: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
+/// `clap` `value_parser` for `broker serve --messages-per-second` /
+/// `--message-burst`: rejects `0` with a clear CLI error instead of letting
+/// it through and silently falling back to the default deep inside
+/// `BrokerLimits` construction (review finding on #491/#53) — an operator
+/// passing `0` almost certainly wants a hard error, not a quiet no-op.
+fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|e| format!("invalid number: {e}"))?;
+    if n == 0 {
+        return Err(
+            "must be greater than 0 (0 would silently fall back to the default, not enforce \
+             a stricter limit)"
+                .to_string(),
+        );
+    }
+    Ok(n)
+}
+
 /// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
 /// when the shell that spawned us goes away.
 ///
@@ -981,12 +998,17 @@ enum BrokerCommands {
 
         /// Sustained per-connection `Deliver`-frame rate, frames/sec (#53).
         /// Exceeding it delays (not disconnects) the connection. Default is
-        /// well above a single live event-streaming Run's normal rate.
-        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().messages_per_second.get())]
+        /// well above a single live event-streaming Run's normal rate. Must
+        /// be nonzero — `0` is rejected outright rather than silently
+        /// falling back to the default, since a `0` is almost certainly a
+        /// misconfiguration (an operator trying to be maximally strict, or a
+        /// scripting bug), not an intentional "block everything".
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().messages_per_second.get(), value_parser = parse_nonzero_u32)]
         messages_per_second: u32,
 
-        /// Burst allowance layered on `--messages-per-second` (#53).
-        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().message_burst.get())]
+        /// Burst allowance layered on `--messages-per-second` (#53). Must be
+        /// nonzero (see `--messages-per-second`).
+        #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().message_burst.get(), value_parser = parse_nonzero_u32)]
         message_burst: u32,
 
         /// Max pending (undelivered-or-unacked) messages a single session's
@@ -1628,10 +1650,13 @@ async fn main() {
                 .spawn_mailbox_gc(std::time::Duration::from_secs(300));
             let limits = bamboo_broker::BrokerLimits {
                 max_connections,
+                // `parse_nonzero_u32` (the clap `value_parser` on both flags)
+                // already rejected `0` at CLI-parse time, so these are
+                // infallible here — no silent fallback needed.
                 messages_per_second: std::num::NonZeroU32::new(messages_per_second)
-                    .unwrap_or(bamboo_broker::BrokerLimits::default().messages_per_second),
+                    .expect("clap value_parser rejects 0"),
                 message_burst: std::num::NonZeroU32::new(message_burst)
-                    .unwrap_or(bamboo_broker::BrokerLimits::default().message_burst),
+                    .expect("clap value_parser rejects 0"),
             };
             let server = std::sync::Arc::new(bamboo_broker::BrokerServer::with_limits(
                 core, token, limits,

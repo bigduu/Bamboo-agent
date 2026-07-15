@@ -23,6 +23,17 @@ pub enum BrokerError {
     /// auth failure.
     #[error("mailbox '{session}' is full ({limit} pending messages)")]
     MailboxFull { session: String, limit: usize },
+    /// The broker explicitly REJECTED a request (e.g. [`Self::MailboxFull`])
+    /// and told the caller so via a correlated [`crate::proto::BrokerFrame::Error`]
+    /// — as opposed to [`Self::Transport`], which means the RPC never got a
+    /// definitive answer at all (network stall, broker crash, timeout). This
+    /// distinction is the point: `BrokerClient::deliver` returns this the
+    /// instant the broker's rejection arrives, instead of the caller burning
+    /// the full receipt timeout to learn the same thing. `reason` is the
+    /// broker's stringified error (client-side; the original `BrokerError`
+    /// variant on the broker doesn't cross the wire, only its `Display`).
+    #[error("broker rejected the request: {0}")]
+    Rejected(String),
 }
 
 pub type BrokerResult<T> = Result<T, BrokerError>;

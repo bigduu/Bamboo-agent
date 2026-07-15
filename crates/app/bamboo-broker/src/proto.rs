@@ -43,7 +43,19 @@ pub enum BrokerFrame {
     Welcome,
     /// Handshake or request rejected; the broker closes the connection after
     /// an auth error.
-    Error { reason: String },
+    ///
+    /// `id` correlates the rejection back to the [`ClientFrame::Deliver`]
+    /// that caused it (e.g. `MailboxFull`) — [`Some`] the message's own
+    /// [`MsgId`] when the broker rejected a specific `Deliver`, `None` for
+    /// rejections with nothing to correlate to (bad handshake, a malformed
+    /// frame). Lets `BrokerClient::deliver` route the rejection back to the
+    /// waiting caller instead of the caller only ever seeing a generic
+    /// receipt timeout (review finding on #491/#53).
+    Error {
+        reason: String,
+        #[serde(default)]
+        id: Option<MsgId>,
+    },
     /// A message pushed from the subscriber's mailbox.
     Message { message: InboxMessage },
     /// Receipt that a [`ClientFrame::Deliver`] was durably enqueued.
@@ -145,6 +157,11 @@ mod tests {
             BrokerFrame::Welcome,
             BrokerFrame::Error {
                 reason: "bad token".into(),
+                id: None,
+            },
+            BrokerFrame::Error {
+                reason: "mailbox 'child' is full (2 pending messages)".into(),
+                id: Some(MsgId::new()),
             },
             BrokerFrame::Message { message: ask_msg() },
             BrokerFrame::Delivered { id: MsgId::new() },
@@ -158,5 +175,22 @@ mod tests {
         for f in frames {
             assert_eq!(BrokerFrame::from_text(&f.to_text()).unwrap(), f);
         }
+    }
+
+    /// A legacy `Error` frame serialized without the `id` field (as every
+    /// `Error` was before this correlation id existed) still parses, with
+    /// `id` defaulting to `None` — so an older broker (or a captured/replayed
+    /// frame) never fails a newer client's deserialization.
+    #[test]
+    fn error_frame_without_id_defaults_to_none() {
+        let legacy = serde_json::json!({ "kind": "error", "reason": "bad token" });
+        let parsed: BrokerFrame = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            BrokerFrame::Error {
+                reason: "bad token".into(),
+                id: None,
+            }
+        );
     }
 }

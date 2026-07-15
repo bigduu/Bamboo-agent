@@ -347,17 +347,29 @@ async fn max_connections_slot_frees_on_disconnect() {
         // accept_async/handle_conn task, releasing its permit.
     }
 
-    // Give the server task a moment to notice the closed connection and
-    // release its semaphore permit.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let second = tokio::time::timeout(
-        Duration::from_secs(5),
-        BrokerClient::connect(&endpoint, agent("second"), TOKEN),
-    )
-    .await
-    .expect("connection attempt does not hang");
-    assert!(second.is_ok(), "a freed slot must admit a new connection");
+    // Poll for the slot to free (short retry interval, bounded overall
+    // timeout) instead of a single fixed sleep + one connect attempt: the
+    // server needs a moment to notice the closed raw TCP connection and
+    // release its semaphore permit, but exactly how long is timing-dependent
+    // — a fixed sleep is a (low-probability but real) source of CI flakiness
+    // under load. Retrying until it succeeds or the deadline passes gets the
+    // same guarantee without a hardcoded margin (review finding on #491/#53).
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if BrokerClient::connect(&endpoint, agent("second"), TOKEN)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        second.is_ok(),
+        "a freed slot must admit a new connection within 5s of the old one closing"
+    );
 }
 
 /// Message-flood DoS defense (#53): a connection sending `Deliver` frames
@@ -393,5 +405,61 @@ async fn deliver_rate_limit_backpressures_a_flooding_connection() {
         elapsed >= Duration::from_millis(150),
         "a burst beyond the token bucket must be delayed, not accepted \
          instantly (took {elapsed:?})"
+    );
+}
+
+/// Mailbox-flood rejection reaches the SENDER end-to-end over a real
+/// WebSocket connection (review finding #1 on PR #491/#53): once a mailbox
+/// is at its pending cap, `deliver()` must return a fast, clear
+/// `BrokerError::Rejected` — not the generic 30s `DELIVER_RECEIPT_TIMEOUT` a
+/// caller would otherwise burn waiting for a `Delivered` receipt the broker
+/// will never send.
+#[tokio::test]
+async fn mailbox_full_rejection_reaches_the_delivering_client() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let core = Arc::new(BrokerCore::new(dir.path()).with_max_pending_per_mailbox(1));
+    let server = Arc::new(BrokerServer::new(core, TOKEN));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+    let endpoint = format!("ws://{addr}");
+
+    let mut sender = BrokerClient::connect(&endpoint, agent("flooder2"), TOKEN)
+        .await
+        .expect("connects");
+
+    // 1st delivery reaches the cap — nobody ever subscribes to "hoard", so
+    // nothing drains it.
+    sender
+        .deliver("hoard", ask("flooder2"))
+        .await
+        .expect("1st delivery is under the cap");
+
+    // 2nd delivery must be rejected promptly (well under the 30s production
+    // receipt timeout), not silently swallowed and left to time out.
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        sender.deliver("hoard", ask("flooder2")),
+    )
+    .await
+    .expect("deliver() resolves promptly instead of hanging out the 30s receipt timeout");
+
+    match outcome {
+        Err(bamboo_broker::BrokerError::Rejected(reason)) => {
+            assert!(
+                reason.contains("full"),
+                "expected the MailboxFull reason to reach the caller verbatim, got: {reason}"
+            );
+        }
+        other => panic!("expected BrokerError::Rejected, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the rejection must reach the caller fast, not via the 30s receipt \
+         timeout — took {:?}",
+        started.elapsed(),
     );
 }
