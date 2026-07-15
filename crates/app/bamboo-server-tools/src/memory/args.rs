@@ -4,11 +4,12 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use bamboo_memory::memory_store::{DurableMemoryStatus, DurableMemoryType};
+use bamboo_memory::memory_store::{DurableMemoryStatus, DurableMemoryType, TemporalGranularity};
 
 pub(super) type FilterTypeSet = (
     Option<HashSet<DurableMemoryType>>,
     Option<HashSet<DurableMemoryStatus>>,
+    Option<HashSet<TemporalGranularity>>,
 );
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +178,12 @@ pub(super) struct QueryFilters {
     pub(super) r#type: Vec<String>,
     #[serde(default)]
     pub(super) status: Vec<String>,
+    /// Optional temporal-granularity filter (day/week/month/quarter/year). Shared
+    /// by `query` and `purge`. Empty/omitted = no filtering (back-compat); a
+    /// memory with no granularity never matches a non-empty filter (issue #61
+    /// phase 2 recall filtering, the "只看本周的 memory" ask).
+    #[serde(default)]
+    pub(super) granularity: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

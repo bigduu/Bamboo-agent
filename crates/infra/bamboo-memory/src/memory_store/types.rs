@@ -91,6 +91,61 @@ impl TemporalGranularity {
             Some(Self::Day) => 5,
         }
     }
+
+    /// Whether this granularity is "high churn" per the issue's Prefix Cache
+    /// Friendly constraint: day/week memories change often enough that they must
+    /// never land in the stable prompt prefix (see `budget::segment_by_granularity_budget`).
+    /// `None` and month/quarter/year are low-churn / prefix-eligible; week/day are
+    /// high-churn / suffix-only. Derived from [`cache_stability_rank`] so the
+    /// ordering tie-break (Phase 1) and the budget segmentation (Phase 2) can never
+    /// disagree about which side of the coarse/fine line a granularity falls on.
+    pub fn is_high_churn(granularity: Option<Self>) -> bool {
+        Self::cache_stability_rank(granularity) > Self::cache_stability_rank(Some(Self::Month))
+    }
+}
+
+#[cfg(test)]
+mod granularity_tests {
+    use super::TemporalGranularity;
+
+    #[test]
+    fn is_high_churn_splits_coarse_from_fine_at_month() {
+        // Low-churn / prefix-eligible: unset, year, quarter, month.
+        assert!(!TemporalGranularity::is_high_churn(None));
+        assert!(!TemporalGranularity::is_high_churn(Some(
+            TemporalGranularity::Year
+        )));
+        assert!(!TemporalGranularity::is_high_churn(Some(
+            TemporalGranularity::Quarter
+        )));
+        assert!(!TemporalGranularity::is_high_churn(Some(
+            TemporalGranularity::Month
+        )));
+        // High-churn / suffix-only: week, day.
+        assert!(TemporalGranularity::is_high_churn(Some(
+            TemporalGranularity::Week
+        )));
+        assert!(TemporalGranularity::is_high_churn(Some(
+            TemporalGranularity::Day
+        )));
+    }
+
+    #[test]
+    fn parse_round_trips_as_str_for_every_variant() {
+        for granularity in [
+            TemporalGranularity::Day,
+            TemporalGranularity::Week,
+            TemporalGranularity::Month,
+            TemporalGranularity::Quarter,
+            TemporalGranularity::Year,
+        ] {
+            assert_eq!(
+                TemporalGranularity::parse(granularity.as_str()),
+                Some(granularity)
+            );
+        }
+        assert_eq!(TemporalGranularity::parse("decade"), None);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

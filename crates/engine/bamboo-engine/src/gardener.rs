@@ -1,6 +1,7 @@
-//! Background "gardener": LLM-driven remediation of memory-quality problems.
+//! Background "gardener": LLM-driven remediation of memory-quality problems, plus
+//! two deterministic (no-LLM) maintenance passes.
 //!
-//! Two symmetric passes share one cadence and one cost model:
+//! Two symmetric LLM-backed passes share one cadence and one cost model:
 //! - the **blob gardener** splits multi-topic "blob" memories into atomic pieces;
 //! - the **dedup gardener** consolidates near-duplicate memories into one.
 //!
@@ -9,6 +10,12 @@
 //! deterministic prefilter finds nothing (an idle gardener costs nothing). The
 //! *decision* needs the model; the *worklist* (which memories are blobs / which are
 //! near-duplicates) is produced for free by `MemoryStore` scan methods.
+//!
+//! Two further passes run in the same loop but need no model at all: the
+//! **freshness gardener** (issue #61 phase 2) conservatively demotes stale
+//! fine-grained memories to Stale, and the **capacity gardener** (L5/#263) bounds
+//! each scope's recallable size by archiving the lowest-value overflow. Both are
+//! non-destructive (Stale/Archived, never deleted) and on by default.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +64,12 @@ pub struct DedupGardenerRunResult {
 pub struct CapacityGardenerRunResult {
     pub scopes_scanned: usize,
     pub archived: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FreshnessGardenerRunResult {
+    pub scopes_scanned: usize,
+    pub marked_stale: usize,
 }
 
 pub(crate) async fn collect_model_json(
@@ -488,6 +501,57 @@ async fn run_capacity_gardener_once_with_store(
     Ok(Some(result))
 }
 
+/// Temporal-granularity freshness gardener (issue #61 phase 2, follow-up to the
+/// L5/#263 capacity gardener above): conservatively demotes Active day/week
+/// granularity memories to Stale once they cross the documented staleness window
+/// (`bamboo_memory::memory_store::freshness::granularity_expired`). Deterministic
+/// — no LLM, no cost — and non-destructive: it only ever moves Active → Stale,
+/// never archives or deletes. Off when `granularity_freshness_gardener_enabled`
+/// is false; on by default (like the blob/dedup passes). `Ok(None)` when the
+/// feature is off.
+pub async fn run_freshness_gardener_once(
+    ctx: &AutoDreamContext,
+) -> Result<Option<FreshnessGardenerRunResult>, String> {
+    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    run_freshness_gardener_once_with_store(ctx, &memory).await
+}
+
+async fn run_freshness_gardener_once_with_store(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+) -> Result<Option<FreshnessGardenerRunResult>, String> {
+    let memory_cfg = ctx.config.read().await.memory.clone().unwrap_or_default();
+    if !memory_cfg.granularity_freshness_gardener_enabled {
+        return Ok(None);
+    }
+
+    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
+    for key in memory.list_project_keys().await.unwrap_or_default() {
+        targets.push((MemoryScope::Project, Some(key)));
+    }
+
+    let mut result = FreshnessGardenerRunResult::default();
+    for (scope, project_key) in &targets {
+        let expired = memory
+            .expire_stale_granularity(*scope, project_key.as_deref())
+            .await
+            .map_err(|error| format!("granularity freshness pass failed: {error}"))?;
+        result.scopes_scanned += 1;
+        result.marked_stale += expired.len();
+    }
+    if result.marked_stale > 0 {
+        tracing::info!(
+            target: GARDENER_TRACING_TARGET,
+            event = "freshness_run_complete",
+            scopes_scanned = result.scopes_scanned,
+            marked_stale = result.marked_stale,
+            "[freshness-gardener] marked {} fine-grained memories stale",
+            result.marked_stale
+        );
+    }
+    Ok(Some(result))
+}
+
 /// How often the gardener loop polls for the volume trigger. Kept short relative
 /// to the (typically daily) time interval so library growth is caught within
 /// minutes, not a full interval. Each poll is a cheap count + a config read; the
@@ -528,6 +592,18 @@ async fn run_gardener_passes(ctx: &AutoDreamContext) {
             target: GARDENER_TRACING_TARGET,
             event = "dedup_run_failed",
             "[dedup-gardener] run failed: {}",
+            error
+        );
+    }
+    // Freshness pass before capacity: memories it demotes to Stale in this same
+    // run are then discounted by `memory_value`'s stale_penalty, so the capacity
+    // gardener's overflow scoring (if it runs right after) already reflects any
+    // granularity-driven staleness from this pass.
+    if let Err(error) = run_freshness_gardener_once(ctx).await {
+        tracing::warn!(
+            target: GARDENER_TRACING_TARGET,
+            event = "freshness_run_failed",
+            "[freshness-gardener] run failed: {}",
             error
         );
     }
@@ -966,6 +1042,100 @@ mod tests {
                 .unwrap(),
             4,
             "archived docs are kept on disk, not deleted"
+        );
+    }
+
+    /// Issue #61 phase 2: the freshness gardener is gated by
+    /// `granularity_freshness_gardener_enabled` (default ON) and, when disabled,
+    /// short-circuits to `Ok(None)` without touching any memory — mirroring the
+    /// on/off contract the blob/dedup/capacity passes already use.
+    #[tokio::test]
+    async fn freshness_gardener_is_noop_when_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(bamboo_config::MemoryConfig {
+                granularity_freshness_gardener_enabled: false,
+                ..bamboo_config::MemoryConfig::default()
+            }),
+            ..Config::default()
+        }));
+        let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
+        let ctx = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config,
+            provider_registry,
+        };
+        assert_eq!(run_freshness_gardener_once(&ctx).await.unwrap(), None);
+    }
+
+    /// When enabled (the default), the freshness gardener scans every scope
+    /// (global + each project) and reports zero `marked_stale` for memories that
+    /// haven't crossed their staleness window yet — confirming the pass is wired
+    /// through `MemoryStore::expire_stale_granularity` correctly without relying
+    /// on backdated fixtures (the time-threshold math itself is covered by
+    /// `bamboo-memory`'s own `expire_stale_granularity_marks_only_expired_day_and_week_memories`
+    /// test, which has direct access to backdate a document's `updated_at`).
+    #[tokio::test]
+    async fn freshness_gardener_runs_when_enabled_and_scans_every_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
+
+        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Freshly written day note",
+                "Not yet old enough to expire.",
+                &[],
+                Some("s"),
+                "m",
+                false,
+                Some(bamboo_memory::memory_store::TemporalGranularity::Day),
+            )
+            .await
+            .unwrap();
+
+        // Enabled by default (matches `MemoryConfig::default()`).
+        let config = Arc::new(RwLock::new(Config::default()));
+        let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
+        let ctx = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config,
+            provider_registry,
+        };
+
+        let result = run_freshness_gardener_once_with_store(&ctx, &memory)
+            .await
+            .unwrap()
+            .expect("freshness pass should run when enabled");
+        assert!(
+            result.scopes_scanned >= 1,
+            "at least the global scope is scanned"
+        );
+        assert_eq!(
+            result.marked_stale, 0,
+            "a freshly-written day memory has not crossed its staleness window yet"
         );
     }
 }

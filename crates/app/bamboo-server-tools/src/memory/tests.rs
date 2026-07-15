@@ -167,3 +167,145 @@ fn parse_granularity_none_or_empty_is_none() {
 fn parse_granularity_rejects_unknown_value() {
     assert!(MemoryTool::parse_granularity(Some("decade")).is_err());
 }
+
+#[test]
+fn parse_query_filters_granularity_absent_or_empty_means_no_filtering() {
+    let (_, _, granularity) = MemoryTool::parse_query_filters(None).unwrap();
+    assert_eq!(granularity, None);
+
+    let filters = args::QueryFilters {
+        r#type: Vec::new(),
+        status: Vec::new(),
+        granularity: Vec::new(),
+    };
+    let (_, _, granularity) = MemoryTool::parse_query_filters(Some(&filters)).unwrap();
+    assert_eq!(granularity, None);
+}
+
+#[test]
+fn parse_query_filters_parses_known_granularities_case_insensitively() {
+    let filters = args::QueryFilters {
+        r#type: Vec::new(),
+        status: Vec::new(),
+        granularity: vec!["Week".to_string(), " year ".to_string()],
+    };
+    let (_, _, granularity) = MemoryTool::parse_query_filters(Some(&filters)).unwrap();
+    let granularity = granularity.expect("filter should be Some");
+    assert_eq!(granularity.len(), 2);
+    assert!(granularity.contains(&bamboo_memory::memory_store::TemporalGranularity::Week));
+    assert!(granularity.contains(&bamboo_memory::memory_store::TemporalGranularity::Year));
+}
+
+#[test]
+fn parse_query_filters_partial_filter_object_leaves_other_dimensions_unfiltered() {
+    // Regression guard: setting ONLY `granularity` on a `filters` object must not
+    // implicitly turn the omitted `type`/`status` sub-lists into an empty (and
+    // therefore match-nothing) filter.
+    let filters = args::QueryFilters {
+        r#type: Vec::new(),
+        status: Vec::new(),
+        granularity: vec!["week".to_string()],
+    };
+    let (filter_types, filter_statuses, filter_granularity) =
+        MemoryTool::parse_query_filters(Some(&filters)).unwrap();
+    assert_eq!(
+        filter_types, None,
+        "empty type sub-list must stay unfiltered"
+    );
+    assert_eq!(
+        filter_statuses, None,
+        "empty status sub-list must stay unfiltered"
+    );
+    assert!(filter_granularity.is_some());
+}
+
+#[test]
+fn parse_query_filters_rejects_unknown_granularity() {
+    let filters = args::QueryFilters {
+        r#type: Vec::new(),
+        status: Vec::new(),
+        granularity: vec!["decade".to_string()],
+    };
+    assert!(MemoryTool::parse_query_filters(Some(&filters)).is_err());
+}
+
+#[tokio::test]
+async fn query_action_filters_by_granularity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = build_memory_tool(dir.path());
+
+    tool.invoke(
+        json!({
+            "action": "write",
+            "scope": "project",
+            "type": "project",
+            "title": "This week's sprint priorities",
+            "content": "Ship the granularity filter end to end.",
+            "project_key": "proj-1",
+            "granularity": "week"
+        }),
+        test_context("session-granularity"),
+    )
+    .await
+    .expect("write week memory should succeed");
+    tool.invoke(
+        json!({
+            "action": "write",
+            "scope": "project",
+            "type": "project",
+            "title": "Long-term architecture direction",
+            "content": "Move to a modular workspace layout over the year.",
+            "project_key": "proj-1",
+            "granularity": "year"
+        }),
+        test_context("session-granularity"),
+    )
+    .await
+    .expect("write year memory should succeed");
+
+    let out = tool
+        .invoke(
+            json!({
+                "action": "query",
+                "scope": "project",
+                "project_key": "proj-1",
+                "filters": {"granularity": ["week"]}
+            }),
+            test_context("session-granularity"),
+        )
+        .await
+        .expect("filtered query should succeed");
+    let ToolOutcome::Completed(result) = out else {
+        panic!("expected Completed")
+    };
+    let value: serde_json::Value = serde_json::from_str(&result.result).expect("valid json");
+    let items = value["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "only the week-granularity memory matches");
+    assert_eq!(items[0]["title"], "This week's sprint priorities");
+
+    // A `filters` object that sets ONLY `granularity` (leaving `type`/`status` at
+    // their empty defaults) must not accidentally filter by the absent fields too
+    // — regression guard for a bug this test caught during development, where
+    // `filter_types`/`filter_statuses` became `Some(<empty set>)` (matching
+    // nothing) whenever `filters` was present at all, regardless of whether their
+    // own sub-lists were populated.
+    assert_eq!(value["data"]["matched_count"], 1);
+
+    // Absent filter = old behavior: both memories are returned.
+    let out = tool
+        .invoke(
+            json!({
+                "action": "query",
+                "scope": "project",
+                "project_key": "proj-1"
+            }),
+            test_context("session-granularity"),
+        )
+        .await
+        .expect("unfiltered query should succeed");
+    let ToolOutcome::Completed(result) = out else {
+        panic!("expected Completed")
+    };
+    let value: serde_json::Value = serde_json::from_str(&result.result).expect("valid json");
+    assert_eq!(value["data"]["matched_count"], 2);
+}
