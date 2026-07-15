@@ -80,16 +80,32 @@ pub trait Deployer: Send + Sync {
 
 /// A handle to a deployment that is NOT a local child process (e.g. a remote
 /// worker reached over an in-process `russh` session). Owning this keeps the
-/// remote alive; `shutdown` tears it down (kill the remote process + close the
-/// connection/tunnel).
+/// remote alive; `shutdown`/`shutdown_with_timeout` tear it down (kill the
+/// remote process + close the connection/tunnel).
 #[async_trait]
 pub trait RemoteDeployment: Send + Sync {
     /// Remote OS pid of the launched worker, if the deployer captured one.
     fn remote_pid(&self) -> Option<u32> {
         None
     }
-    /// Tear down the remote worker and release the connection/tunnel.
-    async fn shutdown(&self);
+
+    /// Tear down the remote worker and release the connection/tunnel, using
+    /// [`DEFAULT_GRACEFUL_STOP_TIMEOUT`] as the grace window. See
+    /// [`Self::shutdown_with_timeout`].
+    async fn shutdown(&self) {
+        self.shutdown_with_timeout(DEFAULT_GRACEFUL_STOP_TIMEOUT)
+            .await;
+    }
+
+    /// Tear down the remote worker with an explicit grace window: signal the
+    /// worker to stop and poll for it to exit on its own — keeping the SSH
+    /// session (and therefore the reverse tunnel the worker drains its
+    /// in-flight Ask/Task/Run through) alive the whole time — before falling
+    /// back to a hard kill and only THEN closing the connection/tunnel. #489
+    /// (follow-up to #49/#488: the local-process path already does this via
+    /// [`DeployedAgent::shutdown_with_timeout`]; this is the remote-path
+    /// parity fix).
+    async fn shutdown_with_timeout(&self, timeout: Duration);
 }
 
 /// A running deployment. Killed on drop (`kill_on_drop`); `shutdown` also runs
@@ -156,9 +172,11 @@ impl DeployedAgent {
     /// falling back to a hard `SIGKILL` (`Child::start_kill`). A worker with no
     /// signal handler (e.g. an old binary) or one that's genuinely wedged still
     /// gets killed once `timeout` elapses, so `action=stop` is always bounded.
-    /// Remote deployments delegate to [`RemoteDeployment::shutdown`] unchanged
-    /// (out of scope for #49 — see the issue's evidence, which is specific to
-    /// the local-process `start_kill()` path). #49.
+    /// Remote deployments delegate to
+    /// [`RemoteDeployment::shutdown_with_timeout`] with the same `timeout`,
+    /// so a remotely-deployed worker gets the identical bounded-grace
+    /// treatment — SSH session and reverse tunnel stay up until the worker
+    /// exits or the window elapses (#489, closing the gap #49 left open).
     pub async fn shutdown_with_timeout(self, timeout: Duration) {
         match self.inner {
             DeployedInner::Process { mut child, cleanup } => {
@@ -194,7 +212,7 @@ impl DeployedAgent {
                     }
                 }
             }
-            DeployedInner::Remote(h) => h.shutdown().await,
+            DeployedInner::Remote(h) => h.shutdown_with_timeout(timeout).await,
         }
     }
 }
