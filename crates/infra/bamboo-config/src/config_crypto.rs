@@ -614,4 +614,27 @@ impl Config {
         restore_env_key!(anthropic);
         restore_env_key!(gemini);
     }
+
+    /// Re-encrypt every secret domain's `*_encrypted` field from current
+    /// in-memory plaintext, without the disk-only sanitization steps.
+    ///
+    /// `Config::save_to_dir` runs these refreshes on a save-time clone, so the
+    /// live in-memory config never sees the resulting ciphertext: a provider
+    /// instance created over HTTP keeps `api_key_encrypted: None` in memory for
+    /// the rest of the session. Any code that then serializes the live config
+    /// and deserializes it back — the settings-PATCH merge in
+    /// `config_manager::build_merged_config` — drops the
+    /// `#[serde(skip_serializing)]` plaintext and is left with neither field,
+    /// permanently losing the key on the next persist (#516). Call this after
+    /// mutating the live config so ciphertext stays in sync with plaintext.
+    pub fn refresh_encrypted_secrets(&mut self) -> Result<()> {
+        self.refresh_proxy_auth_encrypted()?;
+        self.refresh_provider_api_keys_encrypted()?;
+        self.refresh_provider_instance_api_keys_encrypted()?;
+        self.refresh_env_vars_encrypted()?;
+        self.refresh_cluster_fabric_encrypted()?;
+        self.refresh_notifications_encrypted()?;
+        self.refresh_connect_platform_tokens_encrypted()?;
+        Ok(())
+    }
 }
