@@ -413,31 +413,35 @@ pub fn preserve_masked_notification_secrets(patch_obj: &mut Map<String, Value>, 
 /// the current config's plaintext values.
 ///
 /// Mirrors [`preserve_masked_notification_secrets`]. `connect.platforms` is a
-/// list (not a single object like ntfy/bark), so entries are matched
-/// POSITIONALLY: patch index `i` is resolved against `current.connect.platforms[i]`.
-/// This mirrors how the settings UI round-trips the list (it always sends the
-/// full array back in the same order it was fetched in — the same convention
-/// `env_vars`' full-array replace relies on) — reordering platforms in the
-/// same request as leaving a token masked is not supported and drops that
-/// entry's token, same as no plaintext being configured yet.
+/// list (not a single object like ntfy/bark), so each patch entry is resolved
+/// against a `current.connect.platforms` entry via three strategies, tried in
+/// order:
 ///
-/// Known limitation (issue #454 follow-up), still present: there is no
-/// stable per-entry id, so reordering two entries of the SAME
-/// `platform_type` (e.g. two `"telegram"` entries, once multi-bot is
-/// supported) at the same time as leaving one masked is indistinguishable
-/// from "not reordered" and can still attach the wrong token to an entry —
-/// fixing that needs a schema change (a stable id field) tracked separately.
-/// What IS fixed here: a reorder is detected whenever it changes the
-/// `platform_type` at a given index — `type` is checked against `current`'s
-/// entry at the same index, and a mismatch (or an index beyond
-/// `current.connect.platforms`, e.g. a preceding entry was removed) no
-/// longer drops the secret outright. Instead (issue #490) it falls back to a
-/// type-based lookup: `current.connect.platforms.iter().find(|p|
-/// p.platform_type == patch_type)`. This is safe because `multi_bot_guard`
-/// (#462) means only the FIRST entry of a given type is ever started, so
-/// resolving to any same-typed entry is strictly better than silently
-/// wiping the secret. Only when no entry of that type exists anywhere in
-/// `current` does the mask get dropped, same as "nothing configured yet".
+/// 1. **Id match (#496)** — if the patch entry carries an `id` and some entry
+///    in `current` has the same [`crate::ConnectPlatformConfig::id`], that
+///    entry is authoritative, full stop. A stable server-assigned id
+///    unambiguously identifies the same logical platform regardless of
+///    position or `platform_type` — this is the only strategy that correctly
+///    disambiguates two entries that share the same `platform_type` and have
+///    been reordered relative to each other (the scenario #490/#492's
+///    type+positional fallback cannot fully resolve; see the regression test
+///    `preserve_masked_connect_secrets_resolves_duplicate_type_by_id_even_when_reordered`
+///    below). Legacy entries without an id (or a patch from a client that
+///    doesn't echo it back) simply fall through to strategy 2.
+/// 2. **Positional + type guard** — patch index `i` is resolved against
+///    `current.connect.platforms[i]`, guarded by `type` equality at that
+///    index. This mirrors how the settings UI round-trips the list (it
+///    always sends the full array back in the same order it was fetched in
+///    — the same convention `env_vars`' full-array replace relies on).
+/// 3. **Type-based fallback (#490)** — when the positional entry's type
+///    disagrees with the patch entry's `type` (or the patch index is beyond
+///    `current.connect.platforms`), fall back to
+///    `current.connect.platforms.iter().find(|p| p.platform_type == patch_type)`.
+///    This is safe because `multi_bot_guard` (#462) means only the FIRST
+///    entry of a given type is ever started, so resolving to any same-typed
+///    entry is strictly better than silently wiping the secret. Only when no
+///    entry of that type exists anywhere in `current` does the mask get
+///    dropped, same as "nothing configured yet".
 pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, current: &Config) {
     let Some(platforms) = patch_obj
         .get_mut("connect")
@@ -452,6 +456,23 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
             continue;
         };
         let patch_type = obj.get("type").and_then(|v| v.as_str());
+        let patch_id = obj.get("id").and_then(|v| v.as_str());
+
+        // Strategy 1 (#496): an id match is authoritative and unambiguous —
+        // it doesn't need (and isn't guarded by) a type/position check,
+        // since a server-assigned id already uniquely identifies one entry.
+        let by_id = patch_id.and_then(|patch_id| {
+            current
+                .connect
+                .platforms
+                .iter()
+                .find(|p| p.id.as_deref() == Some(patch_id))
+        });
+
+        // Strategies 2/3 (#490/#492): positional + type guard, falling back
+        // to a type-only lookup — unchanged, and only consulted when there
+        // was no id (or the id didn't match anything in `current`, e.g. a
+        // stale id echoed after the entry was removed).
         let existing = current.connect.platforms.get(index);
         // A patch entry that names a "type" disagreeing with `current`'s
         // entry at the same index (or an index beyond `current`'s array)
@@ -462,20 +483,22 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
         // which always echoes the whole object back) can't be checked and
         // falls back to the pre-existing positional-only behavior (no
         // type-based fallback either, since there's no type to search by).
-        let guarded = existing
-            .filter(|p| match patch_type {
-                Some(patch_type) => patch_type == p.platform_type,
-                None => true,
-            })
-            .or_else(|| {
-                patch_type.and_then(|patch_type| {
-                    current
-                        .connect
-                        .platforms
-                        .iter()
-                        .find(|p| p.platform_type == patch_type)
+        let guarded = by_id.or_else(|| {
+            existing
+                .filter(|p| match patch_type {
+                    Some(patch_type) => patch_type == p.platform_type,
+                    None => true,
                 })
-            });
+                .or_else(|| {
+                    patch_type.and_then(|patch_type| {
+                        current
+                            .connect
+                            .platforms
+                            .iter()
+                            .find(|p| p.platform_type == patch_type)
+                    })
+                })
+        });
         preserve_masked_secret_field(obj, "token", guarded.and_then(|p| p.token.as_deref()));
         preserve_masked_secret_field(
             obj,
@@ -685,6 +708,7 @@ mod tests {
 
     fn connect_platform(platform_type: &str, token: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
+            id: None,
             platform_type: platform_type.to_string(),
             token: Some(token.to_string()),
             token_encrypted: None,
@@ -694,6 +718,17 @@ mod tests {
             domain: None,
             allow_from: Vec::new(),
             admin_from: Vec::new(),
+        }
+    }
+
+    fn connect_platform_with_id(
+        id: &str,
+        platform_type: &str,
+        token: &str,
+    ) -> crate::ConnectPlatformConfig {
+        crate::ConnectPlatformConfig {
+            id: Some(id.to_string()),
+            ..connect_platform(platform_type, token)
         }
     }
 
@@ -901,8 +936,99 @@ mod tests {
         );
     }
 
+    /// #496 — the exact scenario the issue is about: two entries share the
+    /// same `platform_type` ("telegram") AND have been reordered, so the
+    /// type+positional guard alone can't tell they were swapped (the type at
+    /// each index still matches "telegram" either way). Without an id, this
+    /// class of reorder can attach the wrong sibling's secret. With a
+    /// server-assigned id present on both, resolution is unambiguous
+    /// regardless of position.
+    #[test]
+    fn preserve_masked_connect_secrets_resolves_duplicate_type_by_id_even_when_reordered() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform_with_id("id-a", "telegram", "bot-a-token"),
+            connect_platform_with_id("id-b", "telegram", "bot-b-token"),
+        ];
+
+        // The client echoes the array back SWAPPED: id-b now at index 0,
+        // id-a now at index 1. Positional+type resolution alone would
+        // (wrongly) resolve index 0 against current[0] (id-a's token) since
+        // both are "telegram" — the id lets us catch the swap.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[
+                {"id":"id-b","type":"telegram","token":"****...****"},
+                {"id":"id-a","type":"telegram","token":"****...****"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"], "bot-b-token",
+            "index 0 (id-b) must resolve to id-b's own token, not the positionally-co-located id-a"
+        );
+        assert_eq!(
+            patch["connect"]["platforms"][1]["token"], "bot-a-token",
+            "index 1 (id-a) must resolve to id-a's own token"
+        );
+    }
+
+    /// A patch entry whose `id` doesn't match anything in `current` (e.g. a
+    /// brand-new entry a client invented an id for, or a stale id echoed
+    /// after the entry was removed) falls through to the existing
+    /// positional/type-based resolution rather than treating the mismatch
+    /// as fatal.
+    #[test]
+    fn preserve_masked_connect_secrets_falls_back_when_id_not_found_in_current() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform("telegram", "existing-bot-token")];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"id":"unknown-id","type":"telegram","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"], "existing-bot-token",
+            "an id absent from `current` falls back to the positional+type guard"
+        );
+    }
+
+    /// Back-compat: a patch entry with no "id" field at all (legacy client,
+    /// or an entry created before ids existed) is unaffected by the new
+    /// id-matching branch and goes straight to the existing
+    /// positional/type-based resolution — exercised here with `current`
+    /// entries that DO have ids (post-migration) to prove the id branch is
+    /// skipped cleanly rather than erroring on the missing field.
+    #[test]
+    fn preserve_masked_connect_secrets_ignores_id_branch_when_patch_omits_id() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform_with_id(
+            "id-a",
+            "telegram",
+            "existing-bot-token",
+        )];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"type":"telegram","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"],
+            "existing-bot-token"
+        );
+    }
+
     fn feishu_platform(app_secret: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
+            id: None,
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,

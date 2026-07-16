@@ -716,6 +716,21 @@ pub struct NotificationsConfig {
 /// external chat platform (Telegram first).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectPlatformConfig {
+    /// Stable per-entry identifier (#496). Not part of the original schema —
+    /// absent on legacy/hand-written entries and on a freshly-echoed new
+    /// entry from a client. [`Config::save_to_dir`] assigns one (a random
+    /// UUID) to any entry that lacks it as part of the normal save path
+    /// (migration-on-write); load never mutates/rewrites the config to
+    /// backfill it, per #493's never-overwrite-until-confirmed semantics.
+    ///
+    /// Used by [`crate::patch::preserve_masked_connect_secrets`] as the
+    /// FIRST resolution strategy for a masked secret in a settings PATCH,
+    /// ahead of the positional/`type`-based fallbacks (#490/#492) — an exact
+    /// id match unambiguously identifies the same logical entry even when
+    /// two entries share the same `platform_type` and have been reordered,
+    /// which position+type alone cannot always disambiguate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Platform adapter selector, e.g. `"telegram"`. Unrecognized values are
     /// skipped (with a startup warning) rather than failing config load —
     /// forward-compatible with future adapters (Feishu/Slack).
@@ -2964,6 +2979,29 @@ impl Config {
         Ok(())
     }
 
+    /// Assign a stable [`ConnectPlatformConfig::id`] to every `connect.platforms`
+    /// entry that doesn't already have one (#496).
+    ///
+    /// Migration-on-write: [`Config::save_to_dir`] always calls this on its
+    /// internal save-copy before persisting, so every path that writes
+    /// `connect.json` gets ids backfilled. Callers that mutate the *live*
+    /// in-memory config as part of a save (e.g. the server's settings-PATCH
+    /// handler) should also call this directly on that in-memory value
+    /// before responding, so a client that echoes the response straight
+    /// back round-trips the id immediately rather than only after the next
+    /// reload/restart. Never called from load — a config that's never saved
+    /// again (e.g. one sitting in an unconfirmed-recovery state, see #493)
+    /// is never rewritten just to backfill ids. An entry that already has
+    /// an id keeps it unchanged; ids are never reassigned or deduplicated
+    /// once set.
+    pub fn assign_connect_platform_ids(&mut self) {
+        for platform in &mut self.connect.platforms {
+            if platform.id.is_none() {
+                platform.id = Some(uuid::Uuid::new_v4().to_string());
+            }
+        }
+    }
+
     /// Save configuration to disk under the provided data directory.
     ///
     /// Configuration is always stored as `{data_dir}/config.json`.
@@ -3007,6 +3045,7 @@ impl Config {
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.refresh_notifications_encrypted()?;
+        to_save.assign_connect_platform_ids();
         to_save.refresh_connect_platform_tokens_encrypted()?;
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
@@ -4437,6 +4476,7 @@ mod tests {
         token_encrypted: &str,
     ) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
+            id: None,
             platform_type: platform_type.to_string(),
             token: None,
             token_encrypted: Some(token_encrypted.to_string()),
@@ -4487,6 +4527,118 @@ mod tests {
         assert!(
             connect_json["platforms"][0].get("token").is_none(),
             "the plaintext token is never persisted (skip_serializing)"
+        );
+    }
+
+    // ── stable connect.platforms id (#496) ───────────────────────────────
+
+    #[test]
+    fn save_assigns_a_missing_connect_platform_id() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![connect_platform_with_encrypted("telegram", "cipher")];
+        assert!(
+            config.connect.platforms[0].id.is_none(),
+            "precondition: the entry starts without an id"
+        );
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        let persisted_id = connect_json["platforms"][0]["id"]
+            .as_str()
+            .expect("save_to_dir must backfill a missing id onto the persisted entry");
+        assert!(!persisted_id.is_empty());
+
+        let reloaded = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert_eq!(
+            reloaded.connect.platforms[0].id.as_deref(),
+            Some(persisted_id),
+            "the assigned id round-trips through a reload"
+        );
+    }
+
+    #[test]
+    fn save_never_reassigns_an_existing_connect_platform_id() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        let mut platform = connect_platform_with_encrypted("telegram", "cipher");
+        platform.id = Some("stable-id-123".to_string());
+        config.connect.platforms = vec![platform];
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("first save succeeds");
+        // Save again (e.g. an unrelated settings change) — the id must not change.
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("second save succeeds");
+
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        assert_eq!(connect_json["platforms"][0]["id"], "stable-id-123");
+    }
+
+    #[test]
+    fn save_assigns_distinct_ids_to_duplicate_platform_type_entries() {
+        let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
+        let temp = TempHome::new();
+
+        let mut config = Config::create_default();
+        config.connect.platforms = vec![
+            connect_platform_with_encrypted("telegram", "cipher-a"),
+            connect_platform_with_encrypted("telegram", "cipher-b"),
+        ];
+
+        config
+            .save_to_dir(temp.path.clone())
+            .expect("save succeeds");
+
+        let connect_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
+                .unwrap();
+        let id_a = connect_json["platforms"][0]["id"].as_str().unwrap();
+        let id_b = connect_json["platforms"][1]["id"].as_str().unwrap();
+        assert_ne!(
+            id_a, id_b,
+            "two entries sharing platform_type must still get distinct ids"
+        );
+    }
+
+    #[test]
+    fn load_never_assigns_or_persists_an_id_by_itself() {
+        let temp = TempHome::new();
+        std::fs::write(
+            connect_json_path(&temp),
+            serde_json::json!({
+                "platforms": [
+                    { "type": "telegram", "token_encrypted": "cipher-abc", "allow_from": ["u1"] }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let connect_json_before = std::fs::read_to_string(connect_json_path(&temp)).unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        assert!(
+            config.connect.platforms[0].id.is_none(),
+            "load alone must not backfill an id in memory"
+        );
+        let connect_json_after = std::fs::read_to_string(connect_json_path(&temp)).unwrap();
+        assert_eq!(
+            connect_json_before, connect_json_after,
+            "load must never rewrite connect.json on disk just to backfill an id (#493)"
         );
     }
 
@@ -4831,6 +4983,7 @@ mod tests {
 
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
+            id: None,
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
@@ -4871,6 +5024,7 @@ mod tests {
 
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
+            id: None,
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
