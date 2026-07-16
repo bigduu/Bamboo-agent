@@ -1303,27 +1303,29 @@ mod tests {
     #[tokio::test]
     async fn concurrent_proxy_calls_overlap_at_the_orchestrator() {
         // Prove overlap DIRECTLY (issue #486) instead of inferring it from
-        // wall-clock duration: earlier this asserted `elapsed < N ms`
-        // against a `sleep(200ms)` backend, which raced CI load — a loaded
-        // runner can push even genuinely-concurrent calls past any fixed
-        // real-ms bound, producing a one-off failure with no code
-        // regression. (A `tokio::time::pause()` virtual-clock variant was
-        // tried and discarded: it doesn't compose safely with this test's
-        // REAL TCP/WebSocket IO — auto-advance raced the broker
-        // connect/handshake against the proxy's timeout-and-reconnect path,
-        // spuriously triggering reconnect/backoff and making the measured
-        // "elapsed" worse, not more deterministic.)
+        // wall-clock duration: this originally asserted `elapsed < N ms`
+        // against a `sleep(200ms)` backend, which raced CI load. Then #502
+        // switched to a high-water-mark (`fetch_max` of instantaneous
+        // `in_flight`), which is deterministic in the "genuinely serial"
+        // direction but still racy in the "CPU-starved" direction: under
+        // extreme scheduler pressure the 4 spawned calls might never all
+        // actually be polled at once, so the observed high-water mark can
+        // top out below 4 even though the orchestrator itself doesn't
+        // serialize anything — a false failure with no code regression.
         //
-        // Instead, `SlowMcp` tracks its own instantaneous concurrency: bump
-        // `in_flight` before the (still real, still 200ms — exercising the
-        // exact same overlap window) sleep, record the high-water mark via
-        // `fetch_max`, then decrement after. Serial handling could never
-        // observe more than 1 in flight at a time; genuine overlap of the 4
-        // spawned calls must observe all 4 at some point. Zero dependency on
-        // how fast or slow the host happens to be.
+        // Fix: force the rendezvous instead of hoping for it. `SlowMcp`
+        // bumps `in_flight`/`max_in_flight` and then blocks each call on a
+        // `Barrier` sized for all 4 concurrent calls — nobody proceeds until
+        // all 4 have arrived. That makes `max_in_flight == 4` deterministic
+        // regardless of how loaded the host is. If the orchestrator ever
+        // regresses to serializing these calls, only 1 of the 4 barrier
+        // parties will ever arrive and the wait deadlocks — bounded by the
+        // outer `tokio::time::timeout` below, which turns that regression
+        // into a clear, fast test failure instead of a hang.
         struct SlowMcp {
             in_flight: AtomicU32,
             max_in_flight: AtomicU32,
+            rendezvous: tokio::sync::Barrier,
         }
         #[async_trait]
         impl ToolExecutor for SlowMcp {
@@ -1331,7 +1333,11 @@ mod tests {
                 let now_in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_in_flight
                     .fetch_max(now_in_flight, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Forced rendezvous: block until all 4 concurrent calls have
+                // arrived here. This is what makes the overlap deterministic
+                // rather than probabilistic.
+                self.rendezvous.wait().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 Ok(ToolResult {
                     success: true,
@@ -1358,9 +1364,11 @@ mod tests {
                 }]
             }
         }
+        const N: u32 = 4;
         let slow_mcp = Arc::new(SlowMcp {
             in_flight: AtomicU32::new(0),
             max_in_flight: AtomicU32::new(0),
+            rendezvous: tokio::sync::Barrier::new(N as usize),
         });
 
         let dir = tempfile::tempdir().unwrap();
@@ -1402,10 +1410,11 @@ mod tests {
             .expect("proxy connects"),
         );
 
-        // 4 concurrent 200ms calls; `SlowMcp::max_in_flight` records the
-        // high-water mark of calls it observed simultaneously in progress.
+        // N concurrent 50ms calls, forced to rendezvous inside `SlowMcp`;
+        // `max_in_flight` records the high-water mark of calls it observed
+        // simultaneously in progress.
         let mut handles = Vec::new();
-        for i in 0..4u32 {
+        for i in 0..N {
             let p = proxy.clone();
             handles.push(tokio::spawn(async move {
                 let call = ToolCall {
@@ -1419,13 +1428,21 @@ mod tests {
                 p.execute(&call).await.expect("returns")
             }));
         }
-        for h in handles {
-            h.await.unwrap();
-        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for h in handles {
+                h.await.unwrap();
+            }
+        })
+        .await
+        .expect(
+            "timed out waiting for the 4 concurrent proxy calls to complete — this means \
+             the orchestrator is serializing them (only some of the 4 ever reached the \
+             rendezvous barrier), which is the regression this test guards against",
+        );
         let max_in_flight = slow_mcp.max_in_flight.load(Ordering::SeqCst);
         assert_eq!(
-            max_in_flight, 4,
-            "4 concurrent proxy calls must OVERLAP at the orchestrator (serial handling \
+            max_in_flight, N,
+            "{N} concurrent proxy calls must OVERLAP at the orchestrator (serial handling \
              could never observe more than 1 in flight at once); observed max_in_flight = \
              {max_in_flight}"
         );
