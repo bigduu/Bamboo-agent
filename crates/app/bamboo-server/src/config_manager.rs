@@ -163,6 +163,10 @@ pub fn build_merged_config(
     // key (no ciphertext, #253) would be silently blanked by any settings PATCH.
     // Copy env-sourced keys back from the live `current` config. #373.
     new_config.preserve_env_sourced_provider_keys(current);
+    // Defense-in-depth: restore a provider instance's ciphertext (and
+    // re-hydrate its plaintext) if it came out of the merge+hydrate above
+    // with neither field, while `current` still has the ciphertext. #515.
+    new_config.preserve_provider_instance_encrypted_keys(current);
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
     new_config.normalize_plugin_trust_settings();
@@ -256,4 +260,67 @@ mod tests {
         assert!(openai.api_key_from_env);
         assert!(openai.api_key_encrypted.is_none(), "still not persisted");
     }
+
+    fn instance_config(api_key: &str) -> Config {
+        let mut instance: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({ "provider_type": "openai" })).unwrap();
+        instance.api_key = api_key.to_string();
+        let mut config = Config::default();
+        config
+            .provider_instances
+            .insert("inst-1".to_string(), instance);
+        config
+            .refresh_provider_instance_api_keys_encrypted()
+            .expect("encrypt");
+        config
+    }
+
+    // #515: an unrelated settings-save PATCH (one that never mentions
+    // `provider_instances` at all) must not wipe an instance's ciphertext —
+    // full pipeline (build_merged_config + sync_provider_api_keys_encrypted_for_patch),
+    // as exercised by set_bamboo_config.
+    #[test]
+    fn unrelated_patch_preserves_provider_instance_ciphertext() {
+        let current = instance_config("sk-instance-secret");
+        let prev_ciphertext = current.provider_instances["inst-1"]
+            .api_key_encrypted
+            .clone()
+            .expect("current should have ciphertext");
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"http_proxy":"http://example.invalid:8080"}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(intents.provider_instances.is_empty());
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = &merged.provider_instances["inst-1"];
+        assert_eq!(
+            instance.api_key, "sk-instance-secret",
+            "plaintext must survive an unrelated save"
+        );
+        assert_eq!(
+            instance.api_key_encrypted.as_deref(),
+            Some(prev_ciphertext.as_str()),
+            "ciphertext must survive an unrelated save"
+        );
+    }
+
+    // NOTE: an end-to-end "explicit `api_key: ''` clear actually clears a
+    // provider-instance key that already has stored ciphertext" test is
+    // deliberately NOT included here. Investigating #515's clear-semantics
+    // caveat surfaced a SEPARATE, pre-existing bug (present before this patch,
+    // and equally reproducible for legacy `providers.*`, not just
+    // `provider_instances`): `build_merged_config` unconditionally calls
+    // `hydrate_*_from_encrypted` after the merge, which resurrects the
+    // plaintext from ciphertext for ANY empty `api_key` — including one that's
+    // empty because the patch explicitly cleared it. By the time
+    // `sync_provider_api_keys_encrypted_for_patch` runs, the resurrected
+    // (non-empty) plaintext looks like "still has a key", so it re-encrypts
+    // the OLD value instead of clearing it. Fixing that needs
+    // `ProviderApiKeyIntents` (or an equivalent) to carry the original patch
+    // value through to `build_merged_config` so hydration can skip entries
+    // the patch explicitly touched — a distinct change from #515's fix, out
+    // of scope here. Filed as a follow-up issue; see PR description.
 }

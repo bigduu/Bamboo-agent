@@ -5281,6 +5281,125 @@ mod tests {
         );
     }
 
+    fn provider_instance(api_key: &str, api_key_encrypted: Option<&str>) -> ProviderInstanceConfig {
+        // Build via deserialize (not a struct literal) so this test doesn't need
+        // updating every time a field is added to ProviderInstanceConfig.
+        let mut value = serde_json::json!({ "provider_type": "openai" });
+        if !api_key.is_empty() {
+            value["api_key"] = serde_json::Value::String(api_key.to_string());
+        }
+        if let Some(enc) = api_key_encrypted {
+            value["api_key_encrypted"] = serde_json::Value::String(enc.to_string());
+        }
+        serde_json::from_value(value).expect("provider instance should deserialize")
+    }
+
+    // #515: when a provider instance comes out of a merge with neither a
+    // plaintext `api_key` nor `api_key_encrypted`, but the previous (live)
+    // config still holds the ciphertext, it must be restored rather than
+    // silently wiped.
+    #[test]
+    fn preserve_provider_instance_encrypted_keys_restores_dropped_ciphertext() {
+        let mut previous = Config::default();
+        let mut prev_instance = provider_instance("", None);
+        prev_instance.api_key_encrypted = None;
+        previous
+            .provider_instances
+            .insert("inst-1".to_string(), prev_instance);
+        // Give `previous` a real, encrypted key.
+        previous
+            .provider_instances
+            .get_mut("inst-1")
+            .unwrap()
+            .api_key = "sk-instance-secret".to_string();
+        previous
+            .refresh_provider_instance_api_keys_encrypted()
+            .expect("encrypt");
+        let prev_ciphertext = previous.provider_instances["inst-1"]
+            .api_key_encrypted
+            .clone()
+            .expect("previous should have ciphertext");
+
+        // Simulate the post-merge+hydrate state: neither field survived.
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("inst-1".to_string(), provider_instance("", None));
+
+        merged.preserve_provider_instance_encrypted_keys(&previous);
+
+        let restored = &merged.provider_instances["inst-1"];
+        assert_eq!(
+            restored.api_key_encrypted.as_deref(),
+            Some(prev_ciphertext.as_str()),
+            "ciphertext must be restored from the previous config"
+        );
+        assert_eq!(
+            restored.api_key, "sk-instance-secret",
+            "plaintext must be re-hydrated from the restored ciphertext"
+        );
+    }
+
+    // An explicit clear (`api_key: ""` from the client) never reaches the
+    // carry-forward: `previous`'s ciphertext survives the merge unchanged
+    // (clients can't patch `api_key_encrypted` directly), so `merged` already
+    // has `api_key_encrypted` set — the "neither field present" guard must
+    // stay false and the clear must NOT be fought.
+    #[test]
+    fn preserve_provider_instance_encrypted_keys_does_not_fight_an_explicit_clear() {
+        let mut previous = Config::default();
+        previous
+            .provider_instances
+            .insert("inst-1".to_string(), provider_instance("sk-old", None));
+        previous
+            .refresh_provider_instance_api_keys_encrypted()
+            .expect("encrypt");
+
+        // Merged already reflects an explicit clear: ciphertext survived the
+        // merge (it's still `previous`'s), but the client's `api_key: ""`
+        // patch is the plaintext value here — mirroring the shape
+        // `build_merged_config` would actually produce before hydrate runs.
+        let mut merged = Config::default();
+        let mut cleared = provider_instance("", None);
+        cleared.api_key_encrypted = previous.provider_instances["inst-1"]
+            .api_key_encrypted
+            .clone();
+        merged
+            .provider_instances
+            .insert("inst-1".to_string(), cleared);
+
+        merged.preserve_provider_instance_encrypted_keys(&previous);
+
+        // Not touched by this pass — a real clear is handled by the intents-based
+        // sync in `sync_provider_api_keys_encrypted_for_patch`, not here.
+        assert_eq!(
+            merged.provider_instances["inst-1"].api_key_encrypted,
+            previous.provider_instances["inst-1"].api_key_encrypted,
+            "carry-forward must not touch an instance whose ciphertext already survived the merge"
+        );
+    }
+
+    // Nothing to carry forward if `previous` never had ciphertext either
+    // (e.g. the instance genuinely has no key) — must stay empty, not error.
+    #[test]
+    fn preserve_provider_instance_encrypted_keys_noop_when_previous_has_nothing() {
+        let mut previous = Config::default();
+        previous
+            .provider_instances
+            .insert("inst-1".to_string(), provider_instance("", None));
+
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("inst-1".to_string(), provider_instance("", None));
+
+        merged.preserve_provider_instance_encrypted_keys(&previous);
+
+        let instance = &merged.provider_instances["inst-1"];
+        assert!(instance.api_key.is_empty());
+        assert!(instance.api_key_encrypted.is_none());
+    }
+
     #[test]
     fn get_memory_background_model_falls_back_to_provider_fast_model() {
         let mut config = Config::default();

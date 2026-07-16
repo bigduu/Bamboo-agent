@@ -352,6 +352,21 @@ pub async fn create_provider_instance(
                 if should_set_default {
                     config.default_provider_instance = Some(instance_id.clone());
                 }
+                // Mirror the ciphertext this create will persist to disk back
+                // onto the LIVE in-memory config. Without this, `save_to_dir`
+                // only encrypts a disposable clone it builds internally, so
+                // `api_key_encrypted` stays `None` in memory even though disk
+                // has it — a later unrelated settings save (whose serde
+                // round-trip drops the skip_serializing plaintext `api_key`)
+                // would then persist neither field, wiping the ciphertext
+                // that's already on disk. #515.
+                config
+                    .refresh_provider_instance_api_keys_encrypted()
+                    .map_err(|e| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "Failed to encrypt provider instance api_key: {e}"
+                        ))
+                    })?;
                 Ok(())
             },
             ConfigUpdateEffects {
@@ -403,6 +418,16 @@ pub async fn update_provider_instance(
                 config
                     .provider_instances
                     .insert(instance_id.clone(), updated);
+                // See the matching comment in `create_provider_instance`: keep
+                // the live in-memory ciphertext in sync with what gets
+                // persisted to disk. #515.
+                config
+                    .refresh_provider_instance_api_keys_encrypted()
+                    .map_err(|e| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "Failed to encrypt provider instance api_key: {e}"
+                        ))
+                    })?;
                 Ok(())
             },
             ConfigUpdateEffects {
@@ -527,5 +552,122 @@ mod tests {
         let instance = build_instance_from_create(&create_request("****...****sk-new"))
             .expect("mixed value is not a placeholder");
         assert_eq!(instance.api_key, "****...****sk-new");
+    }
+
+    // #515: creating a provider instance persists `api_key_encrypted` to disk
+    // but (pre-fix) left the LIVE in-memory config's copy at `None`. A later,
+    // completely unrelated settings save (build_merged_config's serde
+    // round-trip drops the `#[serde(skip_serializing)]` plaintext `api_key`)
+    // then persisted neither field, wiping the ciphertext that was already on
+    // disk. This must survive in the same process, without any reload.
+    #[tokio::test]
+    async fn settings_save_does_not_wipe_instance_encrypted_key_same_session() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        let app_state = web::Data::new(state);
+
+        let create_resp = create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-instance-secret")),
+        )
+        .await
+        .expect("create should succeed");
+        assert_eq!(create_resp.status(), actix_web::http::StatusCode::CREATED);
+
+        // A settings save that does not mention `provider_instances` at all.
+        let save_payload: Value =
+            serde_json::json!({ "http_proxy": "http://example.invalid:8080" });
+        crate::handlers::settings::set_bamboo_config(app_state.clone(), web::Json(save_payload))
+            .await
+            .expect("unrelated settings save should succeed");
+
+        let config_path = temp_dir.path().join("config.json");
+        let raw = std::fs::read_to_string(&config_path).expect("config.json should exist");
+        let on_disk: Value = serde_json::from_str(&raw).expect("config.json should be valid JSON");
+        let instances = on_disk
+            .get("provider_instances")
+            .and_then(|v| v.as_object())
+            .expect("provider_instances should be present on disk");
+        assert_eq!(instances.len(), 1, "exactly one instance was created");
+        let (_id, instance) = instances.iter().next().expect("instance present");
+        let encrypted = instance
+            .get("api_key_encrypted")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            !encrypted.is_empty(),
+            "api_key_encrypted must survive an unrelated settings save, got: {:?}",
+            instance
+        );
+    }
+
+    // Same as above but through the update path: an update that never touches
+    // `config` (so `api_key` isn't in the patch at all) must also keep the
+    // live in-memory ciphertext in sync, so a later unrelated settings save
+    // doesn't wipe it either.
+    #[tokio::test]
+    async fn settings_save_does_not_wipe_instance_encrypted_key_after_update_same_session() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        let app_state = web::Data::new(state);
+
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-instance-secret")),
+        )
+        .await
+        .expect("create should succeed");
+
+        let instance_id = {
+            let config = app_state.config.read().await;
+            config
+                .provider_instances
+                .keys()
+                .next()
+                .cloned()
+                .expect("instance exists")
+        };
+
+        let update_payload = UpdateInstanceRequest {
+            label: Some("Renamed".to_string()),
+            enabled: None,
+            config: None,
+        };
+        update_provider_instance(
+            app_state.clone(),
+            web::Path::from(instance_id.clone()),
+            web::Json(update_payload),
+        )
+        .await
+        .expect("update should succeed");
+
+        let save_payload: Value =
+            serde_json::json!({ "http_proxy": "http://example.invalid:9090" });
+        crate::handlers::settings::set_bamboo_config(app_state.clone(), web::Json(save_payload))
+            .await
+            .expect("unrelated settings save should succeed");
+
+        let config_path = temp_dir.path().join("config.json");
+        let raw = std::fs::read_to_string(&config_path).expect("config.json should exist");
+        let on_disk: Value = serde_json::from_str(&raw).expect("config.json should be valid JSON");
+        let instance = &on_disk["provider_instances"][&instance_id];
+        let encrypted = instance
+            .get("api_key_encrypted")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            !encrypted.is_empty(),
+            "api_key_encrypted must survive update+unrelated settings save, got: {:?}",
+            instance
+        );
+        assert_eq!(
+            instance.get("label").and_then(|v| v.as_str()),
+            Some("Renamed"),
+            "the update itself should still apply"
+        );
     }
 }

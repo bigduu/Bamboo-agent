@@ -614,4 +614,56 @@ impl Config {
         restore_env_key!(anthropic);
         restore_env_key!(gemini);
     }
+
+    /// Defense-in-depth carry-forward for provider-instance keys (#515),
+    /// mirroring [`Config::preserve_env_sourced_provider_keys`].
+    ///
+    /// `build_merged_config`'s serde round-trip drops the
+    /// `#[serde(skip_serializing)]` plaintext `api_key`; hydration then
+    /// restores it from `api_key_encrypted` if that ciphertext survived the
+    /// merge. Normally it does — clients can never patch
+    /// `api_key_encrypted` directly (stripped by `sanitize_root_patch`), and
+    /// `deep_merge_json` only overwrites keys actually present in the patch,
+    /// so an unrelated save (or even an explicit `api_key` clear, which only
+    /// ever touches the plaintext field in the patch) always leaves the
+    /// previous ciphertext in the merged JSON.
+    ///
+    /// This only matters when that invariant has *already* been broken
+    /// elsewhere and `self` ends up with an instance that has NEITHER a
+    /// plaintext `api_key` NOR `api_key_encrypted` after the merge+hydrate
+    /// above, while `previous` (the live config from before this merge) still
+    /// has the ciphertext — e.g. a provider-instance create/update whose
+    /// in-memory ciphertext wasn't refreshed to match what was persisted to
+    /// disk. In that case, copy the ciphertext (and re-hydrate the
+    /// plaintext) back from `previous` rather than silently wiping it.
+    ///
+    /// Never fires for a genuine explicit clear: a client-issued
+    /// `api_key: ""` patch always leaves `previous`'s ciphertext intact
+    /// through the merge (see above), so `self` already has
+    /// `api_key_encrypted` set by the time this runs and the "neither field
+    /// present" condition below is false.
+    pub fn preserve_provider_instance_encrypted_keys(&mut self, previous: &Config) {
+        for (id, instance) in self.provider_instances.iter_mut() {
+            if !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some() {
+                continue;
+            }
+            let Some(prev_encrypted) = previous
+                .provider_instances
+                .get(id)
+                .and_then(|prev| prev.api_key_encrypted.as_deref())
+            else {
+                continue;
+            };
+
+            instance.api_key_encrypted = Some(prev_encrypted.to_string());
+            match crate::encryption::decrypt(prev_encrypted) {
+                Ok(value) => instance.api_key = value,
+                Err(e) => tracing::warn!(
+                    instance_id = id,
+                    "Failed to decrypt api_key while restoring dropped ciphertext: {}",
+                    e
+                ),
+            }
+        }
+    }
 }
