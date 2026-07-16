@@ -20,6 +20,23 @@ use crate::services::frontend_package::{
 };
 use bamboo_config::TlsConfig;
 
+/// Whether `path` belongs to bamboo's API surface (as opposed to a SPA
+/// frontend route the static-file fallback should serve `index.html` for).
+///
+/// Shared by both SPA-fallback closures below (desktop + production/Docker
+/// serve paths) so the allow-list can't drift between them — previously each
+/// closure hand-duplicated this list and neither included `/v2/` (the pairing/
+/// device/WS-multiplex prefix), so an unmatched `/v2/*` path would silently
+/// fall through to `index.html` instead of a real 404. #251 (finding 7).
+fn is_api_path(path: &str) -> bool {
+    path.starts_with("/api/")
+        || path.starts_with("/v1/")
+        || path.starts_with("/v2/")
+        || path.starts_with("/openai/")
+        || path.starts_with("/anthropic/")
+        || path.starts_with("/gemini/")
+}
+
 fn canonicalize_static_dir(path: &Path) -> Result<PathBuf, String> {
     let canonicalized = path
         .canonicalize()
@@ -139,12 +156,7 @@ pub async fn run_with_tls(
                         let index_file = index_file.clone();
                         async move {
                             let path = req.path().to_string();
-                            if path.starts_with("/api/")
-                                || path.starts_with("/v1/")
-                                || path.starts_with("/openai/")
-                                || path.starts_with("/anthropic/")
-                                || path.starts_with("/gemini/")
-                            {
+                            if is_api_path(&path) {
                                 let response = HttpResponse::NotFound().finish();
                                 return Ok(ServiceResponse::new(req.into_parts().0, response));
                             }
@@ -346,12 +358,7 @@ pub async fn run_with_bind_and_static_tls(
                         let index_file = index_file.clone();
                         async move {
                             let path = req.path().to_string();
-                            if path.starts_with("/api/")
-                                || path.starts_with("/v1/")
-                                || path.starts_with("/openai/")
-                                || path.starts_with("/anthropic/")
-                                || path.starts_with("/gemini/")
-                            {
+                            if is_api_path(&path) {
                                 let response = HttpResponse::NotFound().finish();
                                 return Ok(ServiceResponse::new(req.into_parts().0, response));
                             }
@@ -438,5 +445,29 @@ mod tests {
                 .expect("configured static dir should be returned");
 
         assert_eq!(resolved, static_dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn is_api_path_covers_every_registered_version_prefix() {
+        // #251 (finding 7): every prefix `routes::configure_routes` actually
+        // registers must be recognized here, or an unmatched sub-path under it
+        // would wrongly fall through to the SPA `index.html` instead of a 404.
+        for api_path in [
+            "/api/v1/sessions",
+            "/v1/bamboo/workflows",
+            "/v2/unknown",
+            "/openai/v1/models",
+            "/anthropic/v1/messages",
+            "/gemini/v1beta/models",
+        ] {
+            assert!(is_api_path(api_path), "{api_path} must be an API path");
+        }
+
+        for frontend_path in ["/", "/index.html", "/assets/app.js", "/settings"] {
+            assert!(
+                !is_api_path(frontend_path),
+                "{frontend_path} must NOT be treated as an API path"
+            );
+        }
     }
 }

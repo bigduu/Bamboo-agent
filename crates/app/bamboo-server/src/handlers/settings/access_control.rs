@@ -443,16 +443,30 @@ fn build_access_verified_cookie(config: &Config, secure: bool) -> Option<Cookie<
     )
 }
 
+/// Public route suffixes reachable under BOTH of bamboo's native-API version
+/// prefixes (`/api/v1` canonical, `/v1` legacy alias — see
+/// `routes::bamboo_v1_routes` / #251 finding 1). Kept as one list so a route
+/// that's public under one prefix can't silently end up gated under its alias
+/// — the exact drift `is_public_access_route` used to be exposed to when each
+/// prefix's public paths were hand-listed separately (#251 finding 7).
+const PUBLIC_VERSIONED_SUFFIXES: &[&str] =
+    &["/health", "/bamboo/access/status", "/bamboo/access/verify"];
+
 fn is_public_access_route(path: &str) -> bool {
+    for prefix in ["/api/v1", "/v1"] {
+        if let Some(suffix) = path.strip_prefix(prefix) {
+            if PUBLIC_VERSIONED_SUFFIXES.contains(&suffix) {
+                return true;
+            }
+        }
+    }
+
     matches!(
         path,
-        "/api/v1/health"
-            // Unversioned liveness/readiness probes for load balancers / k8s —
-            // must be reachable without a credential. #251 (finding 6).
-            | "/healthz"
+        // Unversioned liveness/readiness probes for load balancers / k8s —
+        // must be reachable without a credential. #251 (finding 6).
+        "/healthz"
             | "/readyz"
-            | "/v1/bamboo/access/status"
-            | "/v1/bamboo/access/verify"
             // v2-P2 (#181): a brand-new device has no credential yet, so the
             // pairing endpoint must be reachable unauthenticated. It self-gates
             // by requiring the owner root password in its body.
@@ -1620,6 +1634,31 @@ mod tests {
         assert!(is_public_access_route("/healthz"));
         assert!(is_public_access_route("/readyz"));
         assert!(is_public_access_route("/api/v1/health"));
+    }
+
+    #[test]
+    fn public_access_status_routes_are_public_under_both_version_prefixes() {
+        // #251 (finding 1 + 7): `/v1/bamboo/access/*` is aliased at the new
+        // canonical `/api/v1/bamboo/access/*` prefix — a route that's public
+        // under one prefix must stay public under its alias, or a legitimate
+        // pre-auth client (checking whether a password is required at all)
+        // would get locked out simply for calling the canonical path.
+        for prefix in ["/v1", "/api/v1"] {
+            assert!(
+                is_public_access_route(&format!("{prefix}/bamboo/access/status")),
+                "{prefix}/bamboo/access/status must be public"
+            );
+            assert!(
+                is_public_access_route(&format!("{prefix}/bamboo/access/verify")),
+                "{prefix}/bamboo/access/verify must be public"
+            );
+            // The sibling password-UPDATE route must stay gated under both
+            // prefixes — only status/verify are pre-auth.
+            assert!(
+                !is_public_access_route(&format!("{prefix}/bamboo/access/password")),
+                "{prefix}/bamboo/access/password must stay gated"
+            );
+        }
     }
 
     // ── v2-P2 pairing codes + brute-force guard (#181, slice 2) ────────────

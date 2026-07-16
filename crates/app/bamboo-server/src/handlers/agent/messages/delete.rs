@@ -18,8 +18,10 @@ pub async fn delete_message(
     }
 
     let Some(mut session) = load_session_or_404(&state, &session_id).await? else {
+        // Canonical nested error envelope — matches `AppError`'s shape (#251
+        // finding 2), with `session_id` kept as a sibling field.
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };
@@ -30,7 +32,7 @@ pub async fn delete_message(
 
     if before == after {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Message not found",
+            "error": crate::error::error_value("Message not found"),
             "session_id": session_id,
             "message_id": message_id,
         })));

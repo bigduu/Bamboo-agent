@@ -78,6 +78,110 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
     }
 }
 
+/// #251 (finding 1): every route that used to live ONLY under bare `/v1/*`
+/// (commands/settings/skills/tools/workspace/copilot/cluster) must now ALSO
+/// resolve under the canonical `/api/v1/*` prefix — proving the alias in
+/// `routes::bamboo_v1::bamboo_v1_routes` actually mounts both prefixes, not
+/// just the legacy one.
+#[actix_web::test]
+async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+
+    // A representative sample spanning every route group registered by
+    // `bamboo_routes_scope` (commands / settings / skills / tools / workspace /
+    // copilot / provider-catalog / provider-instances / cluster nodes).
+    let relative_paths = [
+        "/commands",
+        "/bamboo/workflows",
+        "/bamboo/setup/status",
+        "/bamboo/config",
+        "/bamboo/access/status",
+        "/bamboo/model-limits/defaults",
+        "/bamboo/tools",
+        "/bamboo/env-vars",
+        "/skills",
+        "/skills/available-tools",
+        "/workspace/recent",
+        "/bamboo/provider-catalog",
+        "/bamboo/settings/provider-instances",
+        "/bamboo/settings/nodes",
+    ];
+
+    for relative in relative_paths {
+        for prefix in ["/api/v1", "/v1"] {
+            let uri = format!("{prefix}{relative}");
+            let req = test::TestRequest::get()
+                .uri(&uri)
+                .insert_header((header::HOST, "localhost:9562"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "expected {uri} to be registered (alias parity, #251 finding 1)"
+            );
+        }
+    }
+}
+
+/// #251 (finding 4): per-session actions (execute/events/stop/history/task/
+/// respond/child-approval) must resolve under BOTH their new canonical nested
+/// `/sessions/{id}/…` form AND their original flat `/…/{id}` form — the flat
+/// form is a permanent legacy alias to the same handler, not a breaking move.
+#[actix_web::test]
+async fn session_subresource_routes_resolve_under_nested_and_flat_alias() {
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+
+    // (method, nested path, flat legacy alias path)
+    let pairs: Vec<(&str, String, String)> = vec![
+        (
+            "GET",
+            "/api/v1/sessions/example/history".to_string(),
+            "/api/v1/history/example".to_string(),
+        ),
+        (
+            "GET",
+            "/api/v1/sessions/example/task".to_string(),
+            "/api/v1/task/example".to_string(),
+        ),
+        (
+            "GET",
+            "/api/v1/sessions/example/task/exists".to_string(),
+            "/api/v1/task/example/exists".to_string(),
+        ),
+        (
+            "GET",
+            "/api/v1/sessions/example/respond/pending".to_string(),
+            "/api/v1/respond/example/pending".to_string(),
+        ),
+        (
+            "POST",
+            "/api/v1/sessions/example/stop".to_string(),
+            "/api/v1/stop/example".to_string(),
+        ),
+        (
+            "POST",
+            "/api/v1/sessions/example/child-approval".to_string(),
+            "/api/v1/child-approval/example".to_string(),
+        ),
+    ];
+
+    for (method, nested, flat) in pairs {
+        for uri in [&nested, &flat] {
+            let req = match method {
+                "POST" => test::TestRequest::post().uri(uri).to_request(),
+                _ => test::TestRequest::get().uri(uri).to_request(),
+            };
+            let resp = test::call_service(&app, req).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "expected {method} {uri} to be registered (nested/alias parity, #251 finding 4)"
+            );
+        }
+    }
+}
+
 #[actix_web::test]
 async fn remote_unverified_request_is_blocked_by_access_middleware() {
     let data_dir = tempdir().unwrap();

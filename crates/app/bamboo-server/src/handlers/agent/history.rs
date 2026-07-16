@@ -136,14 +136,17 @@ pub async fn handler(
         match state.storage.load_session(&session_id).await {
             Ok(Some(s)) => session = Some(s),
             Ok(None) => {
+                // Canonical nested error envelope — matches `AppError`'s shape
+                // (#251 finding 2), with `session_id` kept as a sibling field
+                // for callers that already read it off this endpoint.
                 return HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "Session not found",
+                    "error": crate::error::error_value("Session not found"),
                     "session_id": session_id
                 }));
             }
             Err(e) => {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Failed to load session: {e}"),
+                    "error": crate::error::error_value(format!("Failed to load session: {e}")),
                     "session_id": session_id
                 }));
             }
@@ -152,7 +155,7 @@ pub async fn handler(
 
     let Some(session) = session else {
         return HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": "Session load unexpectedly returned no data",
+            "error": crate::error::error_value("Session load unexpectedly returned no data"),
             "session_id": session_id
         }));
     };
@@ -464,5 +467,56 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["is_delta"], false);
         assert_eq!(seqs(&body["messages"]), vec!["a", "b"]);
+    }
+
+    /// `GET /api/v1/history/{id}` on an unknown session must use the
+    /// canonical nested error envelope, not the old flat
+    /// `{"error": "<string>"}` shape. #251 (finding 2).
+    #[actix_web::test]
+    async fn history_not_found_uses_canonical_error_envelope() {
+        let (state, _id) = app_state_with_session(vec![]).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/history/does-not-exist")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Session not found");
+        assert_eq!(body["session_id"], "does-not-exist");
+    }
+
+    /// The same nested history endpoint reachable via its canonical
+    /// `/api/v1/sessions/{id}/history` path (#251 finding 4) returns
+    /// identical data to the legacy flat `/api/v1/history/{id}` alias.
+    #[actix_web::test]
+    async fn history_is_reachable_via_canonical_nested_path() {
+        let (state, id) = app_state_with_session(vec![Message::user("hi")]).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}/history"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(seqs(&resp["messages"]), vec!["hi"]);
     }
 }

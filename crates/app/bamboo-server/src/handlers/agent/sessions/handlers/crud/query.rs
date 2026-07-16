@@ -115,7 +115,9 @@ pub async fn get_session(
             Ok(response.json(GetSessionResponse { session: summary }))
         }
         None => Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            // Canonical nested error envelope — matches `AppError`'s shape
+            // (#251 finding 2), with `session_id` kept as a sibling field.
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         }))),
     }
@@ -242,5 +244,34 @@ mod pagination_http_tests {
         assert_eq!(page2["offset"], 2);
         assert_eq!(page2["sessions"].as_array().unwrap().len(), 1);
         assert!(page2.get("next_offset").is_none() || page2["next_offset"].is_null());
+    }
+
+    /// `GET /api/v1/sessions/{id}` on an unknown id must use the canonical
+    /// nested error envelope (`{"error": {"message", "type"}}`, matching
+    /// `AppError`), not the old flat `{"error": "<string>"}` shape. #251
+    /// (finding 2).
+    #[actix_web::test]
+    async fn get_session_not_found_uses_canonical_error_envelope() {
+        let state = app_state_with_sessions(0).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/does-not-exist")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Session not found");
+        assert_eq!(body["session_id"], "does-not-exist");
     }
 }
