@@ -418,16 +418,26 @@ pub fn preserve_masked_notification_secrets(patch_obj: &mut Map<String, Value>, 
 /// order:
 ///
 /// 1. **Id match (#496)** — if the patch entry carries an `id` and some entry
-///    in `current` has the same [`crate::ConnectPlatformConfig::id`], that
-///    entry is authoritative, full stop. A stable server-assigned id
-///    unambiguously identifies the same logical platform regardless of
-///    position or `platform_type` — this is the only strategy that correctly
+///    in `current` has the same [`crate::ConnectPlatformConfig::id`] AND a
+///    consistent `platform_type`, that entry is authoritative. A stable
+///    server-assigned id unambiguously identifies the same logical platform
+///    regardless of position — this is the only strategy that correctly
 ///    disambiguates two entries that share the same `platform_type` and have
 ///    been reordered relative to each other (the scenario #490/#492's
 ///    type+positional fallback cannot fully resolve; see the regression test
 ///    `preserve_masked_connect_secrets_resolves_duplicate_type_by_id_even_when_reordered`
-///    below). Legacy entries without an id (or a patch from a client that
-///    doesn't echo it back) simply fall through to strategy 2.
+///    below). The id match is guarded by the same type-consistency check as
+///    strategy 2: a patch entry whose `type` DISAGREES with the id-matched
+///    entry's `platform_type` (e.g. a stale/reused id after a client-side
+///    bug, or a flow that repurposes an entry's identity for a different
+///    platform) must not inherit the differently-typed entry's secret — a
+///    Telegram bot token pasted into a Feishu adapter is never right. Such
+///    a mismatch falls through to strategies 2/3 (which will also refuse a
+///    cross-type resolution, dropping the mask — same as "nothing configured
+///    yet"). A patch entry with an `id` but no `type` at all can't be
+///    checked and resolves on id alone, mirroring strategy 2's handling of
+///    a missing `type`. Legacy entries without an id (or a patch from a
+///    client that doesn't echo it back) simply fall through to strategy 2.
 /// 2. **Positional + type guard** — patch index `i` is resolved against
 ///    `current.connect.platforms[i]`, guarded by `type` equality at that
 ///    index. This mirrors how the settings UI round-trips the list (it
@@ -458,21 +468,27 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
         let patch_type = obj.get("type").and_then(|v| v.as_str());
         let patch_id = obj.get("id").and_then(|v| v.as_str());
 
-        // Strategy 1 (#496): an id match is authoritative and unambiguous —
-        // it doesn't need (and isn't guarded by) a type/position check,
-        // since a server-assigned id already uniquely identifies one entry.
+        // Strategy 1 (#496): an id match is position-independent, but it is
+        // still guarded by the SAME type-consistency check strategies 2/3
+        // enforce — an id pointing at a differently-typed entry (stale or
+        // repurposed id) must not leak that entry's secret into an adapter
+        // of another type. A patch entry with no "type" can't be checked and
+        // resolves on id alone (mirrors strategy 2's missing-"type" case).
         let by_id = patch_id.and_then(|patch_id| {
-            current
-                .connect
-                .platforms
-                .iter()
-                .find(|p| p.id.as_deref() == Some(patch_id))
+            current.connect.platforms.iter().find(|p| {
+                p.id.as_deref() == Some(patch_id)
+                    && match patch_type {
+                        Some(patch_type) => patch_type == p.platform_type,
+                        None => true,
+                    }
+            })
         });
 
         // Strategies 2/3 (#490/#492): positional + type guard, falling back
         // to a type-only lookup — unchanged, and only consulted when there
-        // was no id (or the id didn't match anything in `current`, e.g. a
-        // stale id echoed after the entry was removed).
+        // was no id, the id didn't match anything in `current` (e.g. a
+        // stale id echoed after the entry was removed), or the id-matched
+        // entry failed the type-consistency guard above.
         let existing = current.connect.platforms.get(index);
         // A patch entry that names a "type" disagreeing with `current`'s
         // entry at the same index (or an index beyond `current`'s array)
@@ -995,6 +1011,95 @@ mod tests {
         assert_eq!(
             patch["connect"]["platforms"][0]["token"], "existing-bot-token",
             "an id absent from `current` falls back to the positional+type guard"
+        );
+    }
+
+    /// PR #510 review: the id branch is guarded by the same type-consistency
+    /// check as the positional branch. A patch entry whose `id` matches a
+    /// `current` entry of a DIFFERENT `platform_type` (stale/reused id, or a
+    /// flow repurposing an entry's identity for another platform) must NOT
+    /// inherit that entry's secret — with no same-typed entry anywhere in
+    /// `current`, the mask drops, same as "nothing configured yet".
+    #[test]
+    fn preserve_masked_connect_secrets_rejects_id_match_when_type_differs() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform_with_id(
+            "id-a",
+            "telegram",
+            "telegram-secret-token",
+        )];
+
+        // The patch reuses stored entry id-a's id but claims to be a Feishu
+        // adapter — resolving the mask against the Telegram entry would paste
+        // a Telegram bot token into a Feishu config.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"id":"id-a","type":"feishu","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert!(
+            !patch["connect"]["platforms"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("token"),
+            "an id match with a disagreeing type must not resolve the mask from that entry"
+        );
+    }
+
+    /// The type-mismatched-id fall-through still reaches strategies 2/3: if a
+    /// same-typed entry DOES exist elsewhere in `current`, the type-based
+    /// fallback (#490) resolves the mask against it — the bad id only
+    /// disqualifies the id branch, it doesn't poison the whole resolution.
+    #[test]
+    fn preserve_masked_connect_secrets_type_mismatched_id_still_falls_through_to_type_lookup() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform_with_id("id-a", "telegram", "telegram-secret-token"),
+            connect_platform_with_id("id-b", "feishu", "feishu-secret-token"),
+        ];
+
+        // id-a belongs to the telegram entry, but the patch entry says
+        // "feishu" (at index 0, where current has telegram): the id branch
+        // and the positional branch both refuse, and the type-based fallback
+        // resolves against the feishu entry at index 1.
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"id":"id-a","type":"feishu","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"], "feishu-secret-token",
+            "the fall-through must resolve via the type lookup, never via the mismatched id"
+        );
+    }
+
+    /// A patch entry with an `id` but no `type` at all can't be
+    /// type-checked and resolves on id alone — mirrors the positional
+    /// branch's handling of a missing `type` (documented in the id-branch
+    /// guard). Placed at an out-of-range index to prove it's the id doing
+    /// the work, not position.
+    #[test]
+    fn preserve_masked_connect_secrets_id_without_type_resolves_on_id_alone() {
+        let mut current = Config::default();
+        current.connect.platforms = vec![
+            connect_platform_with_id("id-a", "telegram", "bot-a-token"),
+            connect_platform_with_id("id-b", "telegram", "bot-b-token"),
+        ];
+
+        let mut patch: Map<String, Value> = serde_json::from_str(
+            r#"{"connect":{"platforms":[{"id":"id-b","token":"****...****"}]}}"#,
+        )
+        .unwrap();
+
+        preserve_masked_connect_secrets(&mut patch, &current);
+
+        assert_eq!(
+            patch["connect"]["platforms"][0]["token"], "bot-b-token",
+            "with no type to check, the id match resolves to its own entry, not the positional one"
         );
     }
 
