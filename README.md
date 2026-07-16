@@ -261,6 +261,14 @@ async fn main() -> anyhow::Result<()> {
 
 > Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) build an `ExecuteRequest` with `ExecuteRequestBuilder` (both re-exported from `bamboo_sdk::agent`) and call `agent.execute(&mut session, req)` — the same canonical engine path `run` / `run_stream` funnel into.
 
+**Approval / clarification + resume.** A run can pause mid-loop waiting for input — a `conclusion_with_options` clarification, or a gated tool call under a configured `PermissionChecker` — surfaced as `AgentEvent::NeedClarification` / `ToolApprovalRequested`. Resolve it with `agent.answer(session_id, "Approve").await?` (the in-process equivalent of the HTTP `POST /sessions/{id}/respond` endpoint — same use-case function under the hood, so behavior matches exactly), then continue with `agent.resume_stream(outcome.session)` / `agent.resume(&mut session)` — or do both in one call with `agent.answer_and_resume_stream(session_id, "Approve").await?`. `AnswerOutcome` also carries any plan-mode transition and the permission grants an approval implied (auto-applied to the builder's `.permission_checker(...)`, if one was configured).
+
+**Session ergonomics.** `agent.list_sessions()` (most-recently-updated first), `agent.get_session(id)`, `agent.session_history(id)`, `agent.delete_session(id)` — no need to reach for `agent.storage()` directly for the common cases. `list_sessions` needs the concrete session-index handle `with_defaults_for_data_dir` assembles.
+
+**MCP.** `.mcp_server(config)` / `.mcp_servers([...])` on the builder connect MCP servers (in `with_defaults_for_data_dir`) and merge their tools into the built-in tool surface via `CompositeToolExecutor` — each server's `initialize` instructions are folded into the tool guidance automatically.
+
+**Typed errors.** `with_defaults_for_data_dir` / `build` / `answer` / the session-ergonomics methods all return `Result<_, SdkError>` — a `thiserror` enum (`ProviderInit`, `StoreInit`, `SkillInit`, `McpServerStart`, `SessionNotFound`, `NoPendingQuestion`, `InvalidResponse`, …) instead of a bare `String`, so callers can match on the failure kind. `SdkError` also wraps `AgentError` (`#[from]`) so it composes with `run`/`run_stream`'s existing typed error in a function returning `Result<_, SdkError>`.
+
 Add the facade crate as a dependency (path or git):
 
 ```toml
