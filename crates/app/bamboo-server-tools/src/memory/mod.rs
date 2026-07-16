@@ -118,7 +118,30 @@ impl Tool for MemoryTool {
                 "pieces": {"type": "array", "items": {"type": "object"}},
                 "ids": {"type": "array", "items": {"type": "string"}},
                 "min_score": {"type": "number"},
-                "filters": {"type": "object"},
+                "filters": {
+                    "type": "object",
+                    "description": "Optional narrowing for `query`/`purge`. Each sub-filter is independent and defaults to unfiltered when omitted or empty.",
+                    "properties": {
+                        "type": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                            "description": "Restrict results to these memory types. Omit for no type filtering."
+                        },
+                        "status": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["active", "stale", "superseded", "contradicted", "archived"]},
+                            "description": "Restrict results to these statuses. Omit for no status filtering."
+                        },
+                        "granularity": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["day", "week", "month", "quarter", "year"]
+                            },
+                            "description": "Restrict results to these temporal granularities: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). This is a hard filter (unlike the passive recall-into-prompt ordering): a memory whose granularity doesn't appear in this list is excluded entirely, and a memory with no granularity never matches a non-empty filter here. Omit for no granularity filtering."
+                        }
+                    }
+                },
                 "options": {"type": "object"},
                 "reason": {"type": "string"}
             },
