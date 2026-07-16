@@ -311,6 +311,22 @@ pub struct AppState {
     /// `crate::service_manager`'s module docs.
     pub service_manager: Arc<crate::service_manager::ServiceManager>,
 
+    /// Handle to the background boot-time service reconcile pass
+    /// (`plugin_installer::boot_reconcile_services`, spawned fire-and-forget
+    /// by `app_state::builder` — see its comment). It is deliberately NOT
+    /// synchronized against `plugin_installer::PLUGIN_OP_LOCK`, so it can, in
+    /// principle, race a `ServerPluginInstaller::install`/
+    /// `stop_services_for_upgrade` call that lands on the SAME data dir
+    /// while it is still in flight (e.g. immediately after construction).
+    /// Production code never touches this field; it exists purely as a
+    /// test-only synchronization point (see
+    /// [`AppState::wait_for_boot_reconcile_services`]) so
+    /// `plugin_installer::tests` can deterministically drain that one-shot
+    /// pass before exercising service install/stop/upgrade, instead of
+    /// racing it under CI scheduling jitter (issue #486).
+    #[doc(hidden)]
+    pub boot_reconcile_services_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+
     /// Metrics collection and persistence service
     ///
     /// Tracks token usage, costs, and performance metrics
@@ -398,6 +414,19 @@ impl AppState {
     /// Release the title-generation slot for `session_id`. Idempotent.
     pub fn title_gen_release(&self, session_id: &str) {
         self.title_gen_in_flight.remove(session_id);
+    }
+
+    /// Test-only synchronization point (see
+    /// [`boot_reconcile_services_handle`](Self::boot_reconcile_services_handle)'s
+    /// doc comment): wait for the background boot-time service reconcile
+    /// pass to finish. Idempotent — a second call (or a call after
+    /// production code never having populated the handle) is a no-op.
+    #[doc(hidden)]
+    pub async fn wait_for_boot_reconcile_services(&self) {
+        let handle = self.boot_reconcile_services_handle.lock().await.take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
     }
 }
 

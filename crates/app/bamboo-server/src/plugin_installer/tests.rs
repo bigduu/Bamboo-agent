@@ -22,6 +22,20 @@ async fn new_installer(data_dir: &Path) -> (web::Data<AppState>, ServerPluginIns
     let state = AppState::new(data_dir.to_path_buf())
         .await
         .expect("app state should initialize");
+    // `AppState::new` fires the boot-time service reconcile pass
+    // (`plugin_installer::boot_reconcile_services`) in the background,
+    // unsynchronized against `PLUGIN_OP_LOCK` (see that function's doc
+    // comment). On a fresh `data_dir` it is a same-tick no-op (nothing in
+    // `installed.json` yet) — UNLESS it is still in flight when a
+    // service-lifecycle test below writes `installed.json` and starts/stops
+    // a service moments later, in which case it can race back in and
+    // resurrect (or fail to see) a service the test just
+    // installed/stopped, producing exactly the `is_running` flakes tracked
+    // by issue #486. Draining it here (once, before any test touches
+    // `installed.json`) removes that race entirely: by construction it can
+    // only observe an empty store at this point, so this always resolves
+    // near-instantly.
+    state.wait_for_boot_reconcile_services().await;
     let data = web::Data::new(state);
     let installer = ServerPluginInstaller::new(data.clone());
     (data, installer)

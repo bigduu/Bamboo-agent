@@ -48,10 +48,12 @@ pub struct AgentDeployment {
     /// A parent-resolved `ProvisionSpec` (serialized JSON) the orchestrator ships
     /// to the worker — model/creds/MCP/bus all decided here, so the worker stops
     /// self-resolving from its host config (a remote node needs no bamboo config
-    /// of its own). Delivery is per-deployer: Local pipes it to stdin
+    /// of its own, and a Docker worker needs no mount of the orchestrator's home
+    /// — #46). Delivery is per-deployer: Local and Docker pipe it to stdin
     /// (`--spec-stdin`); Ssh/Russh upload it to a remote file (`--spec-file`).
-    /// `None` keeps the legacy argv+env self-resolve bootstrap (Docker still
-    /// self-resolves via its mounted home).
+    /// `None` keeps the legacy argv+env self-resolve bootstrap (Docker then
+    /// falls back to `DockerDeployer::mount_home` if set, or a homeless
+    /// container otherwise).
     pub spec_json: Option<String>,
 }
 
@@ -78,16 +80,32 @@ pub trait Deployer: Send + Sync {
 
 /// A handle to a deployment that is NOT a local child process (e.g. a remote
 /// worker reached over an in-process `russh` session). Owning this keeps the
-/// remote alive; `shutdown` tears it down (kill the remote process + close the
-/// connection/tunnel).
+/// remote alive; `shutdown`/`shutdown_with_timeout` tear it down (kill the
+/// remote process + close the connection/tunnel).
 #[async_trait]
 pub trait RemoteDeployment: Send + Sync {
     /// Remote OS pid of the launched worker, if the deployer captured one.
     fn remote_pid(&self) -> Option<u32> {
         None
     }
-    /// Tear down the remote worker and release the connection/tunnel.
-    async fn shutdown(&self);
+
+    /// Tear down the remote worker and release the connection/tunnel, using
+    /// [`DEFAULT_GRACEFUL_STOP_TIMEOUT`] as the grace window. See
+    /// [`Self::shutdown_with_timeout`].
+    async fn shutdown(&self) {
+        self.shutdown_with_timeout(DEFAULT_GRACEFUL_STOP_TIMEOUT)
+            .await;
+    }
+
+    /// Tear down the remote worker with an explicit grace window: signal the
+    /// worker to stop and poll for it to exit on its own — keeping the SSH
+    /// session (and therefore the reverse tunnel the worker drains its
+    /// in-flight Ask/Task/Run through) alive the whole time — before falling
+    /// back to a hard kill and only THEN closing the connection/tunnel. #489
+    /// (follow-up to #49/#488: the local-process path already does this via
+    /// [`DeployedAgent::shutdown_with_timeout`]; this is the remote-path
+    /// parity fix).
+    async fn shutdown_with_timeout(&self, timeout: Duration);
 }
 
 /// A running deployment. Killed on drop (`kill_on_drop`); `shutdown` also runs
@@ -154,9 +172,11 @@ impl DeployedAgent {
     /// falling back to a hard `SIGKILL` (`Child::start_kill`). A worker with no
     /// signal handler (e.g. an old binary) or one that's genuinely wedged still
     /// gets killed once `timeout` elapses, so `action=stop` is always bounded.
-    /// Remote deployments delegate to [`RemoteDeployment::shutdown`] unchanged
-    /// (out of scope for #49 — see the issue's evidence, which is specific to
-    /// the local-process `start_kill()` path). #49.
+    /// Remote deployments delegate to
+    /// [`RemoteDeployment::shutdown_with_timeout`] with the same `timeout`,
+    /// so a remotely-deployed worker gets the identical bounded-grace
+    /// treatment — SSH session and reverse tunnel stay up until the worker
+    /// exits or the window elapses (#489, closing the gap #49 left open).
     pub async fn shutdown_with_timeout(self, timeout: Duration) {
         match self.inner {
             DeployedInner::Process { mut child, cleanup } => {
@@ -192,7 +212,7 @@ impl DeployedAgent {
                     }
                 }
             }
-            DeployedInner::Remote(h) => h.shutdown().await,
+            DeployedInner::Remote(h) => h.shutdown_with_timeout(timeout).await,
         }
     }
 }
@@ -333,13 +353,16 @@ pub struct DockerDeployer {
     pub bamboo_in_image: String,
     /// e.g. `Some("host")` so the container can reach a `127.0.0.1` broker.
     pub network: Option<String>,
-    /// Host bamboo home dir to seed the worker from: mounted read-only at
-    /// `/seed`, then config + encryption key + skills are copied into the
-    /// container's writable data dir at startup, so the worker reads the
-    /// orchestrator's config (MCP servers + skills + provider creds) while
-    /// keeping an isolated, writable data dir. (Trusted-local convenience; it
-    /// also exposes the config's secrets to the container — P3 will scope this
-    /// down.)
+    /// LEGACY fallback: host bamboo home dir to seed the worker from — mounted
+    /// read-only at `/seed`, then config + encryption key + skills copied into
+    /// the container's writable data dir at startup. This exposes **every**
+    /// provider credential in the orchestrator's config to the container (#46)
+    /// and is only still consulted when `AgentDeployment::spec_json` is unset
+    /// (e.g. a caller with no configured credentials). The normal path —
+    /// `deploy_agent`'s `env=docker` — ships a parent-resolved `ProvisionSpec`
+    /// (just the assigned model's credential, no encryption key, no full
+    /// config) over stdin instead; see `spec_json` below, which takes
+    /// precedence over this field whenever both are set.
     pub mount_home: Option<PathBuf>,
 }
 
@@ -383,7 +406,21 @@ impl DockerDeployer {
             a.push("--network".into());
             a.push(net.clone());
         }
-        if let Some(home) = &self.mount_home {
+        if d.spec_json.is_some() {
+            // Parent-resolved spec rides the container's stdin — no home mount,
+            // no on-disk config/encryption-key copy (#46). `-i` keeps stdin
+            // open for the pipe; `deploy()` writes the spec and closes it right
+            // after spawn, mirroring `LocalProcessDeployer`. Takes precedence
+            // over `mount_home` (same "spec is authoritative" rule as the CLI's
+            // `--spec-stdin`/`--spec-file`).
+            a.push("-i".into());
+            a.push("--entrypoint".into());
+            a.push(self.bamboo_in_image.clone());
+            a.push(self.image.clone());
+            let mut argv = agent_argv(d);
+            argv.push("--spec-stdin".to_string());
+            a.extend(argv);
+        } else if let Some(home) = &self.mount_home {
             // Seed the worker from the orchestrator's home, but DON'T run on a
             // read-only mount of it: the worker writes the moment it starts
             // (skill-store builtin sync, session/event persistence), so a
@@ -437,7 +474,25 @@ impl Deployer for DockerDeployer {
         let container = format!("bamboo-agent-{}", d.id);
         let mut cmd = Command::new(&self.docker_bin);
         cmd.args(self.argv(d, &container)).kill_on_drop(true);
-        let child = cmd.spawn().map_err(spawn_err)?;
+        if d.spec_json.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        let mut child = cmd.spawn().map_err(spawn_err)?;
+        // Feed the spec, then close stdin so the worker reads to EOF (same
+        // handshake as `LocalProcessDeployer`).
+        if let Some(spec_json) = &d.spec_json {
+            use tokio::io::AsyncWriteExt;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(spec_json.as_bytes())
+                    .await
+                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
+            }
+        }
         Ok(DeployedAgent::from_parts(
             d.id.clone(),
             child,
@@ -1071,5 +1126,132 @@ mod tests {
         assert!(!a
             .iter()
             .any(|x| x.contains("tok") && !x.starts_with("BAMBOO_BROKER_TOKEN=")));
+    }
+
+    /// #46 — a `spec_json` deploy must NOT mount the orchestrator's home (no
+    /// `/seed` volume, no config/encryption-key copy script): the worker gets
+    /// only the parent-resolved spec, piped over stdin.
+    #[test]
+    fn docker_argv_uses_spec_stdin_and_never_mounts_home() {
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1}"#.to_string());
+        let deployer = DockerDeployer::new("img");
+        let a = deployer.argv(&d, "c");
+
+        // No home mount at all — no `-v`, no `/seed`.
+        assert!(!a.contains(&"-v".to_string()));
+        assert!(!a.iter().any(|x| x.contains("/seed")));
+        // No shell-wrapped copy script — direct entrypoint on the bamboo binary.
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--entrypoint".to_string(), "bamboo".to_string()]));
+        assert!(!a.iter().any(|x| x == "/bin/sh"));
+        assert!(!a.iter().any(|x| x.contains("config.json")));
+        assert!(!a.iter().any(|x| x.contains(".bamboo_encryption_key")));
+        // stdin stays open for the piped spec, and the worker is told to read it.
+        assert!(a.contains(&"-i".to_string()));
+        assert!(a.contains(&"--spec-stdin".to_string()));
+        // The broker token must never appear on argv (it rides as -e env).
+        assert!(!a
+            .iter()
+            .any(|x| x.contains("tok") && !x.starts_with("BAMBOO_BROKER_TOKEN=")));
+    }
+
+    /// `spec_json` is authoritative even when a caller also set `mount_home` —
+    /// mirrors the CLI's "spec is authoritative" rule for `--spec-stdin`.
+    #[test]
+    fn docker_argv_spec_json_takes_precedence_over_mount_home() {
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1}"#.to_string());
+        let deployer = DockerDeployer::new("img").mount_home("/home/u/.bamboo");
+        let a = deployer.argv(&d, "c");
+        assert!(!a.iter().any(|x| x.contains("/seed")));
+        assert!(a.contains(&"--spec-stdin".to_string()));
+    }
+
+    /// The docker e2e networking path (`host.docker.internal` + host-gateway
+    /// alias) must survive spec_json delivery unchanged (#46 must not regress
+    /// the existing docker deploy path).
+    #[test]
+    fn docker_argv_spec_json_still_wires_host_docker_internal() {
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1}"#.to_string());
+        let deployer = DockerDeployer::new("img");
+        let a = deployer.argv(&d, "c");
+        assert!(a.windows(2).any(|w| w
+            == [
+                "--add-host".to_string(),
+                "host.docker.internal:host-gateway".to_string()
+            ]));
+    }
+
+    /// End-to-end (no real `docker` binary): `deploy()` must actually pipe the
+    /// spec JSON to the child's stdin and close it, exactly like
+    /// `LocalProcessDeployer`. Stand in `cat` for `docker` so the "container"
+    /// just echoes stdin back to a marker file we can assert on.
+    #[tokio::test]
+    async fn docker_deploy_pipes_spec_json_to_stdin() {
+        let marker = std::env::temp_dir().join(format!(
+            "bamboo_docker_spec_stdin_{}_{:?}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        // A fake "docker" that just `cat`s its stdin to the marker file,
+        // ignoring all the run/--rm/etc. argv (it never touches a real image).
+        let fake_docker = std::env::temp_dir().join(format!(
+            "bamboo_fake_docker_{}_{:?}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &fake_docker,
+            format!("#!/bin/sh\ncat > {}\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut d = dep();
+        d.spec_json = Some(r#"{"version":1,"secret":"do-not-mount-whole-home"}"#.to_string());
+        let mut deployer = DockerDeployer::new("img");
+        deployer.docker_bin = fake_docker.to_string_lossy().into_owned();
+
+        let agent = deployer.deploy(&d).await.expect("fake docker deploy");
+        // The fake "docker" is `cat`, which finishes writing the marker once
+        // stdin (closed by `deploy()` right after writing the spec) hits EOF.
+        // Poll the marker's CONTENT rather than the child's liveness: an
+        // unreaped exited child still answers `kill -0` (zombie) until
+        // something calls `wait()` on it, which would race this assertion. We
+        // deliberately never call `shutdown()` here — it would re-invoke the
+        // same fake binary as a `rm -f` cleanup command and clobber the marker
+        // with an empty write.
+        let expected = r#"{"version":1,"secret":"do-not-mount-whole-home"}"#;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut written = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&marker) {
+                if s == expected {
+                    written = s;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(written, expected, "fake docker never wrote the piped spec");
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake_docker);
+        drop(agent);
     }
 }
