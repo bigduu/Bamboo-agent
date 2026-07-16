@@ -165,6 +165,18 @@ impl AppState {
                 // (and any GET immediately after) already reflects the id a
                 // client can round-trip on its next PATCH.
                 cfg.assign_connect_platform_ids();
+                // Same live-vs-save-copy treatment for ciphertext (#516):
+                // `save_to_dir` refreshes `*_encrypted` only on its save-time
+                // clone, so a secret set through this entrypoint (e.g. a
+                // provider instance created over HTTP) would otherwise stay
+                // plaintext-only in memory — and the next settings-PATCH merge
+                // (`build_merged_config`'s serde round-trip drops plaintext)
+                // would lose the key entirely.
+                cfg.refresh_encrypted_secrets().map_err(|e| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "Failed to refresh encrypted secrets: {e}"
+                    ))
+                })?;
                 cfg.publish_env_vars();
                 let newly_off = !was_off && cfg.plugin_trust.enforcement_is_off();
                 (cfg.clone(), newly_off)
@@ -202,6 +214,11 @@ impl AppState {
         // caller (the settings-merge HTTP response) all agree on the same
         // ids — mirrors the `update_config` treatment above.
         new_config.assign_connect_platform_ids();
+        // Keep ciphertext in sync with plaintext on the config that becomes
+        // the live in-memory state — same #516 rationale as `update_config`.
+        new_config.refresh_encrypted_secrets().map_err(|e| {
+            AppError::InternalError(anyhow::anyhow!("Failed to refresh encrypted secrets: {e}"))
+        })?;
 
         // Same #126 serialization as update_config: mutate + persist under the
         // config-IO lock so a reload can't interleave; effects run unlocked.

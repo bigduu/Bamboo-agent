@@ -352,21 +352,10 @@ pub async fn create_provider_instance(
                 if should_set_default {
                     config.default_provider_instance = Some(instance_id.clone());
                 }
-                // Mirror the ciphertext this create will persist to disk back
-                // onto the LIVE in-memory config. Without this, `save_to_dir`
-                // only encrypts a disposable clone it builds internally, so
-                // `api_key_encrypted` stays `None` in memory even though disk
-                // has it — a later unrelated settings save (whose serde
-                // round-trip drops the skip_serializing plaintext `api_key`)
-                // would then persist neither field, wiping the ciphertext
-                // that's already on disk. #515.
-                config
-                    .refresh_provider_instance_api_keys_encrypted()
-                    .map_err(|e| {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "Failed to encrypt provider instance api_key: {e}"
-                        ))
-                    })?;
+                // No explicit ciphertext refresh needed here: `update_config`
+                // runs `Config::refresh_encrypted_secrets` on the live config
+                // after this closure (#515/#516), so `api_key_encrypted` is
+                // populated in memory before persist/response.
                 Ok(())
             },
             ConfigUpdateEffects {
@@ -418,16 +407,8 @@ pub async fn update_provider_instance(
                 config
                     .provider_instances
                     .insert(instance_id.clone(), updated);
-                // See the matching comment in `create_provider_instance`: keep
-                // the live in-memory ciphertext in sync with what gets
-                // persisted to disk. #515.
-                config
-                    .refresh_provider_instance_api_keys_encrypted()
-                    .map_err(|e| {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "Failed to encrypt provider instance api_key: {e}"
-                        ))
-                    })?;
+                // Ciphertext sync happens centrally in `update_config` via
+                // `Config::refresh_encrypted_secrets` (#515/#516).
                 Ok(())
             },
             ConfigUpdateEffects {

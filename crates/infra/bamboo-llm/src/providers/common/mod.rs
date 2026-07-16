@@ -45,6 +45,72 @@ pub(crate) fn looks_like_reasoning_unsupported_error(
     mentions_reasoning && indicates_unsupported
 }
 
+/// Whether an error response means the referenced `previous_response_id` does
+/// not exist upstream (OpenAI's `previous_response_not_found`), so a single
+/// retry WITHOUT the stateful continuation is warranted. Bamboo always sends
+/// the full input array alongside the id, so dropping it loses no context.
+///
+/// This fires for ids that reference a `store=false` (never persisted) turn,
+/// ids past the upstream retention window, ids minted under a different
+/// key/org, and fabricated ids a compat-proxy client chained back. It must NOT
+/// fire on other "not found" errors (e.g. an unknown model), so it requires an
+/// explicit mention of the previous-response parameter.
+pub(crate) fn looks_like_previous_response_not_found_error(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    if !(status == 400 || status == 404) {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    if b.contains("previous_response_not_found") {
+        return true;
+    }
+    let mentions_previous_response =
+        b.contains("previous_response_id") || b.contains("previous response");
+    let indicates_missing =
+        b.contains("not found") || b.contains("not_found") || b.contains("does not exist");
+    mentions_previous_response && indicates_missing
+}
+
+#[cfg(test)]
+mod previous_response_not_found_tests {
+    use super::looks_like_previous_response_not_found_error as f;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn fires_on_openai_previous_response_not_found_error() {
+        let bad = StatusCode::BAD_REQUEST;
+        // The exact OpenAI error shape (code = previous_response_not_found).
+        assert!(f(
+            bad,
+            r#"{"error":{"message":"Previous response with id 'resp_123' not found.","type":"invalid_request_error","param":"previous_response_id","code":"previous_response_not_found"}}"#
+        ));
+        // Message-only variants, with and without the structured code.
+        assert!(f(bad, "Previous response with id 'resp_x' not found."));
+        assert!(f(bad, "previous_response_id 'resp_x' does not exist"));
+        assert!(f(StatusCode::NOT_FOUND, "previous_response_not_found"));
+    }
+
+    #[test]
+    fn does_not_fire_on_unrelated_errors() {
+        let bad = StatusCode::BAD_REQUEST;
+        // Other "not found" errors must not trigger a continuation-stripping retry.
+        assert!(!f(bad, "The model `gpt-x` does not exist or is not found"));
+        assert!(!f(bad, "Invalid value for 'previous_response_id'")); // bad VALUE, not missing
+        assert!(!f(
+            bad,
+            "previous_response_id is not supported for this model"
+        )); // Copilot-style unsupported, handled separately
+            // Non-4xx statuses never qualify.
+        assert!(!f(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "previous_response_not_found"
+        ));
+        assert!(!f(StatusCode::UNAUTHORIZED, "previous response not found"));
+    }
+}
+
 #[cfg(test)]
 mod reasoning_heuristic_tests {
     use super::looks_like_reasoning_unsupported_error as f;

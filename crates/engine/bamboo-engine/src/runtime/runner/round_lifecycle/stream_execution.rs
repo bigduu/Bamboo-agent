@@ -64,6 +64,35 @@ fn provider_supports_previous_response_id(provider_type: Option<&str>) -> bool {
     !matches!(provider_type.map(str::trim), Some("copilot"))
 }
 
+/// The engine's Responses-API request POLICY — store / verbosity / reasoning
+/// summary / include list — defined in ONE place so the continuation gate below
+/// and the planned request can never disagree about `store`.
+fn engine_responses_policy() -> ResponsesRequestOptions {
+    ResponsesRequestOptions {
+        store: Some(false),
+        // Encourage the model to emit visible narration alongside tool calls.
+        text_verbosity: Some("high".to_string()),
+        reasoning_summary: Some("auto".to_string()),
+        include: Some(vec!["reasoning.encrypted_content".to_string()]),
+        ..Default::default()
+    }
+}
+
+/// Whether the stateful Responses continuation (`previous_response_id`) may be
+/// used under the given request policy. Chaining requires the PREVIOUS turn to
+/// have been stored upstream: with `store=false` the upstream never persists a
+/// turn, so referencing its id on the next round fails with HTTP 400
+/// `invalid_request_error` / `previous_response_not_found`. Since the engine
+/// always sends the full input array alongside the id, omitting it under a
+/// stateless policy loses nothing. Copilot's HTTP /responses endpoint rejects
+/// the parameter outright, so it is excluded regardless of policy.
+fn responses_continuation_enabled(
+    policy: &ResponsesRequestOptions,
+    provider_type: Option<&str>,
+) -> bool {
+    policy.store == Some(true) && provider_supports_previous_response_id(provider_type)
+}
+
 fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
     let mut kinds = Vec::new();
     if error.is_timeout() {
@@ -604,14 +633,7 @@ fn plan_llm_request(
     // The engine sets request POLICY only. The Responses prompt wire view
     // (instructions / input_messages / previous_response_id) is derived by the
     // OpenAI/Copilot adapter from the IR via `responses_request_options`.
-    let responses_options = ResponsesRequestOptions {
-        store: Some(false),
-        // Encourage the model to emit visible narration alongside tool calls.
-        text_verbosity: Some("high".to_string()),
-        reasoning_summary: Some("auto".to_string()),
-        include: Some(vec!["reasoning.encrypted_content".to_string()]),
-        ..Default::default()
-    };
+    let responses_options = engine_responses_policy();
 
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
@@ -682,10 +704,14 @@ pub(super) async fn execute_llm_stream(
     let session_id = frame.session_id;
 
     let llm_started_at = std::time::Instant::now();
-    let supports_previous_response_id = provider_supports_previous_response_id(provider_type);
+    // Stateful chaining is gated on the request policy: a `store=false` turn is
+    // never persisted upstream, so its id must not be sent back (it would 400
+    // with `previous_response_not_found`) nor kept in session metadata.
+    let responses_policy = engine_responses_policy();
+    let continuation_enabled = responses_continuation_enabled(&responses_policy, provider_type);
     // Owned (not borrowed) so the immutable borrow of `session` ends here and the
     // drift diagnostic below can take `&mut session`.
-    let previous_response_id = if supports_previous_response_id {
+    let previous_response_id = if continuation_enabled {
         session_previous_response_id(session).map(str::to_string)
     } else {
         None
@@ -730,10 +756,11 @@ pub(super) async fn execute_llm_stream(
         reasoning_effort,
         tool_schemas.len(),
     );
-    if !supports_previous_response_id {
+    if !continuation_enabled {
         tracing::debug!(
-            "[{}] Responses API previous_response_id disabled for provider={}",
+            "[{}] Responses API previous_response_id disabled (store={:?}, provider={})",
             session_id,
+            responses_policy.store,
             provider_name.unwrap_or("unknown")
         );
     }
@@ -876,7 +903,7 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if supports_previous_response_id {
+    if continuation_enabled {
         if let Some(response_id) = stream_output
             .response_id
             .as_deref()

@@ -470,4 +470,129 @@ mod tests {
             );
         }
     }
+
+    /// #512: every prior route/allow-list test (`routes::tests`,
+    /// `is_api_path_covers_every_registered_version_prefix` above) exercises
+    /// `configure_routes`/`is_api_path` in isolation — never together, and
+    /// never with the `actix_files::Files` SPA-fallback service actually
+    /// mounted the way the real `run`/`run_with_bind_and_static_tls` server
+    /// factories mount it. That gap matters: `Files::new("/", ..)` is
+    /// registered LAST (after `.configure(configure_routes)`), and its
+    /// `default_handler` is the ONLY thing standing between an unmatched path
+    /// and the SPA `index.html`. A route-table assertion can't see that
+    /// interaction; only a real `test::call_service` against the exact same
+    /// composed `App` can. This test builds that composition (routes +
+    /// Files-with-`is_api_path`-gated-fallback, mirroring the closures in
+    /// `run_with_tls`/`run_with_bind_and_static_tls` above) and drives every
+    /// native-API prefix plus the SPA fallback through it end-to-end.
+    #[actix_web::test]
+    async fn full_app_assembly_forwards_every_api_prefix_and_still_serves_spa_fallback() {
+        use actix_web::dev::{fn_service, ServiceRequest, ServiceResponse};
+        use actix_web::http::StatusCode;
+        use actix_web::{test, App};
+
+        let static_dir = tempdir().unwrap();
+        let index_file = static_dir.path().join("index.html");
+        std::fs::write(&index_file, "<html>spa-fallback-marker</html>").unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .configure(crate::routes::configure_routes)
+                .service(
+                    fs::Files::new("/", static_dir.path())
+                        .index_file("index.html")
+                        .default_handler(fn_service(move |req: ServiceRequest| {
+                            let index_file = index_file.clone();
+                            async move {
+                                let path = req.path().to_string();
+                                if is_api_path(&path) {
+                                    let response = HttpResponse::NotFound().finish();
+                                    return Ok(ServiceResponse::new(req.into_parts().0, response));
+                                }
+                                let (http_req, _) = req.into_parts();
+                                match actix_files::NamedFile::open_async(index_file).await {
+                                    Ok(file) => Ok(ServiceResponse::new(
+                                        http_req.clone(),
+                                        file.into_response(&http_req),
+                                    )),
+                                    Err(_) => Ok(ServiceResponse::new(
+                                        http_req,
+                                        HttpResponse::NotFound().finish(),
+                                    )),
+                                }
+                            }
+                        })),
+                ),
+        )
+        .await;
+
+        // Every native-API prefix (legacy /v1 alias, canonical /api/v1, the
+        // /api/v1-nested session sub-resource alias, /v2, and the three
+        // provider-forwarding prefixes) must still reach ITS OWN handler, not
+        // get swallowed by the Files fallback registered after it.
+        for (method, uri) in [
+            ("GET", "/v1/bamboo/workflows"),
+            ("GET", "/api/v1/bamboo/workflows"),
+            ("GET", "/api/v1/sessions"),
+            ("GET", "/api/v1/sessions/does-not-exist/history"),
+            ("GET", "/api/v1/history/does-not-exist"),
+            ("GET", "/v2/stream"),
+            ("GET", "/openai/v1/models"),
+            ("GET", "/anthropic/v1/models"),
+            ("GET", "/gemini/v1beta/models"),
+        ] {
+            let req = test::TestRequest::with_uri(uri)
+                .method(method.parse().unwrap())
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {uri} must be routed to its real handler, not 404 via the SPA fallback"
+            );
+        }
+
+        // The two flat/nested session-history aliases must resolve to the SAME
+        // handler (both "session not found", not one 404-route/one 404-session).
+        let flat = test::TestRequest::get()
+            .uri("/api/v1/history/does-not-exist")
+            .to_request();
+        let flat_status = test::call_service(&app, flat).await.status();
+        let nested = test::TestRequest::get()
+            .uri("/api/v1/sessions/does-not-exist/history")
+            .to_request();
+        let nested_status = test::call_service(&app, nested).await.status();
+        assert_eq!(
+            flat_status, nested_status,
+            "flat and nested history aliases must behave identically"
+        );
+
+        // An unmatched path UNDER a real API prefix must 404 for real — it must
+        // NOT fall through to index.html just because Files is mounted at "/".
+        let bogus_api_req = test::TestRequest::get()
+            .uri("/api/v1/totally-not-a-real-route")
+            .to_request();
+        let bogus_api_resp = test::call_service(&app, bogus_api_req).await;
+        assert_eq!(
+            bogus_api_resp.status(),
+            StatusCode::NOT_FOUND,
+            "an unmatched /api/v1/* path must 404, not silently serve the SPA"
+        );
+
+        // A genuine frontend deep-link (not under any API prefix) must serve
+        // index.html via the SPA fallback, proving the fallback still works
+        // once every API scope above it has had its shot at matching first.
+        let spa_req = test::TestRequest::get()
+            .uri("/chat/some-deep-route")
+            .to_request();
+        let spa_resp = test::call_service(&app, spa_req).await;
+        assert_eq!(spa_resp.status(), StatusCode::OK);
+        let body = actix_web::body::to_bytes(spa_resp.into_body())
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("spa-fallback-marker"),
+            "non-API deep link must serve the SPA index.html"
+        );
+    }
 }

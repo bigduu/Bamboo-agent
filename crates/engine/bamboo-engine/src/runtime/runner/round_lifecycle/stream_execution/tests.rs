@@ -1511,7 +1511,13 @@ fn ir_responses_view_orders_guide_skill_conversation_and_lifts_system_to_instruc
 }
 
 #[tokio::test]
-async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
+async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_policy() {
+    // The engine's Responses policy is stateless (`store=false`): the upstream
+    // never persists a turn, so a chained `previous_response_id` is guaranteed to
+    // fail with `previous_response_not_found`. A session that still carries a
+    // stale id (persisted by a pre-fix build) must be sent as a FULL request with
+    // NO continuation, the stale id must be scrubbed from metadata, and the new
+    // response id must NOT be persisted for the next round.
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2", "test-model");
     session.metadata.insert(
@@ -1569,17 +1575,17 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), 1);
-    assert!(matches!(requested_messages[0].role, Role::Tool));
-    assert!(requested_messages
-        .iter()
-        .all(|message| !matches!(message.role, Role::System)));
+    // FULL request (no continuation delta): system field + whole conversation.
+    assert_eq!(requested_messages.len(), 4);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert!(matches!(requested_messages[3].role, Role::Tool));
+    // The stale id is NOT sent to the provider.
     assert_eq!(
         llm.requested_previous_response_id
             .lock()
             .expect("previous_response_id lock")
             .as_deref(),
-        Some("resp_prev")
+        None
     );
     assert_eq!(
         llm.requested_instructions
@@ -1617,20 +1623,60 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
             .as_deref(),
         Some("session-stream-2")
     );
+    // The stream still surfaces the upstream response id, but under a stateless
+    // store policy the engine neither keeps the stale id nor persists the new
+    // one — the metadata key is scrubbed entirely.
     assert_eq!(stream_output.response_id.as_deref(), Some("resp_next"));
-    assert_eq!(
-        session
-            .metadata
-            .get("responses.previous_response_id")
-            .map(String::as_str),
-        Some("resp_next")
-    );
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+}
+
+#[test]
+fn responses_continuation_enabled_requires_store_true_and_supported_provider() {
+    use bamboo_llm::provider::ResponsesRequestOptions;
+
+    // The engine's shipped policy is stateless — this is the invariant that
+    // guarantees no `previous_response_id` ever rides a `store=false` turn
+    // (OpenAI rejects that with 400 `previous_response_not_found`).
+    let shipped = super::engine_responses_policy();
+    assert_eq!(shipped.store, Some(false));
+    assert!(!super::responses_continuation_enabled(
+        &shipped,
+        Some("openai")
+    ));
+
+    // A stateful (store=true) policy re-enables chaining for providers that
+    // support the parameter…
+    let stateful = ResponsesRequestOptions {
+        store: Some(true),
+        ..Default::default()
+    };
+    assert!(super::responses_continuation_enabled(
+        &stateful,
+        Some("openai")
+    ));
+    assert!(super::responses_continuation_enabled(&stateful, None));
+    // …but never for Copilot, whose HTTP /responses endpoint rejects it.
+    assert!(!super::responses_continuation_enabled(
+        &stateful,
+        Some("copilot")
+    ));
+
+    // store unset defaults to the stateless wire value (false) → disabled.
+    let unset = ResponsesRequestOptions::default();
+    assert!(!super::responses_continuation_enabled(
+        &unset,
+        Some("openai")
+    ));
 }
 
 #[tokio::test]
-async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block() {
+async fn execute_llm_stream_includes_external_memory_volatile_block() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2a", "test-model");
+    // A stale continuation id may still be present (pre-fix persistence); under
+    // the stateless store policy it is ignored and the request is sent in full.
     session.metadata.insert(
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
@@ -1692,21 +1738,31 @@ async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block(
         .lock()
         .expect("messages lock")
         .clone();
-    // Volatile context (external memory) is re-sent in the delta but now at the
-    // tail, after the conversation continuation.
-    assert_eq!(requested_messages.len(), 2);
-    assert!(matches!(requested_messages[0].role, Role::Tool));
-    assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
+    // Full request: system field, whole conversation, then the volatile external
+    // memory block at the tail (out of the cacheable prefix).
+    assert_eq!(requested_messages.len(), 5);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert!(matches!(requested_messages[3].role, Role::Tool));
+    assert!(matches!(requested_messages[4].role, Role::User));
+    assert!(requested_messages[4]
         .content
         .contains("context_type: external_memory"));
-    assert!(requested_messages[1].content.contains("Session note body"));
+    assert!(requested_messages[4].content.contains("Session note body"));
+    // The stale continuation id was ignored, not forwarded.
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
 }
 
 #[tokio::test]
-async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_blocks() {
+async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2plan", "test-model");
+    // Stale continuation id: ignored under the stateless store policy.
     session.metadata.insert(
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
@@ -1777,29 +1833,31 @@ async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_
         .lock()
         .expect("messages lock")
         .clone();
-    // Conversation continuation first, then the volatile plan blocks at the tail
-    // (in push order: plan_runtime, then plan_mode).
-    assert_eq!(requested_messages.len(), 3);
-    assert!(matches!(requested_messages[0].role, Role::Tool));
-    assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
+    // Full request: system field + conversation, then the volatile plan blocks
+    // at the tail (in push order: plan_runtime, then plan_mode).
+    assert_eq!(requested_messages.len(), 6);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert!(matches!(requested_messages[3].role, Role::Tool));
+    assert!(matches!(requested_messages[4].role, Role::User));
+    assert!(requested_messages[4]
         .content
         .contains("context_type: plan_runtime_state"));
-    assert!(requested_messages[1]
+    assert!(requested_messages[4]
         .content
         .contains("DURABLE PLAN EXECUTION CONTEXT"));
-    assert!(matches!(requested_messages[2].role, Role::User));
-    assert!(requested_messages[2]
+    assert!(matches!(requested_messages[5].role, Role::User));
+    assert!(requested_messages[5]
         .content
         .contains("context_type: plan_mode_state"));
-    assert!(requested_messages[2].content.contains("PLAN MODE ACTIVE"));
+    assert!(requested_messages[5].content.contains("PLAN MODE ACTIVE"));
 }
 
 #[tokio::test]
-async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_compression_is_active()
-{
+async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_active() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2b", "test-model");
+    // Stale continuation id: ignored under the stateless store policy — the
+    // request rides the full lanes wire with the summary as dynamic context.
     session.metadata.insert(
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
@@ -1861,26 +1919,30 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), 3);
-    assert!(matches!(requested_messages[0].role, Role::User));
-    assert!(requested_messages[0]
+    // Full request: system field, the summary as dynamic context, then the whole
+    // (compressed) conversation window.
+    assert_eq!(requested_messages.len(), 6);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert!(matches!(requested_messages[1].role, Role::User));
+    assert!(requested_messages[1]
         .content
         .contains("context_type: conversation_summary"));
-    assert!(requested_messages[0]
+    assert!(requested_messages[1]
         .content
         .contains("Older work has been summarized locally."));
-    assert!(matches!(requested_messages[1].role, Role::User));
+    assert!(matches!(requested_messages[2].role, Role::User));
     assert_eq!(
-        requested_messages[1].content,
-        "continue from the compressed state"
+        requested_messages[2].content,
+        "previous work was compressed"
     );
-    assert!(matches!(requested_messages[2].role, Role::Tool));
+    assert!(matches!(requested_messages[5].role, Role::Tool));
+    // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
             .lock()
             .expect("previous_response_id lock")
             .as_deref(),
-        Some("resp_prev")
+        None
     );
     assert_eq!(
         llm.requested_instructions

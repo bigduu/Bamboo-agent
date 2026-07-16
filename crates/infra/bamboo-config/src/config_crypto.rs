@@ -615,55 +615,26 @@ impl Config {
         restore_env_key!(gemini);
     }
 
-    /// Defense-in-depth carry-forward for provider-instance keys (#515),
-    /// mirroring [`Config::preserve_env_sourced_provider_keys`].
+    /// Re-encrypt every secret domain's `*_encrypted` field from current
+    /// in-memory plaintext, without the disk-only sanitization steps.
     ///
-    /// `build_merged_config`'s serde round-trip drops the
-    /// `#[serde(skip_serializing)]` plaintext `api_key`; hydration then
-    /// restores it from `api_key_encrypted` if that ciphertext survived the
-    /// merge. Normally it does — clients can never patch
-    /// `api_key_encrypted` directly (stripped by `sanitize_root_patch`), and
-    /// `deep_merge_json` only overwrites keys actually present in the patch,
-    /// so an unrelated save (or even an explicit `api_key` clear, which only
-    /// ever touches the plaintext field in the patch) always leaves the
-    /// previous ciphertext in the merged JSON.
-    ///
-    /// This only matters when that invariant has *already* been broken
-    /// elsewhere and `self` ends up with an instance that has NEITHER a
-    /// plaintext `api_key` NOR `api_key_encrypted` after the merge+hydrate
-    /// above, while `previous` (the live config from before this merge) still
-    /// has the ciphertext — e.g. a provider-instance create/update whose
-    /// in-memory ciphertext wasn't refreshed to match what was persisted to
-    /// disk. In that case, copy the ciphertext (and re-hydrate the
-    /// plaintext) back from `previous` rather than silently wiping it.
-    ///
-    /// Never fires for a genuine explicit clear: a client-issued
-    /// `api_key: ""` patch always leaves `previous`'s ciphertext intact
-    /// through the merge (see above), so `self` already has
-    /// `api_key_encrypted` set by the time this runs and the "neither field
-    /// present" condition below is false.
-    pub fn preserve_provider_instance_encrypted_keys(&mut self, previous: &Config) {
-        for (id, instance) in self.provider_instances.iter_mut() {
-            if !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some() {
-                continue;
-            }
-            let Some(prev_encrypted) = previous
-                .provider_instances
-                .get(id)
-                .and_then(|prev| prev.api_key_encrypted.as_deref())
-            else {
-                continue;
-            };
-
-            instance.api_key_encrypted = Some(prev_encrypted.to_string());
-            match crate::encryption::decrypt(prev_encrypted) {
-                Ok(value) => instance.api_key = value,
-                Err(e) => tracing::warn!(
-                    instance_id = id,
-                    "Failed to decrypt api_key while restoring dropped ciphertext: {}",
-                    e
-                ),
-            }
-        }
+    /// `Config::save_to_dir` runs these refreshes on a save-time clone, so the
+    /// live in-memory config never sees the resulting ciphertext: a provider
+    /// instance created over HTTP keeps `api_key_encrypted: None` in memory for
+    /// the rest of the session. Any code that then serializes the live config
+    /// and deserializes it back — the settings-PATCH merge in
+    /// `config_manager::build_merged_config` — drops the
+    /// `#[serde(skip_serializing)]` plaintext and is left with neither field,
+    /// permanently losing the key on the next persist (#516). Call this after
+    /// mutating the live config so ciphertext stays in sync with plaintext.
+    pub fn refresh_encrypted_secrets(&mut self) -> Result<()> {
+        self.refresh_proxy_auth_encrypted()?;
+        self.refresh_provider_api_keys_encrypted()?;
+        self.refresh_provider_instance_api_keys_encrypted()?;
+        self.refresh_env_vars_encrypted()?;
+        self.refresh_cluster_fabric_encrypted()?;
+        self.refresh_notifications_encrypted()?;
+        self.refresh_connect_platform_tokens_encrypted()?;
+        Ok(())
     }
 }
