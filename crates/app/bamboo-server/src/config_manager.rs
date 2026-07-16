@@ -26,11 +26,14 @@ use bamboo_llm::Config;
 // Re-export pure domain logic from the config crate so server consumers
 // can import through `config_manager`.
 pub use bamboo_config::patch::{
-    clear_provider_ciphertext_for_explicit_clears, deep_merge_json, domains_for_root_patch,
-    effects_for_root_patch, is_masked_api_key, preserve_masked_connect_secrets,
-    preserve_masked_notification_secrets, preserve_masked_provider_api_keys,
-    preserve_unpatched_provider_secrets, provider_api_key_intents, sanitize_root_patch,
-    DomainChanges, PatchEffects, ReloadMode,
+    clear_connect_ciphertext_for_explicit_clears,
+    clear_notification_ciphertext_for_explicit_clears,
+    clear_provider_ciphertext_for_explicit_clears, connect_secret_intents, deep_merge_json,
+    domains_for_root_patch, effects_for_root_patch, is_masked_api_key, notification_secret_intents,
+    preserve_masked_connect_secrets, preserve_masked_notification_secrets,
+    preserve_masked_provider_api_keys, preserve_unpatched_provider_secrets,
+    provider_api_key_intents, sanitize_root_patch, ConnectSecretIntents, DomainChanges,
+    NotificationSecretIntents, PatchEffects, ReloadMode,
 };
 
 pub fn sync_provider_api_keys_encrypted_for_patch(
@@ -149,6 +152,11 @@ pub fn build_merged_config(
     // this patch explicitly sets or clears — those must NOT get their dropped
     // key carried forward below (#516).
     let api_key_intents = provider_api_key_intents(&patch_obj);
+    // Same capture for the other secret domains that flow through this merge
+    // (#521 — ntfy `token` / Bark `device_key` / connect `token` and Feishu
+    // `app_secret`): must be read before the patch is consumed below.
+    let notification_intents = notification_secret_intents(&patch_obj);
+    let connect_intents = connect_secret_intents(&patch_obj);
 
     let mut merged = serde_json::to_value(current)
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to serialize config: {e}")))?;
@@ -161,6 +169,10 @@ pub fn build_merged_config(
     // BEFORE hydration — otherwise hydration refills the plaintext from it and
     // the subsequent sync/save re-encrypts, silently undoing the clear (#516).
     clear_provider_ciphertext_for_explicit_clears(&mut new_config, &api_key_intents);
+    // Same treatment for notification/connect secrets (#521) — same rationale,
+    // same ordering requirement (before hydration below).
+    clear_notification_ciphertext_for_explicit_clears(&mut new_config, &notification_intents);
+    clear_connect_ciphertext_for_explicit_clears(&mut new_config, &connect_intents);
     new_config.hydrate_proxy_auth_from_encrypted();
     new_config.hydrate_provider_api_keys_from_encrypted();
     new_config.hydrate_provider_instance_api_keys_from_encrypted();
@@ -397,5 +409,261 @@ mod tests {
             Some(prev_ciphertext.as_str()),
             "ciphertext must survive an unrelated save"
         );
+    }
+
+    // ── #521: full-pipeline coverage for notification secrets ──────────
+    //
+    // Mirrors set_bamboo_config's actual call order: preserve_masked_* first
+    // (mutating the patch against `current`), THEN build_merged_config, THEN
+    // the post-merge re-encrypt (`refresh_notifications_encrypted`, run in
+    // production by `Config::refresh_encrypted_secrets` inside
+    // `AppState::update_config`).
+
+    fn config_with_notification_secrets(ntfy_token: &str, bark_key: &str) -> Config {
+        let mut config = Config::default();
+        config.notifications.ntfy.token = Some(ntfy_token.to_string());
+        config.notifications.bark.device_key = Some(bark_key.to_string());
+        config.refresh_encrypted_secrets().expect("refresh");
+        config
+    }
+
+    fn merge_notifications_patch(current: &Config, patch_json: &str) -> Config {
+        let mut patch_obj: Map<String, Value> = serde_json::from_str(patch_json).unwrap();
+        preserve_masked_notification_secrets(&mut patch_obj, current);
+        let mut merged = build_merged_config(current, patch_obj).expect("merge");
+        merged.refresh_encrypted_secrets().expect("refresh");
+        merged
+    }
+
+    #[test]
+    fn explicit_notification_secret_clear_wins_over_in_memory_ciphertext() {
+        let current = config_with_notification_secrets("ntfy-secret", "bark-secret");
+        assert!(current.notifications.ntfy.token_encrypted.is_some());
+        assert!(current.notifications.bark.device_key_encrypted.is_some());
+
+        let merged = merge_notifications_patch(
+            &current,
+            r#"{"notifications":{"ntfy":{"token":""},"bark":{"device_key":""}}}"#,
+        );
+
+        assert!(
+            merged
+                .notifications
+                .ntfy
+                .token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "explicit clear must win"
+        );
+        assert!(
+            merged.notifications.ntfy.token_encrypted.is_none(),
+            "ciphertext must be cleared too (#521)"
+        );
+        assert!(merged
+            .notifications
+            .bark
+            .device_key
+            .as_deref()
+            .unwrap_or("")
+            .is_empty());
+        assert!(merged.notifications.bark.device_key_encrypted.is_none());
+    }
+
+    #[test]
+    fn unrelated_patch_preserves_notification_secrets() {
+        // NOTE: unlike providers (whose ciphertext is only touched by the
+        // explicit-intent-gated `sync_provider_api_keys_encrypted_for_patch`),
+        // notification ciphertext is unconditionally recomputed by
+        // `refresh_encrypted_secrets` on every write (pre-existing,
+        // out-of-scope-for-#521 design) — so only plaintext survival and
+        // ciphertext presence are asserted, not exact ciphertext bytes.
+        let current = config_with_notification_secrets("ntfy-secret", "bark-secret");
+
+        let merged =
+            merge_notifications_patch(&current, r#"{"http_proxy":"http://example.invalid:8080"}"#);
+
+        assert_eq!(
+            merged.notifications.ntfy.token.as_deref(),
+            Some("ntfy-secret"),
+            "an unrelated settings PATCH must not lose the ntfy token"
+        );
+        assert!(merged.notifications.ntfy.token_encrypted.is_some());
+        assert_eq!(
+            merged.notifications.bark.device_key.as_deref(),
+            Some("bark-secret"),
+            "an unrelated settings PATCH must not lose the Bark device key"
+        );
+        assert!(merged.notifications.bark.device_key_encrypted.is_some());
+    }
+
+    #[test]
+    fn masked_notification_secret_placeholder_preserves_value() {
+        let current = config_with_notification_secrets("ntfy-secret", "bark-secret");
+
+        let merged = merge_notifications_patch(
+            &current,
+            r#"{"notifications":{"ntfy":{"token":"****...****"},"bark":{"device_key":"****...****"}}}"#,
+        );
+
+        assert_eq!(
+            merged.notifications.ntfy.token.as_deref(),
+            Some("ntfy-secret")
+        );
+        assert!(merged.notifications.ntfy.token_encrypted.is_some());
+        assert_eq!(
+            merged.notifications.bark.device_key.as_deref(),
+            Some("bark-secret")
+        );
+        assert!(merged.notifications.bark.device_key_encrypted.is_some());
+    }
+
+    #[test]
+    fn new_notification_secret_value_replaces_and_encrypts() {
+        let current = config_with_notification_secrets("ntfy-old", "bark-old");
+
+        let merged = merge_notifications_patch(
+            &current,
+            r#"{"notifications":{"ntfy":{"token":"ntfy-new"},"bark":{"device_key":"bark-new"}}}"#,
+        );
+
+        assert_eq!(merged.notifications.ntfy.token.as_deref(), Some("ntfy-new"));
+        assert!(merged.notifications.ntfy.token_encrypted.is_some());
+        assert_eq!(
+            merged.notifications.bark.device_key.as_deref(),
+            Some("bark-new")
+        );
+        assert!(merged.notifications.bark.device_key_encrypted.is_some());
+    }
+
+    // ── #521: full-pipeline coverage for connect platform secrets ──────
+
+    fn config_with_connect_platform(platform_type: &str, token: &str) -> Config {
+        let mut config = Config::default();
+        let platform: bamboo_config::ConnectPlatformConfig =
+            serde_json::from_value(serde_json::json!({
+                "type": platform_type,
+                "token": token,
+            }))
+            .expect("valid platform");
+        config.connect.platforms = vec![platform];
+        config.refresh_encrypted_secrets().expect("refresh");
+        config
+    }
+
+    fn merge_connect_patch(current: &Config, patch_json: &str) -> Config {
+        let mut patch_obj: Map<String, Value> = serde_json::from_str(patch_json).unwrap();
+        preserve_masked_connect_secrets(&mut patch_obj, current);
+        let mut merged = build_merged_config(current, patch_obj).expect("merge");
+        merged.refresh_encrypted_secrets().expect("refresh");
+        merged
+    }
+
+    #[test]
+    fn explicit_connect_token_clear_wins_over_in_memory_ciphertext() {
+        let current = config_with_connect_platform("telegram", "tg-secret-token");
+        assert!(current.connect.platforms[0].token_encrypted.is_some());
+
+        let merged = merge_connect_patch(
+            &current,
+            r#"{"connect":{"platforms":[{"type":"telegram","token":""}]}}"#,
+        );
+
+        assert!(
+            merged.connect.platforms[0]
+                .token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "explicit clear must win"
+        );
+        assert!(
+            merged.connect.platforms[0].token_encrypted.is_none(),
+            "ciphertext must be cleared too (#521)"
+        );
+    }
+
+    #[test]
+    fn explicit_connect_app_secret_clear_wins_over_in_memory_ciphertext() {
+        let mut current = Config::default();
+        let platform: bamboo_config::ConnectPlatformConfig =
+            serde_json::from_value(serde_json::json!({
+                "type": "feishu",
+                "app_id": "cli_x",
+                "app_secret": "feishu-secret",
+            }))
+            .expect("valid platform");
+        current.connect.platforms = vec![platform];
+        current.refresh_encrypted_secrets().expect("refresh");
+        assert!(current.connect.platforms[0].app_secret_encrypted.is_some());
+
+        let merged = merge_connect_patch(
+            &current,
+            r#"{"connect":{"platforms":[{"type":"feishu","app_id":"cli_x","app_secret":""}]}}"#,
+        );
+
+        assert!(
+            merged.connect.platforms[0]
+                .app_secret
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "explicit clear must win"
+        );
+        assert!(
+            merged.connect.platforms[0].app_secret_encrypted.is_none(),
+            "ciphertext must be cleared too (#521)"
+        );
+    }
+
+    #[test]
+    fn unrelated_patch_preserves_connect_token() {
+        // Same NOTE as `unrelated_patch_preserves_notification_secrets`: connect
+        // ciphertext is unconditionally recomputed by `refresh_encrypted_secrets`
+        // on every write, so only plaintext survival + ciphertext presence are
+        // asserted.
+        let current = config_with_connect_platform("telegram", "tg-secret-token");
+
+        let merged =
+            merge_connect_patch(&current, r#"{"http_proxy":"http://example.invalid:8080"}"#);
+
+        assert_eq!(
+            merged.connect.platforms[0].token.as_deref(),
+            Some("tg-secret-token"),
+            "an unrelated settings PATCH must not lose the connect platform token"
+        );
+        assert!(merged.connect.platforms[0].token_encrypted.is_some());
+    }
+
+    #[test]
+    fn masked_connect_token_placeholder_preserves_value() {
+        let current = config_with_connect_platform("telegram", "tg-secret-token");
+
+        let merged = merge_connect_patch(
+            &current,
+            r#"{"connect":{"platforms":[{"type":"telegram","token":"****...****"}]}}"#,
+        );
+
+        assert_eq!(
+            merged.connect.platforms[0].token.as_deref(),
+            Some("tg-secret-token")
+        );
+        assert!(merged.connect.platforms[0].token_encrypted.is_some());
+    }
+
+    #[test]
+    fn new_connect_token_value_replaces_and_encrypts() {
+        let current = config_with_connect_platform("telegram", "tg-old-token");
+
+        let merged = merge_connect_patch(
+            &current,
+            r#"{"connect":{"platforms":[{"type":"telegram","token":"tg-new-token"}]}}"#,
+        );
+
+        assert_eq!(
+            merged.connect.platforms[0].token.as_deref(),
+            Some("tg-new-token")
+        );
+        assert!(merged.connect.platforms[0].token_encrypted.is_some());
     }
 }

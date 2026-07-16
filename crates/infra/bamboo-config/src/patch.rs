@@ -474,6 +474,188 @@ pub fn clear_provider_ciphertext_for_explicit_clears(
     }
 }
 
+/// Extract notification-channel secret update intents (ntfy `token`, Bark
+/// `device_key`) from a config patch.
+///
+/// Mirrors [`provider_api_key_intents`]: masked placeholders are ignored
+/// (they signal "keep existing secret"); an explicit empty string is a
+/// genuine intent (a clear), same as a genuine new value (a set). Must be
+/// read from the patch AFTER [`preserve_masked_notification_secrets`] has
+/// resolved masked placeholders — same calling convention as the provider
+/// intents (#521).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationSecretIntents {
+    pub ntfy_token: bool,
+    pub bark_device_key: bool,
+}
+
+pub fn notification_secret_intents(patch_obj: &Map<String, Value>) -> NotificationSecretIntents {
+    let mut intents = NotificationSecretIntents::default();
+
+    let Some(notifications) = patch_obj.get("notifications").and_then(|v| v.as_object()) else {
+        return intents;
+    };
+
+    if let Some(token) = notifications
+        .get("ntfy")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("token"))
+        .and_then(|v| v.as_str())
+    {
+        if !is_masked_api_key(token) {
+            intents.ntfy_token = true;
+        }
+    }
+
+    if let Some(device_key) = notifications
+        .get("bark")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("device_key"))
+        .and_then(|v| v.as_str())
+    {
+        if !is_masked_api_key(device_key) {
+            intents.bark_device_key = true;
+        }
+    }
+
+    intents
+}
+
+/// Make an explicit `token: ""` / `device_key: ""` clear actually clear.
+///
+/// Generalizes [`clear_provider_ciphertext_for_explicit_clears`] (#521) to
+/// notification-channel secrets: `notifications.ntfy.token_encrypted` /
+/// `notifications.bark.device_key_encrypted` are NOT `skip_serializing` (only
+/// `skip_serializing_if = "Option::is_none"`), so the merge round-trip in
+/// `config_manager::build_merged_config` carries the live config's ciphertext
+/// straight into the merged value even when the patch explicitly cleared the
+/// plaintext. `hydrate_notifications_from_encrypted` would then refill the
+/// plaintext from that ciphertext, and the subsequent
+/// `Config::refresh_notifications_encrypted` (which deliberately preserves
+/// ciphertext when plaintext is empty, #268) would leave it in place —
+/// silently undoing the clear. For every field the patch explicitly touched
+/// whose merged plaintext is empty (a clear, not a set), drop the
+/// round-tripped ciphertext BEFORE hydration so nothing refills it.
+pub fn clear_notification_ciphertext_for_explicit_clears(
+    merged: &mut Config,
+    intents: &NotificationSecretIntents,
+) {
+    if intents.ntfy_token
+        && merged
+            .notifications
+            .ntfy
+            .token
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        merged.notifications.ntfy.token_encrypted = None;
+    }
+
+    if intents.bark_device_key
+        && merged
+            .notifications
+            .bark
+            .device_key
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        merged.notifications.bark.device_key_encrypted = None;
+    }
+}
+
+/// Extract bamboo-connect platform secret update intents (`token`,
+/// `app_secret`) from a config patch, keyed by the platform's position in the
+/// patch's `connect.platforms` array.
+///
+/// `connect.platforms` is a full-array replace (the settings UI always
+/// round-trips the whole list back in the same order it was fetched in — see
+/// [`preserve_masked_connect_secrets`]'s module docs), so
+/// `config_manager::build_merged_config`'s merged `connect.platforms[i]`
+/// always originates verbatim from the patch's `connect.platforms[i]` —
+/// position `i` in the patch and position `i` in the merged config always
+/// refer to the same logical entry, regardless of how that entry's position
+/// relates to `current.connect.platforms` (id/type resolution, #490/#492/#496,
+/// happens earlier and only rewrites the VALUE at a given patch index, never
+/// its position). Masked placeholders are ignored — mirrors
+/// [`provider_api_key_intents`]; must be read from the patch AFTER
+/// [`preserve_masked_connect_secrets`] has resolved them (#521).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectSecretIntents {
+    pub token: std::collections::BTreeSet<usize>,
+    pub app_secret: std::collections::BTreeSet<usize>,
+}
+
+pub fn connect_secret_intents(patch_obj: &Map<String, Value>) -> ConnectSecretIntents {
+    let mut intents = ConnectSecretIntents::default();
+
+    let Some(platforms) = patch_obj
+        .get("connect")
+        .and_then(|c| c.get("platforms"))
+        .and_then(|v| v.as_array())
+    else {
+        return intents;
+    };
+
+    for (index, platform) in platforms.iter().enumerate() {
+        let Some(obj) = platform.as_object() else {
+            continue;
+        };
+
+        if let Some(token) = obj.get("token").and_then(|v| v.as_str()) {
+            if !is_masked_api_key(token) {
+                intents.token.insert(index);
+            }
+        }
+
+        if let Some(app_secret) = obj.get("app_secret").and_then(|v| v.as_str()) {
+            if !is_masked_api_key(app_secret) {
+                intents.app_secret.insert(index);
+            }
+        }
+    }
+
+    intents
+}
+
+/// Make an explicit `token: ""` / `app_secret: ""` clear actually clear.
+///
+/// Generalizes [`clear_provider_ciphertext_for_explicit_clears`] (#521) to
+/// bamboo-connect platform secrets — same rationale as
+/// [`clear_notification_ciphertext_for_explicit_clears`]:
+/// `token_encrypted`/`app_secret_encrypted` are not `skip_serializing`, so an
+/// explicit clear's round-tripped ciphertext must be dropped BEFORE
+/// hydration or it silently refills the plaintext hydration cleared.
+pub fn clear_connect_ciphertext_for_explicit_clears(
+    merged: &mut Config,
+    intents: &ConnectSecretIntents,
+) {
+    for &index in intents.token.iter() {
+        if let Some(platform) = merged.connect.platforms.get_mut(index) {
+            if platform.token.as_deref().unwrap_or("").trim().is_empty() {
+                platform.token_encrypted = None;
+            }
+        }
+    }
+
+    for &index in intents.app_secret.iter() {
+        if let Some(platform) = merged.connect.platforms.get_mut(index) {
+            if platform
+                .app_secret
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                platform.app_secret_encrypted = None;
+            }
+        }
+    }
+}
+
 /// Replace masked notification-channel secret placeholders (ntfy `token`, Bark
 /// `device_key`) in a patch with the current config's plaintext values.
 ///
@@ -885,6 +1067,176 @@ mod tests {
             merged.provider_instances["uuid-2"]
                 .api_key_encrypted
                 .as_deref(),
+            Some("kept-ct")
+        );
+    }
+
+    // ── #521: notification-secret clear intent ─────────────────────────
+
+    #[test]
+    fn notification_secret_intents_ignores_masked_placeholders() {
+        let patch = json!({
+            "notifications": {
+                "ntfy": { "token": "****...****" },
+                "bark": { "device_key": "tk-real-new-value" }
+            }
+        });
+        let intents = notification_secret_intents(patch.as_object().unwrap());
+        assert!(!intents.ntfy_token, "masked placeholder is not an intent");
+        assert!(intents.bark_device_key, "a real value is an intent");
+    }
+
+    #[test]
+    fn notification_secret_intents_detects_explicit_clear() {
+        let patch = json!({
+            "notifications": {
+                "ntfy": { "token": "" },
+                "bark": { "device_key": "" }
+            }
+        });
+        let intents = notification_secret_intents(patch.as_object().unwrap());
+        assert!(intents.ntfy_token, "empty string is a clear intent");
+        assert!(intents.bark_device_key, "empty string is a clear intent");
+    }
+
+    #[test]
+    fn notification_secret_intents_empty_when_untouched() {
+        let patch = json!({ "notifications": { "ntfy": { "enabled": true } } });
+        let intents = notification_secret_intents(patch.as_object().unwrap());
+        assert!(!intents.ntfy_token);
+        assert!(!intents.bark_device_key);
+    }
+
+    #[test]
+    fn clear_notification_ciphertext_drops_roundtripped_ciphertext_on_clear_intents() {
+        // Merged state right after deserialization of a clear patch: empty
+        // plaintext from the patch, ciphertext carried over by the round-trip
+        // of the live config. Hydration must find nothing to refill (#521).
+        let mut merged = Config::default();
+        merged.notifications.ntfy.token = None;
+        merged.notifications.ntfy.token_encrypted = Some("roundtripped-ntfy-ct".to_string());
+        merged.notifications.bark.device_key = None;
+        merged.notifications.bark.device_key_encrypted = Some("roundtripped-bark-ct".to_string());
+
+        let intents = NotificationSecretIntents {
+            ntfy_token: true,
+            bark_device_key: true,
+        };
+        clear_notification_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert!(merged.notifications.ntfy.token_encrypted.is_none());
+        assert!(merged.notifications.bark.device_key_encrypted.is_none());
+    }
+
+    #[test]
+    fn clear_notification_ciphertext_leaves_set_intents_and_unpatched_alone() {
+        let mut merged = Config::default();
+        // A SET intent (non-empty merged plaintext) keeps its ciphertext — the
+        // later refresh overwrites it with the new value's encryption.
+        merged.notifications.ntfy.token = Some("brand-new-token".to_string());
+        merged.notifications.ntfy.token_encrypted = Some("stale-ct".to_string());
+        // No intent at all: untouched regardless of plaintext/ciphertext state.
+        merged.notifications.bark.device_key = None;
+        merged.notifications.bark.device_key_encrypted = Some("kept-ct".to_string());
+
+        let intents = NotificationSecretIntents {
+            ntfy_token: true,
+            bark_device_key: false,
+        };
+        clear_notification_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert_eq!(
+            merged.notifications.ntfy.token_encrypted.as_deref(),
+            Some("stale-ct")
+        );
+        assert_eq!(
+            merged.notifications.bark.device_key_encrypted.as_deref(),
+            Some("kept-ct")
+        );
+    }
+
+    // ── #521: connect-secret clear intent ───────────────────────────────
+
+    #[test]
+    fn connect_secret_intents_ignores_masked_and_detects_clear_by_position() {
+        let patch = json!({
+            "connect": {
+                "platforms": [
+                    { "type": "telegram", "token": "****...****" },
+                    { "type": "telegram", "token": "" },
+                    { "type": "feishu", "app_secret": "real-new-secret" }
+                ]
+            }
+        });
+        let intents = connect_secret_intents(patch.as_object().unwrap());
+        assert!(
+            !intents.token.contains(&0),
+            "masked placeholder is not an intent"
+        );
+        assert!(intents.token.contains(&1), "empty string is a clear intent");
+        assert!(intents.app_secret.contains(&2), "a real value is an intent");
+    }
+
+    #[test]
+    fn connect_secret_intents_empty_when_no_platforms_patched() {
+        let patch = json!({ "http_proxy": "http://example.invalid:8080" });
+        let intents = connect_secret_intents(patch.as_object().unwrap());
+        assert!(intents.token.is_empty());
+        assert!(intents.app_secret.is_empty());
+    }
+
+    #[test]
+    fn clear_connect_ciphertext_drops_roundtripped_ciphertext_on_clear_intents() {
+        // Merged state right after deserialization of a clear patch: empty
+        // plaintext, ciphertext carried over by the round-trip of the live
+        // config at the SAME position the patch's full-array-replace put it
+        // (#521).
+        let mut merged = Config::default();
+        merged.connect.platforms = vec![
+            connect_platform("telegram", ""), // will be overwritten below
+            feishu_platform(""),
+        ];
+        merged.connect.platforms[0].token = None;
+        merged.connect.platforms[0].token_encrypted = Some("roundtripped-token-ct".to_string());
+        merged.connect.platforms[1].app_secret = None;
+        merged.connect.platforms[1].app_secret_encrypted =
+            Some("roundtripped-secret-ct".to_string());
+
+        let mut intents = ConnectSecretIntents::default();
+        intents.token.insert(0);
+        intents.app_secret.insert(1);
+
+        clear_connect_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert!(merged.connect.platforms[0].token_encrypted.is_none());
+        assert!(merged.connect.platforms[1].app_secret_encrypted.is_none());
+    }
+
+    #[test]
+    fn clear_connect_ciphertext_leaves_set_intents_and_unpatched_alone() {
+        let mut merged = Config::default();
+        merged.connect.platforms = vec![connect_platform("telegram", "brand-new-token")];
+        merged.connect.platforms[0].token_encrypted = Some("stale-ct".to_string());
+        // A second platform with no clear intent (untouched by the patch)
+        // must keep its ciphertext regardless of its plaintext state.
+        merged
+            .connect
+            .platforms
+            .push(connect_platform("feishu", ""));
+        merged.connect.platforms[1].token = None;
+        merged.connect.platforms[1].token_encrypted = Some("kept-ct".to_string());
+
+        let mut intents = ConnectSecretIntents::default();
+        intents.token.insert(0);
+
+        clear_connect_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert_eq!(
+            merged.connect.platforms[0].token_encrypted.as_deref(),
+            Some("stale-ct")
+        );
+        assert_eq!(
+            merged.connect.platforms[1].token_encrypted.as_deref(),
             Some("kept-ct")
         );
     }
