@@ -12,13 +12,43 @@
 #   /lib/.../libc.so.6: version `GLIBC_2.39' not found
 # Keep builder+runtime aligned to avoid glibc ABI mismatches.
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm AS chef
+
+# cargo-chef splits the build into a dependency layer (cached across
+# source-only changes) and a workspace layer. Without it, `COPY . .`
+# immediately before `cargo build` invalidates the single build layer on ANY
+# source change, forcing a full recompile of ~25 workspace crates' worth of
+# dependencies every time (worsened by `lto = true` + `opt-level = 3`). Pinned
+# version, `--locked`, matches the repo's build reproducibility conventions.
+RUN cargo install cargo-chef --version 0.1.77 --locked
 
 WORKDIR /app
 
-# Copy the full workspace. `.dockerignore` keeps target/ and .git out;
-# builtin_skills/ is embedded by bamboo-skills' build.rs (include_bytes!), so it
-# must stay in the build context (do NOT exclude **/*.md).
+FROM chef AS planner
+
+# `.dockerignore` keeps target/ and .git out; builtin_skills/ is embedded by
+# bamboo-skills' build.rs (include_bytes!), so it must stay in the build
+# context (do NOT exclude **/*.md).
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+WORKDIR /app
+
+# Builds ONLY the dependency graph (crates.io deps) described by recipe.json.
+# This layer is invalidated by a Cargo.toml/Cargo.lock change, NOT by a
+# source-only change, so it's reused across builds where just application
+# code changed. bamboo-skills' and bamboo-server's build.rs scripts probe for
+# builtin_skills/ and frontend_package/ and degrade gracefully (empty
+# skill list / no embedded frontend) when those directories aren't present
+# yet at this stage — real content lands in the COPY below.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --bin bamboo --recipe-path recipe.json
+
+# Now copy the full workspace (same .dockerignore exclusions as above) and
+# build the workspace's own crates. Dependencies are already compiled by the
+# `chef cook` layer, so this only recompiles bamboo's own source.
 COPY . .
 
 # Build from crates.io (default sparse registry). Builds on CI runners with

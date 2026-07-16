@@ -150,19 +150,38 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        # Pinned + --locked for reproducible, non-drifting CI runs (was
+        # `cargo install cargo-audit` unpinned — bamboo-agent#254).
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Run security audit
         # RUSTSEC-2026-0154 (russh) + RUSTSEC-2026-0153 (russh-cryptovec) are now
         # FIXED by upgrading russh 0.52 -> 0.60.3 (ring backend, no aws-lc/cmake).
         #
-        # Remaining ignore (transitive, no safe in-tree fix):
-        #   RUSTSEC-2023-0071  rsa (Marvin timing sidechannel) — NO fixed release
-        #     exists in ANY rsa version (incl. the 0.10-rc pulled by russh 0.60);
-        #     transitive via russh's ssh-key RSA support. bamboo's only RSA use is
-        #     operator-initiated SSH deploy (low exposure).
-        run: |
-          cargo audit \
-            --ignore RUSTSEC-2024-0384 \
-            --ignore RUSTSEC-2025-0134 \
-            --ignore RUSTSEC-2023-0071
+        # The remaining ignore list moved out of this CLI invocation into the
+        # tracked `.cargo/audit.toml` config (cargo-audit's documented
+        # discovery path — a bare root-level `audit.toml` is NOT picked up),
+        # where each entry carries a justification and a re-check trigger
+        # instead of being a silent, undocumented flag (bamboo-agent#254).
+        run: cargo audit
+
+  deny:
+    name: cargo-deny (licenses/bans/advisories/sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned by commit SHA (not just the `v2` tag) for supply-chain
+      # reproducibility — deny.toml at the repo root is tuned to be green
+      # against the current dependency tree (bamboo-agent#254).
+      #
+      # IMPORTANT: this action release bundles cargo-deny 0.20.2 (see the
+      # `deny_version` in the action's Dockerfile at this commit); deny.toml
+      # was validated against that exact cargo-deny version. Older releases
+      # (e.g. v2.0.11 = cargo-deny 0.18.2) fail on deny.toml's newer schema
+      # ([bans] allow-workspace) and license-expression syntax — when bumping
+      # this pin, re-run `cargo deny check` locally with the matching version.
+      - name: cargo-deny check
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
+        with:
+          command: check

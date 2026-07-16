@@ -1,0 +1,27 @@
+# cargo-audit configuration — tracks advisories we deliberately ignore, with
+# justification and a review trigger, instead of burying them as bare
+# `--ignore` flags on the CI command line (bamboo-agent#254).
+#
+# Review policy: re-check each entry whenever `cargo audit` is next run
+# against an updated Cargo.lock (dependabot bump, manual upgrade) — drop the
+# ignore as soon as a fixed version is available and pulled in.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — rsa crate: Marvin timing/padding oracle sidechannel
+    # in PKCS#1 v1.5 decryption. NO fixed release exists in ANY rsa version,
+    # including the 0.10-rc pulled in transitively via russh 0.60's ssh-key
+    # RSA key support. bamboo's only RSA exposure is operator-initiated SSH
+    # deploy (bamboo-deploy), a low-frequency, operator-controlled path — not
+    # a network-facing decryption oracle. Re-check: any rsa release that
+    # addresses RUSTSEC-2023-0071, or a russh release that drops the
+    # transitive dependency.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2025-0134 — rustls-pemfile is unmaintained (informational, no
+    # known vulnerability); repository archived since 2025-08. Transitive
+    # dependency pulled in by the TLS stack. Re-check: when the pulling crate
+    # migrates PEM parsing to rustls-pki-types >=1.9 (the upstream-suggested
+    # replacement) or another maintained fork.
+    "RUSTSEC-2025-0134",
+]
