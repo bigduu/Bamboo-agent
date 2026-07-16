@@ -879,11 +879,34 @@ mod tests {
     #[tokio::test]
     async fn concurrent_asks_to_one_worker_overlap() {
         use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
-        use std::time::Instant;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
-        // An executor where each run takes 200ms. Serial handling of N asks to ONE
-        // worker would take ~N*200ms; concurrent (per-ask spawn) overlaps to ~200ms.
-        struct SlowEcho;
+        // N concurrent asks to ONE worker. Prove overlap DIRECTLY (issue #486)
+        // instead of inferring it from wall-clock duration: this originally
+        // asserted `elapsed < 500ms` against a `sleep(200ms)` backend, which
+        // raced CI load — a loaded runner can push even genuinely-concurrent
+        // asks past any fixed real-ms bound, producing a one-off failure with
+        // no code regression.
+        //
+        // Fix: `SlowEcho` tracks its own instantaneous concurrency
+        // (`in_flight` / `max_in_flight` high-water mark via `fetch_max`) AND
+        // forces the rendezvous instead of hoping the scheduler produces it:
+        // each of the N batch runs blocks on a `Barrier` sized for N until
+        // all N have arrived, so `max_in_flight == N` is deterministic
+        // regardless of host load. If per-ask spawn ever regresses to serial
+        // handling, only 1 of the N barrier parties will ever arrive and the
+        // wait deadlocks — bounded by the outer `tokio::time::timeout` below,
+        // turning that regression into a clear, fast failure instead of a
+        // hang. The preceding subscription probe ("ping") is exempted from
+        // the barrier — it runs alone, before the batch, specifically to
+        // confirm subscription, and would otherwise deadlock waiting for N-1
+        // batch calls that haven't been sent yet.
+        const N: usize = 4;
+        struct SlowEcho {
+            in_flight: AtomicU32,
+            max_in_flight: AtomicU32,
+            rendezvous: tokio::sync::Barrier,
+        }
         #[async_trait::async_trait]
         impl ChildExecutor for SlowEcho {
             async fn run(
@@ -893,13 +916,29 @@ mod tests {
                 _steer: SteerInbox,
                 _cancel: CancellationToken,
             ) -> ChildOutcome {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                if spec.assignment == "ping" {
+                    return ChildOutcome::completed(format!("done: {}", spec.assignment));
+                }
+                let now_in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight
+                    .fetch_max(now_in_flight, Ordering::SeqCst);
+                // Forced rendezvous: block until all N concurrent batch asks
+                // have arrived here.
+                self.rendezvous.wait().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 ChildOutcome::completed(format!("done: {}", spec.assignment))
             }
         }
+        let slow_echo = Arc::new(SlowEcho {
+            in_flight: AtomicU32::new(0),
+            max_in_flight: AtomicU32::new(0),
+            rendezvous: tokio::sync::Barrier::new(N),
+        });
 
         let (endpoint, _dir) = start().await;
         let worker_ep = endpoint.clone();
+        let slow_echo_for_worker = slow_echo.clone();
         tokio::spawn(async move {
             let _ = serve_executor(
                 &worker_ep,
@@ -908,7 +947,7 @@ mod tests {
                     role: None,
                 },
                 TOKEN,
-                Arc::new(SlowEcho),
+                slow_echo_for_worker,
             )
             .await;
         });
@@ -942,30 +981,37 @@ mod tests {
         }
 
         // Fire N concurrent (Query) Asks to the SAME worker, then await all N
-        // correlated replies. Serial would be ~N*200ms; concurrent ~200ms.
-        const N: usize = 4;
+        // correlated replies. Each batch run is forced to rendezvous inside
+        // `SlowEcho` (see above), so genuine overlap is deterministic rather
+        // than inferred from wall-clock duration.
         let mut want: std::collections::HashSet<MsgId> = std::collections::HashSet::new();
-        let start = Instant::now();
         for i in 0..N {
             let q = ask("orch", &format!("q{i}"));
             want.insert(q.id.clone());
             orch.deliver("worker", q).await.unwrap();
         }
-        while !want.is_empty() {
-            let r = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
-                .await
-                .expect("a reply arrives")
-                .expect("present");
-            if let Some(cid) = &r.correlation_id {
-                want.remove(cid);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !want.is_empty() {
+                let r = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+                    .await
+                    .expect("a reply arrives")
+                    .expect("present");
+                if let Some(cid) = &r.correlation_id {
+                    want.remove(cid);
+                }
             }
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "{N} concurrent 200ms Asks to ONE worker must OVERLAP \
-             (serial would be ~{}ms); took {elapsed:?}",
-            N * 200
+        })
+        .await
+        .expect(
+            "timed out waiting for the N concurrent Asks to complete — this means the \
+             per-ask spawn is serializing them (only some of the N ever reached the \
+             rendezvous barrier), which is the regression this test guards against",
+        );
+        let max_in_flight = slow_echo.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(
+            max_in_flight, N as u32,
+            "{N} concurrent Asks to ONE worker must OVERLAP (serial handling could never \
+             observe more than 1 in flight at once); observed max_in_flight = {max_in_flight}"
         );
     }
 
