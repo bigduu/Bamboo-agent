@@ -26,10 +26,11 @@ use bamboo_llm::Config;
 // Re-export pure domain logic from the config crate so server consumers
 // can import through `config_manager`.
 pub use bamboo_config::patch::{
-    deep_merge_json, domains_for_root_patch, effects_for_root_patch, is_masked_api_key,
-    preserve_masked_connect_secrets, preserve_masked_notification_secrets,
-    preserve_masked_provider_api_keys, preserve_unpatched_provider_secrets,
-    provider_api_key_intents, sanitize_root_patch, DomainChanges, PatchEffects, ReloadMode,
+    clear_provider_ciphertext_for_explicit_clears, deep_merge_json, domains_for_root_patch,
+    effects_for_root_patch, is_masked_api_key, preserve_masked_connect_secrets,
+    preserve_masked_notification_secrets, preserve_masked_provider_api_keys,
+    preserve_unpatched_provider_secrets, provider_api_key_intents, sanitize_root_patch,
+    DomainChanges, PatchEffects, ReloadMode,
 };
 
 pub fn sync_provider_api_keys_encrypted_for_patch(
@@ -156,6 +157,10 @@ pub fn build_merged_config(
 
     let mut new_config: Config = serde_json::from_value(merged)
         .map_err(|e| AppError::BadRequest(format!("Invalid configuration JSON: {e}")))?;
+    // An explicit `api_key: ""` clear must drop the round-tripped ciphertext
+    // BEFORE hydration — otherwise hydration refills the plaintext from it and
+    // the subsequent sync/save re-encrypts, silently undoing the clear (#516).
+    clear_provider_ciphertext_for_explicit_clears(&mut new_config, &api_key_intents);
     new_config.hydrate_proxy_auth_from_encrypted();
     new_config.hydrate_provider_api_keys_from_encrypted();
     new_config.hydrate_provider_instance_api_keys_from_encrypted();
@@ -328,5 +333,36 @@ mod tests {
         let instance = merged.provider_instances.get("uuid-1").expect("instance");
         assert!(instance.api_key.is_empty(), "explicit clear must win");
         assert!(instance.api_key_encrypted.is_none());
+    }
+
+    // An explicit clear must also win when the live config holds ciphertext in
+    // memory — the normal state now that update_config keeps ciphertext in sync
+    // (#516). Without the pre-hydration ciphertext drop, hydration would refill
+    // the plaintext from the round-tripped ciphertext and sync would re-encrypt
+    // it, silently undoing the clear.
+    #[test]
+    fn explicit_instance_key_clear_wins_over_in_memory_ciphertext() {
+        let mut current = config_with_plaintext_only_instance("sk-old");
+        current.refresh_encrypted_secrets().expect("refresh");
+        assert!(
+            current.provider_instances["uuid-1"]
+                .api_key_encrypted
+                .is_some(),
+            "precondition: live config holds ciphertext"
+        );
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"provider_instances":{"uuid-1":{"api_key":""}}}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = merged.provider_instances.get("uuid-1").expect("instance");
+        assert!(instance.api_key.is_empty(), "explicit clear must win");
+        assert!(
+            instance.api_key_encrypted.is_none(),
+            "ciphertext must be cleared too"
+        );
     }
 }

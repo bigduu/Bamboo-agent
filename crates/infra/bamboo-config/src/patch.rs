@@ -437,6 +437,43 @@ pub fn preserve_unpatched_provider_secrets(
     }
 }
 
+/// Make an explicit `api_key: ""` clear actually clear.
+///
+/// The merge round-trip carries the live config's `api_key_encrypted` into the
+/// merged value; hydration would then refill the plaintext from it and the
+/// subsequent sync/save would re-encrypt — silently undoing the clear. For
+/// every provider/instance the patch explicitly touched whose merged plaintext
+/// is empty (a clear, not a set), drop the round-tripped ciphertext BEFORE
+/// hydration so nothing refills the key (#516).
+pub fn clear_provider_ciphertext_for_explicit_clears(
+    merged: &mut Config,
+    intents: &ProviderApiKeyIntents,
+) {
+    macro_rules! clear_ciphertext {
+        ($field:ident) => {
+            if intents.providers.contains(stringify!($field)) {
+                if let Some(cfg) = merged.providers.$field.as_mut() {
+                    if cfg.api_key.trim().is_empty() {
+                        cfg.api_key_encrypted = None;
+                    }
+                }
+            }
+        };
+    }
+    clear_ciphertext!(openai);
+    clear_ciphertext!(anthropic);
+    clear_ciphertext!(gemini);
+    clear_ciphertext!(bodhi);
+
+    for id in intents.provider_instances.iter() {
+        if let Some(instance) = merged.provider_instances.get_mut(id) {
+            if instance.api_key.trim().is_empty() {
+                instance.api_key_encrypted = None;
+            }
+        }
+    }
+}
+
 /// Replace masked notification-channel secret placeholders (ntfy `token`, Bark
 /// `device_key`) in a patch with the current config's plaintext values.
 ///
@@ -789,6 +826,67 @@ mod tests {
         let cleared = &merged.provider_instances["uuid-1"];
         assert!(cleared.api_key.is_empty(), "explicit clear must win");
         assert!(cleared.api_key_encrypted.is_none());
+    }
+
+    #[test]
+    fn clear_provider_ciphertext_drops_roundtripped_ciphertext_on_clear_intents() {
+        // Merged state right after deserialization of a clear patch: empty
+        // plaintext from the patch, ciphertext carried over by the round-trip
+        // of the live config. Hydration must find nothing to refill.
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("", Some("roundtripped-ct")));
+        merged.providers.openai = Some(crate::OpenAIConfig {
+            api_key_encrypted: Some("legacy-ct".to_string()),
+            ..Default::default()
+        });
+
+        let mut intents = ProviderApiKeyIntents::default();
+        intents.provider_instances.insert("uuid-1".to_string());
+        intents.providers.insert("openai".to_string());
+
+        clear_provider_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert!(merged.provider_instances["uuid-1"]
+            .api_key_encrypted
+            .is_none());
+        assert!(merged
+            .providers
+            .openai
+            .as_ref()
+            .unwrap()
+            .api_key_encrypted
+            .is_none());
+    }
+
+    #[test]
+    fn clear_provider_ciphertext_leaves_set_intents_and_unpatched_alone() {
+        // A SET intent (non-empty merged plaintext) keeps its ciphertext (the
+        // later sync overwrites it), and an instance without any intent is
+        // untouched.
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("sk-new", Some("stale-ct")));
+        merged
+            .provider_instances
+            .insert("uuid-2".to_string(), instance("", Some("kept-ct")));
+
+        let mut intents = ProviderApiKeyIntents::default();
+        intents.provider_instances.insert("uuid-1".to_string());
+
+        clear_provider_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert!(merged.provider_instances["uuid-1"]
+            .api_key_encrypted
+            .is_some());
+        assert_eq!(
+            merged.provider_instances["uuid-2"]
+                .api_key_encrypted
+                .as_deref(),
+            Some("kept-ct")
+        );
     }
 
     #[test]
