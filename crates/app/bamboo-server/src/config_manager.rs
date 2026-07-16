@@ -177,7 +177,7 @@ pub fn build_merged_config(
     // `None` in the live config — e.g. a provider instance freshly created via
     // the instance CRUD endpoints): hydration has nothing to decrypt and the
     // key would vanish from config.json on the next persist. Carry unpatched
-    // keys forward from the live config. #516.
+    // keys forward from the live config. #515/#516.
     preserve_unpatched_provider_secrets(&mut new_config, current, &api_key_intents);
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
@@ -363,6 +363,39 @@ mod tests {
         assert!(
             instance.api_key_encrypted.is_none(),
             "ciphertext must be cleared too"
+        );
+    }
+
+    // #515: an unrelated settings-save PATCH must also preserve an instance
+    // whose live config already holds ciphertext in memory (the normal state
+    // now that update_config keeps ciphertext in sync) — both the plaintext
+    // AND the exact stored ciphertext must survive the round trip.
+    #[test]
+    fn unrelated_patch_preserves_provider_instance_ciphertext() {
+        let mut current = config_with_plaintext_only_instance("sk-instance-secret");
+        current.refresh_encrypted_secrets().expect("refresh");
+        let prev_ciphertext = current.provider_instances["uuid-1"]
+            .api_key_encrypted
+            .clone()
+            .expect("current should have ciphertext");
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"http_proxy":"http://example.invalid:8080"}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(intents.provider_instances.is_empty());
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = &merged.provider_instances["uuid-1"];
+        assert_eq!(
+            instance.api_key, "sk-instance-secret",
+            "plaintext must survive an unrelated save"
+        );
+        assert_eq!(
+            instance.api_key_encrypted.as_deref(),
+            Some(prev_ciphertext.as_str()),
+            "ciphertext must survive an unrelated save"
         );
     }
 }
