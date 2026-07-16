@@ -26,11 +26,16 @@ use tokio::sync::RwLock;
 use bamboo_agent_core::tools::{Tool, ToolExecutor};
 use bamboo_engine::AgentBuilder as EngineAgentBuilder;
 use bamboo_llm::{create_provider_with_dir, Config, LLMProvider};
+use bamboo_mcp::executor::{CompositeToolExecutor, McpToolExecutor};
+use bamboo_mcp::manager::McpServerManager;
+use bamboo_mcp::McpServerConfig;
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
+use bamboo_tools::permission::PermissionChecker;
 use bamboo_tools::ToolRegistry;
 
+use super::error::SdkError;
 use super::Agent;
 
 /// Default metrics retention window (days), mirroring `MetricsService::new`.
@@ -59,6 +64,20 @@ pub struct AgentBuilder {
     provider_name: Option<String>,
     /// API key applied to the active provider's config before provider creation.
     api_key: Option<String>,
+    /// MCP servers to connect and merge into the tool surface in
+    /// `with_defaults_for_data_dir`. See [`mcp_server`](Self::mcp_server).
+    mcp_servers: Vec<McpServerConfig>,
+    /// Permission checker applied to the built-in tool executor assembled by
+    /// `with_defaults_for_data_dir`. `None` (the default) means no permission
+    /// gating at all — every tool call runs unprompted. See
+    /// [`permission_checker`](Self::permission_checker).
+    permission_checker: Option<Arc<dyn PermissionChecker>>,
+    /// Concrete session-index handle assembled by `with_defaults_for_data_dir`
+    /// (internal — not settable directly). Carried onto [`Agent`] to back the
+    /// session-listing ergonomics ([`Agent::list_sessions`](super::Agent::list_sessions)),
+    /// which need the concrete `SessionStoreV2` rather than the type-erased
+    /// `Arc<dyn Storage>` the engine builder takes.
+    session_store: Option<Arc<SessionStoreV2>>,
 }
 
 impl AgentBuilder {
@@ -71,6 +90,9 @@ impl AgentBuilder {
             model: None,
             provider_name: None,
             api_key: None,
+            mcp_servers: Vec::new(),
+            permission_checker: None,
+            session_store: None,
         }
     }
 
@@ -146,6 +168,93 @@ impl AgentBuilder {
         self
     }
 
+    /// Connect an MCP server and merge its tools into the agent's tool surface.
+    ///
+    /// Only takes effect via
+    /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir), which
+    /// starts every configured server (in call order) and composes their tools
+    /// with the built-in surface via
+    /// [`CompositeToolExecutor`](bamboo_mcp::executor::CompositeToolExecutor) —
+    /// built-ins are tried first, falling back to MCP on `NotFound`. Each
+    /// server's `initialize` `instructions` (if any) are folded into the tool
+    /// guidance the engine injects into the system prompt automatically (no
+    /// extra wiring needed).
+    ///
+    /// A later [`tools`](Self::tools)/[`tool`](Self::tool) selection REPLACES
+    /// the whole assembled executor at [`build`](Self::build) time (existing
+    /// behavior, unchanged by this method) — so an explicit tool selection
+    /// currently excludes MCP tools. Select tools via `allowed_tools` on the
+    /// server config instead if you need to restrict without losing MCP.
+    ///
+    /// ```rust,ignore
+    /// use bamboo_sdk::agent::McpServerConfig;
+    /// use bamboo_mcp::{StdioConfig, TransportConfig};
+    ///
+    /// let agent = Agent::builder()
+    ///     .model("claude-sonnet-4-6")
+    ///     .mcp_server(McpServerConfig {
+    ///         id: "fs".into(),
+    ///         name: Some("filesystem".into()),
+    ///         enabled: true,
+    ///         transport: TransportConfig::Stdio(StdioConfig {
+    ///             command: "npx".into(),
+    ///             args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+    ///             cwd: None,
+    ///             env: Default::default(),
+    ///             env_encrypted: Default::default(),
+    ///             startup_timeout_ms: 20_000,
+    ///         }),
+    ///         request_timeout_ms: 60_000,
+    ///         healthcheck_interval_ms: 30_000,
+    ///         reconnect: Default::default(),
+    ///         allowed_tools: Vec::new(),
+    ///         denied_tools: Vec::new(),
+    ///     })
+    ///     .with_defaults_for_data_dir(data_dir).await?
+    ///     .build()?;
+    /// ```
+    pub fn mcp_server(mut self, config: McpServerConfig) -> Self {
+        self.mcp_servers.push(config);
+        self
+    }
+
+    /// Connect multiple MCP servers. See [`mcp_server`](Self::mcp_server).
+    pub fn mcp_servers<I>(mut self, configs: I) -> Self
+    where
+        I: IntoIterator<Item = McpServerConfig>,
+    {
+        self.mcp_servers.extend(configs);
+        self
+    }
+
+    /// Gate the built-in tool executor behind a permission checker (e.g.
+    /// `bamboo_tools::permission::ConfigPermissionChecker`).
+    ///
+    /// Only takes effect via
+    /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir). The
+    /// SDK's historical default (no checker configured) is **bypass
+    /// everything** — no tool call is ever gated — so this is purely opt-in;
+    /// see [`bypass_permissions`](Self::bypass_permissions) to make that intent
+    /// explicit at the call site.
+    ///
+    /// Once gated, a tool call that needs approval suspends the run (a
+    /// `NeedClarification`/`ToolApprovalRequested` event, session
+    /// `pending_question` set) exactly like a `conclusion_with_options`
+    /// clarification — resolve it with [`Agent::answer`](super::Agent::answer).
+    pub fn permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
+        self.permission_checker = Some(checker);
+        self
+    }
+
+    /// Explicitly request the SDK's default: no permission checker, so every
+    /// tool call runs unprompted. A no-op relative to never calling
+    /// [`permission_checker`](Self::permission_checker) — provided so callers
+    /// can say what they mean instead of relying on silent default behavior.
+    pub fn bypass_permissions(mut self) -> Self {
+        self.permission_checker = None;
+        self
+    }
+
     // -- Explicit dependency injection (passthrough) ------------------------
 
     /// Inject a pre-built LLM provider, bypassing config-driven creation.
@@ -189,11 +298,18 @@ impl AgentBuilder {
     /// `<data_dir>/config.json` must define the active provider with a non-empty
     /// `api_key` (the same config `bamboo serve` reads). A fresh data dir with no
     /// `config.json` defaults to the `anthropic` provider with no key, so step 6
-    /// (`create_provider_with_dir`) returns `Err("failed to create provider: …")`.
+    /// (`create_provider_with_dir`) returns [`SdkError::ProviderInit`].
     /// The `copilot` provider is the only one that can authenticate keyless (via
     /// its cached OAuth token). Set the key via the config file, or pass it on the
     /// builder with [`api_key`](Self::api_key) **before** calling this method.
-    pub async fn with_defaults_for_data_dir(mut self, data_dir: PathBuf) -> Result<Self, String> {
+    ///
+    /// If [`mcp_server`](Self::mcp_server)/[`mcp_servers`](Self::mcp_servers) were
+    /// configured, each server is connected here (in call order) and its tools
+    /// merged into the built-in tool surface; a connection failure fails the
+    /// whole call with [`SdkError::McpServerStart`]. If
+    /// [`permission_checker`](Self::permission_checker) was configured, it gates
+    /// the built-in tool executor from this point on.
+    pub async fn with_defaults_for_data_dir(mut self, data_dir: PathBuf) -> Result<Self, SdkError> {
         // 1. Config.
         let mut config = Config::from_data_dir(Some(data_dir.clone()));
         // Select the provider first, so `api_key` and provider creation both act
@@ -208,19 +324,46 @@ impl AgentBuilder {
         // 6. Provider (created before config is moved into the shared lock).
         let provider = create_provider_with_dir(&config, data_dir.clone())
             .await
-            .map_err(|e| format!("failed to create provider: {e}"))?;
+            .map_err(|e| SdkError::ProviderInit(e.to_string()))?;
 
-        // 7. Default tools (builtin + config-aware).
+        // 7. Default tools (builtin + config-aware), optionally gated by a
+        // permission checker and merged with any configured MCP servers.
         let config = Arc::new(RwLock::new(config));
-        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
-            bamboo_tools::BuiltinToolExecutor::new_with_config(config.clone()),
-        );
+        let builtin_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            match self.permission_checker.clone() {
+                Some(checker) => Arc::new(
+                    bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+                        config.clone(),
+                        checker,
+                    ),
+                ),
+                None => Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_config(
+                    config.clone(),
+                )),
+            };
+        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            if self.mcp_servers.is_empty() {
+                builtin_tools
+            } else {
+                let mcp_manager = Arc::new(McpServerManager::new_with_config(config.clone()));
+                for server_config in &self.mcp_servers {
+                    let server_id = server_config.id.clone();
+                    mcp_manager
+                        .start_server(server_config.clone())
+                        .await
+                        .map_err(|source| SdkError::McpServerStart { server_id, source })?;
+                }
+                let mcp_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
+                    McpToolExecutor::new(mcp_manager.clone(), mcp_manager.tool_index()),
+                );
+                Arc::new(CompositeToolExecutor::new(builtin_tools, mcp_tools))
+            };
 
         // 2/3. Storage + persistence + attachment reader.
         let store = Arc::new(
             SessionStoreV2::new(data_dir.clone())
                 .await
-                .map_err(|e| format!("failed to initialize session store: {e}"))?,
+                .map_err(|e| SdkError::StoreInit(e.to_string()))?,
         );
         let persistence = Arc::new(LockedSessionStore::new(store.clone()));
 
@@ -233,7 +376,7 @@ impl AgentBuilder {
         skill_manager
             .initialize()
             .await
-            .map_err(|e| format!("failed to initialize skill manager: {e}"))?;
+            .map_err(|e| SdkError::SkillInit(e.to_string()))?;
 
         // 5. Metrics collector.
         let metrics_storage: Arc<dyn bamboo_metrics::storage::MetricsStorage> =
@@ -241,6 +384,7 @@ impl AgentBuilder {
         let metrics_collector =
             MetricsCollector::spawn(metrics_storage, DEFAULT_METRICS_RETENTION_DAYS);
 
+        self.session_store = Some(store.clone());
         self.inner = self
             .inner
             .storage(store.clone())
@@ -259,11 +403,14 @@ impl AgentBuilder {
     ///
     /// If a tool set was configured via [`tools`](Self::tools) / [`tool`](Self::tool),
     /// the agent's default tool executor is built from exactly those tools, so
-    /// the advertised tool surface is precisely the caller's selection. With no
-    /// selection, the full default built-in surface is used. The configured
+    /// the advertised tool surface is precisely the caller's selection (this
+    /// REPLACES any MCP composition from
+    /// [`mcp_server`](Self::mcp_server)/[`mcp_servers`](Self::mcp_servers) —
+    /// existing behavior, unchanged). With no selection, the full default
+    /// built-in (+ MCP, if configured) surface is used. The configured
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
-    pub fn build(mut self) -> Result<Agent, String> {
+    pub fn build(mut self) -> Result<Agent, SdkError> {
         if !self.tools.is_empty() {
             let registry = ToolRegistry::new();
             for tool in &self.tools {
@@ -274,11 +421,16 @@ impl AgentBuilder {
             self.inner = self.inner.default_tools(executor);
         }
 
-        let runtime = self.inner.build().map_err(|e| e.to_string())?;
+        let runtime = self
+            .inner
+            .build()
+            .map_err(|e| SdkError::Build(e.to_string()))?;
         Ok(Agent::from_runtime_with_config(
             runtime,
             self.system_prompt,
             self.model,
+            self.session_store,
+            self.permission_checker,
         ))
     }
 }
