@@ -319,6 +319,7 @@ mod tests {
 
     fn platform(platform_type: &str, token: Option<&str>) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
+            id: None,
             platform_type: platform_type.to_string(),
             token: token.map(str::to_string),
             token_encrypted: None,

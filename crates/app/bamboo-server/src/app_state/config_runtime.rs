@@ -159,6 +159,12 @@ impl AppState {
                 reject_if_recovery_pending(&cfg)?;
                 let was_off = cfg.plugin_trust.enforcement_is_off();
                 update(&mut cfg)?;
+                // Backfill any missing connect.platforms id (#496) on the live
+                // in-memory config itself — not just inside `save_to_dir`'s
+                // internal save-copy — so the response this update returns
+                // (and any GET immediately after) already reflects the id a
+                // client can round-trip on its next PATCH.
+                cfg.assign_connect_platform_ids();
                 cfg.publish_env_vars();
                 let newly_off = !was_off && cfg.plugin_trust.enforcement_is_off();
                 (cfg.clone(), newly_off)
@@ -187,9 +193,16 @@ impl AppState {
     /// Replace the full config (used for JSON merge endpoints).
     pub async fn replace_config(
         &self,
-        new_config: Config,
+        mut new_config: Config,
         effects: ConfigUpdateEffects,
     ) -> Result<Config, AppError> {
+        // Backfill any missing connect.platforms id (#496) up front, before
+        // any of the clones below are taken, so the in-memory config, the
+        // disk-persisted snapshot, and the value this call returns to the
+        // caller (the settings-merge HTTP response) all agree on the same
+        // ids — mirrors the `update_config` treatment above.
+        new_config.assign_connect_platform_ids();
+
         // Same #126 serialization as update_config: mutate + persist under the
         // config-IO lock so a reload can't interleave; effects run unlocked.
         {

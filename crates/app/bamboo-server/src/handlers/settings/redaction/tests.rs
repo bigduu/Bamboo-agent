@@ -359,6 +359,7 @@ fn redact_config_never_leaks_notification_ciphertext_even_when_client_supplied()
 fn redact_config_masks_configured_connect_platform_token() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        id: None,
         platform_type: "telegram".to_string(),
         token: None,
         token_encrypted: Some("enc-telegram".to_string()),
@@ -390,6 +391,7 @@ fn redact_config_masks_configured_connect_platform_token() {
 fn redact_config_omits_unconfigured_connect_platform_token() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        id: None,
         platform_type: "telegram".to_string(),
         token: None,
         token_encrypted: None,
@@ -436,6 +438,7 @@ fn redact_config_never_leaks_connect_platform_ciphertext_even_when_client_suppli
 fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_domain() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        id: None,
         platform_type: "feishu".to_string(),
         token: None,
         token_encrypted: None,
@@ -473,6 +476,7 @@ fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_
 fn redact_config_omits_unconfigured_connect_platform_app_secret() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
+        id: None,
         platform_type: "feishu".to_string(),
         token: None,
         token_encrypted: None,
