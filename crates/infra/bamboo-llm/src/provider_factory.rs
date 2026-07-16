@@ -141,6 +141,9 @@ pub async fn create_provider_by_name(
 
             provider = provider.with_reasoning_effort(anthropic_config.reasoning_effort);
             provider = provider.with_request_overrides(anthropic_config.request_overrides.clone());
+            provider = provider.with_thinking_replay_always(
+                anthropic_config.thinking_replay_always.unwrap_or(false),
+            );
 
             Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
@@ -386,6 +389,7 @@ mod tests {
                     max_tokens: Some(4096),
                     reasoning_effort: None,
                     request_overrides: None,
+                    thinking_replay_always: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()

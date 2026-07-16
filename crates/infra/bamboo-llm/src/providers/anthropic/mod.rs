@@ -41,6 +41,24 @@ pub struct AnthropicProvider {
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
+    /// Whether to replay a prior turn's `reasoning` text as a `thinking` content
+    /// block unconditionally (issue #520).
+    ///
+    /// The real Anthropic API requires `thinking` input blocks to carry a
+    /// `signature` it can cryptographically verify as its own — bamboo never
+    /// captures that signature (the SSE parser drops `signature_delta`), so any
+    /// block we replay is either foreign (minted by a different provider, e.g.
+    /// after a mid-session model switch) or an unsigned copy of Claude's own
+    /// prior thinking. Real Anthropic 400s on both. The safe default is to omit
+    /// the block entirely: Anthropic does not require prior-turn thinking to
+    /// continue a conversation.
+    ///
+    /// Some Anthropic-compatible upstreams (e.g. GLM's `/anthropic` endpoint)
+    /// have the opposite contract: they require the `thinking` block to be
+    /// PRESENT on every assistant turn once thinking is enabled, but never
+    /// validate its signature. Setting this to `true` restores the old
+    /// unconditional-emission behavior for that class of upstream.
+    thinking_replay_always: bool,
 }
 
 impl AnthropicProvider {
@@ -53,6 +71,7 @@ impl AnthropicProvider {
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
+            thinking_replay_always: false,
         }
     }
 
@@ -88,6 +107,15 @@ impl AnthropicProvider {
     /// Configure request overrides for this provider.
     pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
         self.request_overrides = overrides;
+        self
+    }
+
+    /// Opt into unconditional `thinking`-block replay (issue #520), for
+    /// Anthropic-compatible upstreams (e.g. GLM) that require the block to be
+    /// present regardless of signature. Real Anthropic should never set this —
+    /// it will reject an unsigned/foreign thinking block with a 400.
+    pub fn with_thinking_replay_always(mut self, always: bool) -> Self {
+        self.thinking_replay_always = always;
         self
     }
 
@@ -234,6 +262,7 @@ impl AnthropicProvider {
             reasoning_effort,
             parallel_tool_calls,
             cache_plan,
+            self.thinking_replay_always,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -344,6 +373,7 @@ impl AnthropicProvider {
                     None,
                     parallel_tool_calls,
                     cache_plan,
+                    self.thinking_replay_always,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -446,6 +476,13 @@ pub fn build_anthropic_request(
     )
 }
 
+// NOTE: `build_anthropic_request` and `build_anthropic_request_with_cache` are
+// the widely-used simple entry points (production `Bodhi` proxy path + dozens
+// of tests unrelated to thinking replay); they always target real Anthropic,
+// so both hardcode `thinking_replay_always = false` inside
+// `build_anthropic_request_with_cache` below rather than growing another
+// public parameter every caller has to thread through.
+
 /// Build an Anthropic Messages API request body, placing prompt-cache
 /// breakpoints according to a provider-agnostic [`PromptCachePlan`].
 ///
@@ -481,6 +518,7 @@ pub fn build_anthropic_request_with_cache(
         reasoning_effort,
         parallel_tool_calls,
         cache,
+        false,
     )
 }
 
@@ -490,6 +528,14 @@ pub fn build_anthropic_request_with_cache(
 /// `cache_control` breakpoint still lands on the last block, so caching behavior
 /// is unchanged; only the structure (N text blocks vs one joined block) differs.
 /// With empty `system_blocks` this is byte-identical to the legacy path.
+///
+/// `thinking_replay_always`: see [`AnthropicProvider::with_thinking_replay_always`]
+/// (issue #520) — when `false` (the default for real Anthropic), a `thinking`
+/// block is never replayed from history since bamboo cannot prove it carries a
+/// signature Anthropic itself minted; when `true`, prior `reasoning` text is
+/// unconditionally re-emitted as a `thinking` block whenever the current
+/// request has thinking enabled, matching the legacy behavior some
+/// Anthropic-compatible upstreams (e.g. GLM) require.
 #[allow(clippy::too_many_arguments)]
 pub fn build_anthropic_request_with_cache_blocks(
     messages: &[Message],
@@ -501,6 +547,7 @@ pub fn build_anthropic_request_with_cache_blocks(
     reasoning_effort: Option<ReasoningEffort>,
     parallel_tool_calls: Option<bool>,
     cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
 ) -> Value {
     let default_plan = PromptCachePlan {
         cache_tools: true,
@@ -510,8 +557,17 @@ pub fn build_anthropic_request_with_cache_blocks(
     let plan = cache.unwrap_or(&default_plan);
     let ttl = plan.ttl;
 
-    let (mut system, mut anthropic_messages, message_ids) =
-        messages_to_anthropic_json(messages, system_blocks);
+    // Whether the CURRENT request enables extended thinking — a `thinking`
+    // block can never be replayed when it's disabled (Anthropic rejects it in
+    // that case too, issue #520).
+    let thinking_enabled = anthropic_thinking_from_effort(reasoning_effort, max_tokens).is_some();
+
+    let (mut system, mut anthropic_messages, message_ids) = messages_to_anthropic_json(
+        messages,
+        system_blocks,
+        thinking_enabled,
+        thinking_replay_always,
+    );
 
     // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
     // markers per request. Spend the budget on the most stable regions first
@@ -650,9 +706,14 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 /// When `system_blocks` is non-empty it is the canonical, structured source for
 /// the system field (each block → its own text block); otherwise the system field
 /// is the joined `System`-message text (legacy, byte-identical).
+///
+/// `thinking_enabled`/`thinking_replay_always` gate `thinking`-block replay on
+/// assistant turns — see [`build_anthropic_request_with_cache_blocks`] (#520).
 fn messages_to_anthropic_json(
     messages: &[Message],
     system_blocks: &[PromptBlock],
+    thinking_enabled: bool,
+    thinking_replay_always: bool,
 ) -> (Option<Value>, Vec<Value>, Vec<Vec<String>>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
@@ -680,7 +741,12 @@ fn messages_to_anthropic_json(
                 // System message; skip it (rather than emit a null/empty entry)
                 // so a malformed conversation never pollutes the `messages`
                 // array nor crashes the call (issue #22).
-                let Some(msg_json) = message_to_anthropic_json(m, keep_image) else {
+                let Some(msg_json) = message_to_anthropic_json(
+                    m,
+                    keep_image,
+                    thinking_enabled,
+                    thinking_replay_always,
+                ) else {
                     continue;
                 };
                 // Coalesce consecutive SAME-ROLE messages into one. Anthropic
@@ -770,7 +836,16 @@ fn message_has_image(message: &Message) -> bool {
 /// during an LLM call (issue #22). Callers consume this with `filter_map` /
 /// `let-else` so a skipped message is omitted entirely, never turned into a
 /// `null`/empty entry in the `messages` array.
-fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Option<Value> {
+///
+/// `thinking_enabled`/`thinking_replay_always` gate whether `message.reasoning`
+/// is replayed as a `thinking` content block — see
+/// [`build_anthropic_request_with_cache_blocks`] (#520).
+fn message_to_anthropic_json(
+    message: &Message,
+    keep_image: bool,
+    thinking_enabled: bool,
+    thinking_replay_always: bool,
+) -> Option<Value> {
     match message.role {
         // A System message belongs in the top-level `system` field, not the
         // `messages` array; the caller (`messages_to_anthropic_json`) routes it
@@ -791,18 +866,30 @@ fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Option<Valu
         Role::Assistant => {
             let mut blocks: Vec<Value> = Vec::new();
 
-            // When extended thinking was enabled, Anthropic requires the
-            // `thinking` content block to be present in every assistant
-            // message — including tool-call turns.  Without it the API
-            // returns HTTP 400:
-            //   "thinking is enabled but reasoning_content is missing in
-            //    assistant tool call message at index N"
-            if let Some(reasoning) = &message.reasoning {
-                if !reasoning.is_empty() {
-                    blocks.push(json!({
-                        "type": "thinking",
-                        "thinking": reasoning,
-                    }));
+            // Replay `message.reasoning` as a `thinking` content block ONLY
+            // when the current request has thinking enabled AND the upstream
+            // is explicitly known to require the block unconditionally
+            // (`thinking_replay_always`, e.g. a GLM-style anthropic-compat
+            // upstream that doesn't validate signatures).
+            //
+            // The real Anthropic API requires `thinking` input blocks to carry
+            // a `signature` it minted itself; bamboo never captures that
+            // signature (the SSE parser drops `signature_delta`), so any block
+            // we could replay here is either foreign (minted by a different
+            // provider after a mid-session model switch, #520) or an unsigned
+            // copy of Claude's own prior turn. Real Anthropic 400s on both, and
+            // also 400s if a thinking block is sent while thinking is
+            // disabled for the current request. Anthropic does not require
+            // prior-turn thinking to continue a conversation, so the safe
+            // default is to omit it entirely.
+            if thinking_enabled && thinking_replay_always {
+                if let Some(reasoning) = &message.reasoning {
+                    if !reasoning.is_empty() {
+                        blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": reasoning,
+                        }));
+                    }
                 }
             }
 
@@ -1505,6 +1592,7 @@ mod anthropic_request_building {
             None,
             None,
             None,
+            false,
         );
 
         let system = out["system"].as_array().expect("system is a block array");
@@ -1544,6 +1632,7 @@ mod anthropic_request_building {
             None,
             None,
             None,
+            false,
         );
         let system = out["system"].as_array().expect("system array");
         assert_eq!(system.len(), 1);
@@ -1562,8 +1651,8 @@ mod anthropic_request_building {
                 data: "AAAA".to_string(),
             }],
         );
-        let v =
-            super::message_to_anthropic_json(&msg, true).expect("tool message should serialize");
+        let v = super::message_to_anthropic_json(&msg, true, false, false)
+            .expect("tool message should serialize");
         let block = &v["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "toolu_1");
@@ -1586,8 +1675,8 @@ mod anthropic_request_building {
     fn tool_result_without_image_stays_plain_string() {
         // Regression: text-only tool results keep the cheap string form.
         let msg = Message::tool_result("toolu_2", "plain text");
-        let v =
-            super::message_to_anthropic_json(&msg, true).expect("tool message should serialize");
+        let v = super::message_to_anthropic_json(&msg, true, false, false)
+            .expect("tool message should serialize");
         assert_eq!(v["content"][0]["type"], "tool_result");
         assert_eq!(v["content"][0]["content"], "plain text");
     }
@@ -1605,8 +1694,8 @@ mod anthropic_request_building {
                 data: "OLD".to_string(),
             }],
         );
-        let v =
-            super::message_to_anthropic_json(&msg, false).expect("tool message should serialize");
+        let v = super::message_to_anthropic_json(&msg, false, false, false)
+            .expect("tool message should serialize");
         let content = &v["content"][0]["content"];
         // No image block — content is a plain string with the omission note.
         assert!(content.is_string(), "dropped image should leave a string");
@@ -1625,7 +1714,7 @@ mod anthropic_request_building {
         // (a) Direct: a System message serializes to None instead of panicking.
         let system_msg = Message::system("You are a robot.");
         assert!(
-            super::message_to_anthropic_json(&system_msg, true).is_none(),
+            super::message_to_anthropic_json(&system_msg, true, false, false).is_none(),
             "a System message must serialize to None (skipped), not panic"
         );
 
@@ -1640,7 +1729,7 @@ mod anthropic_request_building {
         ];
         let serialized: Vec<Value> = conversation
             .iter()
-            .filter_map(|m| super::message_to_anthropic_json(m, true))
+            .filter_map(|m| super::message_to_anthropic_json(m, true, false, false))
             .collect();
 
         // The System message is omitted; User + Assistant survive, in order.
@@ -1678,7 +1767,8 @@ mod anthropic_request_building {
         let assistant_id = assistant.id.clone();
 
         let messages = [system, user, assistant];
-        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+        let (system_val, out, out_ids) =
+            super::messages_to_anthropic_json(&messages, &[], false, false);
 
         // (a) The System message is routed into the top-level `system` field.
         let system_value =
@@ -1733,7 +1823,8 @@ mod anthropic_request_building {
             Message::user("Hello"),
             Message::assistant("Hi!", None),
         ];
-        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+        let (system_val, out, out_ids) =
+            super::messages_to_anthropic_json(&messages, &[], false, false);
 
         // Both system messages are joined into the system field.
         let system_value =
@@ -1812,7 +1903,8 @@ mod anthropic_request_building {
             Message::system("mid-conversation system"),
             Message::tool_result("call_1", "found it"),
         ];
-        let (system_val, out, out_ids) = super::messages_to_anthropic_json(&messages, &[]);
+        let (system_val, out, out_ids) =
+            super::messages_to_anthropic_json(&messages, &[], false, false);
 
         // The wedged System message is routed to the system field, not dropped.
         assert!(
@@ -2427,13 +2519,29 @@ mod anthropic_request_building {
         // Anthropic rejects a `thinking` block in any non-first position, so the
         // merged-in turn's thinking is dropped. (#101 invariant: coalescing never
         // produces an illegal block order, even for the assistant role.)
+        //
+        // This exercises the compat (`thinking_replay_always`) path directly —
+        // see `build_anthropic_request_with_cache_blocks` (#520) — since that's
+        // the only mode that still emits `thinking` blocks from history at all;
+        // the invariant under test (coalescing never produces an illegal block
+        // order) is orthogonal to that replay policy.
         let messages = vec![
             Message::assistant_with_reasoning("a1", None, Some("reason one".into())),
             Message::assistant_with_reasoning("a2", None, Some("reason two".into())),
         ];
 
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true,
+        );
         let built = out["messages"].as_array().expect("messages array");
         assert_eq!(built.len(), 1, "the two assistant turns coalesced");
 
@@ -2895,15 +3003,100 @@ mod anthropic_request_building_edge_cases {
         assert_eq!(out["max_tokens"], 2048);
     }
 
+    /// Issue #520: by default (real Anthropic, `thinking_replay_always = false`)
+    /// a `thinking` block is NEVER replayed from history, even when the current
+    /// request has thinking enabled and the reasoning text is non-empty — bamboo
+    /// never captures the signature Anthropic requires on a replayed `thinking`
+    /// block, so sending one back unconditionally 400s. This is the direct
+    /// regression test for root cause 1's "pure-Anthropic multi-round" variant.
     #[test]
-    fn assistant_reasoning_included_as_thinking_block() {
+    fn assistant_reasoning_omitted_by_default_even_with_thinking_enabled() {
         let messages = vec![Message::assistant_with_reasoning(
             "Here is the answer.",
             None,
             Some("I thought about it.".to_string()),
         )];
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false, // thinking_replay_always = false: the real-Anthropic default
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            1,
+            "no thinking block is replayed without a captured signature"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Here is the answer.");
+    }
+
+    /// Issue #520's named repro: history containing reasoning minted by a
+    /// DIFFERENT provider (e.g. a GPT Responses reasoning summary, persisted
+    /// into the same `Message.reasoning` field bamboo uses for every provider)
+    /// must never be replayed as an Anthropic `thinking` block after a
+    /// mid-session model switch to Claude — that block would carry text
+    /// Anthropic never signed, and real Anthropic 400s on it.
+    #[test]
+    fn foreign_reasoning_never_replayed_as_thinking_block_after_provider_switch() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Done reading the repo.",
+            None,
+            Some("GPT's own reasoning summary text.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")),
+            "foreign reasoning must never surface as a `thinking` block: {content:?}"
+        );
+    }
+
+    /// Compat upstreams (e.g. GLM's anthropic-compat endpoint) require the
+    /// `thinking` block to be present unconditionally and don't validate its
+    /// signature — `thinking_replay_always = true` preserves that legacy
+    /// behavior for them.
+    #[test]
+    fn assistant_reasoning_included_as_thinking_block_in_compat_mode() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true, // thinking_replay_always = true: compat mode
+        );
 
         let content = out["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -2916,7 +3109,7 @@ mod anthropic_request_building_edge_cases {
     }
 
     #[test]
-    fn assistant_reasoning_included_with_tool_calls() {
+    fn assistant_reasoning_included_with_tool_calls_in_compat_mode() {
         use bamboo_domain::{FunctionCall, ToolCall};
         let tool_call = ToolCall {
             id: "call_1".to_string(),
@@ -2931,8 +3124,18 @@ mod anthropic_request_building_edge_cases {
             Some(vec![tool_call]),
             Some("Planning the search.".to_string()),
         )];
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true, // thinking_replay_always = true: compat mode
+        );
 
         let content = out["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -2941,6 +3144,38 @@ mod anthropic_request_building_edge_cases {
         assert_eq!(content[0]["thinking"], "Planning the search.");
         // Tool use block second (no text because content is empty)
         assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    /// Even in compat mode, a thinking block must never be sent when the
+    /// CURRENT request has thinking disabled — Anthropic (and Anthropic-style
+    /// upstreams) reject a thinking block in that case too (#520).
+    #[test]
+    fn assistant_reasoning_omitted_in_compat_mode_when_thinking_disabled() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            64,
+            false,
+            None, // reasoning_effort = None -> thinking disabled for this request
+            None,
+            None,
+            true, // thinking_replay_always = true
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            1,
+            "thinking disabled for this request always wins over compat mode"
+        );
+        assert_eq!(content[0]["type"], "text");
     }
 
     #[test]
