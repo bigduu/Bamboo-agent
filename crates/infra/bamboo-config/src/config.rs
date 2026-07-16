@@ -1665,6 +1665,25 @@ pub struct AnthropicConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_overrides: Option<RequestOverridesConfig>,
 
+    /// Unconditionally replay a prior turn's `reasoning` as a `thinking`
+    /// content block, regardless of whether bamboo captured a valid signature
+    /// for it (issue #520).
+    ///
+    /// Defaults to `false`/absent, which is REQUIRED for real Anthropic: it
+    /// requires `thinking` input blocks to carry a signature it minted itself,
+    /// and bamboo never captures one, so an unconditionally-replayed block is
+    /// always rejected with a 400 (either because it's foreign — minted by a
+    /// different provider after a mid-session model switch — or because it's
+    /// an unsigned copy of Claude's own prior turn).
+    ///
+    /// Set this to `true` only when pointing `base_url` at an
+    /// Anthropic-COMPATIBLE upstream (e.g. GLM's `/anthropic` endpoint) that
+    /// has the opposite contract: it requires the `thinking` block to be
+    /// present whenever thinking is enabled, but never validates its
+    /// signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_replay_always: Option<bool>,
+
     /// Preserve unknown keys under `providers.anthropic`.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,

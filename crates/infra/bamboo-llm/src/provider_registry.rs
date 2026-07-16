@@ -385,6 +385,14 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
                 max_tokens: None,
                 reasoning_effort: instance.reasoning_effort,
                 request_overrides: instance.request_overrides.clone(),
+                // Anthropic-compatible upstreams (e.g. GLM) that require
+                // unconditional `thinking`-block presence opt in via this
+                // instance's `extra.thinking_replay_always` (#520); real
+                // Anthropic must never set it.
+                thinking_replay_always: instance
+                    .extra
+                    .get("thinking_replay_always")
+                    .and_then(|v| v.as_bool()),
                 extra: Default::default(),
             });
         }
@@ -613,6 +621,75 @@ mod tests {
         );
         assert_eq!(openai.model.as_deref(), Some("gpt-4o"));
         assert_eq!(config.provider, "openai");
+    }
+
+    /// Issue #520: an Anthropic provider instance's `extra.thinking_replay_always`
+    /// (the GLM-style anthropic-compat opt-in) must project through to the
+    /// legacy `AnthropicConfig` slot `create_provider_by_name` reads.
+    #[test]
+    fn test_apply_instance_to_config_anthropic_projects_thinking_replay_always() {
+        let mut config = Config::default();
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "thinking_replay_always".to_string(),
+            serde_json::json!(true),
+        );
+        let instance = ProviderInstanceConfig {
+            provider_type: "anthropic".to_string(),
+            label: Some("GLM compat".to_string()),
+            api_key: "glm-key".to_string(),
+            api_key_encrypted: None,
+            base_url: Some("https://glm.example.com/anthropic".to_string()),
+            model: Some("glm-4.6".to_string()),
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            enabled: true,
+            extra,
+        };
+
+        apply_instance_to_config(&mut config, &instance);
+
+        let anthropic = config
+            .providers
+            .anthropic
+            .as_ref()
+            .expect("anthropic should be set");
+        assert_eq!(anthropic.thinking_replay_always, Some(true));
+    }
+
+    /// Without the `extra.thinking_replay_always` key at all, the projected
+    /// config must leave it `None` — `create_provider_by_name` then defaults
+    /// to `false`, the safe real-Anthropic behavior (#520).
+    #[test]
+    fn test_apply_instance_to_config_anthropic_defaults_thinking_replay_always_to_none() {
+        let mut config = Config::default();
+        let instance = ProviderInstanceConfig {
+            provider_type: "anthropic".to_string(),
+            label: None,
+            api_key: "sk-ant-key".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            enabled: true,
+            extra: Default::default(),
+        };
+
+        apply_instance_to_config(&mut config, &instance);
+
+        let anthropic = config
+            .providers
+            .anthropic
+            .as_ref()
+            .expect("anthropic should be set");
+        assert_eq!(anthropic.thinking_replay_always, None);
     }
 
     /// A poisoned lock must not brick the registry: every subsequent operation

@@ -278,6 +278,7 @@ mod comprehensive_config_tests {
             reasoning_effort: None,
             max_tokens: None,
             request_overrides: None,
+            thinking_replay_always: None,
             extra: Default::default(),
         });
         original.server.port = 8888;
