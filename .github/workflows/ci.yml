@@ -174,7 +174,14 @@ jobs:
       # Pinned by commit SHA (not just the `v2` tag) for supply-chain
       # reproducibility — deny.toml at the repo root is tuned to be green
       # against the current dependency tree (bamboo-agent#254).
+      #
+      # IMPORTANT: this action release bundles cargo-deny 0.20.2 (see the
+      # `deny_version` in the action's Dockerfile at this commit); deny.toml
+      # was validated against that exact cargo-deny version. Older releases
+      # (e.g. v2.0.11 = cargo-deny 0.18.2) fail on deny.toml's newer schema
+      # ([bans] allow-workspace) and license-expression syntax — when bumping
+      # this pin, re-run `cargo deny check` locally with the matching version.
       - name: cargo-deny check
-        uses: EmbarkStudios/cargo-deny-action@34899fc7ba81ca6268d5947a7a16b4649013fea1 # v2.0.11
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
         with:
           command: check
