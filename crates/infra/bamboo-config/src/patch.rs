@@ -374,6 +374,69 @@ pub fn preserve_masked_provider_api_keys(patch_obj: &mut Map<String, Value>, cur
     }
 }
 
+/// Carry provider secrets that the merge round-trip dropped forward from the
+/// live config.
+///
+/// `config_manager::build_merged_config` serializes the live config before
+/// merging a patch, which drops every `#[serde(skip_serializing)]` plaintext
+/// `api_key`. Hydration afterwards only restores ciphertext-backed keys — but
+/// the live config can legitimately hold a plaintext-only secret whose
+/// `api_key_encrypted` is still `None` (ciphertext is only ever computed on
+/// `save_to_dir`'s save-time clone; a provider instance freshly created via
+/// the instance CRUD endpoints stays plaintext-only in memory). The merged
+/// config then ends up with NEITHER field and the key is silently lost on the
+/// next persist: config.json loses `api_key_encrypted` while config.json.bak
+/// keeps it (#516).
+///
+/// Restores `api_key`/`api_key_encrypted` from `current` for every legacy
+/// provider and provider instance that the patch did not explicitly set or
+/// clear (per `intents`), whenever the merge left neither field behind.
+/// Generalizes the env-sourced rescue of
+/// [`Config::preserve_env_sourced_provider_keys`] (#373).
+pub fn preserve_unpatched_provider_secrets(
+    merged: &mut Config,
+    current: &Config,
+    intents: &ProviderApiKeyIntents,
+) {
+    macro_rules! carry_forward {
+        ($field:ident) => {
+            if !intents.providers.contains(stringify!($field)) {
+                if let (Some(new_cfg), Some(prev)) = (
+                    merged.providers.$field.as_mut(),
+                    current.providers.$field.as_ref(),
+                ) {
+                    if new_cfg.api_key.trim().is_empty()
+                        && new_cfg.api_key_encrypted.is_none()
+                        && (!prev.api_key.trim().is_empty() || prev.api_key_encrypted.is_some())
+                    {
+                        new_cfg.api_key = prev.api_key.clone();
+                        new_cfg.api_key_encrypted = prev.api_key_encrypted.clone();
+                    }
+                }
+            }
+        };
+    }
+    carry_forward!(openai);
+    carry_forward!(anthropic);
+    carry_forward!(gemini);
+    carry_forward!(bodhi);
+
+    for (id, instance) in merged.provider_instances.iter_mut() {
+        if intents.provider_instances.contains(id) {
+            continue;
+        }
+        if !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some() {
+            continue;
+        }
+        if let Some(prev) = current.provider_instances.get(id) {
+            if !prev.api_key.trim().is_empty() || prev.api_key_encrypted.is_some() {
+                instance.api_key = prev.api_key.clone();
+                instance.api_key_encrypted = prev.api_key_encrypted.clone();
+            }
+        }
+    }
+}
+
 /// Replace masked notification-channel secret placeholders (ntfy `token`, Bark
 /// `device_key`) in a patch with the current config's plaintext values.
 ///
@@ -626,6 +689,106 @@ mod tests {
         assert!(!intents.providers.contains("openai"));
         assert!(intents.provider_instances.contains("personal-openai"));
         assert!(!intents.provider_instances.contains("work-openai"));
+    }
+
+    /// Build a provider instance via serde (the struct has no `Default`), so
+    /// the tests stay robust to new fields.
+    fn instance(api_key: &str, encrypted: Option<&str>) -> crate::ProviderInstanceConfig {
+        serde_json::from_value(json!({
+            "provider_type": "openai",
+            "api_key": api_key,
+            "api_key_encrypted": encrypted,
+        }))
+        .expect("valid instance")
+    }
+
+    #[test]
+    fn preserve_unpatched_provider_secrets_restores_roundtrip_dropped_keys() {
+        // #516: the live config can hold a plaintext-only secret (ciphertext is
+        // computed only on save_to_dir's save-time clone). The merge round-trip
+        // drops the `skip_serializing` plaintext, leaving neither field.
+        let mut current = Config::default();
+        current
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("sk-instance-live", None));
+        current.providers.openai = Some(crate::OpenAIConfig {
+            api_key: "sk-legacy-live".to_string(),
+            ..Default::default()
+        });
+
+        // Simulate the post-round-trip merge result: both fields lost.
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("", None));
+        merged.providers.openai = Some(crate::OpenAIConfig::default());
+
+        preserve_unpatched_provider_secrets(
+            &mut merged,
+            &current,
+            &ProviderApiKeyIntents::default(),
+        );
+
+        assert_eq!(
+            merged.provider_instances["uuid-1"].api_key,
+            "sk-instance-live"
+        );
+        assert_eq!(
+            merged.providers.openai.as_ref().unwrap().api_key,
+            "sk-legacy-live"
+        );
+    }
+
+    #[test]
+    fn preserve_unpatched_provider_secrets_carries_ciphertext_only_keys() {
+        // A key whose plaintext failed to hydrate (#268) must still carry its
+        // ciphertext forward instead of being dropped.
+        let mut current = Config::default();
+        current
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("", Some("preexisting-ct")));
+
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("", None));
+
+        preserve_unpatched_provider_secrets(
+            &mut merged,
+            &current,
+            &ProviderApiKeyIntents::default(),
+        );
+
+        assert_eq!(
+            merged.provider_instances["uuid-1"]
+                .api_key_encrypted
+                .as_deref(),
+            Some("preexisting-ct")
+        );
+    }
+
+    #[test]
+    fn preserve_unpatched_provider_secrets_respects_explicit_intents() {
+        // A provider/instance the patch explicitly set or cleared must not have
+        // the old key resurrected.
+        let mut current = Config::default();
+        current
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("sk-old", None));
+
+        let mut merged = Config::default();
+        merged
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("", None));
+
+        let mut intents = ProviderApiKeyIntents::default();
+        intents.provider_instances.insert("uuid-1".to_string());
+
+        preserve_unpatched_provider_secrets(&mut merged, &current, &intents);
+
+        let cleared = &merged.provider_instances["uuid-1"];
+        assert!(cleared.api_key.is_empty(), "explicit clear must win");
+        assert!(cleared.api_key_encrypted.is_none());
     }
 
     #[test]

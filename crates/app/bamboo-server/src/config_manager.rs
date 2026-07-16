@@ -28,8 +28,8 @@ use bamboo_llm::Config;
 pub use bamboo_config::patch::{
     deep_merge_json, domains_for_root_patch, effects_for_root_patch, is_masked_api_key,
     preserve_masked_connect_secrets, preserve_masked_notification_secrets,
-    preserve_masked_provider_api_keys, provider_api_key_intents, sanitize_root_patch,
-    DomainChanges, PatchEffects, ReloadMode,
+    preserve_masked_provider_api_keys, preserve_unpatched_provider_secrets,
+    provider_api_key_intents, sanitize_root_patch, DomainChanges, PatchEffects, ReloadMode,
 };
 
 pub fn sync_provider_api_keys_encrypted_for_patch(
@@ -144,6 +144,11 @@ pub fn build_merged_config(
     current: &Config,
     patch_obj: Map<String, Value>,
 ) -> Result<Config, AppError> {
+    // Captured before the merge consumes the patch: which providers/instances
+    // this patch explicitly sets or clears — those must NOT get their dropped
+    // key carried forward below (#516).
+    let api_key_intents = provider_api_key_intents(&patch_obj);
+
     let mut merged = serde_json::to_value(current)
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to serialize config: {e}")))?;
 
@@ -163,6 +168,12 @@ pub fn build_merged_config(
     // key (no ciphertext, #253) would be silently blanked by any settings PATCH.
     // Copy env-sourced keys back from the live `current` config. #373.
     new_config.preserve_env_sourced_provider_keys(current);
+    // Same round-trip hazard for any OTHER plaintext-only key (ciphertext still
+    // `None` in the live config — e.g. a provider instance freshly created via
+    // the instance CRUD endpoints): hydration has nothing to decrypt and the
+    // key would vanish from config.json on the next persist. Carry unpatched
+    // keys forward from the live config. #516.
+    preserve_unpatched_provider_secrets(&mut new_config, current, &api_key_intents);
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
     new_config.normalize_plugin_trust_settings();
@@ -255,5 +266,67 @@ mod tests {
         );
         assert!(openai.api_key_from_env);
         assert!(openai.api_key_encrypted.is_none(), "still not persisted");
+    }
+
+    /// The live in-memory state right after `POST /provider-instances`:
+    /// plaintext key, ciphertext still `None` (ciphertext is only ever computed
+    /// on `save_to_dir`'s save-time clone).
+    fn config_with_plaintext_only_instance(api_key: &str) -> Config {
+        let mut config = Config::default();
+        let instance: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "api_key": api_key,
+            }))
+            .expect("valid instance");
+        config
+            .provider_instances
+            .insert("uuid-1".to_string(), instance);
+        config
+    }
+
+    // #516 regression: the lotus instance-mode 保存配置 sends a defaults/features
+    // patch that never mentions the instance. The merge round-trip drops the
+    // `skip_serializing` plaintext, hydration has no ciphertext to restore, and
+    // the freshly-created instance's key was silently wiped from config.json
+    // (config.json.bak kept the previous good copy).
+    #[test]
+    fn unrelated_patch_preserves_plaintext_only_instance_key() {
+        let current = config_with_plaintext_only_instance("sk-instance-live");
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"features":{"provider_model_ref":true}}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(intents.provider_instances.is_empty());
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = merged.provider_instances.get("uuid-1").expect("instance");
+        assert_eq!(
+            instance.api_key, "sk-instance-live",
+            "an unrelated settings PATCH must not lose the instance key (#516)"
+        );
+    }
+
+    // The carry-forward must not resurrect a key the patch explicitly cleared.
+    #[test]
+    fn explicit_instance_key_clear_still_clears() {
+        let current = config_with_plaintext_only_instance("sk-old");
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"provider_instances":{"uuid-1":{"api_key":""}}}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(
+            intents.provider_instances.contains("uuid-1"),
+            "empty string is a clear intent"
+        );
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = merged.provider_instances.get("uuid-1").expect("instance");
+        assert!(instance.api_key.is_empty(), "explicit clear must win");
+        assert!(instance.api_key_encrypted.is_none());
     }
 }

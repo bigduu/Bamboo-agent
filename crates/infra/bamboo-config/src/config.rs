@@ -3035,18 +3035,12 @@ impl Config {
         to_save.extra.remove("data_dir");
         // Root-level `model` is deprecated; do not persist it.
         to_save.extra.remove("model");
-        to_save.refresh_proxy_auth_encrypted()?;
-        to_save.refresh_provider_api_keys_encrypted()?;
-        to_save.refresh_provider_instance_api_keys_encrypted()?;
-        to_save.refresh_env_vars_encrypted()?;
-        to_save.sanitize_env_vars_for_disk();
-        to_save.refresh_cluster_fabric_encrypted()?;
-        to_save.sanitize_cluster_fabric_for_disk();
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
-        to_save.refresh_notifications_encrypted()?;
+        to_save.refresh_encrypted_secrets()?;
+        to_save.sanitize_env_vars_for_disk();
+        to_save.sanitize_cluster_fabric_for_disk();
         to_save.assign_connect_platform_ids();
-        to_save.refresh_connect_platform_tokens_encrypted()?;
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
 
@@ -5278,6 +5272,45 @@ mod tests {
         assert!(
             !enc.is_empty() && enc != "stale-ciphertext",
             "plaintext re-encrypted"
+        );
+    }
+
+    #[test]
+    fn refresh_encrypted_secrets_makes_instance_key_survive_serde_roundtrip() {
+        // #516: `save_to_dir` refreshes ciphertext only on its save-time clone,
+        // so a provider instance created over HTTP stays plaintext-only in the
+        // live config. Serializing that live config (as the settings-PATCH
+        // merge does) drops the `skip_serializing` plaintext and the key is
+        // gone. `refresh_encrypted_secrets` on the live config closes the gap.
+        let mut config = Config::default();
+        let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "api_key": "sk-instance-live",
+        }))
+        .expect("valid instance");
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+
+        config.refresh_encrypted_secrets().expect("refresh");
+        assert!(
+            config.provider_instances["work"]
+                .api_key_encrypted
+                .is_some(),
+            "live config must hold ciphertext after refresh"
+        );
+
+        // The build_merged_config-style round-trip.
+        let value = serde_json::to_value(&config).expect("serialize");
+        let mut back: Config = serde_json::from_value(value).expect("deserialize");
+        assert!(
+            back.provider_instances["work"].api_key.is_empty(),
+            "plaintext is skip_serializing"
+        );
+        back.hydrate_provider_instance_api_keys_from_encrypted();
+        assert_eq!(
+            back.provider_instances["work"].api_key, "sk-instance-live",
+            "key must be recoverable from the round-tripped ciphertext"
         );
     }
 
