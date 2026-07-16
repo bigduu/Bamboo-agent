@@ -71,7 +71,14 @@ fn ledger_scope() -> impl HttpServiceFactory {
 
 /// Configure agent API routes (core agent functionality)
 ///
-/// Routes for chat, execute, events, stop, history, task, respond, delete, health, metrics, mcp
+/// Routes for chat, execute, events, stop, history, task, respond, delete, health, metrics, mcp.
+///
+/// Per-session actions (execute/events/stop/history/task/respond/child-approval)
+/// are registered TWICE: once under the canonical nested
+/// `/sessions/{session_id}/…` form, and once more under their original flat
+/// `/…/{session_id}` form as a legacy alias to the identical handler — see the
+/// "canonical nested form" / "legacy flat aliases" comment blocks below.
+/// #251 (finding 4).
 pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     let mut scope = web::scope("/api/v1")
         .wrap(actix_web::middleware::from_fn(
@@ -200,6 +207,55 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/execute/defaults",
             web::get().to(agent::execute::defaults_handler),
         )
+        // ── Session sub-resources — canonical nested form (#251 finding 4) ──
+        // Every per-session action below is nested under `/sessions/{session_id}/…`,
+        // matching the already-nested `messages`/`attachments` sub-resources. The
+        // flat root-level siblings further down (`/execute/{id}`, `/events/{id}`,
+        // `/stop/{id}`, `/history/{id}`, `/task/{id}`, `/respond/{id}`,
+        // `/child-approval/{id}`) are kept registered as LEGACY ALIASES pointing at
+        // the exact same handlers — old clients (Lotus, bamboo CLI/SDK, magpie)
+        // keep working unchanged. New callers should prefer the nested form.
+        .route(
+            "/sessions/{session_id}/execute",
+            web::post().to(agent::execute::handler),
+        )
+        .route(
+            "/sessions/{session_id}/events",
+            web::get().to(agent::events::handler),
+        )
+        .route(
+            "/sessions/{session_id}/stop",
+            web::post().to(agent::stop::handler),
+        )
+        .route(
+            "/sessions/{session_id}/history",
+            web::get().to(agent::history::handler),
+        )
+        .route(
+            "/sessions/{session_id}/task",
+            web::get().to(agent::task::get_task_list),
+        )
+        .route(
+            "/sessions/{session_id}/task/exists",
+            web::get().to(agent::task::has_task_list),
+        )
+        .route(
+            "/sessions/{session_id}/respond",
+            web::post().to(agent::respond::submit_response),
+        )
+        .route(
+            "/sessions/{session_id}/respond/pending",
+            web::get().to(agent::respond::get_pending_question),
+        )
+        // Phase 2: deliver a human approval decision to a child sub-agent's
+        // blocked gated tool (surfaced via AgentEvent::ChildApprovalRequested).
+        .route(
+            "/sessions/{child_session_id}/child-approval",
+            web::post().to(agent::child_approval::handler),
+        )
+        // ── Legacy flat aliases (#251 finding 4) — kept byte-identical to their
+        // pre-refactor paths, wired to the SAME handlers as the nested routes
+        // above, so no existing client breaks.
         .route(
             "/execute/{session_id}",
             web::post().to(agent::execute::handler),
@@ -212,8 +268,6 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // sessions (multi-client sync, replaces session-index polling).
         .route("/stream", web::get().to(agent::stream::handler))
         .route("/stop/{session_id}", web::post().to(agent::stop::handler))
-        // Phase 2: deliver a human approval decision to a child sub-agent's
-        // blocked gated tool (surfaced via AgentEvent::ChildApprovalRequested).
         .route(
             "/child-approval/{child_session_id}",
             web::post().to(agent::child_approval::handler),
@@ -324,6 +378,24 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     if dev_endpoints_enabled() {
         scope = scope.route("/dev/reset", web::post().to(agent::dev::reset));
     }
+
+    // Bamboo internal routes (commands/settings/skills/tools/workspace/
+    // copilot/provider-catalog/provider-instances/cluster-fabric) — nested
+    // into this SAME `/api/v1` scope (not a second competing
+    // `Scope("/api/v1")`) so they become reachable at the canonical prefix
+    // while a separate `/v1` scope (`routes::bamboo_v1::bamboo_v1_routes`)
+    // keeps mounting the identical routes as a legacy alias. #251 (finding 1)
+    // — see `bamboo_v1::bamboo_relative_routes`'s doc comment for why this
+    // must be a nested `.service()` call rather than its own top-level scope.
+    // MUST be registered LAST in this scope: its own path prefix is empty
+    // (`""`), which matches as a prefix of every remaining path — actix hands
+    // a matched scope the whole request and does not fall through to
+    // resources registered after it, so anything registered later here would
+    // be silently shadowed (caught by
+    // `dev_reset_route_registered_when_dev_endpoints_enabled` during
+    // development, when `/dev/reset` 404'd after being registered before
+    // this line).
+    scope = scope.service(super::bamboo_v1::bamboo_relative_routes());
 
     cfg.service(scope);
 

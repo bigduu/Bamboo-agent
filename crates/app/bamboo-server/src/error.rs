@@ -78,6 +78,30 @@ struct JsonErrorWrapper {
     error: JsonError,
 }
 
+/// The value of the `"error"` key in bamboo's canonical error envelope
+/// (`{"error": {"message", "type", "code"}}`, matching [`AppError`]'s
+/// [`ResponseError::error_response`] body) — for the minority of handlers
+/// that are not (yet) modeled as an `AppError` variant but still need to
+/// return extra sibling fields alongside the error (e.g. `session_id`,
+/// `message_id`) that a bare `AppError` has no place for.
+///
+/// Prefer returning `Result<_, AppError>` directly when there are no extra
+/// sibling fields — this helper exists only to converge the remaining
+/// hand-written `HttpResponse::X().json(json!({"error": "<flat string>", ...}))`
+/// call sites (#251 finding 2) onto the SAME envelope shape as `AppError`,
+/// without forcing every one of them through a full `AppError` variant.
+///
+/// # Example
+/// ```ignore
+/// HttpResponse::NotFound().json(serde_json::json!({
+///     "error": error_value("Session not found"),
+///     "session_id": session_id,
+/// }))
+/// ```
+pub fn error_value(message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "message": message.into(), "type": "api_error" })
+}
+
 impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
@@ -253,5 +277,28 @@ mod tests {
         let json_err = serde_json::from_str::<bool>("not a bool").unwrap_err();
         let app_error: AppError = json_err.into();
         assert!(matches!(app_error, AppError::SerializationError(_)));
+    }
+
+    /// The canonical envelope is a nested `{"error": {"message", "type"}}` —
+    /// `AppError::error_response` and [`error_value`] must agree on the same
+    /// shape (modulo the extra sibling fields `error_value` callers add
+    /// alongside `"error"`). #251 (finding 2).
+    #[actix_web::test]
+    async fn app_error_and_error_value_agree_on_envelope_shape() {
+        let resp = AppError::NotFound("Session".to_string()).error_response();
+        let bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let app_err_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(app_err_body["error"]["type"], "api_error");
+        assert!(app_err_body["error"]["message"].is_string());
+
+        let helper_error = error_value("Session not found");
+        assert_eq!(helper_error["type"], "api_error");
+        assert_eq!(helper_error["message"], "Session not found");
+
+        // Same "type" tag on both shapes.
+        assert_eq!(
+            app_err_body["error"]["type"], helper_error["type"],
+            "AppError and error_value must use the same error \"type\" tag"
+        );
     }
 }

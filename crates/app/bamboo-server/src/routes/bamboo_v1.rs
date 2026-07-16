@@ -2,11 +2,31 @@ use actix_web::{dev::HttpServiceFactory, web};
 
 use crate::handlers::{command, copilot_auth, settings, skill, tools, workspace};
 
-fn bamboo_v1_scope() -> impl HttpServiceFactory {
-    web::scope("/v1")
-        .wrap(actix_web::middleware::from_fn(
-            settings::enforce_access_password_middleware,
-        ))
+/// Builds the full Bamboo internal route table (commands / settings / skills /
+/// tools / workspace / copilot-auth / provider-catalog / provider-instances /
+/// cluster-fabric) as a set of routes relative to whatever scope mounts them —
+/// this factory adds NO path prefix and NO middleware wrap of its own.
+///
+/// Nested TWICE (#251 finding 1):
+///   - inside `routes::agent::agent_routes`'s single `/api/v1` scope (the
+///     canonical mount — see that function's `.service(bamboo_v1::bamboo_relative_routes())`
+///     call), so it inherits that scope's prefix AND its
+///     `enforce_access_password_middleware` wrap;
+///   - inside [`bamboo_v1_routes`]'s own `/v1` scope below, as a permanent
+///     back-compat alias for existing clients (Lotus, bamboo CLI/SDK, magpie)
+///     that still call bare `/v1/*`.
+///
+/// Deliberately NOT a second top-level `Scope("/api/v1")`: actix-web routes a
+/// request to the FIRST registered `Scope` whose prefix matches and then hands
+/// it the whole sub-tree — an unmatched path inside that scope 404s directly,
+/// it does not fall through to try a sibling scope with an identical prefix.
+/// Two competing `Scope("/api/v1")` registrations would therefore silently
+/// shadow one other (this exact bug was caught by
+/// `routes::tests::bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix`
+/// during development). Nesting inside the ONE scope `agent_routes` already
+/// owns is the only pattern that works here.
+pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
+    web::scope("")
         // Command routes
         .route("/commands", web::get().to(command::list_commands))
         .route(
@@ -277,9 +297,27 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
         )
 }
 
-/// Configure Bamboo internal `/v1/*` routes.
+/// Configure the legacy `/v1/*` alias for Bamboo's internal routes.
+///
+/// Three native-API prefixes used to coexist (`/api/v1` for the agent surface,
+/// bare `/v1` for settings/skills/tools/workspace/copilot/cluster, `/v2` for
+/// pairing/devices/ws) — pure historical drift for the first two, since both
+/// are bamboo's own API and nothing distinguishes them by version or
+/// capability. `/api/v1` is now canonical for ALL of bamboo's native REST
+/// surface (mounted by `routes::agent::agent_routes`, which nests
+/// [`bamboo_relative_routes`] into its own `/api/v1` scope); `/v1` here is
+/// kept mounted as a permanent back-compat alias (not scheduled for removal —
+/// no deprecation window has been announced to consumers). `/v2` is a
+/// distinct, intentionally-versioned newer generation (the WS multiplex +
+/// device pairing) and is unaffected by this alias. #251 (finding 1).
 ///
 /// OpenAI-compatible forwarding endpoints live under `/openai/v1/*`.
 pub fn bamboo_v1_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(bamboo_v1_scope());
+    cfg.service(
+        web::scope("/v1")
+            .wrap(actix_web::middleware::from_fn(
+                settings::enforce_access_password_middleware,
+            ))
+            .service(bamboo_relative_routes()),
+    );
 }

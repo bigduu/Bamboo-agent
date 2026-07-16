@@ -37,8 +37,11 @@ pub async fn create_session(
     {
         Ok(value) => value,
         Err(error) => {
+            // Canonical nested error envelope (#251 finding 2); `message` is kept
+            // as a top-level sibling field too since existing callers already
+            // read the detail from there, not from `error.message`.
             return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "Invalid gold_config",
+                "error": crate::error::error_value("Invalid gold_config"),
                 "message": error.to_string()
             })));
         }
@@ -90,7 +93,7 @@ pub async fn create_session(
             session: SessionSummary::from_entry(entry, false),
         })),
         None => Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": "Session created but missing from index",
+            "error": crate::error::error_value("Session created but missing from index"),
             "session_id": id
         }))),
     }
