@@ -219,6 +219,75 @@ impl OpenAIProvider {
             let status = response.status();
             let text = response.text().await?;
 
+            // The upstream can no longer resolve the stateful continuation id —
+            // e.g. the referenced turn was never stored (`store=false`), aged out
+            // of retention, or belongs to another key/org. The full input array
+            // is sent alongside the id, so retrying once WITHOUT the continuation
+            // is lossless and keeps the session alive instead of hard-failing.
+            let sent_previous_response_id = responses_options
+                .and_then(|opts| opts.previous_response_id.as_deref())
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if sent_previous_response_id
+                && crate::providers::common::looks_like_previous_response_not_found_error(
+                    status, &text,
+                )
+            {
+                tracing::warn!(
+                    "OpenAI /responses could not find previous_response_id for model '{}'; retrying without stateful continuation. Upstream response: {}",
+                    model,
+                    text
+                );
+
+                let mut fallback_options = responses_options.cloned().unwrap_or_default();
+                fallback_options.previous_response_id = None;
+                let mut fallback_body = build_responses_body(
+                    model,
+                    messages,
+                    tools,
+                    max_output_tokens,
+                    reasoning_effort,
+                    Some(&fallback_options),
+                    parallel_tool_calls,
+                );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_RESPONSES,
+                    Some(model),
+                );
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                let fallback_headers =
+                    self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
+                let fallback =
+                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
+                        self.client
+                            .post(&responses_url)
+                            .headers(fallback_headers.clone())
+                            .json(&fallback_body)
+                    })
+                    .await?;
+
+                if !fallback.status().is_success() {
+                    let fallback_status = fallback.status();
+                    let fallback_text = fallback.text().await?;
+                    return Err(LLMError::Api(format!(
+                        "HTTP {}: {}",
+                        fallback_status, fallback_text
+                    )));
+                }
+
+                let mut parser =
+                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
+                let model_for_debug = model.to_string();
+                let stream = llm_stream_from_sse(fallback, move |event, data| {
+                    let parsed = parser.handle_event(event, data);
+                    append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
+                    parsed
+                });
+                return Ok(stream);
+            }
+
             if reasoning_effort.is_some()
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
@@ -874,5 +943,161 @@ mod tests {
         // Model is passed to chat_stream() as a parameter
 
         assert_eq!(provider.base_url, "https://custom.api.com");
+    }
+
+    // ===== /responses previous_response_not_found fallback (wiremock) =====
+
+    use futures::StreamExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const PREVIOUS_RESPONSE_NOT_FOUND_BODY: &str = r#"{"error":{"message":"Previous response with id 'resp_stale' not found.","type":"invalid_request_error","param":"previous_response_id","code":"previous_response_not_found"}}"#;
+
+    const RESPONSES_SSE_OK: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\"}}\n\n";
+
+    /// Emulates the real OpenAI contract: a request chaining a stale (or never
+    /// stored) `previous_response_id` fails with 400
+    /// `previous_response_not_found`; a request without it streams normally.
+    struct PreviousResponseNotFoundResponder;
+
+    impl Respond for PreviousResponseNotFoundResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON request body");
+            if body.get("previous_response_id").is_some() {
+                ResponseTemplate::new(400).set_body_string(PREVIOUS_RESPONSE_NOT_FOUND_BODY)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK)
+            }
+        }
+    }
+
+    fn responses_provider(server: &MockServer) -> OpenAIProvider {
+        OpenAIProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_responses_only_models(vec!["gpt-5*".to_string()])
+    }
+
+    fn options_with_previous_response_id(id: Option<&str>) -> LLMRequestOptions {
+        LLMRequestOptions {
+            responses: Some(ResponsesRequestOptions {
+                previous_response_id: id.map(str::to_string),
+                store: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn collect_tokens(mut stream: LLMStream) -> String {
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.expect("stream chunk") {
+                LLMChunk::Token(token) => text.push_str(&token),
+                LLMChunk::Done => break,
+                _ => {}
+            }
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn responses_retries_without_previous_response_id_on_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(PreviousResponseNotFoundResponder)
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = responses_provider(&server);
+        let options = options_with_previous_response_id(Some("resp_stale"));
+        let stream = provider
+            .chat_stream_with_options(
+                &[Message::user("hello")],
+                &[],
+                None,
+                "gpt-5.2",
+                Some(&options),
+            )
+            .await
+            .expect("fallback retry without previous_response_id must succeed");
+
+        assert_eq!(collect_tokens(stream).await, "hi");
+
+        // First request chained the stale id; the retry dropped it but kept the
+        // full input array, so no context was lost.
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(first["previous_response_id"], "resp_stale");
+        assert!(second.get("previous_response_id").is_none());
+        assert_eq!(first["input"], second["input"]);
+    }
+
+    #[tokio::test]
+    async fn responses_does_not_retry_unrelated_400_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"The model `gpt-x` does not exist","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = responses_provider(&server);
+        let options = options_with_previous_response_id(Some("resp_stale"));
+        let error = match provider
+            .chat_stream_with_options(
+                &[Message::user("hello")],
+                &[],
+                None,
+                "gpt-5.2",
+                Some(&options),
+            )
+            .await
+        {
+            Ok(_) => panic!("unrelated 400 must not trigger the continuation fallback"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("model_not_found"));
+    }
+
+    #[tokio::test]
+    async fn responses_does_not_retry_not_found_when_no_continuation_was_sent() {
+        // A broken upstream that answers `previous_response_not_found` even though
+        // no id was sent must NOT put the provider into a retry loop.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(PREVIOUS_RESPONSE_NOT_FOUND_BODY),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = responses_provider(&server);
+        let options = options_with_previous_response_id(None);
+        let error = match provider
+            .chat_stream_with_options(
+                &[Message::user("hello")],
+                &[],
+                None,
+                "gpt-5.2",
+                Some(&options),
+            )
+            .await
+        {
+            Ok(_) => panic!("no continuation sent → surface the upstream error as-is"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("previous_response_not_found"));
     }
 }

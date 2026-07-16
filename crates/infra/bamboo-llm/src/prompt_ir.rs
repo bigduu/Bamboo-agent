@@ -398,7 +398,6 @@ mod tests {
 
     #[test]
     fn responses_request_options_omits_instructions_when_system_blank() {
-        use crate::provider::ResponsesRequestOptions;
         let ir = PromptIR {
             system_text: "   ".to_string(),
             ..PromptIR::default()
