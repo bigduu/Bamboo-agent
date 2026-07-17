@@ -111,16 +111,11 @@ confidence-threshold = 0.8
 # Allow 1 or more licenses on a per-crate basis, so that particular licenses
 # aren't accepted for every possible crate as with the normal allow list.
 #
-# actix-governor (the actix-web integration for the `governor` rate limiter,
-# used by bamboo-server's rate-limit middleware) is GPL-3.0-or-later — unlike
-# the MIT/Apache-2.0 `governor` crate it wraps. This is a real license-compat
-# question for a binary distribution (not a cargo-deny config problem to
-# paper over), so it's an explicit, narrowly-scoped exception rather than a
-# blanket GPL allowance, and is flagged for follow-up (new-issue candidate,
-# bamboo-agent#254 PR description) rather than silently resolved here.
-exceptions = [
-    { allow = ["GPL-3.0-or-later"], crate = "actix-governor" },
-]
+# No exceptions currently needed: `actix-governor` (GPL-3.0-or-later) was
+# replaced by an in-repo actix middleware over the MIT/Apache-2.0 `governor`
+# crate it used to wrap (bamboo-server's `src/rate_limit.rs`, #504), which
+# removed the GPL dependency entirely rather than requiring one.
+exceptions = []
 
 # Some crates don't have (easily) machine readable licensing information,
 # adding a clarification entry for it allows you to manually specify the

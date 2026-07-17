@@ -27,7 +27,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 /// Configure all routes for production mode.
 ///
 /// This registers the same route set as [`configure_routes`]; the actual per-IP
-/// rate limiting is applied as an `actix-governor` middleware (`.wrap(Governor)`)
+/// rate limiting is applied as a [`crate::rate_limit`] middleware (`.wrap(RateLimit)`)
 /// on the production App in `server::entrypoints` / `server::web_service`, since
 /// rate limiting is App-level middleware, not route configuration. See
 /// [`crate::config::build_rate_limiter`]. (Name kept for back-compat.) #13.
