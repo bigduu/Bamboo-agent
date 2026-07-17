@@ -1,13 +1,18 @@
 # Driving Claude Code as an external agent — protocol reference
 
-Status: reference knowledge for a future `ClaudeCodeExecutor` (`ChildExecutor` impl).
+Status: **implemented** — `ClaudeCodeExecutor` lives at `src/claude_code_executor.rs`
+and is selected via `subagents.executor = "claude_code"` (see the [config
+reference](config-reference.md#sub-agents--the-claude_code-executor) for the
+user-facing config surface). This doc is kept as protocol-reference detail for
+anyone touching/extending the executor itself — the original design record.
 Source: distilled from `chenhg5/cc-connect` `agent/claudecode/` (Go, battle-tested against
 Claude Code 2.x in production), verified against the repo at commit `main@2026-07-11`.
-File references below are to that repo.
+File references below are to that repo, and may not match line numbers in the
+current bamboo implementation exactly.
 
 ## Where this plugs into bamboo
 
-`bamboo-subagent::provision::ExecutorSpec` already reserves the slot
+`bamboo-subagent::provision::ExecutorSpec` reserves the slot
 (`provision.rs:221`):
 
 ```rust
@@ -15,7 +20,7 @@ File references below are to that repo.
 CliAdapter { command: String, args: Vec<String> },
 ```
 
-No executor implements it yet. The work is:
+The original implementation plan (kept for history):
 
 1. `ClaudeCodeExecutor: ChildExecutor` (`executor.rs:169`) — owns the child process,
    translates `RunSpec` → stream-json stdin, stream-json stdout → `EventSink`,

@@ -1327,6 +1327,7 @@ dependencies = [
  "bamboo-metrics",
  "bamboo-skills",
  "bamboo-storage",
+ "bamboo-subagent",
  "bamboo-tools",
  "serde_json",
  "tempfile",
