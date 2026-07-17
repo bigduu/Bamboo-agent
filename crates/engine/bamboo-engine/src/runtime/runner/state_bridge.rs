@@ -159,13 +159,15 @@ pub async fn refresh_turn_boundary_from_disk(
         session.clear_pending_injected_messages();
         session.updated_at = chrono::Utc::now();
 
+        let mut saved = false;
         if let Some(persistence) = persistence {
-            if let Err(error) = persistence.save_runtime_session(session).await {
-                tracing::warn!(
+            match persistence.save_runtime_session(session).await {
+                Ok(()) => saved = true,
+                Err(error) => tracing::warn!(
                     "[{}] Failed to persist pending injected message cleanup: {}",
                     session.id,
                     error
-                );
+                ),
             }
         }
 
@@ -175,24 +177,24 @@ pub async fn refresh_turn_boundary_from_disk(
             merged
         );
 
-        // The cleanup save above adopted the freshest on-disk bypass; re-read it
-        // so the value the caller stamps reflects a `PATCH` that may have landed
-        // DURING the merge, not the pre-merge snapshot. Only when we actually
-        // saved (injected messages present) — the no-injection fast path keeps
-        // its single load. #540.
-        let refreshed_bypass = storage
-            .load_session(&session.id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| {
-                s.agent_runtime_state
-                    .as_ref()
-                    .map(|rs| rs.bypass_permissions)
-            });
+        // When the cleanup save ran, the adopting `save_runtime_session` stamped
+        // the freshest on-disk bypass onto `session.agent_runtime_state` (so a
+        // `PATCH` that landed DURING the merge is already reflected there) — read
+        // it back from memory instead of a third full-session deserialization on
+        // this steering hot path. Without a save, `session` holds no disk-fresh
+        // value, so keep the pre-merge snapshot. #540.
+        let disk_bypass_permissions = if saved {
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|rs| rs.bypass_permissions)
+                .or(disk_bypass_permissions)
+        } else {
+            disk_bypass_permissions
+        };
         return TurnBoundaryRefresh {
             merged,
-            disk_bypass_permissions: refreshed_bypass.or(disk_bypass_permissions),
+            disk_bypass_permissions,
         };
     }
 

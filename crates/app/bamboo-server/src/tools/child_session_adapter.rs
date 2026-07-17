@@ -111,6 +111,25 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    /// Shared tail of the two child-save methods: map the persist error and
+    /// refresh the in-memory cache. The two public methods differ ONLY in which
+    /// persistence call they make (adopting vs authoritative); everything after
+    /// is identical, so it lives here to stay in lockstep. #540.
+    fn finish_child_save(
+        &self,
+        child: &Session,
+        saved: std::io::Result<()>,
+    ) -> Result<(), ChildSessionError> {
+        saved.map_err(|error| {
+            ChildSessionError::Execution(format!("failed to save child session: {error}"))
+        })?;
+        self.sessions_cache.insert(
+            child.id.clone(),
+            Arc::new(parking_lot::RwLock::new(child.clone())),
+        );
+        Ok(())
+    }
+
     /// Construct an adapter. Public so a self-orchestrating WORKER (Phase 6:
     /// direct nested execution) can build its OWN child-session machinery
     /// against its own store/scheduler — the struct fields are `pub(crate)`, so
@@ -489,19 +508,8 @@ impl ChildSessionPort for ChildSessionAdapter {
         // Adopting save: most child actions (update/run/send_message/cancel)
         // don't touch bypass_permissions, so a concurrent `PATCH` to a running
         // child must still win over this control write. #540.
-        self.persistence
-            .merge_save_runtime(child)
-            .await
-            .map_err(|error| {
-                ChildSessionError::Execution(format!("failed to save child session: {error}"))
-            })?;
-
-        self.sessions_cache.insert(
-            child.id.clone(),
-            Arc::new(parking_lot::RwLock::new(child.clone())),
-        );
-
-        Ok(())
+        let saved = self.persistence.merge_save_runtime(child).await;
+        self.finish_child_save(child, saved)
     }
 
     async fn save_child_session_authoritative_flags(
@@ -511,19 +519,11 @@ impl ChildSessionPort for ChildSessionAdapter {
         // Non-adopting save: the caller just set the child's posture flags from
         // the live parent (the #74 re-seed), so persist them as-is instead of
         // reverting to the child's stale on-disk bypass. #540.
-        self.persistence
+        let saved = self
+            .persistence
             .save_runtime_authoritative_flags(child)
-            .await
-            .map_err(|error| {
-                ChildSessionError::Execution(format!("failed to save child session: {error}"))
-            })?;
-
-        self.sessions_cache.insert(
-            child.id.clone(),
-            Arc::new(parking_lot::RwLock::new(child.clone())),
-        );
-
-        Ok(())
+            .await;
+        self.finish_child_save(child, saved)
     }
 
     async fn is_child_running(&self, child_session_id: &str) -> bool {
