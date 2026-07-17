@@ -2,8 +2,8 @@ use bytes::Bytes;
 use serde::Serialize;
 
 use super::super::super::types::{
-    ResponsesCreateResponse, ResponsesFunctionCallOutputItem, ResponsesOutputItem,
-    ResponsesStreamEvent,
+    ResponsesCreateResponse, ResponsesFunctionCallOutputItem, ResponsesMessageOutputItem,
+    ResponsesOutputItem, ResponsesStreamEvent,
 };
 
 pub(super) fn created_event(
@@ -22,13 +22,7 @@ pub(super) fn created_event(
             output: Vec::new(),
             usage: None,
         }),
-        response_id: None,
-        item_id: None,
-        output_index: None,
-        content_index: None,
-        delta: None,
-        item: None,
-        arguments: None,
+        ..Default::default()
     }
 }
 
@@ -39,14 +33,12 @@ pub(super) fn output_text_delta_event(
 ) -> ResponsesStreamEvent<ResponsesCreateResponse> {
     ResponsesStreamEvent {
         event_type: "response.output_text.delta".to_string(),
-        response: None,
         response_id: Some(response_id.to_string()),
         item_id: Some(item_id.to_string()),
         output_index: Some(0),
         content_index: Some(0),
         delta: Some(delta),
-        item: None,
-        arguments: None,
+        ..Default::default()
     }
 }
 
@@ -56,17 +48,11 @@ pub(super) fn completed_event(
     ResponsesStreamEvent {
         event_type: "response.completed".to_string(),
         response: Some(response),
-        response_id: None,
-        item_id: None,
-        output_index: None,
-        content_index: None,
-        delta: None,
-        item: None,
-        arguments: None,
+        ..Default::default()
     }
 }
 
-/// A bare event skeleton for the function-call item events below.
+/// A bare event skeleton for the per-item events below.
 fn item_event(
     event_type: &str,
     response_id: &str,
@@ -75,15 +61,41 @@ fn item_event(
 ) -> ResponsesStreamEvent<ResponsesCreateResponse> {
     ResponsesStreamEvent {
         event_type: event_type.to_string(),
-        response: None,
         response_id: Some(response_id.to_string()),
         item_id: Some(item_id.to_string()),
         output_index: Some(output_index),
-        content_index: None,
-        delta: None,
-        item: None,
-        arguments: None,
+        ..Default::default()
     }
+}
+
+/// `response.output_item.added` for the assistant message item at
+/// output_index 0 (in_progress, empty content) — emitted right after
+/// `response.created`, so clients that assemble output from output_item
+/// events (Codex) see the message item, not just its text deltas (#525).
+pub(super) fn message_item_added_event(
+    response_id: &str,
+    message_id: &str,
+) -> ResponsesStreamEvent<ResponsesCreateResponse> {
+    let mut event = item_event("response.output_item.added", response_id, message_id, 0);
+    event.item = Some(ResponsesOutputItem::Message(ResponsesMessageOutputItem {
+        id: message_id.to_string(),
+        item_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content: Vec::new(),
+        status: Some("in_progress".to_string()),
+    }));
+    event
+}
+
+/// `response.output_item.done` for the completed assistant message item
+/// (full text), emitted before the function-call item events (#525).
+pub(super) fn message_item_done_event(
+    response_id: &str,
+    item: &ResponsesMessageOutputItem,
+) -> ResponsesStreamEvent<ResponsesCreateResponse> {
+    let mut event = item_event("response.output_item.done", response_id, &item.id, 0);
+    event.item = Some(ResponsesOutputItem::Message(item.clone()));
+    event
 }
 
 /// The standard Responses event sequence for ONE completed function call,

@@ -215,3 +215,32 @@ fn completed_response_carries_aggregated_function_call() {
     );
     assert!(payload["response"]["output"].as_array().unwrap().len() == 2);
 }
+
+// #525 review: the assistant message item must also surface via
+// output_item.added/done — clients that assemble output from output_item
+// events would otherwise never finalize the assistant's text.
+#[test]
+fn message_item_events_announce_and_finalize_the_message_item() {
+    use super::events::{message_item_added_event, message_item_done_event};
+
+    let (name, added) = decode_sse_event(event_to_sse_bytes(&message_item_added_event(
+        "resp_1", "msg_1",
+    )));
+    assert_eq!(name, "response.output_item.added");
+    assert_eq!(added["output_index"], 0);
+    assert_eq!(added["item"]["type"], "message");
+    assert_eq!(added["item"]["id"], "msg_1");
+    assert_eq!(added["item"]["status"], "in_progress");
+
+    let output = build_output_items("msg_1", "final text".to_string(), vec![]);
+    let super::super::super::types::ResponsesOutputItem::Message(message) = &output[0] else {
+        panic!("expected message item at output_index 0");
+    };
+    let (name, done) = decode_sse_event(event_to_sse_bytes(&message_item_done_event(
+        "resp_1", message,
+    )));
+    assert_eq!(name, "response.output_item.done");
+    assert_eq!(done["item"]["type"], "message");
+    assert_eq!(done["item"]["status"], "completed");
+    assert_eq!(done["item"]["content"][0]["text"], "final text");
+}

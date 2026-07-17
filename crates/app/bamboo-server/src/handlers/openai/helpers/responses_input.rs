@@ -76,15 +76,33 @@ pub(super) fn responses_input_to_chat_messages(
                 .unwrap_or("")
                 .to_string();
 
+            let call = ToolCall {
+                id: call_id,
+                tool_type: "function".to_string(),
+                function: FunctionCall { name, arguments },
+            };
+
+            // A function_call item belongs to the assistant turn immediately
+            // preceding it. Attach it there — one assistant message per turn
+            // with ALL of its tool_calls. Emitting one single-call assistant
+            // message per item breaks parallel tool calls: Chat-Completions
+            // upstreams reject an assistant tool_calls message that is not
+            // immediately followed by its tool results (#525).
+            if let Some(last) = messages.last_mut() {
+                if matches!(last.role, Role::Assistant) {
+                    match last.tool_calls.as_mut() {
+                        Some(calls) => calls.push(call),
+                        None => last.tool_calls = Some(vec![call]),
+                    }
+                    continue;
+                }
+            }
+
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: Content::Text(String::new()),
                 phase: Some("commentary".to_string()),
-                tool_calls: Some(vec![ToolCall {
-                    id: call_id,
-                    tool_type: "function".to_string(),
-                    function: FunctionCall { name, arguments },
-                }]),
+                tool_calls: Some(vec![call]),
                 tool_call_id: None,
             });
             continue;

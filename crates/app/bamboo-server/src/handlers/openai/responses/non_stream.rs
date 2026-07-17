@@ -101,7 +101,17 @@ pub(super) async fn handle_non_streaming_response(
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let created_at = now_unix_ts();
 
-    let output = build_output_items(&message_id, content, tool_calls.finalize());
+    // Merged fragments whose name never arrived are dropped by finalize();
+    // make that visible instead of silently losing a call attempt (#525).
+    let fragment_groups = tool_calls.parts().len();
+    let finalized_calls = tool_calls.finalize();
+    if finalized_calls.len() < fragment_groups {
+        tracing::warn!(
+            dropped = fragment_groups - finalized_calls.len(),
+            "Dropping incomplete streamed tool call(s) whose name never arrived"
+        );
+    }
+    let output = build_output_items(&message_id, content, finalized_calls);
     let resp = build_completed_response(response_id, created_at, display_model, output);
 
     app_state.metrics_service.collector().forward_completed(

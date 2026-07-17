@@ -73,15 +73,19 @@ pub(super) struct ResponsesFunctionToolParam {
 
 /// A `tools[]` entry on POST /responses.
 ///
-/// Untagged, tried in order: the flat Responses shape (spec), the nested
-/// Chat-Completions shape (legacy clients that already worked against this
-/// endpoint), then a raw catch-all so non-function tool types (`web_search`,
-/// …) can be skipped instead of failing the whole request. #525.
+/// Untagged, tried in order: the nested Chat-Completions shape FIRST (legacy
+/// clients that already worked against this endpoint — and hybrid entries
+/// carrying both a top-level `name` and a `function` object must keep their
+/// real schema from `function.parameters`, which Flat would silently drop),
+/// then the flat Responses shape (spec), then a raw catch-all so non-function
+/// tool types (`web_search`, …) can be skipped instead of failing the whole
+/// request. A pure flat entry has no `function` key, so it cleanly falls
+/// through Nested. #525.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub(super) enum ResponsesToolParam {
-    Flat(ResponsesFunctionToolParam),
     Nested(Tool),
+    Flat(ResponsesFunctionToolParam),
     Other(serde_json::Value),
 }
 
@@ -109,6 +113,9 @@ pub(super) struct ResponsesMessageOutputItem {
     pub(super) item_type: String, // "message"
     pub(super) role: String, // "assistant"
     pub(super) content: Vec<ResponsesTextContent>,
+    /// "in_progress" while streaming, "completed" in final output (#525).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) status: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -166,6 +173,24 @@ pub(super) struct ResponsesStreamEvent<T> {
     /// Complete arguments for `response.function_call_arguments.done` (#525).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) arguments: Option<String>,
+}
+
+/// Manual impl (not derived) so it doesn't require `T: Default` — event
+/// constructors set only the fields their event type carries. #525.
+impl<T> Default for ResponsesStreamEvent<T> {
+    fn default() -> Self {
+        Self {
+            event_type: String::new(),
+            response: None,
+            response_id: None,
+            item_id: None,
+            output_index: None,
+            content_index: None,
+            delta: None,
+            item: None,
+            arguments: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +324,7 @@ mod tests {
                 content_type: "output_text".to_string(),
                 text: "Response text".to_string(),
             }],
+            status: None,
         };
 
         let json = serde_json::to_string(&item).unwrap();
@@ -332,6 +358,7 @@ mod tests {
             item_type: "message".to_string(),
             role: "assistant".to_string(),
             content: vec![],
+            status: None,
         };
 
         let output_item = ResponsesOutputItem::Message(msg_item.clone());
@@ -400,14 +427,7 @@ mod tests {
     fn test_responses_stream_event_minimal() {
         let event: ResponsesStreamEvent<String> = ResponsesStreamEvent {
             event_type: "response.created".to_string(),
-            response: None,
-            response_id: None,
-            item_id: None,
-            output_index: None,
-            content_index: None,
-            delta: None,
-            item: None,
-            arguments: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -418,14 +438,12 @@ mod tests {
     fn test_responses_stream_event_with_delta() {
         let event: ResponsesStreamEvent<String> = ResponsesStreamEvent {
             event_type: "response.output_item.text.delta".to_string(),
-            response: None,
             response_id: Some("resp-123".to_string()),
             item_id: Some("item-456".to_string()),
             output_index: Some(0),
             content_index: Some(0),
             delta: Some("Hello".to_string()),
-            item: None,
-            arguments: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -514,6 +532,29 @@ mod tests {
         let req: ResponsesCreateRequest = serde_json::from_str(json).unwrap();
         let tools = req.tools.expect("tools parsed");
         assert!(matches!(&tools[0], ResponsesToolParam::Other(_)));
+    }
+
+    // A hybrid entry carrying BOTH a top-level `name` and a nested `function`
+    // object must resolve as Nested — matching Flat would silently drop the
+    // real schema living in function.parameters.
+    #[test]
+    fn test_responses_hybrid_tool_entry_prefers_nested_schema() {
+        let json = r#"{
+            "model":"gpt-5",
+            "tools":[{
+                "type":"function",
+                "name":"search",
+                "function":{"name":"search","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}
+            }]
+        }"#;
+        let req: ResponsesCreateRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.expect("tools parsed");
+        match &tools[0] {
+            ResponsesToolParam::Nested(tool) => {
+                assert!(tool.function.parameters.get("properties").is_some());
+            }
+            other => panic!("hybrid entry must prefer nested, got {other:?}"),
+        }
     }
 
     #[test]

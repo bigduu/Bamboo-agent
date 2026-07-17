@@ -18,18 +18,17 @@ pub(super) fn convert_messages(
         .collect()
 }
 
+fn nested_tool_to_schema(tool: bamboo_llm::api::models::Tool) -> Result<ToolSchema, AppError> {
+    ToolSchema::from_provider(tool).map_err(|error| {
+        AppError::InternalError(anyhow::anyhow!("Failed to convert tool: {}", error))
+    })
+}
+
 pub(super) fn convert_tools(
     tools: Option<Vec<bamboo_llm::api::models::Tool>>,
 ) -> Result<Vec<ToolSchema>, AppError> {
     match tools {
-        Some(tools) => tools
-            .into_iter()
-            .map(|tool| {
-                ToolSchema::from_provider(tool).map_err(|error| {
-                    AppError::InternalError(anyhow::anyhow!("Failed to convert tool: {}", error))
-                })
-            })
-            .collect(),
+        Some(tools) => tools.into_iter().map(nested_tool_to_schema).collect(),
         None => Ok(vec![]),
     }
 }
@@ -53,31 +52,44 @@ pub(super) fn convert_responses_tools(
         match tool {
             ResponsesToolParam::Flat(flat) => {
                 if flat.tool_type != "function" {
-                    tracing::debug!(
+                    // warn, not debug: a skipped `custom` (freeform) tool is a
+                    // capability the client expects the model to call — the
+                    // operator needs a visible signal, not a silent gap.
+                    tracing::warn!(
                         tool_type = %flat.tool_type,
-                        "Skipping unsupported Responses tool type"
+                        name = %flat.name,
+                        "Skipping unsupported Responses tool type (not forwarded to the model)"
                     );
                     continue;
                 }
+                // An omitted `parameters` deserializes to JSON null; normalize
+                // to an empty object schema so providers doing schema
+                // validation don't choke on `parameters: null`.
+                let parameters = if flat.parameters.is_null() {
+                    serde_json::json!({"type": "object", "properties": {}})
+                } else {
+                    flat.parameters
+                };
                 converted.push(ToolSchema {
                     schema_type: flat.tool_type,
                     function: FunctionSchema {
                         name: flat.name,
                         description: flat.description.unwrap_or_default(),
-                        parameters: flat.parameters,
+                        parameters,
                     },
                 });
             }
             ResponsesToolParam::Nested(tool) => {
-                converted.push(ToolSchema::from_provider(tool).map_err(|error| {
-                    AppError::InternalError(anyhow::anyhow!("Failed to convert tool: {}", error))
-                })?);
+                converted.push(nested_tool_to_schema(tool)?);
             }
             ResponsesToolParam::Other(value) => {
-                let tool_type = value
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<missing>");
+                // A missing/non-string `type` is garbage, not an unsupported
+                // feature — fail fast like the old strict parsing did.
+                let Some(tool_type) = value.get("type").and_then(|v| v.as_str()) else {
+                    return Err(AppError::BadRequest(
+                        "Malformed tools[] entry: missing string `type` field".to_string(),
+                    ));
+                };
                 if tool_type == "function" {
                     return Err(AppError::BadRequest(
                         "Malformed function tool: expected the flat Responses shape \
@@ -86,7 +98,10 @@ pub(super) fn convert_responses_tools(
                             .to_string(),
                     ));
                 }
-                tracing::debug!(%tool_type, "Skipping unsupported Responses tool type");
+                tracing::warn!(
+                    %tool_type,
+                    "Skipping unsupported Responses tool type (not forwarded to the model)"
+                );
             }
         }
     }

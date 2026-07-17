@@ -379,3 +379,80 @@ fn responses_input_skips_unknown_item_types() {
         _ => panic!("expected text content"),
     }
 }
+
+#[test]
+fn convert_responses_tools_normalizes_missing_parameters_to_empty_schema() {
+    // An omitted `parameters` must not forward `parameters: null` upstream.
+    let tools: Vec<super::types::ResponsesToolParam> = serde_json::from_value(serde_json::json!([
+        {"type": "function", "name": "ping"}
+    ]))
+    .unwrap();
+
+    let schemas = super::helpers::convert_responses_tools(Some(tools)).unwrap();
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(
+        schemas[0].function.parameters,
+        serde_json::json!({"type": "object", "properties": {}})
+    );
+}
+
+#[test]
+fn convert_responses_tools_rejects_entry_without_type() {
+    // A tools[] entry with no `type` at all is garbage, not an unsupported
+    // feature — fail fast like the old strict parsing did.
+    let tools: Vec<super::types::ResponsesToolParam> =
+        serde_json::from_value(serde_json::json!([{"name": "my_tool", "parameters": {}}])).unwrap();
+
+    let err = super::helpers::convert_responses_tools(Some(tools))
+        .expect_err("type-less tools entry must be rejected");
+    assert!(matches!(err, crate::error::AppError::BadRequest(_)));
+}
+
+// #525 review: parallel tool calls round-tripped as consecutive function_call
+// items must merge into ONE assistant message — one single-call assistant
+// message per item is rejected by Chat-Completions upstreams ("assistant
+// message with tool_calls must be followed by tool messages responding to
+// each tool_call_id").
+#[test]
+fn responses_input_merges_parallel_function_calls_into_one_assistant_turn() {
+    let msgs = responses_input_to_chat_messages(serde_json::json!([
+        {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{\"p\":\"a\"}"},
+        {"type": "function_call", "call_id": "c2", "name": "read", "arguments": "{\"p\":\"b\"}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "A"},
+        {"type": "function_call_output", "call_id": "c2", "output": "B"}
+    ]))
+    .unwrap();
+
+    assert_eq!(msgs.len(), 3, "one assistant turn + two tool results");
+    assert_eq!(msgs[0].role, Role::Assistant);
+    let calls = msgs[0].tool_calls.as_ref().expect("tool_calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "c1");
+    assert_eq!(calls[1].id, "c2");
+    assert_eq!(msgs[1].role, Role::Tool);
+    assert_eq!(msgs[1].tool_call_id.as_deref(), Some("c1"));
+    assert_eq!(msgs[2].role, Role::Tool);
+    assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c2"));
+}
+
+// A function_call following the assistant's text message from the same turn
+// attaches to that message (Chat-Completions puts tool_calls ON the assistant
+// message that carries the turn's content).
+#[test]
+fn responses_input_attaches_function_call_to_preceding_assistant_message() {
+    let msgs = responses_input_to_chat_messages(serde_json::json!([
+        {"role": "assistant", "content": "Let me check."},
+        {"type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}"}
+    ]))
+    .unwrap();
+
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, Role::Assistant);
+    match &msgs[0].content {
+        Content::Text(t) => assert_eq!(t, "Let me check."),
+        _ => panic!("expected text content"),
+    }
+    let calls = msgs[0].tool_calls.as_ref().expect("tool_calls attached");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "c1");
+}
