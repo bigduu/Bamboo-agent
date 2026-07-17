@@ -785,6 +785,9 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 Some(sink)
             },
             app_data_dir: Some(self.app_data_dir.clone()),
+            // Resume does not carry a fresh per-request override; the
+            // config-level default (issue #221) still applies.
+            run_budget: None,
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
             on_complete: None,

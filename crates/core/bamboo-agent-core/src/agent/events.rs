@@ -79,6 +79,10 @@ use serde::{Deserialize, Serialize};
 /// - `SubAgentHeartbeat` - Periodic heartbeat while the child is running
 /// - `SubAgentCompleted` - Child session finished (completed/cancelled/error)
 ///
+/// ## Resource Guardrails
+/// - `BudgetExceeded` - A per-run token/tool-call/subagent budget tripped and
+///   the run was gracefully stopped (issue #221)
+///
 /// ## Terminal Events
 /// - `Complete` - Execution finished successfully
 /// - `Cancelled` - Execution was cancelled by the user
@@ -542,6 +546,27 @@ pub enum AgentEvent {
         resource: String,
     },
 
+    /// A per-run resource guardrail (token / tool-call / subagent budget)
+    /// tripped and the run was gracefully stopped — issue #221.
+    ///
+    /// Mirrors the `runtime.completion_reason = "budget_exceeded"` session
+    /// metadata stamp (see `bamboo_engine::runtime::config::AgentLoopConfig`)
+    /// as a structured, client-observable signal so a caller can display it
+    /// and (per the issue's "熔断" ask) react without polling session state.
+    /// The run still finalizes exactly like a normal completion — this event
+    /// precedes `Complete` in the stream, it does not replace it.
+    BudgetExceeded {
+        /// Session identifier.
+        session_id: String,
+        /// Which budget tripped: `"max_total_tokens"` | `"max_tool_calls"` |
+        /// `"max_subagents"`.
+        kind: String,
+        /// The configured limit that was exceeded.
+        limit: u64,
+        /// The actual cumulative usage observed when the guardrail tripped.
+        actual: u64,
+    },
+
     /// Agent execution completed successfully.
     Complete {
         /// Final token usage statistics
@@ -618,6 +643,7 @@ impl AgentEvent {
             | AgentEvent::SessionCleared { session_id, .. }
             | AgentEvent::MessageAppended { session_id, .. }
             | AgentEvent::ExecutionStarted { session_id, .. }
+            | AgentEvent::BudgetExceeded { session_id, .. }
             | AgentEvent::Notification { session_id, .. } => Some(session_id.as_str()),
             AgentEvent::SubAgentStarted {
                 parent_session_id, ..
@@ -666,6 +692,7 @@ impl AgentEvent {
                 | AgentEvent::NeedClarification { .. }
                 | AgentEvent::ToolApprovalRequested { .. }
                 | AgentEvent::ExecutionStarted { .. }
+                | AgentEvent::BudgetExceeded { .. }
                 | AgentEvent::Complete { .. }
                 | AgentEvent::Cancelled { .. }
                 | AgentEvent::Error { .. }

@@ -138,6 +138,15 @@ pub struct ExecuteRequest {
     /// so a within-run resume keeps the persisted posture.
     #[serde(default)]
     pub no_human_approver: bool,
+    /// Optional per-run resource guardrail override (issue #221): token /
+    /// tool-call / subagent budget for THIS execution. TIGHTEN-ONLY: per
+    /// field, the effective limit is the minimum of this override and the
+    /// config-level `run_budget` default — a client can lower the operator's
+    /// ceiling for one run but can never raise or remove it (a looser value
+    /// is silently clamped to the config default). An unset field keeps the
+    /// config default, which may itself be unlimited.
+    #[serde(default)]
+    pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 #[cfg(test)]
@@ -195,6 +204,31 @@ mod tests {
         assert!(req.skill_mode.is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.client_sync.is_none());
+        assert!(
+            req.run_budget.is_none(),
+            "omitted run_budget means \"use the config default\", not \"unlimited\""
+        );
+    }
+
+    /// Issue #221 plumb-through: a client can set a per-run token/tool-call/
+    /// subagent budget override on the `POST /execute` body, and it decodes
+    /// into the same `bamboo_config::RunBudgetConfig` the config-level default
+    /// uses — no separate wire DTO to keep in sync.
+    #[test]
+    fn test_execute_request_deserializes_run_budget_override() {
+        let json = r#"{
+            "model": "claude-3-opus",
+            "run_budget": { "max_total_tokens": 50000, "max_subagents": 2 }
+        }"#;
+        let req: ExecuteRequest = serde_json::from_str(json).unwrap();
+
+        let run_budget = req.run_budget.expect("run_budget should deserialize");
+        assert_eq!(run_budget.max_total_tokens, Some(50_000));
+        assert_eq!(
+            run_budget.max_tool_calls, None,
+            "an omitted field within run_budget falls back to the config default, not zero"
+        );
+        assert_eq!(run_budget.max_subagents, Some(2));
     }
 
     #[test]

@@ -84,6 +84,132 @@ struct TurnOutcome {
     sent_complete: bool,
 }
 
+// ---- Per-run resource guardrails (issue #221) ----
+
+/// The `SubAgent` tool's name (see `bamboo-server-tools::sub_agent::SubAgentTool`).
+/// Duplicated here as a plain string — the engine has no dependency on the
+/// server-tools crate that owns the tool — purely to COUNT spawn attempts for
+/// the per-run `max_subagents` budget guardrail below; it never affects
+/// dispatch. A tool rename must update both sites.
+const SUBAGENT_TOOL_NAME: &str = "SubAgent";
+
+/// True when `call` is a `SubAgent` tool call that creates a NEW child: its
+/// `action` argument is `"create"`, or the argument is absent/unparsable (the
+/// tool's own legacy default — see `SubAgentArgs`'s `#[serde(tag = "action")]`
+/// in `bamboo-server-tools`). Every other action (`wait`/`list`/`get`/
+/// `update`/`run`/`send_message`/`cancel`/`delete`/`list_models`) manages an
+/// EXISTING child and is not counted against the spawn budget.
+fn is_subagent_create_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
+    if call.function.name != SUBAGENT_TOOL_NAME {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        })
+        .is_none_or(|action| action == "create")
+}
+
+/// A per-run resource guardrail that has just tripped: which budget, its
+/// configured limit, and the actual cumulative usage observed.
+struct RunBudgetExceeded {
+    kind: &'static str,
+    limit: u64,
+    actual: u64,
+}
+
+/// One round's ACTUAL (provider-reported) usage + activity, accumulated
+/// across the round's retry attempts for the per-run budget guardrails
+/// (issue #221).
+///
+/// ACCUMULATES (`saturating_add`), never overwrites: a successful LLM call
+/// whose post-LLM handling then fails retryably re-enters the attempt loop
+/// and calls the LLM again, and the earlier attempt's tokens were already
+/// billed by the provider. Overwriting per attempt would silently drop that
+/// real spend from the budget (fail-open undercount — PR #539 review #1);
+/// summing keeps the budget fail-closed. Tool-call/subagent counts follow the
+/// same rule: a retried attempt's calls may have partially executed, and
+/// counting them errs on the safe (tighter) side.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RoundActivity {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    tool_call_count: u32,
+    subagent_spawn_count: u32,
+}
+
+impl RoundActivity {
+    /// Absorb one LLM attempt's billed usage/activity into this round's
+    /// totals. Called once per successful `execute_llm_round` return, the
+    /// moment `stream_output` becomes available — before it is consumed by
+    /// `handle_no_tool_calls`/`handle_tool_calls_path`.
+    fn absorb_attempt(&mut self, stream_output: &StreamHandlingOutput) {
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(stream_output.input_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(stream_output.output_tokens);
+        self.tool_call_count = self
+            .tool_call_count
+            .saturating_add(stream_output.tool_calls.len() as u32);
+        self.subagent_spawn_count = self.subagent_spawn_count.saturating_add(
+            stream_output
+                .tool_calls
+                .iter()
+                .filter(|call| is_subagent_create_call(call))
+                .count() as u32,
+        );
+    }
+}
+
+/// Checks the run's cumulative activity (already accumulated into `round` —
+/// see `RoundRuntimeState::total_*`) against the resolved per-run budget.
+/// Checked in a fixed priority order (tokens, then tool calls, then
+/// subagents) so exactly one guardrail is reported when several trip in the
+/// same round. Mirrors the `max_rounds` exhaustion check in spirit: this is a
+/// graceful-stop trigger, not an error.
+fn check_run_budget_exceeded(
+    round: &bamboo_domain::session::runtime_state::RoundRuntimeState,
+    budget: &bamboo_config::RunBudgetConfig,
+) -> Option<RunBudgetExceeded> {
+    let total_tokens = round
+        .total_prompt_tokens
+        .saturating_add(round.total_completion_tokens);
+    if let Some(limit) = budget.max_total_tokens {
+        if total_tokens >= limit {
+            return Some(RunBudgetExceeded {
+                kind: "max_total_tokens",
+                limit,
+                actual: total_tokens,
+            });
+        }
+    }
+    if let Some(limit) = budget.max_tool_calls {
+        if round.total_tool_calls >= limit {
+            return Some(RunBudgetExceeded {
+                kind: "max_tool_calls",
+                limit: limit as u64,
+                actual: round.total_tool_calls as u64,
+            });
+        }
+    }
+    if let Some(limit) = budget.max_subagents {
+        if round.total_subagents_spawned >= limit {
+            return Some(RunBudgetExceeded {
+                kind: "max_subagents",
+                limit: limit as u64,
+                actual: round.total_subagents_spawned as u64,
+            });
+        }
+    }
+    None
+}
+
 /// Terminal child run statuses, as mirrored into the session index.
 fn is_terminal_child_status(status: &str) -> bool {
     matches!(
@@ -1223,7 +1349,16 @@ pub(super) async fn run_pipeline(
     // session, so a normal completion is never misread as exhaustion (mirrors
     // how `runtime.suspend_reason` is cleared on resume).
     let mut max_rounds_summary_used = false;
+    // One-shot sentinel for the run-budget summary turn (issue #221), mirroring
+    // `max_rounds_summary_used` above: the first guard hit grants one final
+    // summary round; the next hit stops unconditionally.
+    let mut budget_summary_used = false;
     session.metadata.remove("runtime.completion_reason");
+    // Same hygiene for the budget-trip detail key (issue #221): without this,
+    // one tripped run would leave `budget_exceeded_kind` on the session
+    // forever, misleading clients on every later run that stops for an
+    // unrelated reason (or completes normally).
+    session.metadata.remove("runtime.budget_exceeded_kind");
 
     loop {
         refresh_auxiliary_models_for_round(state, config);
@@ -1359,6 +1494,14 @@ pub(super) async fn run_pipeline(
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
         let mut terminal_error: Option<AgentError> = None;
+
+        // Actual (provider-reported) usage + activity for THIS round for the
+        // per-run budget guardrails (issue #221) — real numbers, not the
+        // heuristic `round_usage` estimate used for metrics. Reset every
+        // round; accumulated across the retry attempts below (see
+        // `RoundActivity` for why it must sum, never overwrite); an attempt
+        // that errors before streaming contributes 0.
+        let mut round_activity = RoundActivity::default();
 
         for attempt in 1..=MAX_LLM_TURN_ATTEMPTS {
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
@@ -1500,6 +1643,12 @@ pub(super) async fn run_pipeline(
 
             // --- Handle LLM output ---
             let stream_output = llm_output.stream_output;
+
+            // Absorb this attempt's ACTUAL usage/activity before
+            // `stream_output` is consumed below — every successful LLM call in
+            // this round was billed, even if its post-LLM handling then fails
+            // and triggers a retry (issue #221 — see `RoundActivity`).
+            round_activity.absorb_attempt(&stream_output);
 
             if stream_output.tool_calls.is_empty() {
                 // Safety net: if the model is about to finish but left background
@@ -1819,6 +1968,32 @@ pub(super) async fn run_pipeline(
             _ => {}
         }
 
+        // Accumulate this round's actual usage/activity into the run-level
+        // totals BEFORE persisting the runtime state snapshot below, so the
+        // per-run budget guardrails (issue #221) — checked further down — see
+        // up-to-date numbers, and a resumed/inspected session's runtime state
+        // reflects them immediately.
+        state.runtime_state.round.total_prompt_tokens = state
+            .runtime_state
+            .round
+            .total_prompt_tokens
+            .saturating_add(round_activity.prompt_tokens);
+        state.runtime_state.round.total_completion_tokens = state
+            .runtime_state
+            .round
+            .total_completion_tokens
+            .saturating_add(round_activity.completion_tokens);
+        state.runtime_state.round.total_tool_calls = state
+            .runtime_state
+            .round
+            .total_tool_calls
+            .saturating_add(round_activity.tool_call_count);
+        state.runtime_state.round.total_subagents_spawned = state
+            .runtime_state
+            .round
+            .total_subagents_spawned
+            .saturating_add(round_activity.subagent_spawn_count);
+
         state_bridge::write_runtime_state(session, &state.runtime_state);
 
         sent_complete = sent_complete || outcome.sent_complete;
@@ -1868,6 +2043,61 @@ pub(super) async fn run_pipeline(
         }
 
         turn_counter += 1;
+
+        // --- Guard against the per-run resource budget (issue #221) ---
+        //
+        // Checked BEFORE max_rounds so a budget trip is reported with its own
+        // reason even on a run that would also be about to hit max_rounds.
+        // Mirrors the max_rounds guard exactly: one graceful summary turn,
+        // then an unconditional stop — never a hard error, so the run stays
+        // resumable and the session's history reads like a normal completion
+        // plus a clear reason.
+        if let Some(exceeded) =
+            check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget)
+        {
+            if !budget_summary_used {
+                tracing::warn!(
+                    "[{}] Run budget exceeded ({} limit={} actual={}) — granting one summary turn before stopping.",
+                    state.session_id,
+                    exceeded.kind,
+                    exceeded.limit,
+                    exceeded.actual,
+                );
+                session.metadata.insert(
+                    "runtime.completion_reason".to_string(),
+                    "budget_exceeded".to_string(),
+                );
+                session.metadata.insert(
+                    "runtime.budget_exceeded_kind".to_string(),
+                    exceeded.kind.to_string(),
+                );
+                session.add_message(Message::user(format!(
+                    "The run's resource budget ({}, limit={}, reached={}) was exceeded; the \
+                     task was stopped before completion. Stop working now and summarize your \
+                     progress so far and what remains.",
+                    exceeded.kind, exceeded.limit, exceeded.actual
+                )));
+                let _ = event_tx
+                    .send(AgentEvent::BudgetExceeded {
+                        session_id: state.session_id.clone(),
+                        kind: exceeded.kind.to_string(),
+                        limit: exceeded.limit,
+                        actual: exceeded.actual,
+                    })
+                    .await;
+                budget_summary_used = true;
+                continue;
+            }
+
+            tracing::warn!(
+                "[{}] Run budget exceeded ({} limit={} actual={}) — stopping the run before completion.",
+                state.session_id,
+                exceeded.kind,
+                exceeded.limit,
+                exceeded.actual,
+            );
+            break;
+        }
 
         // --- Guard against max_rounds (issue #29) ---
         //
@@ -1986,8 +2216,9 @@ fn heuristic_complexity(
 mod tests {
     use super::super::startup::OverflowRecoveryState;
     use super::{
-        build_guardian_review_prompt, is_overflow_recoverable, is_terminal_child_status,
-        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        build_guardian_review_prompt, check_run_budget_exceeded, is_overflow_recoverable,
+        is_subagent_create_call, is_terminal_child_status, map_turn_error_status,
+        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
         maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
@@ -3001,6 +3232,577 @@ mod tests {
             completes, 0,
             "no Complete emitted during this worst-case run"
         );
+    }
+
+    // ---- Per-run resource guardrails (issue #221) ----
+
+    /// Emits one tool-call round with configurable ACTUAL (provider-reported)
+    /// usage per call, so `round.total_prompt_tokens`/`total_completion_tokens`
+    /// accumulate real numbers the budget guard can trip on — mirrors
+    /// `MaxRoundsProvider` but adds `CacheUsage`/`UsageSummary` chunks.
+    struct UsageProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        prompt_tokens_per_round: u64,
+        completion_tokens_per_round: u64,
+        /// When `true`, every emitted tool call is a `SubAgent` create (issue
+        /// #221's subagent-budget guard); otherwise a plain `noop` call.
+        subagent_calls: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for UsageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+            _: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (name, arguments) = if self.subagent_calls {
+                (
+                    "SubAgent".to_string(),
+                    r#"{"action":"create","prompt":"do work"}"#.to_string(),
+                )
+            } else {
+                ("noop".to_string(), "{}".to_string())
+            };
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: format!("tool-{n}"),
+                tool_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionCall { name, arguments },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::CacheUsage {
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    input_tokens: self.prompt_tokens_per_round,
+                }),
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::UsageSummary {
+                    output_tokens: self.completion_tokens_per_round,
+                    thinking_tokens: 0,
+                }),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_budget_token_limit_stops_run_gracefully() {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        // 15 actual tokens/round (10 prompt + 5 completion); limit=20 trips
+        // partway through round 2 (round1 total=15 < 20; round2 total=30 >= 20).
+        let mut session = Session::new("session-token-budget", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(UsageProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompt_tokens_per_round: 10,
+            completion_tokens_per_round: 5,
+            subagent_calls: false,
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            max_rounds: 50, // high enough that max_rounds never fires first
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_total_tokens: Some(20),
+                max_tool_calls: None,
+                max_subagents: None,
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-token-budget");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let sent_complete =
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+                .await
+                .expect("pipeline runs to completion");
+
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.completion_reason")
+                .map(String::as_str),
+            Some("budget_exceeded"),
+            "budget trip must be stamped in session metadata"
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.budget_exceeded_kind")
+                .map(String::as_str),
+            Some("max_total_tokens"),
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("max_total_tokens")),
+            "a visible budget-exceeded notification message must be appended"
+        );
+        assert!(
+            !sent_complete,
+            "budget trip does not send a normal complete"
+        );
+
+        // Exactly one extra summary round after the trip (round1, round2-trip,
+        // round3-summary), mirroring the max_rounds grace-turn contract.
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        drop(tx);
+        let mut budget_events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::BudgetExceeded {
+                kind,
+                limit,
+                actual,
+                ..
+            } = event
+            {
+                budget_events.push((kind, limit, actual));
+            }
+        }
+        assert_eq!(
+            budget_events.len(),
+            1,
+            "exactly one structured BudgetExceeded event must be emitted"
+        );
+        let (kind, limit, actual) = &budget_events[0];
+        assert_eq!(kind, "max_total_tokens");
+        assert_eq!(*limit, 20);
+        assert_eq!(*actual, 30, "trips on round 2's cumulative total (15+15)");
+    }
+
+    #[tokio::test]
+    async fn run_budget_tool_call_limit_stops_run_gracefully() {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        let mut session = Session::new("session-tool-call-budget", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(UsageProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompt_tokens_per_round: 0,
+            completion_tokens_per_round: 0,
+            subagent_calls: false,
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            max_rounds: 50,
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_total_tokens: None,
+                max_tool_calls: Some(2),
+                max_subagents: None,
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-tool-call-budget");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let _ = super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+            .await
+            .expect("pipeline runs to completion");
+
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.budget_exceeded_kind")
+                .map(String::as_str),
+            Some("max_tool_calls"),
+        );
+        // One tool call per round: round1 total=1 (<2, continue), round2
+        // total=2 (>=2, trip+grace), round3 (unconditional stop) = 3 calls.
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        drop(tx);
+        drain(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn run_budget_subagent_limit_counts_only_create_calls() {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        let mut session = Session::new("session-subagent-budget", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(UsageProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompt_tokens_per_round: 0,
+            completion_tokens_per_round: 0,
+            subagent_calls: true,
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            max_rounds: 50,
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_total_tokens: None,
+                max_tool_calls: None,
+                max_subagents: Some(1),
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-subagent-budget");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let _ = super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+            .await
+            .expect("pipeline runs to completion");
+
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.budget_exceeded_kind")
+                .map(String::as_str),
+            Some("max_subagents"),
+        );
+        // One SubAgent create call per round: round1 total=1 (>=1, trip+grace
+        // immediately), round2 (unconditional stop) = 2 calls.
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(tx);
+        drain(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn run_under_budget_is_unaffected() {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        // A generous budget that a short run never approaches must leave
+        // completion behavior byte-for-byte identical to the no-budget case
+        // (no stamped reason, no injected message, no BudgetExceeded event).
+        let mut session = Session::new("session-under-budget", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(MaxRoundsProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            max_rounds: 2,
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_total_tokens: Some(1_000_000),
+                max_tool_calls: Some(1_000_000),
+                max_subagents: Some(1_000_000),
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-under-budget");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let _ = super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+            .await
+            .expect("pipeline runs to completion");
+
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.completion_reason")
+                .map(String::as_str),
+            Some("max_rounds_reached"),
+            "an under-budget run still hits its real stop reason (max_rounds here), not budget_exceeded"
+        );
+        assert!(!session
+            .metadata
+            .contains_key("runtime.budget_exceeded_kind"));
+        drop(tx);
+        let mut budget_events = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::BudgetExceeded { .. }) {
+                budget_events += 1;
+            }
+        }
+        assert_eq!(budget_events, 0, "no budget event for an under-budget run");
+    }
+
+    async fn drain(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) {
+        while rx.recv().await.is_some() {}
+    }
+
+    /// PR #539 review #1: a round's billed usage must ACCUMULATE across retry
+    /// attempts, never be overwritten. Attempt 1 can succeed at the LLM (real,
+    /// billed tokens) and then fail retryably in post-LLM handling; attempt 2
+    /// calls the LLM again. Both attempts' tokens must count against the
+    /// budget — overwriting would fail open (undercount real spend).
+    #[test]
+    fn round_activity_accumulates_across_retry_attempts_instead_of_overwriting() {
+        use crate::runtime::stream::handler::StreamHandlingOutput;
+
+        fn attempt(input: u64, output: u64, tool_calls: Vec<&str>) -> StreamHandlingOutput {
+            StreamHandlingOutput {
+                response_id: None,
+                content: "x".to_string(),
+                reasoning_content: String::new(),
+                reasoning_signature: None,
+                token_count: 0,
+                tool_calls: tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| bamboo_agent_core::tools::ToolCall {
+                        id: format!("t{i}"),
+                        tool_type: "function".to_string(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: name.to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    })
+                    .collect(),
+                output_tokens: output,
+                thinking_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                input_tokens: input,
+            }
+        }
+
+        let mut activity = super::RoundActivity::default();
+
+        // Attempt 1: billed 100 in / 50 out, one Bash + one SubAgent create.
+        activity.absorb_attempt(&attempt(100, 50, vec!["Bash", "SubAgent"]));
+        assert_eq!(activity.prompt_tokens, 100);
+        assert_eq!(activity.completion_tokens, 50);
+        assert_eq!(activity.tool_call_count, 2);
+        assert_eq!(activity.subagent_spawn_count, 1);
+
+        // Post-LLM handling fails retryably; attempt 2 is billed too. Totals
+        // must be the SUM of both attempts, not attempt 2's numbers alone.
+        activity.absorb_attempt(&attempt(120, 30, vec!["Bash"]));
+        assert_eq!(
+            activity.prompt_tokens, 220,
+            "attempt 1's billed prompt tokens must not be dropped on retry"
+        );
+        assert_eq!(activity.completion_tokens, 80);
+        assert_eq!(activity.tool_call_count, 3);
+        assert_eq!(activity.subagent_spawn_count, 1);
+
+        // Saturates rather than wrapping on absurd totals.
+        activity.absorb_attempt(&attempt(u64::MAX, u64::MAX, vec![]));
+        assert_eq!(activity.prompt_tokens, u64::MAX);
+        assert_eq!(activity.completion_tokens, u64::MAX);
+    }
+
+    /// PR #539 review #2: `runtime.budget_exceeded_kind` must be cleared at
+    /// the start of every run, exactly like `runtime.completion_reason` — a
+    /// run that tripped the budget once must not leave stale trip metadata on
+    /// the session for later runs that stop for unrelated reasons.
+    #[tokio::test]
+    async fn budget_exceeded_kind_metadata_is_cleared_on_the_next_run() {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        let flags = PromptMemoryFlags {
+            project_prompt_injection: false,
+            relevant_recall: false,
+            relevant_recall_rerank: false,
+            project_first_dream: false,
+            ledger_agenda: false,
+        };
+
+        // Run 1: trips the tool-call budget immediately.
+        let mut session = Session::new("session-budget-metadata-hygiene", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(UsageProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompt_tokens_per_round: 0,
+            completion_tokens_per_round: 0,
+            subagent_calls: false,
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let tripping_config = AgentLoopConfig {
+            max_rounds: 50,
+            prompt_memory_flags: flags,
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_total_tokens: None,
+                max_tool_calls: Some(1),
+                max_subagents: None,
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-budget-metadata-hygiene");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _ = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools.clone(),
+            &cancel,
+            &tripping_config,
+            &mut state,
+        )
+        .await
+        .expect("run 1 completes");
+        drop(tx);
+        drain(&mut rx).await;
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.budget_exceeded_kind")
+                .map(String::as_str),
+            Some("max_tool_calls"),
+            "run 1 must stamp the trip detail"
+        );
+
+        // Run 2 on the SAME session, no budget: stops via max_rounds instead.
+        // Both budget metadata keys from run 1 must be gone.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider2 = Arc::new(MaxRoundsProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm2: Arc<dyn LLMProvider> = provider2.clone();
+        let unlimited_config = AgentLoopConfig {
+            max_rounds: 2,
+            prompt_memory_flags: flags,
+            model_name: Some("model".to_string()),
+            ..AgentLoopConfig::default()
+        };
+        let mut state2 = e2e_loop_state("session-budget-metadata-hygiene");
+        let _ = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm2,
+            tools,
+            &cancel,
+            &unlimited_config,
+            &mut state2,
+        )
+        .await
+        .expect("run 2 completes");
+        drop(tx);
+        drain(&mut rx).await;
+
+        assert!(
+            !session
+                .metadata
+                .contains_key("runtime.budget_exceeded_kind"),
+            "stale budget trip detail must be cleared by the next run"
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.completion_reason")
+                .map(String::as_str),
+            Some("max_rounds_reached"),
+            "run 2's own stop reason replaces run 1's budget_exceeded"
+        );
+    }
+
+    #[test]
+    fn is_subagent_create_call_counts_default_and_explicit_create_only() {
+        let call = |arguments: &str| bamboo_agent_core::tools::ToolCall {
+            id: "id".to_string(),
+            tool_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionCall {
+                name: "SubAgent".to_string(),
+                arguments: arguments.to_string(),
+            },
+        };
+        assert!(
+            is_subagent_create_call(&call(r#"{"action":"create","prompt":"x"}"#)),
+            "explicit action=create counts"
+        );
+        assert!(
+            is_subagent_create_call(&call(r#"{"prompt":"x"}"#)),
+            "missing action defaults to the tool's legacy create behavior"
+        );
+        assert!(
+            !is_subagent_create_call(&call(r#"{"action":"wait"}"#)),
+            "action=wait manages an existing child, not a spawn"
+        );
+        assert!(
+            !is_subagent_create_call(&call(r#"{"action":"list"}"#)),
+            "action=list is read-only, not a spawn"
+        );
+
+        let mut other_tool = call(r#"{"action":"create"}"#);
+        other_tool.function.name = "Bash".to_string();
+        assert!(
+            !is_subagent_create_call(&other_tool),
+            "a differently named tool is never counted, regardless of args"
+        );
+    }
+
+    #[test]
+    fn check_run_budget_exceeded_reports_first_tripped_kind_in_priority_order() {
+        use bamboo_domain::session::runtime_state::RoundRuntimeState;
+
+        let unlimited = bamboo_config::RunBudgetConfig::default();
+        let round = RoundRuntimeState {
+            total_prompt_tokens: 5,
+            total_completion_tokens: 5,
+            total_tool_calls: 3,
+            total_subagents_spawned: 1,
+            ..Default::default()
+        };
+        assert!(
+            check_run_budget_exceeded(&round, &unlimited).is_none(),
+            "unlimited config never trips"
+        );
+
+        // Tokens win when multiple limits are simultaneously exceeded.
+        let all_exceeded = bamboo_config::RunBudgetConfig {
+            max_total_tokens: Some(5),
+            max_tool_calls: Some(1),
+            max_subagents: Some(1),
+        };
+        let exceeded =
+            check_run_budget_exceeded(&round, &all_exceeded).expect("some guardrail trips");
+        assert_eq!(exceeded.kind, "max_total_tokens");
+        assert_eq!(exceeded.actual, 10);
+
+        // Only tool_calls exceeded.
+        let tool_calls_only = bamboo_config::RunBudgetConfig {
+            max_total_tokens: None,
+            max_tool_calls: Some(3),
+            max_subagents: None,
+        };
+        let exceeded =
+            check_run_budget_exceeded(&round, &tool_calls_only).expect("tool-call guardrail trips");
+        assert_eq!(exceeded.kind, "max_tool_calls");
+        assert_eq!(exceeded.actual, 3);
     }
 
     #[derive(Default)]

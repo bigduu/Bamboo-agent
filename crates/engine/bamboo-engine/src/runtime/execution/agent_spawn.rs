@@ -151,6 +151,9 @@ pub struct SessionExecutionArgs {
     /// Late-bound bash completion sink (issue #84 Phase 2b follow-up).
     pub bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     pub app_data_dir: Option<std::path::PathBuf>,
+    /// Per-run resource guardrail override (issue #221). `None` uses the
+    /// config-level `Config::run_budget` default unmodified.
+    pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 
     // Post-execution resources.
     pub runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -189,6 +192,7 @@ struct ExecuteRequestParams {
     bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
+    run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 /// Assemble an [`ExecuteRequest`] from the resolved spawn parameters via the
@@ -221,6 +225,7 @@ fn build_execute_request(
         bash_resume_hook,
         bash_completion_sink,
         app_data_dir,
+        run_budget,
     } = params;
 
     let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token)
@@ -230,6 +235,10 @@ fn build_execute_request(
         .guardian_spawner(guardian_spawner)
         .bash_resume_hook(bash_resume_hook)
         .bash_completion_sink(bash_completion_sink);
+
+    if let Some(run_budget) = run_budget {
+        builder = builder.run_budget(run_budget);
+    }
 
     if let Some(tools) = tools {
         builder = builder.tools(tools);
@@ -306,6 +315,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 bash_resume_hook,
                 bash_completion_sink,
                 app_data_dir,
+                run_budget,
                 runners,
                 sessions_cache,
                 on_complete,
@@ -371,6 +381,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                     bash_resume_hook,
                     bash_completion_sink,
                     app_data_dir,
+                    run_budget,
                 },
             );
 

@@ -45,6 +45,9 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
     pub(crate) gold_config: Option<GoldConfig>,
     pub(crate) app_data_dir: Option<std::path::PathBuf>,
+    /// Optional per-run resource guardrail override from the `POST /execute`
+    /// request body (issue #221). `None` uses the config-level default.
+    pub(crate) run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 pub(super) fn execution_tool_surface(is_child_session: bool) -> ToolSurface {
@@ -210,6 +213,7 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         // the next round boundary, issue #84 Phase 2b follow-up).
         bash_completion_sink: Some(args.state.child_completion_coordinator.clone()),
         app_data_dir: args.app_data_dir,
+        run_budget: args.run_budget,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
         on_complete: None,

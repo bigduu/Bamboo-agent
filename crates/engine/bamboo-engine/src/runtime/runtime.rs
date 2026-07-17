@@ -240,6 +240,14 @@ pub struct ExecuteRequest {
     pub bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
+    /// Per-run resource guardrail override (issue #221): token / tool-call /
+    /// subagent budget for THIS execution. TIGHTEN-ONLY: per field, the
+    /// effective limit is the minimum of this override and the config-level
+    /// `Config::run_budget` default — a request can lower the operator's
+    /// ceiling but never raise or remove it. An unset field (`None`) keeps
+    /// the config default (which may itself be unlimited). See
+    /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
+    pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +299,7 @@ pub struct ExecuteRequestBuilder {
     bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
+    run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 impl ExecuteRequestBuilder {
@@ -330,6 +339,7 @@ impl ExecuteRequestBuilder {
             bash_resume_hook: None,
             bash_completion_sink: None,
             app_data_dir: None,
+            run_budget: None,
         }
     }
 
@@ -516,6 +526,15 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the per-run resource guardrail override (issue #221). TIGHTEN-ONLY:
+    /// per field, the effective limit is the minimum of `v` and the
+    /// config-level default — this can never loosen the operator's ceiling;
+    /// see [`bamboo_config::RunBudgetConfig::merged_with_override`].
+    pub fn run_budget(mut self, v: bamboo_config::RunBudgetConfig) -> Self {
+        self.run_budget = Some(v);
+        self
+    }
+
     /// Materialize the underlying [`ExecuteRequest`].
     ///
     /// `gold_config` is an internal feature flag with only a crate-visible
@@ -556,6 +575,7 @@ impl ExecuteRequestBuilder {
             bash_resume_hook: self.bash_resume_hook,
             bash_completion_sink: self.bash_completion_sink,
             app_data_dir: self.app_data_dir,
+            run_budget: self.run_budget,
         }
     }
 }
@@ -610,6 +630,7 @@ impl AgentRuntime {
             bash_resume_hook,
             bash_completion_sink,
             app_data_dir,
+            run_budget,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
@@ -700,6 +721,12 @@ impl AgentRuntime {
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.
             mcp_tool_guidance: tools.tool_guidance(),
+            // Config-level default, tighten-only-merged with the request's
+            // override (issue #221): per field the minimum wins, so no caller
+            // can loosen the operator's ceiling. Merging here (rather than in
+            // the HTTP layer) means every caller — HTTP, schedules, connect,
+            // the in-proc SDK — gets the same clamped fallback for free.
+            run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
             ..Default::default()
         };
 

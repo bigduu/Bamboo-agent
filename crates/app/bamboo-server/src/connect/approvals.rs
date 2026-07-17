@@ -562,6 +562,9 @@ impl ResumeExecutionPort for ConnectResumePort {
                 bash_resume_hook: None,
                 bash_completion_sink: None,
                 app_data_dir: self.ctx.app_data_dir.clone(),
+                // No per-request override on this path; the config-level
+                // default (issue #221) still applies.
+                run_budget: None,
                 runners: self.ctx.agent_runners.clone(),
                 sessions_cache: self.ctx.session_repo.cache().clone(),
                 on_complete: None,
@@ -669,6 +672,9 @@ impl ResumeExecutionPort for ConnectResumePort {
                 bash_resume_hook: None,
                 bash_completion_sink: None,
                 app_data_dir: ctx.app_data_dir.clone(),
+                // No per-request override on this path; the config-level
+                // default (issue #221) still applies.
+                run_budget: None,
                 runners: ctx.agent_runners.clone(),
                 sessions_cache: ctx.session_repo.cache().clone(),
                 on_complete: None,

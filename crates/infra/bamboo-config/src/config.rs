@@ -394,6 +394,79 @@ fn default_true_memory_project_first_dream() -> bool {
     true
 }
 
+/// Per-run resource guardrails (issue #221): a cost/resource ceiling applied
+/// across an entire `AgentRuntime::execute()` call (i.e. one user turn's worth
+/// of internal rounds — the same "run" granularity `max_rounds` already uses).
+///
+/// Every field is `None` by default (unlimited), matching the rest of this
+/// config's opt-in-only posture. A per-request `ExecuteRequest::run_budget`
+/// override (HTTP `POST /execute` body) may only TIGHTEN this config-level
+/// default, never loosen it — per field, the effective limit is the minimum
+/// of the two (see [`RunBudgetConfig::merged_with_override`] and
+/// `bamboo_engine::runtime::runtime::AgentRuntime::execute`).
+///
+/// Exceeding any configured limit gracefully stops the run (mirrors the
+/// `max_rounds` exhaustion path: one final summary turn, then a terminal stop
+/// with `runtime.completion_reason = "budget_exceeded"` on the session, plus a
+/// structured `AgentEvent::BudgetExceeded`) rather than erroring out — the run
+/// stays resumable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunBudgetConfig {
+    /// Maximum total tokens (prompt + completion, actual provider-reported
+    /// usage summed across the run's rounds) before the run is stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+    /// Maximum total tool calls (across every round of the run, not just one
+    /// round — see `max_tool_calls_per_round` for the existing per-round cap)
+    /// before the run is stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+    /// Maximum total `SubAgent` create calls (across the whole run) before the
+    /// run is stopped. Distinct from `subagents.max_concurrent`, which caps how
+    /// many child actor processes run AT ONCE, not how many a single run may
+    /// spawn in total over its lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
+}
+
+/// Tighten-only per-field merge: the effective limit is the MINIMUM of the
+/// config default and the request override, with `None` = unlimited.
+fn min_limit<T: Ord + Copy>(config_default: Option<T>, request: Option<T>) -> Option<T> {
+    match (config_default, request) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+impl RunBudgetConfig {
+    /// Merge a per-request override with this config-level default,
+    /// **tighten-only** (issue #221, PR #539 review): per field, the
+    /// effective limit is the MINIMUM of the two (`None` = unlimited), so a
+    /// `POST /execute` caller can lower a budget below the operator's
+    /// configured ceiling but can never raise or remove it.
+    ///
+    /// Rationale: `run_budget` is a defensive cost circuit-breaker, and the
+    /// server's other guardrails (`max_rounds`, per-round tool caps, …) are
+    /// not client-overridable at all. A client-loosenable ceiling would be no
+    /// ceiling: any caller of `/execute` could send
+    /// `max_total_tokens: u64::MAX` and erase the operator's cap. Overrides
+    /// looser than the config default are silently clamped to it rather than
+    /// rejected — the caller still gets the strictest applicable budget,
+    /// which is always a safe interpretation of their request.
+    pub fn merged_with_override(&self, request_override: Option<&RunBudgetConfig>) -> Self {
+        let Some(over) = request_override else {
+            return *self;
+        };
+        Self {
+            max_total_tokens: min_limit(self.max_total_tokens, over.max_total_tokens),
+            max_tool_calls: min_limit(self.max_tool_calls, over.max_tool_calls),
+            max_subagents: min_limit(self.max_subagents, over.max_subagents),
+        }
+    }
+}
+
 /// Sub-agent execution settings.
 ///
 /// Sub-agents always run as independent **actor** processes — an isolated OS
@@ -1188,6 +1261,13 @@ pub struct Config {
     /// (`max_concurrent`, `broker`, remote/schedulable placements) are advanced.
     #[serde(default)]
     pub subagents: SubagentsConfig,
+
+    /// Config-level default per-run token/tool-call/subagent budget (issue
+    /// #221). `None` fields are unlimited. A per-request `ExecuteRequest`
+    /// override may only tighten these ceilings, never loosen them; see
+    /// [`RunBudgetConfig::merged_with_override`].
+    #[serde(default)]
+    pub run_budget: RunBudgetConfig,
 
     /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
     /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
@@ -2936,6 +3016,7 @@ impl Config {
             proxy_auth_encrypted: None,
             headless_auth: false,
             subagents: SubagentsConfig::default(),
+            run_budget: RunBudgetConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
             providers: ProviderConfigs::default(),
@@ -3536,6 +3617,88 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn run_budget_config_merge_is_tighten_only_per_field() {
+        let config_default = RunBudgetConfig {
+            max_total_tokens: Some(100_000),
+            max_tool_calls: Some(500),
+            max_subagents: Some(10),
+        };
+
+        // No override at all: config default passes through unchanged.
+        assert_eq!(
+            config_default.merged_with_override(None),
+            config_default,
+            "no override falls back to the config default entirely"
+        );
+
+        // Override TIGHTENS exactly one field; the other two keep the config
+        // default (per-field, not all-or-nothing).
+        let tighten_one = RunBudgetConfig {
+            max_total_tokens: Some(5_000),
+            max_tool_calls: None,
+            max_subagents: None,
+        };
+        let merged = config_default.merged_with_override(Some(&tighten_one));
+        assert_eq!(merged.max_total_tokens, Some(5_000));
+        assert_eq!(merged.max_tool_calls, Some(500));
+        assert_eq!(merged.max_subagents, Some(10));
+
+        // A LOOSER override is clamped to the config default: a client can
+        // never raise the operator's ceiling (PR #539 review, finding #3).
+        let loosen_attempt = RunBudgetConfig {
+            max_total_tokens: Some(999_999_999),
+            max_tool_calls: Some(10_000),
+            max_subagents: Some(1_000),
+        };
+        assert_eq!(
+            config_default.merged_with_override(Some(&loosen_attempt)),
+            config_default,
+            "looser per-request values must be clamped to the config ceiling"
+        );
+
+        // Nor can it REMOVE a configured ceiling by omitting the field: an
+        // absent override field keeps the config default, it does not mean
+        // unlimited.
+        let empty_override = RunBudgetConfig::default();
+        assert_eq!(
+            config_default.merged_with_override(Some(&empty_override)),
+            config_default,
+            "an all-absent override body keeps every configured ceiling"
+        );
+
+        // An unlimited config default CAN be tightened by the request (the
+        // request is the only ceiling then), and stays unlimited on fields the
+        // request does not set.
+        let unlimited_default = RunBudgetConfig::default();
+        let merged = unlimited_default.merged_with_override(Some(&tighten_one));
+        assert_eq!(merged.max_total_tokens, Some(5_000));
+        assert_eq!(merged.max_tool_calls, None);
+        assert_eq!(merged.max_subagents, None);
+    }
+
+    #[test]
+    fn run_budget_config_json_round_trips_and_defaults_are_unlimited() {
+        assert_eq!(RunBudgetConfig::default().max_total_tokens, None);
+        assert_eq!(RunBudgetConfig::default().max_tool_calls, None);
+        assert_eq!(RunBudgetConfig::default().max_subagents, None);
+
+        let json = r#"{ "max_total_tokens": 250000, "max_subagents": 3 }"#;
+        let cfg: RunBudgetConfig = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(cfg.max_total_tokens, Some(250_000));
+        assert_eq!(
+            cfg.max_tool_calls, None,
+            "absent field defaults to unlimited"
+        );
+        assert_eq!(cfg.max_subagents, Some(3));
+
+        // Absent fields are omitted on serialize (skip_serializing_if), so an
+        // all-default config round-trips to `{}` rather than three explicit
+        // nulls.
+        let empty = serde_json::to_string(&RunBudgetConfig::default()).unwrap();
+        assert_eq!(empty, "{}");
     }
 
     #[test]

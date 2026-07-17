@@ -120,6 +120,15 @@ pub enum AgentEvent {
         #[serde(default)]
         content_summary: Option<String>,
     },
+    /// A per-run token/tool-call/subagent budget tripped and the run was
+    /// gracefully stopped (issue #221).
+    BudgetExceeded {
+        /// Which budget tripped: `"max_total_tokens"` | `"max_tool_calls"` |
+        /// `"max_subagents"`.
+        kind: String,
+        limit: u64,
+        actual: u64,
+    },
     Complete {
         usage: TokenUsage,
     },
