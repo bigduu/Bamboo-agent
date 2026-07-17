@@ -1306,13 +1306,26 @@ pub(super) async fn run_pipeline(
             })
             .await;
 
-        // --- Merge any queued injected messages from send_message ---
-        state_bridge::merge_pending_injected_messages(
+        // --- Turn-boundary refresh from disk: injected messages + live bypass ---
+        // A single load also picks up a mid-run `PATCH /sessions
+        // {bypass_permissions}`: the run owns a Session taken at spawn and never
+        // otherwise re-reads storage, so without this a bypass flip would not
+        // take effect until the next run. Adopt the disk value onto BOTH the
+        // live runtime state and the owned session so this round's per-tool-call
+        // `ToolExecutionSessionFlags::from_session` sees it. #540.
+        let turn_refresh = state_bridge::refresh_turn_boundary_from_disk(
             session,
             config.storage.as_ref(),
             config.persistence.as_ref(),
         )
         .await;
+        if let Some(disk_bypass) = turn_refresh.disk_bypass_permissions {
+            state.runtime_state.bypass_permissions = disk_bypass;
+            session
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .bypass_permissions = disk_bypass;
+        }
 
         // --- Cancellation check ---
         if cancel_token.is_cancelled() {
