@@ -101,6 +101,70 @@ fn test_message_assistant_with_reasoning() {
     assert_eq!(msg.reasoning, Some(reasoning));
 }
 
+/// #524: `Message.reasoning_signature` must round-trip through JSON
+/// (storage serialization) both ways.
+#[test]
+fn test_message_reasoning_signature_serde_roundtrip() {
+    let reasoning = "Let me think about this...".to_string();
+    let signature = "sig_abc123".to_string();
+    let msg = Message::assistant_with_reasoning("Response", None, Some(reasoning.clone()))
+        .with_reasoning_signature(Some(signature.clone()));
+
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains("reasoning_signature"),
+        "serialized JSON must carry the signature field: {json}"
+    );
+
+    let decoded: Message = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.reasoning, Some(reasoning));
+    assert_eq!(decoded.reasoning_signature, Some(signature));
+}
+
+/// #524 back-compat: a session persisted BEFORE this field existed has no
+/// `reasoning_signature` key in its JSON at all. `#[serde(default)]` must
+/// deserialize that as `None` (unsigned) rather than failing to load the
+/// session — matching #523's safe-omission default for unsigned reasoning.
+#[test]
+fn test_message_reasoning_signature_defaults_to_none_for_legacy_json() {
+    let legacy_json = serde_json::json!({
+        "id": "msg-1",
+        "role": "assistant",
+        "content": "Response",
+        "reasoning": "Let me think about this...",
+        "created_at": Utc::now().to_rfc3339(),
+    });
+
+    let decoded: Message = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(
+        decoded.reasoning,
+        Some("Let me think about this...".to_string())
+    );
+    assert_eq!(
+        decoded.reasoning_signature, None,
+        "legacy session JSON with no reasoning_signature key must decode as unsigned"
+    );
+}
+
+/// The signature field must be OMITTED from serialized JSON when `None`
+/// (`skip_serializing_if`), keeping persisted sessions with no captured
+/// signature exactly as compact as before this field existed.
+#[test]
+fn test_message_reasoning_signature_omitted_from_json_when_none() {
+    let msg = Message::assistant_with_reasoning(
+        "Response",
+        None,
+        Some("Let me think about this...".to_string()),
+    );
+    assert_eq!(msg.reasoning_signature, None);
+
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        !json.contains("reasoning_signature"),
+        "unsigned reasoning must not add a reasoning_signature key: {json}"
+    );
+}
+
 #[test]
 fn test_message_tool_result_constructor() {
     let msg = Message::tool_result("call-123", "Tool output here");
