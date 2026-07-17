@@ -200,6 +200,11 @@ impl FabricDeployer {
             mcp_proxy: Some(ORCHESTRATOR_ID.to_string()),
             log_path: Some(log_path.clone()),
             spec_json,
+            // Fabric config doesn't yet expose a per-node CA-cert path (#48
+            // wires the capability into `AgentDeployment`/the CLI; a fast-follow
+            // can add `node.deploy.tls_ca_cert` if fabric nodes need self-signed
+            // `wss://` brokers without an OS-trust-store install).
+            tls_ca_cert: None,
         };
 
         // Release any prior worker FIRST so its reverse tunnel frees the broker
