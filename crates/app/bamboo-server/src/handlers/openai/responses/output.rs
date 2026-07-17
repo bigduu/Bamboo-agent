@@ -19,6 +19,7 @@ pub(super) fn build_output_items(
             content_type: "output_text".to_string(),
             text: content,
         }],
+        status: Some("completed".to_string()),
     }));
 
     for (idx, tool_call) in tool_calls.into_iter().enumerate() {
@@ -29,6 +30,7 @@ pub(super) fn build_output_items(
                 call_id: tool_call.id,
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
+                status: Some("completed".to_string()),
             },
         ));
     }

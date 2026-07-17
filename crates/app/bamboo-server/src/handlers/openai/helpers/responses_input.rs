@@ -76,15 +76,33 @@ pub(super) fn responses_input_to_chat_messages(
                 .unwrap_or("")
                 .to_string();
 
+            let call = ToolCall {
+                id: call_id,
+                tool_type: "function".to_string(),
+                function: FunctionCall { name, arguments },
+            };
+
+            // A function_call item belongs to the assistant turn immediately
+            // preceding it. Attach it there — one assistant message per turn
+            // with ALL of its tool_calls. Emitting one single-call assistant
+            // message per item breaks parallel tool calls: Chat-Completions
+            // upstreams reject an assistant tool_calls message that is not
+            // immediately followed by its tool results (#525).
+            if let Some(last) = messages.last_mut() {
+                if matches!(last.role, Role::Assistant) {
+                    match last.tool_calls.as_mut() {
+                        Some(calls) => calls.push(call),
+                        None => last.tool_calls = Some(vec![call]),
+                    }
+                    continue;
+                }
+            }
+
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: Content::Text(String::new()),
                 phase: Some("commentary".to_string()),
-                tool_calls: Some(vec![ToolCall {
-                    id: call_id,
-                    tool_type: "function".to_string(),
-                    function: FunctionCall { name, arguments },
-                }]),
+                tool_calls: Some(vec![call]),
                 tool_call_id: None,
             });
             continue;
@@ -96,11 +114,21 @@ pub(super) fn responses_input_to_chat_messages(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let output = obj
-                .get("output")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            // `output` is a string OR an array of content parts
+            // (`[{type:"output_text", text}]`). Flatten parts to text instead
+            // of silently degrading non-string shapes to "" (#525).
+            let output = match obj.get("output") {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|part| part.as_object())
+                    .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                // Any other shape: keep the raw JSON rather than dropping it.
+                Some(other) => other.to_string(),
+            };
 
             messages.push(ChatMessage {
                 role: Role::Tool,
@@ -109,6 +137,16 @@ pub(super) fn responses_input_to_chat_messages(
                 tool_calls: None,
                 tool_call_id: Some(call_id),
             });
+            continue;
+        }
+
+        // An item with an explicitly unknown `type` (Codex round-trips
+        // `reasoning` items, the spec has `web_search_call`, …) must be
+        // skipped: falling into the message branch fabricates an empty user
+        // message that pollutes the conversation (#525). Items WITHOUT a
+        // `type` key defaulted to "message" above and keep flowing.
+        if item_type != "message" {
+            tracing::debug!(item_type, "Skipping unsupported Responses input item type");
             continue;
         }
 
