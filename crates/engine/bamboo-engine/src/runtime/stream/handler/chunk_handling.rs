@@ -64,6 +64,16 @@ pub(super) async fn handle_chunk_result(
             }
             Ok(())
         }
+        Ok(LLMChunk::ReasoningSignature(signature)) => {
+            tracing::debug!(
+                "[{}] Received reasoning signature (len={}, invalidation={})",
+                session_id,
+                signature.len(),
+                signature.is_empty()
+            );
+            state.record_reasoning_signature(signature);
+            Ok(())
+        }
         Ok(LLMChunk::ToolCalls(partial_calls)) => {
             tracing::trace!(
                 "[{}] Received {} tool call parts",

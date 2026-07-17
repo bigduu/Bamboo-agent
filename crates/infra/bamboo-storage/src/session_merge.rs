@@ -615,6 +615,7 @@ mod tests {
             id: "msg-1".to_string(),
             created_at: chrono::Utc::now(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,

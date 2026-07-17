@@ -6,6 +6,11 @@ pub(super) struct StreamAccumulationState {
     response_id: Option<String>,
     content: String,
     reasoning_content: String,
+    /// Provider-minted signature covering `reasoning_content` (#520). `None`
+    /// until a signature arrives; an empty-string invalidation marker clears it
+    /// permanently for this stream (`reasoning_signature_invalidated`).
+    reasoning_signature: Option<String>,
+    reasoning_signature_invalidated: bool,
     token_count: usize,
     tool_calls: ToolCallAccumulator,
     output_tokens: u64,
@@ -21,6 +26,8 @@ impl StreamAccumulationState {
             response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
+            reasoning_signature: None,
+            reasoning_signature_invalidated: false,
             token_count: 0,
             tool_calls: ToolCallAccumulator::new(),
             output_tokens: 0,
@@ -38,6 +45,19 @@ impl StreamAccumulationState {
 
     pub(super) fn append_reasoning_token(&mut self, token: &str) {
         self.reasoning_content.push_str(token);
+    }
+
+    /// Record a provider-minted reasoning signature (#520). An empty string is
+    /// the parser's invalidation marker — the turn produced multiple thinking
+    /// blocks (or a redacted one), so no single signature covers the
+    /// accumulated reasoning text and none may be persisted.
+    pub(super) fn record_reasoning_signature(&mut self, signature: String) {
+        if signature.is_empty() {
+            self.reasoning_signature = None;
+            self.reasoning_signature_invalidated = true;
+        } else if !self.reasoning_signature_invalidated {
+            self.reasoning_signature = Some(signature);
+        }
     }
 
     pub(super) fn set_response_id(&mut self, response_id: String) {
@@ -80,6 +100,7 @@ impl StreamAccumulationState {
             response_id: self.response_id,
             content: self.content,
             reasoning_content: self.reasoning_content,
+            reasoning_signature: self.reasoning_signature,
             token_count: self.token_count,
             tool_calls: self.tool_calls.finalize(),
             output_tokens: self.output_tokens,

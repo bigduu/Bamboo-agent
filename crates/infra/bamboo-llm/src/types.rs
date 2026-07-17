@@ -5,6 +5,14 @@ pub enum LLMChunk {
     ResponseId(String),
     Token(String),
     ReasoningToken(String),
+    /// Provider-minted cryptographic signature covering the turn's accumulated
+    /// reasoning text (Anthropic `signature_delta`). Emitted once, after the
+    /// turn's single `thinking` block closes; an EMPTY string is an
+    /// invalidation marker (the turn produced multiple thinking blocks or a
+    /// `redacted_thinking` block, so no single signature covers the
+    /// accumulated reasoning and any previously captured one must be
+    /// discarded). Consumers that don't replay thinking ignore this. (#520)
+    ReasoningSignature(String),
     ToolCalls(Vec<ToolCall>),
     /// Tool-call deltas that carry the provider's `index` field, so the engine
     /// accumulator can route argument-only continuation fragments to the correct

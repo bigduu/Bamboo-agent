@@ -64,7 +64,9 @@ pub(super) fn build_gemini_event_stream(
                     yield Ok::<_, ActixError>(sse::done_chunk_bytes());
                     break;
                 }
-                Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
+                Ok(LLMChunk::CacheUsage { .. })
+                | Ok(LLMChunk::UsageSummary { .. })
+                | Ok(LLMChunk::ReasoningSignature(_)) => {}
                 Err(error) => {
                     had_error = true;
                     context.metrics.forward_completed(

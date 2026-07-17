@@ -877,6 +877,7 @@ fn record_no_tool_calls_round_completed(
 async fn handle_no_tool_calls(
     content: String,
     reasoning: Option<String>,
+    reasoning_signature: Option<String>,
     prompt_tokens: u64,
     completion_tokens: u64,
     round_usage: MetricsTokenUsage,
@@ -901,8 +902,10 @@ async fn handle_no_tool_calls(
     // the exact pre-#343 no-goal guardian behavior (the guardian ran before the
     // assistant message was appended).
     let add_message_before_gold = config.goal_loop_active();
-    let mut deferred_assistant_message =
-        Some(Message::assistant_with_reasoning(content, None, reasoning));
+    let mut deferred_assistant_message = Some(
+        Message::assistant_with_reasoning(content, None, reasoning)
+            .with_reasoning_signature(reasoning_signature),
+    );
     if add_message_before_gold {
         if let Some(message) = deferred_assistant_message.take() {
             session.add_message(message);
@@ -1018,11 +1021,19 @@ async fn handle_tool_calls_path(
 ) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
-    session.add_message(Message::assistant_with_reasoning(
-        stream_output.content,
-        Some(stream_output.tool_calls.clone()),
-        reasoning,
-    ));
+    // The signature only ever covers the reasoning text, so it rides along only
+    // when the reasoning itself is persisted (#520).
+    let reasoning_signature = reasoning
+        .as_ref()
+        .and_then(|_| stream_output.reasoning_signature.clone());
+    session.add_message(
+        Message::assistant_with_reasoning(
+            stream_output.content,
+            Some(stream_output.tool_calls.clone()),
+            reasoning,
+        )
+        .with_reasoning_signature(reasoning_signature),
+    );
 
     let compression_model = Some(model_name.to_string())
         .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
@@ -1508,6 +1519,9 @@ pub(super) async fn run_pipeline(
                 // guardian review on incomplete work (issue #343).
                 let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                     .then_some(stream_output.reasoning_content);
+                let reasoning_signature = reasoning
+                    .as_ref()
+                    .and_then(|_| stream_output.reasoning_signature.clone());
                 let eval_model = state
                     .auxiliary_models
                     .fast_model_name
@@ -1517,6 +1531,7 @@ pub(super) async fn run_pipeline(
                     handle_no_tool_calls(
                         stream_output.content,
                         reasoning,
+                        reasoning_signature,
                         llm_output.prompt_tokens,
                         llm_output.completion_tokens,
                         llm_output.round_usage,
@@ -2238,6 +2253,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "tentative answer".to_string(),
             None,
+            None,
             5,
             5,
             round_usage(),
@@ -2296,6 +2312,7 @@ mod tests {
 
         let outcome = super::handle_no_tool_calls(
             "final answer".to_string(),
+            None,
             None,
             5,
             5,
@@ -2356,6 +2373,7 @@ mod tests {
         let r1 = super::handle_no_tool_calls(
             "I think that's everything.".to_string(),
             None,
+            None,
             5,
             5,
             round_usage(),
@@ -2397,6 +2415,7 @@ mod tests {
         // --- Round 2: declared complete, judge confirms "achieved" → stop ---
         let r2 = super::handle_no_tool_calls(
             "Done — shipped and verified.".to_string(),
+            None,
             None,
             5,
             5,
@@ -2454,6 +2473,7 @@ mod tests {
 
         let outcome = super::handle_no_tool_calls(
             "All done!".to_string(),
+            None,
             None,
             5,
             5,
@@ -2530,6 +2550,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "tentative — I think that's everything".to_string(),
             None,
+            None,
             5,
             5,
             round_usage(),
@@ -2594,6 +2615,7 @@ mod tests {
 
         let outcome = super::handle_no_tool_calls(
             "Done — shipped and verified.".to_string(),
+            None,
             None,
             5,
             5,
@@ -3232,6 +3254,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "final answer".to_string(),
             Some("reasoning trace".to_string()),
+            None,
             11,
             7,
             MetricsTokenUsage {
@@ -3858,6 +3881,7 @@ mod tests {
             response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
+            reasoning_signature: None,
             token_count: 0,
             tool_calls: vec![call],
             output_tokens: 0,
@@ -4195,6 +4219,7 @@ mod tests {
             response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
+            reasoning_signature: None,
             token_count: 0,
             tool_calls: vec![
                 tool_call("call-compact", "compact_context"),
@@ -4713,6 +4738,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             final_text.to_string(),
             None,
+            None,
             5,
             5,
             round_usage(),
@@ -4783,6 +4809,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             final_text.to_string(),
             None,
+            None,
             5,
             5,
             round_usage(),
@@ -4840,6 +4867,7 @@ mod tests {
 
         let outcome = super::handle_no_tool_calls(
             "   \n  ".to_string(),
+            None,
             None,
             5,
             5,

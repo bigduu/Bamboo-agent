@@ -115,7 +115,9 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 tool_calls.extend(indexed.into_iter().map(|(_, call)| call))
             }
             Ok(LLMChunk::Done) => break,
-            Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
+            Ok(LLMChunk::CacheUsage { .. })
+            | Ok(LLMChunk::UsageSummary { .. })
+            | Ok(LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 had_error = true;
                 error_message = Some(error.to_string());
