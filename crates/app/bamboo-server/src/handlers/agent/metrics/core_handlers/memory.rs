@@ -440,7 +440,9 @@ pub async fn memory_summary(
 ) -> impl Responder {
     if matches!(query.scope, Some(MemoryScope::Session)) {
         return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "session scope is not supported for memory metrics summary",
+            "error": crate::error::error_value(
+                "session scope is not supported for memory metrics summary"
+            ),
         }));
     }
 
@@ -468,7 +470,9 @@ pub async fn memory_timeline(
 ) -> impl Responder {
     if matches!(query.scope, Some(MemoryScope::Session)) {
         return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "session scope is not supported for memory metrics timeline",
+            "error": crate::error::error_value(
+                "session scope is not supported for memory metrics timeline"
+            ),
         }));
     }
 

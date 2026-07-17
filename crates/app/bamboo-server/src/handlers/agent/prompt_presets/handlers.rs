@@ -27,13 +27,13 @@ fn default_preset_item() -> PromptPresetItem {
 
 fn bad_request(message: &str) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({
-        "error": message
+        "error": crate::error::error_value(message)
     }))
 }
 
 fn not_found(preset_id: &str) -> HttpResponse {
     HttpResponse::NotFound().json(serde_json::json!({
-        "error": "Prompt preset not found",
+        "error": crate::error::error_value("Prompt preset not found"),
         "preset_id": preset_id
     }))
 }

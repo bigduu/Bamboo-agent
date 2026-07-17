@@ -12,7 +12,7 @@ pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse>
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "name is required"
+            "error": crate::error::error_value("name is required")
         })));
     }
     Ok(trimmed.to_string())
@@ -21,7 +21,7 @@ pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse>
 fn validate_interval_seconds(interval_seconds: u64) -> Result<(), HttpResponse> {
     if interval_seconds == 0 {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "trigger.every_seconds must be > 0"
+            "error": crate::error::error_value("trigger.every_seconds must be > 0")
         })));
     }
     Ok(())
@@ -39,7 +39,7 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             // with a 400 instead, mirroring the cron/timezone pre-checks.
             if *at <= Utc::now() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "trigger.at must be in the future"
+                    "error": crate::error::error_value("trigger.at must be in the future")
                 })));
             }
             Ok(())
@@ -57,7 +57,7 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
         } => {
             if weekdays.is_empty() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "trigger.weekdays must not be empty"
+                    "error": crate::error::error_value("trigger.weekdays must not be empty")
                 })));
             }
             validate_hms(*hour, *minute, *second)
@@ -70,12 +70,12 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
         } => {
             if days.is_empty() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "trigger.days must not be empty"
+                    "error": crate::error::error_value("trigger.days must not be empty")
                 })));
             }
             if days.iter().any(|day| *day == 0 || *day > 31) {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "trigger.days values must be between 1 and 31"
+                    "error": crate::error::error_value("trigger.days values must be between 1 and 31")
                 })));
             }
             validate_hms(*hour, *minute, *second)
@@ -84,7 +84,7 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             let expr = expr.trim();
             if expr.is_empty() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "trigger.expr is required"
+                    "error": crate::error::error_value("trigger.expr is required")
                 })));
             }
             // Parse with the same `cron::Schedule` the trigger engine uses, so an
@@ -92,7 +92,7 @@ pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(),
             // store (compute_initial_next_run_at) where it surfaces as a 500.
             if expr.parse::<CronSchedule>().is_err() {
                 return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": format!("trigger.expr is not a valid cron expression: {expr}")
+                    "error": crate::error::error_value(format!("trigger.expr is not a valid cron expression: {expr}"))
                 })));
             }
             Ok(())
@@ -107,7 +107,7 @@ pub(super) fn validate_schedule_window(
     if let (Some(start_at), Some(end_at)) = (start_at, end_at) {
         if start_at >= end_at {
             return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "start_at must be earlier than end_at"
+                "error": crate::error::error_value("start_at must be earlier than end_at")
             })));
         }
     }
@@ -129,14 +129,14 @@ pub(super) fn validate_trigger_api_fields(
     if let Some(timezone) = timezone.map(str::trim) {
         if timezone.is_empty() {
             return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "timezone must not be empty when provided"
+                "error": crate::error::error_value("timezone must not be empty when provided")
             })));
         }
         // Same `chrono_tz::Tz` parse the trigger engine uses (parse_timezone);
         // reject a bogus zone with a 400 rather than a later 500.
         if timezone.parse::<Tz>().is_err() {
             return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": format!("timezone is not a valid IANA timezone: {timezone}")
+                "error": crate::error::error_value(format!("timezone is not a valid IANA timezone: {timezone}"))
             })));
         }
     }
@@ -210,17 +210,17 @@ pub(super) fn resolve_patch_schedule_definition(
 fn validate_hms(hour: u8, minute: u8, second: u8) -> Result<(), HttpResponse> {
     if hour > 23 {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "trigger.hour must be between 0 and 23"
+            "error": crate::error::error_value("trigger.hour must be between 0 and 23")
         })));
     }
     if minute > 59 {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "trigger.minute must be between 0 and 59"
+            "error": crate::error::error_value("trigger.minute must be between 0 and 59")
         })));
     }
     if second > 59 {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "trigger.second must be between 0 and 59"
+            "error": crate::error::error_value("trigger.second must be between 0 and 59")
         })));
     }
     Ok(())
@@ -243,7 +243,7 @@ pub(super) async fn validate_auto_execute_run_config(
 
     if !has_task {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "run_config.task_message is required when auto_execute is true"
+            "error": crate::error::error_value("run_config.task_message is required when auto_execute is true")
         })));
     }
 
@@ -260,10 +260,10 @@ pub(super) async fn validate_auto_execute_run_config(
     let snapshot = state.config.read().await.clone();
     if let Err(error) = get_schedule_model_from_config(&snapshot) {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": format!(
+            "error": crate::error::error_value(format!(
                 "run_config.model not provided and no fast/default model configured for provider {}: {}",
                 snapshot.provider, error
-            )
+            ))
         })));
     }
 

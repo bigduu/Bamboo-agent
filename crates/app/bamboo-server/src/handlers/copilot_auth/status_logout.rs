@@ -43,7 +43,7 @@ pub async fn logout_copilot(app_state: web::Data<AppState>) -> Result<HttpRespon
         tracing::error!("Failed to logout: {}", messages.join(", "));
         Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "success": false,
-            "error": messages.join(", ")
+            "error": crate::error::error_value(messages.join(", "))
         })))
     }
 }

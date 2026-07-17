@@ -18,13 +18,13 @@ pub async fn list_discoverable_tools(
         Ok(Some(s)) => s,
         Ok(None) => {
             return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                "error": "Session not found",
+                "error": crate::error::error_value("Session not found"),
                 "session_id": session_id
             })));
         }
         Err(error) => {
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to load session: {error}")
+                "error": crate::error::error_value(format!("Failed to load session: {error}"))
             })));
         }
     };
@@ -68,7 +68,7 @@ pub async fn activate_discoverable_tools(
         })?
     else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };
@@ -115,7 +115,7 @@ pub async fn deactivate_discoverable_tools(
         })?
     else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };

@@ -18,7 +18,8 @@ pub async fn add_server(
         ServerRequest::Mainstream(flat) => match flat.into_internal(None) {
             Ok(config) => config,
             Err(error) => {
-                return HttpResponse::BadRequest().json(serde_json::json!({ "error": error }));
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({ "error": crate::error::error_value(error) }));
             }
         },
     };
@@ -49,7 +50,7 @@ pub async fn add_server(
     if config.enabled {
         if let Err(e) = state.mcp_manager.start_server(config).await {
             return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to start server: {}", e)
+                "error": crate::error::error_value(format!("Failed to start server: {}", e))
             }));
         }
     }
@@ -78,7 +79,8 @@ pub async fn update_server(
         ServerRequest::Mainstream(flat) => match flat.into_internal(Some(server_id.clone())) {
             Ok(config) => config,
             Err(error) => {
-                return HttpResponse::BadRequest().json(serde_json::json!({ "error": error }));
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({ "error": crate::error::error_value(error) }));
             }
         },
     };
@@ -110,7 +112,7 @@ pub async fn update_server(
     if config.enabled {
         if let Err(e) = state.mcp_manager.start_server(config).await {
             return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to update server: {}", e)
+                "error": crate::error::error_value(format!("Failed to update server: {}", e))
             }));
         }
     }

@@ -12,7 +12,7 @@ pub async fn get_task_list(
     let session_id = session_id.into_inner();
     let Some(session) = state.load_session(&session_id).await else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found"
+            "error": crate::error::error_value("Session not found")
         })));
     };
 
@@ -49,7 +49,7 @@ pub async fn has_task_list(
     let session_id = session_id.into_inner();
     let Some(session) = state.load_session(&session_id).await else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found"
+            "error": crate::error::error_value("Session not found")
         })));
     };
 
@@ -66,4 +66,47 @@ pub async fn has_task_list(
         "has_task_list": shared_session.task_list.is_some(),
         "session_id": shared_session.id
     })))
+}
+
+#[cfg(test)]
+mod http_tests {
+    use actix_web::{http::StatusCode, test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    /// `GET /api/v1/sessions/{id}/task` for an unknown session must use the
+    /// canonical nested error envelope (`{"error": {"message", "type"}}`),
+    /// not the old flat `{"error": "<string>"}` shape. #251/#507.
+    #[actix_web::test]
+    async fn get_task_list_not_found_uses_canonical_error_envelope() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/does-not-exist/task")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Session not found");
+    }
 }

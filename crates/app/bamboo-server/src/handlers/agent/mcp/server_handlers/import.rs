@@ -51,7 +51,7 @@ pub async fn import_servers(
 
     if incoming_by_id.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "No servers found under 'mcpServers'"
+            "error": crate::error::error_value("No servers found under 'mcpServers'")
         }));
     }
 

@@ -124,7 +124,7 @@ pub async fn handler(
                 bamboo_engine::session_app::errors::ExecutePreparationError::NotFound(_) => {
                     tracing::warn!("[{session_id}] Execute session not found");
                     HttpResponse::NotFound().json(serde_json::json!({
-                        "error": "Session not found",
+                        "error": crate::error::error_value("Session not found"),
                         "session_id": session_id
                     }))
                 }
@@ -134,7 +134,9 @@ pub async fn handler(
                     let err_msg = load_err.to_string();
                     tracing::error!("[{session_id}] Execute session load error: {err_msg}");
                     HttpResponse::InternalServerError().json(serde_json::json!({
-                        "error": format!("Failed to load session: {err_msg}")
+                        "error": crate::error::error_value(format!(
+                            "Failed to load session: {err_msg}"
+                        ))
                     }))
                 }
                 _ => internal_server_error_response(format!("Execute preparation failed: {error}")),

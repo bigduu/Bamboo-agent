@@ -45,7 +45,7 @@ pub(super) async fn handle_update_provider_config(
     if let Err(error) = app_state.reload_provider().await {
         return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "success": false,
-            "error": format!("Failed to reload provider: {error}")
+            "error": crate::error::error_value(format!("Failed to reload provider: {error}"))
         })));
     }
 
@@ -104,7 +104,7 @@ fn validate_provider_config(config: &Config) -> Result<(), AppError> {
 fn bad_request_response(message: String) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({
         "success": false,
-        "error": message
+        "error": crate::error::error_value(message)
     }))
 }
 

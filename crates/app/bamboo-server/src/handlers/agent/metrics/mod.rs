@@ -19,6 +19,6 @@ pub use unified_handlers::{v2_unified_summary, v2_unified_timeline};
 
 fn internal_error(error: impl std::fmt::Display) -> HttpResponse {
     HttpResponse::InternalServerError().json(serde_json::json!({
-        "error": error.to_string(),
+        "error": crate::error::error_value(error.to_string()),
     }))
 }

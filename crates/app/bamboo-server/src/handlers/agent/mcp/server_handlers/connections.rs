@@ -39,7 +39,7 @@ pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>)
         return match e {
             crate::error::AppError::NotFound(_) => {
                 HttpResponse::NotFound().json(serde_json::json!({
-                    "error": format!("Server '{}' not found", server_id)
+                    "error": crate::error::error_value(format!("Server '{}' not found", server_id))
                 }))
             }
             other => persist_config_error(format!("Failed to save config: {other}")),
@@ -56,7 +56,7 @@ pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>)
             "server_id": server_id
         })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to start server: {}", e)
+            "error": crate::error::error_value(format!("Failed to start server: {}", e))
         })),
     }
 }
@@ -95,7 +95,7 @@ pub async fn disconnect_server(
         return match e {
             crate::error::AppError::NotFound(_) => {
                 HttpResponse::NotFound().json(serde_json::json!({
-                    "error": format!("Server '{}' not found", server_id)
+                    "error": crate::error::error_value(format!("Server '{}' not found", server_id))
                 }))
             }
             other => persist_config_error(format!("Failed to save config: {other}")),
@@ -108,7 +108,7 @@ pub async fn disconnect_server(
             "server_id": server_id
         })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to disconnect server: {}", e)
+            "error": crate::error::error_value(format!("Failed to disconnect server: {}", e))
         })),
     }
 }
@@ -135,7 +135,7 @@ pub async fn refresh_tools(state: web::Data<AppState>, path: web::Path<String>) 
             }))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to refresh tools: {}", e)
+            "error": crate::error::error_value(format!("Failed to refresh tools: {}", e))
         })),
     }
 }

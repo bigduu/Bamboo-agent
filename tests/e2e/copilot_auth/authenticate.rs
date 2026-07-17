@@ -29,13 +29,18 @@ async fn test_copilot_authenticate_endpoint_not_copilot() {
     let json: serde_json::Value =
         serde_json::from_slice(&body).expect("Response should be valid JSON");
 
-    // Verify error response structure
+    // Verify error response structure — canonical nested envelope
+    // (`{"error": {"message", "type"}}`, #251 finding 2 / #507).
     assert!(json.is_object(), "Response should be a JSON object");
     assert!(json.get("success").is_some());
     assert_eq!(json["success"].as_bool(), Some(false));
     assert!(json.get("error").is_some());
+    assert_eq!(json["error"]["type"], "api_error");
     assert!(
-        json["error"].as_str().unwrap().contains("not Copilot"),
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not Copilot"),
         "Error should indicate provider is not Copilot"
     );
 }

@@ -25,7 +25,9 @@ pub(super) fn resolve_model(
     match optional_non_empty(default_model) {
         Some(model) => Ok(model.to_string()),
         None => Err(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "model is required and no default model is configured on this server"
+            "error": crate::error::error_value(
+                "model is required and no default model is configured on this server"
+            )
         }))),
     }
 }

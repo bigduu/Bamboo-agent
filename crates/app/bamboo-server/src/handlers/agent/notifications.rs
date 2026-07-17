@@ -23,7 +23,9 @@ pub async fn update_preferences(
     match state.notification_service.set_preferences(prefs.clone()) {
         Ok(()) => HttpResponse::Ok().json(prefs),
         Err(error) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to persist notification preferences: {error}")
+            "error": crate::error::error_value(format!(
+                "Failed to persist notification preferences: {error}"
+            ))
         })),
     }
 }

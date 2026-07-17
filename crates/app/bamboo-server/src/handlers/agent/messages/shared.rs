@@ -12,7 +12,7 @@ pub(super) async fn ensure_session_not_running(
     if let Some(runner) = runners.get(session_id) {
         if matches!(runner.status, AgentStatus::Running) {
             return Some(HttpResponse::Conflict().json(serde_json::json!({
-                "error": "Session is currently running",
+                "error": crate::error::error_value("Session is currently running"),
                 "session_id": session_id,
             })));
         }

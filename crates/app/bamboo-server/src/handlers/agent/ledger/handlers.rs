@@ -91,12 +91,12 @@ fn internal_server_error(action: &str, error: impl Display) -> Error {
 }
 
 fn bad_request(message: impl Into<String>) -> HttpResponse {
-    HttpResponse::BadRequest().json(json!({ "error": message.into() }))
+    HttpResponse::BadRequest().json(json!({ "error": crate::error::error_value(message.into()) }))
 }
 
 fn record_not_found(record_id: &str) -> HttpResponse {
     HttpResponse::NotFound().json(json!({
-        "error": "Record not found",
+        "error": crate::error::error_value("Record not found"),
         "record_id": record_id
     }))
 }

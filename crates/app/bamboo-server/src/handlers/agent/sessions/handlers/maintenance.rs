@@ -27,7 +27,7 @@ pub async fn clear_session(
 
     if !cleared {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     }
@@ -86,14 +86,14 @@ pub async fn run_project_dream(
     let session_id = path.into_inner();
     let Some(session) = load_session_from_state_or_storage(&state, &session_id).await? else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };
 
     let Some(project_key) = resolve_session_project_key(&session_id, &session) else {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "Project scope unavailable for session",
+            "error": crate::error::error_value("Project scope unavailable for session"),
             "session_id": session_id
         })));
     };
@@ -148,7 +148,7 @@ pub async fn cleanup_sessions(
         "children" => CleanupMode::Children,
         other => {
             return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "Invalid cleanup mode",
+                "error": crate::error::error_value("Invalid cleanup mode"),
                 "mode": other
             })));
         }
@@ -466,8 +466,11 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(resp).await;
+        // Canonical nested error envelope (#251 finding 2), not the old flat
+        // `{"error": "<string>"}` shape.
+        assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(
-            body.get("error").and_then(Value::as_str),
+            body["error"]["message"].as_str(),
             Some("Project scope unavailable for session")
         );
         assert_eq!(

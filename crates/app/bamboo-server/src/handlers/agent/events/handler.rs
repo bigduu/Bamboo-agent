@@ -58,7 +58,7 @@ pub async fn handler(
     {
         tracing::warn!("[{}] Session not found for events subscription", session_id);
         return HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         }));
     }

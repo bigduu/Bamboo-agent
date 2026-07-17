@@ -64,7 +64,7 @@ pub async fn get_server_tools(
             HttpResponse::Ok().json(ToolListResponse { tools })
         }
         None => HttpResponse::NotFound().json(serde_json::json!({
-            "error": format!("Server '{}' not found", server_id)
+            "error": crate::error::error_value(format!("Server '{}' not found", server_id))
         })),
     }
 }

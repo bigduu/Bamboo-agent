@@ -30,7 +30,9 @@ pub(super) async fn append_user_message(
                 Ok(result) => result,
                 Err(error) => {
                     return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                        "error": format!("Failed to store image attachment: {error}")
+                        "error": crate::error::error_value(format!(
+                            "Failed to store image attachment: {error}"
+                        ))
                     })));
                 }
             };
