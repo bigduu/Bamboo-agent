@@ -846,6 +846,9 @@ impl ConnectBridge {
             runners: self.ctx.agent_runners.clone(),
             sessions_cache: self.ctx.session_repo.cache().clone(),
             on_complete: None,
+            // connect-bridged sessions are always root sessions (never
+            // `SessionKind::Child`), so `None` is correct, not a gap.
+            child_completion_handler: None,
         });
 
         self.render_until_settled(key, platform, reply_ctx.clone(), &session_id, rx)

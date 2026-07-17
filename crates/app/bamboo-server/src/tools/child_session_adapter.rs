@@ -88,6 +88,50 @@ fn is_terminal_child_status(status: &str) -> bool {
     )
 }
 
+/// Pure filtering core for [`ChildSessionAdapter::active_child_ids`] (issue
+/// #546 row 9): only a genuinely started-but-not-yet-terminal entry —
+/// `Some(non-terminal-status)` — counts as active. `None` (created but never
+/// run) is excluded, since nothing will ever execute it to move it past
+/// `None`. Extracted as a pure function (no storage I/O) so the filtering
+/// logic is unit-testable in isolation.
+fn filter_active_child_ids(statuses: Vec<(String, Option<String>)>) -> Vec<String> {
+    statuses
+        .into_iter()
+        .filter(|(_, status)| {
+            status
+                .as_deref()
+                .is_some_and(|s| !is_terminal_child_status(s))
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Pure filtering core for [`ChildSessionAdapter::pending_child_ids`] (issue
+/// #546 rows 8/9): keep only candidate ids that are known children of the
+/// parent AND genuinely started-but-not-yet-terminal. Drops already-terminal
+/// ids, never-started ids (`status == None`), and unknown ids (absent from
+/// `statuses` — not a child of this parent at all). Extracted as a pure
+/// function so the filtering logic is unit-testable in isolation.
+fn filter_pending_child_ids(
+    candidate_ids: &[String],
+    statuses: &std::collections::HashMap<String, Option<String>>,
+) -> Vec<String> {
+    candidate_ids
+        .iter()
+        .filter(|id| {
+            statuses
+                .get(id.as_str())
+                .map(|status| {
+                    status
+                        .as_deref()
+                        .is_some_and(|s| !is_terminal_child_status(s))
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
 fn read_runtime_state(session: &Session) -> AgentRuntimeState {
     session
         .agent_runtime_state
@@ -287,15 +331,52 @@ impl ChildSessionAdapter {
 
     /// The parent's currently-active (non-terminal) children, derived from the
     /// session index (single source of truth).
+    ///
+    /// Issue #546 row 9: a child that was `create`d but never `run` has
+    /// `last_run_status == None` — it will NEVER transition to a terminal
+    /// state on its own (nothing is executing it), so it must NOT be
+    /// considered "active" for wait purposes. `SubAgent.wait`'s default
+    /// (no explicit `child_session_ids`) target list is exactly this method's
+    /// output, so before this fix a never-started child silently entered the
+    /// default wait set and the parent suspended on a wait that could never
+    /// resolve. Only `Some(non-terminal-status)` — i.e. genuinely
+    /// started-but-not-yet-finished — counts as active now.
     pub async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
-        self.storage
+        filter_active_child_ids(
+            self.storage
+                .list_child_run_statuses(parent_session_id)
+                .await
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Filter `candidate_ids` down to the subset that are still pending
+    /// (started, not yet terminal) children of `parent_session_id` — i.e.
+    /// eligible to be registered on a NEW wait.
+    ///
+    /// Issue #546 row 8: an EXPLICIT `SubAgent.wait(child_session_ids=[...])`
+    /// call previously registered a durable wait over exactly the ids given,
+    /// with no terminality check at all — if the caller named a child that had
+    /// already finished (a race: the child completed before the wait tool call
+    /// landed), the coordinator's `on_child_completed` for that child had
+    /// ALREADY fired and consumed its one-shot completion event, so no future
+    /// event would ever satisfy the newly-registered wait, stranding the
+    /// parent. Also drops never-started ids (`status == None`, issue #546 row
+    /// 9) and unknown ids (not a child of this parent at all) for the same
+    /// reason — none of them will ever produce a future completion event.
+    pub async fn pending_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidate_ids: &[String],
+    ) -> Vec<String> {
+        let statuses: std::collections::HashMap<String, Option<String>> = self
+            .storage
             .list_child_run_statuses(parent_session_id)
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
-            .map(|(id, _)| id)
-            .collect()
+            .collect();
+        filter_pending_child_ids(candidate_ids, &statuses)
     }
 
     /// Persist a batch of parent-wait registrations in one runtime-only save.
@@ -771,7 +852,103 @@ impl ChildSessionPort for ChildSessionAdapter {
         ChildSessionAdapter::active_child_ids(self, parent_session_id).await
     }
 
+    async fn pending_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidate_ids: &[String],
+    ) -> Vec<String> {
+        ChildSessionAdapter::pending_child_ids(self, parent_session_id, candidate_ids).await
+    }
+
     async fn ensure_child_indexed(&self, child_session_id: &str) {
         let _ = self.session_store.get_index_entry(child_session_id).await;
+    }
+}
+
+#[cfg(test)]
+mod wait_target_filter_tests {
+    use super::*;
+
+    // ── issue #546 row 9: never-started children are never "active" ────────
+
+    #[test]
+    fn filter_active_child_ids_excludes_never_started() {
+        let statuses = vec![
+            ("running".to_string(), Some("running".to_string())),
+            ("never-started".to_string(), None),
+            ("done".to_string(), Some("completed".to_string())),
+        ];
+        let active = filter_active_child_ids(statuses);
+        assert_eq!(active, vec!["running".to_string()]);
+    }
+
+    #[test]
+    fn filter_active_child_ids_empty_when_all_terminal_or_unstarted() {
+        let statuses = vec![
+            ("done".to_string(), Some("completed".to_string())),
+            ("errored".to_string(), Some("error".to_string())),
+            ("never-started".to_string(), None),
+        ];
+        assert!(filter_active_child_ids(statuses).is_empty());
+    }
+
+    // ── issue #546 row 8: an explicit wait target that's already terminal
+    //    (or never started) must never be registered on a new wait ─────────
+
+    #[test]
+    fn filter_pending_child_ids_drops_already_terminal_explicit_target() {
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert("a".to_string(), Some("running".to_string()));
+        statuses.insert("b".to_string(), Some("completed".to_string()));
+
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let pending = filter_pending_child_ids(&candidates, &statuses);
+        assert_eq!(pending, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn filter_pending_child_ids_drops_never_started_explicit_target() {
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert("a".to_string(), Some("running".to_string()));
+        statuses.insert("never-started".to_string(), None);
+
+        let candidates = vec!["a".to_string(), "never-started".to_string()];
+        let pending = filter_pending_child_ids(&candidates, &statuses);
+        assert_eq!(pending, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn filter_pending_child_ids_drops_unknown_ids() {
+        // An id that isn't even a child of this parent (not in the statuses
+        // map at all) must never be registered on a wait.
+        let statuses = std::collections::HashMap::new();
+        let candidates = vec!["not-a-child".to_string()];
+        assert!(filter_pending_child_ids(&candidates, &statuses).is_empty());
+    }
+
+    #[test]
+    fn filter_pending_child_ids_empty_when_every_target_already_terminal() {
+        // The scenario that used to strand the parent forever: EVERY
+        // explicitly-named target had already finished before the wait tool
+        // call landed. Must resolve to an empty pending set (the caller then
+        // treats this as "nothing to wait on", not registering a dead wait).
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert("a".to_string(), Some("completed".to_string()));
+        statuses.insert("b".to_string(), Some("error".to_string()));
+
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        assert!(filter_pending_child_ids(&candidates, &statuses).is_empty());
+    }
+
+    #[test]
+    fn filter_pending_child_ids_keeps_genuinely_active_targets() {
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert("a".to_string(), Some("running".to_string()));
+        statuses.insert("b".to_string(), Some("running".to_string()));
+
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let mut pending = filter_pending_child_ids(&candidates, &statuses);
+        pending.sort();
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
     }
 }

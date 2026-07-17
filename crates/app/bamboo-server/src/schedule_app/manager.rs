@@ -601,6 +601,8 @@ async fn run_schedule_job(
         runners: ctx.agent_runners.clone(),
         sessions_cache: ctx.sessions_cache.clone(),
         on_complete: Some(on_complete),
+        // Scheduled runs always target root sessions, never `SessionKind::Child`.
+        child_completion_handler: None,
     });
 
     Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress)

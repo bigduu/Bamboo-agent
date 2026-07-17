@@ -3,7 +3,25 @@
 //! These traits define the boundary between the domain layer and storage
 //! implementations. Concrete implementations live in infrastructure crates.
 
+use chrono::{DateTime, Utc};
+
 use crate::session::types::Session;
+
+/// Lightweight snapshot of a session's index entry — id, parent, run status,
+/// and last-update timestamp — without paying to load the full `session.json`.
+///
+/// Used by the child-wait heartbeat watchdog (issue #546) to (a) sweep the
+/// index for parents durably suspended on `waiting_for_children`, and (b)
+/// check a single child's staleness (a "running" child whose index entry
+/// hasn't moved in a long time is presumed dead — its owning process is gone
+/// and no completion will ever arrive for it).
+#[derive(Debug, Clone)]
+pub struct SessionRunStatusEntry {
+    pub id: String,
+    pub parent_session_id: Option<String>,
+    pub last_run_status: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
 
 /// Trait for session storage backends.
 ///
@@ -59,6 +77,35 @@ pub trait Storage: Send + Sync {
     ) -> std::io::Result<Vec<(String, Option<String>)>> {
         let _ = parent_session_id;
         Ok(Vec::new())
+    }
+
+    /// List every session whose mirrored `last_run_status` equals `status`,
+    /// sourced from the in-memory index (cheap: no `session.json` reads).
+    ///
+    /// Used by the child-wait heartbeat watchdog (issue #546) to sweep for
+    /// parents durably suspended (`status == "suspended"`) and, at boot, for
+    /// orphaned children left `"running"` by a killed process. Backends
+    /// without a status-aware index return an empty list by default (the
+    /// watchdog degrades to a no-op sweep, never a hard failure).
+    async fn list_sessions_by_run_status(
+        &self,
+        status: &str,
+    ) -> std::io::Result<Vec<SessionRunStatusEntry>> {
+        let _ = status;
+        Ok(Vec::new())
+    }
+
+    /// Cheap single-session status snapshot (id, parent, run status, last
+    /// update), sourced from the in-memory index. Returns `None` when the
+    /// session is not indexed (never persisted, or vanished — e.g. after a
+    /// destructive delete). Used by the child-wait watchdog to check one
+    /// child's staleness without loading its full `session.json`.
+    async fn session_run_status_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<SessionRunStatusEntry>> {
+        let _ = session_id;
+        Ok(None)
     }
 
     /// Append one analysis record — a single JSON line — to the session's

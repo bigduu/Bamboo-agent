@@ -217,6 +217,15 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
         on_complete: None,
+        // Issue #546 row 5: this is THE path `/execute` and `/respond` funnel
+        // through to resume a session — including a child session resumed
+        // after a human answers its approval/clarification gate. Wire the
+        // same coordinator used for the initial-spawn completion publish
+        // (`bash_completion_sink` above already reuses it too) so a resumed
+        // child that reaches a real terminal status still tells its parent.
+        // A no-op for root sessions (`spawn_session_execution` gates on
+        // `session.kind == SessionKind::Child`).
+        child_completion_handler: Some(args.state.child_completion_coordinator.clone()),
     });
 }
 

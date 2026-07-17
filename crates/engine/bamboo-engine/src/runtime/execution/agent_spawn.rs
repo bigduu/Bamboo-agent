@@ -8,12 +8,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use chrono::Utc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Session, SessionKind};
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 
@@ -21,6 +22,7 @@ use crate::runtime::config::{
     AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig, GuardianConfig,
     GuardianSpawner, ImageFallbackConfig,
 };
+use crate::runtime::execution::child_completion::{ChildCompletion, ChildCompletionHandler};
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -162,6 +164,19 @@ pub struct SessionExecutionArgs {
     /// Optional bespoke finalization, run after the runner is finalized and
     /// before the session is persisted. See [`SessionCompletionHook`].
     pub on_complete: Option<SessionCompletionHook>,
+
+    /// Optional child-completion notification hook (issue #546 row 5).
+    ///
+    /// The INITIAL child spawn (`sdk::spawn::run_child_spawn`) has its own
+    /// dedicated terminal-completion publish. This generic execution path is
+    /// also used to RESUME an existing session — including a child resumed
+    /// after a human answers its approval/clarification gate, or a nested
+    /// child-parent resumed by the coordinator — and those resumes previously
+    /// terminated silently with no publish, stranding the parent forever once
+    /// the child finally finished. When `session.kind == SessionKind::Child`
+    /// and the run reaches a genuine terminal status (not `"suspended"`), this
+    /// hook is invoked exactly like the initial-spawn path would.
+    pub child_completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
 }
 
 /// The per-request parameter subset of [`SessionExecutionArgs`] — everything
@@ -319,6 +334,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 runners,
                 sessions_cache,
                 on_complete,
+                child_completion_handler,
             } = args;
 
             // The primary model is required for a spawn; the roster stores it as
@@ -429,6 +445,32 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 Err(error) => {
                     session.set_last_run_status("error");
                     session.set_last_run_error(error.to_string());
+                }
+            }
+
+            // Issue #546 row 5: a resumed CHILD session that reaches a genuine
+            // terminal status must publish its completion to its parent, exactly
+            // like the initial spawn path (`sdk::spawn::run_child_spawn`) does.
+            // Gated on `!suspended_non_terminal` so a child that merely
+            // re-suspended (e.g. immediately re-hit another approval gate, or
+            // registered a NEW wait on its own grandchildren) does not publish a
+            // premature completion — mirrors the terminal/non-terminal split in
+            // `sdk::spawn`.
+            if session.kind == SessionKind::Child && !suspended_non_terminal {
+                if let (Some(handler), Some(parent_session_id)) = (
+                    child_completion_handler.as_ref(),
+                    session.parent_session_id.clone(),
+                ) {
+                    let completion = ChildCompletion {
+                        parent_session_id,
+                        child_session_id: session.id.clone(),
+                        status: session
+                            .last_run_status()
+                            .unwrap_or_else(|| "completed".to_string()),
+                        error: session.last_run_error(),
+                        completed_at: Utc::now(),
+                    };
+                    handler.on_child_completed(completion).await;
                 }
             }
 

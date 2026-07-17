@@ -52,7 +52,22 @@ pub trait ResumeExecutionPort: Send + Sync {
     ///
     /// The adapter creates the mpsc channel, spawns the event forwarder,
     /// and calls the server's agent execution spawner.
-    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest);
+    ///
+    /// Returns `true` if execution was actually (or will imminently be)
+    /// spawned, `false` if the adapter bailed out before spawning anything
+    /// (issue #546 row 7 — e.g. a required late-bound dependency was not yet
+    /// initialized). [`resume_session_execution`] uses this to avoid lying
+    /// about [`ResumeOutcome::Started`] and to release the runner reservation
+    /// via [`Self::release_reservation`] so the slot isn't leaked forever.
+    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) -> bool;
+
+    /// Release a runner reservation that [`Self::try_reserve_runner`] granted
+    /// but [`Self::spawn_resume_execution`] never actually used (returned
+    /// `false`). Without this the reserved `Running` runner entry is a
+    /// permanent leak: every subsequent resume attempt for this session hits
+    /// `AlreadyRunning` against a runner that will never transition out of
+    /// `Running` (issue #546 row 7).
+    async fn release_reservation(&self, session_id: &str);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,15 +125,29 @@ pub async fn resume_session_execution(
     consume_pending_clarification_resume(&mut session);
     port.save_and_cache_session(&mut session).await;
 
-    port.spawn_resume_execution(ResumeSpawnRequest {
-        session_id: session_id.to_string(),
-        session,
-        cancel_token: reservation.cancel_token,
-        run_id: reservation.run_id.clone(),
-        event_sender,
-        config,
-    })
-    .await;
+    let spawned = port
+        .spawn_resume_execution(ResumeSpawnRequest {
+            session_id: session_id.to_string(),
+            session,
+            cancel_token: reservation.cancel_token,
+            run_id: reservation.run_id.clone(),
+            event_sender,
+            config,
+        })
+        .await;
+
+    if !spawned {
+        // Issue #546 row 7: the adapter reserved the runner slot but bailed
+        // before actually spawning execution. Release the reservation so the
+        // slot isn't leaked (every future resume attempt would otherwise hit
+        // `AlreadyRunning` against a runner that can never finish), and report
+        // `Completed` rather than `Started` — this is a lie-free outcome that
+        // callers ALREADY treat as "did not spawn, may be worth retrying"
+        // (mirrors the finalize-clobber `Completed` outcome the bash and
+        // child-completion clobber-retry loops already handle).
+        port.release_reservation(session_id).await;
+        return ResumeOutcome::Completed;
+    }
 
     ResumeOutcome::Started {
         run_id: reservation.run_id,

@@ -20,6 +20,7 @@ use crate::runtime::Agent;
 
 use super::child_completion::{ChildCompletion, ChildCompletionHandler};
 use super::runner_state::AgentRunner;
+use super::session_events::get_or_create_event_sender;
 
 #[derive(Debug, Clone)]
 pub struct SpawnJob {
@@ -88,11 +89,67 @@ impl SpawnScheduler {
     pub fn new(ctx: SpawnContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<SpawnJob>(128);
 
+        // Issue #546 row 2: the ORIGINAL worker awaited `run_spawn_job` directly
+        // in this loop. A panic anywhere in its synchronous setup phase (before
+        // `run_child_spawn`'s own inner task takes over — see the row-1 fix in
+        // `sdk::spawn`) would unwind straight through this `while let` loop,
+        // permanently killing the single worker task: `rx` is dropped, so every
+        // future `enqueue()` fails with "spawn scheduler is not running" for the
+        // REST OF THE PROCESS LIFETIME, and any job already dequeued when the
+        // panic hit is silently lost with no completion ever published.
+        //
+        // Fix: give each job its OWN task, monitored via a nested `JoinHandle`
+        // (mirrors the row-1 pattern) so a panic can never reach this loop.
+        // `run_spawn_job`'s `Err(_)` branches already publish a completion
+        // before returning (see `sdk::spawn::run_child_spawn`), so only the
+        // panic path here needs a synthetic completion.
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                if let Err(err) = run_spawn_job(ctx.clone(), job).await {
-                    tracing::warn!("spawn job failed: {}", err);
-                }
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let parent_session_id = job.parent_session_id.clone();
+                    let child_session_id = job.child_session_id.clone();
+                    let session_event_senders = ctx.session_event_senders.clone();
+                    let completion_handler = ctx.completion_handler.clone();
+
+                    let inner = tokio::spawn(run_spawn_job(ctx, job));
+                    match inner.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!("spawn job failed: {}", err);
+                        }
+                        Err(join_error) => {
+                            let message = if join_error.is_panic() {
+                                "spawn job task panicked before completion could be published \
+                                 (issue #546 row 2)"
+                                    .to_string()
+                            } else {
+                                format!("spawn job task did not complete: {join_error}")
+                            };
+                            tracing::error!(
+                                %parent_session_id,
+                                %child_session_id,
+                                %message,
+                                "run_spawn_job panicked; publishing synthetic error completion \
+                                 so the parent is not stranded"
+                            );
+                            let parent_tx = get_or_create_event_sender(
+                                &session_event_senders,
+                                &parent_session_id,
+                            )
+                            .await;
+                            publish_child_completion_parts(
+                                &parent_tx,
+                                completion_handler,
+                                parent_session_id,
+                                child_session_id,
+                                "error".to_string(),
+                                Some(message),
+                            )
+                            .await;
+                        }
+                    }
+                });
             }
         });
 
@@ -163,7 +220,31 @@ async fn publish_child_completion(
     });
 
     if let Some(handler) = completion_handler {
-        handler.on_child_completed(completion).await;
+        let parent_session_id = completion.parent_session_id.clone();
+        let child_session_id = completion.child_session_id.clone();
+        // Issue #546 row 3: isolate a panic inside the coordinator's own
+        // `on_child_completed` (e.g. an unexpected storage error path or a bug
+        // in guardian-verdict handling) behind a monitored `JoinHandle` so it
+        // can never unwind through this publish call and abort whatever task
+        // invoked it (the child's finalize task, or the scheduler's own
+        // panic-monitor task — rows 1/2). By this point the child's terminal
+        // status is ALREADY durably persisted (every caller of
+        // `publish_child_completion_parts` persists before publishing), so if
+        // the handler panics before clearing the parent's wait, the heartbeat
+        // watchdog (issue #546 Part B) will replay this exact completion from
+        // the index on its next sweep — `on_child_completed` is documented as
+        // idempotent for exactly this reason.
+        let join = tokio::spawn(async move { handler.on_child_completed(completion).await });
+        if let Err(join_error) = join.await {
+            tracing::error!(
+                %parent_session_id,
+                %child_session_id,
+                panicked = join_error.is_panic(),
+                "child-completion handler panicked; the child's terminal status is already \
+                 persisted, so the heartbeat watchdog will replay this completion on its next \
+                 sweep"
+            );
+        }
     }
 }
 

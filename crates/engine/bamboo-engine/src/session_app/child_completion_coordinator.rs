@@ -17,7 +17,7 @@ use crate::execution::{
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
-    GuardianVerdict,
+    GuardianState, GuardianVerdict,
 };
 use crate::Agent;
 use async_trait::async_trait;
@@ -29,15 +29,17 @@ use bamboo_agent_core::{
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
+use bamboo_domain::SessionRunStatusEntry;
 use bamboo_llm::{Config, ProviderModelRouter, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
 
 use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
     resolve_fast_model, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
 };
+use crate::session_app::execute::has_pending_user_message;
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
@@ -408,19 +410,136 @@ impl ChildCompletionCoordinator {
             Arc::new(parking_lot::RwLock::new(session.clone())),
         );
     }
+
+    /// Drive the clear→append→resume for a satisfied child wait through a
+    /// **clobber-retry loop** (issue #546 rows 6+7), mirroring
+    /// [`Self::perform_bash_resume`]'s bounded retry exactly. `resume_message`
+    /// and `guardian_update` are computed ONCE by the caller against the
+    /// initial completion event; each attempt reloads the parent fresh and
+    /// re-applies the SAME transition via [`apply_child_completion_wait_clear`],
+    /// so a reverted parent file (clobber) or a bailed-without-spawning resume
+    /// (row 7) both simply retry the identical mutation against the latest
+    /// state — safe because the transition is a no-op once someone else has
+    /// already applied it (the `waiting_for_children.is_none()` bail in
+    /// [`apply_child_completion_wait_clear`]).
+    ///
+    /// **The caller MUST hold the [`session_resume_lock`] for
+    /// `parent_session_id`** for this call's ENTIRE duration — same
+    /// requirement as [`Self::perform_bash_resume`], and for the same reason:
+    /// the load-check-clear-resume critical section must be serialized against
+    /// every other resume source for this parent (another child completion,
+    /// the watchdog sweep, a bash push). The only caller today
+    /// (`on_child_completed`) already holds it across this whole call.
+    async fn resume_parent_after_child_completion(
+        &self,
+        parent_session_id: String,
+        resume_message: Message,
+        guardian_update: Option<GuardianState>,
+    ) {
+        const MAX_RESUME_ATTEMPTS: u8 = 5;
+        let retry_backoff = Duration::from_millis(200);
+
+        for attempt in 0..MAX_RESUME_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff * attempt as u32).await;
+            }
+
+            let Some(mut session) = self.load_session(&parent_session_id).await else {
+                tracing::warn!(
+                    %parent_session_id,
+                    "child-completion resume: parent session not found; nothing to resume"
+                );
+                return;
+            };
+
+            if !apply_child_completion_wait_clear(
+                &mut session,
+                &resume_message,
+                guardian_update.as_ref(),
+            ) {
+                // Double-resume guard: another source (a concurrent completion
+                // — impossible under the held per-parent lock, but also a
+                // previous attempt of THIS SAME retry loop, or the watchdog
+                // sweep — has already cleared this wait. No-op.
+                tracing::info!(
+                    %parent_session_id, attempt,
+                    "child-completion resume: wait already cleared; nothing to resume"
+                );
+                return;
+            }
+            session.updated_at = Utc::now();
+            self.save_and_cache(&mut session).await;
+
+            let outcome = self.resume_parent(parent_session_id.clone()).await;
+            match outcome {
+                ResumeOutcome::Started { .. } => {
+                    tracing::info!(%parent_session_id, attempt, "child-completion resume: resume fired");
+                    return;
+                }
+                ResumeOutcome::NotFound => {
+                    tracing::warn!(%parent_session_id, "child-completion resume: session vanished during resume");
+                    return;
+                }
+                ResumeOutcome::Completed | ResumeOutcome::AlreadyRunning { .. } => {
+                    // Did not spawn: either a finalize-clobber reverted our
+                    // clear+message before the runner could observe it (row 6),
+                    // or the adapter's `spawn_resume_execution` bailed without
+                    // ever calling it (row 7, now honestly reported instead of
+                    // a lying `Started`). Either way, retry the whole
+                    // clear→append→resume against the latest state.
+                    tracing::warn!(
+                        %parent_session_id, attempt,
+                        outcome = outcome.as_str(),
+                        "child-completion resume: did not spawn (clobber or adapter bail); retrying"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        tracing::warn!(
+            %parent_session_id,
+            attempts = MAX_RESUME_ATTEMPTS,
+            "child-completion resume: exhausted clobber-retry budget without confirming resume; \
+             the heartbeat watchdog (issue #546 Part B) will rescue this parent on its next sweep"
+        );
+    }
 }
 
 #[async_trait]
 impl ChildCompletionHandler for ChildCompletionCoordinator {
     async fn on_child_completed(&self, completion: ChildCompletion) {
+        // Issue #546 row 12: a NON-terminal completion (status "suspended",
+        // published for a child that merely hit an approval/clarification/
+        // grandchild-wait gate — see `sdk::spawn`'s `suspended_non_terminal`
+        // split) must never satisfy a wait or be folded into the completed
+        // set. Before this guard, `derive_completed_child_ids` folded the
+        // just-reported child in UNCONDITIONALLY regardless of its status, so
+        // a merely-suspended child could prematurely resume the parent with
+        // "finished with status `suspended`". The real terminal completion
+        // arrives later when the child is resumed and actually finishes,
+        // re-entering this same path. Bailing here (before acquiring the
+        // per-parent lock or touching storage) also means a non-terminal
+        // completion is nearly free.
+        if !is_terminal_child_status(&completion.status) {
+            tracing::debug!(
+                parent_session_id = %completion.parent_session_id,
+                child_session_id = %completion.child_session_id,
+                status = %completion.status,
+                "non-terminal child completion; not evaluating parent wait policy"
+            );
+            return;
+        }
+
         // Acquire the per-session async lock to eliminate the concurrent
-        // double-resume race (see `parent_locks` for the full scenario). The
-        // inner std::sync::Mutex is released immediately so no sync lock is
-        // held across the await that follows.
+        // double-resume race (see `parent_locks` for the full scenario). Held
+        // for this call's ENTIRE remainder — including the retry-capable
+        // resume below — mirroring `perform_bash_resume`'s own lock discipline
+        // (its callers hold this same lock across their whole retry loop too).
         let per_parent = session_resume_lock(&completion.parent_session_id);
         let _per_parent_guard = per_parent.lock().await;
 
-        let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
+        let Some(parent) = self.load_session(&completion.parent_session_id).await else {
             tracing::warn!(
                 parent_session_id = %completion.parent_session_id,
                 child_session_id = %completion.child_session_id,
@@ -434,7 +553,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         // inspects that session's own `waiting_for_children` runtime state, and
         // resumes it. (Previously this bailed unless the parent was Root, which
         // silently dropped grandchild completions.)
-        let mut runtime_state = read_runtime_state(&parent);
+        let runtime_state = read_runtime_state(&parent);
 
         // Single source of truth: reconstruct the completed-child set from the
         // session index rather than from a denormalized copy on the parent file.
@@ -459,15 +578,9 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 &completed_child_ids,
                 &completion.status,
             );
-            if should_resume {
-                runtime_state.waiting_for_children = None;
-                runtime_state.status = AgentStatusState::Idle;
-                runtime_state.suspension = None;
-            }
         }
 
         if should_resume {
-            parent.metadata.remove("runtime.suspend_reason");
             // Load the completed child once. The guardian branch inspects its
             // subagent_type + final verdict; the generic path folds its final
             // assistant content into the hidden resume message (avoiding an extra
@@ -492,8 +605,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             // parent's recorded review advances GuardianState (phase → Reviewed)
             // and resumes with a verdict-tailored, findings-carrying message. Any
             // id mismatch or unparseable verdict falls through to the generic
-            // resume, so the parent is never stranded.
+            // resume, so the parent is never stranded. The updated GuardianState
+            // (if any) is threaded through to the retry-capable resume below
+            // instead of being written directly to `parent` here — see
+            // `resume_parent_after_child_completion` / `apply_child_completion_wait_clear`.
             let reviewed_round = runtime_state.round.current_round;
+            let mut guardian_update: Option<GuardianState> = None;
             let guardian_resume = loaded_child.as_ref().and_then(|child| {
                 if child.subagent_type().as_deref() != Some("guardian") {
                     return None;
@@ -542,7 +659,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 let approved = verdict.approve;
                 let message = guardian_resume_message(&completion, &verdict);
                 guardian_state.record_verdict(verdict, reviewed_round);
-                write_guardian_state(&mut parent, guardian_state);
+                guardian_update = Some(guardian_state);
                 tracing::info!(
                     parent_session_id = %completion.parent_session_id,
                     child_session_id = %completion.child_session_id,
@@ -562,8 +679,24 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                         .as_deref(),
                 )
             });
-            parent.add_message(resume_message);
-        } else if runtime_state.waiting_for_children.is_some() {
+
+            // Issue #546 rows 6+7: drive the clear→append→resume through a
+            // clobber-retry loop (mirrors the bash push's
+            // `perform_bash_resume`) instead of a single mutate-once attempt
+            // followed by a resume call that only retried `AlreadyRunning`.
+            self.resume_parent_after_child_completion(
+                parent.id.clone(),
+                resume_message,
+                guardian_update,
+            )
+            .await;
+            return;
+        }
+
+        if runtime_state.waiting_for_children.is_some() {
+            // Still waiting on other children — record continued suspension.
+            let mut parent = parent;
+            let mut runtime_state = runtime_state;
             runtime_state.status = AgentStatusState::Suspended;
             runtime_state.suspension = Some(SuspensionState {
                 reason: "waiting_for_children".to_string(),
@@ -571,22 +704,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 resumable: true,
                 hook_point: Some("ChildCompletion".to_string()),
             });
+            parent.updated_at = Utc::now();
+            write_runtime_state(&mut parent, &runtime_state);
+            self.save_and_cache(&mut parent).await;
         }
-
-        parent.updated_at = Utc::now();
-        write_runtime_state(&mut parent, &runtime_state);
-        self.save_and_cache(&mut parent).await;
-
-        // Capture before releasing the per-parent lock so the borrow checker
-        // is satisfied; `resume_parent` has its own retry loop and should not
-        // hold the per-parent lock (it would block other completions for the
-        // same parent, and the state is already durably settled above).
-        let resume_parent_id = parent.id.clone();
-        drop(_per_parent_guard);
-
-        if should_resume {
-            self.resume_parent(resume_parent_id).await;
-        }
+        // else: the parent wasn't waiting on any children at all (a stray or
+        // already-handled completion) — nothing to do.
     }
 }
 
@@ -641,7 +764,16 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         .await
     }
 
-    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+    async fn release_reservation(&self, session_id: &str) {
+        // Issue #546 row 7: undo a runner reservation that was granted but
+        // never used (this adapter's `spawn_resume_execution` bailed before
+        // spawning). Removing the entry entirely (rather than flipping it to
+        // some terminal status) restores the exact pre-reservation state, so
+        // the next `try_reserve_runner` call for this session succeeds cleanly.
+        self.agent_runners.write().await.remove(session_id);
+    }
+
+    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) -> bool {
         let ResumeSpawnRequest {
             session_id,
             session,
@@ -653,7 +785,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
 
         let Some(root_tools) = self.root_tools.read().await.clone() else {
             tracing::error!(%session_id, "cannot resume parent after child completion: root tool surface is not initialized");
-            return;
+            return false;
         };
 
         let model = session.model.clone();
@@ -791,7 +923,17 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
             on_complete: None,
+            // Issue #546 row 5: this IS the resume path for a nested
+            // child-parent (a child that itself spawned grandchildren) — wire
+            // the same coordinator back in as the completion handler so a
+            // resumed child-parent that reaches a real terminal state still
+            // publishes to ITS OWN parent. Before this fix `on_complete`-style
+            // wiring was entirely absent from this path (unlike `on_complete`,
+            // which is a DIFFERENT, unrelated hook), so a resumed child-parent
+            // could finish and never tell its own parent.
+            child_completion_handler: Some(Arc::new(self.clone())),
         });
+        true
     }
 }
 
@@ -880,6 +1022,44 @@ fn apply_bash_resume_transition(session: &mut Session, resume_message: &Message)
     runtime_state.suspension = None;
     write_runtime_state(session, &runtime_state);
     session.metadata.remove("runtime.suspend_reason");
+    session.add_message(resume_message.clone());
+    true
+}
+
+/// Apply the child-wait resume transition to a loaded session **in place**:
+/// clear `waiting_for_children`, mark the runtime Idle, drop the suspension +
+/// `runtime.suspend_reason`, re-apply `guardian_update` if present (a
+/// completing guardian review's verdict), and append `resume_message`. Returns
+/// `false` (a no-op) when the session was not actually waiting on children —
+/// the double-resume guard shared across every retry attempt and every other
+/// resume source for this parent. Pure (no I/O) so both
+/// [`ChildCompletionCoordinator::resume_parent_after_child_completion`] and
+/// unit tests exercise the exact same transition. Mirrors
+/// [`apply_bash_resume_transition`]'s shape for the bash wait.
+///
+/// `guardian_update`, when present, is re-applied on EVERY attempt gated by
+/// the SAME `waiting_for_children.is_some()` check as the wait-clear itself —
+/// safe because a finalize-clobber that reverts the wait reverts the WHOLE
+/// session file (same `merge_save_runtime` full overwrite), so a reverted
+/// guardian write is reverted right alongside it, and re-applying both
+/// together on retry is a genuine re-application, never a duplicate.
+fn apply_child_completion_wait_clear(
+    session: &mut Session,
+    resume_message: &Message,
+    guardian_update: Option<&GuardianState>,
+) -> bool {
+    let mut runtime_state = read_runtime_state(session);
+    if runtime_state.waiting_for_children.is_none() {
+        return false;
+    }
+    runtime_state.waiting_for_children = None;
+    runtime_state.status = AgentStatusState::Idle;
+    runtime_state.suspension = None;
+    write_runtime_state(session, &runtime_state);
+    session.metadata.remove("runtime.suspend_reason");
+    if let Some(guardian_state) = guardian_update {
+        write_guardian_state(session, guardian_state.clone());
+    }
     session.add_message(resume_message.clone());
     true
 }
@@ -1222,6 +1402,316 @@ impl BashCompletionSink for ChildCompletionCoordinator {
         tokio::spawn(async move {
             coordinator.deliver_bash_completion(info).await;
         });
+    }
+}
+
+// ── Child-wait heartbeat watchdog (issue #546 Part B) ──────────────────────
+//
+// Every push-side hole in the failure-mode matrix (#546) is closed above, but
+// "every KNOWN hole" is not "every POSSIBLE hole" — an unforeseen panic, a
+// storage hiccup mid-retry, or a killed process can still strand a parent.
+// This is the last-resort backstop: a periodic sweep over every session the
+// index reports `last_run_status == "suspended"`, looking specifically at
+// those durably waiting on children (`waiting_for_children`), and:
+//
+//  1. Replays a lost completion for any wait-tracked child that is ALREADY
+//     terminal in the index but never reached `on_child_completed` (row 3: a
+//     panic inside the handler; a publish that landed in storage but whose
+//     coordinator call never completed).
+//  2. Synthesizes an `error` completion for a DEAD child — not terminal, but
+//     its index entry hasn't moved in `DEAD_CHILD_GRACE_SECS` (covers a
+//     process crash mid-run, including a full server restart wiping every
+//     in-memory runner — row 10's boot reconciliation feeds this same path by
+//     marking orphaned "running" sessions "error" so this step finds them
+//     already terminal on the very first sweep).
+//  3. Rescues a "stranded-after-clear" parent: the wait was already cleared
+//     (a push succeeded at the mutation but its resume-spawn never landed —
+//     the clobber-retry budget in `resume_parent_after_child_completion`
+//     exhausted, or the process died mid-retry) and a resume message is
+//     genuinely pending — just re-drive the resume.
+//  4. Enforces the 6h wait lease (`WaitingForChildrenState::timeout_at`,
+//     issue #546 row 11 — written but never read before this fix) as a hard
+//     backstop: force-resumes with a verify-don't-assume message even if some
+//     children are nominally still alive.
+//
+// Design invariant: steps 1 and 2 reuse `on_child_completed` as their ONLY
+// resume path — replayed/synthetic completions flow through the exact same
+// terminality guard, wait-policy check, and clobber-retry-capable resume as a
+// genuine push, so there is exactly one resume implementation. Step 3 reuses
+// `resume_parent`; step 4 reuses `resume_parent_after_child_completion`. All
+// four are naturally idempotent against a concurrent push because
+// `on_child_completed` and `resume_parent_after_child_completion` both
+// acquire the per-parent `session_resume_lock` for their full duration — the
+// sweep can never double-resume a parent the push is already handling.
+const DEFAULT_WAIT_WATCHDOG_INTERVAL_SECS: u64 = 60;
+
+/// Grace period a child's index entry may go without updating while still
+/// non-terminal before the sweep gives up on it and synthesizes an `error`
+/// completion. Generous margin over the per-child liveness watchdog's own
+/// defaults (`ChildWatchdogPolicy`: 15 min idle / 60 min total) so a healthy
+/// long-running child already inside those bounds is never mistaken for dead;
+/// this only fires once the CHILD's own watchdog should already have
+/// terminated it and something ELSE (a crash, a panic in the finalize path)
+/// kept that from being observed.
+const DEAD_CHILD_GRACE_SECS: i64 = 90 * 60;
+
+impl ChildCompletionCoordinator {
+    /// Spawn the heartbeat-watchdog backstop as a detached, process-lifetime
+    /// background task. A `None` interval disables the watchdog entirely
+    /// (config-gated by the caller — see `BAMBOO_CHILD_WAIT_WATCHDOG_INTERVAL_SECS`
+    /// / [`wait_watchdog_interval_from_env`]).
+    pub fn spawn_wait_watchdog(self: &Arc<Self>, interval: Option<Duration>) {
+        let Some(interval) = interval else {
+            tracing::info!("child-wait heartbeat watchdog disabled (interval=0)");
+            return;
+        };
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            "child-wait heartbeat watchdog starting (issue #546 Part B)"
+        );
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                coordinator.sweep_stranded_waits().await;
+            }
+        });
+    }
+
+    /// One sweep pass. Never propagates a hard error: every per-session step
+    /// is independently logged-and-skipped so one bad session can't block the
+    /// rest of the sweep or kill the watchdog task.
+    async fn sweep_stranded_waits(&self) {
+        let entries = match self.storage.list_sessions_by_run_status("suspended").await {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(%error, "child-wait watchdog: failed to list suspended sessions");
+                return;
+            }
+        };
+
+        for entry in entries {
+            self.sweep_one_suspended_session(&entry.id).await;
+        }
+    }
+
+    async fn sweep_one_suspended_session(&self, session_id: &str) {
+        let Some(session) = self.load_session(session_id).await else {
+            return; // vanished; nothing to rescue
+        };
+        let runtime_state = read_runtime_state(&session);
+
+        let Some(wait) = runtime_state.waiting_for_children.clone() else {
+            // Step 3: wait already cleared but the index still shows
+            // "suspended" — the clear succeeded but the resume-spawn itself
+            // never landed. Re-drive it if there is genuinely something
+            // pending; a no-op otherwise (this session may simply be
+            // suspended for an unrelated reason, e.g. `waiting_for_bash`,
+            // which has its own dedicated backstop).
+            if has_pending_user_message(&session) {
+                tracing::warn!(
+                    %session_id,
+                    "child-wait watchdog: rescuing a stranded-after-clear parent"
+                );
+                self.resume_parent(session_id.to_string()).await;
+            }
+            return;
+        };
+
+        let now = Utc::now();
+        let completed_now =
+            derive_completed_child_ids(&self.storage, session_id, "__watchdog_sentinel__").await;
+
+        for child_id in &wait.child_session_ids {
+            if completed_now.iter().any(|id| id == child_id) {
+                continue;
+            }
+
+            let snapshot = self.storage.session_run_status_snapshot(child_id).await;
+            match snapshot {
+                Ok(Some(SessionRunStatusEntry {
+                    last_run_status: Some(status),
+                    updated_at,
+                    ..
+                })) if is_terminal_child_status(&status) => {
+                    // Step 1: already terminal in the index, but the
+                    // coordinator never got the memo — replay it.
+                    tracing::warn!(
+                        %session_id, child_id, %status,
+                        "child-wait watchdog: replaying lost completion for already-terminal child"
+                    );
+                    self.on_child_completed(ChildCompletion {
+                        parent_session_id: session_id.to_string(),
+                        child_session_id: child_id.clone(),
+                        status,
+                        error: None,
+                        completed_at: updated_at,
+                    })
+                    .await;
+                }
+                Ok(Some(SessionRunStatusEntry { updated_at, .. })) => {
+                    // Non-terminal (or unset) status: dead only if stale well
+                    // past the grace period.
+                    let stale_secs = now.signed_duration_since(updated_at).num_seconds();
+                    if stale_secs >= DEAD_CHILD_GRACE_SECS {
+                        self.synthesize_dead_child_completion(session_id, child_id, now)
+                            .await;
+                    }
+                }
+                Ok(None) => {
+                    // Step 2 (row 10 companion): vanished from the index
+                    // entirely — a destructive delete, or an index that was
+                    // rebuilt without this child (should be rare given boot
+                    // reconciliation, but never assume). Dead by definition:
+                    // nothing will ever report on it again.
+                    self.synthesize_dead_child_completion(session_id, child_id, now)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id, child_id, %error,
+                        "child-wait watchdog: failed to read child status snapshot; skipping this child this sweep"
+                    );
+                }
+            }
+        }
+
+        // Step 4: enforce the 6h wait lease as a hard backstop. Re-check
+        // AFTER the loop above — it may already have resolved/cleared the
+        // wait via a replayed or synthetic `on_child_completed` call.
+        if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
+            if let Some(refreshed) = self.load_session(session_id).await {
+                if read_runtime_state(&refreshed)
+                    .waiting_for_children
+                    .is_some()
+                {
+                    tracing::warn!(
+                        %session_id,
+                        "child-wait watchdog: 6h wait lease expired; force-resuming"
+                    );
+                    self.force_resume_expired_wait(session_id).await;
+                }
+            }
+        }
+    }
+
+    /// Step 2 body: best-effort mark the dead child's OWN storage record as
+    /// errored (so it stops showing as permanently "running"/stale in the
+    /// UI), then synthesize and replay an `error` completion for it through
+    /// the normal `on_child_completed` path.
+    async fn synthesize_dead_child_completion(
+        &self,
+        parent_session_id: &str,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) {
+        const DEAD_CHILD_MESSAGE: &str =
+            "child session vanished or stopped reporting (heartbeat watchdog, issue #546 Part B)";
+        tracing::warn!(
+            parent_session_id,
+            child_id,
+            "child-wait watchdog: synthesizing error completion for dead/vanished child"
+        );
+        if let Some(mut child_session) = self.load_session(child_id).await {
+            if !child_session
+                .last_run_status()
+                .as_deref()
+                .is_some_and(is_terminal_child_status)
+            {
+                child_session.set_last_run_status("error");
+                child_session.set_last_run_error(DEAD_CHILD_MESSAGE.to_string());
+                child_session.updated_at = now;
+                self.save_and_cache(&mut child_session).await;
+            }
+        }
+        self.on_child_completed(ChildCompletion {
+            parent_session_id: parent_session_id.to_string(),
+            child_session_id: child_id.to_string(),
+            status: "error".to_string(),
+            error: Some(DEAD_CHILD_MESSAGE.to_string()),
+            completed_at: now,
+        })
+        .await;
+    }
+
+    /// Step 4 body: force-resume a parent whose 6h wait lease has expired,
+    /// via the SAME clobber-retry-capable path a genuine child completion
+    /// uses (`resume_parent_after_child_completion`), so the finalize-clobber
+    /// / adapter-bail retry logic covers this path too. Acquires the
+    /// per-parent lock itself (there is no completion event to piggyback the
+    /// lock off of, unlike the push path).
+    async fn force_resume_expired_wait(&self, session_id: &str) {
+        let guard = session_resume_lock(session_id);
+        let _held = guard.lock().await;
+        self.resume_parent_after_child_completion(
+            session_id.to_string(),
+            wait_lease_expired_resume_message(),
+            None,
+        )
+        .await;
+    }
+}
+
+/// Hidden resume message for the 6h wait-lease-expiry force-resume (issue
+/// #546 row 11 / Part B step 4). Deliberately does NOT claim any child
+/// finished — some may still be genuinely running past the lease — so the
+/// model verifies actual status via `SubAgent.get`/`SubAgent.list` instead of
+/// assuming success on a false premise (mirrors
+/// `bash_completion_resume_message`'s `timed_out` wording).
+fn wait_lease_expired_resume_message() -> Message {
+    let body = "Runtime notification: the 6-hour child-wait lease expired while one or more \
+                child sessions may still be running. The session is being resumed so it is not \
+                stranded; verify each child's actual status with SubAgent.list or SubAgent.get \
+                before assuming completion."
+        .to_string();
+    let mut message = Message::user(body);
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY: "child_wait_lease_expired_resume",
+    }));
+    message.never_compress = false;
+    message
+}
+
+/// Resolve the heartbeat-watchdog sweep interval from
+/// `BAMBOO_CHILD_WAIT_WATCHDOG_INTERVAL_SECS` (issue #546 Part B). Unset falls
+/// back to [`DEFAULT_WAIT_WATCHDOG_INTERVAL_SECS`]; `0` (or an unparseable
+/// value) disables the watchdog — returning `None` for
+/// [`ChildCompletionCoordinator::spawn_wait_watchdog`] to treat as "disabled",
+/// mirroring the `BAMBOO_RATE_LIMIT_*` env-tunable precedent elsewhere in the
+/// server. A free function (not a method) so it's usable before a coordinator
+/// instance exists, at server startup wiring time.
+pub fn wait_watchdog_interval_from_env() -> Option<Duration> {
+    parse_wait_watchdog_interval_secs(
+        std::env::var("BAMBOO_CHILD_WAIT_WATCHDOG_INTERVAL_SECS").ok(),
+    )
+}
+
+/// Pure parsing core of [`wait_watchdog_interval_from_env`] — takes the raw
+/// env value (or its absence) directly instead of reading the environment, so
+/// the parsing/default/disable rules are unit-testable without mutating
+/// process-global env state (which would race other tests).
+fn parse_wait_watchdog_interval_secs(raw: Option<String>) -> Option<Duration> {
+    let secs = match raw {
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => {
+                tracing::warn!(
+                    value = %value,
+                    "BAMBOO_CHILD_WAIT_WATCHDOG_INTERVAL_SECS is not a valid non-negative integer; \
+                     using the default"
+                );
+                DEFAULT_WAIT_WATCHDOG_INTERVAL_SECS
+            }
+        },
+        None => DEFAULT_WAIT_WATCHDOG_INTERVAL_SECS,
+    };
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
     }
 }
 
@@ -1758,6 +2248,139 @@ mod tests {
         assert!(
             meta.contains(BASH_COMPLETION_RESUME_KIND),
             "resume message must be tagged as a bash-completion resume: {meta}"
+        );
+    }
+
+    // ── issue #546 row 12: non-terminal completions never satisfy a wait ────
+
+    #[test]
+    fn wait_policy_never_satisfied_by_non_terminal_status() {
+        // Even if a "suspended" child id happened to appear in the completed
+        // set (it must not, per `on_child_completed`'s terminality guard —
+        // this test pins the policy-level half of that invariant), FirstError
+        // must not treat "suspended" as an error-like status.
+        assert!(!is_terminal_child_status("suspended"));
+        assert!(is_terminal_child_status("completed"));
+        assert!(is_terminal_child_status("error"));
+        assert!(is_terminal_child_status("timeout"));
+        assert!(is_terminal_child_status("cancelled"));
+        assert!(is_terminal_child_status("skipped"));
+    }
+
+    // ── issue #546 rows 6+7: the child-completion wait-clear transition ─────
+
+    #[test]
+    fn apply_child_completion_wait_clear_clears_wait_and_appends_message() {
+        use bamboo_domain::session::runtime_state::WaitingForChildrenState;
+
+        let mut session = Session::new("parent-1", "test-model");
+        session.add_message(Message::user("spawn some children"));
+        let mut rt = read_runtime_state(&session);
+        rt.status = AgentStatusState::Suspended;
+        rt.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec!["child-1".to_string()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        ));
+        write_runtime_state(&mut session, &rt);
+        session.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+
+        let completion = make_completion("completed");
+        let resume_message = runtime_resume_message(&completion, 0, Some("done"));
+        let did = apply_child_completion_wait_clear(&mut session, &resume_message, None);
+
+        assert!(did, "a waiting session must transition");
+        let after = read_runtime_state(&session);
+        assert!(
+            after.waiting_for_children.is_none(),
+            "child wait must be cleared"
+        );
+        assert_eq!(after.status, AgentStatusState::Idle);
+        assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(session.messages.len(), 2, "resume message must be appended");
+    }
+
+    #[test]
+    fn apply_child_completion_wait_clear_noops_when_not_waiting() {
+        // Double-resume guard: a session not currently waiting on children is
+        // a no-op — this is what makes a clobber-retry attempt (or the
+        // watchdog sweep) harmless once another source already resumed it.
+        let mut session = Session::new("parent-1", "test-model");
+        session.add_message(Message::user("hi"));
+
+        let completion = make_completion("completed");
+        let resume_message = runtime_resume_message(&completion, 0, None);
+        let did = apply_child_completion_wait_clear(&mut session, &resume_message, None);
+
+        assert!(!did);
+        assert_eq!(session.messages.len(), 1, "no message appended");
+    }
+
+    #[test]
+    fn apply_child_completion_wait_clear_reapplies_guardian_update() {
+        use crate::runtime::guardian_state::{
+            ensure_guardian_state, read_guardian_state, GuardianPhase,
+        };
+        use bamboo_domain::session::runtime_state::WaitingForChildrenState;
+
+        let mut session = Session::new("parent-1", "test-model");
+        let mut rt = read_runtime_state(&session);
+        rt.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec!["guardian-1".to_string()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        ));
+        write_runtime_state(&mut session, &rt);
+
+        let mut guardian_state = ensure_guardian_state(&session);
+        guardian_state.phase = GuardianPhase::Reviewed;
+
+        let completion = make_completion("completed");
+        let resume_message = runtime_resume_message(&completion, 0, None);
+        let did =
+            apply_child_completion_wait_clear(&mut session, &resume_message, Some(&guardian_state));
+
+        assert!(did);
+        let stored = read_guardian_state(&session).expect("guardian state persisted");
+        assert_eq!(stored.phase, GuardianPhase::Reviewed);
+    }
+
+    // ── issue #546 Part B: watchdog interval config gate ─────────────────────
+
+    #[test]
+    fn wait_watchdog_interval_unset_uses_default() {
+        let interval = parse_wait_watchdog_interval_secs(None);
+        assert_eq!(
+            interval,
+            Some(Duration::from_secs(DEFAULT_WAIT_WATCHDOG_INTERVAL_SECS))
+        );
+    }
+
+    #[test]
+    fn wait_watchdog_interval_zero_disables() {
+        assert_eq!(
+            parse_wait_watchdog_interval_secs(Some("0".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn wait_watchdog_interval_custom_value_used() {
+        assert_eq!(
+            parse_wait_watchdog_interval_secs(Some("30".to_string())),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn wait_watchdog_interval_unparseable_falls_back_to_default() {
+        let interval = parse_wait_watchdog_interval_secs(Some("not-a-number".to_string()));
+        assert_eq!(
+            interval,
+            Some(Duration::from_secs(DEFAULT_WAIT_WATCHDOG_INTERVAL_SECS))
         );
     }
 }

@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
-use bamboo_domain::{Role, Session, SessionKind, TokenBudgetUsage};
+use bamboo_domain::{Role, Session, SessionKind, SessionRunStatusEntry, TokenBudgetUsage};
 
 use crate::search_index::{should_index_session, SessionSearchIndex};
 use bamboo_domain::AttachmentReader;
@@ -1332,6 +1332,40 @@ impl Storage for SessionStoreV2 {
             .collect())
     }
 
+    async fn list_sessions_by_run_status(
+        &self,
+        status: &str,
+    ) -> io::Result<Vec<SessionRunStatusEntry>> {
+        let index = self.index.read().await;
+        Ok(index
+            .sessions
+            .values()
+            .filter(|entry| entry.last_run_status.as_deref() == Some(status))
+            .map(|entry| SessionRunStatusEntry {
+                id: entry.id.clone(),
+                parent_session_id: entry.parent_session_id.clone(),
+                last_run_status: entry.last_run_status.clone(),
+                updated_at: entry.updated_at,
+            })
+            .collect())
+    }
+
+    async fn session_run_status_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<SessionRunStatusEntry>> {
+        let index = self.index.read().await;
+        Ok(index
+            .sessions
+            .get(session_id)
+            .map(|entry| SessionRunStatusEntry {
+                id: entry.id.clone(),
+                parent_session_id: entry.parent_session_id.clone(),
+                last_run_status: entry.last_run_status.clone(),
+                updated_at: entry.updated_at,
+            }))
+    }
+
     async fn append_token_usage_record(&self, session_id: &str, json_line: &str) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
@@ -1872,6 +1906,79 @@ mod tests {
         assert_eq!(got[1].0, "ch-pending");
         // pending child has no terminal status mirrored yet.
         assert!(got[1].1.as_deref() != Some("completed"));
+        Ok(())
+    }
+
+    // ── issue #546 Part B: watchdog-support index queries ───────────────────
+
+    #[tokio::test]
+    async fn list_sessions_by_run_status_filters_by_status_across_parents() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+
+        let mut suspended_a = Session::new("root-a".to_string(), "m".to_string());
+        suspended_a
+            .metadata
+            .insert("last_run_status".to_string(), "suspended".to_string());
+        storage.save_session(&suspended_a).await?;
+
+        let mut suspended_b = Session::new_child("child-b", "root-a", "m", "c1");
+        suspended_b
+            .metadata
+            .insert("last_run_status".to_string(), "suspended".to_string());
+        storage.save_session(&suspended_b).await?;
+
+        let mut running = Session::new("root-c".to_string(), "m".to_string());
+        running
+            .metadata
+            .insert("last_run_status".to_string(), "running".to_string());
+        storage.save_session(&running).await?;
+
+        let mut got = storage.list_sessions_by_run_status("suspended").await?;
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            got.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["child-b", "root-a"],
+            "only the two suspended sessions, regardless of kind: {got:?}"
+        );
+        assert_eq!(
+            got.iter()
+                .find(|e| e.id == "child-b")
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("root-a")
+        );
+
+        let running_only = storage.list_sessions_by_run_status("running").await?;
+        assert_eq!(running_only.len(), 1);
+        assert_eq!(running_only[0].id, "root-c");
+
+        let none_matching = storage.list_sessions_by_run_status("cancelled").await?;
+        assert!(none_matching.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_run_status_snapshot_returns_entry_or_none() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+
+        let mut session = Session::new("s-1".to_string(), "m".to_string());
+        session
+            .metadata
+            .insert("last_run_status".to_string(), "running".to_string());
+        storage.save_session(&session).await?;
+
+        let snapshot = storage
+            .session_run_status_snapshot("s-1")
+            .await?
+            .expect("session is indexed");
+        assert_eq!(snapshot.id, "s-1");
+        assert_eq!(snapshot.last_run_status.as_deref(), Some("running"));
+
+        let missing = storage
+            .session_run_status_snapshot("does-not-exist")
+            .await?;
+        assert!(missing.is_none());
         Ok(())
     }
 

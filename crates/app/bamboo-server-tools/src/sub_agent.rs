@@ -783,10 +783,16 @@ impl Tool for SubAgentTool {
             } => {
                 let policy = wait_for.unwrap_or(ChildWaitPolicy::All);
                 // Default to every currently-active child; honor an explicit
-                // subset when provided.
-                let targets = match child_session_ids {
-                    Some(ids) if !ids.is_empty() => ids,
-                    _ => self.sessions.active_child_ids(&parent.id).await,
+                // subset when provided. `active_child_ids` already excludes
+                // terminal AND never-started children (issue #546 row 9), but
+                // an EXPLICIT list is caller-supplied and may name a child
+                // that already finished (a race) or was never started — those
+                // ids are filtered out below (issue #546 row 8) since no
+                // future completion event will ever arrive for them.
+                let explicit_ids = child_session_ids.filter(|ids| !ids.is_empty());
+                let targets = match explicit_ids {
+                    Some(ids) => self.sessions.pending_child_ids(&parent.id, &ids).await,
+                    None => self.sessions.active_child_ids(&parent.id).await,
                 };
 
                 if targets.is_empty() {
@@ -795,7 +801,8 @@ impl Tool for SubAgentTool {
                     return tool_result(json!({
                         "status": "no_active_children",
                         "parent_session_id": parent_session_id,
-                        "note": "No active child sessions to wait for; the parent continues running.",
+                        "note": "No pending child sessions to wait for (already finished, never \
+                                  started, or not found); the parent continues running.",
                     }))
                     .map(ToolOutcome::Completed);
                 }

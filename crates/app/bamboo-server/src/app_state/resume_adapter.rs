@@ -63,7 +63,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
         get_or_create_event_sender(&self.0.session_event_senders, session_id).await
     }
 
-    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+    async fn release_reservation(&self, session_id: &str) {
+        // Issue #546 row 7: this adapter's `spawn_resume_execution` always
+        // spawns something (there is no early-bail path today), so this is
+        // never exercised in production — implemented for trait completeness
+        // and so a future bail path here is automatically safe.
+        self.0.agent_runners.write().await.remove(session_id);
+    }
+
+    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) -> bool {
         let ResumeSpawnRequest {
             session_id,
             session,
@@ -189,7 +197,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     // config-level default (issue #221) still applies.
                     run_budget: None,
                 });
-                return;
+                return true;
             }
             Some(id) => id,
         };
@@ -295,6 +303,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 run_budget: None,
             });
         });
+        true
     }
 }
 

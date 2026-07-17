@@ -215,6 +215,17 @@ pub trait ChildSessionPort: Send + Sync {
     /// The parent's currently-active (non-terminal) child session ids.
     async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String>;
 
+    /// Filter `candidate_ids` down to the subset that are still pending
+    /// (started, not yet terminal) children of `parent_session_id` — eligible
+    /// to be registered on a new wait. Drops already-terminal ids and
+    /// never-started ids (issue #546 rows 8/9): neither will ever produce a
+    /// future completion event, so waiting on them would hang forever.
+    async fn pending_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidate_ids: &[String],
+    ) -> Vec<String>;
+
     /// Find an existing resident agent in the same root tree by its stable
     /// `resident_name`, returning its child session id if one exists. Used to
     /// reuse a resident agent for a new task instead of minting a new child.

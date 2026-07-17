@@ -491,7 +491,14 @@ impl ResumeExecutionPort for ConnectResumePort {
         get_or_create_event_sender(&self.ctx.session_event_senders, session_id).await
     }
 
-    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+    async fn release_reservation(&self, session_id: &str) {
+        // Issue #546 row 7: this adapter's `spawn_resume_execution` always
+        // spawns something (there is no early-bail path today), so this is
+        // never exercised in production — implemented for trait completeness.
+        self.ctx.agent_runners.write().await.remove(session_id);
+    }
+
+    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) -> bool {
         let ResumeSpawnRequest {
             session_id,
             session,
@@ -568,8 +575,13 @@ impl ResumeExecutionPort for ConnectResumePort {
                 runners: self.ctx.agent_runners.clone(),
                 sessions_cache: self.ctx.session_repo.cache().clone(),
                 on_complete: None,
+                // connect-bridged sessions are always root sessions (never
+                // `SessionKind::Child`), so the child-completion publish this
+                // hook drives is always a no-op here — `None` is correct, not
+                // a gap.
+                child_completion_handler: None,
             });
-            return;
+            return true;
         };
 
         let ctx = self.ctx.clone();
@@ -678,8 +690,12 @@ impl ResumeExecutionPort for ConnectResumePort {
                 runners: ctx.agent_runners.clone(),
                 sessions_cache: ctx.session_repo.cache().clone(),
                 on_complete: None,
+                // connect-bridged sessions are always root sessions — see the
+                // comment on the other `SessionExecutionArgs` literal above.
+                child_completion_handler: None,
             });
         });
+        true
     }
 }
 

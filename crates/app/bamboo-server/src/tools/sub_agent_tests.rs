@@ -10,7 +10,6 @@ use uuid::Uuid;
 use bamboo_agent_core::tools::{
     Tool, ToolCtx, ToolError, ToolExecutionContext, ToolOutcome, ToolResult,
 };
-use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_engine::session_app::child_session;
 
 use crate::app_state::{AgentRunner, AgentStatus};
@@ -493,8 +492,29 @@ async fn create_with_wait_true_suspends_and_registers_wait() {
 }
 
 #[tokio::test]
-async fn wait_action_with_explicit_children_suspends_and_registers() {
+async fn wait_action_with_unknown_explicit_children_does_not_register_a_dead_wait() {
+    // Issue #546 rows 8/9: an explicit `child_session_ids` list is filtered
+    // through `ChildSessionPort::pending_child_ids`, which drops any id that
+    // is not a genuinely pending (started, non-terminal) child of THIS
+    // parent — an already-terminal child, a never-started one, or (as here)
+    // an id that isn't a real child at all. None of those will ever produce
+    // a future completion event, so registering a wait over them would
+    // strand the parent forever; this test pins the OLD (pre-#546)
+    // regression where "k1"/"k2"/"k3" — never actually created as children —
+    // were accepted verbatim and durably registered.
+    //
+    // This harness's `Storage` is the lightweight `JsonlStorage` test double,
+    // which has no parent→child index (`list_child_run_statuses` always
+    // returns empty — a test-fixture-only limitation; production always runs
+    // `SessionStoreV2`, exercised directly in `bamboo-storage`'s own
+    // `list_child_run_statuses_filters_by_parent_and_reports_status` /
+    // `list_sessions_by_run_status_*` tests, and the pure filtering logic
+    // itself in `child_session_adapter::wait_target_filter_tests`). So here
+    // every explicit id is "unknown" regardless of content, which still
+    // exercises the safety property this test cares about: unknown ids are
+    // NEVER registered on a wait.
     let harness = build_test_harness().await;
+
     let result = invoke_completed(
         &harness.tool,
         json!({
@@ -507,14 +527,13 @@ async fn wait_action_with_explicit_children_suspends_and_registers() {
     .await
     .expect("wait should succeed");
 
-    assert_eq!(
+    assert_ne!(
         result.display_preference.as_deref(),
         Some("runtime_control:waiting_for_children"),
-        "wait must suspend the parent"
+        "a wait over only unknown/unresolvable targets must not suspend the parent"
     );
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-    assert_eq!(payload["status"].as_str(), Some("waiting"));
-    assert_eq!(payload["wait_for"].as_str(), Some("any"));
+    assert_eq!(payload["status"].as_str(), Some("no_active_children"));
 
     let parent = harness
         .storage
@@ -522,16 +541,13 @@ async fn wait_action_with_explicit_children_suspends_and_registers() {
         .await
         .unwrap()
         .unwrap();
-    let wait = parent
-        .agent_runtime_state
-        .unwrap()
-        .waiting_for_children
-        .unwrap();
-    assert_eq!(
-        wait.child_session_ids,
-        vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]
+    assert!(
+        parent
+            .agent_runtime_state
+            .and_then(|state| state.waiting_for_children)
+            .is_none(),
+        "no dead wait may be registered"
     );
-    assert_eq!(wait.wait_for, ChildWaitPolicy::Any);
 }
 
 #[tokio::test]

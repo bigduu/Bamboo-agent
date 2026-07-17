@@ -69,6 +69,29 @@ pub async fn init_storage(
         }
     }
 
+    // Boot reconciliation (issue #546 row 10): a session whose mirrored index
+    // status is still `"running"` at this point in boot is UNCONDITIONALLY
+    // orphaned — no in-memory runner can possibly exist yet (we are still
+    // constructing storage, before any spawn happens), so whatever process
+    // was running it is gone. Mark each one `"error"` so the child-wait
+    // heartbeat watchdog's very first sweep (started later, once the server
+    // is fully wired) finds them already terminal and wakes their parents on
+    // its first pass, rather than waiting out `DEAD_CHILD_GRACE_SECS`.
+    // Run inline (before the server starts serving) so it can't race a
+    // legitimate spawn that starts immediately after boot.
+    match reconcile_orphaned_running_sessions(session_store.as_ref()).await {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(
+            "Boot reconciliation marked {count} orphaned \"running\" session(s) as \"error\" \
+             (issue #546 row 10)"
+        ),
+        Err(error) => {
+            tracing::warn!(
+                "Boot reconciliation for orphaned running sessions failed (continuing): {error}"
+            );
+        }
+    }
+
     let session_store_for_rebuild = session_store.clone();
     tokio::spawn(async move {
         let purged_rows = match session_store_for_rebuild
@@ -109,6 +132,63 @@ pub async fn init_storage(
         session_store.sessions_root_dir()
     );
     Ok((session_store, storage))
+}
+
+/// Boot reconciliation (issue #546 row 10): mark every session whose mirrored
+/// `last_run_status == "running"` as `"error"`. Called once, synchronously,
+/// during [`init_storage`] — at that point in boot no in-memory runner has
+/// been created for anything yet, so a `"running"` mirror can only be a
+/// leftover from a process that no longer exists. Left untouched, a parent
+/// durably suspended on `waiting_for_children` over such a child would never
+/// see a completion (nothing will ever run to publish one), stranding it
+/// until an operator noticed.
+///
+/// Deliberately uses [`Storage::save_session`] (a full save), NOT the cheaper
+/// [`Storage::save_runtime_state`] sidecar-only path: only `save_session`
+/// calls `upsert_index_from_session`, which is what actually updates the
+/// in-memory index `list_sessions_by_run_status`/`list_child_run_statuses`
+/// read from. A sidecar-only save would leave the index (and therefore the
+/// watchdog sweep and the coordinator's `derive_completed_child_ids`) still
+/// reporting `"running"` forever, silently defeating this whole function. The
+/// extra write cost is a boot-time, once-per-orphan non-issue. Idempotent — a
+/// session already fixed by a previous boot's reconciliation no longer
+/// matches the `"running"` filter.
+async fn reconcile_orphaned_running_sessions(storage: &dyn Storage) -> Result<usize, String> {
+    const ORPHAN_ERROR_MESSAGE: &str =
+        "orphaned by a server restart (boot reconciliation, issue #546 row 10)";
+
+    let orphans = storage
+        .list_sessions_by_run_status("running")
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let mut fixed = 0usize;
+    for orphan in orphans {
+        match storage.load_session(&orphan.id).await {
+            Ok(Some(mut session)) => {
+                session.set_last_run_status("error");
+                session.set_last_run_error(ORPHAN_ERROR_MESSAGE.to_string());
+                if let Err(error) = storage.save_session(&session).await {
+                    tracing::warn!(
+                        session_id = %orphan.id,
+                        %error,
+                        "boot reconciliation: failed to persist orphaned session"
+                    );
+                    continue;
+                }
+                fixed += 1;
+            }
+            Ok(None) => {} // vanished between the index list and the load; nothing to fix
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %orphan.id,
+                    %error,
+                    "boot reconciliation: failed to load orphaned session"
+                );
+            }
+        }
+    }
+    Ok(fixed)
 }
 
 /// Initialize the skill manager with workspace directory and active mode from environment.
@@ -619,5 +699,110 @@ mod eviction_tests {
             senders.contains_key("s1"),
             "sender with a live receiver must be retained even when the runner is dropped"
         );
+    }
+}
+
+#[cfg(test)]
+mod boot_reconciliation_tests {
+    use super::*;
+    use bamboo_agent_core::Session;
+
+    async fn temp_storage() -> (tempfile::TempDir, Arc<SessionStoreV2>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .expect("storage init");
+        (temp, Arc::new(store))
+    }
+
+    // Issue #546 row 10: boot reconciliation marks orphaned "running" sessions
+    // as "error" so the child-wait watchdog's first sweep can wake their
+    // parents, instead of leaving them "running" forever with no process
+    // that will ever finish them.
+
+    #[tokio::test]
+    async fn reconcile_marks_orphaned_running_sessions_as_error() {
+        let (_temp, store) = temp_storage().await;
+
+        let mut orphan = Session::new("orphan-1".to_string(), "m".to_string());
+        orphan
+            .metadata
+            .insert("last_run_status".to_string(), "running".to_string());
+        store.save_session(&orphan).await.expect("save");
+
+        let mut healthy = Session::new("healthy-1".to_string(), "m".to_string());
+        healthy
+            .metadata
+            .insert("last_run_status".to_string(), "completed".to_string());
+        store.save_session(&healthy).await.expect("save");
+
+        let fixed = reconcile_orphaned_running_sessions(store.as_ref())
+            .await
+            .expect("reconciliation ok");
+        assert_eq!(fixed, 1, "only the orphaned running session is touched");
+
+        let reloaded_orphan = store
+            .load_session("orphan-1")
+            .await
+            .expect("load ok")
+            .expect("session present");
+        assert_eq!(
+            reloaded_orphan.last_run_status().as_deref(),
+            Some("error"),
+            "orphaned running session must be marked error"
+        );
+        assert!(
+            reloaded_orphan
+                .last_run_error()
+                .unwrap_or_default()
+                .contains("boot reconciliation"),
+            "error message should explain the cause: {:?}",
+            reloaded_orphan.last_run_error()
+        );
+
+        let reloaded_healthy = store
+            .load_session("healthy-1")
+            .await
+            .expect("load ok")
+            .expect("session present");
+        assert_eq!(
+            reloaded_healthy.last_run_status().as_deref(),
+            Some("completed"),
+            "an already-terminal session must be left untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_noop_when_nothing_is_orphaned() {
+        let (_temp, store) = temp_storage().await;
+        let session = Session::new("s-1".to_string(), "m".to_string());
+        store.save_session(&session).await.expect("save");
+
+        let fixed = reconcile_orphaned_running_sessions(store.as_ref())
+            .await
+            .expect("reconciliation ok");
+        assert_eq!(fixed, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent_across_repeated_boots() {
+        let (_temp, store) = temp_storage().await;
+        let mut orphan = Session::new("orphan-2".to_string(), "m".to_string());
+        orphan
+            .metadata
+            .insert("last_run_status".to_string(), "running".to_string());
+        store.save_session(&orphan).await.expect("save");
+
+        let first = reconcile_orphaned_running_sessions(store.as_ref())
+            .await
+            .expect("first reconciliation ok");
+        assert_eq!(first, 1);
+
+        // A second "boot" finds nothing left to fix — the session is now
+        // "error", not "running", so it no longer matches the filter.
+        let second = reconcile_orphaned_running_sessions(store.as_ref())
+            .await
+            .expect("second reconciliation ok");
+        assert_eq!(second, 0);
     }
 }

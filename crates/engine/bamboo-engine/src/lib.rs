@@ -24,7 +24,9 @@ pub use token_usage_log::TokenUsageRecord;
 
 pub use app_context::AgentSessionContext;
 pub use runtime::execution::agent_spawn::{read_cached_session, SessionCache};
-pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
+pub use session_app::child_completion_coordinator::{
+    wait_watchdog_interval_from_env, ChildCompletionCoordinator,
+};
 
 // Re-export commonly used types from agent (via dependency)
 pub use bamboo_agent_core::{

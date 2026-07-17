@@ -351,6 +351,14 @@ impl AppState {
                 Some(account_sink.inbox()),
             ));
 
+        // Child-wait heartbeat watchdog backstop (issue #546 Part B). Config-
+        // gated via `BAMBOO_CHILD_WAIT_WATCHDOG_INTERVAL_SECS` (default 60s;
+        // `0` disables). Must be started AFTER `set_root_tools` /
+        // `set_guardian_spawner` are wired below so a sweep firing early in
+        // boot doesn't race an uninitialized dependency — deferred to the end
+        // of this function, right after those two calls (search for
+        // "spawn_wait_watchdog" there).
+
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
 
@@ -639,6 +647,13 @@ impl AppState {
         child_completion_coordinator
             .set_guardian_spawner(guardian_spawner.clone())
             .await;
+
+        // Child-wait heartbeat watchdog (issue #546 Part B): started only now
+        // that `root_tools` and `guardian_spawner` are both wired, so an early
+        // sweep can never race `spawn_resume_execution`'s dependency checks.
+        // Config-gated via `BAMBOO_CHILD_WAIT_WATCHDOG_INTERVAL_SECS`.
+        child_completion_coordinator
+            .spawn_wait_watchdog(bamboo_engine::wait_watchdog_interval_from_env());
 
         // The completion coordinator doubles as the bash self-resume hook
         // (issue #84 Phase 2b): it polls the live shell registry and resumes a

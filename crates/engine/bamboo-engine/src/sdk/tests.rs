@@ -17,6 +17,7 @@ use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
 use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 
+use crate::runtime::execution::child_completion::{ChildCompletion, ChildCompletionHandler};
 use crate::runtime::execution::spawn::{ExternalChildRunner, SpawnContext, SpawnJob};
 use crate::sdk::runner::{ChildRunner, RunChildInput};
 use crate::sdk::spawn::run_child_spawn;
@@ -493,6 +494,143 @@ async fn s_t2_5_watchdog_timeout_completes_with_timeout_status() {
     match events.last().unwrap() {
         AgentEvent::SubAgentCompleted { status, .. } => {
             assert_eq!(status, "timeout", "watchdog must yield timeout status");
+        }
+        other => panic!("expected SubAgentCompleted, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #546 row 1 — a panic in the child's execution task must publish a
+// synthetic error completion instead of silently stranding the parent.
+// ---------------------------------------------------------------------------
+
+/// External runner double that panics instead of executing, simulating an
+/// unforeseen panic anywhere in the child's execution path.
+struct PanickingRunner;
+
+#[async_trait]
+impl ExternalChildRunner for PanickingRunner {
+    async fn should_handle(&self, _session: &Session) -> bool {
+        true
+    }
+
+    async fn execute_external_child(
+        &self,
+        _session: &mut Session,
+        _job: &SpawnJob,
+        _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        _cancel_token: tokio_util::sync::CancellationToken,
+    ) -> crate::runtime::runner::Result<()> {
+        panic!("simulated child execution panic (issue #546 row 1 test)");
+    }
+}
+
+#[tokio::test]
+async fn s_t546_1_child_execution_panic_publishes_synthetic_error_completion() {
+    let harness = build_harness(Arc::new(CompletedProvider), Vec::new(), &[]).await;
+    let mut parent_rx = harness.parent_rx.resubscribe();
+    // Swap in a runner that panics instead of executing — everything else
+    // (storage, sessions cache, runner registry) is the real harness.
+    let ctx = SpawnContext {
+        external_child_runner: Arc::new(PanickingRunner),
+        ..harness.ctx.clone()
+    };
+
+    run_child_spawn(
+        ctx,
+        SpawnJob {
+            parent_session_id: harness.parent_session_id.clone(),
+            child_session_id: harness.child_session_id.clone(),
+            model: "gpt-5".to_string(),
+            disabled_tools: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Before the fix this event never arrived — the panic silently dropped
+    // the `JoinHandle` and the parent waited forever.
+    let events = collect_until_completed(&mut parent_rx).await;
+    match events.last().unwrap() {
+        AgentEvent::SubAgentCompleted { status, error, .. } => {
+            assert_eq!(
+                status, "error",
+                "a panicked child execution task must publish a synthetic error completion"
+            );
+            assert!(
+                error.as_deref().unwrap_or_default().contains("panic"),
+                "error should reference the panic: {error:?}"
+            );
+        }
+        other => panic!("expected SubAgentCompleted, got {other:?}"),
+    }
+
+    // The child's own storage record must also reflect the panic — not stay
+    // "running" forever (which would also defeat the boot-reconciliation /
+    // watchdog dead-child staleness signal for issue #546 Part B).
+    let persisted = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted
+            .metadata
+            .get("last_run_status")
+            .map(String::as_str),
+        Some("error")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #546 row 3 — a panic inside the coordinator's `on_child_completed`
+// must not propagate and must not prevent the broadcast `SubAgentCompleted`
+// event (which is sent before the handler runs).
+// ---------------------------------------------------------------------------
+
+struct PanickingCompletionHandler;
+
+#[async_trait]
+impl ChildCompletionHandler for PanickingCompletionHandler {
+    async fn on_child_completed(&self, _completion: ChildCompletion) {
+        panic!("simulated coordinator panic (issue #546 row 3 test)");
+    }
+}
+
+#[tokio::test]
+async fn s_t546_3_completion_handler_panic_does_not_block_broadcast_or_hang() {
+    let harness = build_harness(Arc::new(CompletedProvider), Vec::new(), &[]).await;
+    let mut parent_rx = harness.parent_rx.resubscribe();
+    let ctx = SpawnContext {
+        completion_handler: Some(Arc::new(PanickingCompletionHandler)),
+        ..harness.ctx.clone()
+    };
+
+    // Must complete without hanging or crashing the process — a panicking
+    // handler is isolated behind its own monitored `JoinHandle`
+    // (`publish_child_completion`). `collect_until_completed`'s own internal
+    // timeout would fail this test if the panic somehow blocked delivery.
+    run_child_spawn(
+        ctx,
+        SpawnJob {
+            parent_session_id: harness.parent_session_id.clone(),
+            child_session_id: harness.child_session_id.clone(),
+            model: "gpt-5".to_string(),
+            disabled_tools: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = collect_until_completed(&mut parent_rx).await;
+    match events.last().unwrap() {
+        AgentEvent::SubAgentCompleted { status, .. } => {
+            assert_eq!(
+                status, "completed",
+                "the child's own real completion status is unaffected by a downstream \
+                 handler panic"
+            );
         }
         other => panic!("expected SubAgentCompleted, got {other:?}"),
     }
