@@ -90,7 +90,9 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let body = test::read_body(resp).await;
     let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(err["success"], false);
-    assert!(err["error"]
+    // Canonical nested error envelope (#251 finding 2 / #507).
+    assert_eq!(err["error"]["type"], "api_error");
+    assert!(err["error"]["message"]
         .as_str()
         .unwrap_or("")
         .contains("Invalid configuration"));

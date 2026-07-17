@@ -39,7 +39,10 @@ async fn test_submit_response_rejects_invalid_option_and_keeps_pending_question(
     assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
 
     let body: serde_json::Value = test::read_body_json(resp).await;
-    assert_eq!(body["error"], "Invalid response");
+    // Canonical nested error envelope (#251 finding 2 / #507); the sibling
+    // `message` detail field is unchanged.
+    assert_eq!(body["error"]["message"], "Invalid response");
+    assert_eq!(body["error"]["type"], "api_error");
     assert_eq!(body["message"], "Response must be one of: A, B");
 
     let loaded = state
