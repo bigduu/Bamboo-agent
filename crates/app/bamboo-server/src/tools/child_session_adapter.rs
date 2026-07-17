@@ -299,14 +299,14 @@ impl ChildSessionAdapter {
     }
 
     /// The subset of `candidates` the session index POSITIVELY reports as
-    /// terminal children of this parent (issue #546). Unknown ids are not
-    /// reported — an index-less backend or a not-yet-indexed child must not be
-    /// mistaken for a finished one.
+    /// terminal children of this parent, as `(child_id, status)` pairs
+    /// (issue #546). Unknown ids are not reported — an index-less backend or
+    /// a not-yet-indexed child must not be mistaken for a finished one.
     pub async fn terminal_child_ids(
         &self,
         parent_session_id: &str,
         candidates: &[String],
-    ) -> Vec<String> {
+    ) -> Vec<(String, String)> {
         let statuses = self
             .storage
             .list_child_run_statuses(parent_session_id)
@@ -314,12 +314,13 @@ impl ChildSessionAdapter {
             .unwrap_or_default();
         candidates
             .iter()
-            .filter(|candidate| {
-                statuses.iter().any(|(id, status)| {
-                    id == *candidate && status.as_deref().is_some_and(is_terminal_child_status)
+            .filter_map(|candidate| {
+                statuses.iter().find_map(|(id, status)| {
+                    let status = status.as_deref()?;
+                    (id == candidate && is_terminal_child_status(status))
+                        .then(|| (candidate.clone(), status.to_string()))
                 })
             })
-            .cloned()
             .collect()
     }
 
@@ -800,7 +801,7 @@ impl ChildSessionPort for ChildSessionAdapter {
         &self,
         parent_session_id: &str,
         candidates: &[String],
-    ) -> Vec<String> {
+    ) -> Vec<(String, String)> {
         ChildSessionAdapter::terminal_child_ids(self, parent_session_id, candidates).await
     }
 

@@ -123,6 +123,17 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         return Err(error);
     }
 
+    // Clear suspend leftovers from a PRIOR run (issue #546): a child that
+    // suspended (clarification/approval), was answered through the parent via
+    // `send_message`/`run`, and is now re-enqueued still carries the old
+    // `runtime.suspend_reason` + pending question — none of the re-run entry
+    // points perform respond.rs's clear. The terminal mapping below must only
+    // observe suspend state stamped by THIS run, otherwise a genuinely
+    // completed re-run is published as non-terminal "suspended" and the
+    // parent stalls until the wait lease expires.
+    session.metadata.remove("runtime.suspend_reason");
+    session.clear_pending_question();
+
     // Ensure last message is user (otherwise nothing to do).
     let last_is_user = session
         .messages

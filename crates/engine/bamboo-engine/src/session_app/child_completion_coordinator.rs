@@ -164,6 +164,7 @@ fn wait_policy_satisfied(
     policy: ChildWaitPolicy,
     wait_child_ids: &[String],
     completed_child_ids: &[String],
+    latest_child_id: &str,
     latest_status: &str,
 ) -> bool {
     if wait_child_ids.is_empty() {
@@ -178,7 +179,12 @@ fn wait_policy_satisfied(
             .iter()
             .any(|id| wait_child_ids.iter().any(|wait_id| wait_id == id)),
         ChildWaitPolicy::FirstError => {
-            is_error_like(latest_status)
+            // The error short-circuit only counts a completion from a child
+            // this wait actually tracks (issue #546): a stray/duplicate
+            // completion from an untracked child — e.g. a frozen runner's
+            // task waking up after the watchdog already synthesized its
+            // timeout, in a later run's wait — must not resume the parent.
+            (is_error_like(latest_status) && wait_child_ids.iter().any(|id| id == latest_child_id))
                 || wait_child_ids
                     .iter()
                     .all(|id| completed_child_ids.iter().any(|completed| completed == id))
@@ -485,6 +491,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 wait.wait_for,
                 &wait.child_session_ids,
                 &completed_child_ids,
+                &completion.child_session_id,
                 &completion.status,
             );
             if should_resume {
@@ -1580,8 +1587,18 @@ impl ChildCompletionCoordinator {
             .into_iter()
             .collect();
 
+        struct DeadChild {
+            child_id: String,
+            status: String,
+            reason: String,
+            /// `false` = the id does not name a child of THIS parent (wait ids
+            /// are model-provided and unvalidated): publish the wake but never
+            /// persist onto / cancel / finalize the named session.
+            owned: bool,
+        }
+
         let mut terminal: Vec<(String, String)> = Vec::new();
-        let mut dead: Vec<(String, String, String)> = Vec::new();
+        let mut dead: Vec<DeadChild> = Vec::new();
         for child_id in &wait.child_session_ids {
             let status = statuses.get(child_id).and_then(|status| status.as_deref());
             if let Some(status) = status {
@@ -1591,6 +1608,32 @@ impl ChildCompletionCoordinator {
                 }
             }
             if !is_dead_child_candidate_status(status) {
+                continue;
+            }
+
+            // Ownership check BEFORE anything destructive: `SubAgent.wait` ids
+            // are model-provided and unvalidated, so an id absent from the
+            // parent-scoped status map may name a REAL session in another tree
+            // (a grandchild, a foreign root). Such a session must never be
+            // mutated, cancelled, or finalized here — but the parent's bogus
+            // wait entry still needs a synthetic completion to clear it.
+            let control_plane = self.load_control_plane(child_id).await;
+            let owned = control_plane
+                .as_ref()
+                .is_some_and(|cp| cp.parent_session_id.as_deref() == Some(parent_session_id));
+            if !owned {
+                dead.push(DeadChild {
+                    child_id: child_id.clone(),
+                    status: "error".to_string(),
+                    reason: if control_plane.is_some() {
+                        "waited-on session id is not a child of this session; clearing it \
+                         from the wait without touching that session"
+                            .to_string()
+                    } else {
+                        "waited-on child session does not exist".to_string()
+                    },
+                    owned: false,
+                });
                 continue;
             }
 
@@ -1605,9 +1648,9 @@ impl ChildCompletionCoordinator {
                     let last_activity = runner.last_event_at.unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
-                    let policy = match self.load_control_plane(child_id).await {
+                    let policy = match &control_plane {
                         Some(child) => {
-                            crate::runtime::execution::spawn::watchdog_policy_for_session(&child)
+                            crate::runtime::execution::spawn::watchdog_policy_for_session(child)
                         }
                         None => Default::default(),
                     };
@@ -1617,57 +1660,70 @@ impl ChildCompletionCoordinator {
                         .saturating_add(STALE_RUNNER_SLACK_SECS);
                     if idle_secs >= idle_limit || total_secs >= total_limit {
                         runner.cancel_token.cancel();
-                        dead.push((
-                            child_id.clone(),
-                            "timeout".to_string(),
-                            format!(
+                        dead.push(DeadChild {
+                            child_id: child_id.clone(),
+                            status: "timeout".to_string(),
+                            reason: format!(
                                 "child runner stalled: no events for {idle_secs}s \
                                  (limit {idle_limit}s including watchdog slack); \
                                  force-finalized by the child-wait watchdog"
                             ),
-                        ));
+                            owned: true,
+                        });
                     }
                 }
                 _ => {
                     // Nothing is driving this child, yet its index status will
                     // never advance by itself. The grace covers the enqueue →
                     // running-marker window and slow spawn queues.
-                    let quiet_secs = match self.load_control_plane(child_id).await {
-                        Some(child) => now.signed_duration_since(child.updated_at).num_seconds(),
-                        // Session gone entirely (deleted mid-wait).
-                        None => i64::MAX,
-                    };
+                    let quiet_secs = control_plane
+                        .as_ref()
+                        .map(|child| now.signed_duration_since(child.updated_at).num_seconds())
+                        .unwrap_or(i64::MAX);
                     if quiet_secs >= DEAD_CHILD_GRACE_SECS {
-                        dead.push((
-                            child_id.clone(),
-                            "error".to_string(),
-                            format!(
+                        dead.push(DeadChild {
+                            child_id: child_id.clone(),
+                            status: "error".to_string(),
+                            reason: format!(
                                 "child runner lost (crashed task, dropped spawn job, or \
                                  process restart): index status {status:?} with no live \
                                  runner driving it"
                             ),
-                        ));
+                            owned: true,
+                        });
                     }
                 }
             }
         }
 
         if !dead.is_empty() {
-            for (child_id, status, reason) in dead {
+            for entry in dead {
                 tracing::warn!(
                     %parent_session_id,
-                    child_session_id = %child_id,
-                    %status,
-                    %reason,
+                    child_session_id = %entry.child_id,
+                    status = %entry.status,
+                    reason = %entry.reason,
+                    owned = entry.owned,
                     "child-wait watchdog: synthesizing terminal completion for dead child"
                 );
-                self.synthesize_child_completion(
-                    parent_session_id,
-                    &child_id,
-                    &status,
-                    Some(reason),
-                )
-                .await;
+                if entry.owned {
+                    self.synthesize_child_completion(
+                        parent_session_id,
+                        &entry.child_id,
+                        &entry.status,
+                        Some(entry.reason),
+                    )
+                    .await;
+                } else {
+                    // Foreign / nonexistent id: wake the parent only.
+                    self.publish_synthetic_completion(
+                        parent_session_id,
+                        &entry.child_id,
+                        &entry.status,
+                        Some(entry.reason),
+                    )
+                    .await;
+                }
             }
             // The publishes above re-evaluate the wait policy themselves.
             return;
@@ -1684,6 +1740,7 @@ impl ChildCompletionCoordinator {
                 wait.wait_for,
                 &wait.child_session_ids,
                 &terminal_ids,
+                child_id,
                 status,
             ) {
                 tracing::warn!(
@@ -1716,6 +1773,26 @@ impl ChildCompletionCoordinator {
     ) {
         match self.storage.load_session(child_session_id).await {
             Ok(Some(mut child)) => {
+                // Ownership guard (defense in depth — callers check too): only
+                // a session that IS a child of this parent may be mutated. An
+                // arbitrary session id named in a wait still wakes the parent
+                // via the publish below, but its own state stays untouched.
+                if child.parent_session_id.as_deref() != Some(parent_session_id) {
+                    tracing::warn!(
+                        %parent_session_id,
+                        child_session_id = %child.id,
+                        "child-wait watchdog: refusing to synthesize status onto a session \
+                         that is not a child of this parent"
+                    );
+                    self.publish_synthetic_completion(
+                        parent_session_id,
+                        child_session_id,
+                        status,
+                        error,
+                    )
+                    .await;
+                    return;
+                }
                 child.set_last_run_status(status);
                 match &error {
                     Some(message) => child.set_last_run_error(message.clone()),
@@ -2007,12 +2084,44 @@ mod tests {
             ChildWaitPolicy::All,
             &waited,
             &["a".to_string()],
+            "a",
             "completed"
         ));
         assert!(wait_policy_satisfied(
             ChildWaitPolicy::All,
             &waited,
             &["a".to_string(), "b".to_string()],
+            "b",
+            "completed"
+        ));
+    }
+
+    #[test]
+    fn wait_policy_first_error_requires_tracked_membership() {
+        let waited = vec!["a".to_string(), "b".to_string()];
+        // An error from a TRACKED child resumes immediately.
+        assert!(wait_policy_satisfied(
+            ChildWaitPolicy::FirstError,
+            &waited,
+            &["a".to_string()],
+            "a",
+            "error"
+        ));
+        // An error-like completion from an UNTRACKED child (e.g. a zombie
+        // task from an earlier run waking up late) must not resume the wait.
+        assert!(!wait_policy_satisfied(
+            ChildWaitPolicy::FirstError,
+            &waited,
+            &["a".to_string()],
+            "stray-child",
+            "timeout"
+        ));
+        // The all-complete fallback still applies regardless of the reporter.
+        assert!(wait_policy_satisfied(
+            ChildWaitPolicy::FirstError,
+            &waited,
+            &["a".to_string(), "b".to_string()],
+            "stray-child",
             "completed"
         ));
     }

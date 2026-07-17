@@ -400,7 +400,36 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 },
             );
 
-            let result = agent.execute(&mut session, execute_request).await;
+            // Panic containment (issue #546): everything below — the terminal
+            // status persist, finalize_runner, and the child-completion
+            // publish — only runs if this task survives execution. An
+            // unwinding panic would leave a zombie Running runner entry (which
+            // blinds liveness checks) and, for a child session, strand its
+            // waiting parent. Map a panic to a terminal error instead.
+            let result = {
+                use futures::FutureExt;
+                match std::panic::AssertUnwindSafe(agent.execute(&mut session, execute_request))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        tracing::error!(
+                            "[{}] agent execution panicked; finalizing as terminal error: {}",
+                            session_id,
+                            message
+                        );
+                        Err(AgentError::LLM(format!(
+                            "agent execution panicked: {message}"
+                        )))
+                    }
+                }
+            };
 
             // Send terminal event for all error cases (including cancellation).
             if let Some(error_event) = terminal_error_event_for_result(&result) {

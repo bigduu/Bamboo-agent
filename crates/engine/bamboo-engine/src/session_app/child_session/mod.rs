@@ -216,17 +216,18 @@ pub trait ChildSessionPort: Send + Sync {
     async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String>;
 
     /// The subset of `candidates` the session index POSITIVELY reports as
-    /// terminal children of this parent (issue #546). `SubAgent.wait` drops
-    /// these from an explicit wait — a terminal child fires no further
-    /// completion, so a wait over it could hang the parent. Unknown ids are
-    /// NOT reported (index-less backends can't distinguish "terminal" from
-    /// "not yet indexed"); the child-wait watchdog rescues those at runtime.
-    /// Default: empty (no filtering).
+    /// terminal children of this parent, as `(child_id, status)` pairs
+    /// (issue #546). `SubAgent.wait` uses this to avoid arming a wait over a
+    /// child that fires no further completion — and, policy-permitting, to
+    /// short-circuit a wait the terminal statuses already satisfy. Unknown
+    /// ids are NOT reported (index-less backends can't distinguish "terminal"
+    /// from "not yet indexed"); the child-wait watchdog rescues those at
+    /// runtime. Default: empty (no filtering).
     async fn terminal_child_ids(
         &self,
         parent_session_id: &str,
         candidates: &[String],
-    ) -> Vec<String> {
+    ) -> Vec<(String, String)> {
         let _ = (parent_session_id, candidates);
         Vec::new()
     }
