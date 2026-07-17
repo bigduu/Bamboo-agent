@@ -282,6 +282,7 @@ pub(crate) fn spawn_agent_forwarder(
                             &ch,
                             &seq,
                             skipped,
+                            awaiting_children,
                         )
                         .await
                         {
@@ -388,6 +389,7 @@ pub(crate) fn spawn_agent_forwarder(
                                 &ch,
                                 &seq,
                                 skipped,
+                                awaiting_children,
                             )
                             .await
                             {
@@ -437,6 +439,14 @@ enum LagOutcome {
 ///    channel goes silent forever and the client shows the last tool call as
 ///    running indefinitely ON A HEALTHY SOCKET (the keepalive watchdog cannot
 ///    catch this: keepalives keep arriving).
+///
+/// `own_terminal_already_emitted` is the caller's `awaiting_children` state:
+/// the parent's REAL terminal event already reached the client and the channel
+/// is only held open for child sub-agents. If the gap then swallows the last
+/// `SubAgentCompleted`, self-heal must send ONLY the `terminal` control —
+/// mirroring the normal `is_child_completed && !has_running_child` close — and
+/// never a second, synthesized terminal event for a session whose completion
+/// the client already saw.
 async fn handle_agent_lag(
     state: &web::Data<AppState>,
     session_id: &str,
@@ -445,6 +455,7 @@ async fn handle_agent_lag(
     ch: &str,
     seq: &AgentSeq,
     skipped: u64,
+    own_terminal_already_emitted: bool,
 ) -> LagOutcome {
     tracing::warn!(
         "[{}] ws_v2 agent channel lagged: {} events lost to broadcast-ring overrun; \
@@ -475,11 +486,17 @@ async fn handle_agent_lag(
     };
 
     tracing::warn!(
-        "[{}] ws_v2 agent channel: lag gap swallowed the run's terminal; \
-         emitting synthesized terminal and closing the channel",
-        session_id
+        "[{}] ws_v2 agent channel: lag gap swallowed the run's terminal \
+         (own_terminal_already_emitted={}); closing the channel",
+        session_id,
+        own_terminal_already_emitted
     );
-    if !emit_agent_event(out, encoding, ch, seq, terminal_event).await {
+    // Only synthesize a terminal EVENT when the client never saw the real one.
+    // In the awaiting-children window the parent's terminal was already
+    // delivered — a second one would be a spurious duplicate completion.
+    if !own_terminal_already_emitted
+        && !emit_agent_event(out, encoding, ch, seq, terminal_event).await
+    {
         return LagOutcome::Disconnected;
     }
     let _ = send_env(
@@ -730,5 +747,90 @@ mod tests {
         });
         let frame = next_json(&mut out_rx).await;
         assert_eq!(frame["event"]["content"], "after-gap");
+    }
+
+    /// Review regression (#544): a lag inside the awaiting-children window —
+    /// the parent's REAL terminal was already delivered, the channel is only
+    /// held open for a child sub-agent, and the gap swallows the final
+    /// `SubAgentCompleted`. Self-heal must close with ONLY the `terminal`
+    /// control (mirroring the normal child-completion close) and never emit a
+    /// second, synthesized terminal event for a completion the client already
+    /// saw.
+    #[tokio::test]
+    async fn lag_during_awaiting_children_closes_without_duplicate_terminal_event() {
+        let (state, _tmp) = test_state("lag-parent").await;
+        // A REAL child session (kind=Child, root=parent) with a Running runner,
+        // so the parent's terminal holds the channel open (awaiting_children).
+        let mut child =
+            bamboo_agent_core::Session::new_child("lag-child", "lag-parent", "test-model", "child");
+        state.save_session(&mut child).await;
+        {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("lag-child".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+        }
+
+        let (tx, rx) = broadcast::channel::<AgentEvent>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-parent".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-parent".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        // The parent's REAL terminal: emitted to the client, and the running
+        // child holds the channel open (no terminal control yet).
+        let _ = tx.send(AgentEvent::Complete {
+            usage: Default::default(),
+        });
+        let real_terminal = next_json(&mut out_rx).await;
+        assert_eq!(real_terminal["event"]["type"], "complete");
+
+        // The child finishes: its runner goes away — but the SubAgentCompleted
+        // that would have closed the channel is swallowed by a ring overrun.
+        {
+            let mut runners = state.agent_runners.write().await;
+            runners.remove("lag-child");
+        }
+        // Overflow the 4-slot ring synchronously (current-thread test runtime:
+        // the forwarder cannot run between these sends), so its next recv()
+        // yields Lagged and the SubAgentCompleted inside the gap is lost.
+        let _ = tx.send(AgentEvent::SubAgentCompleted {
+            parent_session_id: "lag-parent".to_string(),
+            child_session_id: "lag-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        });
+        for i in 0..9 {
+            let _ = tx.send(AgentEvent::Token {
+                content: format!("child-tail-{i}"),
+            });
+        }
+
+        // Recovery: the gap control, then ONLY the terminal control — no second
+        // synthesized `complete` event.
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["control"]["type"], "gap");
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(
+            terminal["control"]["type"], "terminal",
+            "self-heal must close with the control only — a synthesized terminal \
+             event here would be a duplicate completion: {terminal}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("close arrives before timeout")
+                .is_none(),
+            "channel must close after the terminal control"
+        );
     }
 }
