@@ -81,29 +81,68 @@ pub fn sync_from_metadata(session: &Session, state: &mut AgentRuntimeState) {
     }
 }
 
+/// Result of a turn-boundary disk refresh: how many injected messages were
+/// merged, and the live per-session `bypass_permissions` flag as it stands on
+/// disk (the authoritative writer is `PATCH /sessions`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TurnBoundaryRefresh {
+    pub merged: usize,
+    /// `None` when there was no storage / no on-disk session to read.
+    pub disk_bypass_permissions: Option<bool>,
+}
+
 /// Merge any queued follow-up messages that were injected via `send_message`
 /// while a session is running.
 ///
-/// Loads the latest persisted session to check for `pending_injected_messages`
-/// metadata, appends them to the in-memory session as user messages, and
-/// clears the metadata flag.
-///
-/// Returns the number of messages merged.
+/// Thin wrapper over [`refresh_turn_boundary_from_disk`] kept for callers that
+/// only need the merge count. Returns the number of messages merged.
 pub async fn merge_pending_injected_messages(
     session: &mut Session,
     storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
     persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) -> usize {
-    let Some(storage) = storage else { return 0 };
+    refresh_turn_boundary_from_disk(session, storage, persistence)
+        .await
+        .merged
+}
+
+/// Turn-boundary refresh from the on-disk session: a SINGLE load that both
+/// merges queued `send_message` injections AND reads the live
+/// `bypass_permissions` flag.
+///
+/// The bypass read is what makes a mid-run `PATCH /sessions {bypass_permissions}`
+/// take effect on the CURRENT run: the run owns a `Session` value taken at spawn
+/// and never otherwise re-reads storage, so the caller applies the returned
+/// `disk_bypass_permissions` to the live runtime state at each round boundary.
+/// The flag is folded into the existing per-round load so large parent sessions
+/// aren't deserialized twice.
+pub async fn refresh_turn_boundary_from_disk(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+) -> TurnBoundaryRefresh {
+    let Some(storage) = storage else {
+        return TurnBoundaryRefresh::default();
+    };
 
     let Ok(Some(latest)) = storage.load_session(&session.id).await else {
-        return 0;
+        return TurnBoundaryRefresh::default();
     };
+
+    let disk_bypass_permissions = Some(
+        latest
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.bypass_permissions),
+    );
 
     // Read via the typed accessor (prefers `runtime_metadata`, falls back to the
     // legacy `pending_injected_messages` JSON string; defensive on malformed).
     let Some(messages) = latest.pending_injected_messages() else {
-        return 0;
+        return TurnBoundaryRefresh {
+            merged: 0,
+            disk_bypass_permissions,
+        };
     };
 
     let mut merged = 0usize;
@@ -136,7 +175,10 @@ pub async fn merge_pending_injected_messages(
         );
     }
 
-    merged
+    TurnBoundaryRefresh {
+        merged,
+        disk_bypass_permissions,
+    }
 }
 
 #[cfg(test)]
@@ -327,5 +369,35 @@ mod tests {
         let mut session = test_session();
         let count = merge_pending_injected_messages(&mut session, None, None).await;
         assert_eq!(count, 0);
+    }
+
+    // #540: the turn-boundary refresh reports the live on-disk bypass flag so
+    // the pipeline can adopt a mid-run PATCH into the running loop's state.
+    #[tokio::test]
+    async fn refresh_turn_boundary_reports_disk_bypass_permissions() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+
+        // Persist a session with bypass ON.
+        let mut persisted = Session::new("bypass-live", "model");
+        let mut state = AgentRuntimeState::new("run-x");
+        state.bypass_permissions = true;
+        persisted.agent_runtime_state = Some(state);
+        storage.save_session(&persisted).await.unwrap();
+
+        // A running loop holds a stale copy with bypass OFF.
+        let mut running = Session::new("bypass-live", "model");
+        running.agent_runtime_state = Some(AgentRuntimeState::new("run-x"));
+
+        let refresh = refresh_turn_boundary_from_disk(&mut running, Some(&storage), None).await;
+        assert_eq!(refresh.disk_bypass_permissions, Some(true));
+        assert_eq!(refresh.merged, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_turn_boundary_reports_none_without_storage() {
+        let mut session = test_session();
+        let refresh = refresh_turn_boundary_from_disk(&mut session, None, None).await;
+        assert_eq!(refresh.disk_bypass_permissions, None);
+        assert_eq!(refresh.merged, 0);
     }
 }

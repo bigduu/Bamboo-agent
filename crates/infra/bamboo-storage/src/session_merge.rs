@@ -154,6 +154,9 @@ impl LockedSessionStore {
         let _guard = self.acquire_lock(&session.id).await;
         if let Ok(Some(latest)) = self.storage.load_runtime_control_plane(&session.id).await {
             apply_authoritative_metadata(session, &latest);
+            // The control-plane sidecar carries `agent_runtime_state`, so a
+            // concurrent mid-run bypass flip is here too — don't revert it. #540.
+            adopt_disk_bypass_permissions(session, &latest);
         }
         self.storage.save_runtime_state(session).await
     }
@@ -220,6 +223,9 @@ impl LockedSessionStore {
 
         if let Some(latest) = latest.as_ref() {
             apply_authoritative_metadata(session, latest);
+            // Never let a running loop's save revert a concurrent mid-run
+            // `PATCH /sessions {bypass_permissions}` flip. #540.
+            adopt_disk_bypass_permissions(session, latest);
         }
         self.storage.save_session(session).await
     }
@@ -277,6 +283,35 @@ async fn merge_authoritative_metadata_into_stale(
 ) {
     if let Ok(Some(latest)) = storage.load_session(&session.id).await {
         apply_authoritative_metadata(session, &latest);
+        adopt_disk_bypass_permissions(session, &latest);
+    }
+}
+
+/// Adopt the on-disk `agent_runtime_state.bypass_permissions` into the session
+/// about to be saved.
+///
+/// `PATCH /sessions {bypass_permissions}` is the SOLE authoritative writer of
+/// this flag (a running loop only carries it forward from run start). Without
+/// this, a runtime save from an in-flight run — which holds the run-start value
+/// — silently reverts a concurrent mid-run flip on disk. Unlike the metadata
+/// group this is NOT version-gated: the PATCH writes via `update_runtime_config`,
+/// which does not bump `metadata_version`. #540.
+fn adopt_disk_bypass_permissions(session: &mut Session, latest: &Session) {
+    let disk_bypass = latest
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.bypass_permissions);
+    match session.agent_runtime_state.as_mut() {
+        Some(state) => state.bypass_permissions = disk_bypass,
+        // No runtime state in memory and disk says "off" → nothing to adopt;
+        // avoid allocating a default state just to store `false`.
+        None if disk_bypass => {
+            session
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .bypass_permissions = true;
+        }
+        None => {}
     }
 }
 
@@ -484,6 +519,98 @@ mod tests {
         // And the in-memory copy was corrected by the merge too.
         assert_eq!(stale_snapshot.title, "User Renamed");
         assert_eq!(stale_snapshot.metadata_version, 1);
+    }
+
+    // #540: a running loop's `merge_save_runtime` (carrying the run-start bypass
+    // value) must NOT revert a concurrent mid-run `PATCH /sessions
+    // {bypass_permissions}` write on disk — disk is the authoritative writer.
+    #[tokio::test]
+    async fn merge_save_runtime_adopts_disk_bypass_permissions() {
+        use bamboo_domain::AgentRuntimeState;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-bypass";
+
+        // Baseline persisted with bypass OFF.
+        let baseline = fresh(session_id);
+        storage.save_session(&baseline).await.unwrap();
+
+        // The running loop holds a snapshot with bypass OFF (run-start value).
+        let mut loop_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
+        loop_snapshot.agent_runtime_state = Some(AgentRuntimeState::default());
+
+        // A concurrent PATCH flips bypass ON on disk (via update_runtime_config).
+        store
+            .update_runtime_config(session_id, |s| {
+                s.agent_runtime_state
+                    .get_or_insert_with(AgentRuntimeState::default)
+                    .bypass_permissions = true;
+            })
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        // The loop saves its stale snapshot: it must adopt disk's ON value, not
+        // revert to OFF.
+        store.merge_save_runtime(&mut loop_snapshot).await.unwrap();
+
+        let after = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(
+            after
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|s| s.bypass_permissions),
+            "disk bypass=ON must survive a stale runtime save (#540)"
+        );
+        // The in-memory copy is corrected too.
+        assert!(loop_snapshot
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|s| s.bypass_permissions));
+    }
+
+    // The reverse direction: a PATCH turning bypass OFF must also stick against
+    // a stale loop snapshot that still has it ON.
+    #[tokio::test]
+    async fn merge_save_runtime_adopts_disk_bypass_off() {
+        use bamboo_domain::AgentRuntimeState;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-bypass-off";
+
+        // Baseline persisted with bypass ON.
+        let mut baseline = fresh(session_id);
+        let mut on_state = AgentRuntimeState::default();
+        on_state.bypass_permissions = true;
+        baseline.agent_runtime_state = Some(on_state);
+        storage.save_session(&baseline).await.unwrap();
+
+        // Loop snapshot still ON.
+        let mut loop_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
+
+        // PATCH flips OFF on disk.
+        store
+            .update_runtime_config(session_id, |s| {
+                s.agent_runtime_state
+                    .get_or_insert_with(AgentRuntimeState::default)
+                    .bypass_permissions = false;
+            })
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        store.merge_save_runtime(&mut loop_snapshot).await.unwrap();
+
+        let after = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(
+            !after
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|s| s.bypass_permissions),
+            "disk bypass=OFF must survive a stale runtime save (#540)"
+        );
     }
 
     // ── Free-function merge tests (updated for metadata-group) ──────
