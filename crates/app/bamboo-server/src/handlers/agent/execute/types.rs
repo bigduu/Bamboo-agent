@@ -139,10 +139,12 @@ pub struct ExecuteRequest {
     #[serde(default)]
     pub no_human_approver: bool,
     /// Optional per-run resource guardrail override (issue #221): token /
-    /// tool-call / subagent budget for THIS execution. Each field falls back
-    /// independently to the config-level `run_budget` default when unset —
-    /// `None` here does not mean "unlimited", it means "use the config
-    /// default" (which may itself be unlimited).
+    /// tool-call / subagent budget for THIS execution. TIGHTEN-ONLY: per
+    /// field, the effective limit is the minimum of this override and the
+    /// config-level `run_budget` default — a client can lower the operator's
+    /// ceiling for one run but can never raise or remove it (a looser value
+    /// is silently clamped to the config default). An unset field keeps the
+    /// config default, which may itself be unlimited.
     #[serde(default)]
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }

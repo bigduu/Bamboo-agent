@@ -241,10 +241,11 @@ pub struct ExecuteRequest {
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
     /// Per-run resource guardrail override (issue #221): token / tool-call /
-    /// subagent budget for THIS execution. Each field falls back independently
-    /// to the config-level `Config::run_budget` default when unset (`None`
-    /// here does not mean "unlimited" — it means "use the config default",
-    /// which may itself be unlimited). See
+    /// subagent budget for THIS execution. TIGHTEN-ONLY: per field, the
+    /// effective limit is the minimum of this override and the config-level
+    /// `Config::run_budget` default — a request can lower the operator's
+    /// ceiling but never raise or remove it. An unset field (`None`) keeps
+    /// the config default (which may itself be unlimited). See
     /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
@@ -525,9 +526,10 @@ impl ExecuteRequestBuilder {
         self
     }
 
-    /// Set the per-run resource guardrail override (issue #221). Each field of
-    /// `v` falls back independently to the config-level default; see
-    /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
+    /// Set the per-run resource guardrail override (issue #221). TIGHTEN-ONLY:
+    /// per field, the effective limit is the minimum of `v` and the
+    /// config-level default — this can never loosen the operator's ceiling;
+    /// see [`bamboo_config::RunBudgetConfig::merged_with_override`].
     pub fn run_budget(mut self, v: bamboo_config::RunBudgetConfig) -> Self {
         self.run_budget = Some(v);
         self
@@ -719,10 +721,11 @@ impl AgentRuntime {
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.
             mcp_tool_guidance: tools.tool_guidance(),
-            // Config-level default, per-field-overridden by the request (issue
-            // #221). Merging here (rather than in the HTTP layer) means every
-            // caller — HTTP, schedules, connect, the in-proc SDK — gets the
-            // same config-default fallback for free.
+            // Config-level default, tighten-only-merged with the request's
+            // override (issue #221): per field the minimum wins, so no caller
+            // can loosen the operator's ceiling. Merging here (rather than in
+            // the HTTP layer) means every caller — HTTP, schedules, connect,
+            // the in-proc SDK — gets the same clamped fallback for free.
             run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
             ..Default::default()
         };
