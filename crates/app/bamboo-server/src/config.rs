@@ -20,10 +20,6 @@
 //! - **Custom**: Restrictive CORS for specific addresses
 
 use actix_cors::Cors;
-use actix_governor::governor::middleware::NoOpMiddleware;
-use actix_governor::{
-    Governor, GovernorConfig, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError,
-};
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::http::header;
@@ -33,6 +29,8 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use tracing::info;
 use tracing::warn;
+
+use crate::rate_limit::{KeyExtractor, RateLimit, RateLimiterConfig, SimpleKeyExtractionError};
 
 /// Default sustained per-IP request rate (requests/second) for the production
 /// (network-exposed) server. Overridable via `BAMBOO_RATE_LIMIT_PER_SECOND`.
@@ -95,7 +93,7 @@ impl ClientIpKeyExtractor {
 
 impl KeyExtractor for ClientIpKeyExtractor {
     type Key = IpAddr;
-    type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
+    type KeyExtractionError = SimpleKeyExtractionError;
 
     fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
         if self.trust_xff {
@@ -143,21 +141,20 @@ fn rate_limiter_config(
     per_second: u64,
     burst: u32,
     key_extractor: ClientIpKeyExtractor,
-) -> GovernorConfig<ClientIpKeyExtractor, NoOpMiddleware> {
+) -> RateLimiterConfig<ClientIpKeyExtractor> {
     // One cell replenishes every `1000 / per_second` ms (>=1), allowing `per_second`
     // sustained req/s with a `burst` bucket. Clamp to >=1 so a bad env value can't
-    // produce a zero period/burst (which finish() would reject).
+    // produce a zero period/burst (which `RateLimiterConfig::new` would panic on).
     let ms_per_request = (1000 / per_second.max(1)).max(1);
-    GovernorConfigBuilder::default()
-        .milliseconds_per_request(ms_per_request)
-        .burst_size(burst.max(1))
-        .key_extractor(key_extractor)
-        .finish()
-        .expect("rate limiter config is valid (non-zero period and burst)")
+    RateLimiterConfig::new(
+        std::time::Duration::from_millis(ms_per_request),
+        burst.max(1),
+        key_extractor,
+    )
 }
 
 /// Build the per-IP rate-limiter config applied to the PRODUCTION (network-bound)
-/// server via the `actix-governor` middleware. Throttles each client IP to
+/// server via the [`crate::rate_limit`] middleware. Throttles each client IP to
 /// `BAMBOO_RATE_LIMIT_PER_SECOND` (default 10) req/s with a `BAMBOO_RATE_LIMIT_BURST`
 /// (default 20) burst, returning 429 Too Many Requests when exceeded. Desktop
 /// (localhost) mode does not apply it. #13.
@@ -168,7 +165,7 @@ fn rate_limiter_config(
 /// `BAMBOO_RATE_LIMIT_TRUSTED_HOPS`, default one hop). #169. XFF mode is OPT-IN
 /// because trusting the header when NOT behind a trusted proxy lets any client
 /// spoof its rate-limit key; see [`ClientIpKeyExtractor`].
-pub fn build_rate_limiter() -> GovernorConfig<ClientIpKeyExtractor, NoOpMiddleware> {
+pub fn build_rate_limiter() -> RateLimiterConfig<ClientIpKeyExtractor> {
     let per_second = std::env::var("BAMBOO_RATE_LIMIT_PER_SECOND")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -789,7 +786,7 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
 /// would NOT have failed them).
 pub fn wrap_governor_and_cors<T, B>(
     app: App<T>,
-    rate_limiter: &GovernorConfig<ClientIpKeyExtractor, NoOpMiddleware>,
+    rate_limiter: &RateLimiterConfig<ClientIpKeyExtractor>,
     apply_rate_limit: bool,
     bind_addr: &str,
     port: u16,
@@ -814,7 +811,7 @@ where
 {
     app.wrap(Condition::new(
         apply_rate_limit,
-        Governor::new(rate_limiter),
+        RateLimit::new(rate_limiter),
     ))
     .wrap(build_cors(bind_addr, port))
 }
@@ -899,7 +896,7 @@ mod tests {
 
     #[actix_web::test]
     async fn rate_limiter_throttles_with_429_after_burst() {
-        use actix_governor::Governor;
+        use crate::rate_limit::RateLimit;
         use actix_web::http::StatusCode;
         use actix_web::{test, web, App, HttpResponse};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -908,7 +905,7 @@ mod tests {
         let conf = rate_limiter_config(1, 2, ClientIpKeyExtractor::peer_ip());
         let app = test::init_service(
             App::new()
-                .wrap(Governor::new(&conf))
+                .wrap(RateLimit::new(&conf))
                 .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
         )
         .await;
@@ -1202,7 +1199,7 @@ mod tests {
     /// behavior that would result.
     #[actix_web::test]
     async fn governor_outside_cors_regression_drops_cors_and_throttles_preflight() {
-        use actix_governor::Governor;
+        use crate::rate_limit::RateLimit;
         use actix_web::http::StatusCode;
         use actix_web::{test, web, App, HttpResponse};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1211,7 +1208,7 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(build_cors("0.0.0.0", 9562)) // inner (WRONG)
-                .wrap(Governor::new(&conf)) // outer (WRONG)
+                .wrap(RateLimit::new(&conf)) // outer (WRONG)
                 .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
         )
         .await;
