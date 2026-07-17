@@ -43,6 +43,12 @@ jobs:
       - name: Run integration tests
         run: cargo test --tests
 
+      - name: Build examples
+        # Compile-only (no network/config needed): guards `examples/*.rs` —
+        # and the README SDK snippet each one's doc comment mirrors — against
+        # drifting from the real API (bamboo-agent#255).
+        run: cargo build --examples
+
   e2e-test:
     name: E2E Tests
     runs-on: ubuntu-latest

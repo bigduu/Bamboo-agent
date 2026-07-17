@@ -302,6 +302,8 @@ The easiest way to create this is `bamboo init` (see [First-run setup](#first-ru
 ```
 
 > Config precedence: file < environment variables < CLI arguments. Environment variables include `BAMBOO_DATA_DIR`, `BAMBOO_PORT`, `BAMBOO_BIND`, `BAMBOO_PROVIDER`, `BAMBOO_WORKERS`, `BAMBOO_CORS_ALLOW_ORIGINS`, and per-provider keys `BAMBOO_OPENAI_API_KEY` / `BAMBOO_ANTHROPIC_API_KEY` / `BAMBOO_GEMINI_API_KEY` (supplied at runtime, never persisted to disk — for Docker/CI/secret-manager deploys without a plaintext key in `config.json`).
+>
+> This is a minimal example. For every key (multi-provider instances, MCP servers, memory/auto-dream/gardener, sub-agents + the `claude_code` executor, the IM `connect` bridge, `plugin_trust`, notifications, keyword masking, and the full env var list), see [`docs/config-reference.md`](./docs/config-reference.md).
 
 ### Docker
 
@@ -340,9 +342,13 @@ Zenith is a monorepo, and bamboo is the execution-engine submodule within it.
 | [**pavilion**](../pavilion) | Official website & docs |
 | [**Zenith (root)**](../) | Monorepo entry, submodule pointers, release train |
 
-**In-module docs:**
+**In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:
+- Getting started: [`docs/guides/GETTING_STARTED.md`](./docs/guides/GETTING_STARTED.md)
+- Configuration reference (every `config.json` key + env vars): [`docs/config-reference.md`](./docs/config-reference.md)
+- How-to guides: [Connect/IM bridge](./docs/guides/CONNECT.md) · [Plugins](./docs/guides/PLUGINS.md) · [Deploy](./docs/guides/DEPLOY.md)
 - API reference: [`docs/guides/API.md`](./docs/guides/API.md)
 - Migration: [`docs/guides/MIGRATION_GUIDE.md`](./docs/guides/MIGRATION_GUIDE.md)
+- Runnable SDK examples: [`examples/`](./examples)
 - [CONTRIBUTING](./CONTRIBUTING.md) · [CHANGELOG](./CHANGELOG.md) · [SECURITY](./SECURITY.md)
 
 ---
