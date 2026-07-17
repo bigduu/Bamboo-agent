@@ -51,6 +51,7 @@ pub async fn prepare_chat_turn(
 
     // ---- Resolve enhance prompt ----
     resolve_enhance_prompt(&mut session, input.enhance_prompt.as_deref());
+    let enhance_prompt = session.enhance_prompt();
 
     // ---- Resolve copilot conclusion with options enhancement ----
     resolve_copilot_conclusion_with_options_enhancement(
@@ -77,8 +78,11 @@ pub async fn prepare_chat_turn(
     session.metadata.remove(SKILL_RUNTIME_LAST_KEY);
 
     // ---- Build enhanced system prompt with profile ----
-    let (system_prompt, prompt_profile) =
-        build_enhanced_system_prompt_with_profile(&base_prompt, None, workspace_path.as_deref());
+    let (system_prompt, prompt_profile) = build_enhanced_system_prompt_with_profile(
+        &base_prompt,
+        enhance_prompt.as_deref(),
+        workspace_path.as_deref(),
+    );
 
     session.metadata.insert(
         PROMPT_COMPOSER_VERSION_KEY.to_string(),
@@ -465,6 +469,104 @@ fn build_enhanced_system_prompt_with_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_app::errors::{SessionLoadError, SessionSaveError};
+    use async_trait::async_trait;
+
+    struct InMemorySessionAccess;
+
+    #[async_trait]
+    impl SessionAccess for InMemorySessionAccess {
+        async fn load_session(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
+            Ok(None)
+        }
+
+        async fn load_or_create(&self, id: &str, model: &str) -> Result<Session, SessionLoadError> {
+            Ok(Session::new(id, model))
+        }
+
+        async fn load_merged(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
+            Ok(None)
+        }
+
+        async fn save_session(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
+            Ok(())
+        }
+
+        async fn save_and_cache(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
+            Ok(())
+        }
+    }
+
+    fn chat_turn_input(enhance_prompt: Option<&str>) -> super::super::types::ChatTurnInput {
+        super::super::types::ChatTurnInput {
+            session_id: "session-enhance".to_string(),
+            model: "gpt-5".to_string(),
+            model_ref: None,
+            provider: None,
+            message: "hello".to_string(),
+            system_prompt: Some("Base prompt".to_string()),
+            enhance_prompt: enhance_prompt.map(ToString::to_string),
+            workspace_path: None,
+            selected_skill_ids: None,
+            copilot_conclusion_with_options_enhancement_enabled: None,
+            data_dir: None,
+        }
+    }
+
+    fn system_message_content(session: &Session) -> String {
+        session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, Role::System))
+            .map(|message| message.content.clone())
+            .expect("session should have a system message")
+    }
+
+    // Regression: the request's enhance_prompt must land in the upserted system
+    // message, not just in session metadata (it was silently dropped once).
+    #[tokio::test]
+    async fn prepare_chat_turn_merges_enhance_prompt_into_system_message() {
+        let session = prepare_chat_turn(
+            &InMemorySessionAccess,
+            chat_turn_input(Some("Extra enhancement guidance")),
+            "",
+            "Builtin fallback",
+        )
+        .await
+        .expect("prepare_chat_turn should succeed");
+
+        let system_prompt = system_message_content(&session);
+        assert!(system_prompt.starts_with("Base prompt"));
+        assert!(system_prompt.contains("Extra enhancement guidance"));
+        assert_eq!(
+            session.enhance_prompt().as_deref(),
+            Some("Extra enhancement guidance")
+        );
+        assert!(session
+            .metadata
+            .get(PROMPT_COMPONENT_FLAGS_KEY)
+            .is_some_and(|flags| flags.contains("enhance=1")));
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_without_enhance_prompt_keeps_base_only() {
+        let session = prepare_chat_turn(
+            &InMemorySessionAccess,
+            chat_turn_input(None),
+            "",
+            "Builtin fallback",
+        )
+        .await
+        .expect("prepare_chat_turn should succeed");
+
+        let system_prompt = system_message_content(&session);
+        assert!(system_prompt.starts_with("Base prompt"));
+        assert!(session.enhance_prompt().is_none());
+        assert!(session
+            .metadata
+            .get(PROMPT_COMPONENT_FLAGS_KEY)
+            .is_some_and(|flags| flags.contains("enhance=0")));
+    }
 
     // The non-server disk fallback (`default_workspace_from_data_dir`) tested
     // directly + deterministically — no global workspace-provider involved (the
