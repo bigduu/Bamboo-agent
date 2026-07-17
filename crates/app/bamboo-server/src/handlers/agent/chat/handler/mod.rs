@@ -102,7 +102,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         Err(error) => {
             tracing::error!("Chat turn preparation failed: {error}");
             return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to prepare chat: {error}")
+                "error": crate::error::error_value(format!("Failed to prepare chat: {error}"))
             }));
         }
     };
@@ -183,7 +183,7 @@ async fn handle_goal_command(
         Some(s) => s,
         None => {
             return HttpResponse::NotFound().json(serde_json::json!({
-                "error": "Session not found",
+                "error": crate::error::error_value("Session not found"),
                 "session_id": session_id
             }));
         }
@@ -262,7 +262,7 @@ async fn handle_goal_command(
         Err(e) => {
             tracing::error!(session_id = %session_id, "Failed to persist gold_config: {e}");
             return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to update goal config: {e}")
+                "error": crate::error::error_value(format!("Failed to update goal config: {e}"))
             }));
         }
     }

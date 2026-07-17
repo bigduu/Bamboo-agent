@@ -8,7 +8,7 @@ pub(super) fn internal_server_error(action: &str, error: impl Display) -> Error 
 
 pub(super) fn schedule_not_found(schedule_id: &str) -> HttpResponse {
     HttpResponse::NotFound().json(serde_json::json!({
-        "error": "Schedule not found",
+        "error": crate::error::error_value("Schedule not found"),
         "schedule_id": schedule_id
     }))
 }

@@ -28,7 +28,7 @@ pub async fn truncate_messages(
 
     let Some(mut session) = load_session_or_404(&state, &session_id).await? else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };
@@ -37,7 +37,7 @@ pub async fn truncate_messages(
         TruncateRequest::AfterLastUser => {
             let Some(removed) = truncate_after_last_user(&mut session) else {
                 return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "No user message found to truncate after",
+                    "error": crate::error::error_value("No user message found to truncate after"),
                     "session_id": session_id
                 })));
             };
@@ -95,7 +95,9 @@ pub async fn truncate_messages(
                     );
                     let Some(removed) = truncate_for_unresolved_tool_calls(&mut session) else {
                         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                            "error": "Found unresolved tool calls but no prior user message to retry from",
+                            "error": crate::error::error_value(
+                                "Found unresolved tool calls but no prior user message to retry from"
+                            ),
                             "session_id": session_id
                         })));
                     };

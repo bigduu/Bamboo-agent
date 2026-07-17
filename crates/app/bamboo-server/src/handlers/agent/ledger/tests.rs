@@ -90,7 +90,7 @@ async fn post_without_title_is_bad_request() {
         .expect("upsert");
     let (status, body) = response_json(response).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("title"));
+    assert!(body["error"]["message"].as_str().unwrap().contains("title"));
 }
 
 #[actix_web::test]
@@ -107,7 +107,10 @@ async fn post_with_bad_datetime_is_bad_request() {
     .expect("upsert");
     let (status, body) = response_json(response).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("due_at"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("due_at"));
 }
 
 #[actix_web::test]
@@ -124,7 +127,10 @@ async fn post_project_scope_without_key_is_bad_request() {
     .expect("upsert");
     let (status, body) = response_json(response).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("project_key"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("project_key"));
 }
 
 #[actix_web::test]

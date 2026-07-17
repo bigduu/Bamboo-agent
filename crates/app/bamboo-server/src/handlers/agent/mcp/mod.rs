@@ -19,6 +19,6 @@ pub use tool_handlers::{get_server_tools, list_tools};
 
 fn persist_config_error(message: impl Into<String>) -> HttpResponse {
     HttpResponse::InternalServerError().json(serde_json::json!({
-        "error": message.into()
+        "error": crate::error::error_value(message.into())
     }))
 }

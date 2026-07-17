@@ -152,6 +152,51 @@ mod tests {
         assert_eq!(normalized.as_deref(), Some("hourly sweep"));
     }
 
+    #[cfg(test)]
+    mod http_tests {
+        use actix_web::{http::StatusCode, test, web, App};
+        use serde_json::Value;
+        use tempfile::tempdir;
+
+        use crate::routes::configure_routes;
+        use crate::AppState;
+
+        /// `DELETE /api/v1/schedules/{id}` for an unknown schedule must use
+        /// the canonical nested error envelope (`{"error": {"message",
+        /// "type"}}`), not the old flat `{"error": "<string>"}` shape.
+        /// #251/#507.
+        #[actix_web::test]
+        async fn delete_schedule_not_found_uses_canonical_error_envelope() {
+            let temp_dir = tempdir().expect("tempdir");
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(
+                AppState::new(temp_dir.path().to_path_buf())
+                    .await
+                    .expect("app state"),
+            );
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::delete()
+                    .uri("/api/v1/schedules/does-not-exist")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            let body: Value = test::read_body_json(resp).await;
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["message"], "Schedule not found");
+            assert_eq!(body["schedule_id"], "does-not-exist");
+        }
+    }
+
     #[test]
     fn normalize_optional_name_drops_blank_values() {
         let normalized = normalize_optional_name(Some("   "));

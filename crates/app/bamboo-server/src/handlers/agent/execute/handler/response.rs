@@ -4,13 +4,13 @@ use super::super::{ExecuteResponse, ExecuteSyncInfo};
 
 pub(super) fn bad_request_error_response(message: impl Into<String>) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({
-        "error": message.into()
+        "error": crate::error::error_value(message.into())
     }))
 }
 
 pub(super) fn internal_server_error_response(message: impl Into<String>) -> HttpResponse {
     HttpResponse::InternalServerError().json(serde_json::json!({
-        "error": message.into()
+        "error": crate::error::error_value(message.into())
     }))
 }
 

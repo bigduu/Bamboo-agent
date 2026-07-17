@@ -82,7 +82,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
                 error
             );
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": "Failed to delete session"
+                "error": crate::error::error_value("Failed to delete session")
             })));
         }
     };
@@ -137,6 +137,6 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
     }
 
     Ok(HttpResponse::NotFound().json(serde_json::json!({
-        "error": "Session not found"
+        "error": crate::error::error_value("Session not found")
     })))
 }

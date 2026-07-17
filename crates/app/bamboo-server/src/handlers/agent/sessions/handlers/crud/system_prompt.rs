@@ -27,7 +27,7 @@ pub async fn get_system_prompt_snapshot(
             Some(session) => session,
             None => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "Session not found",
+                    "error": crate::error::error_value("Session not found"),
                     "session_id": session_id
                 })));
             }

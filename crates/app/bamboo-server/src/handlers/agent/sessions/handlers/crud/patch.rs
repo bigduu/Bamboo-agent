@@ -26,7 +26,9 @@ fn precondition_failed(session_id: &str, current: u64) -> HttpResponse {
     HttpResponse::PreconditionFailed()
         .insert_header((actix_web::http::header::ETAG, format!("\"{current}\"")))
         .json(serde_json::json!({
-            "error": "Version conflict: the session was modified by another client",
+            "error": crate::error::error_value(
+                "Version conflict: the session was modified by another client"
+            ),
             "session_id": session_id,
             "current_version": current,
         }))
@@ -67,7 +69,7 @@ pub async fn patch_session(
             Ok(_) => {}
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "Session not found",
+                    "error": crate::error::error_value("Session not found"),
                     "session_id": id
                 })));
             }
@@ -92,7 +94,7 @@ pub async fn patch_session(
             Ok(_) => {}
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "Session not found",
+                    "error": crate::error::error_value("Session not found"),
                     "session_id": id
                 })));
             }
@@ -115,7 +117,7 @@ pub async fn patch_session(
             Ok(value) => value,
             Err(error) => {
                 return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "Invalid gold_config",
+                    "error": crate::error::error_value("Invalid gold_config"),
                     "message": error.to_string()
                 })));
             }
@@ -131,7 +133,7 @@ pub async fn patch_session(
             Ok(_) => {}
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "Session not found",
+                    "error": crate::error::error_value("Session not found"),
                     "session_id": id
                 })));
             }
@@ -215,7 +217,7 @@ pub async fn patch_session(
 
         let Some(session) = updated else {
             return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                "error": "Session not found",
+                "error": crate::error::error_value("Session not found"),
                 "session_id": session_id
             })));
         };

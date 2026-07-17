@@ -67,7 +67,7 @@ pub async fn session_detail(state: web::Data<AppState>, path: web::Path<String>)
     match state.metrics_service.session_detail(&session_id).await {
         Ok(Some(detail)) => HttpResponse::Ok().json(detail),
         Ok(None) => HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Metrics for session not found",
+            "error": crate::error::error_value("Metrics for session not found"),
             "session_id": session_id,
         })),
         Err(error) => internal_error(error),

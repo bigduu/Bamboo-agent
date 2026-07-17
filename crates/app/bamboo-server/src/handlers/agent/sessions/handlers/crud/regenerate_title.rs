@@ -26,7 +26,7 @@ pub async fn regenerate_session_title(
 
     if !exists {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     }

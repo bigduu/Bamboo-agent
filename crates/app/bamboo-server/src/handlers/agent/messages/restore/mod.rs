@@ -34,7 +34,7 @@ pub async fn restore_session_state(
 
     if target_message_id.is_empty() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "target_message_id is required",
+            "error": crate::error::error_value("target_message_id is required"),
             "session_id": session_id,
         })));
     }
@@ -45,7 +45,7 @@ pub async fn restore_session_state(
 
     let Some(mut session) = load_session_or_404(&state, &session_id).await? else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };
@@ -53,7 +53,7 @@ pub async fn restore_session_state(
     let Some(target_index) = find_target_message_index(&session.messages, &target_message_id)
     else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Target message not found",
+            "error": crate::error::error_value("Target message not found"),
             "session_id": session_id,
             "target_message_id": target_message_id,
         })));

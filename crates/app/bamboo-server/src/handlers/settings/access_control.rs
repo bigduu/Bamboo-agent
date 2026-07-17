@@ -1112,10 +1112,9 @@ fn too_many_requests_response(retry_after_secs: u64) -> HttpResponse {
     HttpResponse::TooManyRequests()
         .insert_header((header::RETRY_AFTER, retry_after_secs.to_string()))
         .json(serde_json::json!({
-            "error": {
-                "message": "too many failed password attempts — try again later",
-                "type": "api_error",
-            }
+            "error": crate::error::error_value(
+                "too many failed password attempts — try again later"
+            )
         }))
 }
 

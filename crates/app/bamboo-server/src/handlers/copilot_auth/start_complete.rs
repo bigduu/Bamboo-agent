@@ -21,7 +21,7 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
             tracing::error!("Failed to build Copilot auth HTTP client (proxy?): {}", err);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
-                "error": format!("Failed to build HTTP client: {}", err),
+                "error": crate::error::error_value(format!("Failed to build HTTP client: {}", err)),
             })));
         }
     };
@@ -41,7 +41,7 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
             tracing::error!("Failed to get device code: {}", err);
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
-                "error": format!("Failed to get device code: {}", err)
+                "error": crate::error::error_value(format!("Failed to get device code: {}", err))
             })))
         }
     }
@@ -60,7 +60,7 @@ pub async fn complete_copilot_auth(
             tracing::error!("Failed to build Copilot auth HTTP client (proxy?): {}", err);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
-                "error": format!("Failed to build HTTP client: {}", err),
+                "error": crate::error::error_value(format!("Failed to build HTTP client: {}", err)),
             })));
         }
     };
@@ -104,7 +104,7 @@ pub async fn complete_copilot_auth(
             tracing::error!("Copilot authentication completion failed: {}", err);
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
-                "error": format!("Authentication failed: {}", err)
+                "error": crate::error::error_value(format!("Authentication failed: {}", err))
             })))
         }
     }

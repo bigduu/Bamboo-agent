@@ -13,7 +13,7 @@ pub async fn authenticate_copilot(
     if config.provider != "copilot" {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
-            "error": "Current provider is not Copilot"
+            "error": crate::error::error_value("Current provider is not Copilot")
         })));
     }
 
@@ -23,7 +23,7 @@ pub async fn authenticate_copilot(
             tracing::error!("Failed to build Copilot HTTP client (proxy?): {}", err);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
-                "error": format!("Failed to build HTTP client: {}", err),
+                "error": crate::error::error_value(format!("Failed to build HTTP client: {}", err)),
             })));
         }
     };
@@ -48,7 +48,7 @@ pub async fn authenticate_copilot(
             tracing::error!("Copilot authentication failed: {}", err);
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
-                "error": format!("Authentication failed: {}", err)
+                "error": crate::error::error_value(format!("Authentication failed: {}", err))
             })))
         }
     }

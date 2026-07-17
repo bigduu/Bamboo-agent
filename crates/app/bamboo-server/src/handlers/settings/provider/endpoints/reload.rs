@@ -11,14 +11,14 @@ pub(super) async fn handle_reload_provider_config(
     if let Err(error) = bamboo_llm::validate_provider_config(&new_config) {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
-            "error": error.to_string()
+            "error": crate::error::error_value(error.to_string())
         })));
     }
 
     if let Err(error) = app_state.reload_provider().await {
         return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "success": false,
-            "error": format!("Failed to reload provider: {error}")
+            "error": crate::error::error_value(format!("Failed to reload provider: {error}"))
         })));
     }
 

@@ -43,22 +43,26 @@ pub async fn submit_response(
                 return match error {
                     bamboo_engine::session_app::errors::RespondError::NotFound(_) => {
                         Ok(HttpResponse::NotFound().json(serde_json::json!({
-                            "error": "Session not found"
+                            "error": crate::error::error_value("Session not found")
                         })))
                     }
                     bamboo_engine::session_app::errors::RespondError::NoPendingQuestion => {
                         Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                            "error": "No pending question waiting for response"
+                            "error": crate::error::error_value(
+                                "No pending question waiting for response"
+                            )
                         })))
                     }
                     bamboo_engine::session_app::errors::RespondError::InvalidResponse(msg) => {
                         Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                            "error": "Invalid response",
+                            "error": crate::error::error_value("Invalid response"),
                             "message": msg,
                         })))
                     }
                     _ => Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                        "error": format!("Response submission failed: {error}")
+                        "error": crate::error::error_value(format!(
+                            "Response submission failed: {error}"
+                        ))
                     }))),
                 };
             }

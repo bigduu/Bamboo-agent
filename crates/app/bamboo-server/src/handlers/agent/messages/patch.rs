@@ -19,7 +19,7 @@ pub async fn patch_message(
 
     if content.trim().is_empty() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "content must not be empty",
+            "error": crate::error::error_value("content must not be empty"),
             "session_id": session_id,
             "message_id": message_id,
         })));
@@ -31,7 +31,7 @@ pub async fn patch_message(
 
     let Some(mut session) = load_session_or_404(&state, &session_id).await? else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Session not found",
+            "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
     };
@@ -42,7 +42,7 @@ pub async fn patch_message(
         .find(|message| message.id == message_id)
     else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": "Message not found",
+            "error": crate::error::error_value("Message not found"),
             "session_id": session_id,
             "message_id": message_id,
         })));
@@ -56,7 +56,7 @@ pub async fn patch_message(
 
     if !matches!(message.role, Role::Assistant) || has_tool_calls {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "Only assistant text messages can be updated",
+            "error": crate::error::error_value("Only assistant text messages can be updated"),
             "session_id": session_id,
             "message_id": message_id,
         })));
@@ -75,4 +75,79 @@ pub async fn patch_message(
         "message_id": message_id,
         "message_count": message_count,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{http::StatusCode, test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    async fn new_state() -> web::Data<AppState> {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        )
+    }
+
+    /// `PATCH /api/v1/sessions/{id}/messages/{id}` on an unknown session must
+    /// use the canonical nested error envelope (`{"error": {"message",
+    /// "type"}}`), not the old flat `{"error": "<string>"}` shape. #251/#507.
+    #[actix_web::test]
+    async fn patch_message_not_found_uses_canonical_error_envelope() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri("/api/v1/sessions/does-not-exist/messages/does-not-exist")
+                .set_json(serde_json::json!({ "content": "edited" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Session not found");
+        assert_eq!(body["session_id"], "does-not-exist");
+    }
+
+    /// A blank `content` is a 400 with the same canonical envelope shape.
+    #[actix_web::test]
+    async fn patch_message_empty_content_uses_canonical_error_envelope() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri("/api/v1/sessions/some-session/messages/some-message")
+                .set_json(serde_json::json!({ "content": "   " }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "content must not be empty");
+    }
 }
