@@ -298,6 +298,32 @@ impl ChildSessionAdapter {
             .collect()
     }
 
+    /// The subset of `candidates` the session index POSITIVELY reports as
+    /// terminal children of this parent, as `(child_id, status)` pairs
+    /// (issue #546). Unknown ids are not reported — an index-less backend or
+    /// a not-yet-indexed child must not be mistaken for a finished one.
+    pub async fn terminal_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidates: &[String],
+    ) -> Vec<(String, String)> {
+        let statuses = self
+            .storage
+            .list_child_run_statuses(parent_session_id)
+            .await
+            .unwrap_or_default();
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                statuses.iter().find_map(|(id, status)| {
+                    let status = status.as_deref()?;
+                    (id == candidate && is_terminal_child_status(status))
+                        .then(|| (candidate.clone(), status.to_string()))
+                })
+            })
+            .collect()
+    }
+
     /// Persist a batch of parent-wait registrations in one runtime-only save.
     async fn flush_parent_waits(
         &self,
@@ -769,6 +795,14 @@ impl ChildSessionPort for ChildSessionAdapter {
 
     async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
         ChildSessionAdapter::active_child_ids(self, parent_session_id).await
+    }
+
+    async fn terminal_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidates: &[String],
+    ) -> Vec<(String, String)> {
+        ChildSessionAdapter::terminal_child_ids(self, parent_session_id, candidates).await
     }
 
     async fn ensure_child_indexed(&self, child_session_id: &str) {

@@ -21,6 +21,7 @@ use crate::runtime::config::{
     AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig, GuardianConfig,
     GuardianSpawner, ImageFallbackConfig,
 };
+use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -162,6 +163,19 @@ pub struct SessionExecutionArgs {
     /// Optional bespoke finalization, run after the runner is finalized and
     /// before the session is persisted. See [`SessionCompletionHook`].
     pub on_complete: Option<SessionCompletionHook>,
+
+    /// Child-completion publisher for CHILD sessions driven through this path
+    /// (issue #546). The canonical first run of a child goes through
+    /// `run_child_spawn`, which publishes its own terminal completion — but a
+    /// child RESUMED later (after an approval, a clarification answer, or a
+    /// nested child-parent woken by its own children) runs through
+    /// `spawn_session_execution` and previously published nothing, so the
+    /// waiting parent was never woken. When set and `session.kind == Child`
+    /// with a parent id, the terminal block invokes this handler after the
+    /// final persist + runner finalization. Non-terminal suspends publish the
+    /// non-terminal "suspended" status, which the coordinator's terminality
+    /// guard ignores.
+    pub child_completion_handler: Option<Arc<dyn super::ChildCompletionHandler>>,
 }
 
 /// The per-request parameter subset of [`SessionExecutionArgs`] — everything
@@ -319,6 +333,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 runners,
                 sessions_cache,
                 on_complete,
+                child_completion_handler,
             } = args;
 
             // The primary model is required for a spawn; the roster stores it as
@@ -385,7 +400,36 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 },
             );
 
-            let result = agent.execute(&mut session, execute_request).await;
+            // Panic containment (issue #546): everything below — the terminal
+            // status persist, finalize_runner, and the child-completion
+            // publish — only runs if this task survives execution. An
+            // unwinding panic would leave a zombie Running runner entry (which
+            // blinds liveness checks) and, for a child session, strand its
+            // waiting parent. Map a panic to a terminal error instead.
+            let result = {
+                use futures::FutureExt;
+                match std::panic::AssertUnwindSafe(agent.execute(&mut session, execute_request))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        tracing::error!(
+                            "[{}] agent execution panicked; finalizing as terminal error: {}",
+                            session_id,
+                            message
+                        );
+                        Err(AgentError::LLM(format!(
+                            "agent execution panicked: {message}"
+                        )))
+                    }
+                }
+            };
 
             // Send terminal event for all error cases (including cancellation).
             if let Some(error_event) = terminal_error_event_for_result(&result) {
@@ -453,11 +497,51 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // lingering in its optimistic-settle window.
             finalize_runner(&runners, &session_id, &result).await;
 
+            // A CHILD session finishing through this path (a resumed child, or
+            // a nested child-parent woken by its own children) must wake its
+            // waiting parent (issue #546). Publish AFTER the final persist and
+            // runner finalization so the coordinator reads the child's settled
+            // terminal state — the resume message folds in the child's final
+            // assistant content from storage. The status mirrors the
+            // `last_run_status` mapping above; a non-terminal "suspended" is
+            // published too and ignored by the coordinator's terminality guard.
+            let child_completion = child_completion_handler.filter(|_| {
+                session.kind == bamboo_agent_core::SessionKind::Child
+                    && session.parent_session_id.is_some()
+            });
+            let parent_session_id = session.parent_session_id.clone();
+            let child_status = session.last_run_status();
+            let child_error = session.last_run_error();
+
             // Update memory cache.
             sessions_cache.insert(
                 session_id.clone(),
                 Arc::new(parking_lot::RwLock::new(session)),
             );
+
+            if let (Some(handler), Some(parent_session_id), Some(status)) =
+                (child_completion, parent_session_id, child_status)
+            {
+                use futures::FutureExt;
+                let completion = ChildCompletion {
+                    parent_session_id: parent_session_id.clone(),
+                    child_session_id: session_id.clone(),
+                    status,
+                    error: child_error,
+                    completed_at: chrono::Utc::now(),
+                };
+                if std::panic::AssertUnwindSafe(handler.on_child_completed(completion))
+                    .catch_unwind()
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        %parent_session_id,
+                        child_session_id = %session_id,
+                        "child completion handler panicked on resumed-child terminal"
+                    );
+                }
+            }
 
             tracing::info!("[{}] Agent execution completed", session_id);
         }

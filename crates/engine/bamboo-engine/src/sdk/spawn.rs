@@ -100,6 +100,17 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
 
     if session.kind != SessionKind::Child {
         let error = "spawn job child session is not kind=child".to_string();
+        // Persist the terminal status so the session index never reports this
+        // child as pending/running — a wait registered over it later (or the
+        // orphan safety net) would otherwise hang on a status that no future
+        // completion can ever advance.
+        session.set_last_run_status("error");
+        session.set_last_run_error(error.clone());
+        let _ = ctx
+            .agent
+            .persistence()
+            .save_runtime_session(&mut session)
+            .await;
         publish_child_completion_parts(
             &parent_tx,
             ctx.completion_handler.clone(),
@@ -111,6 +122,17 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         .await;
         return Err(error);
     }
+
+    // Clear suspend leftovers from a PRIOR run (issue #546): a child that
+    // suspended (clarification/approval), was answered through the parent via
+    // `send_message`/`run`, and is now re-enqueued still carries the old
+    // `runtime.suspend_reason` + pending question — none of the re-run entry
+    // points perform respond.rs's clear. The terminal mapping below must only
+    // observe suspend state stamped by THIS run, otherwise a genuinely
+    // completed re-run is published as non-terminal "suspended" and the
+    // parent stalls until the wait lease expires.
+    session.metadata.remove("runtime.suspend_reason");
+    session.clear_pending_question();
 
     // Ensure last message is user (otherwise nothing to do).
     let last_is_user = session
@@ -160,6 +182,17 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     )
     .await
     else {
+        // A Running runner already exists for this child (duplicate enqueue, or
+        // a stale entry left by a dead task). Publish nothing: if the earlier
+        // run is alive its own completion will fire; if it is a stale entry the
+        // child-wait watchdog will detect the dead child and synthesize an
+        // error completion. Publishing "error" here would falsely satisfy the
+        // parent's wait while a genuine run is still in flight.
+        tracing::warn!(
+            parent_session_id = %job.parent_session_id,
+            child_session_id = %job.child_session_id,
+            "child spawn skipped: runner already registered for this child"
+        );
         return Ok(());
     };
 
@@ -273,11 +306,43 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // via BashOutput. No strand can occur because the gate refuses to
         // suspend without the hook. (The parent-resume path re-wires the hook,
         // so a RESUMED run is covered; only the initial child run is not.)
+        // Panic containment: this task's terminal block below is the ONLY thing
+        // that publishes the child's completion — if execution panics and the
+        // task unwinds, the parent waits forever on a wake that can never fire.
+        // Catch the unwind and map it to a terminal error instead. The session
+        // may have been partially mutated by the panicking run; that is
+        // acceptable — we persist what we have and surface the panic as the
+        // child's error so the parent can decide how to proceed.
         let result: crate::runtime::runner::Result<()> =
             if external_runner.should_handle(&session).await {
-                external_runner
-                    .execute_external_child(&mut session, &job, mpsc_tx, cancel_token.clone())
-                    .await
+                use futures::FutureExt;
+                match std::panic::AssertUnwindSafe(external_runner.execute_external_child(
+                    &mut session,
+                    &job,
+                    mpsc_tx,
+                    cancel_token.clone(),
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        tracing::error!(
+                            parent_session_id = %job.parent_session_id,
+                            child_session_id = %job.child_session_id,
+                            panic = %message,
+                            "child execution panicked; publishing terminal error completion"
+                        );
+                        Err(bamboo_agent_core::AgentError::LLM(format!(
+                            "child execution panicked: {message}"
+                        )))
+                    }
+                }
             } else {
                 Err(bamboo_agent_core::AgentError::LLM(format!(
                 "No child runner matched session runtime metadata: agent_id={:?}, protocol={:?}",
@@ -297,19 +362,22 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // likewise NOT done — it must not publish a premature terminal
         // "completed" to its parent while a `run_in_background` shell is still
         // running for it.
-        let suspended_non_terminal = session
-            .metadata
-            .get("runtime.suspend_reason")
-            .map(|reason| {
-                matches!(
-                    reason.as_str(),
-                    "awaiting_parent_approval" | "waiting_for_bash"
-                )
-            })
-            .unwrap_or(false);
+        //
+        // Issue #546: the same holds for EVERY suspend reason — a child-parent
+        // suspending on its own grandchildren (waiting_for_children) or on a
+        // human clarification is not done either. Any non-empty suspend reason
+        // maps to the non-terminal "suspended" status (mirroring the top-level
+        // mapping in `agent_spawn`), which the completion coordinator's
+        // terminality guard leaves un-counted; the real terminal completion is
+        // published when the child later resumes and finishes.
+        let suspended_non_terminal = result.is_ok()
+            && session
+                .metadata
+                .get("runtime.suspend_reason")
+                .is_some_and(|reason| !reason.trim().is_empty());
         let (status, error) = if let Some(reason) = timeout_error {
             ("timeout".to_string(), Some(reason))
-        } else if suspended_non_terminal && result.is_ok() {
+        } else if suspended_non_terminal {
             ("suspended".to_string(), None)
         } else {
             match &result {

@@ -495,6 +495,10 @@ async fn create_with_wait_true_suspends_and_registers_wait() {
 #[tokio::test]
 async fn wait_action_with_explicit_children_suspends_and_registers() {
     let harness = build_test_harness().await;
+    // The jsonl-backed harness has no child index, so nothing is positively
+    // reported terminal and every requested id must be KEPT (issue #546:
+    // unknown ≠ finished — only index-confirmed terminal ids are dropped; a
+    // truly bogus id is rescued by the child-wait watchdog at runtime).
     let result = invoke_completed(
         &harness.tool,
         json!({
@@ -515,6 +519,13 @@ async fn wait_action_with_explicit_children_suspends_and_registers() {
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
     assert_eq!(payload["status"].as_str(), Some("waiting"));
     assert_eq!(payload["wait_for"].as_str(), Some("any"));
+    assert_eq!(
+        payload["already_terminal_child_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "nothing may be dropped when the index reports no terminal children: {payload}"
+    );
 
     let parent = harness
         .storage

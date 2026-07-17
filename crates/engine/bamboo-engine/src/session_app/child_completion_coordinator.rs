@@ -11,8 +11,9 @@ use std::time::Duration;
 use bamboo_domain::poison::PoisonRecover;
 
 use crate::execution::{
-    create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
-    ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
+    create_event_forwarder, finalize_runner, spawn_session_execution, try_reserve_runner,
+    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, RunnerReservation,
+    SessionExecutionArgs,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -27,7 +28,7 @@ use bamboo_agent_core::{
     AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session,
 };
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForChildrenState,
 };
 use bamboo_llm::{Config, ProviderModelRouter, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
@@ -163,6 +164,7 @@ fn wait_policy_satisfied(
     policy: ChildWaitPolicy,
     wait_child_ids: &[String],
     completed_child_ids: &[String],
+    latest_child_id: &str,
     latest_status: &str,
 ) -> bool {
     if wait_child_ids.is_empty() {
@@ -177,7 +179,12 @@ fn wait_policy_satisfied(
             .iter()
             .any(|id| wait_child_ids.iter().any(|wait_id| wait_id == id)),
         ChildWaitPolicy::FirstError => {
-            is_error_like(latest_status)
+            // The error short-circuit only counts a completion from a child
+            // this wait actually tracks (issue #546): a stray/duplicate
+            // completion from an untracked child — e.g. a frozen runner's
+            // task waking up after the watchdog already synthesized its
+            // timeout, in a later run's wait — must not resume the parent.
+            (is_error_like(latest_status) && wait_child_ids.iter().any(|id| id == latest_child_id))
                 || wait_child_ids
                     .iter()
                     .all(|id| completed_child_ids.iter().any(|completed| completed == id))
@@ -394,6 +401,15 @@ impl ChildCompletionCoordinator {
             }
         }
         // Exhausted the AlreadyRunning retry budget; surface the final state.
+        // The wait state was already cleared and the resume message persisted,
+        // so nothing event-driven will retry — the child-wait watchdog is the
+        // backstop that picks this stranded parent up (it resumes suspended
+        // sessions that hold a pending runtime resume message but no runner).
+        tracing::error!(
+            %parent_session_id,
+            "parent resume gave up after AlreadyRunning retry budget; \
+             relying on the child-wait watchdog backstop"
+        );
         ResumeOutcome::AlreadyRunning {
             run_id: String::new(),
         }
@@ -413,6 +429,24 @@ impl ChildCompletionCoordinator {
 #[async_trait]
 impl ChildCompletionHandler for ChildCompletionCoordinator {
     async fn on_child_completed(&self, completion: ChildCompletion) {
+        // Terminality guard: a child that reports a NON-terminal status (e.g.
+        // "suspended" — awaiting parent approval, its own bash wait, or its own
+        // grandchildren) is not done. It must never satisfy the parent's wait:
+        // `derive_completed_child_ids` folds the just-reported child in
+        // unconditionally, so without this guard a suspending child would
+        // resume the parent with a premature "finished with status
+        // `suspended`" message. The child will publish a real terminal
+        // completion when it later resumes and finishes.
+        if !is_terminal_child_status(&completion.status) {
+            tracing::info!(
+                parent_session_id = %completion.parent_session_id,
+                child_session_id = %completion.child_session_id,
+                status = %completion.status,
+                "non-terminal child status; leaving the parent wait armed"
+            );
+            return;
+        }
+
         // Acquire the per-session async lock to eliminate the concurrent
         // double-resume race (see `parent_locks` for the full scenario). The
         // inner std::sync::Mutex is released immediately so no sync lock is
@@ -457,6 +491,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 wait.wait_for,
                 &wait.child_session_ids,
                 &completed_child_ids,
+                &completion.child_session_id,
                 &completion.status,
             );
             if should_resume {
@@ -468,24 +503,58 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         if should_resume {
             parent.metadata.remove("runtime.suspend_reason");
-            // Load the completed child once. The guardian branch inspects its
-            // subagent_type + final verdict; the generic path folds its final
-            // assistant content into the hidden resume message (avoiding an extra
-            // `SubAgent.get` round trip after resume).
-            let loaded_child = match self
+
+            // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
+            // model-provided and unvalidated, and the watchdog unstrands a wait
+            // over a FOREIGN/unknown id by publishing a synthetic completion
+            // here. We must resume the parent (so it is not stranded) but MUST
+            // NOT fold that foreign session's transcript into the parent — that
+            // would be a cross-session disclosure primitive. Decide ownership
+            // from the child's OWN parent linkage (control-plane only, no
+            // messages loaded), and only load its full content when it is truly
+            // this parent's child. An unowned id resumes with the neutral/error
+            // message (`runtime_resume_message` falls back to `completion.error`
+            // when no child content is supplied).
+            let reported_child_owned = match self
                 .storage
-                .load_session(&completion.child_session_id)
+                .load_runtime_control_plane(&completion.child_session_id)
                 .await
             {
-                Ok(child) => child,
-                Err(error) => {
-                    tracing::warn!(
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "failed to load child session for runtime resume message"
-                    );
-                    None
+                Ok(Some(control_plane)) => completion_child_is_owned(
+                    &completion.parent_session_id,
+                    control_plane.parent_session_id.as_deref(),
+                ),
+                _ => false,
+            };
+
+            // Load the completed child once, ONLY when owned. The guardian
+            // branch inspects its subagent_type + final verdict; the generic
+            // path folds its final assistant content into the hidden resume
+            // message (avoiding an extra `SubAgent.get` round trip after resume).
+            let loaded_child = if reported_child_owned {
+                match self
+                    .storage
+                    .load_session(&completion.child_session_id)
+                    .await
+                {
+                    Ok(child) => child,
+                    Err(error) => {
+                        tracing::warn!(
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "failed to load child session for runtime resume message"
+                        );
+                        None
+                    }
                 }
+            } else {
+                tracing::warn!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    "completion child is not a child of this parent; resuming with a neutral \
+                     message and NOT folding its content"
+                );
+                None
             };
 
             // Guardian branch: a completing guardian reviewer that matches the
@@ -791,6 +860,10 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
             on_complete: None,
+            // A resumed session that is itself a CHILD (nested sub-agents)
+            // must publish its terminal completion so ITS parent is woken
+            // in turn (issue #546).
+            child_completion_handler: Some(Arc::new(self.clone())),
         });
     }
 }
@@ -1225,10 +1298,777 @@ impl BashCompletionSink for ChildCompletionCoordinator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Child-wait watchdog (issue #546)
+// ---------------------------------------------------------------------------
+
+/// How often the child-wait watchdog sweeps suspended sessions.
+const CHILD_WAIT_SWEEP_INTERVAL_SECS: u64 = 30;
+/// Leave a freshly registered wait alone for this long so the event-driven
+/// completion push always gets the first shot (and just-enqueued spawn jobs
+/// have time to persist their running marker).
+const CHILD_WAIT_REGISTRATION_GRACE_SECS: i64 = 60;
+/// A waited child with NO live runner and a non-terminal index status is
+/// declared dead once its control-plane has been quiet for this long.
+const DEAD_CHILD_GRACE_SECS: i64 = 120;
+/// Slack on top of the per-child liveness policy before a Running-but-frozen
+/// runner entry (dead task) is force-finalized by the sweeper. The per-child
+/// watchdog cancels at `max_idle`/`max_total` and the child then publishes its
+/// own timeout; an entry frozen this far PAST those limits proves that
+/// machinery is dead.
+const STALE_RUNNER_SLACK_SECS: i64 = 600;
+
+/// Whether a waited child's index status means the sweeper must consider it
+/// DEAD when nothing is driving it: non-terminal and not legitimately
+/// suspended. `None` = never ran (created-but-never-started, or a spawn that
+/// was lost before its running marker persisted).
+fn is_dead_child_candidate_status(status: Option<&str>) -> bool {
+    match status {
+        // "suspended" children wait on a human / their own children / bash —
+        // their wake has its own driver; never declare them dead here.
+        Some(status) => !is_terminal_child_status(status) && status != "suspended",
+        None => true,
+    }
+}
+
+/// Whether a reported completion's child id is genuinely a child of the parent
+/// it claims (issue #546 read-side disclosure guard). `SubAgent.wait` ids are
+/// model-provided, and the watchdog resolves an unowned id by publishing a
+/// synthetic completion so the parent is unstranded — but the parent must NEVER
+/// receive a FOREIGN session's content folded into its transcript.
+/// `child_parent_linkage` is that session's own `parent_session_id` (`None`
+/// when the session does not exist). Pure so the rule is unit-testable.
+fn completion_child_is_owned(reported_parent: &str, child_parent_linkage: Option<&str>) -> bool {
+    child_parent_linkage == Some(reported_parent)
+}
+
+/// Pick which terminal child's completion to replay when the wait is already
+/// satisfied but the parent is still suspended (lost wake). Prefer an
+/// error-like child so a `FirstError` policy re-evaluates truthfully.
+fn select_replay_child(terminal: &[(String, String)]) -> Option<&(String, String)> {
+    terminal
+        .iter()
+        .find(|(_, status)| is_error_like(status))
+        .or_else(|| terminal.last())
+}
+
+fn child_wait_watchdog_resume_message(body: String) -> Message {
+    let mut message = Message::user(body);
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY: "child_wait_watchdog_resume",
+    }));
+    message.never_compress = false;
+    message
+}
+
+fn empty_child_wait_message() -> Message {
+    child_wait_watchdog_resume_message(
+        "Runtime notification: this session was suspended waiting for child sessions, but the \
+         wait tracked no children (internal inconsistency). The session has been resumed; use \
+         SubAgent.list to inspect child state and continue the task."
+            .to_string(),
+    )
+}
+
+fn child_wait_lease_expired_message(child_ids: &[String]) -> Message {
+    child_wait_watchdog_resume_message(format!(
+        "Runtime notification: the wait lease for child session(s) [{}] expired before they all \
+         reported completion. They were NOT cancelled and may still be running or already \
+         finished — verify their actual status with SubAgent.list / SubAgent.get before assuming \
+         anything, then continue the task.",
+        child_ids.join(", ")
+    ))
+}
+
+/// Child-wait watchdog (issue #546): the heartbeat backstop for parents
+/// suspended on `waiting_for_children`.
+///
+/// The primary wake is the event-driven completion push (child terminal →
+/// [`ChildCompletionHandler::on_child_completed`] → resume). This sweeper
+/// exists because ANY break in that chain — a panicked child task, a dead
+/// spawn scheduler, a process restart, a clobbered/exhausted resume, a wait
+/// registered over an already-terminal child — previously stranded the parent
+/// forever. It mirrors the bash backstop's philosophy: coarse, cheap, yields
+/// to the push, and only acts when the durable state proves nothing else can.
+///
+/// All wake decisions funnel through the SAME machinery the push uses
+/// (synthetic/replayed completions → `on_child_completed`, per-parent
+/// serialization via [`session_resume_lock`]), so there is exactly one resume
+/// implementation.
+impl ChildCompletionCoordinator {
+    /// Spawn the watchdog: one boot-time reconciliation pass, then a sweep
+    /// every [`CHILD_WAIT_SWEEP_INTERVAL_SECS`]. Call once at server startup.
+    pub fn spawn_child_wait_watchdog(self: &Arc<Self>) {
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move {
+            use futures::FutureExt;
+            if std::panic::AssertUnwindSafe(coordinator.reconcile_orphans_at_boot())
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!("child-wait watchdog: boot reconciliation panicked");
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                CHILD_WAIT_SWEEP_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate tick (boot reconciliation just ran).
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits())
+                    .catch_unwind()
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("child-wait watchdog: sweep panicked; continuing");
+                }
+            }
+        });
+    }
+
+    /// One-shot startup reconciliation: a process restart kills every in-flight
+    /// child task AND the in-memory bash backstop polls, but the durable state
+    /// (child index status `running`, parents suspended on bash) survives —
+    /// previously stranding those parents forever.
+    async fn reconcile_orphans_at_boot(&self) {
+        let cutoff = Utc::now();
+
+        // (1) Children left `running` by the previous process: no task in THIS
+        // process is driving them, so no completion will ever fire. Mark them
+        // terminal and wake their parents through the canonical path. (Root
+        // sessions left `running` are user-visible and user-recoverable; only
+        // children hold a suspended parent hostage.)
+        let running = self
+            .storage
+            .list_sessions_by_run_status("running")
+            .await
+            .unwrap_or_default();
+        for (child_id, parent_id) in running {
+            let Some(parent_id) = parent_id else { continue };
+            if self.runner_is_running(&child_id).await {
+                continue;
+            }
+            let Some(control_plane) = self.load_control_plane(&child_id).await else {
+                continue;
+            };
+            // A child that started AFTER boot is alive by definition — the
+            // cutoff guards the tiny window where a fresh spawn races this scan.
+            if control_plane.updated_at >= cutoff {
+                continue;
+            }
+            tracing::warn!(
+                child_session_id = %child_id,
+                parent_session_id = %parent_id,
+                "boot reconciliation: child was running when the process died; \
+                 marking it error and waking the parent"
+            );
+            self.synthesize_child_completion(
+                &parent_id,
+                &child_id,
+                "error",
+                Some(
+                    "orphaned by server restart: the process died while this child session \
+                     was running"
+                        .to_string(),
+                ),
+            )
+            .await;
+        }
+
+        // (2) Sessions suspended on `waiting_for_bash`: their backstop poll was
+        // an in-memory task that died with the process. Re-arm it — with the
+        // shell registry empty after a restart it resumes on its first check.
+        let suspended = self
+            .storage
+            .list_sessions_by_run_status("suspended")
+            .await
+            .unwrap_or_default();
+        for (session_id, _) in suspended {
+            let Some(control_plane) = self.load_control_plane(&session_id).await else {
+                continue;
+            };
+            if control_plane
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str)
+                != Some("waiting_for_bash")
+            {
+                continue;
+            }
+            if let Some(wait) = read_runtime_state(&control_plane).waiting_for_bash {
+                tracing::warn!(
+                    %session_id,
+                    "boot reconciliation: re-arming bash self-resume backstop lost in restart"
+                );
+                let coordinator = self.clone();
+                tokio::spawn(async move {
+                    coordinator
+                        .bash_self_resume(session_id, wait.bash_ids)
+                        .await;
+                });
+            }
+        }
+    }
+
+    async fn runner_is_running(&self, session_id: &str) -> bool {
+        let runners = self.agent_runners.read().await;
+        runners
+            .get(session_id)
+            .is_some_and(|runner| matches!(runner.status, AgentStatus::Running))
+    }
+
+    async fn load_control_plane(&self, session_id: &str) -> Option<Session> {
+        match self.storage.load_runtime_control_plane(session_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "child-wait watchdog: failed to load session control plane"
+                );
+                None
+            }
+        }
+    }
+
+    /// One sweep: inspect every session whose index status is `suspended`.
+    /// Cheap in the common case — the candidate list is small and each check is
+    /// a sidecar (control-plane) load.
+    async fn sweep_child_waits(&self) {
+        let suspended = match self.storage.list_sessions_by_run_status("suspended").await {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(%error, "child-wait watchdog: failed to list suspended sessions");
+                return;
+            }
+        };
+        for (session_id, _) in suspended {
+            self.sweep_one_suspended_session(&session_id).await;
+        }
+    }
+
+    async fn sweep_one_suspended_session(&self, session_id: &str) {
+        // A live runner means the session already resumed (the index status
+        // only advances at its next terminal) — nothing to do.
+        if self.runner_is_running(session_id).await {
+            return;
+        }
+        let Some(session) = self.load_control_plane(session_id).await else {
+            return;
+        };
+        let runtime_state = read_runtime_state(&session);
+        let suspend_reason = session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match (
+            suspend_reason.as_str(),
+            runtime_state.waiting_for_children.clone(),
+        ) {
+            // Human-gated or bash-owned waits: not ours to time out.
+            ("waiting_for_bash", _)
+            | ("awaiting_clarification", _)
+            | ("awaiting_parent_approval", _) => {}
+            (_, Some(wait)) => self.sweep_child_wait(session_id, wait).await,
+            // Suspended with NO armed wait: either the coordinator cleared the
+            // wait but its resume never spawned, or state is half-cleared.
+            ("waiting_for_children", None) | ("", None) => {
+                self.rescue_stranded_resume(session_id).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Evaluate one armed child wait against reality and act on what the
+    /// durable state proves: dead children are synthesized terminal, an
+    /// already-satisfied wait gets its lost wake replayed, an expired lease or
+    /// empty wait force-resumes the parent.
+    async fn sweep_child_wait(&self, parent_session_id: &str, wait: WaitingForChildrenState) {
+        let now = Utc::now();
+
+        if wait.child_session_ids.is_empty() {
+            tracing::warn!(
+                %parent_session_id,
+                "child-wait watchdog: wait armed over an empty child set; force-resuming"
+            );
+            self.force_resume_child_wait(parent_session_id, empty_child_wait_message())
+                .await;
+            return;
+        }
+
+        // The 6h lease (previously written but never read). Expiry does not
+        // kill children — child runners own child liveness; the parent is
+        // resumed with a verify-don't-assume note.
+        if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
+            tracing::warn!(
+                %parent_session_id,
+                "child-wait watchdog: wait lease expired; force-resuming parent"
+            );
+            self.force_resume_child_wait(
+                parent_session_id,
+                child_wait_lease_expired_message(&wait.child_session_ids),
+            )
+            .await;
+            return;
+        }
+
+        // Yield to the event-driven push on fresh waits.
+        if now.signed_duration_since(wait.registered_at).num_seconds()
+            < CHILD_WAIT_REGISTRATION_GRACE_SECS
+        {
+            return;
+        }
+
+        let statuses: HashMap<String, Option<String>> = self
+            .storage
+            .list_child_run_statuses(parent_session_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        struct DeadChild {
+            child_id: String,
+            status: String,
+            reason: String,
+            /// `false` = the id does not name a child of THIS parent (wait ids
+            /// are model-provided and unvalidated): publish the wake but never
+            /// persist onto / cancel / finalize the named session.
+            owned: bool,
+        }
+
+        let mut terminal: Vec<(String, String)> = Vec::new();
+        let mut dead: Vec<DeadChild> = Vec::new();
+        for child_id in &wait.child_session_ids {
+            let status = statuses.get(child_id).and_then(|status| status.as_deref());
+            if let Some(status) = status {
+                if is_terminal_child_status(status) {
+                    terminal.push((child_id.clone(), status.to_string()));
+                    continue;
+                }
+            }
+            if !is_dead_child_candidate_status(status) {
+                continue;
+            }
+
+            // Ownership check BEFORE anything destructive: `SubAgent.wait` ids
+            // are model-provided and unvalidated, so an id absent from the
+            // parent-scoped status map may name a REAL session in another tree
+            // (a grandchild, a foreign root). Such a session must never be
+            // mutated, cancelled, or finalized here — but the parent's bogus
+            // wait entry still needs a synthetic completion to clear it.
+            let control_plane = self.load_control_plane(child_id).await;
+            let owned = control_plane
+                .as_ref()
+                .is_some_and(|cp| cp.parent_session_id.as_deref() == Some(parent_session_id));
+            if !owned {
+                dead.push(DeadChild {
+                    child_id: child_id.clone(),
+                    status: "error".to_string(),
+                    reason: if control_plane.is_some() {
+                        "waited-on session id is not a child of this session; clearing it \
+                         from the wait without touching that session"
+                            .to_string()
+                    } else {
+                        "waited-on child session does not exist".to_string()
+                    },
+                    owned: false,
+                });
+                continue;
+            }
+
+            let runner = { self.agent_runners.read().await.get(child_id).cloned() };
+            match runner {
+                Some(runner) if matches!(runner.status, AgentStatus::Running) => {
+                    // A live-looking runner: only intervene when it is frozen
+                    // far PAST the per-child liveness limits — which proves the
+                    // per-child watchdog machinery itself is dead (task
+                    // panicked or lost), because it would have cancelled and
+                    // published a timeout long before.
+                    let last_activity = runner.last_event_at.unwrap_or(runner.started_at);
+                    let idle_secs = now.signed_duration_since(last_activity).num_seconds();
+                    let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
+                    let policy = match &control_plane {
+                        Some(child) => {
+                            crate::runtime::execution::spawn::watchdog_policy_for_session(child)
+                        }
+                        None => Default::default(),
+                    };
+                    let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
+                    let total_limit = policy
+                        .max_total_secs
+                        .saturating_add(STALE_RUNNER_SLACK_SECS);
+                    if idle_secs >= idle_limit || total_secs >= total_limit {
+                        runner.cancel_token.cancel();
+                        dead.push(DeadChild {
+                            child_id: child_id.clone(),
+                            status: "timeout".to_string(),
+                            reason: format!(
+                                "child runner stalled: no events for {idle_secs}s \
+                                 (limit {idle_limit}s including watchdog slack); \
+                                 force-finalized by the child-wait watchdog"
+                            ),
+                            owned: true,
+                        });
+                    }
+                }
+                _ => {
+                    // Nothing is driving this child, yet its index status will
+                    // never advance by itself. The grace covers the enqueue →
+                    // running-marker window and slow spawn queues.
+                    let quiet_secs = control_plane
+                        .as_ref()
+                        .map(|child| now.signed_duration_since(child.updated_at).num_seconds())
+                        .unwrap_or(i64::MAX);
+                    if quiet_secs >= DEAD_CHILD_GRACE_SECS {
+                        dead.push(DeadChild {
+                            child_id: child_id.clone(),
+                            status: "error".to_string(),
+                            reason: format!(
+                                "child runner lost (crashed task, dropped spawn job, or \
+                                 process restart): index status {status:?} with no live \
+                                 runner driving it"
+                            ),
+                            owned: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !dead.is_empty() {
+            for entry in dead {
+                tracing::warn!(
+                    %parent_session_id,
+                    child_session_id = %entry.child_id,
+                    status = %entry.status,
+                    reason = %entry.reason,
+                    owned = entry.owned,
+                    "child-wait watchdog: synthesizing terminal completion for dead child"
+                );
+                if entry.owned {
+                    self.synthesize_child_completion(
+                        parent_session_id,
+                        &entry.child_id,
+                        &entry.status,
+                        Some(entry.reason),
+                    )
+                    .await;
+                } else {
+                    // Foreign / nonexistent id: wake the parent only.
+                    self.publish_synthetic_completion(
+                        parent_session_id,
+                        &entry.child_id,
+                        &entry.status,
+                        Some(entry.reason),
+                    )
+                    .await;
+                }
+            }
+            // The publishes above re-evaluate the wait policy themselves.
+            return;
+        }
+
+        // No dead children — but if the terminal set ALREADY satisfies the
+        // policy, the original wake was lost (clobbered resume / retry budget
+        // exhausted / completion raced the wait registration). Replay one real
+        // completion through the canonical path; `on_child_completed` is
+        // idempotent for an already-cleared wait.
+        let terminal_ids: Vec<String> = terminal.iter().map(|(id, _)| id.clone()).collect();
+        if let Some((child_id, status)) = select_replay_child(&terminal) {
+            if wait_policy_satisfied(
+                wait.wait_for,
+                &wait.child_session_ids,
+                &terminal_ids,
+                child_id,
+                status,
+            ) {
+                tracing::warn!(
+                    %parent_session_id,
+                    child_session_id = %child_id,
+                    "child-wait watchdog: wait already satisfied but parent still suspended \
+                     (lost wake); replaying the completion"
+                );
+                let error = self
+                    .load_control_plane(child_id)
+                    .await
+                    .and_then(|child| child.last_run_error());
+                self.publish_synthetic_completion(parent_session_id, child_id, status, error)
+                    .await;
+            }
+        }
+    }
+
+    /// Persist a synthesized terminal status on the child (so the index flips
+    /// and nothing re-detects or re-suspends on it), finalize any lingering
+    /// runner entry (so a future re-run can reserve), then publish through the
+    /// canonical completion path — broadcast + `on_child_completed`, exactly
+    /// like a real child terminal.
+    async fn synthesize_child_completion(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        status: &str,
+        error: Option<String>,
+    ) {
+        match self.storage.load_session(child_session_id).await {
+            Ok(Some(mut child)) => {
+                // Ownership guard (defense in depth — callers check too): only
+                // a session that IS a child of this parent may be mutated. An
+                // arbitrary session id named in a wait still wakes the parent
+                // via the publish below, but its own state stays untouched.
+                if child.parent_session_id.as_deref() != Some(parent_session_id) {
+                    tracing::warn!(
+                        %parent_session_id,
+                        child_session_id = %child.id,
+                        "child-wait watchdog: refusing to synthesize status onto a session \
+                         that is not a child of this parent"
+                    );
+                    self.publish_synthetic_completion(
+                        parent_session_id,
+                        child_session_id,
+                        status,
+                        error,
+                    )
+                    .await;
+                    return;
+                }
+                child.set_last_run_status(status);
+                match &error {
+                    Some(message) => child.set_last_run_error(message.clone()),
+                    None => child.clear_last_run_error(),
+                }
+                child.updated_at = Utc::now();
+                if let Err(save_error) = self.persistence.merge_save_runtime(&mut child).await {
+                    tracing::warn!(
+                        child_session_id = %child.id,
+                        %save_error,
+                        "child-wait watchdog: failed to persist synthesized terminal status"
+                    );
+                }
+                self.sessions
+                    .insert(child.id.clone(), Arc::new(parking_lot::RwLock::new(child)));
+            }
+            Ok(None) => {}
+            Err(load_error) => {
+                tracing::warn!(
+                    %child_session_id,
+                    %load_error,
+                    "child-wait watchdog: failed to load child for synthesized terminal status"
+                );
+            }
+        }
+        finalize_runner(
+            &self.agent_runners,
+            child_session_id,
+            &Err(bamboo_agent_core::AgentError::LLM(
+                error
+                    .clone()
+                    .unwrap_or_else(|| format!("synthesized {status}")),
+            )),
+        )
+        .await;
+        self.publish_synthetic_completion(parent_session_id, child_session_id, status, error)
+            .await;
+    }
+
+    async fn publish_synthetic_completion(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        status: &str,
+        error: Option<String>,
+    ) {
+        let parent_tx = crate::execution::session_events::get_or_create_event_sender(
+            &self.session_event_senders,
+            parent_session_id,
+        )
+        .await;
+        let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
+        crate::runtime::execution::spawn::publish_child_completion_parts(
+            &parent_tx,
+            Some(handler),
+            parent_session_id.to_string(),
+            child_session_id.to_string(),
+            status.to_string(),
+            error,
+        )
+        .await;
+    }
+
+    /// A parent whose wait was already cleared (resume message appended) but
+    /// whose resume never spawned — retry-budget exhaustion, root-tools not
+    /// yet initialized, or a restart between clear and spawn. Detected by: no
+    /// live runner, no armed wait, and a pending hidden runtime resume message
+    /// as the LAST message. Resume is all that's left to do.
+    async fn rescue_stranded_resume(&self, session_id: &str) {
+        let Some(session) = self.load_session(session_id).await else {
+            return;
+        };
+        let pending_runtime_resume = session.messages.last().is_some_and(|message| {
+            matches!(message.role, Role::User)
+                && message
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|meta| meta.get(RUNTIME_RESUME_MESSAGE_KIND_KEY).is_some())
+        });
+        if !pending_runtime_resume {
+            return;
+        }
+        tracing::warn!(
+            %session_id,
+            "child-wait watchdog: stranded resume detected (wait cleared, resume never \
+             spawned); resuming"
+        );
+        self.resume_parent(session_id.to_string()).await;
+    }
+
+    /// Clear the parent's child wait, append `resume_message`, and drive the
+    /// resume — with a bounded clobber-retry mirroring
+    /// [`Self::perform_bash_resume`]: a suspending runner's one-shot finalize
+    /// save can land after ours and revert the wait while dropping the
+    /// message; we detect the re-armed wait and re-clear.
+    async fn force_resume_child_wait(&self, session_id: &str, resume_message: Message) {
+        const MAX_ATTEMPTS: u8 = 5;
+        let lock = session_resume_lock(session_id);
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            {
+                let _held = lock.lock().await;
+                let Some(mut session) = self.load_session(session_id).await else {
+                    return;
+                };
+                let mut runtime_state = read_runtime_state(&session);
+                if runtime_state.waiting_for_children.is_none() {
+                    // Another source already resumed this parent.
+                    return;
+                }
+                runtime_state.waiting_for_children = None;
+                runtime_state.status = AgentStatusState::Idle;
+                runtime_state.suspension = None;
+                write_runtime_state(&mut session, &runtime_state);
+                session.metadata.remove("runtime.suspend_reason");
+                session.add_message(resume_message.clone());
+                session.updated_at = Utc::now();
+                self.save_and_cache(&mut session).await;
+            }
+            let outcome = self.resume_parent(session_id.to_string()).await;
+            match outcome {
+                ResumeOutcome::Started { .. } | ResumeOutcome::NotFound => return,
+                ResumeOutcome::Completed | ResumeOutcome::AlreadyRunning { .. } => {
+                    // Only retry when the persisted wait was clobbered back to
+                    // armed; if it stayed cleared with the message intact, the
+                    // next sweep's stranded-resume rescue finishes the job.
+                    let clobbered = self
+                        .load_session(session_id)
+                        .await
+                        .map(|session| read_runtime_state(&session).waiting_for_children.is_some())
+                        .unwrap_or(false);
+                    if !clobbered {
+                        return;
+                    }
+                }
+            }
+        }
+        tracing::error!(
+            %session_id,
+            "child-wait watchdog: force-resume exhausted its clobber-retry budget"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_agent_core::Message;
+
+    // ── child-wait watchdog pure helpers (issue #546) ────────────────────
+
+    #[test]
+    fn dead_child_candidate_status_matrix() {
+        // Never ran / lost before the running marker: dead candidate.
+        assert!(is_dead_child_candidate_status(None));
+        // Actively-reported non-terminal statuses: dead candidates when nothing
+        // is driving them.
+        assert!(is_dead_child_candidate_status(Some("running")));
+        assert!(is_dead_child_candidate_status(Some("pending")));
+        // Legitimately quiescent: waiting on a human / own children / bash.
+        assert!(!is_dead_child_candidate_status(Some("suspended")));
+        // Terminal statuses can never be "dead" — they are already done.
+        for status in ["completed", "error", "timeout", "cancelled", "skipped"] {
+            assert!(!is_dead_child_candidate_status(Some(status)), "{status}");
+        }
+    }
+
+    #[test]
+    fn completion_child_ownership_gates_content_fold() {
+        // Owned: the child's own parent linkage matches the reporting parent.
+        assert!(completion_child_is_owned("parent-1", Some("parent-1")));
+        // Foreign: a real session that belongs to a DIFFERENT parent — its
+        // content must never be folded into parent-1's transcript.
+        assert!(!completion_child_is_owned("parent-1", Some("parent-2")));
+        // Root/unparented session, or a nonexistent id (linkage None).
+        assert!(!completion_child_is_owned("parent-1", None));
+    }
+
+    #[test]
+    fn replay_child_prefers_error_like_for_first_error_policy() {
+        let terminal = vec![
+            ("c-ok".to_string(), "completed".to_string()),
+            ("c-err".to_string(), "timeout".to_string()),
+            ("c-late".to_string(), "completed".to_string()),
+        ];
+        let (id, status) = select_replay_child(&terminal).expect("non-empty");
+        assert_eq!(id, "c-err");
+        assert_eq!(status, "timeout");
+
+        let all_ok = vec![
+            ("c-1".to_string(), "completed".to_string()),
+            ("c-2".to_string(), "completed".to_string()),
+        ];
+        let (id, _) = select_replay_child(&all_ok).expect("non-empty");
+        assert_eq!(id, "c-2");
+
+        assert!(select_replay_child(&[]).is_none());
+    }
+
+    #[test]
+    fn watchdog_resume_messages_are_hidden_runtime_messages() {
+        for message in [
+            empty_child_wait_message(),
+            child_wait_lease_expired_message(&["c-1".to_string(), "c-2".to_string()]),
+        ] {
+            assert!(matches!(message.role, Role::User));
+            let meta = message.metadata.expect("hidden runtime metadata");
+            assert_eq!(meta[RUNTIME_RESUME_MESSAGE_HIDDEN_KEY], true);
+            assert_eq!(
+                meta[RUNTIME_RESUME_MESSAGE_KIND_KEY],
+                "child_wait_watchdog_resume"
+            );
+        }
+        let lease = child_wait_lease_expired_message(&["c-1".to_string()]);
+        // The lease message must never claim the children finished.
+        assert!(lease.content.contains("NOT cancelled"));
+        assert!(lease.content.contains("c-1"));
+    }
+
+    // ── on_child_completed terminality guard (issue #546) ────────────────
+
+    #[test]
+    fn non_terminal_statuses_never_satisfy_wait_policies() {
+        // The guard keys on `is_terminal_child_status`; "suspended" (and any
+        // unknown non-terminal string) must not count toward any policy.
+        assert!(!is_terminal_child_status("suspended"));
+        assert!(!is_terminal_child_status("running"));
+        assert!(!is_terminal_child_status("pending"));
+    }
 
     fn make_completion(status: &str) -> ChildCompletion {
         ChildCompletion {
@@ -1300,12 +2140,44 @@ mod tests {
             ChildWaitPolicy::All,
             &waited,
             &["a".to_string()],
+            "a",
             "completed"
         ));
         assert!(wait_policy_satisfied(
             ChildWaitPolicy::All,
             &waited,
             &["a".to_string(), "b".to_string()],
+            "b",
+            "completed"
+        ));
+    }
+
+    #[test]
+    fn wait_policy_first_error_requires_tracked_membership() {
+        let waited = vec!["a".to_string(), "b".to_string()];
+        // An error from a TRACKED child resumes immediately.
+        assert!(wait_policy_satisfied(
+            ChildWaitPolicy::FirstError,
+            &waited,
+            &["a".to_string()],
+            "a",
+            "error"
+        ));
+        // An error-like completion from an UNTRACKED child (e.g. a zombie
+        // task from an earlier run waking up late) must not resume the wait.
+        assert!(!wait_policy_satisfied(
+            ChildWaitPolicy::FirstError,
+            &waited,
+            &["a".to_string()],
+            "stray-child",
+            "timeout"
+        ));
+        // The all-complete fallback still applies regardless of the reporter.
+        assert!(wait_policy_satisfied(
+            ChildWaitPolicy::FirstError,
+            &waited,
+            &["a".to_string(), "b".to_string()],
+            "stray-child",
             "completed"
         ));
     }

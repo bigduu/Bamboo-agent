@@ -568,6 +568,9 @@ impl ResumeExecutionPort for ConnectResumePort {
                 runners: self.ctx.agent_runners.clone(),
                 sessions_cache: self.ctx.session_repo.cache().clone(),
                 on_complete: None,
+                // Connect drives root sessions; a child finishing on this
+                // path is backstopped by the child-wait watchdog (#546).
+                child_completion_handler: None,
             });
             return;
         };
@@ -678,6 +681,9 @@ impl ResumeExecutionPort for ConnectResumePort {
                 runners: ctx.agent_runners.clone(),
                 sessions_cache: ctx.session_repo.cache().clone(),
                 on_complete: None,
+                // Connect drives root sessions; a child finishing on this
+                // path is backstopped by the child-wait watchdog (#546).
+                child_completion_handler: None,
             });
         });
     }

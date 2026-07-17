@@ -88,10 +88,43 @@ impl SpawnScheduler {
     pub fn new(ctx: SpawnContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<SpawnJob>(128);
 
+        // The worker loop is a single point of failure for ALL child spawning:
+        // if it unwinds, queued jobs are dropped with no completion published
+        // and every later enqueue fails with "spawn scheduler is not running"
+        // for the rest of the process lifetime. Run each job on its own task
+        // and await the JoinHandle — a panicking job is isolated, keeps the
+        // worker alive, and still publishes a terminal error completion so the
+        // waiting parent is woken instead of stranded.
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                if let Err(err) = run_spawn_job(ctx.clone(), job).await {
-                    tracing::warn!("spawn job failed: {}", err);
+                let job_ctx = ctx.clone();
+                let job_for_panic = job.clone();
+                let handle = tokio::spawn(async move {
+                    if let Err(err) = run_spawn_job(job_ctx, job).await {
+                        tracing::warn!("spawn job failed: {}", err);
+                    }
+                });
+                if let Err(join_error) = handle.await {
+                    tracing::error!(
+                        parent_session_id = %job_for_panic.parent_session_id,
+                        child_session_id = %job_for_panic.child_session_id,
+                        error = %join_error,
+                        "spawn job panicked; publishing terminal error completion"
+                    );
+                    let parent_tx = super::session_events::get_or_create_event_sender(
+                        &ctx.session_event_senders,
+                        &job_for_panic.parent_session_id,
+                    )
+                    .await;
+                    publish_child_completion_parts(
+                        &parent_tx,
+                        ctx.completion_handler.clone(),
+                        job_for_panic.parent_session_id.clone(),
+                        job_for_panic.child_session_id.clone(),
+                        "error".to_string(),
+                        Some(format!("child spawn panicked: {join_error}")),
+                    )
+                    .await;
                 }
             }
         });
@@ -110,8 +143,11 @@ impl SpawnScheduler {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChildWatchdogPolicy {
     check_interval_secs: i64,
-    max_total_secs: i64,
-    max_idle_secs: i64,
+    // pub(crate): the child-wait watchdog (#546) reads these limits to decide
+    // when a Running runner entry whose task died (frozen last_event_at) is
+    // stale beyond what the per-child liveness watchdog could still act on.
+    pub(crate) max_total_secs: i64,
+    pub(crate) max_idle_secs: i64,
 }
 
 impl Default for ChildWatchdogPolicy {
@@ -163,7 +199,26 @@ async fn publish_child_completion(
     });
 
     if let Some(handler) = completion_handler {
-        handler.on_child_completed(completion).await;
+        // Contain a panicking handler: this call frequently runs on the caller's
+        // only liveness-critical task (the child's terminal block, or the spawn
+        // scheduler worker for early failures). Unwinding here would kill that
+        // task after the child already looks terminal everywhere — the classic
+        // stranded-parent signature. The child-wait watchdog backstops the wake
+        // that a panicked handler failed to deliver.
+        use futures::FutureExt;
+        let parent_session_id = completion.parent_session_id.clone();
+        let child_session_id = completion.child_session_id.clone();
+        if std::panic::AssertUnwindSafe(handler.on_child_completed(completion))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                %parent_session_id,
+                %child_session_id,
+                "child completion handler panicked; child-wait watchdog will backstop the parent wake"
+            );
+        }
     }
 }
 
