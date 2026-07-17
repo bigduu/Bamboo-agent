@@ -5,8 +5,16 @@
 //! and forwards the subscription stream back out as `Message` frames. Reachable
 //! on any address (`0.0.0.0:PORT`) so workers deployed via subprocess / Docker /
 //! SSH can dial home over the network.
+//!
+//! TLS (`wss://`, #48): [`BrokerServer::with_tls`] wraps every accepted
+//! `TcpStream` in a `tokio_rustls::TlsAcceptor` before the WS upgrade, using
+//! the SAME cert/key-loading helper `bamboo-subagent`'s own `WsServer::bind_tls`
+//! uses (`bamboo_subagent::transport::build_server_config`) — one hardened
+//! implementation, two call sites. Plaintext `ws://` (no `with_tls` call)
+//! stays the default — zero regression for loopback/trusted-link use.
 
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -14,8 +22,10 @@ use futures_util::{SinkExt, StreamExt};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, WebSocketStream};
 
@@ -23,7 +33,6 @@ use crate::core::{BrokerCore, PushItem};
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::{BrokerFrame, ClientFrame};
 
-type Ws = WebSocketStream<TcpStream>;
 /// Un-keyed (single-bucket) token-bucket limiter for one connection's
 /// `Deliver` rate (#53).
 type DeliverLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
@@ -85,6 +94,10 @@ pub struct BrokerServer {
     /// `limits.max_connections`. Held for the lifetime of each connection's
     /// task (#53).
     connection_slots: Arc<Semaphore>,
+    /// TLS acceptor for terminating `wss://` before the WS upgrade — `None`
+    /// (the default) keeps the historical bare-`TcpStream` `ws://` behavior.
+    /// Set via [`with_tls`](Self::with_tls). #48.
+    tls: Option<TlsAcceptor>,
 }
 
 impl BrokerServer {
@@ -104,7 +117,31 @@ impl BrokerServer {
             token: token.into(),
             connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
             limits,
+            tls: None,
         }
+    }
+
+    /// Terminate TLS (`wss://`) on every accepted connection before the WS
+    /// upgrade, built from a PEM `cert_file`/`key_file` pair (#48). Reuses
+    /// `bamboo_subagent::transport::build_server_config` (rustls + explicit
+    /// `ring` provider) — the exact cert/key-loading logic
+    /// `bamboo-subagent`'s own `WsServer::bind_tls` uses — so the workspace
+    /// resolves a single crypto provider and never hits the rustls 0.23
+    /// no-default-provider panic.
+    ///
+    /// **Fail-fast:** a missing/unreadable/unparseable cert or key returns
+    /// `Err` immediately — this never silently falls back to plaintext.
+    pub fn with_tls(mut self, cert_file: &Path, key_file: &Path) -> BrokerResult<Self> {
+        let server_config = bamboo_subagent::transport::build_server_config(cert_file, key_file)
+            .map_err(BrokerError::Tls)?;
+        self.tls = Some(TlsAcceptor::from(Arc::new(server_config)));
+        Ok(self)
+    }
+
+    /// `true` once [`with_tls`](Self::with_tls) has configured a TLS acceptor
+    /// — i.e. this server terminates `wss://`, not bare `ws://`.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
     }
 
     /// Accept connections forever, one task each. Returns only on a listener
@@ -126,7 +163,21 @@ impl BrokerServer {
                 Ok(permit) => {
                     tokio::spawn(async move {
                         let _permit = permit; // held for the connection's lifetime
-                        if let Err(e) = server.handle_conn(stream).await {
+                                              // The TLS handshake (when configured) runs inside this
+                                              // spawned task, not on the accept loop, so a slow/hostile
+                                              // client can't stall acceptance of other connections —
+                                              // mirrors `bamboo_subagent::transport::WsServer::serve`'s
+                                              // same tradeoff (#48).
+                        let result = match &server.tls {
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(tls_stream) => server.handle_conn(tls_stream).await,
+                                Err(e) => Err(BrokerError::Tls(format!(
+                                    "tls accept handshake ({peer}): {e}"
+                                ))),
+                            },
+                            None => server.handle_conn(stream).await,
+                        };
+                        if let Err(e) = result {
                             tracing::debug!("broker connection ended: {e}");
                         }
                     });
@@ -143,7 +194,15 @@ impl BrokerServer {
         }
     }
 
-    async fn handle_conn(&self, stream: TcpStream) -> BrokerResult<()> {
+    /// Perform the WS upgrade + serve loop over an already-TLS-terminated (or
+    /// plaintext) stream. Generic over the stream type so ONE implementation
+    /// serves both bare `TcpStream` (`ws://`) and `TlsStream<TcpStream>`
+    /// (`wss://`) connections (#48) — mirrors
+    /// `bamboo_subagent::transport::handle_conn`'s same genericization.
+    async fn handle_conn<S>(&self, stream: S) -> BrokerResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let ws = accept_async(stream)
             .await
             .map_err(|e| BrokerError::Transport(format!("ws accept: {e}")))?;
@@ -303,7 +362,15 @@ async fn next_pushed(rx: &mut Option<mpsc::UnboundedReceiver<PushItem>>) -> Opti
 }
 
 /// Read the next client frame, skipping ping/pong/binary. `Ok(None)` on close.
-async fn read_client_frame(source: &mut SplitStream<Ws>) -> BrokerResult<Option<ClientFrame>> {
+/// Generic over the underlying stream (plain `TcpStream` or
+/// `TlsStream<TcpStream>`, #48) so plaintext and TLS connections share one
+/// implementation.
+async fn read_client_frame<S>(
+    source: &mut SplitStream<WebSocketStream<S>>,
+) -> BrokerResult<Option<ClientFrame>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         match source.next().await {
             Some(Ok(Message::Text(t))) => {
@@ -318,7 +385,13 @@ async fn read_client_frame(source: &mut SplitStream<Ws>) -> BrokerResult<Option<
     }
 }
 
-async fn send(sink: &mut SplitSink<Ws, Message>, frame: BrokerFrame) -> BrokerResult<()> {
+async fn send<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    frame: BrokerFrame,
+) -> BrokerResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     sink.send(Message::text(frame.to_text()))
         .await
         .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))

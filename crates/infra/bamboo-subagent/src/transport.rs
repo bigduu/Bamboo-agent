@@ -318,7 +318,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Build a rustls [`rustls::ServerConfig`] from PEM cert/key files against an
 /// explicit `ring` provider (mirrors `bamboo-server`'s `build_rustls_config`).
-fn build_server_config(cert_file: &Path, key_file: &Path) -> Result<rustls::ServerConfig, String> {
+///
+/// `pub` (not crate-private) so a sibling network-facing crate — e.g.
+/// `bamboo-broker`'s own WS listener (#48) — can build a `TlsAcceptor` from
+/// the exact same, already-hardened cert/key-loading logic instead of
+/// duplicating it. Keeps the workspace's "single crypto provider" invariant
+/// (see this function's own `ring` provider construction below) enforced in
+/// one place.
+pub fn build_server_config(
+    cert_file: &Path,
+    key_file: &Path,
+) -> Result<rustls::ServerConfig, String> {
     use std::fs::File;
     use std::io::BufReader;
 

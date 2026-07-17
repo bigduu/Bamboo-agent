@@ -33,8 +33,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::deploy::{
-    agent_argv, broker_port, sh_quote, AgentDeployment, DeployedAgent, Deployer, RemoteDeployment,
-    UploadSpec,
+    agent_argv, broker_port, broker_scheme, sh_quote, AgentDeployment, DeployedAgent, Deployer,
+    RemoteDeployment, UploadSpec,
 };
 use crate::error::{BrokerError, BrokerResult};
 
@@ -371,8 +371,12 @@ impl Deployer for RusshDeployer {
         };
 
         // 5. Launch the worker pointed at the tunnel mouth on the remote loopback.
+        // Scheme preserved from the original endpoint (#48): the tunnel forwards
+        // raw bytes end-to-end, so a `wss://` broker still needs the worker to
+        // open a TLS handshake over it — hardcoding `ws://` would break that.
         let mut tunneled = d.clone();
-        tunneled.broker_endpoint = format!("ws://127.0.0.1:{bport}");
+        tunneled.broker_endpoint =
+            format!("{}://127.0.0.1:{bport}", broker_scheme(&d.broker_endpoint));
         let remote_cmd = build_launch_cmd(
             &tunneled,
             &self.bamboo_on_remote,
@@ -643,6 +647,7 @@ mod tests {
             mcp_proxy: Some("bamboo-orchestrator".into()),
             log_path: None,
             spec_json: None,
+            tls_ca_cert: None,
         }
     }
 
