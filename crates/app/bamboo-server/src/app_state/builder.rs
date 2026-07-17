@@ -646,6 +646,13 @@ impl AppState {
         let bash_resume_hook: Arc<dyn bamboo_engine::BashResumeHook> =
             child_completion_coordinator.clone();
 
+        // Child-wait watchdog (issue #546): boot-time reconciliation of
+        // children orphaned by a restart, then a periodic heartbeat sweep that
+        // backstops every lost child→parent wake (panicked child task, dead
+        // spawn scheduler, clobbered resume, expired wait lease, ...). Spawned
+        // AFTER `set_root_tools` above so a boot-time parent resume can spawn.
+        child_completion_coordinator.spawn_child_wait_watchdog();
+
         // Cluster-fabric reconcile: session-bound workers died with the previous
         // bamboo process (kill-on-drop child / in-memory russh session), so any
         // persisted `Running`/`Deploying` node state is stale on boot. Flip it to

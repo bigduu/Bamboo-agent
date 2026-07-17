@@ -217,6 +217,10 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
         on_complete: None,
+        // Resumed/child sessions finishing on this path wake their waiting
+        // parent through the completion coordinator (issue #546); the
+        // publish is gated on kind=Child inside `spawn_session_execution`.
+        child_completion_handler: Some(args.state.child_completion_coordinator.clone()),
     });
 }
 

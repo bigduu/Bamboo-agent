@@ -1332,6 +1332,19 @@ impl Storage for SessionStoreV2 {
             .collect())
     }
 
+    async fn list_sessions_by_run_status(
+        &self,
+        status: &str,
+    ) -> io::Result<Vec<(String, Option<String>)>> {
+        let index = self.index.read().await;
+        Ok(index
+            .sessions
+            .values()
+            .filter(|entry| entry.last_run_status.as_deref() == Some(status))
+            .map(|entry| (entry.id.clone(), entry.parent_session_id.clone()))
+            .collect())
+    }
+
     async fn append_token_usage_record(&self, session_id: &str, json_line: &str) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
@@ -1872,6 +1885,42 @@ mod tests {
         assert_eq!(got[1].0, "ch-pending");
         // pending child has no terminal status mirrored yet.
         assert!(got[1].1.as_deref() != Some("completed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_sessions_by_run_status_matches_index_and_reports_parent() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+
+        let mut root = Session::new("r-susp".to_string(), "m".to_string());
+        root.metadata
+            .insert("last_run_status".to_string(), "suspended".to_string());
+        storage.save_session(&root).await?;
+
+        let mut child = Session::new_child("ch-run", "r-susp", "m", "c");
+        child
+            .metadata
+            .insert("last_run_status".to_string(), "running".to_string());
+        storage.save_session(&child).await?;
+
+        let mut done = Session::new("r-done".to_string(), "m".to_string());
+        done.metadata
+            .insert("last_run_status".to_string(), "completed".to_string());
+        storage.save_session(&done).await?;
+
+        let suspended = storage.list_sessions_by_run_status("suspended").await?;
+        assert_eq!(suspended, vec![("r-susp".to_string(), None)]);
+
+        let running = storage.list_sessions_by_run_status("running").await?;
+        assert_eq!(
+            running,
+            vec![("ch-run".to_string(), Some("r-susp".to_string()))]
+        );
+
+        assert!(storage
+            .list_sessions_by_run_status("timeout")
+            .await?
+            .is_empty());
         Ok(())
     }
 

@@ -219,6 +219,20 @@ fn waiting_for_children_tool_result(mut value: serde_json::Value) -> Result<Tool
     })
 }
 
+/// Split an explicit `SubAgent.wait` id list into `(targets, dropped)`:
+/// `dropped` = ids the index positively reported terminal (waiting on them
+/// could never be satisfied — issue #546), `targets` = everything else,
+/// including unknown ids (kept: the watchdog rescues a bogus id at runtime;
+/// an index-less backend reports nothing terminal and filters nothing).
+fn partition_wait_targets(
+    requested: Vec<String>,
+    known_terminal: &[String],
+) -> (Vec<String>, Vec<String>) {
+    requested
+        .into_iter()
+        .partition(|id| !known_terminal.contains(id))
+}
+
 /// Map a `ChildSessionError` to a `ToolError`.
 fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
     match error {
@@ -783,19 +797,45 @@ impl Tool for SubAgentTool {
             } => {
                 let policy = wait_for.unwrap_or(ChildWaitPolicy::All);
                 // Default to every currently-active child; honor an explicit
-                // subset when provided.
-                let targets = match child_session_ids {
-                    Some(ids) if !ids.is_empty() => ids,
-                    _ => self.sessions.active_child_ids(&parent.id).await,
+                // subset when provided. Explicit ids the index POSITIVELY
+                // reports terminal are dropped (issue #546): a terminal child
+                // fires no further completion, so a wait registered over it
+                // previously suspended the parent forever. Unknown ids are
+                // KEPT (an index-less backend or a not-yet-indexed child must
+                // not be mistaken for finished); if such an id turns out to be
+                // bogus, the child-wait watchdog rescues the parent at runtime.
+                let (targets, dropped): (Vec<String>, Vec<String>) = match child_session_ids {
+                    Some(ids) if !ids.is_empty() => {
+                        let terminal = self.sessions.terminal_child_ids(&parent.id, &ids).await;
+                        partition_wait_targets(ids, &terminal)
+                    }
+                    _ => (
+                        self.sessions.active_child_ids(&parent.id).await,
+                        Vec::new(),
+                    ),
                 };
 
                 if targets.is_empty() {
-                    // Nothing to wait on — never register an empty wait (that
-                    // would suspend the parent with no child able to resume it).
+                    // Nothing left to wait on — never register an empty wait
+                    // (that would suspend the parent with no child able to
+                    // resume it). Any explicitly named children are already
+                    // terminal (or unknown): tell the model to read their
+                    // results instead of suspending.
+                    let note = if dropped.is_empty() {
+                        "No active child sessions to wait for; the parent continues running."
+                            .to_string()
+                    } else {
+                        format!(
+                            "The requested child session(s) [{}] are already finished; nothing \
+                             to wait for. Use SubAgent.get to read their results.",
+                            dropped.join(", ")
+                        )
+                    };
                     return tool_result(json!({
                         "status": "no_active_children",
                         "parent_session_id": parent_session_id,
-                        "note": "No active child sessions to wait for; the parent continues running.",
+                        "already_terminal_child_ids": dropped,
+                        "note": note,
                     }))
                     .map(ToolOutcome::Completed);
                 }
@@ -810,6 +850,7 @@ impl Tool for SubAgentTool {
                     "status": "waiting",
                     "parent_session_id": parent_session_id,
                     "child_session_ids": targets,
+                    "already_terminal_child_ids": dropped,
                     "wait_for": policy.as_str(),
                     "waiting_on": count,
                 }))
@@ -971,6 +1012,29 @@ impl Tool for SubAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_wait_targets_drops_only_known_terminal_ids() {
+        let (targets, dropped) = partition_wait_targets(
+            vec!["done".into(), "running".into(), "unknown".into()],
+            &["done".to_string()],
+        );
+        assert_eq!(targets, vec!["running".to_string(), "unknown".to_string()]);
+        assert_eq!(dropped, vec!["done".to_string()]);
+
+        // Index-less backend: nothing reported terminal → nothing filtered.
+        let (targets, dropped) = partition_wait_targets(vec!["a".into(), "b".into()], &[]);
+        assert_eq!(targets, vec!["a".to_string(), "b".to_string()]);
+        assert!(dropped.is_empty());
+
+        // Everything already finished → nothing left to wait on.
+        let (targets, dropped) = partition_wait_targets(
+            vec!["a".into(), "b".into()],
+            &["a".to_string(), "b".to_string()],
+        );
+        assert!(targets.is_empty());
+        assert_eq!(dropped, vec!["a".to_string(), "b".to_string()]);
+    }
 
     #[test]
     fn normalize_title_accepts_legacy_description() {

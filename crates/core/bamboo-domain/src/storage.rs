@@ -61,6 +61,22 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// List `(session_id, parent_session_id)` for every session whose
+    /// `last_run_status` equals `status`, sourced from the backend's index.
+    ///
+    /// The child-wait watchdog (issue #546) uses this to cheaply enumerate
+    /// candidates — sessions suspended on children (`status == "suspended"`)
+    /// and orphaned children left `"running"` by a process restart — without
+    /// loading every session. Backends without an index return an empty list
+    /// by default, which degrades the watchdog to a no-op (never an error).
+    async fn list_sessions_by_run_status(
+        &self,
+        status: &str,
+    ) -> std::io::Result<Vec<(String, Option<String>)>> {
+        let _ = status;
+        Ok(Vec::new())
+    }
+
     /// Append one analysis record — a single JSON line — to the session's
     /// dedicated, append-only token-usage log, stored alongside the session's
     /// other files in its per-session directory.
