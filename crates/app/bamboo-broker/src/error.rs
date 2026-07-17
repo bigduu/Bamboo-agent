@@ -16,6 +16,13 @@ pub enum BrokerError {
     /// WebSocket / IO transport failure.
     #[error("transport: {0}")]
     Transport(String),
+    /// TLS configuration / handshake failure — bad/missing cert or key
+    /// (server `wss://` listener, #48), a bad custom CA (client-side
+    /// self-signed trust), or the TLS handshake itself failing. Kept distinct
+    /// from [`Self::Transport`] so callers/logs can tell "the TLS layer
+    /// rejected this" apart from a plain socket/WS-protocol failure.
+    #[error("tls: {0}")]
+    Tls(String),
     /// `deliver` refused: the target session's mailbox already holds
     /// `limit` pending (undelivered-or-unacked) messages — a backlog cap
     /// against a flood aimed at an offline/never-draining mailbox filling

@@ -2,7 +2,22 @@
 //! reader that demuxes incoming frames into a `messages` stream and a
 //! `delivered` receipt stream — so one connection can both deliver and
 //! subscribe (the parent does both: deliver an Ask, subscribe for the Reply).
+//!
+//! TLS (`wss://`, #48): a bare `ws://` endpoint always worked unencrypted; a
+//! `wss://` endpoint now works TWO ways —
+//! - **CA-signed cert** (Let's Encrypt, a corporate/internal CA already
+//!   installed in the OS trust store, …): zero configuration.
+//!   [`BrokerClient::connect`] negotiates TLS against the OS's native root
+//!   store (`tokio-tungstenite`'s `rustls-tls-native-roots` feature).
+//! - **Self-signed cert** (the common homelab/cross-network quick-start):
+//!   [`BrokerClient::connect_with_tls`] takes an explicit
+//!   `rustls::ClientConfig` — build one with
+//!   [`client_config_trusting_cert`] (or
+//!   `bamboo_subagent::transport::client_config_trusting_cert` directly) to
+//!   trust exactly the worker/broker's own cert with no OS trust-store
+//!   changes.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,11 +27,24 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::{BrokerFrame, ClientFrame};
+
+/// Build a rustls [`rustls::ClientConfig`] that trusts exactly the
+/// certificate(s) in `cert_file` (PEM) — for connecting to a broker or
+/// broker-agent serving a self-signed cert over `wss://` (#48). Thin wrapper
+/// over `bamboo_subagent::transport::client_config_trusting_cert` (same
+/// helper `ChildClient`'s direct-WS path already uses) that maps its
+/// `Result<_, String>` into [`BrokerError::Tls`].
+pub fn client_config_trusting_cert(cert_file: &Path) -> BrokerResult<rustls::ClientConfig> {
+    bamboo_subagent::transport::client_config_trusting_cert(cert_file).map_err(BrokerError::Tls)
+}
 
 pub(crate) type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
@@ -69,8 +97,35 @@ pub struct BrokerClient {
 impl BrokerClient {
     /// Connect to `endpoint` (`ws://host:port` or `wss://…`), authenticate with
     /// `token`, and bind this connection to `agent.session_id`.
+    ///
+    /// A `wss://` endpoint is negotiated against the OS's native TLS root
+    /// store (works with any CA-signed cert, e.g. Let's Encrypt, or a
+    /// self-signed cert whose CA the operator already installed locally) — no
+    /// extra configuration. To trust a self-signed cert WITHOUT touching the
+    /// OS trust store (the common homelab/cross-network quick-start), use
+    /// [`connect_with_tls`](Self::connect_with_tls) with a config from
+    /// [`client_config_trusting_cert`]. #48.
     pub async fn connect(endpoint: &str, agent: AgentRef, token: &str) -> BrokerResult<Self> {
-        let (ws, _resp) = connect_async(endpoint)
+        Self::connect_with_tls(endpoint, agent, token, None).await
+    }
+
+    /// Like [`connect`](Self::connect), but for `wss://` lets the caller
+    /// supply a custom rustls [`rustls::ClientConfig`] — e.g. one built by
+    /// [`client_config_trusting_cert`] that trusts exactly a self-signed
+    /// worker/broker cert. `None` falls back to the OS native root store
+    /// (identical to [`connect`](Self::connect)). Ignored for plaintext
+    /// `ws://`. #48.
+    pub async fn connect_with_tls(
+        endpoint: &str,
+        agent: AgentRef,
+        token: &str,
+        tls_config: Option<rustls::ClientConfig>,
+    ) -> BrokerResult<Self> {
+        let request = endpoint
+            .into_client_request()
+            .map_err(|e| BrokerError::Transport(format!("bad endpoint '{endpoint}': {e}")))?;
+        let connector = tls_config.map(|cfg| Connector::Rustls(Arc::new(cfg)));
+        let (ws, _resp) = connect_async_tls_with_config(request, None, false, connector)
             .await
             .map_err(|e| BrokerError::Transport(format!("connect {endpoint}: {e}")))?;
         let (mut sink, mut source) = ws.split();

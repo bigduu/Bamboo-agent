@@ -973,7 +973,10 @@ enum BrokerCommands {
         # Local-only broker (loopback), token from the env var\n  \
         BAMBOO_BROKER_TOKEN=secret bamboo broker serve\n\n  \
         # Accept remote / containerized workers on all interfaces\n  \
-        bamboo broker serve --bind 0.0.0.0:9600 --token secret")]
+        bamboo broker serve --bind 0.0.0.0:9600 --token secret\n\n  \
+        # wss:// for cross-network deployment (#48) — PEM cert/key pair\n  \
+        bamboo broker serve --bind 0.0.0.0:9600 --token secret \\\n    \
+        --cert /etc/bamboo/broker.crt --key /etc/bamboo/broker.key")]
     Serve {
         /// Bind address. Use `0.0.0.0:9600` to accept connections from remote /
         /// containerized workers; `127.0.0.1:9600` for local-only.
@@ -989,6 +992,19 @@ enum BrokerCommands {
         /// Durable mailbox storage root. Defaults to `<bamboo_dir>/broker`.
         #[arg(long)]
         root: Option<PathBuf>,
+
+        /// PEM certificate for `wss://` (#48). Requires `--key`; both present
+        /// switches the listener from plaintext `ws://` to TLS-terminated
+        /// `wss://` — the bearer token and all mailbox traffic (including
+        /// proxied MCP tool arguments) are otherwise sent in the clear, which
+        /// is fine on loopback but unsafe across a network. Omit both for the
+        /// unchanged plaintext default.
+        #[arg(long, requires = "key")]
+        cert: Option<PathBuf>,
+
+        /// PEM private key for `wss://` (#48). Requires `--cert`.
+        #[arg(long, requires = "cert")]
+        key: Option<PathBuf>,
 
         /// Max concurrent WebSocket connections (#53 DoS defense). Beyond
         /// this, new connections are dropped immediately. Default is
@@ -1075,6 +1091,13 @@ enum BrokerAgentCommands {
         /// uploads it next to the binary). Takes precedence over --spec-stdin.
         #[arg(long = "spec-file")]
         spec_file: Option<String>,
+
+        /// PEM CA cert to trust for a `wss://` broker with a self-signed cert
+        /// (#48), instead of the OS native root store. Omit for a CA-signed
+        /// cert (Let's Encrypt, etc.) or a self-signed cert whose CA is
+        /// already installed in the OS trust store — both work with no flag.
+        #[arg(long = "tls-ca-cert")]
+        tls_ca_cert: Option<String>,
     },
 }
 
@@ -1601,6 +1624,8 @@ async fn main() {
                 bind,
                 token,
                 root,
+                cert,
+                key,
                 max_connections,
                 messages_per_second,
                 message_burst,
@@ -1631,9 +1656,14 @@ async fn main() {
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| bind.clone());
+            // #48: `--cert`/`--key` (clap `requires` enforces both-or-neither)
+            // switch the listener to `wss://`. `is_tls` only for the log line
+            // below — the boolean itself never gates anything security-relevant.
+            let is_tls = cert.is_some();
             tracing::info!(
                 %addr,
                 root = %root.display(),
+                tls = is_tls,
                 max_connections,
                 messages_per_second,
                 message_burst,
@@ -1658,9 +1688,19 @@ async fn main() {
                 message_burst: std::num::NonZeroU32::new(message_burst)
                     .expect("clap value_parser rejects 0"),
             };
-            let server = std::sync::Arc::new(bamboo_broker::BrokerServer::with_limits(
-                core, token, limits,
-            ));
+            let mut server = bamboo_broker::BrokerServer::with_limits(core, token, limits);
+            // Fail-fast (#48): a bad/missing cert or key must abort startup, never
+            // silently downgrade to plaintext.
+            if let (Some(cert), Some(key)) = (&cert, &key) {
+                server = match server.with_tls(cert, key) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("broker: failed to load TLS cert/key: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            let server = std::sync::Arc::new(server);
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
                 std::process::exit(1);
@@ -1679,6 +1719,7 @@ async fn main() {
                 mcp_proxy,
                 spec_stdin,
                 spec_file,
+                tls_ca_cert,
             } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
@@ -1704,6 +1745,7 @@ async fn main() {
                     mcp_proxy,
                     spec_stdin,
                     spec_file,
+                    tls_ca_cert,
                 })
                 .await;
             if let Err(e) = result {

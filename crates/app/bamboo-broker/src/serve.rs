@@ -65,9 +65,42 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
-    let mut client = BrokerClient::connect(endpoint, me.clone(), token).await?;
+    serve_mailbox_full(endpoint, me, token, handler, shutdown, None).await
+}
+
+/// Like [`serve_mailbox_with_shutdown`], plus an optional rustls
+/// `ClientConfig` for `wss://` (e.g. [`crate::client::client_config_trusting_cert`]
+/// to trust a self-signed broker cert without touching the OS trust store).
+/// `None` behaves exactly like [`serve_mailbox_with_shutdown`] — the OS
+/// native root store. #48.
+pub async fn serve_mailbox_full<H, Fut>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    handler: H,
+    shutdown: CancellationToken,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+) -> BrokerResult<()>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
+    let mut client =
+        BrokerClient::connect_with_tls(endpoint, me.clone(), token, clone_tls_config(&tls_config))
+            .await?;
     client.subscribe().await?;
     serve_loop(&mut client, &me, handler, shutdown).await
+}
+
+/// [`BrokerClient::connect_with_tls`] takes an owned `ClientConfig` (it hands
+/// it straight to `Connector::Rustls(Arc::new(cfg))`), but the serve chain
+/// here shares ONE config across the worker's own connection plus every
+/// per-run reconnect ([`handle_run`]'s forward/approval deliver
+/// connections) — so it's held as an `Arc` and cloned out (rustls
+/// `ClientConfig::clone` is cheap: its fields are themselves `Arc`-backed)
+/// at each call site instead of rebuilding it. #48.
+fn clone_tls_config(cfg: &Option<Arc<rustls::ClientConfig>>) -> Option<rustls::ClientConfig> {
+    cfg.as_deref().cloned()
 }
 
 /// One finished handler routed back to the single client owner for delivery+ack.
@@ -290,6 +323,26 @@ pub async fn serve_executor_with_shutdown<E>(
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
+    serve_executor_full(endpoint, me, token, executor, shutdown, None).await
+}
+
+/// Like [`serve_executor_with_shutdown`], plus an optional rustls
+/// `ClientConfig` for `wss://` (see [`serve_mailbox_full`]) — threaded into
+/// BOTH the worker's own connection and [`handle_run`]'s per-run
+/// forward/approval reconnects, so a `Run`'s event/approval traffic uses the
+/// same self-signed-cert trust as the worker's primary connection. `None`
+/// behaves exactly like [`serve_executor_with_shutdown`]. #48.
+pub async fn serve_executor_full<E>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    executor: Arc<E>,
+    shutdown: CancellationToken,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+) -> BrokerResult<()>
+where
+    E: bamboo_subagent::ChildExecutor + ?Sized,
+{
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Per-run coordination so a SEPARATE Steer / ApprovalReply mailbox message can
@@ -300,7 +353,8 @@ where
     let endpoint_owned = endpoint.to_string();
     let token_owned = token.to_string();
     let me_owned = me.clone();
-    serve_mailbox_with_shutdown(
+    let tls_owned = tls_config.clone();
+    serve_mailbox_full(
         endpoint,
         me,
         token,
@@ -312,6 +366,7 @@ where
             let endpoint = endpoint_owned.clone();
             let token = token_owned.clone();
             let me = me_owned.clone();
+            let tls_config = tls_owned.clone();
             async move {
                 match msg.kind {
                     // A full child session over the bus (the actor-over-mailbox path):
@@ -326,6 +381,7 @@ where
                             cancel,
                             &coords,
                             &waiters,
+                            tls_config,
                         )
                         .await
                     }
@@ -369,6 +425,7 @@ where
             }
         },
         shutdown,
+        tls_config,
     )
     .await
 }
@@ -401,6 +458,7 @@ async fn handle_run<E>(
     cancel: CancellationToken,
     coords: &RunCoords,
     waiters: &ApprovalWaiters,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 ) -> Handled
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
@@ -439,8 +497,16 @@ where
     let me_fwd = me.clone();
     let parent_fwd = parent.clone();
     let (ep_fwd, tok_fwd) = (endpoint.clone(), token.clone());
+    let tls_fwd = tls_config.clone();
     let forward = tokio::spawn(async move {
-        let mut deliver = match BrokerClient::connect(&ep_fwd, me_fwd.clone(), &tok_fwd).await {
+        let mut deliver = match BrokerClient::connect_with_tls(
+            &ep_fwd,
+            me_fwd.clone(),
+            &tok_fwd,
+            tls_fwd.as_deref().cloned(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("run {run_id_fwd:?}: event deliver connect failed: {e}");
@@ -479,7 +545,14 @@ where
     let waiters_drain = Arc::clone(waiters);
     let run_id_appr = run_id.clone();
     let approval = tokio::spawn(async move {
-        let mut deliver = match BrokerClient::connect(&endpoint, me.clone(), &token).await {
+        let mut deliver = match BrokerClient::connect_with_tls(
+            &endpoint,
+            me.clone(),
+            &token,
+            tls_config.as_deref().cloned(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("run {run_id_appr:?}: approval deliver connect failed: {e}");

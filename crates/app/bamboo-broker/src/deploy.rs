@@ -55,6 +55,14 @@ pub struct AgentDeployment {
     /// falls back to `DockerDeployer::mount_home` if set, or a homeless
     /// container otherwise).
     pub spec_json: Option<String>,
+    /// Path (AS THE AGENT WILL REACH IT — same convention as `broker_endpoint`)
+    /// to a PEM CA cert the worker should trust for a `wss://` broker with a
+    /// self-signed cert, instead of the OS native root store (#48). Getting the
+    /// file onto the target host is the caller's/deployer-config's job — same
+    /// as `broker_endpoint` already assumes the address resolves from there.
+    /// `None` (the common case: CA-signed cert, or no TLS) uses the OS trust
+    /// store, i.e. `broker-agent serve` with no `--tls-ca-cert`.
+    pub tls_ca_cert: Option<String>,
 }
 
 /// Brings up a broker-agent in some environment and returns a handle to it.
@@ -266,6 +274,10 @@ pub(crate) fn agent_argv(d: &AgentDeployment) -> Vec<String> {
     if let Some(orchestrator) = &d.mcp_proxy {
         a.push("--mcp-proxy".into());
         a.push(orchestrator.clone());
+    }
+    if let Some(ca_cert) = &d.tls_ca_cert {
+        a.push("--tls-ca-cert".into());
+        a.push(ca_cert.clone());
     }
     a
 }
@@ -710,7 +722,8 @@ impl SshDeployer {
 
         let mut tunneled = d.clone();
         if let Some(p) = port {
-            tunneled.broker_endpoint = format!("ws://127.0.0.1:{p}");
+            let scheme = broker_scheme(&d.broker_endpoint);
+            tunneled.broker_endpoint = format!("{scheme}://127.0.0.1:{p}");
         }
         let mut remote = format!("BAMBOO_BROKER_TOKEN={}", sh_quote(&d.token));
         remote.push(' ');
@@ -849,6 +862,23 @@ pub(crate) fn broker_port(endpoint: &str) -> Option<u16> {
     after_host.split(['/', '?']).next()?.parse().ok()
 }
 
+/// The scheme (`"ws"` or `"wss"`) of a broker endpoint, for rewriting it to
+/// the tunnel mouth on `127.0.0.1` (SSH/russh deploy) WITHOUT silently
+/// downgrading a `wss://` broker to `ws://` (#48 — the reverse tunnel forwards
+/// raw bytes end-to-end, so the worker on the far side must still open a TLS
+/// handshake if the real broker terminates TLS; hardcoding `ws://` here would
+/// make the worker attempt a plaintext WS upgrade over what the broker treats
+/// as a TLS stream, and the connection fails). Defaults to `"ws"` for anything
+/// not literally prefixed `wss://` — i.e. unchanged behavior for every
+/// existing plaintext deployment.
+pub(crate) fn broker_scheme(endpoint: &str) -> &'static str {
+    if endpoint.starts_with("wss://") {
+        "wss"
+    } else {
+        "ws"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +895,7 @@ mod tests {
             mcp_proxy: None,
             log_path: None,
             spec_json: None,
+            tls_ca_cert: None,
         }
     }
 

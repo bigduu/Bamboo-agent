@@ -192,6 +192,11 @@ impl DeployAgentTool {
             mcp_proxy: Some(bamboo_broker::ORCHESTRATOR_ID.to_string()),
             log_path: None,
             spec_json,
+            // No self-signed CA to trust: on-demand-deploy targets (local/docker/
+            // ssh via this tool) don't yet expose a per-deploy `--tls-ca-cert`
+            // param; `wss://` still works here against a CA-signed broker cert
+            // (or a self-signed one whose CA is already in the OS trust store).
+            tls_ca_cert: None,
         };
         let handle = deployer
             .deploy(&deployment)

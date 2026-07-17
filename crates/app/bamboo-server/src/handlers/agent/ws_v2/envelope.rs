@@ -169,6 +169,18 @@ pub(crate) fn feed_reset_control(from_seq: u64) -> Value {
     serde_json::json!({ "type": "feed_reset", "from_seq": from_seq })
 }
 
+/// The app-level keepalive envelope sent on every ping tick (#533):
+/// `{ch:"sys", seq:0, control:{type:"keepalive"}}`.
+///
+/// Browsers never expose protocol-level ping frames to JS, so this DATA frame
+/// is the client's only observable liveness signal — the lotus watchdog forces
+/// a reconnect when it stops arriving (a half-open socket after sleep/wake or
+/// NAT idle eviction never fires `onclose` on its own). `seq` is fixed at 0:
+/// the `sys` channel carries no ordered stream to resume.
+pub(crate) fn sys_keepalive_envelope() -> ServerEnvelope {
+    ServerEnvelope::control("sys", 0, serde_json::json!({ "type": "keepalive" }))
+}
+
 /// A client→server frame, tagged by `type`.
 ///
 /// Unknown / malformed frames deserialize to [`ClientFrame::Unknown`] (via the
@@ -515,5 +527,17 @@ mod tests {
         );
         assert_eq!(Channel::parse("agent."), None);
         assert_eq!(Channel::parse("bogus"), None);
+    }
+
+    /// #533: the sys keepalive wire shape is a CONTRACT with the lotus
+    /// watchdog (`ch === "sys"` + `control.type === "keepalive"`) — lock the
+    /// exact JSON so a refactor can't silently break client liveness.
+    #[test]
+    fn sys_keepalive_wire_shape() {
+        let text = sys_keepalive_envelope().to_text().expect("serializes");
+        assert_eq!(
+            text,
+            r#"{"ch":"sys","seq":0,"control":{"type":"keepalive"}}"#
+        );
     }
 }

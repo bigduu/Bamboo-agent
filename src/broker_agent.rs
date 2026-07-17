@@ -94,6 +94,11 @@ pub struct BrokerAgentArgs {
     /// (the delivery a remote deployer uses — it SFTP/scp-uploads the spec next to
     /// the binary rather than piping a TTY'd stdin).
     pub spec_file: Option<String>,
+    /// Path to a PEM CA cert to trust for a `wss://` broker with a self-signed
+    /// cert, instead of the OS native root store (#48). `None` (the common
+    /// case: CA-signed cert, no TLS, or a self-signed cert whose CA is already
+    /// in the OS trust store) uses the OS store.
+    pub tls_ca_cert: Option<String>,
 }
 
 /// Connect to the broker and serve until the connection drops or a graceful
@@ -103,6 +108,17 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
     // stops pulling new work, finishes + replies to the in-flight Ask/Task/Run,
     // and returns — instead of the process dying mid-answer.
     let shutdown = install_shutdown_signal();
+
+    // #48: an explicit CA cert to trust for a self-signed `wss://` broker,
+    // instead of the OS native root store. Built once and shared (as an `Arc`)
+    // across the worker's own connection and every per-Run reconnect.
+    let tls_config = match &args.tls_ca_cert {
+        Some(path) => Some(Arc::new(
+            bamboo_broker::client_config_trusting_cert(std::path::Path::new(path))
+                .map_err(|e| format!("broker-agent: --tls-ca-cert '{path}': {e}"))?,
+        )),
+        None => None,
+    };
 
     // Parent-shipped bootstrap: read the authoritative ProvisionSpec the
     // orchestrator resolved (identity, bus, model, creds, MCP) — from an uploaded
@@ -158,8 +174,8 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
             )),
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };
-        return bamboo_broker::serve_executor_with_shutdown(
-            &endpoint, me, &token, executor, shutdown,
+        return bamboo_broker::serve_executor_full(
+            &endpoint, me, &token, executor, shutdown, tls_config,
         )
         .await
         .map_err(|e| format!("broker-agent (spec) failed: {e}"));
@@ -173,12 +189,13 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
     tracing::info!(id = %args.id, broker = %args.broker, echo = args.echo, "broker-agent connecting");
 
     if args.echo {
-        return bamboo_broker::serve_executor_with_shutdown(
+        return bamboo_broker::serve_executor_full(
             &args.broker,
             me,
             &args.token,
             Arc::new(EchoExecutor),
             shutdown,
+            tls_config,
         )
         .await
         .map_err(|e| format!("broker-agent (echo) failed: {e}"));
@@ -186,12 +203,13 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
 
     let spec = build_spec(&args)?;
     let executor = BambooRuntimeExecutor::build(&spec).await?;
-    bamboo_broker::serve_executor_with_shutdown(
+    bamboo_broker::serve_executor_full(
         &args.broker,
         me,
         &args.token,
         Arc::new(executor),
         shutdown,
+        tls_config,
     )
     .await
     .map_err(|e| format!("broker-agent failed: {e}"))
@@ -231,7 +249,11 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     // Model precedence: explicit --model > config defaults.sub_agent > defaults.chat.
     // A deployed worker given no --model must still inherit the configured default,
     // otherwise its AgentLoopConfig has no model_name and every LLM call fails.
-    spec.model = args.model.as_deref().and_then(parse_model).or_else(|| {
+    let explicit_model = match args.model.as_deref() {
+        Some(raw) => parse_model(raw)?,
+        None => None,
+    };
+    spec.model = explicit_model.or_else(|| {
         config.defaults.as_ref().and_then(|defaults| {
             defaults
                 .sub_agent
@@ -308,23 +330,17 @@ fn portable_mcp(
     }
 }
 
-/// Parse `provider:model`; a bare value leaves the provider empty (resolved by
-/// the runtime against the configured default).
-fn parse_model(s: &str) -> Option<ModelRefSpec> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    Some(match s.split_once(':') {
-        Some((p, m)) => ModelRefSpec {
-            provider: p.trim().to_string(),
-            model: m.trim().to_string(),
-        },
-        None => ModelRefSpec {
-            provider: String::new(),
-            model: s.to_string(),
-        },
-    })
+/// Parse `--model provider:model`; a bare value leaves the provider empty
+/// (resolved by the runtime against the configured default). Shared grammar
+/// (#246): the `provider:model` / bare-model split and malformed-colon
+/// validation live in [`crate::model_spec`], same as `-p -m` and
+/// `actor run|serve -m`.
+fn parse_model(s: &str) -> Result<Option<ModelRefSpec>, String> {
+    let parsed = crate::model_spec::parse_model_spec(s).map_err(|e| format!("--model {e}"))?;
+    Ok(parsed.map(|p| ModelRefSpec {
+        provider: p.provider.unwrap_or_default(),
+        model: p.model,
+    }))
 }
 
 #[cfg(test)]
@@ -334,20 +350,29 @@ mod tests {
     #[test]
     fn parse_model_handles_provider_pair_and_bare() {
         assert_eq!(
-            parse_model("anthropic:claude-sonnet-4-6"),
+            parse_model("anthropic:claude-sonnet-4-6").unwrap(),
             Some(ModelRefSpec {
                 provider: "anthropic".into(),
                 model: "claude-sonnet-4-6".into()
             })
         );
         assert_eq!(
-            parse_model("gpt-5"),
+            parse_model("gpt-5").unwrap(),
             Some(ModelRefSpec {
                 provider: String::new(),
                 model: "gpt-5".into()
             })
         );
-        assert_eq!(parse_model("   "), None);
+        assert_eq!(parse_model("   ").unwrap(), None);
+    }
+
+    /// A malformed `provider:` (empty half) is rejected — previously this
+    /// silently produced a bogus empty-provider or empty-model spec; now it
+    /// fails fast like `-p -m` / `actor run -m` already do (#246).
+    #[test]
+    fn parse_model_rejects_malformed_colon() {
+        assert!(parse_model("openai:").is_err());
+        assert!(parse_model(":gpt-4o").is_err());
     }
 
     #[test]

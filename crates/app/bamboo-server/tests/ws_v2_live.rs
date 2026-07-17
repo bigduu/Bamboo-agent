@@ -36,19 +36,31 @@ use tokio::net::TcpListener;
 /// short enough to assert the "no hello → closed" path quickly.
 const TEST_AUTH_DEADLINE_MS: u64 = 1500;
 
+/// The shortened ping interval for the whole test binary (#533): every
+/// authorized connection receives an app-level `sys` keepalive data frame at
+/// this cadence, so the keepalive tests resolve in milliseconds and every
+/// OTHER test doubles as an interleaving check (the generic envelope helpers
+/// skip `sys` frames exactly like a tolerant client does).
+const TEST_PING_INTERVAL_MS: u64 = 200;
+
 /// A generous-but-bounded ceiling for any single frame wait.
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 static INIT: Once = Once::new();
 
-/// Shorten the ws_v2 unauthorized auth deadline process-wide. Production never
-/// sets this env var, so the 10s default is untouched; the test binary sets it
-/// once so the deadline-close path is fast and deterministic.
+/// Shorten the ws_v2 unauthorized auth deadline + ping interval process-wide.
+/// Production never sets these env vars, so the 10s/15s defaults are untouched;
+/// the test binary sets them once so the deadline-close path and the `sys`
+/// keepalive cadence are fast and deterministic.
 fn init_short_auth_deadline() {
     INIT.call_once(|| {
         std::env::set_var(
             "BAMBOO_WS_AUTH_DEADLINE_MS",
             TEST_AUTH_DEADLINE_MS.to_string(),
+        );
+        std::env::set_var(
+            "BAMBOO_WS_PING_INTERVAL_MS",
+            TEST_PING_INTERVAL_MS.to_string(),
         );
     });
 }
@@ -180,7 +192,12 @@ async fn next_msgpack_envelope(conn: &mut WsConn) -> Option<Value> {
             .expect("frame did not arrive before timeout")?;
         match frame.expect("ws protocol error") {
             ws::Frame::Binary(bytes) => {
-                return Some(rmp_serde::from_slice(&bytes).expect("envelope is msgpack"));
+                let value: Value = rmp_serde::from_slice(&bytes).expect("envelope is msgpack");
+                // Skip interleaved `sys` keepalives (#533), like a tolerant client.
+                if value["ch"] == "sys" {
+                    continue;
+                }
+                return Some(value);
             }
             ws::Frame::Text(bytes) => panic!(
                 "msgpack mode must yield BINARY frames, got text: {}",
@@ -211,11 +228,38 @@ async fn next_envelope(conn: &mut WsConn) -> Option<Value> {
             .expect("frame did not arrive before timeout")?;
         match frame.expect("ws protocol error") {
             ws::Frame::Text(bytes) => {
-                return Some(serde_json::from_slice(&bytes).expect("envelope is JSON"));
+                let value: Value = serde_json::from_slice(&bytes).expect("envelope is JSON");
+                // Skip interleaved `sys` keepalives (#533), like a tolerant client.
+                if value["ch"] == "sys" {
+                    continue;
+                }
+                return Some(value);
             }
             ws::Frame::Ping(_) | ws::Frame::Pong(_) => continue,
             ws::Frame::Close(_) => return None,
             other => panic!("unexpected ws frame: {other:?}"),
+        }
+    }
+}
+
+/// Receive the next `sys` keepalive envelope (skipping everything else) within
+/// [`RECV_TIMEOUT`]. Decodes text frames as JSON and binary frames as msgpack,
+/// so one helper serves both subprotocols.
+async fn next_sys_keepalive(conn: &mut WsConn) -> Value {
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, conn.next())
+            .await
+            .expect("sys keepalive did not arrive before timeout")
+            .expect("connection closed while waiting for sys keepalive");
+        let value: Value = match frame.expect("ws protocol error") {
+            ws::Frame::Text(bytes) => serde_json::from_slice(&bytes).expect("envelope is JSON"),
+            ws::Frame::Binary(bytes) => rmp_serde::from_slice(&bytes).expect("envelope is msgpack"),
+            _ => continue,
+        };
+        if value["ch"] == "sys" {
+            return value;
         }
     }
 }
@@ -794,6 +838,62 @@ async fn no_subprotocol_stays_json_with_no_echo() {
         .await
         .expect("JSON feed envelope on the default path");
     assert_eq!(env["ch"], "feed");
+
+    server.stop().await;
+}
+
+// ── Scenario 6: app-level sys keepalive (#533) ──────────────────────────────
+
+/// An authorized JSON connection receives the `sys` keepalive DATA frame on the
+/// ping cadence — the browser-observable liveness signal (protocol pings are
+/// invisible to JS). Two in a row prove it's periodic, not a one-off.
+#[actix_web::test]
+async fn sys_keepalive_data_frames_arrive_on_json_connection() {
+    let server = TestServer::start(|_| {}).await;
+    let mut conn = connect_local(&server).await;
+
+    for _ in 0..2 {
+        let env = next_sys_keepalive(&mut conn).await;
+        assert_eq!(env["ch"], "sys");
+        assert_eq!(env["seq"], 0);
+        assert_eq!(env["control"]["type"], "keepalive");
+    }
+
+    server.stop().await;
+}
+
+/// The msgpack subprotocol carries the same keepalive as a BINARY frame with
+/// identical decoded shape.
+#[actix_web::test]
+async fn sys_keepalive_data_frames_arrive_on_msgpack_connection() {
+    let server = TestServer::start(|_| {}).await;
+    let (mut conn, subprotocol) = connect_local_msgpack(&server).await;
+    assert_eq!(subprotocol.as_deref(), Some("bamboo.v2.msgpack"));
+
+    let env = next_sys_keepalive(&mut conn).await;
+    assert_eq!(env["ch"], "sys");
+    assert_eq!(env["control"]["type"], "keepalive");
+
+    server.stop().await;
+}
+
+/// An UNAUTHORIZED connection gets NO `sys` keepalive: it is served nothing
+/// (same posture as channel data) and the auth deadline closes it. The frames
+/// observed until close must be protocol-level only.
+#[actix_web::test]
+async fn sys_keepalive_not_sent_to_unauthorized_connection() {
+    let mut captured = None;
+    let server = TestServer::start(|config| {
+        captured = Some(with_device(config));
+    })
+    .await;
+    let _ = captured; // a device exists → remotes require a hello.
+
+    let mut conn = connect_remote(&server).await;
+    // expect_closed panics on ANY text frame — which is exactly the assertion:
+    // no sys keepalive may be served before authorization, and the deadline
+    // (1.5s here) spans several ping ticks (200ms), so a leak would surface.
+    expect_closed(&mut conn).await;
 
     server.stop().await;
 }

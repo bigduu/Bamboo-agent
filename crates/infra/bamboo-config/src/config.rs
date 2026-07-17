@@ -2225,6 +2225,16 @@ impl Config {
         // state) when present. MUST run before the token hydration below so
         // it decrypts the post-merge ciphertext, not a stale/legacy copy.
         config.merge_connect_config(&data_dir);
+        // One-time (idempotent) sweep of the rotated config.json.bak[.N]
+        // generations for a legacy embedded `connect` sub-tree left behind by
+        // a pre-#455 build (#468, follow-up to #457). Independent of whether
+        // `merge_connect_config` just migrated the CURRENT config.json above —
+        // an instance that was already migrated by an earlier run of this
+        // binary has a clean config.json today but may still carry the
+        // legacy key in an untouched `.bak`/`.bak.1`/`.bak.2` generation, since
+        // backup rotation only overwrites those on a fresh SAVE. Runs on every
+        // load but is cheap and a no-op once every generation has been swept.
+        scrub_legacy_connect_from_config_backups(&data_dir);
         // Decrypt encrypted bamboo-connect platform tokens into in-memory plaintext.
         config.hydrate_connect_platform_tokens_from_encrypted();
         config.normalize_tool_settings();
@@ -3258,6 +3268,107 @@ fn strip_legacy_connect_key_from_config_json(data_dir: &std::path::Path) {
             "Failed to write config.json after stripping legacy `connect` key: {}",
             e
         );
+    }
+}
+
+/// Sweep the rotated `config.json.bak[.N]` generations for a legacy embedded
+/// `connect` sub-tree that predates the #455 connect.json split, and strip it
+/// in place. #468 (follow-up to #457).
+///
+/// `strip_legacy_connect_key_from_config_json` only ever rewrites the CURRENT
+/// `config.json` — it never reaches into `.bak` generations, and the normal
+/// backup-rotation path (see [`rotate_backups`]) only overwrites a `.bak[.N]`
+/// slot as a side effect of a fresh SAVE. An instance that upgraded from a
+/// pre-#455 build but rarely (or never) triggers a config save can therefore
+/// carry the legacy, encrypted `connect` sub-tree — including bot tokens, an
+/// immediately-usable remote-control credential — in an old backup generation
+/// indefinitely, even after its live config.json has long since been
+/// migrated.
+///
+/// Deliberately surgical, mirroring the `.bak` files' role as the user's
+/// recovery net (#493's "backups are a low-sensitivity snapshot, don't fuss
+/// with them" posture):
+/// - a generation that doesn't exist, or that fails to parse as JSON, is
+///   SKIPPED — logged, never deleted, never guessed at. Corrupt/foreign
+///   content in a `.bak` slot is left exactly as found for hand inspection.
+/// - a generation that parses but carries no `connect` key (the overwhelming
+///   majority, especially on any instance that predates this fix by more
+///   than `BAK_GENERATIONS` saves) is left COMPLETELY untouched — not even a
+///   byte-identical rewrite — so its mtime and on-disk bytes survive.
+/// - only a generation that actually parses AND carries the legacy key gets
+///   rewritten, via the same key-removal-on-the-raw-`Value` + `write_atomic`
+///   approach as `strip_legacy_connect_key_from_config_json`, so every other
+///   byte of that snapshot (all other settings, formatting aside) survives.
+///
+/// Runs unconditionally on every load (not gated on the CURRENT config.json
+/// still carrying the legacy key) specifically to catch already-migrated
+/// installs whose backups predate this fix. Cheap: at most `BAK_GENERATIONS`
+/// small file reads, and a genuine no-op (zero writes) once every generation
+/// has been swept once. Best-effort like its sibling: failures are logged,
+/// not propagated, since this runs as a side effect of `Config::new()` /
+/// load, which has no `Result` to surface it through.
+fn scrub_legacy_connect_from_config_backups(data_dir: &std::path::Path) {
+    let config_path = data_dir.join("config.json");
+    for gen in 0..BAK_GENERATIONS {
+        let backup = backup_path_for(&config_path, gen);
+        let content = match std::fs::read_to_string(&backup) {
+            Ok(content) => content,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "Failed to read {:?} while scanning for legacy connect data ({}); \
+                         leaving it untouched",
+                        backup,
+                        e
+                    );
+                }
+                continue;
+            }
+        };
+        let mut value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "Skipping unparsable backup {:?} while scanning for legacy connect data \
+                     ({}); left untouched (never deleted)",
+                    backup,
+                    e
+                );
+                continue;
+            }
+        };
+        let Some(obj) = value.as_object_mut() else {
+            // Not a JSON object (e.g. `null`/an array) — nothing to strip, and
+            // not a shape we should try to rewrite. Leave it alone.
+            continue;
+        };
+        if obj.remove("connect").is_none() {
+            // No legacy key in this generation — skip without writing so the
+            // file's bytes/mtime are left completely untouched.
+            continue;
+        }
+        let rewritten = match serde_json::to_string_pretty(&value) {
+            Ok(rewritten) => rewritten,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to serialize {:?} after stripping legacy connect data: {}",
+                    backup,
+                    e
+                );
+                continue;
+            }
+        };
+        match write_atomic(&backup, rewritten.as_bytes()) {
+            Ok(()) => tracing::info!(
+                "Scrubbed legacy embedded connect data from backup generation {:?} (#468)",
+                backup
+            ),
+            Err(e) => tracing::error!(
+                "Failed to write {:?} after stripping legacy connect data: {}",
+                backup,
+                e
+            ),
+        }
     }
 }
 
@@ -4994,6 +5105,222 @@ mod tests {
             config_json.get("connect").is_none(),
             "the stale legacy `connect` key must be stripped from config.json \
              immediately on load, not left for the next natural save"
+        );
+    }
+
+    /// #468 (follow-up to #457): a `.bak` generation that predates the #455
+    /// split can still carry the legacy embedded `connect` sub-tree even
+    /// after the LIVE config.json has long since been migrated (a clean
+    /// config.json here, with no `connect` key at all, proves the sweep does
+    /// not depend on the current-load migration path having just fired).
+    /// Only the tainted generation is rewritten; every other key in it
+    /// survives, and the rewrite strips exactly the `connect` key.
+    #[test]
+    fn scrub_strips_legacy_connect_from_tainted_backup_generation() {
+        let temp = TempHome::new();
+        temp.set_config_json(&serde_json::json!({ "http_proxy": "http://current" }).to_string());
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({
+                "http_proxy": "http://old",
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "legacy-bak-cipher", "allow_from": ["u1"] }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        // The live config is unaffected — connect.json never existed and
+        // config.json never had the key, so in-memory connect stays empty.
+        assert!(config.connect.platforms.is_empty());
+
+        let bak: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path.join("config.json.bak")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            bak.get("connect").is_none(),
+            "the legacy `connect` key must be stripped from the tainted .bak generation"
+        );
+        assert_eq!(
+            bak["http_proxy"], "http://old",
+            "every other key in the .bak generation survives the scrub byte-for-byte in content"
+        );
+    }
+
+    /// The sweep must touch EVERY rotated generation that carries the legacy
+    /// key, not just `.bak` — an upgraded instance can have the taint several
+    /// generations deep depending on how many saves happened since #455/#457
+    /// shipped but before this fix.
+    #[test]
+    fn scrub_reaches_all_rotated_generations() {
+        let temp = TempHome::new();
+        temp.set_config_json(&serde_json::json!({}).to_string());
+        for (gen_suffix, cipher) in [
+            ("config.json.bak", "cipher-gen0"),
+            ("config.json.bak.1", "cipher-gen1"),
+            ("config.json.bak.2", "cipher-gen2"),
+        ] {
+            std::fs::write(
+                temp.path.join(gen_suffix),
+                serde_json::json!({
+                    "connect": {
+                        "platforms": [
+                            { "type": "telegram", "token_encrypted": cipher }
+                        ]
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let _config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        for gen_suffix in ["config.json.bak", "config.json.bak.1", "config.json.bak.2"] {
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(temp.path.join(gen_suffix)).unwrap())
+                    .unwrap();
+            assert!(
+                value.get("connect").is_none(),
+                "{gen_suffix} must have its legacy `connect` key stripped"
+            );
+        }
+    }
+
+    /// A `.bak` generation with NO legacy `connect` key must be left
+    /// completely untouched by the sweep — not even a byte-identical
+    /// rewrite — preserving the file's bytes/mtime exactly. This is the
+    /// overwhelming common case (any backup created after #455/#457 shipped)
+    /// and the whole point of the surgical, only-touch-what's-tainted
+    /// approach: `.bak` files are the user's recovery net (#493) and
+    /// shouldn't be churned by an unrelated sweep.
+    #[test]
+    fn scrub_leaves_untainted_backup_byte_and_mtime_identical() {
+        let temp = TempHome::new();
+        temp.set_config_json(&serde_json::json!({}).to_string());
+        let bak_path = temp.path.join("config.json.bak");
+        std::fs::write(
+            &bak_path,
+            serde_json::json!({ "http_proxy": "http://clean-backup" }).to_string(),
+        )
+        .unwrap();
+
+        let before_bytes = std::fs::read(&bak_path).unwrap();
+        let before_mtime = std::fs::metadata(&bak_path).unwrap().modified().unwrap();
+
+        // A tiny sleep would make an mtime-changed assertion more robust, but
+        // even without one, a same-mtime filesystem is the STRONGER
+        // guarantee of "no write happened" — good enough on its own.
+        let _config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        let after_bytes = std::fs::read(&bak_path).unwrap();
+        let after_mtime = std::fs::metadata(&bak_path).unwrap().modified().unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "a .bak generation without a legacy `connect` key must not be rewritten at all"
+        );
+        assert_eq!(
+            before_mtime, after_mtime,
+            "no write means no mtime change either"
+        );
+    }
+
+    /// An unparsable `.bak` generation (corrupt/foreign content) must be
+    /// skipped, not deleted and not guessed at — it's left exactly as found
+    /// so an operator can inspect it by hand, matching the same fail-safe
+    /// posture as the rest of the backup/quarantine machinery.
+    #[test]
+    fn scrub_skips_unparsable_backup_without_deleting_it() {
+        let temp = TempHome::new();
+        temp.set_config_json(&serde_json::json!({}).to_string());
+        std::fs::write(temp.path.join("config.json.bak"), "{ not valid json").unwrap();
+
+        let _config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+
+        let content = std::fs::read_to_string(temp.path.join("config.json.bak")).unwrap();
+        assert_eq!(
+            content, "{ not valid json",
+            "an unparsable .bak generation must be left byte-for-byte untouched, never deleted"
+        );
+    }
+
+    /// A missing generation (e.g. only `.bak` exists, no `.bak.1`/`.bak.2`
+    /// yet) must not trip an error — it's the common case for a young
+    /// install and the sweep should just skip straight past it.
+    #[test]
+    fn scrub_tolerates_missing_generations() {
+        let temp = TempHome::new();
+        temp.set_config_json(&serde_json::json!({}).to_string());
+        // No .bak files at all.
+        let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        assert!(config.connect.platforms.is_empty());
+        assert!(!temp.path.join("config.json.bak").exists());
+    }
+
+    /// The scrub sweep must not interfere with normal backup rotation on
+    /// subsequent saves — rotation keeps working exactly as before.
+    #[test]
+    fn scrub_does_not_break_backup_rotation() {
+        let temp = TempHome::new();
+        std::fs::write(
+            temp.path.join("config.json"),
+            serde_json::json!({
+                "http_proxy": "http://proxy-v1",
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "legacy-cipher" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({
+                "http_proxy": "http://proxy-v0",
+                "connect": {
+                    "platforms": [
+                        { "type": "telegram", "token_encrypted": "legacy-bak-cipher" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Load triggers: migration of the live legacy key + the .bak sweep.
+        let mut config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
+        let bak: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path.join("config.json.bak")).unwrap(),
+        )
+        .unwrap();
+        assert!(bak.get("connect").is_none(), ".bak scrubbed on load");
+
+        // Rotation still works on a subsequent save: v_current -> .bak,
+        // .bak(old) -> .bak.1.
+        config.http_proxy = "http://proxy-v2".to_string();
+        config.save_to_dir(temp.path.clone()).unwrap();
+
+        let new_bak = std::fs::read_to_string(temp.path.join("config.json.bak")).unwrap();
+        assert!(
+            new_bak.contains("proxy-v1"),
+            ".bak reflects the pre-save (migrated, scrub-clean) state after rotation"
+        );
+        let new_bak1 = std::fs::read_to_string(temp.path.join("config.json.bak.1")).unwrap();
+        assert!(
+            new_bak1.contains("proxy-v0"),
+            ".bak.1 holds the scrubbed older generation after rotation"
+        );
+        assert!(
+            !new_bak1.contains("legacy-bak-cipher"),
+            "the rotated-down generation stays scrubbed — rotation doesn't resurrect the \
+             stripped secret"
         );
     }
 
