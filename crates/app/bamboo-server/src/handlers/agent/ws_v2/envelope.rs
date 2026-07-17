@@ -169,6 +169,16 @@ pub(crate) fn feed_reset_control(from_seq: u64) -> Value {
     serde_json::json!({ "type": "feed_reset", "from_seq": from_seq })
 }
 
+/// A gap control payload for an `agent.{sid}` channel (#543): the broadcast
+/// ring overran while this connection was slow and `skipped` events were lost
+/// beyond recovery (agent events have no durable journal, unlike the feed).
+/// The client must reconcile the session's authoritative state via REST — the
+/// transcript it derived from the live stream may be missing tool results or
+/// whole turns.
+pub(crate) fn gap_control(skipped: u64) -> Value {
+    serde_json::json!({ "type": "gap", "skipped": skipped })
+}
+
 /// The app-level keepalive envelope sent on every ping tick (#533):
 /// `{ch:"sys", seq:0, control:{type:"keepalive"}}`.
 ///

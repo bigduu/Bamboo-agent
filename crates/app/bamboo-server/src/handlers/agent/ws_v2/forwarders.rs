@@ -47,9 +47,11 @@ use bamboo_engine::events::journal;
 
 use actix_web::web;
 
-use super::envelope::{feed_reset_control, terminal_control, Encoding, OutFrame, ServerEnvelope};
-use crate::app_state::AppState;
-use crate::handlers::agent::events::{has_running_child, Coalescer};
+use super::envelope::{
+    feed_reset_control, gap_control, terminal_control, Encoding, OutFrame, ServerEnvelope,
+};
+use crate::app_state::{AgentStatus, AppState};
+use crate::handlers::agent::events::{has_running_child, terminal_event_if_ready, Coalescer};
 use crate::handlers::agent::stream::{plan_replay, ReplayPlan};
 
 /// What the driver sends to the WS writer: an already-encoded frame (a JSON text
@@ -271,7 +273,23 @@ pub(crate) fn spawn_agent_forwarder(
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        match handle_agent_lag(
+                            &state,
+                            &session_id,
+                            &out,
+                            encoding,
+                            &ch,
+                            &seq,
+                            skipped,
+                            awaiting_children,
+                        )
+                        .await
+                        {
+                            LagOutcome::Continue => continue,
+                            LagOutcome::Stop | LagOutcome::Disconnected => return,
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -353,7 +371,7 @@ pub(crate) fn spawn_agent_forwarder(
                                 return;
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // A lag gap dropped intervening events; flush the
                             // pending buffer so we never merge tokens across the
                             // gap and fabricate adjacency.
@@ -362,6 +380,21 @@ pub(crate) fn spawn_agent_forwarder(
                                     return;
                                 }
                                 flush_deadline = None;
+                            }
+                            match handle_agent_lag(
+                                &state,
+                                &session_id,
+                                &out,
+                                encoding,
+                                &ch,
+                                &seq,
+                                skipped,
+                                awaiting_children,
+                            )
+                            .await
+                            {
+                                LagOutcome::Continue => {}
+                                LagOutcome::Stop | LagOutcome::Disconnected => return,
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -376,6 +409,103 @@ pub(crate) fn spawn_agent_forwarder(
             }
         }
     })
+}
+
+/// What the agent forwarder should do after a broadcast-lag recovery attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum LagOutcome {
+    /// Keep live-tailing (the run is still live, or the socket is closing).
+    Continue,
+    /// The lost gap swallowed the run's terminal; the synthesized terminal was
+    /// emitted and the channel is done.
+    Stop,
+    /// The outbound queue is gone (connection closing) — stop silently.
+    Disconnected,
+}
+
+/// Recover from a broadcast-ring overrun on an `agent.{sid}` channel (#543).
+///
+/// Agent events have NO durable journal (unlike the feed), so a lag gap is
+/// unrecoverable data loss — the events are gone. What we CAN do:
+///
+/// 1. Tell the client: emit a `{type:"gap", skipped}` control so it reconciles
+///    the session's authoritative state via REST instead of trusting a
+///    transcript with a hole in it.
+/// 2. Self-heal a swallowed terminal: if the runner is no longer `Running` and
+///    the one-shot predicate ([`terminal_event_if_ready`] — not suspended, no
+///    pending resume, no running child) says the run is over, the gap ate the
+///    terminal event. Emit the synthesized terminal + the `terminal` control
+///    and close, exactly as if the real one had been delivered — otherwise the
+///    channel goes silent forever and the client shows the last tool call as
+///    running indefinitely ON A HEALTHY SOCKET (the keepalive watchdog cannot
+///    catch this: keepalives keep arriving).
+///
+/// `own_terminal_already_emitted` is the caller's `awaiting_children` state:
+/// the parent's REAL terminal event already reached the client and the channel
+/// is only held open for child sub-agents. If the gap then swallows the last
+/// `SubAgentCompleted`, self-heal must send ONLY the `terminal` control —
+/// mirroring the normal `is_child_completed && !has_running_child` close — and
+/// never a second, synthesized terminal event for a session whose completion
+/// the client already saw.
+async fn handle_agent_lag(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    skipped: u64,
+    own_terminal_already_emitted: bool,
+) -> LagOutcome {
+    tracing::warn!(
+        "[{}] ws_v2 agent channel lagged: {} events lost to broadcast-ring overrun; \
+         emitting gap control (client must reconcile via REST)",
+        session_id,
+        skipped
+    );
+    if !send_env(
+        out,
+        encoding,
+        ServerEnvelope::control(ch, seq.next(), gap_control(skipped)),
+    )
+    .await
+    {
+        return LagOutcome::Disconnected;
+    }
+
+    let runner_status = {
+        let runners = state.agent_runners.read().await;
+        runners.get(session_id).map(|runner| runner.status.clone())
+    };
+    if matches!(runner_status, Some(AgentStatus::Running)) {
+        return LagOutcome::Continue;
+    }
+    let Some(terminal_event) = terminal_event_if_ready(state, session_id, runner_status).await
+    else {
+        return LagOutcome::Continue;
+    };
+
+    tracing::warn!(
+        "[{}] ws_v2 agent channel: lag gap swallowed the run's terminal \
+         (own_terminal_already_emitted={}); closing the channel",
+        session_id,
+        own_terminal_already_emitted
+    );
+    // Only synthesize a terminal EVENT when the client never saw the real one.
+    // In the awaiting-children window the parent's terminal was already
+    // delivered — a second one would be a spurious duplicate completion.
+    if !own_terminal_already_emitted
+        && !emit_agent_event(out, encoding, ch, seq, terminal_event).await
+    {
+        return LagOutcome::Disconnected;
+    }
+    let _ = send_env(
+        out,
+        encoding,
+        ServerEnvelope::control(ch, seq.next(), terminal_control("complete")),
+    )
+    .await;
+    LagOutcome::Stop
 }
 
 /// Serialize an `AgentEvent` into an `{ch, seq, event}` envelope and push it,
@@ -406,6 +536,7 @@ fn is_terminal_event(event: &AgentEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_state::AgentRunner;
 
     #[test]
     fn agent_seq_is_monotonic_and_one_based() {
@@ -488,5 +619,218 @@ mod tests {
         assert_eq!(v["event"]["seq"], 99);
         assert_eq!(v["event"]["session_id"], "s1");
         assert_eq!(v["event"]["event"]["type"], "token");
+    }
+
+    // ── Broadcast-lag recovery (#543) ────────────────────────────────────────
+
+    /// Receive + decode the next JSON frame from the forwarder's outbound queue.
+    async fn next_json(rx: &mut mpsc::Receiver<OutFrame>) -> serde_json::Value {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("frame arrives before timeout")
+            .expect("outbound queue still open")
+        {
+            OutFrame::Text(text) => serde_json::from_str(&text).expect("frame is JSON"),
+            OutFrame::Binary(_) => panic!("JSON mode must not emit binary frames"),
+        }
+    }
+
+    async fn test_state(session_id: &str) -> (web::Data<AppState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+        let mut session = bamboo_agent_core::Session::new(session_id, "test-model");
+        // Last message = Assistant → does not prevent the one-shot terminal.
+        session.add_message(bamboo_agent_core::Message::assistant("done", None));
+        state.save_session(&mut session).await;
+        (state, tmp)
+    }
+
+    /// Overflow a 4-slot ring with 10 events BEFORE the forwarder polls, so its
+    /// first `recv()` yields `Lagged(6)` (the ring retains the newest 4). The
+    /// sender is returned so the caller keeps the channel open.
+    fn lagged_channel() -> (
+        broadcast::Sender<AgentEvent>,
+        broadcast::Receiver<AgentEvent>,
+    ) {
+        let (tx, rx) = broadcast::channel::<AgentEvent>(4);
+        for i in 0..10 {
+            let _ = tx.send(AgentEvent::Token {
+                content: format!("t{i}"),
+            });
+        }
+        (tx, rx)
+    }
+
+    /// The gap swallowed the run's terminal (no runner → the run is over, and
+    /// the session state allows the one-shot terminal): the forwarder must emit
+    /// the gap control, a SYNTHESIZED terminal event, and the terminal control,
+    /// then close — never strand the client on a silent channel (#543).
+    #[tokio::test]
+    async fn lag_emits_gap_control_and_synthesized_terminal_when_run_finished() {
+        let (state, _tmp) = test_state("lag-done").await;
+        let (_tx, rx) = lagged_channel();
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-done".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-done".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["ch"], "agent.lag-done");
+        assert_eq!(gap["control"]["type"], "gap");
+        assert_eq!(gap["control"]["skipped"], 6);
+
+        let terminal_event = next_json(&mut out_rx).await;
+        assert_eq!(terminal_event["event"]["type"], "complete");
+
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(terminal["control"]["type"], "terminal");
+
+        // The forwarder is done: its sender is dropped, closing the queue.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("close arrives before timeout")
+                .is_none(),
+            "channel must close after the synthesized terminal"
+        );
+    }
+
+    /// The run is still live (runner `Running`): the forwarder emits the gap
+    /// control so the client reconciles, then KEEPS tailing — the retained ring
+    /// events and later live events still flow.
+    #[tokio::test]
+    async fn lag_emits_gap_control_and_keeps_tailing_when_runner_running() {
+        let (state, _tmp) = test_state("lag-live").await;
+        {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("lag-live".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+        }
+        let (tx, rx) = lagged_channel();
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-live".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-live".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["control"]["type"], "gap");
+        assert_eq!(gap["control"]["skipped"], 6);
+
+        // The ring's retained tail (t6..t9) still flows after the gap.
+        for i in 6..10 {
+            let frame = next_json(&mut out_rx).await;
+            assert_eq!(frame["event"]["type"], "token");
+            assert_eq!(frame["event"]["content"], format!("t{i}"));
+        }
+
+        // And the channel is still LIVE: a later event arrives too.
+        let _ = tx.send(AgentEvent::Token {
+            content: "after-gap".to_string(),
+        });
+        let frame = next_json(&mut out_rx).await;
+        assert_eq!(frame["event"]["content"], "after-gap");
+    }
+
+    /// Review regression (#544): a lag inside the awaiting-children window —
+    /// the parent's REAL terminal was already delivered, the channel is only
+    /// held open for a child sub-agent, and the gap swallows the final
+    /// `SubAgentCompleted`. Self-heal must close with ONLY the `terminal`
+    /// control (mirroring the normal child-completion close) and never emit a
+    /// second, synthesized terminal event for a completion the client already
+    /// saw.
+    #[tokio::test]
+    async fn lag_during_awaiting_children_closes_without_duplicate_terminal_event() {
+        let (state, _tmp) = test_state("lag-parent").await;
+        // A REAL child session (kind=Child, root=parent) with a Running runner,
+        // so the parent's terminal holds the channel open (awaiting_children).
+        let mut child =
+            bamboo_agent_core::Session::new_child("lag-child", "lag-parent", "test-model", "child");
+        state.save_session(&mut child).await;
+        {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("lag-child".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+        }
+
+        let (tx, rx) = broadcast::channel::<AgentEvent>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-parent".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-parent".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        // The parent's REAL terminal: emitted to the client, and the running
+        // child holds the channel open (no terminal control yet).
+        let _ = tx.send(AgentEvent::Complete {
+            usage: Default::default(),
+        });
+        let real_terminal = next_json(&mut out_rx).await;
+        assert_eq!(real_terminal["event"]["type"], "complete");
+
+        // The child finishes: its runner goes away — but the SubAgentCompleted
+        // that would have closed the channel is swallowed by a ring overrun.
+        {
+            let mut runners = state.agent_runners.write().await;
+            runners.remove("lag-child");
+        }
+        // Overflow the 4-slot ring synchronously (current-thread test runtime:
+        // the forwarder cannot run between these sends), so its next recv()
+        // yields Lagged and the SubAgentCompleted inside the gap is lost.
+        let _ = tx.send(AgentEvent::SubAgentCompleted {
+            parent_session_id: "lag-parent".to_string(),
+            child_session_id: "lag-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        });
+        for i in 0..9 {
+            let _ = tx.send(AgentEvent::Token {
+                content: format!("child-tail-{i}"),
+            });
+        }
+
+        // Recovery: the gap control, then ONLY the terminal control — no second
+        // synthesized `complete` event.
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["control"]["type"], "gap");
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(
+            terminal["control"]["type"], "terminal",
+            "self-heal must close with the control only — a synthesized terminal \
+             event here would be a duplicate completion: {terminal}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("close arrives before timeout")
+                .is_none(),
+            "channel must close after the terminal control"
+        );
     }
 }

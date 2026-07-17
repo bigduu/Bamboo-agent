@@ -84,10 +84,18 @@ use crate::handlers::agent::stop::cancel_session;
 /// driver drains them with a fair merge.
 const OUTBOUND_BUFFER: usize = 64;
 
-/// WS ping interval (~15s), mirroring the v1 SSE `[KEEPALIVE]` cadence. Each
-/// tick sends BOTH the protocol-level ping (server-side write probe) and the
-/// app-level `sys` keepalive data frame (client-side liveness signal, #533).
-const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// WS ping interval. Each tick sends BOTH the protocol-level ping (server-side
+/// write probe) and the app-level `sys` keepalive data frame (client-side
+/// liveness signal, #533).
+///
+/// 5s (down from the v1 SSE 15s cadence, #543): the client watchdog cannot
+/// detect a dead socket faster than a few missed keepalives, and 3×15s ≈ 45s
+/// is far too long for a user actively watching a running session. At 5s the
+/// watchdog resolves in ~15s. The frames are tiny (a ping + a ~50-byte text
+/// frame); the cost is negligible even for remote clients. The lotus watchdog
+/// ADAPTS its threshold to the observed cadence (3×, clamped), so old-server ×
+/// new-client pairings stay safe in both directions.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Env var the live integration test sets to SHORTEN the ping interval so the
 /// `sys` keepalive cadence is asserted in milliseconds, not 15s. Read once per

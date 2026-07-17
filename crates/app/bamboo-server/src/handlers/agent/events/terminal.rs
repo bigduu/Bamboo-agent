@@ -7,7 +7,7 @@ use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::AgentStatusState;
 use bamboo_engine::session_app::execute::has_pending_user_message;
 
-pub(super) async fn terminal_event_if_ready(
+pub(crate) async fn terminal_event_if_ready(
     state: &web::Data<AppState>,
     session_id: &str,
     runner_status: Option<AgentStatus>,
