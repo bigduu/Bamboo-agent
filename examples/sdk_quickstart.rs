@@ -24,7 +24,17 @@
 //!   configured `PermissionChecker`), the event loop sees
 //!   `AgentEvent::NeedClarification` / `ToolApprovalRequested`, answers it via
 //!   `Agent::answer`, and resumes the run via `Agent::resume_stream` — the
-//!   "ask → answer → resume" flow.
+//!   "ask → answer → resume" flow. When the approved question was a gated tool
+//!   call, resuming also RE-EXECUTES that tool for real (against the agent's
+//!   own tool executor) and writes the genuine output back before the loop
+//!   continues — no extra code needed, it happens automatically inside
+//!   `resume`/`resume_stream` (bamboo-agent#509).
+//!
+//!   A separate mechanism, `AgentEvent::ChildApprovalRequested`, covers an
+//!   out-of-process CHILD sub-agent's gated tool (only relevant if you've also
+//!   wired the engine's actor/broker transport — `with_defaults_for_data_dir`
+//!   does not). Answer those with `Agent::answer_child_approval`, not
+//!   `Agent::answer`.
 
 use std::time::Duration;
 
@@ -72,7 +82,10 @@ async fn main() -> anyhow::Result<()> {
         // for input (a `conclusion_with_options` call, or a gated tool under a
         // configured permission checker). Both suspend via the same
         // `session.pending_question` mechanism, so both are answered the same
-        // way. Answer it, then resume the run from where it left off.
+        // way. Answer it, then resume the run from where it left off — if this
+        // was a permission approval, `answer_and_resume_stream` also
+        // re-executes the gated tool for real before the loop continues, so
+        // the model sees genuine output rather than an inferred placeholder.
         let needs_answer = matches!(
             event,
             AgentEvent::NeedClarification { .. } | AgentEvent::ToolApprovalRequested { .. }
