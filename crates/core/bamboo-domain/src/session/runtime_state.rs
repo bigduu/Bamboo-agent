@@ -41,9 +41,22 @@ pub struct RoundRuntimeState {
     pub max_rounds: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_id: Option<String>,
+    /// Cumulative tool calls issued across every round of this run so far.
+    /// Consulted by the per-run `max_tool_calls` budget guardrail (issue #221).
     pub total_tool_calls: u32,
+    /// Cumulative actual (provider-reported) prompt tokens across every round
+    /// of this run so far. Consulted by the per-run `max_total_tokens` budget
+    /// guardrail (issue #221).
     pub total_prompt_tokens: u64,
+    /// Cumulative actual (provider-reported) completion tokens across every
+    /// round of this run so far. Consulted by the per-run `max_total_tokens`
+    /// budget guardrail (issue #221).
     pub total_completion_tokens: u64,
+    /// Cumulative `SubAgent` create calls issued across every round of this
+    /// run so far. Consulted by the per-run `max_subagents` budget guardrail
+    /// (issue #221).
+    #[serde(default)]
+    pub total_subagents_spawned: u32,
 }
 
 /// Prompt assembly tracking.

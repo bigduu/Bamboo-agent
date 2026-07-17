@@ -22,6 +22,7 @@ fn is_critical_event(event: &AgentEvent) -> bool {
             | AgentEvent::SessionPinnedUpdated { .. }
             | AgentEvent::PlanModeEntered { .. }
             | AgentEvent::PlanModeExited { .. }
+            | AgentEvent::BudgetExceeded { .. }
     )
 }
 

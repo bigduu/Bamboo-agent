@@ -2151,6 +2151,20 @@ impl App {
                 self.notify(NoticeLevel::Error, format!("Error: {message}"));
                 self.finalize_streaming();
             }
+            AgentEvent::BudgetExceeded {
+                kind,
+                limit,
+                actual,
+            } => {
+                // Precedes the run's normal `Complete`/`Cancelled` terminal
+                // event (see bamboo_agent_core::AgentEvent::BudgetExceeded) —
+                // just surface why the run is about to stop; the terminal
+                // event still finalizes streaming.
+                self.notify(
+                    NoticeLevel::Warn,
+                    format!("Run budget exceeded ({kind}: {actual}/{limit}) — stopping."),
+                );
+            }
             AgentEvent::ToolToken { content, .. } => {
                 // Deliberately not routed into the matching ToolCallDisplay by
                 // `tool_call_id`: today's rendering already prints tool output

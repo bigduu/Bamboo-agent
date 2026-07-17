@@ -76,6 +76,7 @@ fn execute_request_empty_model_normalizes_to_compat_absent() {
         reasoning_effort: None,
         client_sync: None,
         no_human_approver: false,
+        run_budget: None,
     };
 
     let model = request.model.as_deref().unwrap_or("").trim();

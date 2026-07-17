@@ -240,6 +240,13 @@ pub struct ExecuteRequest {
     pub bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
+    /// Per-run resource guardrail override (issue #221): token / tool-call /
+    /// subagent budget for THIS execution. Each field falls back independently
+    /// to the config-level `Config::run_budget` default when unset (`None`
+    /// here does not mean "unlimited" — it means "use the config default",
+    /// which may itself be unlimited). See
+    /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
+    pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +298,7 @@ pub struct ExecuteRequestBuilder {
     bash_resume_hook: Option<Arc<dyn BashResumeHook>>,
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
+    run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 impl ExecuteRequestBuilder {
@@ -330,6 +338,7 @@ impl ExecuteRequestBuilder {
             bash_resume_hook: None,
             bash_completion_sink: None,
             app_data_dir: None,
+            run_budget: None,
         }
     }
 
@@ -516,6 +525,14 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the per-run resource guardrail override (issue #221). Each field of
+    /// `v` falls back independently to the config-level default; see
+    /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
+    pub fn run_budget(mut self, v: bamboo_config::RunBudgetConfig) -> Self {
+        self.run_budget = Some(v);
+        self
+    }
+
     /// Materialize the underlying [`ExecuteRequest`].
     ///
     /// `gold_config` is an internal feature flag with only a crate-visible
@@ -556,6 +573,7 @@ impl ExecuteRequestBuilder {
             bash_resume_hook: self.bash_resume_hook,
             bash_completion_sink: self.bash_completion_sink,
             app_data_dir: self.app_data_dir,
+            run_budget: self.run_budget,
         }
     }
 }
@@ -610,6 +628,7 @@ impl AgentRuntime {
             bash_resume_hook,
             bash_completion_sink,
             app_data_dir,
+            run_budget,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
@@ -700,6 +719,11 @@ impl AgentRuntime {
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.
             mcp_tool_guidance: tools.tool_guidance(),
+            // Config-level default, per-field-overridden by the request (issue
+            // #221). Merging here (rather than in the HTTP layer) means every
+            // caller — HTTP, schedules, connect, the in-proc SDK — gets the
+            // same config-default fallback for free.
+            run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
             ..Default::default()
         };
 

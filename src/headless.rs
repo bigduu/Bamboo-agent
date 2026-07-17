@@ -421,6 +421,10 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             // its sub-agents (which inherit it) route gated actions to the
             // off-loop model-reviewer instead of escalating to an absent human.
             no_human_approver: true,
+            // No `--budget-*` CLI flags yet (issue #221 follow-up); a headless
+            // run gets the config-level `run_budget` default like every other
+            // path.
+            run_budget: None,
         }),
     )
     .await;

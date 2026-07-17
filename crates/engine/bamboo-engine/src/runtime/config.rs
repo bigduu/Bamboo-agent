@@ -492,6 +492,12 @@ pub struct AgentLoopConfig {
     /// and appended to the tool-guide section of the system prompt, so a server's
     /// own how-to-use notes appear only while that server is loaded for the run.
     pub(crate) mcp_tool_guidance: Option<String>,
+    /// Per-run resource guardrails (issue #221): already resolved — the
+    /// per-request override merged over the config-level default (see
+    /// [`AgentRuntime::execute`](crate::runtime::runtime::AgentRuntime::execute)).
+    /// Checked after every round; exceeding a configured limit gracefully
+    /// stops the run (mirrors the `max_rounds` exhaustion path).
+    pub(crate) run_budget: bamboo_config::RunBudgetConfig,
 }
 
 impl Default for AgentLoopConfig {
@@ -545,6 +551,7 @@ impl Default for AgentLoopConfig {
             auxiliary_model_resolver: None,
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
+            run_budget: bamboo_config::RunBudgetConfig::default(),
         }
     }
 }

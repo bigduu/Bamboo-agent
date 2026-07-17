@@ -37,6 +37,9 @@ pub(super) struct ReadyExecution {
     /// The `no_human_approver` posture from THIS execute request. #74: re-derived
     /// per user-initiated execute and written over the session's persisted flag.
     pub no_human_approver: bool,
+    /// Optional per-run resource guardrail override from THIS execute request
+    /// (issue #221). `None` uses the config-level default.
+    pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
 /// Reserve the runner, persist, and spawn the agent loop for a ready session.
@@ -181,6 +184,7 @@ pub(super) async fn handle_execute_ready(
         image_fallback,
         gold_config,
         app_data_dir: Some(state.app_data_dir.clone()),
+        run_budget: ready.run_budget,
     });
 
     started_response(session_id, sync_info, run_id)

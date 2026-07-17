@@ -40,6 +40,9 @@ pub enum NotificationCategory {
     RunCompleted,
     /// A run failed (`AgentEvent::Error`).
     RunFailed,
+    /// A per-run token/tool-call/subagent budget tripped and the run was
+    /// gracefully stopped (`AgentEvent::BudgetExceeded`, issue #221).
+    BudgetExceeded,
     /// A caller-supplied notification minted directly by the `notify` tool
     /// rather than derived from a specific `AgentEvent` variant.
     Custom,
@@ -56,6 +59,7 @@ impl NotificationCategory {
             NotificationCategory::BackgroundTaskCompleted => "background_task_completed",
             NotificationCategory::RunCompleted => "run_completed",
             NotificationCategory::RunFailed => "run_failed",
+            NotificationCategory::BudgetExceeded => "budget_exceeded",
             NotificationCategory::Custom => "custom",
         }
     }
@@ -267,6 +271,31 @@ pub fn classify(
                 title: "Run failed".to_string(),
                 body: truncate(message, RUN_FAILED_BODY_MAX),
                 dedup_key: format!("run:{session_id}:failed"),
+            })
+        }
+
+        AgentEvent::BudgetExceeded {
+            kind,
+            limit,
+            actual,
+            ..
+        } => {
+            // No dedicated preference for this category yet; gated on
+            // `on_run_failed` since a budget-exceeded stop is, like a failure,
+            // an abnormal (non-`Complete`) run termination the user should
+            // learn about promptly.
+            if !prefs.on_run_failed {
+                return None;
+            }
+            Some(ClassifiedNotification {
+                category: NotificationCategory::BudgetExceeded,
+                priority: NotificationPriority::High,
+                title: "Run stopped: budget exceeded".to_string(),
+                body: truncate(
+                    &format!("{kind} reached {actual}/{limit}; the run was stopped."),
+                    RUN_FAILED_BODY_MAX,
+                ),
+                dedup_key: format!("run:{session_id}:budget_exceeded"),
             })
         }
 

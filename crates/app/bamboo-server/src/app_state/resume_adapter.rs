@@ -185,6 +185,9 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     image_fallback,
                     gold_config,
                     app_data_dir: Some(state.app_data_dir.clone()),
+                    // Resume has no per-request override channel; the
+                    // config-level default (issue #221) still applies.
+                    run_budget: None,
                 });
                 return;
             }
@@ -287,6 +290,9 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 image_fallback,
                 gold_config,
                 app_data_dir: Some(state.app_data_dir.clone()),
+                // Resume has no per-request override channel; the
+                // config-level default (issue #221) still applies.
+                run_budget: None,
             });
         });
     }

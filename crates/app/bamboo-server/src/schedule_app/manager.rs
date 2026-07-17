@@ -595,6 +595,9 @@ async fn run_schedule_job(
         // (consistent with `can_async_resume: false` on this path).
         bash_completion_sink: None,
         app_data_dir: ctx.app_data_dir.clone(),
+        // Scheduled runs have no per-request override channel; the
+        // config-level default (issue #221) still applies.
+        run_budget: None,
         runners: ctx.agent_runners.clone(),
         sessions_cache: ctx.sessions_cache.clone(),
         on_complete: Some(on_complete),

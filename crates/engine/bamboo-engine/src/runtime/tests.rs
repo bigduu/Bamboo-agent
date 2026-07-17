@@ -43,6 +43,46 @@ fn agent_loop_config_default() {
     assert!(config.selected_skill_ids.is_none());
     assert!(config.disabled_tools.is_empty());
     assert!(!config.skip_initial_user_message);
+    // Issue #221: no budget configured anywhere means unlimited, matching
+    // every other resource knob's opt-in-only default.
+    assert_eq!(config.run_budget, bamboo_config::RunBudgetConfig::default());
+}
+
+/// Issue #221 plumb-through (engine hop): `ExecuteRequestBuilder::run_budget`
+/// is the exact setter the server's `agent_spawn::build_execute_request`
+/// calls when the HTTP request carried an override — verify it lands
+/// unmodified on the built `ExecuteRequest`, ready for
+/// `AgentRuntime::execute` to merge against the config-level default.
+#[test]
+fn execute_request_builder_carries_run_budget_override_through_to_the_request() {
+    use super::runtime::ExecuteRequestBuilder;
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, _rx) = mpsc::channel(1);
+    let override_budget = bamboo_config::RunBudgetConfig {
+        max_total_tokens: Some(42_000),
+        max_tool_calls: Some(7),
+        max_subagents: None,
+    };
+
+    let request = ExecuteRequestBuilder::new("hello", tx, CancellationToken::new())
+        .run_budget(override_budget)
+        .build();
+
+    assert_eq!(request.run_budget, Some(override_budget));
+}
+
+/// Building WITHOUT `.run_budget(..)` leaves it `None` — `AgentRuntime::execute`
+/// must read that as "use the config-level default", not "unlimited".
+#[test]
+fn execute_request_builder_defaults_run_budget_to_none() {
+    use super::runtime::ExecuteRequestBuilder;
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, _rx) = mpsc::channel(1);
+    let request = ExecuteRequestBuilder::new("hello", tx, CancellationToken::new()).build();
+
+    assert!(request.run_budget.is_none());
 }
 
 #[test]
