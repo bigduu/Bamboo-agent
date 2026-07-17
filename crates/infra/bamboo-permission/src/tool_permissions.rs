@@ -34,37 +34,49 @@ pub fn check_permissions(
                     "Missing or invalid 'command' parameter".to_string(),
                 ));
             }
-            let mut contexts = Vec::new();
 
-            // AST-based security analysis
+            // AST-based security analysis (bash_security). #560: exactly ONE
+            // context per Bash call — the resource is always the bare
+            // command, never mangled with a "SECURITY:" prefix, so whitelist
+            // patterns and session grants (which glob-match against
+            // `ctx.resource`) match uniformly regardless of whether the
+            // analysis happened to notice a benign construct (`${…}`, an
+            // `if`, a heredoc). The "Dangerous shell pattern" framing is
+            // reserved for an actual `Deny` verdict; Allow-level warnings
+            // (parameter expansion, control flow, command substitution, …)
+            // are folded into the description as an informational note
+            // instead of changing the request's identity/severity.
             let security = bash_security::analyze_command(command);
-            if security.is_dangerous() {
-                contexts.push(PermissionContext::new(
-                    PermissionType::ExecuteCommand,
-                    format!("SECURITY: {}", command),
-                    format!("Dangerous shell pattern detected: {}", security.summary()),
-                ));
+            // #556: AST-based (argv[0] basename), not a substring scan — see
+            // `is_delete_command`.
+            let is_delete = is_delete_command(command);
+
+            let permission_type = if is_delete {
+                PermissionType::DeleteOperation
+            } else {
+                PermissionType::ExecuteCommand
+            };
+
+            let mut description = if is_delete {
+                format!("Delete operation via shell: {}", command)
+            } else {
+                format!("Execute command: {}", command)
+            };
+            if security.verdict == bash_security::BashVerdict::Deny {
+                description = format!(
+                    "Dangerous shell pattern detected: {} — {}",
+                    security.summary(),
+                    description
+                );
+            } else if security.is_dangerous() {
+                description = format!("{} (note: {})", description, security.summary());
             }
 
-            if is_delete_command(command) {
-                contexts.push(PermissionContext::new(
-                    PermissionType::DeleteOperation,
-                    command,
-                    format!("Delete operation via shell: {}", command),
-                ));
-            }
-
-            if !contexts
-                .iter()
-                .any(|ctx| ctx.resource.starts_with("SECURITY:"))
-            {
-                contexts.push(PermissionContext::new(
-                    PermissionType::ExecuteCommand,
-                    command,
-                    format!("Execute command: {}", command),
-                ));
-            }
-            Ok(Some(contexts))
+            Ok(Some(vec![PermissionContext::new(
+                permission_type,
+                command,
+                description,
+            )]))
         }
         "session_note" | "memory_note" => {
             let action = required_string_arg(args, "action")?
@@ -299,14 +311,22 @@ fn extract_domain(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
+/// True if some command actually INVOKED by `command` (i.e. some top-level
+/// `argv[0]` basename, AST-based — not a raw substring/keyword scan) is a
+/// delete command. #556: a delete keyword that merely appears in a comment, a
+/// quoted string, or as a substring of an unrelated word (`cat model.json`,
+/// `# rm cleanup`, `git commit -m "rm helper"`, `git grep 'rm -rf'`) never
+/// matches, because those bytes are never an `argv[0]`. Fails CLOSED (returns
+/// `true`) when the command can't be parsed, mirroring
+/// [`bash_security::is_compound_command`]'s poisoned-lock/unparseable
+/// handling — an unverifiable command is never mistaken for a non-delete one.
 pub fn is_delete_command(command: &str) -> bool {
-    let command_lower = command.to_ascii_lowercase();
-    DELETE_COMMANDS.iter().any(|delete| {
-        command_lower
-            .split_whitespace()
-            .any(|token| token == *delete)
-            || command_lower.contains(delete)
-    })
+    match bash_security::top_level_command_basenames(command) {
+        Some(names) => names
+            .iter()
+            .any(|name| DELETE_COMMANDS.contains(&name.as_str())),
+        None => true,
+    }
 }
 
 fn required_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, PermissionError> {
@@ -474,12 +494,85 @@ mod tests {
 
     #[test]
     fn check_permissions_bash_delete() {
+        // #560: exactly ONE context per Bash call, not two sequential prompts
+        // for a single `rm x` — DeleteOperation carries the elevated risk
+        // classification directly rather than being a second context.
         let args = json!({"command": "rm -rf /tmp/a"});
         let contexts = check_permissions("Bash", &args).unwrap().unwrap();
-        assert_eq!(contexts.len(), 2);
-        assert!(contexts
-            .iter()
-            .any(|ctx| ctx.permission_type == PermissionType::DeleteOperation));
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::DeleteOperation);
+        // The resource stays the bare command — never "SECURITY: …" — so a
+        // whitelist/session-grant pattern matches it uniformly.
+        assert_eq!(contexts[0].resource, "rm -rf /tmp/a");
+    }
+
+    #[test]
+    fn check_permissions_bash_resource_never_security_prefixed() {
+        // #560: an Allow-level warning (benign `${…}` parameter expansion)
+        // must not rewrite the resource, or a `Bash(cargo *)`-style whitelist
+        // pattern could never match this call.
+        let args = json!({"command": "echo ${HOME}"});
+        let contexts = check_permissions("Bash", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(contexts[0].resource, "echo ${HOME}");
+        assert!(!contexts[0].resource.starts_with("SECURITY:"));
+    }
+
+    #[test]
+    fn check_permissions_bash_deny_verdict_gets_security_framing() {
+        // A real Deny verdict (eval-like builtin) still surfaces the
+        // "Dangerous shell pattern" framing — in the description, not the
+        // resource.
+        let args = json!({"command": "eval 'cat /etc/passwd'"});
+        let contexts = check_permissions("Bash", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].resource, "eval 'cat /etc/passwd'");
+        assert!(contexts[0]
+            .operation_description
+            .contains("Dangerous shell pattern detected"));
+    }
+
+    #[test]
+    fn check_permissions_bash_delete_false_positives_not_gated_as_delete() {
+        // #556: a delete keyword that only appears in a comment, a quoted
+        // string, or as a substring of an unrelated word must NOT classify as
+        // DeleteOperation.
+        for cmd in [
+            "cat model.json",
+            "python format.py",
+            "git diff --word-diff",
+            "ls orders/",
+            "grep -n herd file.txt",
+            "echo hyperderive",
+            "cargo build",
+            "git commit -m \"remove dead code, rm helper\"",
+            "git grep -n 'rm -rf'",
+            "echo \"please delete me\"",
+            "man rm",
+            "which rm",
+        ] {
+            let args = json!({"command": cmd});
+            let contexts = check_permissions("Bash", &args).unwrap().unwrap();
+            assert_eq!(
+                contexts[0].permission_type,
+                PermissionType::ExecuteCommand,
+                "`{cmd}` must not classify as DeleteOperation"
+            );
+        }
+    }
+
+    #[test]
+    fn check_permissions_bash_real_deletes_still_gated_as_delete() {
+        for cmd in ["rm -rf /tmp/a", "rmdir /tmp/b", "unlink /tmp/c", "rm x"] {
+            let args = json!({"command": cmd});
+            let contexts = check_permissions("Bash", &args).unwrap().unwrap();
+            assert_eq!(
+                contexts[0].permission_type,
+                PermissionType::DeleteOperation,
+                "`{cmd}` must classify as DeleteOperation"
+            );
+        }
     }
 
     #[test]
