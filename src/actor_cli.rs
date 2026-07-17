@@ -451,26 +451,23 @@ fn print_event(event: &serde_json::Value, raw: bool) {
 }
 
 /// `--model provider:model` (or bare model on the default provider) >
-/// `defaults.sub_agent` > `defaults.chat`.
+/// `defaults.sub_agent` > `defaults.chat`. Shared grammar (#246): the
+/// `provider:model` / bare-model split lives in [`crate::model_spec`], same
+/// as `-p -m` and `broker-agent spawn --model`.
 fn resolve_model(
     explicit: &Option<String>,
     config: &Config,
 ) -> Result<Option<ModelRefSpec>, String> {
-    if let Some(spec) = explicit {
-        let spec = spec.trim();
-        if let Some((p, m)) = spec.split_once(':') {
-            if p.trim().is_empty() || m.trim().is_empty() {
-                return Err(format!("--model '{spec}' must be provider:model"));
-            }
+    if let Some(raw) = explicit {
+        if let Some(parsed) =
+            crate::model_spec::parse_model_spec(raw).map_err(|e| format!("--model {e}"))?
+        {
+            let provider = parsed.provider.unwrap_or_else(|| config.provider.clone());
             return Ok(Some(ModelRefSpec {
-                provider: p.trim().into(),
-                model: m.trim().into(),
+                provider,
+                model: parsed.model,
             }));
         }
-        return Ok(Some(ModelRefSpec {
-            provider: config.provider.clone(),
-            model: spec.into(),
-        }));
     }
     if let Some(defaults) = &config.defaults {
         let pick = defaults.sub_agent.as_ref().or(Some(&defaults.chat));
@@ -486,4 +483,106 @@ fn resolve_model(
 
 fn pick_credential(creds: &[ScopedCredential], provider: &str) -> Option<ScopedCredential> {
     creds.iter().find(|c| c.provider == provider).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    /// `--model provider:model` resolves to that exact pair, independent of
+    /// the configured default provider.
+    #[test]
+    fn resolve_model_colon_form() {
+        let config = Config {
+            provider: "anthropic".into(),
+            ..Config::default()
+        };
+        let m = resolve_model(&some("openai:gpt-4o"), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.provider, "openai");
+        assert_eq!(m.model, "gpt-4o");
+    }
+
+    /// A bare `--model <id>` binds to the config's default provider — same
+    /// grammar `bamboo -p -m` uses (#246).
+    #[test]
+    fn resolve_model_bare_uses_config_default_provider() {
+        let config = Config {
+            provider: "openai".into(),
+            ..Config::default()
+        };
+        let m = resolve_model(&some("gpt-4o"), &config).unwrap().unwrap();
+        assert_eq!(m.provider, "openai");
+        assert_eq!(m.model, "gpt-4o");
+    }
+
+    fn defaults_config(
+        chat: (&str, &str),
+        sub_agent: Option<(&str, &str)>,
+    ) -> bamboo_config::DefaultsConfig {
+        bamboo_config::DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new(chat.0, chat.1),
+            fast: None,
+            task_summary: None,
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_agent: sub_agent.map(|(p, m)| bamboo_domain::ProviderModelRef::new(p, m)),
+            subagent_models: std::collections::HashMap::new(),
+        }
+    }
+
+    /// No `--model` falls back to `defaults.sub_agent`, then `defaults.chat`.
+    #[test]
+    fn resolve_model_falls_back_to_defaults_sub_agent() {
+        let config = Config {
+            defaults: Some(defaults_config(
+                ("anthropic", "claude-x"),
+                Some(("openai", "gpt-sub")),
+            )),
+            ..Config::default()
+        };
+        let m = resolve_model(&None, &config).unwrap().unwrap();
+        assert_eq!(m.provider, "openai");
+        assert_eq!(m.model, "gpt-sub");
+    }
+
+    /// No `--model` and no `defaults.sub_agent` falls back to `defaults.chat`.
+    #[test]
+    fn resolve_model_falls_back_to_defaults_chat() {
+        let config = Config {
+            defaults: Some(defaults_config(("anthropic", "claude-x"), None)),
+            ..Config::default()
+        };
+        let m = resolve_model(&None, &config).unwrap().unwrap();
+        assert_eq!(m.provider, "anthropic");
+        assert_eq!(m.model, "claude-x");
+    }
+
+    /// Neither `--model` nor `defaults` configured → `None` (caller decides
+    /// whether that's fatal).
+    #[test]
+    fn resolve_model_none_when_nothing_configured() {
+        let config = Config {
+            defaults: None,
+            ..Config::default()
+        };
+        assert_eq!(resolve_model(&None, &config).unwrap(), None);
+    }
+
+    /// A malformed `provider:` (empty half) is rejected — same grammar
+    /// `bamboo -p -m` enforces (#246), not silently treated as a bare model.
+    #[test]
+    fn resolve_model_malformed_colon_errors() {
+        let config = Config::default();
+        assert!(resolve_model(&some("openai:"), &config).is_err());
+        assert!(resolve_model(&some(":gpt-4o"), &config).is_err());
+    }
 }

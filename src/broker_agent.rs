@@ -249,7 +249,11 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     // Model precedence: explicit --model > config defaults.sub_agent > defaults.chat.
     // A deployed worker given no --model must still inherit the configured default,
     // otherwise its AgentLoopConfig has no model_name and every LLM call fails.
-    spec.model = args.model.as_deref().and_then(parse_model).or_else(|| {
+    let explicit_model = match args.model.as_deref() {
+        Some(raw) => parse_model(raw)?,
+        None => None,
+    };
+    spec.model = explicit_model.or_else(|| {
         config.defaults.as_ref().and_then(|defaults| {
             defaults
                 .sub_agent
@@ -326,23 +330,17 @@ fn portable_mcp(
     }
 }
 
-/// Parse `provider:model`; a bare value leaves the provider empty (resolved by
-/// the runtime against the configured default).
-fn parse_model(s: &str) -> Option<ModelRefSpec> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    Some(match s.split_once(':') {
-        Some((p, m)) => ModelRefSpec {
-            provider: p.trim().to_string(),
-            model: m.trim().to_string(),
-        },
-        None => ModelRefSpec {
-            provider: String::new(),
-            model: s.to_string(),
-        },
-    })
+/// Parse `--model provider:model`; a bare value leaves the provider empty
+/// (resolved by the runtime against the configured default). Shared grammar
+/// (#246): the `provider:model` / bare-model split and malformed-colon
+/// validation live in [`crate::model_spec`], same as `-p -m` and
+/// `actor run|serve -m`.
+fn parse_model(s: &str) -> Result<Option<ModelRefSpec>, String> {
+    let parsed = crate::model_spec::parse_model_spec(s).map_err(|e| format!("--model {e}"))?;
+    Ok(parsed.map(|p| ModelRefSpec {
+        provider: p.provider.unwrap_or_default(),
+        model: p.model,
+    }))
 }
 
 #[cfg(test)]
@@ -352,20 +350,29 @@ mod tests {
     #[test]
     fn parse_model_handles_provider_pair_and_bare() {
         assert_eq!(
-            parse_model("anthropic:claude-sonnet-4-6"),
+            parse_model("anthropic:claude-sonnet-4-6").unwrap(),
             Some(ModelRefSpec {
                 provider: "anthropic".into(),
                 model: "claude-sonnet-4-6".into()
             })
         );
         assert_eq!(
-            parse_model("gpt-5"),
+            parse_model("gpt-5").unwrap(),
             Some(ModelRefSpec {
                 provider: String::new(),
                 model: "gpt-5".into()
             })
         );
-        assert_eq!(parse_model("   "), None);
+        assert_eq!(parse_model("   ").unwrap(), None);
+    }
+
+    /// A malformed `provider:` (empty half) is rejected — previously this
+    /// silently produced a bogus empty-provider or empty-model spec; now it
+    /// fails fast like `-p -m` / `actor run -m` already do (#246).
+    #[test]
+    fn parse_model_rejects_malformed_colon() {
+        assert!(parse_model("openai:").is_err());
+        assert!(parse_model(":gpt-4o").is_err());
     }
 
     #[test]
