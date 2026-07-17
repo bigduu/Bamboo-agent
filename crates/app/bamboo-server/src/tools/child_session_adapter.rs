@@ -486,8 +486,13 @@ impl ChildSessionPort for ChildSessionAdapter {
     }
 
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError> {
+        // Parent-side control write: the parent authoritatively sets the child's
+        // posture (e.g. the #74 resident-reuse bypass/no-human re-seed), so this
+        // must persist the in-memory flags as-is, NOT adopt the child's stale
+        // on-disk bypass (which the loop-protection in `merge_save_runtime`
+        // would). #540.
         self.persistence
-            .merge_save_runtime(child)
+            .save_runtime_authoritative_flags(child)
             .await
             .map_err(|error| {
                 ChildSessionError::Execution(format!("failed to save child session: {error}"))

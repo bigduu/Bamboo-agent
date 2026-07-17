@@ -129,12 +129,13 @@ pub async fn refresh_turn_boundary_from_disk(
         return TurnBoundaryRefresh::default();
     };
 
-    let disk_bypass_permissions = Some(
-        latest
-            .agent_runtime_state
-            .as_ref()
-            .is_some_and(|state| state.bypass_permissions),
-    );
+    // A disk copy with no runtime state carries no authoritative bypass value —
+    // report `None` (unknown) so the caller leaves the live flag untouched
+    // rather than force-disabling a legitimately bypassed run. #540.
+    let disk_bypass_permissions = latest
+        .agent_runtime_state
+        .as_ref()
+        .map(|state| state.bypass_permissions);
 
     // Read via the typed accessor (prefers `runtime_metadata`, falls back to the
     // legacy `pending_injected_messages` JSON string; defensive on malformed).
@@ -173,6 +174,26 @@ pub async fn refresh_turn_boundary_from_disk(
             session.id,
             merged
         );
+
+        // The cleanup save above adopted the freshest on-disk bypass; re-read it
+        // so the value the caller stamps reflects a `PATCH` that may have landed
+        // DURING the merge, not the pre-merge snapshot. Only when we actually
+        // saved (injected messages present) — the no-injection fast path keeps
+        // its single load. #540.
+        let refreshed_bypass = storage
+            .load_session(&session.id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                s.agent_runtime_state
+                    .as_ref()
+                    .map(|rs| rs.bypass_permissions)
+            });
+        return TurnBoundaryRefresh {
+            merged,
+            disk_bypass_permissions: refreshed_bypass.or(disk_bypass_permissions),
+        };
     }
 
     TurnBoundaryRefresh {
@@ -399,5 +420,20 @@ mod tests {
         let refresh = refresh_turn_boundary_from_disk(&mut session, None, None).await;
         assert_eq!(refresh.disk_bypass_permissions, None);
         assert_eq!(refresh.merged, 0);
+    }
+
+    // #540 review: a disk copy with no agent_runtime_state reports None
+    // (unknown), NOT Some(false) — so the pipeline won't force-disable a
+    // legitimately bypassed run.
+    #[tokio::test]
+    async fn refresh_turn_boundary_reports_none_when_disk_has_no_runtime_state() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let persisted = Session::new("no-rs", "model");
+        assert!(persisted.agent_runtime_state.is_none());
+        storage.save_session(&persisted).await.unwrap();
+
+        let mut running = Session::new("no-rs", "model");
+        let refresh = refresh_turn_boundary_from_disk(&mut running, Some(&storage), None).await;
+        assert_eq!(refresh.disk_bypass_permissions, None);
     }
 }
