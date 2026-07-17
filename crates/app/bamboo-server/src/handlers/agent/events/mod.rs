@@ -15,7 +15,7 @@ pub(crate) use stream::Coalescer;
 // Reused by the v2 WS `agent.{sid}` forwarder to keep the channel open while
 // child sub-agents are still running (parity with the v1 SSE stream, which does
 // not close on the parent terminal while descendants survive).
-pub(crate) use terminal::has_running_child;
+pub(crate) use terminal::{has_running_child, terminal_event_if_ready};
 
 #[cfg(test)]
 mod tests;
