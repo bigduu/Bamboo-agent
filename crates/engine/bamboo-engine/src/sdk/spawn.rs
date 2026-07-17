@@ -377,7 +377,7 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
                 .is_some_and(|reason| !reason.trim().is_empty());
         let (status, error) = if let Some(reason) = timeout_error {
             ("timeout".to_string(), Some(reason))
-        } else if suspended_non_terminal && result.is_ok() {
+        } else if suspended_non_terminal {
             ("suspended".to_string(), None)
         } else {
             match &result {

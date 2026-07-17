@@ -503,24 +503,58 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         if should_resume {
             parent.metadata.remove("runtime.suspend_reason");
-            // Load the completed child once. The guardian branch inspects its
-            // subagent_type + final verdict; the generic path folds its final
-            // assistant content into the hidden resume message (avoiding an extra
-            // `SubAgent.get` round trip after resume).
-            let loaded_child = match self
+
+            // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
+            // model-provided and unvalidated, and the watchdog unstrands a wait
+            // over a FOREIGN/unknown id by publishing a synthetic completion
+            // here. We must resume the parent (so it is not stranded) but MUST
+            // NOT fold that foreign session's transcript into the parent — that
+            // would be a cross-session disclosure primitive. Decide ownership
+            // from the child's OWN parent linkage (control-plane only, no
+            // messages loaded), and only load its full content when it is truly
+            // this parent's child. An unowned id resumes with the neutral/error
+            // message (`runtime_resume_message` falls back to `completion.error`
+            // when no child content is supplied).
+            let reported_child_owned = match self
                 .storage
-                .load_session(&completion.child_session_id)
+                .load_runtime_control_plane(&completion.child_session_id)
                 .await
             {
-                Ok(child) => child,
-                Err(error) => {
-                    tracing::warn!(
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "failed to load child session for runtime resume message"
-                    );
-                    None
+                Ok(Some(control_plane)) => completion_child_is_owned(
+                    &completion.parent_session_id,
+                    control_plane.parent_session_id.as_deref(),
+                ),
+                _ => false,
+            };
+
+            // Load the completed child once, ONLY when owned. The guardian
+            // branch inspects its subagent_type + final verdict; the generic
+            // path folds its final assistant content into the hidden resume
+            // message (avoiding an extra `SubAgent.get` round trip after resume).
+            let loaded_child = if reported_child_owned {
+                match self
+                    .storage
+                    .load_session(&completion.child_session_id)
+                    .await
+                {
+                    Ok(child) => child,
+                    Err(error) => {
+                        tracing::warn!(
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "failed to load child session for runtime resume message"
+                        );
+                        None
+                    }
                 }
+            } else {
+                tracing::warn!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    "completion child is not a child of this parent; resuming with a neutral \
+                     message and NOT folding its content"
+                );
+                None
             };
 
             // Guardian branch: a completing guardian reviewer that matches the
@@ -1297,6 +1331,17 @@ fn is_dead_child_candidate_status(status: Option<&str>) -> bool {
     }
 }
 
+/// Whether a reported completion's child id is genuinely a child of the parent
+/// it claims (issue #546 read-side disclosure guard). `SubAgent.wait` ids are
+/// model-provided, and the watchdog resolves an unowned id by publishing a
+/// synthetic completion so the parent is unstranded — but the parent must NEVER
+/// receive a FOREIGN session's content folded into its transcript.
+/// `child_parent_linkage` is that session's own `parent_session_id` (`None`
+/// when the session does not exist). Pure so the rule is unit-testable.
+fn completion_child_is_owned(reported_parent: &str, child_parent_linkage: Option<&str>) -> bool {
+    child_parent_linkage == Some(reported_parent)
+}
+
 /// Pick which terminal child's completion to replay when the wait is already
 /// satisfied but the parent is still suspended (lost wake). Prefer an
 /// error-like child so a `FirstError` policy re-evaluates truthfully.
@@ -1960,6 +2005,17 @@ mod tests {
         for status in ["completed", "error", "timeout", "cancelled", "skipped"] {
             assert!(!is_dead_child_candidate_status(Some(status)), "{status}");
         }
+    }
+
+    #[test]
+    fn completion_child_ownership_gates_content_fold() {
+        // Owned: the child's own parent linkage matches the reporting parent.
+        assert!(completion_child_is_owned("parent-1", Some("parent-1")));
+        // Foreign: a real session that belongs to a DIFFERENT parent — its
+        // content must never be folded into parent-1's transcript.
+        assert!(!completion_child_is_owned("parent-1", Some("parent-2")));
+        // Root/unparented session, or a nonexistent id (linkage None).
+        assert!(!completion_child_is_owned("parent-1", None));
     }
 
     #[test]
