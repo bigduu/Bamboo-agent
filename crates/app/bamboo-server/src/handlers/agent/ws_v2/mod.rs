@@ -69,8 +69,8 @@ use tokio_stream::StreamMap;
 use serde::Deserialize;
 
 use self::envelope::{
-    decode_client_frame, Channel, ClientFrame, Encoding, OutFrame, SUBPROTOCOL_JSON,
-    SUBPROTOCOL_MSGPACK,
+    decode_client_frame, sys_keepalive_envelope, Channel, ClientFrame, Encoding, OutFrame,
+    SUBPROTOCOL_JSON, SUBPROTOCOL_MSGPACK,
 };
 use self::forwarders::{spawn_agent_forwarder, spawn_feed_forwarder, OutboundTx};
 use crate::app_state::AppState;
@@ -84,8 +84,25 @@ use crate::handlers::agent::stop::cancel_session;
 /// driver drains them with a fair merge.
 const OUTBOUND_BUFFER: usize = 64;
 
-/// WS ping interval (~15s), mirroring the v1 SSE `[KEEPALIVE]` cadence.
+/// WS ping interval (~15s), mirroring the v1 SSE `[KEEPALIVE]` cadence. Each
+/// tick sends BOTH the protocol-level ping (server-side write probe) and the
+/// app-level `sys` keepalive data frame (client-side liveness signal, #533).
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Env var the live integration test sets to SHORTEN the ping interval so the
+/// `sys` keepalive cadence is asserted in milliseconds, not 15s. Read once per
+/// connection in [`drive`]. Production NEVER sets it.
+const PING_INTERVAL_OVERRIDE_ENV: &str = "BAMBOO_WS_PING_INTERVAL_MS";
+
+/// The effective ping interval: the [`PING_INTERVAL`] default unless
+/// [`PING_INTERVAL_OVERRIDE_ENV`] is set to a valid millisecond count (test-only).
+fn ping_interval() -> Duration {
+    std::env::var(PING_INTERVAL_OVERRIDE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(PING_INTERVAL)
+}
 
 /// How long an UNAUTHORIZED connection may stay open before it must present a
 /// valid `hello` device token. A connection that opens the (now public) upgrade
@@ -339,7 +356,7 @@ async fn drive(
     // channel id and mutated together (see [`subscribe`] / unsubscribe / teardown).
     let mut forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut queues: StreamMap<String, ReceiverStream<OutFrame>> = StreamMap::new();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut ping = tokio::time::interval(ping_interval());
     ping.tick().await; // skip the immediate tick
 
     // Authorization state (#189). Seeded from the upgrade-time decision so local
@@ -379,13 +396,37 @@ async fn drive(
                     break;
                 }
             }
-            // Keepalive ping. Liveness is write-driven (a dead peer surfaces as a
+            // Keepalive. Liveness is write-driven (a dead peer surfaces as a
             // failed `ping`/`text` write); we do NOT track Pong arrivals or run a
             // pong timeout — same one-directional keepalive contract as the v1 SSE
             // stream.
+            //
+            // TWO frames go out per tick (#533):
+            // - a protocol-level ping — the server-side write probe (unchanged);
+            // - an app-level `{ch:"sys", control:{type:"keepalive"}}` DATA frame —
+            //   browsers never expose protocol pings to JS, so without a data
+            //   frame a client on a half-open socket (sleep/wake, NAT idle
+            //   eviction) has NO observable liveness signal and sits "open"
+            //   forever after the server tears down. The sys frame is what the
+            //   lotus watchdog keys on to force a reconnect. Old clients ignore
+            //   the unknown `sys` channel, so this is backward-compatible.
             _ = ping.tick() => {
                 if session.ping(b"").await.is_err() {
                     break;
+                }
+                // Only an AUTHORIZED connection gets the data frame: an
+                // unauthenticated socket is served nothing (same posture as
+                // channel data) and is closed by the auth deadline anyway.
+                if authorized {
+                    if let Some(frame) = sys_keepalive_envelope().encode(encoding) {
+                        let write = match frame {
+                            OutFrame::Text(s) => session.text(s).await,
+                            OutFrame::Binary(b) => session.binary(b).await,
+                        };
+                        if write.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             // Client frames. In JSON mode the client sends TEXT frames; in msgpack
