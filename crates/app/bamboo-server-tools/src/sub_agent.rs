@@ -616,8 +616,11 @@ impl Tool for SubAgentTool {
                                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
                             rs.bypass_permissions = parent_bypass;
                             rs.no_human_approver = parent_no_human;
+                            // Authoritative flag write: persist the freshly
+                            // mirrored posture as-is; the adopting save would
+                            // revert bypass to the child's stale disk value. #540/#74.
                             self.sessions
-                                .save_child_session(&mut child)
+                                .save_child_session_authoritative_flags(&mut child)
                                 .await
                                 .map_err(tool_error_from_child_session)?;
                         }
