@@ -21,9 +21,42 @@ pub fn is_masked_api_key(value: &str) -> bool {
     !v.is_empty() && v.chars().all(|c| c == '*' || c == '.')
 }
 
+/// Decide whether `obj[field]` expresses a secret update **intent** — a
+/// genuine new value or an explicit clear — as opposed to "leave alone"
+/// (field absent) or "keep existing" (a masked placeholder string).
+///
+/// Three ways a client can write a secret field, and what each means:
+/// - absent → not an intent (existing #521/#516 behavior, unchanged).
+/// - a masked placeholder string (`is_masked_api_key`) → not an intent, the
+///   caller resolves it back to the live plaintext (`preserve_masked_*`).
+/// - anything else — a real new value, an explicit `""`, OR an explicit
+///   JSON `null` (#505's RFC-7386-style delete) → **is** an intent. `""`
+///   and `null` are equivalent clear signals here: [`deep_merge_json`]
+///   removes a `null` field from the merge target the same way it would
+///   settle on an empty string for a plain scalar, and treating both as
+///   "the caller explicitly asked to clear this" keeps the intent set in
+///   sync with what the merge is about to do — a `null` clear must be
+///   registered as an intent or `preserve_unpatched_provider_secrets` (which
+///   only skips fields the intents mark as touched) would resurrect the
+///   value the caller just deleted.
+fn is_secret_field_intent(obj: &Map<String, Value>, field: &str) -> bool {
+    match obj.get(field) {
+        None => false,
+        Some(Value::Null) => true,
+        Some(value) => match value.as_str() {
+            Some(s) => !is_masked_api_key(s),
+            // Not a string and not null (shouldn't happen from a
+            // well-behaved client) — no coherent intent to extract.
+            None => false,
+        },
+    }
+}
+
 /// Extract API-key update intents from a config patch.
 ///
-/// Masked placeholders are ignored — they signal "keep existing key".
+/// Masked placeholders are ignored — they signal "keep existing key". An
+/// explicit `null` is treated the same as an explicit `""` clear (#505) —
+/// see [`is_secret_field_intent`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderApiKeyIntents {
     pub providers: std::collections::BTreeSet<String>,
@@ -38,13 +71,9 @@ pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> ProviderApiKe
             let Some(obj) = provider_patch.as_object() else {
                 continue;
             };
-            let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if is_masked_api_key(api_key) {
-                continue;
+            if is_secret_field_intent(obj, "api_key") {
+                intents.providers.insert(provider_name.clone());
             }
-            intents.providers.insert(provider_name.clone());
         }
     }
 
@@ -56,13 +85,9 @@ pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> ProviderApiKe
             let Some(obj) = instance_patch.as_object() else {
                 continue;
             };
-            let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if is_masked_api_key(api_key) {
-                continue;
+            if is_secret_field_intent(obj, "api_key") {
+                intents.provider_instances.insert(instance_id.clone());
             }
-            intents.provider_instances.insert(instance_id.clone());
         }
     }
 
@@ -478,8 +503,9 @@ pub fn clear_provider_ciphertext_for_explicit_clears(
 /// `device_key`) from a config patch.
 ///
 /// Mirrors [`provider_api_key_intents`]: masked placeholders are ignored
-/// (they signal "keep existing secret"); an explicit empty string is a
-/// genuine intent (a clear), same as a genuine new value (a set). Must be
+/// (they signal "keep existing secret"); an explicit empty string OR an
+/// explicit JSON `null` (#505) is a genuine intent (a clear), same as a
+/// genuine new value (a set) — see [`is_secret_field_intent`]. Must be
 /// read from the patch AFTER [`preserve_masked_notification_secrets`] has
 /// resolved masked placeholders — same calling convention as the provider
 /// intents (#521).
@@ -496,26 +522,12 @@ pub fn notification_secret_intents(patch_obj: &Map<String, Value>) -> Notificati
         return intents;
     };
 
-    if let Some(token) = notifications
-        .get("ntfy")
-        .and_then(|v| v.as_object())
-        .and_then(|o| o.get("token"))
-        .and_then(|v| v.as_str())
-    {
-        if !is_masked_api_key(token) {
-            intents.ntfy_token = true;
-        }
+    if let Some(ntfy) = notifications.get("ntfy").and_then(|v| v.as_object()) {
+        intents.ntfy_token = is_secret_field_intent(ntfy, "token");
     }
 
-    if let Some(device_key) = notifications
-        .get("bark")
-        .and_then(|v| v.as_object())
-        .and_then(|o| o.get("device_key"))
-        .and_then(|v| v.as_str())
-    {
-        if !is_masked_api_key(device_key) {
-            intents.bark_device_key = true;
-        }
+    if let Some(bark) = notifications.get("bark").and_then(|v| v.as_object()) {
+        intents.bark_device_key = is_secret_field_intent(bark, "device_key");
     }
 
     intents
@@ -581,8 +593,10 @@ pub fn clear_notification_ciphertext_for_explicit_clears(
 /// relates to `current.connect.platforms` (id/type resolution, #490/#492/#496,
 /// happens earlier and only rewrites the VALUE at a given patch index, never
 /// its position). Masked placeholders are ignored — mirrors
-/// [`provider_api_key_intents`]; must be read from the patch AFTER
-/// [`preserve_masked_connect_secrets`] has resolved them (#521).
+/// [`provider_api_key_intents`]; an explicit `null` is treated the same as
+/// an explicit `""` clear (#505) — see [`is_secret_field_intent`]. Must be
+/// read from the patch AFTER [`preserve_masked_connect_secrets`] has
+/// resolved masked placeholders (#521).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectSecretIntents {
     pub token: std::collections::BTreeSet<usize>,
@@ -605,16 +619,12 @@ pub fn connect_secret_intents(patch_obj: &Map<String, Value>) -> ConnectSecretIn
             continue;
         };
 
-        if let Some(token) = obj.get("token").and_then(|v| v.as_str()) {
-            if !is_masked_api_key(token) {
-                intents.token.insert(index);
-            }
+        if is_secret_field_intent(obj, "token") {
+            intents.token.insert(index);
         }
 
-        if let Some(app_secret) = obj.get("app_secret").and_then(|v| v.as_str()) {
-            if !is_masked_api_key(app_secret) {
-                intents.app_secret.insert(index);
-            }
+        if is_secret_field_intent(obj, "app_secret") {
+            intents.app_secret.insert(index);
         }
     }
 
@@ -832,14 +842,102 @@ fn preserve_masked_secret_field(
     }
 }
 
-/// Deep merge `src` into `dst`, recursively combining objects and replacing leaf values.
+/// Deep merge `src` into `dst`, recursively combining objects and replacing leaf
+/// values — [RFC 7386 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386)
+/// semantics, generalized to arbitrary depth (#505).
+///
+/// ## Semantics (opt-in per value)
+///
+/// | Patch value at key `k`                        | Effect on `dst`                                    |
+/// |------------------------------------------------|-----------------------------------------------------|
+/// | key `k` absent from the patch object            | `dst[k]` unchanged (back-compat, unaffected by this)|
+/// | `k: null`                                       | `dst[k]` **removed** — see below for what that means|
+/// | `k: <object>`, `dst[k]` also an object          | recursively merged (this table applied one level down)|
+/// | `k: <object>`, `dst[k]` absent/non-object       | `dst[k]` set verbatim to the patch object            |
+/// | `k: <scalar \| array>`                          | `dst[k]` replaced verbatim (arrays are leaf values — RFC 7386 never merges into an array; a `null` *inside* an array is a literal element, not a delete marker)|
+///
+/// Removing `dst[k]` (the `null` row) has an effect that depends on what `k`
+/// deserializes into on the Rust side, because "removed" means the merged
+/// JSON object no longer carries that key at all — the subsequent
+/// `serde_json::from_value::<Config>` falls back to that field's own
+/// `#[serde(default)]`:
+/// - `Option<T>` field → default is `None` → **the value is cleared/unset**.
+///   This is the fix issue #505 asks for (e.g. `subagents.claude_code_binary:
+///   null` un-sets a previously-written override).
+/// - `Vec<T>` / `HashMap<K, V>` field reached directly (i.e. `null` sits at
+///   the position of the *whole* collection, not one of its entries) →
+///   default is empty → **the whole collection resets to empty/default**.
+///   Per the design note in #505: a `null` *inside* an array never reaches
+///   this path (arrays are leaf-replaced, previous row), so "does a null
+///   inside an array delete that element" does not apply — only "does a
+///   null in place of the whole array delete the array" does, and the
+///   answer is yes.
+/// - Plain non-`Option` scalar/struct field with a `Default` impl → resets
+///   to that type's default (e.g. `notifications: null` resets the entire
+///   notifications subtree to defaults, `http_proxy: null` resets it to
+///   `""`).
+/// - A key one level inside a map keyed by dynamic strings (e.g.
+///   `provider_instances`, `mcpServers`) → since JSON can't distinguish a
+///   struct's named fields from a `HashMap`'s dynamic keys, the same rule
+///   removes just that one entry — **this is how a client deletes a single
+///   provider instance or MCP server** (`provider_instances: { "<id>": null
+///   }`).
+///
+/// A patch that wants to clear ONE field of a nested config (e.g. just
+/// `providers.openai.api_key`) should send `null` at that leaf, not at an
+/// enclosing object — `providers: { openai: null }` wipes the *entire*
+/// openai provider config (model, base_url, api_key, everything), not just
+/// the key. Both are valid, opt-in RFC 7386 semantics; callers choose their
+/// blast radius by choosing which level they null out.
+///
+/// ## Secret-field composition (must NOT be bypassed)
+///
+/// This function is intentionally unaware of which fields are secrets. The
+/// server layer (`config_manager::build_merged_config`) MUST extract secret
+/// clear/set *intents* from the RAW patch object (via
+/// [`provider_api_key_intents`], [`notification_secret_intents`],
+/// [`connect_secret_intents`]) **before** calling this function — those
+/// intent extractors now treat `null` on `api_key` / `token` / `device_key`
+/// / `app_secret` identically to an explicit `""`: both are a "clear"
+/// intent, distinct from an absent field ("leave alone") and from a masked
+/// placeholder ("keep existing"). This preserves the precedence chain
+/// established by #516/#517/#521/#522:
+/// 1. masked placeholder → resolved back to the current plaintext (a `null`
+///    is never masked — `is_masked_api_key` only matches strings — so this
+///    step is a no-op for a `null` clear, which is correct: nothing should
+///    resurrect a value the caller explicitly asked to delete).
+/// 2. explicit clear intent (`""` OR `null`) → the merge (this function)
+///    removes/empties the field, then `clear_*_ciphertext_for_explicit_clears`
+///    drops the round-tripped ciphertext so hydration can't refill it.
+/// 3. no intent at all (key absent from the patch) → `preserve_unpatched_*`
+///    carries the live secret forward across the serde round-trip.
+///
+/// Without step 2 recognizing `null` as a clear intent, a `null`-delete of a
+/// secret field would silently get UNDONE by step 3 (which only skips
+/// providers/instances the intents mark as explicitly touched) — the merge
+/// would drop the key, but `preserve_unpatched_provider_secrets` would then
+/// think the field was untouched and copy the old ciphertext straight back.
 pub fn deep_merge_json(dst: &mut Value, src: Value) {
     match (dst, src) {
         (Value::Object(dst_map), Value::Object(src_map)) => {
             for (key, value) in src_map {
+                if value.is_null() {
+                    // RFC 7386: `null` deletes the member from the target
+                    // object. Absent from `dst` afterwards → the eventual
+                    // `serde_json::from_value` falls back to that field's
+                    // own `#[serde(default)]` (None for Option<T>, empty for
+                    // Vec/HashMap, the type default otherwise). A key that
+                    // was never in `dst` to begin with is simply a no-op,
+                    // matching RFC 7386 (deleting a non-existent member is
+                    // not an error).
+                    dst_map.remove(&key);
+                    continue;
+                }
                 match dst_map.get_mut(&key) {
-                    Some(existing) => deep_merge_json(existing, value),
-                    None => {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        deep_merge_json(existing, value);
+                    }
+                    _ => {
                         dst_map.insert(key, value);
                     }
                 }
@@ -1926,6 +2024,350 @@ mod tests {
                 .unwrap()
                 .contains_key("app_secret"),
             "mask must still drop when no entry of that type exists anywhere in current"
+        );
+    }
+
+    // ── #505: RFC 7386-style null-delete ────────────────────────────────
+    //
+    // Full round-trip helper: serialize `current`, deep-merge `patch` into
+    // it, and deserialize the result back into a `Config` — exactly what
+    // `config_manager::build_merged_config` does around `deep_merge_json`,
+    // minus the secret-specific composition (covered separately below).
+    fn merge_and_deserialize(current: &Config, patch: Value) -> Config {
+        let mut merged = serde_json::to_value(current).unwrap();
+        deep_merge_json(&mut merged, patch);
+        serde_json::from_value(merged).expect("merged config should deserialize")
+    }
+
+    #[test]
+    fn null_deletes_option_scalar_leaf() {
+        // The exact case #505 was filed for: an Option<String> field that
+        // was written once can never be un-set through plain overwrite
+        // semantics. A null leaf deletes just that field.
+        let mut current = Config::default();
+        current.subagents.claude_code_binary = Some("/usr/local/bin/claude".to_string());
+        current.subagents.claude_code_model = Some("claude-sonnet".to_string());
+
+        let merged = merge_and_deserialize(
+            &current,
+            json!({ "subagents": { "claude_code_binary": null } }),
+        );
+
+        assert_eq!(merged.subagents.claude_code_binary, None);
+        // Surgical: a sibling Option field in the same object that the
+        // patch didn't touch survives untouched.
+        assert_eq!(
+            merged.subagents.claude_code_model,
+            Some("claude-sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_key_leaves_value_unchanged_back_compat() {
+        // Back-compat is a hard requirement: omitting a key from the patch
+        // must never be interpreted as a delete, regardless of the new null
+        // semantics living right next to it.
+        let mut current = Config::default();
+        current.subagents.claude_code_binary = Some("/usr/local/bin/claude".to_string());
+        current.subagents.max_concurrent = Some(4);
+
+        // The patch touches a sibling field only; claude_code_binary is
+        // simply not mentioned.
+        let merged =
+            merge_and_deserialize(&current, json!({ "subagents": { "max_concurrent": 16 } }));
+
+        assert_eq!(
+            merged.subagents.claude_code_binary,
+            Some("/usr/local/bin/claude".to_string()),
+            "an omitted key must leave the existing value untouched"
+        );
+        assert_eq!(merged.subagents.max_concurrent, Some(16));
+    }
+
+    #[test]
+    fn null_on_whole_object_subtree_resets_it_to_defaults() {
+        // Before #505, `null` on a non-Option struct field (like
+        // `notifications`) crashed the ENTIRE patch with a deserialize
+        // error ("invalid type: null, expected struct..."). Deleting the
+        // key now falls back to that field's own `#[serde(default)]`,
+        // resetting the whole subtree rather than erroring.
+        let mut current = Config::default();
+        current.notifications.ntfy.token = Some("existing-token".to_string());
+        current.notifications.ntfy.enabled = true;
+
+        let merged = merge_and_deserialize(&current, json!({ "notifications": null }));
+
+        assert_eq!(merged.notifications, crate::NotificationsConfig::default());
+    }
+
+    #[test]
+    fn null_deletes_one_hashmap_entry_keeps_siblings() {
+        // The other half of the issue's motivating gap: a client could never
+        // delete a single map entry (provider instance, MCP server, ...) —
+        // sending null for one entry used to crash deserialization of the
+        // WHOLE map. Now it deletes just that entry.
+        //
+        // Note: `api_key` is `#[serde(skip_serializing)]` (plaintext never
+        // round-trips through `serde_json::to_value` — that's the unrelated
+        // #516 quirk `preserve_unpatched_provider_secrets` exists to paper
+        // over), so this test asserts survival via `label`, a plain
+        // serialized field, to isolate the hashmap-entry-delete mechanic
+        // being tested here from that separate secret-round-trip concern
+        // (covered by its own tests below).
+        fn labeled_instance(label: &str) -> crate::ProviderInstanceConfig {
+            serde_json::from_value(json!({
+                "provider_type": "openai",
+                "label": label,
+            }))
+            .expect("valid instance")
+        }
+
+        let mut current = Config::default();
+        current
+            .provider_instances
+            .insert("uuid-1".to_string(), labeled_instance("Work"));
+        current
+            .provider_instances
+            .insert("uuid-2".to_string(), labeled_instance("Personal"));
+
+        let merged = merge_and_deserialize(
+            &current,
+            json!({ "provider_instances": { "uuid-1": null } }),
+        );
+
+        assert!(!merged.provider_instances.contains_key("uuid-1"));
+        assert_eq!(
+            merged
+                .provider_instances
+                .get("uuid-2")
+                .and_then(|i| i.label.as_deref()),
+            Some("Personal"),
+            "sibling map entries the patch didn't touch must survive"
+        );
+    }
+
+    #[test]
+    fn null_on_whole_array_field_resets_it_to_empty() {
+        // Design decision (#505): arrays are leaf-replaced, never merged
+        // element-by-element. A `null` standing in for the WHOLE array
+        // deletes it (falls back to Vec's default, i.e. empty) — but this
+        // is a distinct case from "null as one element inside a
+        // surviving array" (covered by the next test), which is NOT a
+        // delete marker.
+        let mut current = Config::default();
+        current.connect.platforms = vec![connect_platform("telegram", "tok")];
+
+        let merged = merge_and_deserialize(&current, json!({ "connect": { "platforms": null } }));
+
+        assert!(merged.connect.platforms.is_empty());
+    }
+
+    #[test]
+    fn null_inside_a_surviving_array_is_a_literal_element_not_a_delete_marker() {
+        // RFC 7386 never recurses into arrays — they're leaf values, always
+        // replaced wholesale. So a patch that sends `[..., null, ...]` does
+        // NOT delete an element out of the existing array; the whole array
+        // is replaced verbatim, null and all. Demonstrated here against a
+        // `Vec<String>` field: since `String` (not `Option<String>`) can't
+        // hold a null, the round-trip surfaces a normal type error instead
+        // of silently dropping an element — proving the null was carried
+        // through literally, not specially interpreted.
+        let mut current = Config::default();
+        current.subagents.worker_args = Some(vec!["subagent-worker".to_string()]);
+
+        let mut merged = serde_json::to_value(&current).unwrap();
+        deep_merge_json(
+            &mut merged,
+            json!({ "subagents": { "worker_args": ["a", null, "b"] } }),
+        );
+
+        // The array in the merged JSON is the patch's array verbatim,
+        // literal null included — not silently filtered.
+        assert_eq!(
+            merged["subagents"]["worker_args"],
+            json!(["a", null, "b"]),
+            "arrays are leaf-replaced verbatim; a null element is not deleted"
+        );
+        let result: Result<Config, _> = serde_json::from_value(merged);
+        assert!(
+            result.is_err(),
+            "a literal null inside a Vec<String> is a type error, not an element delete"
+        );
+    }
+
+    #[test]
+    fn sentinel_string_values_still_work_after_null_delete_support() {
+        // Lotus #80: `subagents.executor = "bamboo_runtime"` is a plain
+        // string sentinel value (not related to null-delete at all) that
+        // must keep working exactly as a normal overwrite.
+        let current = Config::default();
+
+        let merged = merge_and_deserialize(
+            &current,
+            json!({ "subagents": { "executor": "bamboo_runtime" } }),
+        );
+
+        assert_eq!(
+            merged.subagents.executor,
+            Some("bamboo_runtime".to_string())
+        );
+    }
+
+    #[test]
+    fn subagents_max_concurrent_null_clears_it_like_todays_lotus_ui() {
+        // Existing-null-usage survey finding: Lotus's SystemSettingsConfigTab
+        // already sends `{"subagents":{"max_concurrent": null}}` today (the
+        // AntD InputNumber reports `null` when the field is cleared — see
+        // `SystemSettingsConfigTab.tsx`), relying on serde_json's built-in
+        // `Option<T>` + `null` -> `None` handling as an ACCIDENT of the old
+        // "just overwrite the leaf with whatever JSON value arrived"
+        // catch-all. The new delete-the-key implementation must reproduce
+        // that exact end result (None) so this already-shipped Lotus flow
+        // keeps working unchanged.
+        let mut current = Config::default();
+        current.subagents.max_concurrent = Some(4);
+
+        let merged =
+            merge_and_deserialize(&current, json!({ "subagents": { "max_concurrent": null } }));
+
+        assert_eq!(merged.subagents.max_concurrent, None);
+    }
+
+    // ── #505: secret-field composition (intents recognize null as clear) ──
+
+    #[test]
+    fn provider_api_key_intents_treats_null_as_clear_intent() {
+        let patch = json!({
+            "providers": { "openai": { "api_key": null } },
+            "provider_instances": { "uuid-1": { "api_key": null } }
+        });
+        let intents = provider_api_key_intents(patch.as_object().unwrap());
+        assert!(
+            intents.providers.contains("openai"),
+            "a null api_key must register as an explicit clear intent, \
+             same as an empty string — otherwise preserve_unpatched_provider_secrets \
+             would resurrect the deleted key"
+        );
+        assert!(intents.provider_instances.contains("uuid-1"));
+    }
+
+    #[test]
+    fn provider_api_key_intents_null_and_empty_string_are_equivalent_intents() {
+        let null_patch = json!({ "providers": { "openai": { "api_key": null } } });
+        let empty_patch = json!({ "providers": { "openai": { "api_key": "" } } });
+        assert_eq!(
+            provider_api_key_intents(null_patch.as_object().unwrap()),
+            provider_api_key_intents(empty_patch.as_object().unwrap()),
+            "null and \"\" must be recognized as the same clear intent"
+        );
+    }
+
+    #[test]
+    fn null_api_key_does_not_get_resurrected_by_preserve_unpatched_secrets() {
+        // End-to-end composition proof for the precedence rule documented on
+        // `deep_merge_json`: null-delete (step 2) must not be undone by the
+        // unpatched-secret carry-forward (step 3). This mirrors
+        // `preserve_unpatched_provider_secrets_respects_explicit_intents`
+        // above, but with a `null` clear instead of `""`.
+        let mut current = Config::default();
+        current
+            .provider_instances
+            .insert("uuid-1".to_string(), instance("sk-old", None));
+
+        let patch = json!({ "provider_instances": { "uuid-1": { "api_key": null } } });
+        let intents = provider_api_key_intents(patch.as_object().unwrap());
+        assert!(intents.provider_instances.contains("uuid-1"));
+
+        let mut merged = merge_and_deserialize(&current, patch);
+        preserve_unpatched_provider_secrets(&mut merged, &current, &intents);
+
+        assert_eq!(
+            merged.provider_instances["uuid-1"].api_key, "",
+            "a null-delete of api_key must stick, not get resurrected from `current`"
+        );
+    }
+
+    #[test]
+    fn notification_secret_intents_treats_null_as_clear_intent() {
+        let patch = json!({
+            "notifications": { "ntfy": { "token": null }, "bark": { "device_key": null } }
+        });
+        let intents = notification_secret_intents(patch.as_object().unwrap());
+        assert!(intents.ntfy_token);
+        assert!(intents.bark_device_key);
+    }
+
+    #[test]
+    fn connect_secret_intents_treats_null_as_clear_intent() {
+        let patch = json!({
+            "connect": { "platforms": [ { "type": "telegram", "token": null } ] }
+        });
+        let intents = connect_secret_intents(patch.as_object().unwrap());
+        assert!(intents.token.contains(&0));
+    }
+
+    #[test]
+    fn null_ntfy_token_clears_roundtripped_ciphertext_via_clear_intents() {
+        // Full composition: the merge leaves `token_encrypted` behind (only
+        // `token` was null-deleted, not the whole `ntfy` object), so
+        // `clear_notification_ciphertext_for_explicit_clears` must strip it
+        // once the intent is recognized — otherwise hydration would refill
+        // the "deleted" plaintext straight from the stale ciphertext.
+        let mut current = Config::default();
+        current.notifications.ntfy.token = Some("existing-token".to_string());
+        current.notifications.ntfy.token_encrypted = Some("existing-ct".to_string());
+
+        let patch = json!({ "notifications": { "ntfy": { "token": null } } });
+        let intents = notification_secret_intents(patch.as_object().unwrap());
+        assert!(intents.ntfy_token);
+
+        let mut merged = merge_and_deserialize(&current, patch);
+        assert_eq!(
+            merged.notifications.ntfy.token_encrypted.as_deref(),
+            Some("existing-ct"),
+            "the merge alone leaves the round-tripped ciphertext behind"
+        );
+
+        clear_notification_ciphertext_for_explicit_clears(&mut merged, &intents);
+
+        assert_eq!(merged.notifications.ntfy.token, None);
+        assert!(
+            merged.notifications.ntfy.token_encrypted.is_none(),
+            "the clear-intent pass must drop the stale ciphertext so hydration can't refill it"
+        );
+    }
+
+    #[test]
+    fn whole_providers_null_wipes_everything_without_resurrecting_secrets() {
+        // Coarse-grained blast radius: `{"providers": null}` deletes the
+        // ENTIRE providers subtree (not just one provider's key). Confirms
+        // this doesn't accidentally resurrect secrets: intents are empty
+        // (the raw patch's "providers" is a scalar null, not an object, so
+        // `provider_api_key_intents` finds no per-provider object to walk),
+        // but `preserve_unpatched_provider_secrets`'s carry-forward only
+        // fires when the MERGED side still has a `Some(..)` provider config
+        // to carry into — which a whole-subtree wipe doesn't leave behind.
+        let mut current = Config::default();
+        current.providers.openai = Some(crate::OpenAIConfig {
+            api_key: "sk-legacy-live".to_string(),
+            ..Default::default()
+        });
+
+        let patch = json!({ "providers": null });
+        let intents = provider_api_key_intents(patch.as_object().unwrap());
+        assert!(intents.providers.is_empty());
+
+        let mut merged = merge_and_deserialize(&current, patch);
+        assert!(
+            merged.providers.openai.is_none(),
+            "the whole providers subtree must reset to default"
+        );
+
+        preserve_unpatched_provider_secrets(&mut merged, &current, &intents);
+
+        assert!(
+            merged.providers.openai.is_none(),
+            "carry-forward must not resurrect a provider the patch wiped out entirely"
         );
     }
 }

@@ -493,6 +493,42 @@ bamboo serve --port 9562 --data-dir ~/.local/share/bamboo
   when `BAMBOO_WORKSPACE_ROOT` is set explicitly. Intended for orchestrated /
   multi-tenant deployments that want "one folder = one tenant's entire state".
 
+### Runtime Config Patching (`POST /v1/bamboo/config`)
+
+The live `config.json` (providers, subagents, notifications, MCP servers,
+bamboo-connect platforms, ...) is updated with a partial JSON PATCH — you
+only send the fields you want to change. Two rules:
+
+- **An omitted key leaves the existing value unchanged.** This is
+  unconditional back-compat: a patch that doesn't mention a field never
+  touches it.
+- **An explicit JSON `null` deletes that field**, opt-in per value
+  ([RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) JSON Merge Patch
+  semantics). What "deleted" means depends on what's there:
+  - an optional field (e.g. `subagents.claude_code_binary`) → cleared back
+    to unset.
+  - a whole object subtree (e.g. `notifications: null`) → reset to defaults.
+  - one entry of a dynamic map (e.g. `provider_instances: {"<id>": null}`,
+    `mcpServers: {"<name>": null}`) → that one entry removed, siblings
+    untouched.
+  - a whole array (e.g. `connect.platforms: null`) → emptied. A `null`
+    *inside* an array element is never a delete marker — arrays are always
+    replaced wholesale, not merged element-by-element.
+
+  Secret fields (`api_key`, `token`, `device_key`, `app_secret`) treat
+  `null` as an explicit clear, equivalent to sending `""` — both are
+  distinct from a masked placeholder (`****...****`, which means "keep the
+  existing secret").
+
+  Choose your blast radius by choosing which level you null out: nulling a
+  single leaf (`providers.openai.api_key: null`) clears just that field;
+  nulling an enclosing object (`providers.openai: null`) wipes the whole
+  provider's config.
+
+See `bamboo_config::patch::deep_merge_json`'s doc comment for the full
+semantics table and the precedence rules against masked-placeholder
+resolution.
+
 ---
 
 ## Architecture
