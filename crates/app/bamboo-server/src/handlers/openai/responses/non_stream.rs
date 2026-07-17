@@ -56,7 +56,9 @@ pub(super) async fn handle_non_streaming_response(
         .map_err(map_provider_error)?;
 
     let mut content = String::new();
-    let mut tool_calls: Vec<bamboo_agent_core::tools::ToolCall> = Vec::new();
+    // Merge partial tool-call fragments by index/id — a raw Vec shatters one
+    // call into N broken output items (#525). Same as the streaming worker.
+    let mut tool_calls = bamboo_agent_core::tools::ToolCallAccumulator::new();
     let mut upstream_response_id: Option<String> = None;
 
     while let Some(chunk_result) = stream.next().await {
@@ -68,9 +70,9 @@ pub(super) async fn handle_non_streaming_response(
             // Keep parity with streaming behavior: expose reasoning narration as text.
             Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
             Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
-            // Indexed variant: drop indices, same behavior. #236.
+            // Indexed variant: route fragments by provider index (#236/#525).
             Ok(bamboo_llm::types::LLMChunk::ToolCallsIndexed(calls)) => {
-                tool_calls.extend(calls.into_iter().map(|(_, call)| call))
+                tool_calls.extend_indexed(calls)
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
@@ -99,7 +101,7 @@ pub(super) async fn handle_non_streaming_response(
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let created_at = now_unix_ts();
 
-    let output = build_output_items(&message_id, content, tool_calls);
+    let output = build_output_items(&message_id, content, tool_calls.finalize());
     let resp = build_completed_response(response_id, created_at, display_model, output);
 
     app_state.metrics_service.collector().forward_completed(

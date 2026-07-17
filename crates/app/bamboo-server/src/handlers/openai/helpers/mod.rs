@@ -18,6 +18,12 @@ pub(super) fn convert_tools(
     conversion::convert_tools(tools)
 }
 
+pub(super) fn convert_responses_tools(
+    tools: Option<Vec<super::types::ResponsesToolParam>>,
+) -> Result<Vec<bamboo_agent_core::tools::ToolSchema>, crate::error::AppError> {
+    conversion::convert_responses_tools(tools)
+}
+
 pub(super) fn responses_input_to_chat_messages(
     input: serde_json::Value,
 ) -> Result<Vec<bamboo_llm::api::models::ChatMessage>, crate::error::AppError> {

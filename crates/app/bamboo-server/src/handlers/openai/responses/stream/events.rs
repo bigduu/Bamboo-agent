@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use serde::Serialize;
 
-use super::super::super::types::{ResponsesCreateResponse, ResponsesStreamEvent};
+use super::super::super::types::{
+    ResponsesCreateResponse, ResponsesFunctionCallOutputItem, ResponsesOutputItem,
+    ResponsesStreamEvent,
+};
 
 pub(super) fn created_event(
     response_id: String,
@@ -24,6 +27,8 @@ pub(super) fn created_event(
         output_index: None,
         content_index: None,
         delta: None,
+        item: None,
+        arguments: None,
     }
 }
 
@@ -40,6 +45,8 @@ pub(super) fn output_text_delta_event(
         output_index: Some(0),
         content_index: Some(0),
         delta: Some(delta),
+        item: None,
+        arguments: None,
     }
 }
 
@@ -54,7 +61,88 @@ pub(super) fn completed_event(
         output_index: None,
         content_index: None,
         delta: None,
+        item: None,
+        arguments: None,
     }
+}
+
+/// A bare event skeleton for the function-call item events below.
+fn item_event(
+    event_type: &str,
+    response_id: &str,
+    item_id: &str,
+    output_index: u32,
+) -> ResponsesStreamEvent<ResponsesCreateResponse> {
+    ResponsesStreamEvent {
+        event_type: event_type.to_string(),
+        response: None,
+        response_id: Some(response_id.to_string()),
+        item_id: Some(item_id.to_string()),
+        output_index: Some(output_index),
+        content_index: None,
+        delta: None,
+        item: None,
+        arguments: None,
+    }
+}
+
+/// The standard Responses event sequence for ONE completed function call,
+/// emitted before `response.completed` (#525):
+/// `response.output_item.added` (item, in_progress, empty arguments) →
+/// `response.function_call_arguments.delta` (full aggregated arguments — a
+/// single delta is spec-legal) → `response.function_call_arguments.done` →
+/// `response.output_item.done` (item, completed, full arguments).
+///
+/// Codex collects function calls from `response.output_item.done`.
+pub(super) fn function_call_item_events(
+    response_id: &str,
+    item: &ResponsesFunctionCallOutputItem,
+    output_index: u32,
+) -> Vec<ResponsesStreamEvent<ResponsesCreateResponse>> {
+    let mut added = item_event(
+        "response.output_item.added",
+        response_id,
+        &item.id,
+        output_index,
+    );
+    added.item = Some(ResponsesOutputItem::FunctionCall(
+        ResponsesFunctionCallOutputItem {
+            arguments: String::new(),
+            status: Some("in_progress".to_string()),
+            ..item.clone()
+        },
+    ));
+
+    let mut arguments_delta = item_event(
+        "response.function_call_arguments.delta",
+        response_id,
+        &item.id,
+        output_index,
+    );
+    arguments_delta.delta = Some(item.arguments.clone());
+
+    let mut arguments_done = item_event(
+        "response.function_call_arguments.done",
+        response_id,
+        &item.id,
+        output_index,
+    );
+    arguments_done.arguments = Some(item.arguments.clone());
+
+    let mut done = item_event(
+        "response.output_item.done",
+        response_id,
+        &item.id,
+        output_index,
+    );
+    done.item = Some(ResponsesOutputItem::FunctionCall(
+        ResponsesFunctionCallOutputItem {
+            status: Some("completed".to_string()),
+            ..item.clone()
+        },
+    ));
+
+    vec![added, arguments_delta, arguments_done, done]
 }
 
 pub(super) fn event_to_sse_bytes<T: Serialize>(event: &ResponsesStreamEvent<T>) -> Bytes {

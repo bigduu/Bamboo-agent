@@ -29,7 +29,7 @@ pub(super) struct Model {
 /// - `input` (string or array of message-like objects)
 /// - `instructions` (forwarded as top-level Responses API instructions)
 /// - `previous_response_id` (passed via flattened parameters for stateful continuation)
-/// - `tools` (OpenAI tool schema; reuses existing OpenAI-compatible tool model)
+/// - `tools` (Responses-API flat tool entries; legacy nested shape tolerated)
 /// - `stream`
 /// - `max_output_tokens` (mapped to provider max tokens)
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -40,13 +40,49 @@ pub struct ResponsesCreateRequest {
     #[serde(default)]
     pub(super) instructions: Option<String>,
     #[serde(default)]
-    pub(super) tools: Option<Vec<Tool>>,
+    pub(super) tools: Option<Vec<ResponsesToolParam>>,
     #[serde(default)]
     pub(super) stream: Option<bool>,
     #[serde(default)]
     pub(super) max_output_tokens: Option<u32>,
     #[serde(flatten)]
     pub(super) parameters: HashMap<String, serde_json::Value>,
+}
+
+/// A Responses-API function tool declaration — FLAT, per the spec:
+/// `{"type":"function","name":"…","description":"…","parameters":{…},"strict":false}`.
+///
+/// The nested `{type, function:{name,…}}` shape belongs to the Chat Completions
+/// wire format; reusing that model here made every tools-bearing /responses
+/// request fail with `missing field 'function'` (#525).
+#[derive(Debug, Deserialize, Clone)]
+pub(super) struct ResponsesFunctionToolParam {
+    #[serde(rename = "type")]
+    pub(super) tool_type: String,
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) parameters: serde_json::Value,
+    /// Accepted and ignored — bamboo does not enforce strict schemas upstream.
+    /// Kept as a real field (read in tests) to document the wire shape.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) strict: Option<bool>,
+}
+
+/// A `tools[]` entry on POST /responses.
+///
+/// Untagged, tried in order: the flat Responses shape (spec), the nested
+/// Chat-Completions shape (legacy clients that already worked against this
+/// endpoint), then a raw catch-all so non-function tool types (`web_search`,
+/// …) can be skipped instead of failing the whole request. #525.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub(super) enum ResponsesToolParam {
+    Flat(ResponsesFunctionToolParam),
+    Nested(Tool),
+    Other(serde_json::Value),
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -83,6 +119,10 @@ pub(super) struct ResponsesFunctionCallOutputItem {
     pub(super) call_id: String,
     pub(super) name: String,
     pub(super) arguments: String,
+    /// "in_progress" while streaming, "completed" in final output. Clients
+    /// (Codex) read the completed item off `response.output_item.done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) status: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -120,6 +160,12 @@ pub(super) struct ResponsesStreamEvent<T> {
     pub(super) content_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) delta: Option<String>,
+    /// Full item object for `response.output_item.added` / `.done` (#525).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) item: Option<ResponsesOutputItem>,
+    /// Complete arguments for `response.function_call_arguments.done` (#525).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) arguments: Option<String>,
 }
 
 #[cfg(test)]
@@ -269,6 +315,7 @@ mod tests {
             call_id: "call-789".to_string(),
             name: "get_weather".to_string(),
             arguments: r#"{"location":"NYC"}"#.to_string(),
+            status: None,
         };
 
         let json = serde_json::to_string(&item).unwrap();
@@ -300,6 +347,7 @@ mod tests {
             call_id: "call-1".to_string(),
             name: "test".to_string(),
             arguments: "{}".to_string(),
+            status: None,
         };
 
         let output_item = ResponsesOutputItem::FunctionCall(fc_item.clone());
@@ -358,6 +406,8 @@ mod tests {
             output_index: None,
             content_index: None,
             delta: None,
+            item: None,
+            arguments: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -374,6 +424,8 @@ mod tests {
             output_index: Some(0),
             content_index: Some(0),
             delta: Some("Hello".to_string()),
+            item: None,
+            arguments: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -399,6 +451,69 @@ mod tests {
             req.parameters.get("previous_response_id").unwrap(),
             &serde_json::json!("resp_123")
         );
+    }
+
+    // #525: the Responses API sends function tools FLAT (name/parameters at the
+    // top level, `strict` present). This exact shape used to 400 with
+    // "missing field `function`" because the field reused the nested
+    // Chat-Completions Tool model.
+    #[test]
+    fn test_responses_create_request_with_flat_tools() {
+        let json = r#"{
+            "model":"gpt-5",
+            "input":"hi",
+            "tools":[{
+                "type":"function",
+                "name":"get_weather",
+                "description":"Get weather",
+                "strict":false,
+                "parameters":{"type":"object","properties":{"location":{"type":"string"}}}
+            }]
+        }"#;
+        let req: ResponsesCreateRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.expect("tools parsed");
+        assert_eq!(tools.len(), 1);
+        match &tools[0] {
+            ResponsesToolParam::Flat(flat) => {
+                assert_eq!(flat.tool_type, "function");
+                assert_eq!(flat.name, "get_weather");
+                assert_eq!(flat.description.as_deref(), Some("Get weather"));
+                assert_eq!(flat.strict, Some(false));
+                assert!(flat.parameters.get("properties").is_some());
+            }
+            other => panic!("expected flat tool param, got {other:?}"),
+        }
+    }
+
+    // Legacy clients that already sent the nested Chat-Completions shape to
+    // this endpoint must keep working.
+    #[test]
+    fn test_responses_create_request_with_nested_tools_still_parses() {
+        let json = r#"{
+            "model":"gpt-5",
+            "tools":[{
+                "type":"function",
+                "function":{"name":"get_weather","parameters":{"type":"object"}}
+            }]
+        }"#;
+        let req: ResponsesCreateRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.expect("tools parsed");
+        match &tools[0] {
+            ResponsesToolParam::Nested(tool) => {
+                assert_eq!(tool.function.name, "get_weather");
+            }
+            other => panic!("expected nested tool param, got {other:?}"),
+        }
+    }
+
+    // Non-function tool types (web_search, …) must not fail the request; they
+    // land in the catch-all and are skipped at conversion time.
+    #[test]
+    fn test_responses_create_request_tolerates_non_function_tools() {
+        let json = r#"{"model":"gpt-5","tools":[{"type":"web_search"}]}"#;
+        let req: ResponsesCreateRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.expect("tools parsed");
+        assert!(matches!(&tools[0], ResponsesToolParam::Other(_)));
     }
 
     #[test]

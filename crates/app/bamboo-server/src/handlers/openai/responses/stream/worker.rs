@@ -6,10 +6,13 @@ use bamboo_llm::provider::LLMStream;
 use bamboo_llm::types::LLMChunk;
 use bamboo_metrics::{ForwardStatus, MetricsCollector};
 
+use bamboo_agent_core::tools::ToolCallAccumulator;
+
+use super::super::super::types::ResponsesOutputItem;
 use super::super::output::{build_completed_response, build_output_items};
 use super::events::{
     completed_event, created_event, done_sse_bytes, event_to_sse_bytes, failed_sse_bytes,
-    output_text_delta_event,
+    function_call_item_events, output_text_delta_event,
 };
 use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 
@@ -35,7 +38,11 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
     let mut had_error = false;
     let mut error_message: Option<String> = None;
     let mut content = String::new();
-    let mut tool_calls: Vec<bamboo_agent_core::tools::ToolCall> = Vec::new();
+    // Providers stream PARTIAL tool-call fragments (argument-only continuation
+    // chunks with empty id/name). Merge them by provider index / call id via
+    // the engine's accumulator instead of collecting raw fragments — a raw Vec
+    // shatters one call into N broken output items (#525).
+    let mut tool_calls = ToolCallAccumulator::new();
     let mut response_id: Option<String> = None;
     let mut created_sent = false;
 
@@ -104,7 +111,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 }
                 tool_calls.extend(calls)
             }
-            // Indexed variant: drop indices, same behavior. #236.
+            // Indexed variant: route fragments by provider index (#236/#525).
             Ok(LLMChunk::ToolCallsIndexed(indexed)) => {
                 let active_response_id = response_id
                     .clone()
@@ -112,7 +119,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 if !ensure_created_event(&mut args, &active_response_id, &mut created_sent).await {
                     break;
                 }
-                tool_calls.extend(indexed.into_iter().map(|(_, call)| call))
+                tool_calls.extend_indexed(indexed)
             }
             Ok(LLMChunk::Done) => break,
             Ok(LLMChunk::CacheUsage { .. })
@@ -149,7 +156,25 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
     if !ensure_created_event(&mut args, &final_response_id, &mut created_sent).await {
         return;
     }
-    let output = build_output_items(&args.message_id, content, tool_calls);
+    let output = build_output_items(&args.message_id, content, tool_calls.finalize());
+
+    // Emit the standard per-call event sequence (output_item.added →
+    // function_call_arguments.delta/.done → output_item.done) before
+    // response.completed — Responses clients (Codex) collect function calls
+    // from output_item.done, not from the completed payload alone (#525).
+    // build_output_items puts the message item at output_index 0 and function
+    // calls after it, so enumerate() indices are already the output indices.
+    for (output_index, item) in output.iter().enumerate() {
+        let ResponsesOutputItem::FunctionCall(fc) = item else {
+            continue;
+        };
+        for event in function_call_item_events(&final_response_id, fc, output_index as u32) {
+            if args.tx.send(Ok(event_to_sse_bytes(&event))).await.is_err() {
+                return;
+            }
+        }
+    }
+
     let response = build_completed_response(
         final_response_id,
         args.created_at,

@@ -3,7 +3,7 @@ use actix_web::web;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::helpers::{
-    convert_messages, convert_tools, parse_parallel_tool_calls, parse_reasoning_effort,
+    convert_messages, convert_responses_tools, parse_parallel_tool_calls, parse_reasoning_effort,
     parse_responses_request_options, responses_input_to_chat_messages,
 };
 use super::super::types::ResponsesCreateRequest;
@@ -58,7 +58,7 @@ pub(super) async fn prepare_request(
         }
     })?;
 
-    let internal_tools = convert_tools(request.tools)?;
+    let internal_tools = convert_responses_tools(request.tools)?;
 
     let max_tokens = request.max_output_tokens.or_else(|| {
         request

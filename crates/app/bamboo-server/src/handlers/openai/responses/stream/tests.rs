@@ -99,3 +99,119 @@ fn map_provider_error_wraps_non_proxy_errors() {
         _ => panic!("expected internal error"),
     }
 }
+
+// ── #525: function-call streaming event sequence + fragment aggregation ─
+
+use super::events::function_call_item_events;
+use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolCallAccumulator};
+
+fn fragment(id: &str, name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    }
+}
+
+// The exact upstream pattern that used to shatter one call into N broken
+// items: a metadata fragment followed by argument-only continuation fragments
+// (empty id/name), all sharing the provider index.
+#[test]
+fn indexed_fragments_aggregate_into_single_function_call_item() {
+    let mut acc = ToolCallAccumulator::new();
+    acc.extend_indexed(vec![(0, fragment("call_w1", "get_weather", ""))]);
+    acc.extend_indexed(vec![(0, fragment("", "", "{\"location\":"))]);
+    acc.extend_indexed(vec![(0, fragment("", "", "\"NYC\"}"))]);
+
+    let output = build_output_items("msg_1", String::new(), acc.finalize());
+
+    let function_items: Vec<_> = output
+        .iter()
+        .filter_map(|item| match item {
+            super::super::super::types::ResponsesOutputItem::FunctionCall(fc) => Some(fc),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        function_items.len(),
+        1,
+        "fragments must merge into ONE item"
+    );
+    assert_eq!(function_items[0].call_id, "call_w1");
+    assert_eq!(function_items[0].name, "get_weather");
+    assert_eq!(function_items[0].arguments, "{\"location\":\"NYC\"}");
+    assert_eq!(function_items[0].status.as_deref(), Some("completed"));
+}
+
+#[test]
+fn function_call_item_events_emit_standard_sequence() {
+    let output = build_output_items(
+        "msg_1",
+        String::new(),
+        vec![fragment("call_w1", "get_weather", "{\"location\":\"NYC\"}")],
+    );
+    let super::super::super::types::ResponsesOutputItem::FunctionCall(fc) = &output[1] else {
+        panic!("expected function_call item at output_index 1");
+    };
+
+    let events = function_call_item_events("resp_1", fc, 1);
+    let decoded: Vec<_> = events
+        .iter()
+        .map(|event| decode_sse_event(event_to_sse_bytes(event)))
+        .collect();
+
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+        ]
+    );
+
+    let (_, added) = &decoded[0];
+    assert_eq!(added["item"]["type"], "function_call");
+    assert_eq!(added["item"]["call_id"], "call_w1");
+    assert_eq!(added["item"]["status"], "in_progress");
+    assert_eq!(added["item"]["arguments"], "");
+    assert_eq!(added["output_index"], 1);
+
+    let (_, delta) = &decoded[1];
+    assert_eq!(delta["delta"], "{\"location\":\"NYC\"}");
+    assert_eq!(delta["item_id"], added["item"]["id"]);
+
+    let (_, args_done) = &decoded[2];
+    assert_eq!(args_done["arguments"], "{\"location\":\"NYC\"}");
+
+    let (_, item_done) = &decoded[3];
+    assert_eq!(item_done["item"]["status"], "completed");
+    assert_eq!(item_done["item"]["arguments"], "{\"location\":\"NYC\"}");
+    assert_eq!(item_done["item"]["name"], "get_weather");
+}
+
+#[test]
+fn completed_response_carries_aggregated_function_call() {
+    let mut acc = ToolCallAccumulator::new();
+    acc.extend(vec![fragment("call_1", "search", "{\"q\":")]);
+    acc.extend(vec![fragment("call_1", "", "\"hi\"}")]);
+
+    let output = build_output_items("msg_1", "text".to_string(), acc.finalize());
+    let response = build_completed_response("resp_1".to_string(), 1, "m".to_string(), output);
+    let event = completed_event(response);
+    let (_, payload) = decode_sse_event(event_to_sse_bytes(&event));
+
+    assert_eq!(payload["response"]["output"][0]["type"], "message");
+    assert_eq!(payload["response"]["output"][1]["type"], "function_call");
+    assert_eq!(
+        payload["response"]["output"][1]["arguments"],
+        "{\"q\":\"hi\"}"
+    );
+    assert!(payload["response"]["output"].as_array().unwrap().len() == 2);
+}
