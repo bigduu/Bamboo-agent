@@ -683,20 +683,15 @@ fn resolve_model_selection(
     default_provider: &str,
 ) -> Result<ModelSelection, String> {
     let cli_provider = provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
-    let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
 
-    // Split an explicit `provider:model` spec, if any.
-    let (spec_provider, bare_model) = match model {
-        Some(spec) => match spec.split_once(':') {
-            Some((p, m)) => {
-                let (p, m) = (p.trim(), m.trim());
-                if p.is_empty() || m.is_empty() {
-                    return Err(format!("-m '{spec}' must be 'provider:model'"));
-                }
-                (Some(p.to_string()), Some(m.to_string()))
+    // Split an explicit `provider:model` spec, if any — shared grammar (#246).
+    let (spec_provider, bare_model) = match model.as_deref() {
+        Some(raw) => {
+            match crate::model_spec::parse_model_spec(raw).map_err(|e| format!("-m {e}"))? {
+                Some(parsed) => (parsed.provider, Some(parsed.model)),
+                None => (None, None),
             }
-            None => (None, Some(spec.to_string())),
-        },
+        }
         None => (None, None),
     };
 
