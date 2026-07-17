@@ -666,4 +666,156 @@ mod tests {
         );
         assert!(merged.connect.platforms[0].token_encrypted.is_some());
     }
+
+    // ── #505: RFC7386-style null-delete through the FULL production pipeline ──
+    //
+    // These mirror the existing `""`-clear tests above (same helpers, same
+    // call order: preserve_masked_* → build_merged_config →
+    // sync_provider_api_keys_encrypted_for_patch / refresh_encrypted_secrets)
+    // but exercise a `null` clear instead, proving the new delete semantics
+    // compose correctly with the #516/#521 secret machinery end-to-end, not
+    // just at the `bamboo-config`-crate unit level.
+
+    #[test]
+    fn null_instance_api_key_clear_wins_over_in_memory_ciphertext() {
+        // Same scenario as `explicit_instance_key_clear_wins_over_in_memory_ciphertext`
+        // above, but the client sends `null` instead of `""`.
+        let mut current = config_with_plaintext_only_instance("sk-old");
+        current.refresh_encrypted_secrets().expect("refresh");
+        assert!(
+            current.provider_instances["uuid-1"]
+                .api_key_encrypted
+                .is_some(),
+            "precondition: live config holds ciphertext"
+        );
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"provider_instances":{"uuid-1":{"api_key":null}}}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(
+            intents.provider_instances.contains("uuid-1"),
+            "null must register as a clear intent, same as \"\""
+        );
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = merged.provider_instances.get("uuid-1").expect("instance");
+        assert!(instance.api_key.is_empty(), "null clear must win");
+        assert!(
+            instance.api_key_encrypted.is_none(),
+            "ciphertext must be cleared too, not resurrected via hydration"
+        );
+    }
+
+    #[test]
+    fn null_deletes_a_whole_provider_instance_entry() {
+        // The other half of #505: deleting an entire map entry (not just
+        // clearing one field within it). Two instances exist; the patch
+        // null-deletes one by id and must leave the other untouched.
+        let mut current = config_with_plaintext_only_instance("sk-keep-me");
+        let second: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "label": "Delete Me",
+            }))
+            .expect("valid instance");
+        current
+            .provider_instances
+            .insert("uuid-2".to_string(), second);
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"provider_instances":{"uuid-2":null}}"#).unwrap();
+        let intents = provider_api_key_intents(&patch);
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        assert!(
+            !merged.provider_instances.contains_key("uuid-2"),
+            "the null-targeted instance must be gone"
+        );
+        assert_eq!(
+            merged
+                .provider_instances
+                .get("uuid-1")
+                .map(|i| &i.provider_type),
+            Some(&"openai".to_string()),
+            "the untouched sibling instance must survive"
+        );
+    }
+
+    #[test]
+    fn null_ntfy_token_clear_wins_over_in_memory_ciphertext() {
+        // Same scenario as `explicit_notification_secret_clear_wins_over_in_memory_ciphertext`
+        // above, but only ntfy is cleared, and via `null` rather than `""`.
+        let current = config_with_notification_secrets("ntfy-secret", "bark-secret");
+
+        let merged =
+            merge_notifications_patch(&current, r#"{"notifications":{"ntfy":{"token":null}}}"#);
+
+        assert!(
+            merged
+                .notifications
+                .ntfy
+                .token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "null clear must win"
+        );
+        assert!(
+            merged.notifications.ntfy.token_encrypted.is_none(),
+            "ciphertext must be cleared too, not resurrected via hydration"
+        );
+        // Sibling secret domain (bark), untouched by the patch, must survive.
+        assert_eq!(
+            merged.notifications.bark.device_key.as_deref(),
+            Some("bark-secret")
+        );
+        assert!(merged.notifications.bark.device_key_encrypted.is_some());
+    }
+
+    #[test]
+    fn null_connect_token_clear_wins_over_in_memory_ciphertext() {
+        let current = config_with_connect_platform("telegram", "tg-old-token");
+
+        let merged = merge_connect_patch(
+            &current,
+            r#"{"connect":{"platforms":[{"type":"telegram","token":null}]}}"#,
+        );
+
+        assert!(
+            merged.connect.platforms[0]
+                .token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "null clear must win"
+        );
+        assert!(
+            merged.connect.platforms[0].token_encrypted.is_none(),
+            "ciphertext must be cleared too, not resurrected via hydration"
+        );
+    }
+
+    #[test]
+    fn null_subagents_claude_code_binary_is_unset_and_does_not_crash_the_patch() {
+        // The exact motivating case from issue #505, exercised through the
+        // full `build_merged_config` pipeline (not just `deep_merge_json` in
+        // isolation): an `Option<String>` field written once must become
+        // un-settable via a later PATCH.
+        let mut current = Config::default();
+        current.subagents.claude_code_binary = Some("/usr/local/bin/claude".to_string());
+        current.subagents.executor = Some("claude_code".to_string());
+
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"subagents":{"claude_code_binary":null}}"#).unwrap();
+        let merged = build_merged_config(&current, patch).expect("merge must not error");
+
+        assert_eq!(merged.subagents.claude_code_binary, None);
+        // Sibling field untouched by the patch survives — proves this was a
+        // surgical field-level delete, not a whole-subtree reset.
+        assert_eq!(merged.subagents.executor, Some("claude_code".to_string()));
+    }
 }
