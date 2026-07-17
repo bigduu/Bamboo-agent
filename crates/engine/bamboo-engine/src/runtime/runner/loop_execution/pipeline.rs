@@ -1019,13 +1019,13 @@ async fn handle_tool_calls_path(
     task_context: &mut Option<TaskLoopContext>,
     cancel_token: &CancellationToken,
 ) -> Result<TurnOutcome, AgentError> {
-    let reasoning_present = !stream_output.reasoning_content.trim().is_empty();
-    // Only carry the signature alongside actual reasoning text — a signature
-    // with no text would be a nonsensical replay target (#524).
-    let reasoning_signature = reasoning_present
-        .then_some(stream_output.reasoning_signature.clone())
-        .flatten();
-    let reasoning = reasoning_present.then_some(stream_output.reasoning_content);
+    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+        .then_some(stream_output.reasoning_content);
+    // The signature only ever covers the reasoning text, so it rides along only
+    // when the reasoning itself is persisted (#520).
+    let reasoning_signature = reasoning
+        .as_ref()
+        .and_then(|_| stream_output.reasoning_signature.clone());
     session.add_message(
         Message::assistant_with_reasoning(
             stream_output.content,
@@ -1517,14 +1517,11 @@ pub(super) async fn run_pipeline(
                 // only runs once Gold decides to STOP, so a premature terminal
                 // (goal not met) loops on a continuation without spending a
                 // guardian review on incomplete work (issue #343).
-                let reasoning_present = !stream_output.reasoning_content.trim().is_empty();
-                // Only carry the signature alongside actual reasoning text — a
-                // signature with no text would be a nonsensical replay target
-                // (#524).
-                let reasoning_signature = reasoning_present
-                    .then_some(stream_output.reasoning_signature.clone())
-                    .flatten();
-                let reasoning = reasoning_present.then_some(stream_output.reasoning_content);
+                let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                    .then_some(stream_output.reasoning_content);
+                let reasoning_signature = reasoning
+                    .as_ref()
+                    .and_then(|_| stream_output.reasoning_signature.clone());
                 let eval_model = state
                     .auxiliary_models
                     .fast_model_name
@@ -2256,7 +2253,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "tentative answer".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -2316,7 +2313,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "final answer".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -2376,7 +2373,7 @@ mod tests {
         let r1 = super::handle_no_tool_calls(
             "I think that's everything.".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -2419,7 +2416,7 @@ mod tests {
         let r2 = super::handle_no_tool_calls(
             "Done — shipped and verified.".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -2477,7 +2474,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "All done!".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -2553,7 +2550,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "tentative — I think that's everything".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -2619,7 +2616,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "Done — shipped and verified.".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -3257,7 +3254,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "final answer".to_string(),
             Some("reasoning trace".to_string()),
-            Some("sig_captured_by_anthropic".to_string()), // reasoning_signature (#524)
+            None,
             11,
             7,
             MetricsTokenUsage {
@@ -3290,11 +3287,6 @@ mod tests {
         assert_eq!(
             session.messages[0].reasoning.as_deref(),
             Some("reasoning trace")
-        );
-        assert_eq!(
-            session.messages[0].reasoning_signature.as_deref(),
-            Some("sig_captured_by_anthropic"),
-            "captured signature must thread through to the persisted message (#524)"
         );
 
         let event = rx.recv().await.expect("complete event should be sent");
@@ -4051,75 +4043,6 @@ mod tests {
         );
     }
 
-    /// #524: a captured Anthropic signature on the stream output must thread
-    /// through `handle_tool_calls_path` onto the persisted assistant message,
-    /// alongside the reasoning text it signs.
-    #[tokio::test]
-    async fn handle_tool_calls_path_persists_reasoning_signature_on_assistant_message() {
-        let tools: Arc<dyn ToolExecutor> = Arc::new(CancelProbeToolExecutor {
-            block: false,
-            started: Arc::new(AtomicBool::new(false)),
-        });
-        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(128);
-        let llm: Arc<dyn LLMProvider> = Arc::new(StubProvider);
-        let config = AgentLoopConfig::default();
-        let mut session = Session::new("s-sig", "model");
-        let frame = RoundFrame {
-            session_id: "s-sig",
-            round_id: "r1",
-            turn: 0,
-            debug_enabled: false,
-            event_tx: &event_tx,
-            metrics_collector: None,
-            config: &config,
-            llm: &llm,
-            tools: &tools,
-        };
-        let auxiliary_models = crate::runtime::config::AuxiliaryModelConfig::default();
-        let mut task_context: Option<TaskLoopContext> = None;
-        let cancel_token = CancellationToken::new();
-
-        let mut stream_output = stream_output_with_tool_call(single_read_call());
-        stream_output.reasoning_content = "Anthropic's own thinking.".to_string();
-        stream_output.reasoning_signature = Some("sig_captured_by_anthropic".to_string());
-
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            handle_tool_calls_path(
-                &frame,
-                stream_output,
-                MetricsTokenUsage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                },
-                &mut session,
-                &auxiliary_models,
-                "model",
-                &mut task_context,
-                &cancel_token,
-            ),
-        )
-        .await
-        .expect("handle_tool_calls_path did not complete within 10s")
-        .expect("handle_tool_calls_path should return Ok");
-
-        let assistant_message = session
-            .messages
-            .iter()
-            .find(|m| m.role == bamboo_agent_core::Role::Assistant)
-            .expect("assistant message should have been added");
-        assert_eq!(
-            assistant_message.reasoning.as_deref(),
-            Some("Anthropic's own thinking.")
-        );
-        assert_eq!(
-            assistant_message.reasoning_signature.as_deref(),
-            Some("sig_captured_by_anthropic"),
-            "captured signature must thread through to the persisted message (#524)"
-        );
-    }
-
     // ── Mid-turn compression failure is best-effort, not a whole-turn retry (#238)
     //
     // A transient failure in the MID-TURN context-compression summarization call
@@ -4815,7 +4738,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             final_text.to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -4886,7 +4809,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             final_text.to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),
@@ -4945,7 +4868,7 @@ mod tests {
         let outcome = super::handle_no_tool_calls(
             "   \n  ".to_string(),
             None,
-            None, // reasoning_signature (#524)
+            None,
             5,
             5,
             round_usage(),

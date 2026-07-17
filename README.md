@@ -261,7 +261,9 @@ async fn main() -> anyhow::Result<()> {
 
 > Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) build an `ExecuteRequest` with `ExecuteRequestBuilder` (both re-exported from `bamboo_sdk::agent`) and call `agent.execute(&mut session, req)` — the same canonical engine path `run` / `run_stream` funnel into.
 
-**Approval / clarification + resume.** A run can pause mid-loop waiting for input — a `conclusion_with_options` clarification, or a gated tool call under a configured `PermissionChecker` — surfaced as `AgentEvent::NeedClarification` / `ToolApprovalRequested`. Resolve it with `agent.answer(session_id, "Approve").await?` (the in-process equivalent of the HTTP `POST /sessions/{id}/respond` endpoint — same use-case function under the hood, so behavior matches exactly), then continue with `agent.resume_stream(outcome.session)` / `agent.resume(&mut session)` — or do both in one call with `agent.answer_and_resume_stream(session_id, "Approve").await?`. `AnswerOutcome` also carries any plan-mode transition and the permission grants an approval implied (auto-applied to the builder's `.permission_checker(...)`, if one was configured).
+**Approval / clarification + resume.** A run can pause mid-loop waiting for input — a `conclusion_with_options` clarification, or a gated tool call under a configured `PermissionChecker` — surfaced as `AgentEvent::NeedClarification` / `ToolApprovalRequested`. Resolve it with `agent.answer(session_id, "Approve").await?` (the in-process equivalent of the HTTP `POST /sessions/{id}/respond` endpoint — same use-case function under the hood, so behavior matches exactly), then continue with `agent.resume_stream(outcome.session)` / `agent.resume(&mut session)` — or do both in one call with `agent.answer_and_resume_stream(session_id, "Approve").await?`. `AnswerOutcome` also carries any plan-mode transition and the permission grants an approval implied (auto-applied to the builder's `.permission_checker(...)`, if one was configured). When the approved question was a gated tool call, resuming also **re-executes that tool for real** — against the agent's own tool executor — and writes the genuine output back over the synthetic placeholder before the loop continues, matching the HTTP server's behavior exactly (no extra call needed).
+>
+> A separate mechanism, `AgentEvent::ChildApprovalRequested`, covers an out-of-process CHILD sub-agent's gated tool (only reachable if you've also wired the engine's actor/broker transport — `with_defaults_for_data_dir` does not). Answer those with `agent.answer_child_approval(child_session_id, request_id, approved)` instead of `agent.answer`.
 
 **Session ergonomics.** `agent.list_sessions()` (most-recently-updated first), `agent.get_session(id)`, `agent.session_history(id)`, `agent.delete_session(id)` — no need to reach for `agent.storage()` directly for the common cases. `list_sessions` needs the concrete session-index handle `with_defaults_for_data_dir` assembles.
 
@@ -302,6 +304,8 @@ The easiest way to create this is `bamboo init` (see [First-run setup](#first-ru
 ```
 
 > Config precedence: file < environment variables < CLI arguments. Environment variables include `BAMBOO_DATA_DIR`, `BAMBOO_PORT`, `BAMBOO_BIND`, `BAMBOO_PROVIDER`, `BAMBOO_WORKERS`, `BAMBOO_CORS_ALLOW_ORIGINS`, and per-provider keys `BAMBOO_OPENAI_API_KEY` / `BAMBOO_ANTHROPIC_API_KEY` / `BAMBOO_GEMINI_API_KEY` (supplied at runtime, never persisted to disk — for Docker/CI/secret-manager deploys without a plaintext key in `config.json`).
+>
+> This is a minimal example. For every key (multi-provider instances, MCP servers, memory/auto-dream/gardener, sub-agents + the `claude_code` executor, the IM `connect` bridge, `plugin_trust`, notifications, keyword masking, and the full env var list), see [`docs/config-reference.md`](./docs/config-reference.md).
 
 ### Docker
 
@@ -340,9 +344,13 @@ Zenith is a monorepo, and bamboo is the execution-engine submodule within it.
 | [**pavilion**](../pavilion) | Official website & docs |
 | [**Zenith (root)**](../) | Monorepo entry, submodule pointers, release train |
 
-**In-module docs:**
+**In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:
+- Getting started: [`docs/guides/GETTING_STARTED.md`](./docs/guides/GETTING_STARTED.md)
+- Configuration reference (every `config.json` key + env vars): [`docs/config-reference.md`](./docs/config-reference.md)
+- How-to guides: [Connect/IM bridge](./docs/guides/CONNECT.md) · [Plugins](./docs/guides/PLUGINS.md) · [Deploy](./docs/guides/DEPLOY.md)
 - API reference: [`docs/guides/API.md`](./docs/guides/API.md)
 - Migration: [`docs/guides/MIGRATION_GUIDE.md`](./docs/guides/MIGRATION_GUIDE.md)
+- Runnable SDK examples: [`examples/`](./examples)
 - [CONTRIBUTING](./CONTRIBUTING.md) · [CHANGELOG](./CHANGELOG.md) · [SECURITY](./SECURITY.md)
 
 ---

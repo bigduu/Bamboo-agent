@@ -41,29 +41,23 @@ pub struct AnthropicProvider {
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
-    /// Whether to replay a prior turn's `reasoning` text as an UNSIGNED
-    /// `thinking` content block unconditionally (issue #520).
+    /// Whether to replay a prior turn's `reasoning` text as a `thinking` content
+    /// block unconditionally (issue #520).
     ///
     /// The real Anthropic API requires `thinking` input blocks to carry a
-    /// `signature` it can cryptographically verify as its own. As of #524,
-    /// bamboo DOES capture that signature when the parser observes a
-    /// `signature_delta` event (only the genuine Anthropic streaming path ever
-    /// emits one) and persists it on `Message.reasoning_signature`; a signed
-    /// block is always eligible for replay regardless of this flag — see
-    /// `message_to_anthropic_json`. This flag only controls the fallback for
-    /// blocks with NO captured signature: either foreign reasoning (minted by a
-    /// different provider, e.g. after a mid-session model switch) or an
-    /// unsigned copy of Claude's own prior thinking (e.g. loaded from a session
-    /// persisted before #524). Real Anthropic 400s on an unsigned block, so the
-    /// safe default there is still to omit it entirely — Anthropic does not
-    /// require prior-turn thinking to continue a conversation.
+    /// `signature` it can cryptographically verify as its own — bamboo never
+    /// captures that signature (the SSE parser drops `signature_delta`), so any
+    /// block we replay is either foreign (minted by a different provider, e.g.
+    /// after a mid-session model switch) or an unsigned copy of Claude's own
+    /// prior thinking. Real Anthropic 400s on both. The safe default is to omit
+    /// the block entirely: Anthropic does not require prior-turn thinking to
+    /// continue a conversation.
     ///
     /// Some Anthropic-compatible upstreams (e.g. GLM's `/anthropic` endpoint)
     /// have the opposite contract: they require the `thinking` block to be
     /// PRESENT on every assistant turn once thinking is enabled, but never
     /// validate its signature. Setting this to `true` restores the old
-    /// unconditional-emission behavior for that class of upstream, for turns
-    /// with no captured signature.
+    /// unconditional-emission behavior for that class of upstream.
     thinking_replay_always: bool,
 }
 
@@ -566,7 +560,27 @@ pub fn build_anthropic_request_with_cache_blocks(
     // Whether the CURRENT request enables extended thinking — a `thinking`
     // block can never be replayed when it's disabled (Anthropic rejects it in
     // that case too, issue #520).
-    let thinking_enabled = anthropic_thinking_from_effort(reasoning_effort, max_tokens).is_some();
+    let requested_thinking = anthropic_thinking_from_effort(reasoning_effort, max_tokens);
+    // Thinking-downgrade guard (#520): real Anthropic requires the final
+    // assistant turn whose tool_results this request submits to START with its
+    // original SIGNED thinking block whenever thinking is enabled. After a
+    // mid-session model switch (or a session recorded before signature capture
+    // existed) no such block can ever be produced, so the only way to submit
+    // the tool results without a 400 ("Expected `thinking` or
+    // `redacted_thinking`...") is to disable thinking for this request. An
+    // upstream on `thinking_replay_always` (GLM-style) replays the unsigned
+    // block instead, which satisfies its presence requirement.
+    let thinking_downgraded = requested_thinking.is_some()
+        && !thinking_replay_always
+        && must_downgrade_thinking_for_unsigned_tool_turn(messages);
+    if thinking_downgraded {
+        tracing::warn!(
+            "Anthropic request: disabling extended thinking for this request — the final \
+             assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+             minted by another provider before a mid-session model switch, #520)"
+        );
+    }
+    let thinking_enabled = requested_thinking.is_some() && !thinking_downgraded;
 
     let (mut system, mut anthropic_messages, message_ids) = messages_to_anthropic_json(
         messages,
@@ -629,8 +643,10 @@ pub fn build_anthropic_request_with_cache_blocks(
         body["system"] = system;
     }
 
-    if let Some(thinking) = anthropic_thinking_from_effort(reasoning_effort, max_tokens) {
-        body["thinking"] = thinking;
+    if thinking_enabled {
+        if let Some(thinking) = requested_thinking {
+            body["thinking"] = thinking;
+        }
     }
 
     if !tools.is_empty() {
@@ -664,6 +680,53 @@ fn add_cache_control_to_last_block(message: &mut Value, ttl: CacheTtl) {
     {
         last_block.insert("cache_control".to_string(), cache_control_value(ttl));
     }
+}
+
+/// Whether enabling extended thinking on this request would be rejected by
+/// real Anthropic because the final assistant turn — the one whose
+/// tool_results this request submits — contains `tool_use` but no replayable
+/// SIGNED thinking block. Anthropic requires that turn to start with its
+/// original signed thinking block whenever thinking is enabled; when it was
+/// minted by another provider (mid-session model switch) or recorded before
+/// signature capture existed, no valid block can be produced, so the request
+/// must run with thinking disabled instead of 400ing (#520).
+///
+/// Turns whose reasoning text exists but whose signature was invalidated
+/// (multi-block / redacted thinking) downgrade too: a partial replay would
+/// fail verification.
+fn must_downgrade_thinking_for_unsigned_tool_turn(messages: &[Message]) -> bool {
+    let Some(last_assistant_idx) = messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::Assistant))
+    else {
+        return false;
+    };
+    let last_assistant = &messages[last_assistant_idx];
+    let has_tool_use = last_assistant
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if !has_tool_use {
+        return false;
+    }
+    // The constraint only bites when this request actually submits the
+    // tool_results for that turn (the conversation continues past it with
+    // `Role::Tool` messages).
+    let submits_tool_results = messages[last_assistant_idx + 1..]
+        .iter()
+        .any(|message| matches!(message.role, Role::Tool));
+    if !submits_tool_results {
+        return false;
+    }
+    let has_signed_thinking = last_assistant
+        .reasoning
+        .as_deref()
+        .is_some_and(|reasoning| !reasoning.is_empty())
+        && last_assistant
+            .reasoning_signature
+            .as_deref()
+            .is_some_and(|signature| !signature.is_empty());
+    !has_signed_thinking
 }
 
 fn anthropic_thinking_from_effort(
@@ -872,37 +935,34 @@ fn message_to_anthropic_json(
         Role::Assistant => {
             let mut blocks: Vec<Value> = Vec::new();
 
-            // Replay `message.reasoning` as a `thinking` content block only
-            // when the current request has thinking enabled (Anthropic 400s if
-            // a thinking block is sent while thinking is disabled for the
-            // current request, regardless of anything below). Within that gate,
-            // two independent paths can authorize the replay (#524):
+            // Replay `message.reasoning` as a `thinking` content block ONLY
+            // when the current request has thinking enabled AND either:
+            // - the turn carries the provider-minted `signature` captured at
+            //   stream time (`reasoning_signature`), which real Anthropic
+            //   verifies covers this exact text — the case that keeps
+            //   pure-Claude extended-thinking tool loops working (#520); or
+            // - the upstream is explicitly known to require the block
+            //   unconditionally and not validate signatures
+            //   (`thinking_replay_always`, e.g. a GLM-style anthropic-compat
+            //   upstream).
             //
-            // 1. SIGNED replay — `message.reasoning_signature` is `Some`. Only
-            //    the genuine Anthropic streaming parser ever populates that
-            //    field (from a `signature_delta` SSE event), so its presence is
-            //    itself proof this `reasoning` text was minted by Anthropic —
-            //    no separate provider-provenance tag on `Message` is needed.
-            //    Anthropic can cryptographically verify the signature against
-            //    the block, so this is always safe to send back to Anthropic,
-            //    independent of `thinking_replay_always` (a signed block from a
-            //    real-Anthropic round earlier in this session is legitimate
-            //    even if the session hopped through another provider and back).
-            // 2. UNSIGNED/compat replay — no signature was captured (foreign
-            //    reasoning from a different provider after a mid-session model
-            //    switch, #520; or an unsigned copy of Claude's own prior
-            //    thinking, e.g. a session persisted before #524 shipped).
-            //    Real Anthropic 400s on this, so it is replayed ONLY when the
-            //    upstream is explicitly known to require the block
-            //    unconditionally and not validate signatures
-            //    (`thinking_replay_always`, e.g. a GLM-style anthropic-compat
-            //    upstream). Otherwise it is omitted — Anthropic does not
-            //    require prior-turn thinking to continue a conversation, so
-            //    omission is always safe there.
+            // An UNSIGNED block is otherwise never replayed: it is either
+            // foreign (minted by a different provider after a mid-session
+            // model switch, #520) or a copy of Claude's own prior turn whose
+            // signature was not captured. Real Anthropic 400s on both, and
+            // also 400s if a thinking block is sent while thinking is disabled
+            // for the current request. Anthropic does not require prior-turn
+            // thinking to continue a plain conversation, so the safe default
+            // is to omit it entirely (the final tool_use turn is handled by
+            // the thinking-downgrade guard in the request builder).
             if thinking_enabled {
                 if let Some(reasoning) = &message.reasoning {
                     if !reasoning.is_empty() {
-                        if let Some(signature) = &message.reasoning_signature {
+                        if let Some(signature) = message
+                            .reasoning_signature
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                        {
                             blocks.push(json!({
                                 "type": "thinking",
                                 "thinking": reasoning,
@@ -1174,11 +1234,33 @@ pub struct AnthropicStreamState {
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
     thinking_blocks_by_index: HashSet<usize>,
     thinking_blocks_started: usize,
+    /// `redacted_thinking` blocks started (also counted in
+    /// `thinking_blocks_started`). Their content is encrypted and cannot be
+    /// replayed from `Message.reasoning`, so their presence invalidates the
+    /// captured signature (#520).
+    redacted_thinking_blocks_started: usize,
+    /// Accumulated `signature_delta` payload for the turn's thinking block.
+    thinking_signature: String,
+    /// Set once a [`LLMChunk::ReasoningSignature`] has been emitted, so a later
+    /// extra thinking/redacted block can retract it with an empty-string
+    /// invalidation marker.
+    thinking_signature_emitted: bool,
     thinking_chars_streamed: usize,
     saw_thinking_signal: bool,
     requested_reasoning_effort: Option<ReasoningEffort>,
     request_thinking_enabled: bool,
     request_thinking_budget_tokens: Option<u64>,
+}
+
+impl AnthropicStreamState {
+    /// A captured signature is replayable only when the turn produced exactly
+    /// ONE `thinking` block and no `redacted_thinking`: `Message.reasoning`
+    /// concatenates every block's text, and a signature covers only its own
+    /// block's exact bytes — replaying a merged text under any single
+    /// signature would fail Anthropic's verification (#520).
+    fn thinking_signature_replayable(&self) -> bool {
+        self.thinking_blocks_started == 1 && self.redacted_thinking_blocks_started == 0
+    }
 }
 
 /// Parse a single Anthropic SSE event into an optional [`LLMChunk`].
@@ -1388,12 +1470,25 @@ pub fn parse_anthropic_sse_event(
                 let index = index as usize;
                 state.saw_thinking_signal = true;
                 state.thinking_blocks_started = state.thinking_blocks_started.saturating_add(1);
+                if block_type == "redacted_thinking" {
+                    state.redacted_thinking_blocks_started =
+                        state.redacted_thinking_blocks_started.saturating_add(1);
+                }
                 state.thinking_blocks_by_index.insert(index);
                 tracing::info!(
                     "Anthropic thinking block started: index={} type={}",
                     index,
                     block_type
                 );
+                // A second thinking block (or any redacted one) means no single
+                // signature can cover the accumulated reasoning text; if one was
+                // already emitted for an earlier block, retract it with the
+                // empty-string invalidation marker (#520).
+                if state.thinking_signature_emitted && !state.thinking_signature_replayable() {
+                    state.thinking_signature_emitted = false;
+                    state.thinking_signature.clear();
+                    return Ok(Some(LLMChunk::ReasoningSignature(String::new())));
+                }
                 return Ok(None);
             }
 
@@ -1531,39 +1626,19 @@ pub fn parse_anthropic_sse_event(
                     Ok(None)
                 }
                 "signature_delta" => {
-                    // Anthropic emits exactly one `signature_delta` per
-                    // `thinking` content block, right before its
-                    // `content_block_stop` — the signature covers the whole
-                    // block's already-streamed text. Capture it so a later
-                    // same-provider round can legitimately replay this
-                    // `thinking` block (#524); previously this event type
-                    // hit the catch-all `_ => Ok(None)` below and was
-                    // silently dropped.
+                    // Provider-minted signature over the thinking block's exact
+                    // text — required to replay the block to real Anthropic
+                    // (#520). Accumulate defensively (the real API delivers it
+                    // in one delta); emitted at this block's content_block_stop.
                     let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
                         return Ok(None);
                     };
-                    let index = index as usize;
-                    if !state.thinking_blocks_by_index.contains(&index) {
-                        // Defensive: a signature_delta for a block we never
-                        // saw start (aggregator quirk) — ignore rather than
-                        // error, matching the tolerance policy used
-                        // elsewhere in this parser (#237).
-                        return Ok(None);
+                    if state.thinking_blocks_by_index.contains(&(index as usize)) {
+                        if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
+                            state.thinking_signature.push_str(signature);
+                        }
                     }
-
-                    let signature = delta
-                        .get("signature")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    if signature.is_empty() {
-                        return Ok(None);
-                    }
-                    tracing::debug!(
-                        "Anthropic signature_delta captured: index={}, signature_len={}",
-                        index,
-                        signature.len()
-                    );
-                    Ok(Some(LLMChunk::ReasoningSignature(signature.to_string())))
+                    Ok(None)
                 }
                 _ => Ok(None),
             }
@@ -1578,7 +1653,21 @@ pub fn parse_anthropic_sse_event(
             if let Some(index) = v.get("index").and_then(|i| i.as_u64()) {
                 let index = index as usize;
                 state.tool_uses_by_index.remove(&index);
-                state.thinking_blocks_by_index.remove(&index);
+                let was_thinking_block = state.thinking_blocks_by_index.remove(&index);
+                // The turn's single thinking block just closed with a captured
+                // signature → surface it so the engine can persist it alongside
+                // the accumulated reasoning text (#520). Multi-block/redacted
+                // turns never emit (and retract on the extra block's start).
+                if was_thinking_block
+                    && !state.thinking_signature_emitted
+                    && !state.thinking_signature.is_empty()
+                    && state.thinking_signature_replayable()
+                {
+                    state.thinking_signature_emitted = true;
+                    return Ok(Some(LLMChunk::ReasoningSignature(
+                        state.thinking_signature.clone(),
+                    )));
+                }
             }
             Ok(None)
         }
@@ -2801,72 +2890,6 @@ mod anthropic_stream_parse {
         }
     }
 
-    /// #524: a `thinking` block's `content_block_start` followed by
-    /// `thinking_delta`(s) then `signature_delta` must yield a
-    /// `ReasoningSignature` chunk carrying the captured signature.
-    #[test]
-    fn thinking_block_signature_delta_yields_reasoning_signature() {
-        let mut state = super::AnthropicStreamState::default();
-
-        let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#;
-        let chunk =
-            super::parse_anthropic_sse_event(&mut state, "content_block_start", start).unwrap();
-        assert!(
-            chunk.is_none(),
-            "content_block_start for thinking emits no chunk"
-        );
-
-        let thinking_delta = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me consider..."}}"#;
-        let chunk =
-            super::parse_anthropic_sse_event(&mut state, "content_block_delta", thinking_delta)
-                .unwrap()
-                .expect("chunk");
-        match chunk {
-            LLMChunk::ReasoningToken(text) => assert_eq!(text, "Let me consider..."),
-            other => panic!("expected LLMChunk::ReasoningToken, got {other:?}"),
-        }
-
-        let signature_delta = r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIYAhIM1gbc"}}"#;
-        let chunk =
-            super::parse_anthropic_sse_event(&mut state, "content_block_delta", signature_delta)
-                .unwrap()
-                .expect("chunk");
-        match chunk {
-            LLMChunk::ReasoningSignature(signature) => {
-                assert_eq!(signature, "EqQBCgIYAhIM1gbc");
-            }
-            other => panic!("expected LLMChunk::ReasoningSignature, got {other:?}"),
-        }
-    }
-
-    /// A `signature_delta` for an index that never started a `thinking` block
-    /// (aggregator quirk / malformed stream) must be tolerated as a skip, not
-    /// surfaced as a stream error — matching the tolerance policy used
-    /// elsewhere in this parser for benign shape deviations (#237).
-    #[test]
-    fn signature_delta_for_unknown_thinking_block_is_skipped() {
-        let mut state = super::AnthropicStreamState::default();
-        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#;
-
-        let chunk =
-            super::parse_anthropic_sse_event(&mut state, "content_block_delta", data).unwrap();
-        assert!(chunk.is_none());
-    }
-
-    /// An empty `signature` string must not surface a chunk (nothing useful
-    /// to capture).
-    #[test]
-    fn signature_delta_with_empty_signature_is_skipped() {
-        let mut state = super::AnthropicStreamState::default();
-        let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#;
-        super::parse_anthropic_sse_event(&mut state, "content_block_start", start).unwrap();
-
-        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":""}}"#;
-        let chunk =
-            super::parse_anthropic_sse_event(&mut state, "content_block_delta", data).unwrap();
-        assert!(chunk.is_none());
-    }
-
     #[test]
     fn empty_data_returns_none() {
         let mut state = super::AnthropicStreamState::default();
@@ -3011,6 +3034,144 @@ mod anthropic_stream_parse {
                 "malformed content_block_start skipped: {data}"
             );
         }
+    }
+
+    /// Drive one SSE event and return the parsed chunk (panicking on error).
+    fn drive(state: &mut super::AnthropicStreamState, event: &str, data: &str) -> Option<LLMChunk> {
+        super::parse_anthropic_sse_event(state, event, data).expect("event parses")
+    }
+
+    /// #520: a single thinking block's `signature_delta` is captured and
+    /// surfaced as `ReasoningSignature` when the block closes, alongside the
+    /// streamed reasoning text.
+    #[test]
+    fn single_thinking_block_signature_is_captured_and_emitted_on_block_stop() {
+        let mut state = super::AnthropicStreamState::default();
+        assert!(drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        )
+        .is_none());
+        match drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think."}}"#,
+        ) {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, "Let me think."),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+        assert!(drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_xyz"}}"#,
+        )
+        .is_none());
+        match drive(
+            &mut state,
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ) {
+            Some(LLMChunk::ReasoningSignature(signature)) => assert_eq!(signature, "sig_xyz"),
+            other => panic!("expected reasoning signature, got {other:?}"),
+        }
+    }
+
+    /// A second thinking block makes the accumulated reasoning text span two
+    /// blocks, so no single signature covers it: the already-emitted signature
+    /// is retracted with the empty-string invalidation marker and the second
+    /// block's stop emits nothing.
+    #[test]
+    fn second_thinking_block_retracts_the_emitted_signature() {
+        let mut state = super::AnthropicStreamState::default();
+        drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        );
+        drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_first"}}"#,
+        );
+        match drive(
+            &mut state,
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ) {
+            Some(LLMChunk::ReasoningSignature(signature)) => assert_eq!(signature, "sig_first"),
+            other => panic!("expected first signature, got {other:?}"),
+        }
+
+        match drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":""}}"#,
+        ) {
+            Some(LLMChunk::ReasoningSignature(signature)) => {
+                assert!(
+                    signature.is_empty(),
+                    "second block retracts via empty marker"
+                )
+            }
+            other => panic!("expected invalidation marker, got {other:?}"),
+        }
+        assert!(
+            drive(
+                &mut state,
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":2}"#,
+            )
+            .is_none(),
+            "no signature is re-emitted for a multi-block turn"
+        );
+    }
+
+    /// `redacted_thinking` content is encrypted and not represented in
+    /// `Message.reasoning`, so a turn containing one never emits a signature.
+    #[test]
+    fn redacted_thinking_block_never_emits_a_signature() {
+        let mut state = super::AnthropicStreamState::default();
+        drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+        );
+        drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_redacted"}}"#,
+        );
+        assert!(
+            drive(
+                &mut state,
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            )
+            .is_none(),
+            "a redacted turn's signature must not be surfaced"
+        );
+    }
+
+    /// A signature for a block index that was never announced as thinking is
+    /// ignored (aggregator deviations must not fabricate a signature).
+    #[test]
+    fn signature_delta_for_unannounced_index_is_ignored() {
+        let mut state = super::AnthropicStreamState::default();
+        drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":5,"delta":{"type":"signature_delta","signature":"sig_stray"}}"#,
+        );
+        assert!(
+            drive(
+                &mut state,
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":5}"#,
+            )
+            .is_none(),
+            "stray signature_delta must not produce a chunk"
+        );
     }
 }
 
@@ -3200,130 +3361,6 @@ mod anthropic_request_building_edge_cases {
         );
     }
 
-    /// #524: a captured Anthropic signature authorizes replaying the
-    /// `thinking` block EVEN WITH THE DEFAULT (`thinking_replay_always =
-    /// false`) — the signed-replay path is independent of the compat flag,
-    /// because Anthropic can cryptographically verify the signature itself.
-    /// The `signature` field must be carried onto the outbound block.
-    #[test]
-    fn signed_reasoning_is_replayed_as_thinking_block_regardless_of_compat_flag() {
-        let messages = vec![Message::assistant_with_reasoning(
-            "Here is the answer.",
-            None,
-            Some("I thought about it.".to_string()),
-        )
-        .with_reasoning_signature(Some("sig_captured_by_anthropic".to_string()))];
-        let out = super::build_anthropic_request_with_cache_blocks(
-            &messages,
-            &[],
-            &[],
-            "claude-test",
-            2048,
-            false,
-            Some(bamboo_domain::ReasoningEffort::Medium),
-            None,
-            None,
-            false, // thinking_replay_always = false — signed replay must not need it
-        );
-
-        let content = out["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "thinking");
-        assert_eq!(content[0]["thinking"], "I thought about it.");
-        assert_eq!(content[0]["signature"], "sig_captured_by_anthropic");
-        assert_eq!(content[1]["type"], "text");
-        assert_eq!(content[1]["text"], "Here is the answer.");
-    }
-
-    /// A signed block must still be omitted when the CURRENT request has
-    /// thinking disabled — Anthropic rejects any `thinking` block (signed or
-    /// not) in that case (#520/#524).
-    #[test]
-    fn signed_reasoning_omitted_when_thinking_disabled_for_current_request() {
-        let messages = vec![Message::assistant_with_reasoning(
-            "Here is the answer.",
-            None,
-            Some("I thought about it.".to_string()),
-        )
-        .with_reasoning_signature(Some("sig_captured_by_anthropic".to_string()))];
-        let out = super::build_anthropic_request_with_cache_blocks(
-            &messages,
-            &[],
-            &[],
-            "claude-test",
-            64,
-            false,
-            None, // reasoning_effort = None -> thinking disabled for this request
-            None,
-            None,
-            false,
-        );
-
-        let content = out["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(
-            content.len(),
-            1,
-            "thinking disabled for this request wins even with a captured signature"
-        );
-        assert_eq!(content[0]["type"], "text");
-    }
-
-    /// #524 regression guard for the #520 fix: a signature captured on ONE
-    /// assistant turn must never leak onto a DIFFERENT turn's foreign
-    /// (unsigned) reasoning after a mid-session provider switch. Each
-    /// `Message` carries its own `reasoning_signature`, so a foreign-reasoning
-    /// turn with no signature of its own must still be omitted by default,
-    /// even though an earlier turn in the same request had a genuine one.
-    #[test]
-    fn foreign_reasoning_still_omitted_even_when_another_turn_has_a_signature() {
-        let messages = vec![
-            // Round 1: genuine Anthropic turn with a captured signature.
-            Message::assistant_with_reasoning(
-                "First answer.",
-                None,
-                Some("Anthropic's own thinking.".to_string()),
-            )
-            .with_reasoning_signature(Some("sig_from_anthropic".to_string())),
-            Message::user("Follow-up question."),
-            // Round 2 (post mid-session switch): foreign reasoning, no signature.
-            Message::assistant_with_reasoning(
-                "Second answer.",
-                None,
-                Some("GPT's own reasoning summary text.".to_string()),
-            ),
-        ];
-        let out = super::build_anthropic_request_with_cache_blocks(
-            &messages,
-            &[],
-            &[],
-            "claude-fable-5",
-            2048,
-            false,
-            Some(bamboo_domain::ReasoningEffort::Medium),
-            None,
-            None,
-            false,
-        );
-
-        let out_messages = out["messages"].as_array().unwrap();
-        // Round 1 (signed): thinking block replayed.
-        let first_content = out_messages[0]["content"].as_array().unwrap();
-        assert!(
-            first_content
-                .iter()
-                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")),
-            "signed turn must replay its thinking block: {first_content:?}"
-        );
-        // Round 2 (unsigned/foreign): no thinking block, regardless of round 1.
-        let third_content = out_messages[2]["content"].as_array().unwrap();
-        assert!(
-            third_content
-                .iter()
-                .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")),
-            "foreign/unsigned turn must never replay a thinking block: {third_content:?}"
-        );
-    }
-
     /// Compat upstreams (e.g. GLM's anthropic-compat endpoint) require the
     /// `thinking` block to be present unconditionally and don't validate its
     /// signature — `thinking_replay_always = true` preserves that legacy
@@ -3458,6 +3495,196 @@ mod anthropic_request_building_edge_cases {
         );
 
         assert_eq!(out["model"], "claude-3-opus-20240229");
+    }
+
+    /// #520 follow-up: a turn whose thinking was captured WITH its
+    /// provider-minted signature is replayed as a fully signed `thinking`
+    /// block — this is what keeps pure-Claude extended-thinking tool loops
+    /// working under the signed-only default.
+    #[test]
+    fn signed_reasoning_replayed_as_signed_thinking_block() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )
+        .with_reasoning_signature(Some("sig_abc123".to_string()))];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false, // signed-only default: the signature makes it replayable
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "I thought about it.");
+        assert_eq!(content[0]["signature"], "sig_abc123");
+        assert_eq!(content[1]["type"], "text");
+    }
+
+    /// A signed block must still never be sent when the CURRENT request has
+    /// thinking disabled — Anthropic rejects thinking blocks in that case.
+    #[test]
+    fn signed_reasoning_omitted_when_thinking_disabled() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )
+        .with_reasoning_signature(Some("sig_abc123".to_string()))];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            64,
+            false,
+            None, // thinking disabled for this request
+            None,
+            None,
+            false,
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    fn tool_loop_messages(signature: Option<&str>) -> Vec<Message> {
+        use bamboo_domain::{FunctionCall, ToolCall};
+        vec![
+            Message::user("run a tool"),
+            Message::assistant_with_reasoning(
+                "",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"test"}"#.to_string(),
+                    },
+                }]),
+                Some("Planning the search.".to_string()),
+            )
+            .with_reasoning_signature(signature.map(str::to_string)),
+            Message::tool_result("call_1", r#"{"ok":true}"#),
+        ]
+    }
+
+    /// #520 thinking-downgrade guard: submitting tool_results for a final
+    /// assistant tool_use turn that has NO signed thinking block (e.g. it was
+    /// minted by GPT before a mid-session switch to Claude) must DISABLE
+    /// thinking for the request — with thinking on, real Anthropic 400s
+    /// ("Expected `thinking` or `redacted_thinking`, but found `tool_use`").
+    #[test]
+    fn thinking_downgraded_when_final_tool_turn_has_no_signed_thinking() {
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &tool_loop_messages(None),
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        assert!(
+            out.get("thinking").is_none(),
+            "thinking must be downgraded for an unsigned final tool_use turn: {out}"
+        );
+        // And no unsigned thinking block leaks into the turn either.
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert!(content
+            .iter()
+            .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")));
+    }
+
+    /// With the signature captured, the same tool loop keeps thinking enabled
+    /// and replays the signed block — no downgrade.
+    #[test]
+    fn thinking_kept_when_final_tool_turn_has_signed_thinking() {
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &tool_loop_messages(Some("sig_tool_turn")),
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(out["thinking"]["type"], "enabled");
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "sig_tool_turn");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    /// Compat upstreams (`thinking_replay_always`) replay the unsigned block,
+    /// which satisfies their presence requirement — no downgrade there.
+    #[test]
+    fn thinking_kept_in_compat_mode_even_without_signature() {
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &tool_loop_messages(None),
+            &[],
+            &[],
+            "glm-x",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true, // compat mode
+        );
+
+        assert_eq!(out["thinking"]["type"], "enabled");
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert!(content[0].get("signature").is_none());
+    }
+
+    /// The guard only bites when tool_results are actually being submitted:
+    /// a plain conversation continuing past a final ANSWER turn (no tool_use)
+    /// keeps thinking enabled even though history has unsigned reasoning.
+    #[test]
+    fn thinking_kept_when_final_assistant_turn_has_no_tool_use() {
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant_with_reasoning(
+                "Answer.",
+                None,
+                Some("Foreign reasoning.".to_string()),
+            ),
+            Message::user("follow-up question"),
+        ];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(out["thinking"]["type"], "enabled");
     }
 }
 

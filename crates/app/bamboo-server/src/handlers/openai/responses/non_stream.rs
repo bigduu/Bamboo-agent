@@ -67,9 +67,6 @@ pub(super) async fn handle_non_streaming_response(
             Ok(bamboo_llm::types::LLMChunk::Token(text)) => content.push_str(&text),
             // Keep parity with streaming behavior: expose reasoning narration as text.
             Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
-            // This response format has no thinking-signature concept; drop it
-            // (#524).
-            Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
             // Indexed variant: drop indices, same behavior. #236.
             Ok(bamboo_llm::types::LLMChunk::ToolCallsIndexed(calls)) => {
@@ -77,7 +74,8 @@ pub(super) async fn handle_non_streaming_response(
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
-            | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}
+            | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
+            | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id,

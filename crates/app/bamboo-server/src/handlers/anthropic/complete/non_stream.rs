@@ -80,9 +80,6 @@ pub(super) async fn handle_non_streaming_complete(
                 content.push_str(&text);
             }
             Ok(bamboo_llm::types::LLMChunk::ReasoningToken(_)) => {}
-            // This response format has no thinking-signature concept; drop it
-            // like ReasoningToken above (#524).
-            Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(convert_tool_calls(calls));
             }
@@ -94,7 +91,8 @@ pub(super) async fn handle_non_streaming_complete(
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
-            | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}
+            | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
+            | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id.clone(),

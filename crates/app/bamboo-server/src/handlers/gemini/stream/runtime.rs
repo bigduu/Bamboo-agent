@@ -37,9 +37,6 @@ pub(super) fn build_gemini_event_stream(
                     }
                 }
                 Ok(LLMChunk::ReasoningToken(_)) => {}
-                // Gemini-compat SSE output has no signature concept; drop it
-                // like ReasoningToken above (#524).
-                Ok(LLMChunk::ReasoningSignature(_)) => {}
                 Ok(LLMChunk::ToolCalls(tool_calls)) => {
                     for tool_call in tool_calls {
                         match sse::tool_call_chunk_bytes(tool_call) {
@@ -67,7 +64,9 @@ pub(super) fn build_gemini_event_stream(
                     yield Ok::<_, ActixError>(sse::done_chunk_bytes());
                     break;
                 }
-                Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
+                Ok(LLMChunk::CacheUsage { .. })
+                | Ok(LLMChunk::UsageSummary { .. })
+                | Ok(LLMChunk::ReasoningSignature(_)) => {}
                 Err(error) => {
                     had_error = true;
                     context.metrics.forward_completed(

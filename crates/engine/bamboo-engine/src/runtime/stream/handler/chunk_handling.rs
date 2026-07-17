@@ -65,10 +65,11 @@ pub(super) async fn handle_chunk_result(
             Ok(())
         }
         Ok(LLMChunk::ReasoningSignature(signature)) => {
-            tracing::trace!(
-                "[{}] Received Anthropic thinking-block signature (len={})",
+            tracing::debug!(
+                "[{}] Received reasoning signature (len={}, invalidation={})",
                 session_id,
-                signature.len()
+                signature.len(),
+                signature.is_empty()
             );
             state.record_reasoning_signature(signature);
             Ok(())

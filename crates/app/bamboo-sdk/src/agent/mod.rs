@@ -50,7 +50,9 @@ use tokio::sync::mpsc;
 
 use bamboo_engine::session_app::errors::{SessionLoadError, SessionSaveError};
 use bamboo_engine::session_app::repository::SessionAccess;
-use bamboo_engine::session_app::respond::submit_pending_response;
+use bamboo_engine::session_app::respond::{
+    submit_pending_response, PERMISSION_REEXECUTE_METADATA_KEY,
+};
 use bamboo_engine::session_app::types::RespondInput;
 
 // Re-exported so callers can name the token returned by the `*_cancellable` /
@@ -314,6 +316,17 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
+        // If `answer()` just approved a gated tool call, `session.metadata` carries
+        // the re-execution marker `submit_pending_response` set — the gated tool
+        // never actually ran (the permission gate intercepted it before
+        // execution), so re-run it now for real and write the genuine output back
+        // before the loop resumes. No-op when the marker is absent (the common,
+        // non-permission path), so this is safe to run unconditionally on every
+        // entry into the loop, not just `resume`. See
+        // `reexecute_approved_tool_if_pending` for the full rationale.
+        self.reexecute_approved_tool_if_pending(session, &event_tx)
+            .await;
+
         // Apply the instruction as the session's leading System message and set
         // the configured model via the single authoritative pre-execution
         // mutation point. The builder's prompt is AUTHORITATIVE: it replaces a
@@ -345,6 +358,119 @@ impl Agent {
         }
 
         self.inner.execute(session, builder.build()).await
+    }
+
+    /// Port of `bamboo-server`'s `resume_adapter.rs` re-execution logic: after
+    /// [`answer`](Self::answer) approves a permission prompt,
+    /// `submit_pending_response` stamps `session.metadata` with
+    /// [`PERMISSION_REEXECUTE_METADATA_KEY`] (the approved tool call's id) — the
+    /// gated tool was intercepted BEFORE it ran, so its recorded result is only
+    /// the synthetic "Selected response: Approve" placeholder. This re-runs the
+    /// original tool call for real, against the SAME executor the loop itself
+    /// uses ([`bamboo_engine::Agent::default_tools`]), and overwrites the
+    /// placeholder tool-result message with the genuine output — so the resumed
+    /// loop sees what the operation actually did instead of inferring it.
+    ///
+    /// Emits the same `ToolStart`/`ToolComplete` (or `ToolError`) lifecycle
+    /// events onto `event_tx` that a normal dispatch would, so a streaming
+    /// consumer sees the re-run tool card update exactly like the HTTP surface
+    /// does. Best-effort persists the updated session via
+    /// [`persistence`](Self::persistence) so the real output survives even if the
+    /// process stops before the loop's own next save — logged, not propagated,
+    /// since the loop's subsequent save will also capture it.
+    ///
+    /// No-op (returns immediately) when the marker is absent, so it is safe to
+    /// call unconditionally at the top of every execution, not just resumes.
+    async fn reexecute_approved_tool_if_pending(
+        &self,
+        session: &mut Session,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let Some(tool_call_id) = session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY) else {
+            return;
+        };
+
+        let Some(tool_call) = find_pending_tool_call(session, &tool_call_id) else {
+            tracing::warn!(
+                session_id = %session.id,
+                tool_call_id = %tool_call_id,
+                "Permission re-exec marker set but tool call not found in history"
+            );
+            return;
+        };
+
+        let executor = self.inner.default_tools();
+        let tool_name = tool_call.function.name.clone();
+        let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
+            == bamboo_tools::orchestrator::ToolMutability::Mutating;
+
+        // Frame the re-run with the same lifecycle events the normal loop emits
+        // (via ToolEmitter) so a streaming consumer's tool card updates
+        // (running -> finished) and ToolComplete carries the REAL output — raw
+        // `execute_with_context` only streams tool tokens, not lifecycle.
+        let mut emitter = bamboo_tools::ToolEmitter::new(&tool_call.id, &tool_name, is_mutating);
+        emitter.set_auto_approved(true);
+        let _ = event_tx
+            .send(emitter.begin().clone().into_agent_event())
+            .await;
+
+        let exec_result = {
+            let ctx = bamboo_agent_core::tools::ToolExecutionContext {
+                session_id: Some(session.id.as_str()),
+                tool_call_id: tool_call_id.as_str(),
+                event_tx: Some(event_tx),
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+            executor.execute_with_context(&tool_call, ctx).await
+        };
+
+        let (content, success) = match exec_result {
+            Ok(tool_result) => {
+                let _ = event_tx
+                    .send(
+                        emitter
+                            .finish(Some("Re-executed after approval".to_string()))
+                            .clone()
+                            .into_agent_event(),
+                    )
+                    .await;
+                let _ = event_tx
+                    .send(AgentEvent::ToolComplete {
+                        tool_call_id: tool_call.id.clone(),
+                        result: tool_result.clone(),
+                    })
+                    .await;
+                (tool_result.result, tool_result.success)
+            }
+            Err(error) => {
+                let message = format!("Tool re-execution after approval failed: {error}");
+                let _ = event_tx
+                    .send(emitter.error(message.clone()).clone().into_agent_event())
+                    .await;
+                (message, false)
+            }
+        };
+
+        tracing::info!(
+            session_id = %session.id,
+            tool_name = %tool_name,
+            tool_call_id = %tool_call_id,
+            success,
+            "Re-executed approved tool after permission grant"
+        );
+        apply_tool_result(session, &tool_call_id, content, success);
+
+        if let Err(error) = self.persistence().save_runtime_session(session).await {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "Failed to persist session after tool re-execution (loop's own save will retry)"
+            );
+        }
     }
 
     /// Access the shared storage backend.
@@ -391,17 +517,20 @@ impl Agent {
     /// [`answer_and_resume_stream`](Self::answer_and_resume_stream) to do both
     /// in one call.
     ///
-    /// NOTE: unlike the HTTP server's `/respond` handler, this does NOT
-    /// re-execute a gated tool call after approval — the tool never actually
-    /// ran (the permission gate intercepted it before execution), so the
-    /// resumed loop sees only the synthetic "Selected response: Approve" tool
-    /// result rather than the operation's real output. Full re-execution
-    /// parity (`PERMISSION_REEXECUTE_METADATA_KEY`) is server-adapter logic
-    /// not yet ported to the SDK.
+    /// Like the HTTP server's `/respond` handler, approving a gated tool call
+    /// here also re-executes it for real once the run resumes: `answer` (via
+    /// `submit_pending_response`) stamps the returned session's metadata with
+    /// `PERMISSION_REEXECUTE_METADATA_KEY`, and the next call into
+    /// [`resume`](Self::resume)/[`resume_stream`](Self::resume_stream)/`run*`
+    /// re-runs the originally-gated tool call against the agent's tool executor
+    /// and overwrites the synthetic "Selected response: Approve" placeholder
+    /// with the operation's genuine output before the loop continues — see
+    /// `reexecute_approved_tool_if_pending`.
     ///
     /// NOTE: `ChildApprovalRequested` (an out-of-process sub-agent worker's
     /// gated tool, proxied over the actor protocol) is a SEPARATE mechanism
-    /// from `pending_question`/`respond` and is not covered by this method.
+    /// from `pending_question`/`respond` and is not covered by this method —
+    /// use [`answer_child_approval`](Self::answer_child_approval) instead.
     pub async fn answer(
         &self,
         session_id: impl Into<String>,
@@ -480,6 +609,55 @@ impl Agent {
     ) -> Result<mpsc::Receiver<AgentEvent>, SdkError> {
         let outcome = self.answer(session_id, response).await?;
         Ok(self.resume_stream(outcome.session))
+    }
+
+    /// Answer an out-of-process child sub-agent's gated-tool approval request
+    /// (an [`AgentEvent::ChildApprovalRequested`] surfaced on a run's event
+    /// stream — e.g. from [`run_stream`](Self::run_stream)/
+    /// [`resume_stream`](Self::resume_stream)) — the in-process equivalent of
+    /// the HTTP `POST /api/v1/child-approval/{child_session_id}` endpoint (see
+    /// `bamboo_server::handlers::agent::child_approval`).
+    ///
+    /// This is a SEPARATE mechanism from [`answer`](Self::answer)/
+    /// [`pending_question`](Session::pending_question): a child sub-agent
+    /// worker running out-of-process (over the actor protocol, e.g. a broker
+    /// worker) that hits a gated tool escalates the approval request UP to this
+    /// process rather than suspending its own `pending_question`, and the
+    /// engine tracks it in a process-global pending-approval registry
+    /// (`bamboo_engine::external_agents::live`) keyed by `(child_session_id,
+    /// request_id)` — both taken verbatim from the surfaced event. There is no
+    /// session to load/save here: this only delivers the decision over the
+    /// child's live connection (or fails it closed if the child already
+    /// disconnected or the request already resolved/timed out).
+    ///
+    /// Returns `true` if the decision was delivered to a genuinely-pending
+    /// request, `false` if `request_id` is unknown, was already answered, timed
+    /// out, or the child is no longer live — mirroring the HTTP handler's
+    /// 200-vs-404 distinction. A `false` result does not need cleanup on the
+    /// caller's part: the request is either already resolved or has moved on.
+    ///
+    /// # Boundary
+    ///
+    /// This method only covers the TOP-orchestrator, human-in-the-loop leg of
+    /// child approval (the leg that surfaces `ChildApprovalRequested` at all).
+    /// It requires the agent to actually be driving an out-of-process child —
+    /// i.e. the caller has wired the engine's `external_agents` actor transport
+    /// (broker/worker) — which `AgentBuilder::with_defaults_for_data_dir` does
+    /// NOT assemble; that machinery is a separate, opt-in subsystem. Calling
+    /// this without a live child matching `child_session_id`/`request_id`
+    /// simply returns `false` (no panic, no error) — the same as an unmatched
+    /// HTTP POST.
+    pub fn answer_child_approval(
+        &self,
+        child_session_id: impl AsRef<str>,
+        request_id: impl AsRef<str>,
+        approved: bool,
+    ) -> bool {
+        bamboo_engine::external_agents::live::deliver_approval_checked(
+            child_session_id.as_ref(),
+            request_id.as_ref(),
+            approved,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -584,6 +762,32 @@ impl SessionAccess for Agent {
 
     async fn save_and_cache(&self, session: &mut Session) -> Result<(), SessionSaveError> {
         SessionAccess::save_session(self, session).await
+    }
+}
+
+/// Find the original tool call (with its arguments) by id in the session
+/// history. Mirrors `bamboo-server`'s `resume_adapter::find_pending_tool_call`.
+fn find_pending_tool_call(
+    session: &Session,
+    tool_call_id: &str,
+) -> Option<bamboo_agent_core::tools::ToolCall> {
+    session.messages.iter().find_map(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.iter().find(|call| call.id == tool_call_id).cloned())
+    })
+}
+
+/// Overwrite the tool-result message for `tool_call_id` with the real tool
+/// output. Mirrors `bamboo-server`'s `resume_adapter::apply_tool_result`.
+fn apply_tool_result(session: &mut Session, tool_call_id: &str, content: String, success: bool) {
+    for message in &mut session.messages {
+        if message.tool_call_id.as_deref() == Some(tool_call_id) {
+            message.content = content;
+            message.tool_success = Some(success);
+            return;
+        }
     }
 }
 
@@ -889,5 +1093,338 @@ mod approval_and_session_tests {
         );
         let result = bare.list_sessions().await;
         assert!(matches!(result, Err(SdkError::Unsupported(_))));
+    }
+}
+
+#[cfg(test)]
+mod reexecute_and_child_approval_tests {
+    use super::*;
+    use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A tool whose real output is trivially distinguishable from the
+    /// synthetic "Selected response: Approve" placeholder `submit_pending_response`
+    /// writes, and which counts invocations — so tests can assert it actually ran
+    /// (not merely that the metadata marker was consumed).
+    struct RealOutputTool {
+        calls: AtomicUsize,
+    }
+
+    impl RealOutputTool {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RealOutputTool {
+        fn name(&self) -> &str {
+            "real_output_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test-only tool that returns a distinctive real result"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutcome::Completed(
+                bamboo_agent_core::tools::ToolResult::text(true, format!("REAL TOOL OUTPUT #{n}")),
+            ))
+        }
+    }
+
+    async fn build_test_agent_with_tool(
+        data_dir: std::path::PathBuf,
+        tool: Arc<RealOutputTool>,
+    ) -> Agent {
+        let config_json = r#"{
+            "provider": "anthropic",
+            "providers": {
+                "anthropic": { "api_key": "test-key", "model": "claude-test" }
+            }
+        }"#;
+        std::fs::write(data_dir.join("config.json"), config_json).expect("write config");
+
+        AgentBuilder::new()
+            .model("claude-test")
+            .instruction("test agent")
+            .tool_shared(tool)
+            .with_defaults_for_data_dir(data_dir)
+            .await
+            .expect("defaults should assemble")
+            .build()
+            .expect("agent should build")
+    }
+
+    /// Seed a session suspended on an approved permission prompt for
+    /// `real_output_tool`, matching the shape `check_permissions_for` writes
+    /// before pausing: an assistant message carrying the gated tool call, plus
+    /// the synthesized `awaiting_permission_approval` tool-result payload.
+    fn seed_gated_tool_session(session_id: &str, tool_call_id: &str) -> Session {
+        let mut session = Session::new(session_id.to_string(), "claude-test".to_string());
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: tool_call_id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "real_output_tool".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        session.set_pending_question(
+            tool_call_id.to_string(),
+            "real_output_tool".to_string(),
+            "Permission required".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+        session.add_message(Message::tool_result(
+            tool_call_id,
+            serde_json::json!({
+                "status": "awaiting_permission_approval",
+                "question": "Permission required",
+                "permission_type": "write_file",
+                "resource": "/tmp/example.txt",
+                "options": ["Approve", "Deny"],
+                "allow_custom": false,
+            })
+            .to_string(),
+        ));
+        session
+    }
+
+    #[tokio::test]
+    async fn approve_marks_session_for_reexecution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool).await;
+
+        let session = seed_gated_tool_session("sess-mark", "call-mark-1");
+        agent
+            .storage()
+            .save_session(&session)
+            .await
+            .expect("seed session");
+
+        let outcome = agent
+            .answer("sess-mark", "Approve")
+            .await
+            .expect("answer should succeed");
+
+        assert_eq!(
+            outcome
+                .session
+                .metadata
+                .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("call-mark-1"),
+            "approving a permission prompt must stamp the re-exec marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_does_not_mark_session_for_reexecution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool).await;
+
+        let session = seed_gated_tool_session("sess-deny", "call-deny-1");
+        agent
+            .storage()
+            .save_session(&session)
+            .await
+            .expect("seed session");
+
+        let outcome = agent
+            .answer("sess-deny", "Deny")
+            .await
+            .expect("answer should succeed");
+
+        assert!(outcome.permission_grants.is_empty());
+        assert!(!outcome
+            .session
+            .metadata
+            .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+        // The tool result stays the synthetic "Selected response: Deny" — the
+        // gated tool must NOT have run.
+        let tool_message = outcome
+            .session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-deny-1"))
+            .expect("tool result message present");
+        assert_eq!(tool_message.content, "Selected response: Deny");
+    }
+
+    #[tokio::test]
+    async fn approve_then_reexecute_runs_real_tool_and_overwrites_placeholder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool.clone()).await;
+
+        let session = seed_gated_tool_session("sess-reexec", "call-reexec-1");
+        agent
+            .storage()
+            .save_session(&session)
+            .await
+            .expect("seed session");
+
+        let outcome = agent
+            .answer("sess-reexec", "Approve")
+            .await
+            .expect("answer should succeed");
+        let mut session = outcome.session;
+
+        // Sanity: before re-execution the tool result is still the synthetic
+        // placeholder, and the real tool has not run yet.
+        let placeholder = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
+            .expect("tool result message present");
+        assert_eq!(placeholder.content, "Selected response: Approve");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+
+        // Drive the same re-execution step `resume`/`run*` apply internally
+        // (via `execute_internal`) at the top of the next execution.
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .reexecute_approved_tool_if_pending(&mut session, &event_tx)
+            .await;
+        drop(event_tx);
+
+        // The gated tool ran exactly once, and the placeholder is replaced with
+        // its real output.
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        let real_result = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
+            .expect("tool result message present");
+        assert_eq!(real_result.content, "REAL TOOL OUTPUT #0");
+        assert_eq!(real_result.tool_success, Some(true));
+        assert!(
+            !session
+                .metadata
+                .contains_key(PERMISSION_REEXECUTE_METADATA_KEY),
+            "the marker must be consumed (removed) after re-execution"
+        );
+
+        // Lifecycle events (ToolStart-equivalent begin + ToolComplete) were
+        // emitted, matching what a normal dispatch would stream.
+        let mut saw_tool_complete = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::ToolComplete { tool_call_id, .. } = event {
+                assert_eq!(tool_call_id, "call-reexec-1");
+                saw_tool_complete = true;
+            }
+        }
+        assert!(saw_tool_complete, "expected a ToolComplete event");
+
+        // Persisted too (best-effort save inside the helper).
+        let reloaded = agent
+            .storage()
+            .load_session("sess-reexec")
+            .await
+            .expect("load")
+            .expect("present");
+        let reloaded_result = reloaded
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
+            .expect("tool result message present");
+        assert_eq!(reloaded_result.content, "REAL TOOL OUTPUT #0");
+    }
+
+    #[tokio::test]
+    async fn reexecute_is_noop_without_pending_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool.clone()).await;
+
+        let mut session = Session::new("sess-noop".to_string(), "claude-test".to_string());
+        session.add_message(Message::user("hi"));
+
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .reexecute_approved_tool_if_pending(&mut session, &event_tx)
+            .await;
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reexecute_warns_and_clears_marker_when_tool_call_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool.clone()).await;
+
+        let mut session = Session::new("sess-missing".to_string(), "claude-test".to_string());
+        // Marker set, but no matching tool_calls entry exists in history.
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "ghost-call".to_string(),
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .reexecute_approved_tool_if_pending(&mut session, &event_tx)
+            .await;
+        drop(event_tx);
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err(), "no events should be emitted");
+        assert!(
+            !session
+                .metadata
+                .contains_key(PERMISSION_REEXECUTE_METADATA_KEY),
+            "the marker is removed even when the tool call can't be found, so a \
+             missing/pruned call can't wedge every future execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_child_approval_delivers_only_genuinely_pending_requests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool).await;
+
+        // Unregistered pair: rejected, mirroring an unmatched HTTP POST.
+        assert!(!agent.answer_child_approval("child-x", "req-unknown", true));
+
+        // A live child connection (as the actor adapter registers for the
+        // duration of a running child) plus the pending-approval marker it
+        // records just before surfacing `ChildApprovalRequested` — both are
+        // process-global engine state, set up here exactly as
+        // `external_agents::actor_adapter::drive` would.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _live_guard = bamboo_engine::external_agents::live::register("child-x", tx);
+        bamboo_engine::external_agents::live::register_pending_approval("child-x", "req-1");
+
+        assert!(agent.answer_child_approval("child-x", "req-1", true));
+        match rx.try_recv() {
+            Ok(bamboo_subagent::proto::ParentFrame::ApprovalReply { id, approved }) => {
+                assert_eq!(id, "req-1");
+                assert!(approved);
+            }
+            other => panic!("expected an ApprovalReply frame, got {other:?}"),
+        }
+
+        // One-shot: a replay of the same request_id is rejected.
+        assert!(!agent.answer_child_approval("child-x", "req-1", true));
     }
 }

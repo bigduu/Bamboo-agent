@@ -31,10 +31,9 @@ pub struct StreamHandlingOutput {
     pub response_id: Option<String>,
     pub content: String,
     pub reasoning_content: String,
-    /// Captured Anthropic thinking-block signature for `reasoning_content`, if
-    /// any (#524). See `StreamAccumulationState::record_reasoning_signature`
-    /// for when this stays `None` (non-Anthropic stream, or a turn with more
-    /// than one distinct signed block).
+    /// Provider-minted signature covering `reasoning_content`, present only
+    /// when the turn's thinking arrived as exactly one signed Anthropic
+    /// `thinking` block — see [`bamboo_llm::LLMChunk::ReasoningSignature`] (#520).
     pub reasoning_signature: Option<String>,
     pub token_count: usize,
     pub tool_calls: Vec<ToolCall>,

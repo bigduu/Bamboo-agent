@@ -20,9 +20,6 @@ where
             LLMChunk::ResponseId(_) => {}
             LLMChunk::Token(token) => collected.full_content.push_str(&token),
             LLMChunk::ReasoningToken(_) => {}
-            // Gemini-compat output has no signature concept; drop it like
-            // ReasoningToken above (#524).
-            LLMChunk::ReasoningSignature(_) => {}
             LLMChunk::Done => break,
             // Keep the last tool call batch, matching the original behavior.
             LLMChunk::ToolCalls(calls) => collected.tool_calls = Some(calls),
@@ -30,7 +27,9 @@ where
             LLMChunk::ToolCallsIndexed(calls) => {
                 collected.tool_calls = Some(calls.into_iter().map(|(_, call)| call).collect())
             }
-            LLMChunk::CacheUsage { .. } | LLMChunk::UsageSummary { .. } => {}
+            LLMChunk::CacheUsage { .. }
+            | LLMChunk::UsageSummary { .. }
+            | LLMChunk::ReasoningSignature(_) => {}
         }
     }
 

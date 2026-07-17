@@ -50,9 +50,6 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 }
             }
             Ok(LLMChunk::ReasoningToken(_)) => {}
-            // OpenAI-compat SSE output has no signature concept; drop it like
-            // ReasoningToken above (#524).
-            Ok(LLMChunk::ReasoningSignature(_)) => {}
             Ok(LLMChunk::ToolCalls(calls)) => {
                 if let Some(chunk) = openai_chunk_bytes(LLMChunk::ToolCalls(calls), &args.model) {
                     if args.tx.send(Ok(chunk)).await.is_err() {
@@ -69,7 +66,9 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     }
                 }
             }
-            Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
+            Ok(LLMChunk::CacheUsage { .. })
+            | Ok(LLMChunk::UsageSummary { .. })
+            | Ok(LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 tracing::error!("Stream error: {}", error);
                 let message = error.to_string();

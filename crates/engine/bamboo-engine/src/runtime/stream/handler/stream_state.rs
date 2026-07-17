@@ -6,12 +6,11 @@ pub(super) struct StreamAccumulationState {
     response_id: Option<String>,
     content: String,
     reasoning_content: String,
-    /// Captured Anthropic `signature_delta` for the turn's `thinking` block(s)
-    /// (#524). `Some` only when exactly one distinct signature was observed —
-    /// see [`Self::record_reasoning_signature`].
+    /// Provider-minted signature covering `reasoning_content` (#520). `None`
+    /// until a signature arrives; an empty-string invalidation marker clears it
+    /// permanently for this stream (`reasoning_signature_invalidated`).
     reasoning_signature: Option<String>,
-    /// How many `LLMChunk::ReasoningSignature` chunks this turn has seen.
-    reasoning_signature_count: usize,
+    reasoning_signature_invalidated: bool,
     token_count: usize,
     tool_calls: ToolCallAccumulator,
     output_tokens: u64,
@@ -28,7 +27,7 @@ impl StreamAccumulationState {
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_signature: None,
-            reasoning_signature_count: 0,
+            reasoning_signature_invalidated: false,
             token_count: 0,
             tool_calls: ToolCallAccumulator::new(),
             output_tokens: 0,
@@ -48,22 +47,16 @@ impl StreamAccumulationState {
         self.reasoning_content.push_str(token);
     }
 
-    /// Record a captured Anthropic thinking-block signature.
-    ///
-    /// `Message.reasoning` flattens ALL of a turn's `thinking` block text into
-    /// one string, but Anthropic signs each block individually against its own
-    /// exact bytes. If a turn streamed more than one signed thinking block, we
-    /// cannot faithfully attribute a single signature to the concatenated text
-    /// on replay — attempting to would risk a corrupt-signature 400 from
-    /// Anthropic, exactly the failure class #520/#523 fixed. So: keep the
-    /// signature only when exactly one has been observed; a second distinct
-    /// signature clears it back to unsigned/ambiguous (the safe #523 default).
+    /// Record a provider-minted reasoning signature (#520). An empty string is
+    /// the parser's invalidation marker — the turn produced multiple thinking
+    /// blocks (or a redacted one), so no single signature covers the
+    /// accumulated reasoning text and none may be persisted.
     pub(super) fn record_reasoning_signature(&mut self, signature: String) {
-        self.reasoning_signature_count += 1;
-        if self.reasoning_signature_count == 1 {
-            self.reasoning_signature = Some(signature);
-        } else {
+        if signature.is_empty() {
             self.reasoning_signature = None;
+            self.reasoning_signature_invalidated = true;
+        } else if !self.reasoning_signature_invalidated {
+            self.reasoning_signature = Some(signature);
         }
     }
 

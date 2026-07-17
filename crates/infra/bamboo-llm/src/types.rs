@@ -5,17 +5,13 @@ pub enum LLMChunk {
     ResponseId(String),
     Token(String),
     ReasoningToken(String),
-    /// A genuine Anthropic-minted `signature` captured from a `signature_delta`
-    /// SSE event on a `thinking` content block (#524).
-    ///
-    /// Only the Anthropic streaming parser (`parse_anthropic_sse_event`) ever
-    /// emits this — no other provider's wire format has an equivalent concept,
-    /// so its mere presence in a stream is proof the accompanying
-    /// [`LLMChunk::ReasoningToken`] text was minted by real Anthropic. The
-    /// engine accumulates it alongside the reasoning text and persists it on
-    /// `Message.reasoning_signature`, so a later same-provider Anthropic round
-    /// can legitimately replay the signed `thinking` block instead of omitting
-    /// it (the safe default #523 introduced for the unsigned/foreign case).
+    /// Provider-minted cryptographic signature covering the turn's accumulated
+    /// reasoning text (Anthropic `signature_delta`). Emitted once, after the
+    /// turn's single `thinking` block closes; an EMPTY string is an
+    /// invalidation marker (the turn produced multiple thinking blocks or a
+    /// `redacted_thinking` block, so no single signature covers the
+    /// accumulated reasoning and any previously captured one must be
+    /// discarded). Consumers that don't replay thinking ignore this. (#520)
     ReasoningSignature(String),
     ToolCalls(Vec<ToolCall>),
     /// Tool-call deltas that carry the provider's `index` field, so the engine
@@ -67,15 +63,6 @@ mod tests {
         match chunk {
             LLMChunk::ReasoningToken(s) => assert_eq!(s, "Thinking..."),
             _ => panic!("Expected ReasoningToken variant"),
-        }
-    }
-
-    #[test]
-    fn test_llm_chunk_reasoning_signature() {
-        let chunk = LLMChunk::ReasoningSignature("sig_abc123".to_string());
-        match chunk {
-            LLMChunk::ReasoningSignature(s) => assert_eq!(s, "sig_abc123"),
-            _ => panic!("Expected ReasoningSignature variant"),
         }
     }
 

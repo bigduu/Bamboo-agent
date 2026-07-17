@@ -55,6 +55,19 @@ impl Agent {
     pub fn persistence(&self) -> &Arc<dyn RuntimeSessionPersistence> {
         &self.runtime.persistence
     }
+
+    /// Access the runtime's default tool executor (the root/full tool surface
+    /// assembled at build time).
+    ///
+    /// Exposed so callers can compose additional one-off dispatches against the
+    /// SAME executor the loop itself uses — e.g. re-executing a single
+    /// previously-gated tool call after a permission approval — without forking
+    /// or reaching into `AgentLoopConfig` (which stays unconstructible outside
+    /// the engine). This is a read-only accessor alongside `storage()` /
+    /// `persistence()`; it does not touch the sealed loop config.
+    pub fn default_tools(&self) -> &Arc<dyn bamboo_agent_core::tools::ToolExecutor> {
+        &self.runtime.default_tools
+    }
 }
 
 // ---------------------------------------------------------------------------

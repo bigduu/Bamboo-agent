@@ -95,9 +95,6 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     break;
                 }
             }
-            // This response format has no thinking-signature concept; drop it
-            // (#524).
-            Ok(LLMChunk::ReasoningSignature(_)) => {}
             Ok(LLMChunk::ToolCalls(calls)) => {
                 let active_response_id = response_id
                     .clone()
@@ -118,7 +115,9 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 tool_calls.extend(indexed.into_iter().map(|(_, call)| call))
             }
             Ok(LLMChunk::Done) => break,
-            Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
+            Ok(LLMChunk::CacheUsage { .. })
+            | Ok(LLMChunk::UsageSummary { .. })
+            | Ok(LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 had_error = true;
                 error_message = Some(error.to_string());
