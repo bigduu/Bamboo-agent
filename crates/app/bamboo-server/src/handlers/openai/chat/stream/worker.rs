@@ -66,7 +66,9 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     }
                 }
             }
-            Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
+            Ok(LLMChunk::CacheUsage { .. })
+            | Ok(LLMChunk::UsageSummary { .. })
+            | Ok(LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 tracing::error!("Stream error: {}", error);
                 let message = error.to_string();

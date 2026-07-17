@@ -59,6 +59,14 @@ pub struct Message {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Provider-minted cryptographic signature covering `reasoning`, when the
+    /// turn's thinking arrived as exactly ONE Anthropic `thinking` block (and no
+    /// `redacted_thinking`). Real Anthropic only accepts a replayed `thinking`
+    /// input block whose signature it minted itself over that exact text — so
+    /// this must never be set for reasoning from another provider, and must be
+    /// dropped if `reasoning` is ever rewritten (issue #520).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_parts: Option<Vec<MessagePart>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +136,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,
@@ -149,6 +158,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: Some(parts),
             image_ocr: None,
             phase: None,
@@ -183,6 +193,7 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             reasoning,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase,
@@ -196,6 +207,14 @@ impl Message {
             created_at: Utc::now(),
             metadata: None,
         }
+    }
+
+    /// Attach a provider-minted signature covering `reasoning` (see the field
+    /// doc). Intended for the builder position right after
+    /// [`Message::assistant_with_reasoning`].
+    pub fn with_reasoning_signature(mut self, signature: Option<String>) -> Self {
+        self.reasoning_signature = signature;
+        self
     }
 
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -212,6 +231,7 @@ impl Message {
             role: Role::Tool,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,
@@ -252,6 +272,7 @@ impl Message {
             role: Role::Tool,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts,
             image_ocr: None,
             phase: None,
@@ -273,6 +294,7 @@ impl Message {
             role: Role::System,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,
@@ -1468,5 +1490,30 @@ mod tests {
         assert_eq!(grandchild.parent_session_id.as_deref(), Some("child-1"));
         assert_eq!(grandchild.root_session_id, "root-1");
         assert_eq!(grandchild.spawn_depth, 2);
+    }
+
+    /// #520: the reasoning signature round-trips through serde and stays
+    /// absent from the wire when unset (so pre-existing session files and
+    /// consumers are untouched).
+    #[test]
+    fn reasoning_signature_serde_round_trip_and_backward_compat() {
+        let signed =
+            Message::assistant_with_reasoning("answer", None, Some("thinking text".to_string()))
+                .with_reasoning_signature(Some("sig_123".to_string()));
+        let json = serde_json::to_string(&signed).expect("serialize");
+        assert!(json.contains("\"reasoning_signature\":\"sig_123\""));
+        let back: Message = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.reasoning_signature.as_deref(), Some("sig_123"));
+
+        // Unset → omitted from the wire entirely.
+        let unsigned = Message::assistant("answer", None);
+        let json = serde_json::to_string(&unsigned).expect("serialize");
+        assert!(!json.contains("reasoning_signature"));
+
+        // A legacy persisted message (no field at all) deserializes to None.
+        let legacy =
+            r#"{"id":"m1","role":"assistant","content":"old","created_at":"2026-01-01T00:00:00Z"}"#;
+        let message: Message = serde_json::from_str(legacy).expect("legacy deserializes");
+        assert_eq!(message.reasoning_signature, None);
     }
 }

@@ -27,7 +27,9 @@ where
             LLMChunk::ToolCallsIndexed(calls) => {
                 collected.tool_calls = Some(calls.into_iter().map(|(_, call)| call).collect())
             }
-            LLMChunk::CacheUsage { .. } | LLMChunk::UsageSummary { .. } => {}
+            LLMChunk::CacheUsage { .. }
+            | LLMChunk::UsageSummary { .. }
+            | LLMChunk::ReasoningSignature(_) => {}
         }
     }
 

@@ -62,6 +62,53 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     assert!(matches!(token_event, AgentEvent::Token { .. }));
 }
 
+/// #520: a provider-minted reasoning signature is surfaced on the output so
+/// the persisted assistant message can replay a SIGNED thinking block.
+#[tokio::test]
+async fn consume_llm_stream_captures_reasoning_signature() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("thinking".to_string())),
+        Ok(LLMChunk::ReasoningSignature("sig_abc".to_string())),
+        Ok(LLMChunk::Token("hi".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(8);
+    let output = consume_llm_stream(stream, &event_tx, &CancellationToken::new(), "session-sig")
+        .await
+        .expect("stream should succeed");
+
+    assert_eq!(output.reasoning_content, "thinking");
+    assert_eq!(output.reasoning_signature.as_deref(), Some("sig_abc"));
+}
+
+/// #520: the empty-string marker permanently invalidates the signature for
+/// the stream (multi-block/redacted turns), even if another one follows.
+#[tokio::test]
+async fn consume_llm_stream_honors_signature_invalidation_marker() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningSignature("sig_first".to_string())),
+        Ok(LLMChunk::ReasoningSignature(String::new())),
+        Ok(LLMChunk::ReasoningSignature("sig_late".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(8);
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-sig-invalid",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(
+        output.reasoning_signature, None,
+        "invalidation is permanent for the stream"
+    );
+}
+
 #[tokio::test]
 async fn consume_llm_stream_silent_does_not_emit_events() {
     let stream = build_stream(vec![

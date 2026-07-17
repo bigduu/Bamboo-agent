@@ -74,7 +74,8 @@ pub(super) async fn handle_non_streaming_response(
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
-            | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}
+            | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
+            | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id,

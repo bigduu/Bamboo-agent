@@ -31,6 +31,10 @@ pub struct StreamHandlingOutput {
     pub response_id: Option<String>,
     pub content: String,
     pub reasoning_content: String,
+    /// Provider-minted signature covering `reasoning_content`, present only
+    /// when the turn's thinking arrived as exactly one signed Anthropic
+    /// `thinking` block — see [`bamboo_llm::LLMChunk::ReasoningSignature`] (#520).
+    pub reasoning_signature: Option<String>,
     pub token_count: usize,
     pub tool_calls: Vec<ToolCall>,
     pub output_tokens: u64,
