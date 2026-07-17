@@ -139,6 +139,9 @@ pub(super) fn convert_llm_chunk_to_openai(
             )
         }
         bamboo_llm::types::LLMChunk::ReasoningToken(_) => None,
+        // OpenAI-compat output has no signature concept; drop it like
+        // ReasoningToken above (#524).
+        bamboo_llm::types::LLMChunk::ReasoningSignature(_) => None,
         bamboo_llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),

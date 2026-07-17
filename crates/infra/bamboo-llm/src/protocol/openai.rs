@@ -53,6 +53,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             role,
             content,
             reasoning: None,
+            reasoning_signature: None,
             content_parts,
             image_ocr: None,
             phase,

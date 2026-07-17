@@ -6,6 +6,12 @@ pub(super) struct StreamAccumulationState {
     response_id: Option<String>,
     content: String,
     reasoning_content: String,
+    /// Captured Anthropic `signature_delta` for the turn's `thinking` block(s)
+    /// (#524). `Some` only when exactly one distinct signature was observed —
+    /// see [`Self::record_reasoning_signature`].
+    reasoning_signature: Option<String>,
+    /// How many `LLMChunk::ReasoningSignature` chunks this turn has seen.
+    reasoning_signature_count: usize,
     token_count: usize,
     tool_calls: ToolCallAccumulator,
     output_tokens: u64,
@@ -21,6 +27,8 @@ impl StreamAccumulationState {
             response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
+            reasoning_signature: None,
+            reasoning_signature_count: 0,
             token_count: 0,
             tool_calls: ToolCallAccumulator::new(),
             output_tokens: 0,
@@ -38,6 +46,25 @@ impl StreamAccumulationState {
 
     pub(super) fn append_reasoning_token(&mut self, token: &str) {
         self.reasoning_content.push_str(token);
+    }
+
+    /// Record a captured Anthropic thinking-block signature.
+    ///
+    /// `Message.reasoning` flattens ALL of a turn's `thinking` block text into
+    /// one string, but Anthropic signs each block individually against its own
+    /// exact bytes. If a turn streamed more than one signed thinking block, we
+    /// cannot faithfully attribute a single signature to the concatenated text
+    /// on replay — attempting to would risk a corrupt-signature 400 from
+    /// Anthropic, exactly the failure class #520/#523 fixed. So: keep the
+    /// signature only when exactly one has been observed; a second distinct
+    /// signature clears it back to unsigned/ambiguous (the safe #523 default).
+    pub(super) fn record_reasoning_signature(&mut self, signature: String) {
+        self.reasoning_signature_count += 1;
+        if self.reasoning_signature_count == 1 {
+            self.reasoning_signature = Some(signature);
+        } else {
+            self.reasoning_signature = None;
+        }
     }
 
     pub(super) fn set_response_id(&mut self, response_id: String) {
@@ -80,6 +107,7 @@ impl StreamAccumulationState {
             response_id: self.response_id,
             content: self.content,
             reasoning_content: self.reasoning_content,
+            reasoning_signature: self.reasoning_signature,
             token_count: self.token_count,
             tool_calls: self.tool_calls.finalize(),
             output_tokens: self.output_tokens,

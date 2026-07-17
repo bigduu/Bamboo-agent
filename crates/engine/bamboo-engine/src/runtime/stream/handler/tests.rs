@@ -62,6 +62,85 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     assert!(matches!(token_event, AgentEvent::Token { .. }));
 }
 
+/// #524: a single captured `ReasoningSignature` chunk must survive through to
+/// `StreamHandlingOutput.reasoning_signature`, alongside the reasoning text it
+/// signs.
+#[tokio::test]
+async fn consume_llm_stream_captures_single_reasoning_signature() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("Let me think...".to_string())),
+        Ok(LLMChunk::ReasoningSignature("sig_captured".to_string())),
+        Ok(LLMChunk::Token("Here's the answer.".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(8);
+    let output = consume_llm_stream(stream, &event_tx, &CancellationToken::new(), "session-sig")
+        .await
+        .expect("stream should succeed");
+
+    assert_eq!(output.reasoning_content, "Let me think...");
+    assert_eq!(output.reasoning_signature.as_deref(), Some("sig_captured"));
+}
+
+/// #524: `StreamAccumulationState::record_reasoning_signature` clears the
+/// signature back to `None` when more than one distinct signature is
+/// observed in a single turn — `Message.reasoning` flattens all thinking-block
+/// text into one string, so a single turn's ambiguous multi-block signature
+/// can't be faithfully attributed on replay, and treating it as unsigned is
+/// the safe fallback (matches #523's default).
+#[tokio::test]
+async fn consume_llm_stream_clears_reasoning_signature_on_multiple_blocks() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("First block.".to_string())),
+        Ok(LLMChunk::ReasoningSignature("sig_block_one".to_string())),
+        Ok(LLMChunk::ReasoningToken("Second block.".to_string())),
+        Ok(LLMChunk::ReasoningSignature("sig_block_two".to_string())),
+        Ok(LLMChunk::Token("Answer.".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(8);
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-sig-2",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(output.reasoning_content, "First block.Second block.");
+    assert_eq!(
+        output.reasoning_signature, None,
+        "ambiguous multi-block signature must fall back to unsigned"
+    );
+}
+
+/// A stream with no `ReasoningSignature` chunk at all (any non-Anthropic
+/// provider, or Anthropic with thinking disabled) must leave the signature
+/// `None` — the pre-#524 behavior for every existing provider.
+#[tokio::test]
+async fn consume_llm_stream_reasoning_signature_absent_by_default() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("Reasoning text.".to_string())),
+        Ok(LLMChunk::Token("Answer.".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(8);
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-sig-3",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(output.reasoning_signature, None);
+}
+
 #[tokio::test]
 async fn consume_llm_stream_silent_does_not_emit_events() {
     let stream = build_stream(vec![

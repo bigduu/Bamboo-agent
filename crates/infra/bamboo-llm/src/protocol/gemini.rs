@@ -262,6 +262,7 @@ impl FromProvider<GeminiContent> for Message {
             role,
             content: content_text,
             reasoning: None,
+            reasoning_signature: None,
             content_parts: has_image_parts.then_some(content_parts),
             image_ocr: None,
             phase: None,

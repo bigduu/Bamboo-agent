@@ -59,6 +59,18 @@ pub struct Message {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Anthropic-minted `signature` captured from a `signature_delta` SSE event
+    /// for the `thinking` block(s) that produced [`Self::reasoning`] (#524).
+    ///
+    /// Only the Anthropic streaming path ever populates this — every other
+    /// provider leaves it `None`. Its presence is therefore sufficient proof
+    /// that `reasoning` was genuinely minted (and can be safely replayed) by
+    /// Anthropic; no separate provider-provenance field is needed. `#[serde(default)]`
+    /// keeps old persisted sessions (recorded before this field existed)
+    /// loadable — they simply deserialize to `None`, i.e. unsigned, which is
+    /// exactly #523's safe-omission behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_parts: Option<Vec<MessagePart>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +140,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,
@@ -149,6 +162,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: Some(parts),
             image_ocr: None,
             phase: None,
@@ -183,6 +197,7 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             reasoning,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase,
@@ -196,6 +211,15 @@ impl Message {
             created_at: Utc::now(),
             metadata: None,
         }
+    }
+
+    /// Attach a captured Anthropic `signature_delta` to this (assistant)
+    /// message's [`Self::reasoning`] (#524). Consuming builder so call sites
+    /// can chain it onto `assistant_with_reasoning` without widening that
+    /// constructor's already-large parameter list.
+    pub fn with_reasoning_signature(mut self, signature: Option<String>) -> Self {
+        self.reasoning_signature = signature;
+        self
     }
 
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -212,6 +236,7 @@ impl Message {
             role: Role::Tool,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,
@@ -252,6 +277,7 @@ impl Message {
             role: Role::Tool,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts,
             image_ocr: None,
             phase: None,
@@ -273,6 +299,7 @@ impl Message {
             role: Role::System,
             content: content.into(),
             reasoning: None,
+            reasoning_signature: None,
             content_parts: None,
             image_ocr: None,
             phase: None,

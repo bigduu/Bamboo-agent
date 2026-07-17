@@ -474,6 +474,7 @@ fn add_final_assistant_message(session: &mut bamboo_agent_core::Session, mapper:
         role: Role::Assistant,
         content: text.to_string(),
         reasoning: None,
+        reasoning_signature: None,
         content_parts: None,
         image_ocr: None,
         phase: None,

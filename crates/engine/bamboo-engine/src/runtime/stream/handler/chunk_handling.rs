@@ -64,6 +64,15 @@ pub(super) async fn handle_chunk_result(
             }
             Ok(())
         }
+        Ok(LLMChunk::ReasoningSignature(signature)) => {
+            tracing::trace!(
+                "[{}] Received Anthropic thinking-block signature (len={})",
+                session_id,
+                signature.len()
+            );
+            state.record_reasoning_signature(signature);
+            Ok(())
+        }
         Ok(LLMChunk::ToolCalls(partial_calls)) => {
             tracing::trace!(
                 "[{}] Received {} tool call parts",
