@@ -86,15 +86,27 @@ pub enum SegmentRole {
 /// difference is deliberate + byte-faithful to the pre-IR engine:
 /// - OpenAI/Copilot **Responses** path: sends the FULL [`PromptIR::responses_input`]
 ///   as `input` together with `previous_response_id` (NOT the delta). This mirrors
-///   the legacy `responses_input_messages` exactly; `store=false` is used, so the
-///   request is effectively stateless and `previous_response_id` rides along for
-///   reasoning continuity rather than to elide history.
+///   the legacy `responses_input_messages` exactly.
 /// - Chat-Completions path: sends [`PromptIR::continuation_delta`] (the delta after
 ///   `last_committed_assistant_id`). No Responses-only provider takes this path
 ///   today, so the delta lowering is currently exercised only by tests.
 ///
-/// (Whether `store=false` + `previous_response_id` is the ideal Responses contract
-/// is a PRE-EXISTING question, untouched by the IR rewrite — see the PR discussion.)
+/// `PromptIR.continuation` only ever carries a `Some` value when the caller has
+/// already confirmed the referenced turn was stored upstream — the engine's
+/// shipped Responses policy is `store=false`, under which
+/// `stream_execution::responses_continuation_enabled` never constructs a
+/// `Continuation` in the first place, so `previous_response_id` is never sent and
+/// never persisted (see `engine_responses_policy` /
+/// `responses_continuation_enabled` in
+/// `runtime::runner::round_lifecycle::stream_execution`). Resolved by #513: a
+/// `store=false` turn is never persisted upstream, so referencing its id on the
+/// next round 400s with `previous_response_not_found` — confirmed against
+/// production traffic. This struct/lowering path stays live as the (currently
+/// unused) `store=true` case: a provider or future policy that DOES store turns
+/// server-side can still chain `previous_response_id`, and
+/// `openai/mod.rs::looks_like_previous_response_not_found_error` retries once
+/// without it if the upstream can't resolve it (expired id / different key/org /
+/// a client-forwarded id). See #64 for the original investigation.
 #[derive(Debug, Clone)]
 pub struct Continuation {
     pub previous_response_id: String,
