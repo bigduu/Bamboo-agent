@@ -656,6 +656,7 @@ impl Agent {
         approved: bool,
     ) -> bool {
         bamboo_engine::external_agents::live::deliver_approval_checked(
+            None,
             child_session_id.as_ref(),
             request_id.as_ref(),
             approved,
@@ -1434,11 +1435,13 @@ mod reexecute_and_child_approval_tests {
         // process-global engine state, set up here exactly as
         // `external_agents::actor_adapter::drive` would.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _live_guard = bamboo_engine::external_agents::live::register("child-x", tx);
+        let _live_guard = bamboo_engine::external_agents::live::register("child-x", tx, 0, None);
         let (approval_event_tx, _approval_event_rx) = tokio::sync::mpsc::channel(4);
         bamboo_engine::external_agents::live::register_pending_approval_observed(
+            None,
             "parent-x",
             "child-x",
+            0,
             "req-1",
             "shell",
             "execute",

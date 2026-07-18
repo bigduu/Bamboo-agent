@@ -16,8 +16,20 @@ use bamboo_domain::poison::PoisonRecover;
 use bamboo_subagent::proto::ParentFrame;
 use tokio::sync::mpsc;
 
-fn map() -> &'static Mutex<HashMap<String, mpsc::UnboundedSender<ParentFrame>>> {
-    static MAP: OnceLock<Mutex<HashMap<String, mpsc::UnboundedSender<ParentFrame>>>> =
+use super::approval_registry::{
+    ApprovalRegistry, ApprovalState, DurableApproval, SharedApprovalRegistry,
+};
+
+type ScopeId = usize;
+type LiveKey = (ScopeId, String, u32);
+type PendingKey = (ScopeId, String, String, u32, String);
+
+fn scope_id(registry: Option<&SharedApprovalRegistry>) -> ScopeId {
+    registry.map_or(0, |registry| registry.lock().recover_poison().scope_id())
+}
+
+fn map() -> &'static Mutex<HashMap<LiveKey, mpsc::UnboundedSender<ParentFrame>>> {
+    static MAP: OnceLock<Mutex<HashMap<LiveKey, mpsc::UnboundedSender<ParentFrame>>>> =
         OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -36,20 +48,34 @@ struct PendingApproval {
     resource: String,
     created_at: String,
     version: u64,
+    child_attempt: u32,
     event_tx: mpsc::Sender<AgentEvent>,
 }
 
-fn pending() -> &'static Mutex<HashMap<(String, String), PendingApproval>> {
-    static PENDING: OnceLock<Mutex<HashMap<(String, String), PendingApproval>>> = OnceLock::new();
+fn pending() -> &'static Mutex<HashMap<PendingKey, PendingApproval>> {
+    static PENDING: OnceLock<Mutex<HashMap<PendingKey, PendingApproval>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Configure durable approval storage and fail-close records whose live
+/// transport was lost across restart.
+pub fn initialize_durable_approvals(
+    path: std::path::PathBuf,
+) -> std::io::Result<(SharedApprovalRegistry, Vec<AgentEvent>)> {
+    let mut registry = ApprovalRegistry::open(path)?;
+    let reconciled = registry.reconcile_restart()?;
+    let events = reconciled.into_iter().map(record_event).collect();
+    Ok((std::sync::Arc::new(Mutex::new(registry)), events))
 }
 
 /// Record a `(child_id, request_id)` as a pending human-loop approval. Called
 /// just before surfacing `ChildApprovalRequested` so an external POST can be
 /// correlated against a genuinely-pending request.
 pub fn register_pending_approval_observed(
+    registry: Option<&SharedApprovalRegistry>,
     parent_session_id: &str,
     child_id: &str,
+    child_attempt: u32,
     request_id: &str,
     tool_name: &str,
     permission: &str,
@@ -59,8 +85,35 @@ pub fn register_pending_approval_observed(
     let now = chrono::Utc::now();
     let version = now.timestamp_micros().max(0) as u64;
     let created_at = now.to_rfc3339();
+    let durable_record = DurableApproval {
+        parent_session_id: parent_session_id.to_string(),
+        child_session_id: child_id.to_string(),
+        child_attempt,
+        request_id: request_id.to_string(),
+        tool_name: tool_name.to_string(),
+        permission: permission.to_string(),
+        resource: resource.to_string(),
+        created_at: created_at.clone(),
+        updated_at: created_at.clone(),
+        version,
+        state: ApprovalState::Pending,
+        approved: None,
+        reason: None,
+    };
+    if let Some(registry) = registry {
+        if let Err(error) = registry.lock().recover_poison().register(durable_record) {
+            tracing::error!("failed to persist pending child approval: {error}");
+            return (0, created_at);
+        }
+    }
     pending().lock().recover_poison().insert(
-        (child_id.to_string(), request_id.to_string()),
+        (
+            scope_id(registry),
+            parent_session_id.to_string(),
+            child_id.to_string(),
+            child_attempt,
+            request_id.to_string(),
+        ),
         PendingApproval {
             parent_session_id: parent_session_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -68,6 +121,7 @@ pub fn register_pending_approval_observed(
             resource: resource.to_string(),
             created_at: created_at.clone(),
             version,
+            child_attempt,
             event_tx,
         },
     );
@@ -78,8 +132,10 @@ pub fn register_pending_approval_observed(
 fn register_pending_approval(child_id: &str, request_id: &str) {
     let (event_tx, _rx) = mpsc::channel(1);
     let _ = register_pending_approval_observed(
+        None,
         "test-parent",
         child_id,
+        0,
         request_id,
         "test-tool",
         "test-permission",
@@ -92,52 +148,79 @@ fn register_pending_approval(child_id: &str, request_id: &str) {
 /// return whether it WAS present. A second call for the same pair returns
 /// `false`, so a request can't be answered (or replayed) twice.
 pub fn take_pending_approval(child_id: &str, request_id: &str) -> bool {
-    pending()
-        .lock()
-        .recover_poison()
-        .remove(&(child_id.to_string(), request_id.to_string()))
-        .is_some()
+    remove_unique_pending(None, child_id, request_id).is_some()
 }
 
 /// Drop all pending approvals for a child (e.g. when its live connection ends).
-pub fn clear_pending_approvals_for(child_id: &str) {
+pub fn clear_pending_approvals_for(
+    registry: Option<&SharedApprovalRegistry>,
+    child_id: &str,
+    child_attempt: u32,
+) {
     let records: Vec<_> = {
         let mut guard = pending().lock().recover_poison();
         let keys: Vec<_> = guard
             .keys()
-            .filter(|(child, _)| child == child_id)
+            .filter(|(scope, _, child, attempt, _)| {
+                *scope == scope_id(registry) && child == child_id && *attempt == child_attempt
+            })
             .cloned()
             .collect();
         keys.into_iter()
-            .filter_map(|key| guard.remove(&key).map(|record| (key.1, record)))
+            .filter_map(|key| guard.remove(&key).map(|record| (key.4, record)))
             .collect()
     };
     for (request_id, record) in records {
-        emit_resolution(
+        let durable = finish_durable(
+            registry,
+            &record.parent_session_id,
             child_id,
+            record.child_attempt,
             &request_id,
-            record,
-            "delivery_failed",
+            false,
             Some("child_disconnected"),
         );
+        if registry.is_none() || durable.is_some() {
+            emit_resolution(
+                child_id,
+                &request_id,
+                record,
+                "delivery_failed",
+                Some("child_disconnected"),
+                durable.as_ref(),
+            );
+        }
     }
 }
 
-pub fn expire_pending_approval(child_id: &str, request_id: &str) -> bool {
-    let record = pending()
-        .lock()
-        .recover_poison()
-        .remove(&(child_id.to_string(), request_id.to_string()));
+pub fn expire_pending_approval(
+    registry: Option<&SharedApprovalRegistry>,
+    child_id: &str,
+    request_id: &str,
+) -> bool {
+    let record = remove_unique_pending(registry, child_id, request_id);
     let Some(record) = record else {
         return false;
     };
-    emit_resolution(
+    let durable = finish_durable(
+        registry,
+        &record.parent_session_id,
         child_id,
+        record.child_attempt,
         request_id,
-        record,
-        "expired",
+        false,
         Some("approval_timeout"),
     );
+    if registry.is_none() || durable.is_some() {
+        emit_resolution(
+            child_id,
+            request_id,
+            record,
+            "expired",
+            Some("approval_timeout"),
+            durable.as_ref(),
+        );
+    }
     true
 }
 
@@ -147,20 +230,29 @@ fn emit_resolution(
     record: PendingApproval,
     status: &str,
     reason: Option<&str>,
+    durable: Option<&DurableApproval>,
 ) {
     let now = chrono::Utc::now();
     let event = AgentEvent::ChildApprovalChanged {
         parent_session_id: record.parent_session_id,
         child_session_id: child_id.to_string(),
+        child_attempt: record.child_attempt,
         request_id: request_id.to_string(),
-        version: (now.timestamp_micros().max(0) as u64).max(record.version.saturating_add(1)),
+        version: durable.map_or_else(
+            || (now.timestamp_micros().max(0) as u64).max(record.version.saturating_add(1)),
+            |record| record.version,
+        ),
         status: status.to_string(),
         reason: reason.map(str::to_string),
         tool_name: record.tool_name,
         permission: record.permission,
         resource: record.resource,
         created_at: record.created_at,
-        resolved_at: Some(now.to_rfc3339()),
+        resolved_at: Some(
+            durable
+                .map(|record| record.updated_at.clone())
+                .unwrap_or_else(|| now.to_rfc3339()),
+        ),
     };
     match record.event_tx.try_send(event) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -180,15 +272,52 @@ fn emit_resolution(
 /// — unknown, already-answered/timed-out, or a non-human-loop path
 /// (model-review / escalation) that never registered. This is the entry the
 /// external HTTP handler must use.
-pub fn deliver_approval_checked(child_id: &str, request_id: &str, approved: bool) -> bool {
-    let record = pending()
-        .lock()
-        .recover_poison()
-        .remove(&(child_id.to_string(), request_id.to_string()));
-    let Some(record) = record else {
+pub fn deliver_approval_checked(
+    registry: Option<&SharedApprovalRegistry>,
+    child_id: &str,
+    request_id: &str,
+    approved: bool,
+) -> bool {
+    let Some((key, record)) = find_unique_pending(registry, child_id, request_id) else {
         return false;
     };
-    let delivered = deliver_approval(child_id, request_id, approved);
+    // Persist DecisionRecorded before touching the live transport. Duplicate or
+    // concurrent decisions fail this transition and cannot deliver twice.
+    if let Some(registry) = registry {
+        match registry.lock().recover_poison().record_decision(
+            &record.parent_session_id,
+            child_id,
+            record.child_attempt,
+            request_id,
+            approved,
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::error!("failed to persist child approval decision: {error}");
+                return false;
+            }
+        }
+    }
+    let Some(record) = pending().lock().recover_poison().remove(&key) else {
+        let _ = finish_durable(
+            registry,
+            &record.parent_session_id,
+            child_id,
+            record.child_attempt,
+            request_id,
+            false,
+            Some("pending_state_lost"),
+        );
+        return false;
+    };
+    let delivered = deliver_approval_scoped(
+        registry,
+        child_id,
+        record.child_attempt,
+        request_id,
+        approved,
+    );
     let status = if delivered {
         if approved {
             "approved"
@@ -198,54 +327,181 @@ pub fn deliver_approval_checked(child_id: &str, request_id: &str, approved: bool
     } else {
         "delivery_failed"
     };
-    emit_resolution(
+    let durable = finish_durable(
+        registry,
+        &record.parent_session_id,
         child_id,
+        record.child_attempt,
         request_id,
-        record,
-        status,
+        delivered,
         (!delivered).then_some("child_not_live"),
     );
+    if registry.is_none() || durable.is_some() {
+        emit_resolution(
+            child_id,
+            request_id,
+            record,
+            status,
+            (!delivered).then_some("child_not_live"),
+            durable.as_ref(),
+        );
+    }
     delivered
+}
+
+fn finish_durable(
+    registry: Option<&SharedApprovalRegistry>,
+    parent_id: &str,
+    child_id: &str,
+    child_attempt: u32,
+    request_id: &str,
+    delivered: bool,
+    reason: Option<&str>,
+) -> Option<DurableApproval> {
+    if let Some(registry) = registry {
+        match registry.lock().recover_poison().finish(
+            parent_id,
+            child_id,
+            child_attempt,
+            request_id,
+            delivered,
+            reason,
+        ) {
+            Ok(record) => return record,
+            Err(error) => {
+                tracing::error!("failed to persist child approval resolution: {error}");
+            }
+        }
+    }
+    None
+}
+
+fn record_event(record: DurableApproval) -> AgentEvent {
+    AgentEvent::ChildApprovalChanged {
+        parent_session_id: record.parent_session_id,
+        child_session_id: record.child_session_id,
+        child_attempt: record.child_attempt,
+        request_id: record.request_id,
+        version: record.version,
+        status: match record.state {
+            ApprovalState::Pending => "pending",
+            ApprovalState::DecisionRecorded => "decision_recorded",
+            ApprovalState::Delivered if record.approved == Some(true) => "approved",
+            ApprovalState::Delivered => "denied",
+            ApprovalState::DeliveryFailed => "delivery_failed",
+            ApprovalState::Expired => "expired",
+        }
+        .to_string(),
+        reason: record.reason,
+        tool_name: record.tool_name,
+        permission: record.permission,
+        resource: record.resource,
+        created_at: record.created_at,
+        resolved_at: Some(record.updated_at),
+    }
 }
 
 /// Unregisters the child on drop, so a panicking/returning runner can't leak
 /// a stale sender.
 pub struct LiveActorGuard {
+    scope_id: ScopeId,
     child_id: String,
+    child_attempt: u32,
+    approval_registry: Option<SharedApprovalRegistry>,
 }
 
 impl Drop for LiveActorGuard {
     fn drop(&mut self) {
-        map().lock().recover_poison().remove(&self.child_id);
+        map().lock().recover_poison().remove(&(
+            self.scope_id,
+            self.child_id.clone(),
+            self.child_attempt,
+        ));
         // A disconnecting child can't answer any still-pending approval — drop
         // them so a late external POST finds nothing pending and is rejected.
-        clear_pending_approvals_for(&self.child_id);
+        clear_pending_approvals_for(
+            self.approval_registry.as_ref(),
+            &self.child_id,
+            self.child_attempt,
+        );
     }
 }
 
 /// Register a live child's frame sender for the duration of its run.
-pub fn register(child_id: &str, tx: mpsc::UnboundedSender<ParentFrame>) -> LiveActorGuard {
+pub fn register(
+    child_id: &str,
+    tx: mpsc::UnboundedSender<ParentFrame>,
+    child_attempt: u32,
+    approval_registry: Option<SharedApprovalRegistry>,
+) -> LiveActorGuard {
+    let scope_id = scope_id(approval_registry.as_ref());
     map()
         .lock()
         .recover_poison()
-        .insert(child_id.to_string(), tx);
+        .insert((scope_id, child_id.to_string(), child_attempt), tx);
     LiveActorGuard {
+        scope_id,
         child_id: child_id.to_string(),
+        child_attempt,
+        approval_registry,
     }
+}
+
+fn find_unique_pending(
+    registry: Option<&SharedApprovalRegistry>,
+    child_id: &str,
+    request_id: &str,
+) -> Option<(PendingKey, PendingApproval)> {
+    let guard = pending().lock().recover_poison();
+    let scope = scope_id(registry);
+    let mut matches = guard
+        .iter()
+        .filter(|(key, _)| key.0 == scope && key.2 == child_id && key.4 == request_id);
+    let (key, record) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((key.clone(), record.clone()))
+}
+
+fn remove_unique_pending(
+    registry: Option<&SharedApprovalRegistry>,
+    child_id: &str,
+    request_id: &str,
+) -> Option<PendingApproval> {
+    let mut guard = pending().lock().recover_poison();
+    let scope = scope_id(registry);
+    let mut keys = guard
+        .keys()
+        .filter(|(key_scope, _, child, _, request)| {
+            *key_scope == scope && child == child_id && request == request_id
+        })
+        .cloned();
+    let key = keys.next()?;
+    if keys.next().is_some() {
+        return None;
+    }
+    guard.remove(&key)
 }
 
 /// Deliver an in-band steering message to a live child. Returns `false` when
 /// the child is not live (caller should use the durable queue instead).
 pub fn deliver_message(child_id: &str, text: &str) -> bool {
     let guard = map().lock().recover_poison();
-    match guard.get(child_id) {
-        Some(tx) => tx
-            .send(ParentFrame::Message {
-                text: text.to_string(),
-            })
-            .is_ok(),
-        None => false,
+    let mut senders = guard
+        .iter()
+        .filter(|((_, child, _), _)| child == child_id)
+        .map(|(_, sender)| sender);
+    let Some(tx) = senders.next() else {
+        return false;
+    };
+    if senders.next().is_some() {
+        return false;
     }
+    tx.send(ParentFrame::Message {
+        text: text.to_string(),
+    })
+    .is_ok()
 }
 
 /// Deliver a host/human approval decision to a live child's pending gated-tool
@@ -259,8 +515,18 @@ pub fn deliver_message(child_id: &str, text: &str) -> bool {
 /// `false` when the child is not live (no connection to answer on — the caller
 /// should treat that as a denied/expired request).
 pub fn deliver_approval(child_id: &str, request_id: &str, approved: bool) -> bool {
+    deliver_approval_scoped(None, child_id, 0, request_id, approved)
+}
+
+pub fn deliver_approval_scoped(
+    registry: Option<&SharedApprovalRegistry>,
+    child_id: &str,
+    child_attempt: u32,
+    request_id: &str,
+    approved: bool,
+) -> bool {
     let guard = map().lock().recover_poison();
-    match guard.get(child_id) {
+    match guard.get(&(scope_id(registry), child_id.to_string(), child_attempt)) {
         Some(tx) => tx
             .send(ParentFrame::ApprovalReply {
                 id: request_id.to_string(),
@@ -273,17 +539,28 @@ pub fn deliver_approval(child_id: &str, request_id: &str, approved: bool) -> boo
 
 /// Whether a child currently has a live actor connection.
 pub fn is_live(child_id: &str) -> bool {
-    map().lock().recover_poison().contains_key(child_id)
+    map()
+        .lock()
+        .recover_poison()
+        .keys()
+        .any(|(_, child, _)| child == child_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn registry() -> SharedApprovalRegistry {
+        std::sync::Arc::new(Mutex::new(
+            ApprovalRegistry::open(tempfile::tempdir().unwrap().keep().join("registry.json"))
+                .unwrap(),
+        ))
+    }
+
     #[test]
     fn register_deliver_unregister() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let guard = register("c-live", tx);
+        let guard = register("c-live", tx, 0, None);
         assert!(is_live("c-live"));
         assert!(deliver_message("c-live", "hi"));
         match rx.try_recv() {
@@ -299,7 +576,7 @@ mod tests {
     #[test]
     fn deliver_fails_when_receiver_dropped() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let _guard = register("c-dead", tx);
+        let _guard = register("c-dead", tx, 0, None);
         drop(rx);
         assert!(!deliver_message("c-dead", "hi"));
     }
@@ -307,7 +584,7 @@ mod tests {
     #[test]
     fn deliver_approval_routes_reply_frame() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let guard = register("c-appr", tx);
+        let guard = register("c-appr", tx, 0, None);
         assert!(deliver_approval("c-appr", "req-7", true));
         match rx.try_recv() {
             Ok(ParentFrame::ApprovalReply { id, approved }) => {
@@ -319,6 +596,45 @@ mod tests {
         drop(guard);
         // Not-live child ⇒ false (no connection to answer on).
         assert!(!deliver_approval("c-appr", "req-8", false));
+    }
+
+    #[test]
+    fn app_scopes_and_attempt_guards_do_not_cross_talk() {
+        let first_registry = registry();
+        let second_registry = registry();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (retry_tx, mut retry_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let old_guard = register("shared-child", first_tx, 1, Some(first_registry.clone()));
+        let retry_guard = register("shared-child", retry_tx, 2, Some(first_registry.clone()));
+        let second_guard = register("shared-child", second_tx, 1, Some(second_registry.clone()));
+
+        drop(old_guard);
+        assert!(deliver_approval_scoped(
+            Some(&first_registry),
+            "shared-child",
+            2,
+            "retry-request",
+            true,
+        ));
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Ok(ParentFrame::ApprovalReply { id, .. }) if id == "retry-request"
+        ));
+        assert!(deliver_approval_scoped(
+            Some(&second_registry),
+            "shared-child",
+            1,
+            "other-app-request",
+            false,
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(ParentFrame::ApprovalReply { id, .. }) if id == "other-app-request"
+        ));
+        assert!(first_rx.try_recv().is_err());
+        drop(retry_guard);
+        drop(second_guard);
     }
 
     #[test]
@@ -343,15 +659,20 @@ mod tests {
     #[test]
     fn deliver_approval_checked_only_delivers_for_registered_pair() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _guard = register("c-checked", tx);
+        let _guard = register("c-checked", tx, 0, None);
 
         // Not registered ⇒ rejected, nothing on the wire.
-        assert!(!deliver_approval_checked("c-checked", "req-stray", true));
+        assert!(!deliver_approval_checked(
+            None,
+            "c-checked",
+            "req-stray",
+            true
+        ));
         assert!(rx.try_recv().is_err());
 
         // Registered ⇒ delivered, frame rides the wire, and consumed.
         register_pending_approval("c-checked", "req-ok");
-        assert!(deliver_approval_checked("c-checked", "req-ok", true));
+        assert!(deliver_approval_checked(None, "c-checked", "req-ok", true));
         match rx.try_recv() {
             Ok(ParentFrame::ApprovalReply { id, approved }) => {
                 assert_eq!(id, "req-ok");
@@ -360,7 +681,7 @@ mod tests {
             other => panic!("expected approval reply, got {other:?}"),
         }
         // One-shot: a replay is rejected (and nothing further on the wire).
-        assert!(!deliver_approval_checked("c-checked", "req-ok", true));
+        assert!(!deliver_approval_checked(None, "c-checked", "req-ok", true));
         assert!(rx.try_recv().is_err());
     }
 
@@ -368,7 +689,7 @@ mod tests {
     fn clear_pending_approvals_for_drops_them() {
         register_pending_approval("c-clear", "req-a");
         register_pending_approval("c-clear", "req-b");
-        clear_pending_approvals_for("c-clear");
+        clear_pending_approvals_for(None, "c-clear", 0);
         assert!(!take_pending_approval("c-clear", "req-a"));
         assert!(!take_pending_approval("c-clear", "req-b"));
     }
@@ -376,11 +697,13 @@ mod tests {
     #[tokio::test]
     async fn observed_approval_emits_exactly_one_terminal_outcome() {
         let (wire_tx, _wire_rx) = mpsc::unbounded_channel();
-        let _guard = register("c-audit", wire_tx);
+        let _guard = register("c-audit", wire_tx, 0, None);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         register_pending_approval_observed(
+            None,
             "parent-audit",
             "c-audit",
+            0,
             "req-audit",
             "Bash",
             "execute",
@@ -388,8 +711,18 @@ mod tests {
             event_tx,
         );
 
-        assert!(deliver_approval_checked("c-audit", "req-audit", false));
-        assert!(!deliver_approval_checked("c-audit", "req-audit", true));
+        assert!(deliver_approval_checked(
+            None,
+            "c-audit",
+            "req-audit",
+            false
+        ));
+        assert!(!deliver_approval_checked(
+            None,
+            "c-audit",
+            "req-audit",
+            true
+        ));
         assert!(matches!(
             event_rx.recv().await,
             Some(AgentEvent::ChildApprovalChanged { status, .. }) if status == "denied"
@@ -398,34 +731,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_resolution_uses_registry_version_and_attempt() {
+        let registry = registry();
+        let (wire_tx, _wire_rx) = mpsc::unbounded_channel();
+        let _guard = register("c-versioned", wire_tx, 7, Some(registry.clone()));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (pending_version, _) = register_pending_approval_observed(
+            Some(&registry),
+            "parent-versioned",
+            "c-versioned",
+            7,
+            "req-versioned",
+            "Bash",
+            "execute",
+            "/tmp/versioned",
+            event_tx,
+        );
+
+        assert!(deliver_approval_checked(
+            Some(&registry),
+            "c-versioned",
+            "req-versioned",
+            true,
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ChildApprovalChanged {
+                child_attempt: 7,
+                version,
+                status,
+                ..
+            }) if version == pending_version + 2 && status == "approved"
+        ));
+    }
+
+    #[tokio::test]
     async fn timeout_and_disconnect_emit_terminal_outcomes() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         register_pending_approval_observed(
+            None,
             "parent-audit",
             "c-expire",
+            0,
             "req-expire",
             "Bash",
             "execute",
             "/tmp/x",
             event_tx.clone(),
         );
-        assert!(expire_pending_approval("c-expire", "req-expire"));
-        assert!(!expire_pending_approval("c-expire", "req-expire"));
+        assert!(expire_pending_approval(None, "c-expire", "req-expire"));
+        assert!(!expire_pending_approval(None, "c-expire", "req-expire"));
         assert!(matches!(
             event_rx.recv().await,
             Some(AgentEvent::ChildApprovalChanged { status, .. }) if status == "expired"
         ));
 
         register_pending_approval_observed(
+            None,
             "parent-audit",
             "c-disconnect",
+            0,
             "req-disconnect",
             "Write",
             "write",
             "/tmp/y",
             event_tx,
         );
-        clear_pending_approvals_for("c-disconnect");
+        clear_pending_approvals_for(None, "c-disconnect", 0);
         assert!(matches!(
             event_rx.recv().await,
             Some(AgentEvent::ChildApprovalChanged { status, .. }) if status == "delivery_failed"

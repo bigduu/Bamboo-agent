@@ -44,6 +44,7 @@ mod tests {
         let event = AgentEvent::ChildApprovalChanged {
             parent_session_id: "parent-1".into(),
             child_session_id: "child-1".into(),
+            child_attempt: 1,
             request_id: "req-1".into(),
             version: 2,
             status: "approved".into(),

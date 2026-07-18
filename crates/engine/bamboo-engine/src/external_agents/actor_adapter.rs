@@ -110,6 +110,7 @@ enum PlacementKind {
 
 /// Spawns and drives a child session as an independent actor: a `bamboo-subagent` worker process.
 pub struct ActorChildRunner {
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
     agent_id: String,
     worker_bin: PathBuf,
     worker_args: Vec<String>,
@@ -261,6 +262,7 @@ impl ActorChildRunner {
         max_concurrent: usize,
     ) -> Self {
         Self {
+            approval_registry: None,
             agent_id,
             worker_bin,
             worker_args,
@@ -278,6 +280,14 @@ impl ActorChildRunner {
             schedulable_placements: HashMap::new(),
             schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_approval_registry(
+        mut self,
+        registry: super::approval_registry::SharedApprovalRegistry,
+    ) -> Self {
+        self.approval_registry = Some(registry);
+        self
     }
 
     /// Run children over the mailbox bus (the unified actor+mailbox transport).
@@ -890,12 +900,19 @@ impl ExternalChildRunner for ActorChildRunner {
             // steer this child in-band over the existing WS connection. The guard
             // unregisters on every exit path.
             let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
-            let live_guard = super::live::register(&job.child_session_id, live_tx);
+            let live_guard = super::live::register(
+                &job.child_session_id,
+                live_tx,
+                attempt as u32,
+                self.approval_registry.clone(),
+            );
 
             let result = drive(
                 &mut *client,
                 &job.parent_session_id,
                 &job.child_session_id,
+                attempt as u32,
+                self.approval_registry.as_ref(),
                 self.approval_decider.as_ref(),
                 escalation.clone(),
                 &event_tx,
@@ -1028,6 +1045,8 @@ async fn drive(
     client: &mut dyn bamboo_subagent::ChildLink,
     parent_session_id: &str,
     child_session_id: &str,
+    child_attempt: u32,
+    approval_registry: Option<&super::approval_registry::SharedApprovalRegistry>,
     approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
     escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -1095,6 +1114,7 @@ async fn drive(
                             let child = child_session_id.to_string();
                             let req_id = id.clone();
                             let body = body.clone();
+                            let registry = approval_registry.cloned();
                             tokio::spawn(async move {
                                 let approved = tokio::time::timeout(
                                     CHILD_APPROVAL_TIMEOUT,
@@ -1102,7 +1122,13 @@ async fn drive(
                                 )
                                 .await
                                 .unwrap_or(false);
-                                super::live::deliver_approval(&child, &req_id, approved);
+                                super::live::deliver_approval_scoped(
+                                    registry.as_ref(),
+                                    &child,
+                                    child_attempt,
+                                    &req_id,
+                                    approved,
+                                );
                             });
                         } else if approval_decider.is_some() {
                             // A decider is wired (policy / auto): decide promptly
@@ -1129,6 +1155,7 @@ async fn drive(
                             let child = child_session_id.to_string();
                             let req_id = id.clone();
                             let body = body.clone();
+                            let registry = approval_registry.cloned();
                             tokio::spawn(async move {
                                 let approved = match tokio::time::timeout(
                                     CHILD_APPROVAL_TIMEOUT,
@@ -1143,7 +1170,13 @@ async fn drive(
                                     // Transport error or timeout ⇒ fail closed.
                                     _ => false,
                                 };
-                                super::live::deliver_approval(&child, &req_id, approved);
+                                super::live::deliver_approval_scoped(
+                                    registry.as_ref(),
+                                    &child,
+                                    child_attempt,
+                                    &req_id,
+                                    approved,
+                                );
                             });
                         } else {
                             // Top orchestrator (no escalation bridge): human-in-the-
@@ -1161,17 +1194,46 @@ async fn drive(
                             // human-loop request (and consume it one-shot).
                             let (approval_version, approval_created_at) =
                                 super::live::register_pending_approval_observed(
+                                approval_registry,
                                 parent_session_id,
                                 child_session_id,
+                                child_attempt,
                                 &id,
                                 &tool_name,
                                 &permission,
                                 &resource,
                                 event_tx.clone(),
                             );
+                            if approval_version == 0 {
+                                super::live::deliver_approval_scoped(
+                                    approval_registry,
+                                    child_session_id,
+                                    child_attempt,
+                                    &id,
+                                    false,
+                                );
+                                let _ = event_tx
+                                    .send(AgentEvent::ChildApprovalChanged {
+                                        parent_session_id: parent_session_id.to_string(),
+                                        child_session_id: child_session_id.to_string(),
+                                        child_attempt,
+                                        request_id: id,
+                                        version: 1,
+                                        status: "delivery_failed".to_string(),
+                                        reason: Some("persistence_failed".to_string()),
+                                        tool_name,
+                                        permission,
+                                        resource,
+                                        created_at: approval_created_at,
+                                        resolved_at: Some(chrono::Utc::now().to_rfc3339()),
+                                    })
+                                    .await;
+                                continue;
+                            }
                             let _ = event_tx.send(AgentEvent::ChildApprovalChanged {
                                 parent_session_id: parent_session_id.to_string(),
                                 child_session_id: child_session_id.to_string(),
+                                child_attempt,
                                 request_id: id.clone(),
                                 version: approval_version,
                                 status: "pending".to_string(),
@@ -1192,14 +1254,21 @@ async fn drive(
                                 })
                                 .await;
                             let child = child_session_id.to_string();
+                            let approval_registry = approval_registry.cloned();
                             tokio::spawn(async move {
                                 tokio::time::sleep(CHILD_APPROVAL_TIMEOUT).await;
                                 // Deny only if still pending: a one-shot consume so
                                 // we don't double-deliver if the human already
                                 // answered (the POST took it), and so a late POST
                                 // after this fires finds nothing pending.
-                                if super::live::expire_pending_approval(&child, &id) {
-                                    super::live::deliver_approval(&child, &id, false);
+                                if super::live::expire_pending_approval(approval_registry.as_ref(), &child, &id) {
+                                    super::live::deliver_approval_scoped(
+                                        approval_registry.as_ref(),
+                                        &child,
+                                        child_attempt,
+                                        &id,
+                                        false,
+                                    );
                                 }
                             });
                         }
@@ -1474,6 +1543,8 @@ mod tests {
             &mut link,
             "parent-x",
             "child-x",
+            0,
+            None,
             None,
             None,
             &event_tx,
@@ -1500,6 +1571,8 @@ mod tests {
             &mut link,
             "parent-y",
             "child-y",
+            0,
+            None,
             None,
             None,
             &event_tx,
