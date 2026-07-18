@@ -1,5 +1,6 @@
 use super::terminal::{
-    session_has_terminal_evidence, session_prevents_terminal_event, terminal_event_for_status,
+    session_has_terminal_evidence, session_prevents_terminal_event, terminal_event_for_sources,
+    terminal_event_for_status,
 };
 use crate::app_state::AgentStatus;
 use bamboo_agent_core::{AgentEvent, Message, Session};
@@ -39,6 +40,32 @@ fn terminal_event_for_non_error_status_defaults_to_complete() {
         }
         other => panic!("expected complete event, got {other:?}"),
     }
+}
+
+#[test]
+fn persisted_cancelled_status_replays_cancelled_after_runner_is_gone() {
+    let mut session = Session::new("cancelled", "test-model");
+    let mut runtime = AgentRuntimeState::new("run-cancelled");
+    runtime.status = AgentStatusState::Cancelled;
+    session.agent_runtime_state = Some(runtime);
+
+    assert!(matches!(
+        terminal_event_for_sources(Some(&session), None),
+        AgentEvent::Cancelled { .. }
+    ));
+}
+
+#[test]
+fn persisted_failed_status_replays_error_after_runner_is_gone() {
+    let mut session = Session::new("failed", "test-model");
+    let mut runtime = AgentRuntimeState::new("run-failed");
+    runtime.status = AgentStatusState::Failed;
+    session.agent_runtime_state = Some(runtime);
+
+    assert!(matches!(
+        terminal_event_for_sources(Some(&session), None),
+        AgentEvent::Error { .. }
+    ));
 }
 
 #[test]

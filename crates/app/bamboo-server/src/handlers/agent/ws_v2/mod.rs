@@ -732,11 +732,20 @@ async fn subscribe(
                     )
                     .await
                 {
+                    // Storage and descendant checks above are asynchronous. A
+                    // new runner can be reserved while they run, before it has
+                    // emitted its first broadcast event. Re-read the runner so
+                    // that Pending/Running wins over the stale terminal
+                    // snapshot even while the receiver is still empty.
+                    let current_runner_status = {
+                        let runners = state.agent_runners.read().await;
+                        runners.get(&sid).map(|runner| runner.status.clone())
+                    };
                     // We subscribed before the async storage/child checks. If a
                     // live event arrived meanwhile, preserve its ordering by
                     // handing the still-buffered receiver to the live forwarder
                     // instead of sending a synthetic terminal ahead of it.
-                    if can_attempt_terminal_replay(runner_status.as_ref(), &receiver) {
+                    if can_attempt_terminal_replay(current_runner_status.as_ref(), &receiver) {
                         return finish_subscribe(
                             forwarders,
                             queues,
@@ -776,7 +785,12 @@ fn can_attempt_terminal_replay(
     runner_status: Option<&crate::app_state::AgentStatus>,
     receiver: &tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
 ) -> bool {
-    !matches!(runner_status, Some(crate::app_state::AgentStatus::Running)) && receiver.is_empty()
+    matches!(
+        runner_status,
+        None | Some(crate::app_state::AgentStatus::Completed)
+            | Some(crate::app_state::AgentStatus::Cancelled)
+            | Some(crate::app_state::AgentStatus::Error(_))
+    ) && receiver.is_empty()
 }
 
 fn finish_subscribe(
@@ -1105,5 +1119,18 @@ mod tests {
             !can_attempt_terminal_replay(None, &rx),
             "a queued live frame must win the race with synthetic terminal replay"
         );
+    }
+
+    #[test]
+    fn pending_or_running_runner_blocks_synthetic_terminal_replay() {
+        let (_tx, rx) = tokio::sync::broadcast::channel(4);
+        assert!(!can_attempt_terminal_replay(
+            Some(&crate::app_state::AgentStatus::Pending),
+            &rx,
+        ));
+        assert!(!can_attempt_terminal_replay(
+            Some(&crate::app_state::AgentStatus::Running),
+            &rx,
+        ));
     }
 }

@@ -45,6 +45,20 @@ pub(crate) async fn terminal_event_if_ready(
         );
     }
 
+    // `Pending` is the reservation window immediately before a runner becomes
+    // `Running`. Treat it as live just like `Running`: a reconnect in this gap
+    // must wait for the new run instead of closing on the previous history.
+    if matches!(
+        runner_status,
+        Some(AgentStatus::Pending | AgentStatus::Running)
+    ) {
+        tracing::debug!(
+            "[{}] terminal_event_if_ready -> None (runner is pending/running) -> LIVE stream",
+            session_id,
+        );
+        return None;
+    }
+
     // Absence of an in-memory runner is not itself proof that a run finished:
     // a newly-created session is persisted before its runner is reserved. In
     // that window a subscriber must stay live for the first token instead of
@@ -76,7 +90,7 @@ pub(crate) async fn terminal_event_if_ready(
         "[{}] terminal_event_if_ready -> Some(terminal): no pending user message, not suspended, no running child",
         session_id,
     );
-    Some(terminal_event_for_status(runner_status))
+    Some(terminal_event_for_sources(session.as_ref(), runner_status))
 }
 
 pub(super) fn session_has_terminal_evidence(
@@ -117,6 +131,30 @@ pub(super) fn terminal_event_for_status(runner_status: Option<AgentStatus>) -> A
                 total_tokens: 0,
             },
         },
+    }
+}
+
+pub(super) fn terminal_event_for_sources(
+    session: Option<&Session>,
+    runner_status: Option<AgentStatus>,
+) -> AgentEvent {
+    if runner_status.is_some() {
+        return terminal_event_for_status(runner_status);
+    }
+
+    match session
+        .and_then(|session| session.agent_runtime_state.as_ref())
+        .map(|runtime| runtime.status)
+    {
+        Some(AgentStatusState::Cancelled) => {
+            terminal_event_for_status(Some(AgentStatus::Cancelled))
+        }
+        Some(AgentStatusState::Failed) => AgentEvent::Error {
+            // The durable runtime state records the failure class but does not
+            // currently persist the runner's error string.
+            message: "Agent execution failed".to_string(),
+        },
+        _ => terminal_event_for_status(None),
     }
 }
 
