@@ -12,7 +12,9 @@ pub use handlers::{
 // load/save/rename-on-collision logic the HTTP handlers use for prompt
 // presets, without a second implementation that could drift (see
 // PLUGIN_PLAN.md § Installer-core agent).
-pub(crate) use storage::{ensure_unique_preset_id, load_store, save_store, store_file_path};
+pub(crate) use storage::{
+    ensure_unique_preset_id, load_store, load_stored_presets, save_store, store_file_path,
+};
 pub(crate) use types::StoredPromptPreset;
 
 #[cfg(test)]
