@@ -761,13 +761,13 @@ mod tests {
         )
         .unwrap();
 
-        let raw = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        let raw = std::fs::read_to_string(data_dir.join("providers.json")).unwrap();
         assert!(
             !raw.contains("sk-ant-setupcli-secret"),
             "plaintext api_key must never reach disk"
         );
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(root["providers"]["anthropic"]["api_key_encrypted"]
+        assert!(root["anthropic"]["api_key_encrypted"]
             .as_str()
             .is_some_and(|s| !s.is_empty()));
 
@@ -779,11 +779,11 @@ mod tests {
             false,
         )
         .unwrap();
-        let raw = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        let raw = std::fs::read_to_string(data_dir.join("providers.json")).unwrap();
         assert!(!raw.contains("sk-ant-setupcli-secret"));
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(root["providers"]["anthropic"]["model"], "claude-x");
-        assert!(root["providers"]["anthropic"]["api_key_encrypted"]
+        assert_eq!(root["anthropic"]["model"], "claude-x");
+        assert!(root["anthropic"]["api_key_encrypted"]
             .as_str()
             .is_some_and(|s| !s.is_empty()));
 

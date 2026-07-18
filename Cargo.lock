@@ -1037,10 +1037,12 @@ version = "0.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "async-trait",
  "bamboo-domain",
  "base64",
  "chrono",
  "dirs",
+ "futures",
  "hex",
  "rand 0.10.2",
  "regex",

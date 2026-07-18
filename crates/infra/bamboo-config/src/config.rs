@@ -6,10 +6,13 @@
 //!
 //! # Configuration File
 //!
-//! Configuration is stored in `config.json` under the unified data directory
-//! (defaults to `${HOME}/.bamboo/`). Environment variables can override file values.
+//! Root configuration is stored in `config.json` under the unified data
+//! directory (defaults to `${HOME}/.bamboo/`). Memory, sub-agent, and legacy
+//! provider settings are independently persisted in `memory.json`,
+//! `subagents.json`, and `providers.json`. Environment variables can override
+//! file values.
 //!
-//! # Example (JSON)
+//! # Example `config.json`
 //!
 //! ```json
 //! {
@@ -17,16 +20,17 @@
 //!   "server": {
 //!     "port": 9562,
 //!     "bind": "127.0.0.1"
-//!   },
-//!   "providers": {
-//!     "anthropic": {
-//!       "api_key": "sk-ant-...",
-//!       "model": "claude-3-5-sonnet-20241022"
-//!     },
-//!     "openai": {
-//!       "api_key": "sk-...",
-//!       "base_url": "https://api.openai.com/v1"
-//!     }
+//!   }
+//! }
+//! ```
+//!
+//! # Example `providers.json`
+//!
+//! ```json
+//! {
+//!   "anthropic": {
+//!     "api_key_encrypted": "...",
+//!     "model": "claude-3-5-sonnet-20241022"
 //!   }
 //! }
 //! ```
@@ -36,8 +40,9 @@
 //! Configuration values are loaded in this order (later overrides earlier):
 //! 1. Code defaults (hardcoded default values)
 //! 2. Config file values (from `${HOME}/.bamboo/config.json`)
-//! 3. Environment variables (e.g., `BAMBOO_PORT`)
-//! 4. CLI arguments (e.g., `--port 9000`)
+//! 3. Independent sidecars (`memory.json`, `subagents.json`, `providers.json`)
+//! 4. Environment variables (e.g., `BAMBOO_PORT`)
+//! 5. CLI arguments (e.g., `--port 9000`)
 //!
 //! # Environment Variables
 //!
@@ -49,7 +54,7 @@
 //! - `BAMBOO_OPENAI_API_KEY` / `BAMBOO_ANTHROPIC_API_KEY` / `BAMBOO_GEMINI_API_KEY`:
 //!   Supply a provider's API key from the environment (in-memory only, never
 //!   persisted) — for 12-factor / secret-manager / CI deploys without a
-//!   plaintext key in config.json.
+//!   plaintext key in `providers.json`.
 
 use anyhow::{Context, Result};
 use bamboo_domain::poison::PoisonRecover;
@@ -2228,6 +2233,36 @@ impl Config {
             Self::create_default()
         };
 
+        // Phase-1 registrar migration: an existing sidecar is authoritative;
+        // when absent, retain the legacy inline value loaded from config.json.
+        // A malformed sidecar is never rewritten during load and the inline
+        // value remains available, preventing a bad independent edit from
+        // erasing the user's last usable configuration.
+        let mut memory_module = crate::MemoryConfigModule(config.memory.clone());
+        match memory_module.load_sync(&data_dir) {
+            Ok(true) => config.memory = memory_module.0,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                "Failed to load memory.json; using legacy config.json memory: {error}"
+            ),
+        }
+        let mut subagents_module = crate::SubagentsConfigModule(config.subagents.clone());
+        match subagents_module.load_sync(&data_dir) {
+            Ok(true) => config.subagents = subagents_module.0,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                "Failed to load subagents.json; using legacy config.json subagents: {error}"
+            ),
+        }
+        let mut providers_module = crate::ProviderConfigsModule(config.providers.clone());
+        match providers_module.load_sync(&data_dir) {
+            Ok(true) => config.providers = providers_module.0,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                "Failed to load providers.json; using legacy config.json providers: {error}"
+            ),
+        }
+
         // Decrypt encrypted proxy auth into in-memory plaintext form.
         config.hydrate_proxy_auth_from_encrypted();
         // Decrypt encrypted provider API keys into in-memory plaintext form.
@@ -3054,6 +3089,24 @@ impl Config {
         self.save_to_dir(default_data_dir())
     }
 
+    /// Persist only the memory module, leaving every other config file untouched.
+    pub fn save_memory_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        crate::MemoryConfigModule(self.memory.clone()).save_sync(data_dir)
+    }
+
+    /// Persist only the sub-agent module, leaving every other config file untouched.
+    pub fn save_subagents_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        crate::SubagentsConfigModule(self.subagents.clone()).save_sync(data_dir)
+    }
+
+    /// Persist only provider configuration. Provider plaintext keys are first
+    /// refreshed into their encrypted at-rest representation.
+    pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        let mut config = self.clone();
+        config.refresh_provider_api_keys_encrypted()?;
+        crate::ProviderConfigsModule(config.providers).save_sync(data_dir)
+    }
+
     /// The pending config-corruption recovery, if `config.json` failed to
     /// parse on load and the recovery hasn't been confirmed yet. `None` on
     /// every clean load. #153.
@@ -3114,7 +3167,8 @@ impl Config {
 
     /// Save configuration to disk under the provided data directory.
     ///
-    /// Configuration is always stored as `{data_dir}/config.json`.
+    /// Root configuration is stored as `{data_dir}/config.json`; extracted
+    /// memory, sub-agent, and provider modules are stored in sibling sidecars.
     ///
     /// Refuses to write when this config carries an unconfirmed
     /// [`ConfigRecoveryStatus`] (#153) — i.e. it was recovered from a corrupt
@@ -3167,9 +3221,22 @@ impl Config {
             serde_json::to_value(&to_save).context("Failed to serialize config to JSON")?;
         if let Some(obj) = config_value.as_object_mut() {
             obj.remove("connect");
+            obj.remove("memory");
+            obj.remove("subagents");
+            obj.remove("providers");
         }
         let content = serde_json::to_string_pretty(&config_value)
             .context("Failed to serialize config to JSON")?;
+
+        // Persist extracted modules before stripping their legacy inline
+        // representation from config.json. If the process crashes or the root
+        // rewrite fails during the first migration, the next load can still use
+        // either the new sidecars or the untouched inline values. Do this before
+        // rotating root backups so a sidecar error cannot consume backup history
+        // for a root document that was never rewritten.
+        crate::MemoryConfigModule(to_save.memory.clone()).save_sync(&data_dir)?;
+        crate::SubagentsConfigModule(to_save.subagents.clone()).save_sync(&data_dir)?;
+        crate::ProviderConfigsModule(to_save.providers.clone()).save_sync(&data_dir)?;
 
         // Back up the current on-disk config (last-known-good) before overwriting,
         // so corruption (a bad/partial write, external edit, disk issue) stays
@@ -3539,7 +3606,7 @@ fn rotate_backups(config_path: &std::path::Path, generations: usize) {
     }
 }
 
-fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return std::fs::write(path, content);
     };
@@ -6366,15 +6433,15 @@ mod tests {
             .save_to_dir(temp_home.path.clone())
             .expect("save should encrypt provider api keys");
 
-        let content =
-            std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
+        let content = std::fs::read_to_string(temp_home.path.join("providers.json"))
+            .expect("read providers.json");
         assert!(
             content.contains("\"api_key_encrypted\""),
-            "config.json should store encrypted provider keys"
+            "providers.json should store encrypted provider keys"
         );
         assert!(
             !content.contains("\"api_key\""),
-            "config.json should not store plaintext provider keys"
+            "providers.json should not store plaintext provider keys"
         );
 
         let loaded = Config::from_data_dir(Some(temp_home.path.clone()));

@@ -339,37 +339,6 @@ pub(super) async fn poll_completed_gold_evaluation(state: &mut LoopRunState) {
     }
 }
 
-pub(super) async fn drain_in_flight_gold_evaluation(state: &mut LoopRunState) {
-    if state.gold_evaluation.completed.is_some() {
-        return;
-    }
-
-    let Some(in_flight) = state.gold_evaluation.in_flight.take() else {
-        return;
-    };
-
-    match in_flight.join_handle.await {
-        Ok(Some(result)) => {
-            state.gold_evaluation.completed = Some(result);
-        }
-        Ok(None) => {
-            tracing::debug!(
-                "[{}] Async Gold evaluation cancelled while draining round {}",
-                state.session_id,
-                in_flight.request.round_number
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                "[{}] Async Gold evaluation join failed while draining round {}: {}",
-                state.session_id,
-                in_flight.request.round_number,
-                error
-            );
-        }
-    }
-}
-
 pub(super) async fn apply_completed_gold_evaluation(
     session: &mut Session,
     config: &AgentLoopConfig,

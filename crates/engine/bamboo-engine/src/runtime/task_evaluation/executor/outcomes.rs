@@ -12,6 +12,7 @@ pub(super) async fn build_success_result(
     event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
     prompt_tokens: u64,
+    generation: u64,
 ) -> TaskEvaluationResult {
     tracing::info!(
         "[{}] Task evaluation completed: {} tokens, {} tool calls",
@@ -39,6 +40,7 @@ pub(super) async fn build_success_result(
             session_id: session_id.to_string(),
             updates_count: updates.len(),
             reasoning: reasoning.clone(),
+            generation: Some(generation),
         })
         .await;
 

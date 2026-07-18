@@ -894,6 +894,7 @@ impl ExternalChildRunner for ActorChildRunner {
 
             let result = drive(
                 &mut *client,
+                &job.parent_session_id,
                 &job.child_session_id,
                 self.approval_decider.as_ref(),
                 escalation.clone(),
@@ -1025,6 +1026,7 @@ fn host_of_endpoint(endpoint: &str) -> String {
 /// the correct (then-current) parent bridge rather than a stale/overwritten one.
 async fn drive(
     client: &mut dyn bamboo_subagent::ChildLink,
+    parent_session_id: &str,
     child_session_id: &str,
     approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
     escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,
@@ -1157,7 +1159,29 @@ async fn drive(
                             // the external handler's `deliver_approval_checked` can
                             // correlate an out-of-band POST against a genuine
                             // human-loop request (and consume it one-shot).
-                            super::live::register_pending_approval(child_session_id, &id);
+                            let (approval_version, approval_created_at) =
+                                super::live::register_pending_approval_observed(
+                                parent_session_id,
+                                child_session_id,
+                                &id,
+                                &tool_name,
+                                &permission,
+                                &resource,
+                                event_tx.clone(),
+                            );
+                            let _ = event_tx.send(AgentEvent::ChildApprovalChanged {
+                                parent_session_id: parent_session_id.to_string(),
+                                child_session_id: child_session_id.to_string(),
+                                request_id: id.clone(),
+                                version: approval_version,
+                                status: "pending".to_string(),
+                                reason: None,
+                                tool_name: tool_name.clone(),
+                                permission: permission.clone(),
+                                resource: resource.clone(),
+                                created_at: approval_created_at,
+                                resolved_at: None,
+                            }).await;
                             let _ = event_tx
                                 .send(AgentEvent::ChildApprovalRequested {
                                     child_session_id: child_session_id.to_string(),
@@ -1174,7 +1198,7 @@ async fn drive(
                                 // we don't double-deliver if the human already
                                 // answered (the POST took it), and so a late POST
                                 // after this fires finds nothing pending.
-                                if super::live::take_pending_approval(&child, &id) {
+                                if super::live::expire_pending_approval(&child, &id) {
                                     super::live::deliver_approval(&child, &id, false);
                                 }
                             });
@@ -1448,6 +1472,7 @@ mod tests {
         let mut link = SilentLink;
         let r = drive(
             &mut link,
+            "parent-x",
             "child-x",
             None,
             None,
@@ -1473,6 +1498,7 @@ mod tests {
         // disarms the watchdog.
         let r = drive(
             &mut link,
+            "parent-y",
             "child-y",
             None,
             None,

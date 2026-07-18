@@ -644,13 +644,13 @@ mod tests {
             Some(serde_json::from_value(json!({"api_key": "sk-ant-super-secret"})).unwrap());
         config.save_to_dir(data_dir.clone()).expect("seed save");
 
-        let on_disk = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        let on_disk = std::fs::read_to_string(data_dir.join("providers.json")).unwrap();
         assert!(
             !on_disk.contains("sk-ant-super-secret"),
             "plaintext key must never be written to disk"
         );
-        let cipher_before = serde_json::from_str::<Value>(&on_disk).unwrap()["providers"]
-            ["anthropic"]["api_key_encrypted"]
+        let cipher_before = serde_json::from_str::<Value>(&on_disk).unwrap()["anthropic"]
+            ["api_key_encrypted"]
             .as_str()
             .expect("encrypted key present")
             .to_string();
@@ -666,12 +666,12 @@ mod tests {
             apply_dot_path_set(&loaded, "providers.anthropic.model", json!("claude-x")).unwrap();
         outcome.config.save_to_dir(data_dir.clone()).expect("save");
 
-        let on_disk = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        let on_disk = std::fs::read_to_string(data_dir.join("providers.json")).unwrap();
         assert!(!on_disk.contains("sk-ant-super-secret"));
         let root: Value = serde_json::from_str(&on_disk).unwrap();
-        assert_eq!(root["providers"]["anthropic"]["model"], json!("claude-x"));
+        assert_eq!(root["anthropic"]["model"], json!("claude-x"));
         assert_eq!(
-            root["providers"]["anthropic"]["api_key_encrypted"]
+            root["anthropic"]["api_key_encrypted"]
                 .as_str()
                 .expect("encrypted key still present"),
             cipher_before,
