@@ -1,5 +1,6 @@
 pub mod a2a_adapter;
 pub mod actor_adapter;
+pub mod approval_registry;
 pub mod config;
 pub mod live;
 pub mod mapping;

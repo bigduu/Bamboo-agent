@@ -11,6 +11,8 @@
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 
+use crate::app_state::AppState;
+
 /// Body for `POST /api/v1/child-approval/{child_session_id}`.
 #[derive(Debug, Deserialize)]
 pub struct ChildApprovalDecision {
@@ -29,6 +31,7 @@ struct ChildApprovalResponse {
 ///
 /// `POST /api/v1/child-approval/{child_session_id}`
 pub async fn handler(
+    state: web::Data<AppState>,
     path: web::Path<String>,
     body: web::Json<ChildApprovalDecision>,
 ) -> impl Responder {
@@ -39,6 +42,7 @@ pub async fn handler(
     } = body.into_inner();
 
     let delivered = bamboo_engine::external_agents::live::deliver_approval_checked(
+        Some(&state.approval_registry),
         &child_session_id,
         &request_id,
         approved,

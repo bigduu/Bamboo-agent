@@ -72,7 +72,10 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
 /// needed. Expert `externalAgents` profiles add extra routers so
 /// `external.agent_id` metadata can pin specific roles to other agents. Returns
 /// a composite router that delegates to the first matching runner.
-pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunner> {
+pub fn build_external_child_runner(
+    config: &Config,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
@@ -80,7 +83,7 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
     // The built-in local actor worker is the default runtime for every
     // sub-agent. Always build it; a build failure here is logged and leaves the
     // composite without a default handler (dispatch then errors clearly).
-    match build_local_actor_runner(config) {
+    match build_local_actor_runner(config, approval_registry.clone()) {
         Ok(runner) => runners.push(runner),
         Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
     }
@@ -126,7 +129,7 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
                     continue;
                 }
             };
-            runners.push(Arc::new(ActorChildRunner::new(
+            let mut runner = ActorChildRunner::new(
                 profile.agent_id.clone(),
                 std::path::PathBuf::from(worker_bin),
                 profile.worker_args.clone(),
@@ -138,7 +141,11 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
                     .subagents
                     .max_concurrent
                     .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
-            )));
+            );
+            if let Some(registry) = approval_registry.clone() {
+                runner = runner.with_approval_registry(registry);
+            }
+            runners.push(Arc::new(runner));
             continue;
         }
 
@@ -201,7 +208,10 @@ pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunn
 /// config. Everything is derived: worker = the current bamboo executable +
 /// `subagent-worker`, fabric = per-user temp dir — unless expert fields
 /// override them.
-fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunner>, String> {
+fn build_local_actor_runner(
+    config: &Config,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = &config.subagents;
 
     let (worker_bin, worker_args) = match &sub.worker_bin {
@@ -241,31 +251,33 @@ fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunn
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };
 
-    Ok(Arc::new(
-        ActorChildRunner::new(
-            super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
-            worker_bin,
-            worker_args,
-            fabric_dir,
-            executor,
-            extract_provider_credentials(config),
-            config.provider.clone(),
-            sub.max_concurrent
-                .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
-        )
-        .with_remote_placements(resolve_remote_placements(
-            &sub.remote_placements,
-            &config.cluster_fabric.nodes,
-        ))
-        .with_schedulable_placements(resolve_schedulable_placements(
-            &sub.schedulable_placements,
-            &config.cluster_fabric.nodes,
-        ))
-        .with_bus(sub.broker.as_ref().map(|b| bamboo_subagent::BusEndpoint {
-            endpoint: b.endpoint.clone(),
-            token: b.token.clone(),
-        })),
+    let mut runner = ActorChildRunner::new(
+        super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
+        worker_bin,
+        worker_args,
+        fabric_dir,
+        executor,
+        extract_provider_credentials(config),
+        config.provider.clone(),
+        sub.max_concurrent
+            .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
+    )
+    .with_remote_placements(resolve_remote_placements(
+        &sub.remote_placements,
+        &config.cluster_fabric.nodes,
     ))
+    .with_schedulable_placements(resolve_schedulable_placements(
+        &sub.schedulable_placements,
+        &config.cluster_fabric.nodes,
+    ))
+    .with_bus(sub.broker.as_ref().map(|b| bamboo_subagent::BusEndpoint {
+        endpoint: b.endpoint.clone(),
+        token: b.token.clone(),
+    }));
+    if let Some(registry) = approval_registry {
+        runner = runner.with_approval_registry(registry);
+    }
+    Ok(Arc::new(runner))
 }
 
 /// Resolve config `schedulable_placements` into runner-ready handles (#181, P2b),

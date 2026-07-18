@@ -313,6 +313,18 @@ impl AppState {
                     "failed to initialize account change-feed journal: {e}"
                 ))
             })?;
+        let (approval_registry, restart_approval_events) =
+            bamboo_engine::external_agents::live::initialize_durable_approvals(
+                data_dir.join("approvals/child-approvals-v1.json"),
+            )
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "failed to initialize durable child approvals: {error}"
+                ))
+            })?;
+        for event in restart_approval_events {
+            account_sink.record(event.session_id(), &event);
+        }
 
         // Sub-agents are full agents with the full toolset (no per-role tool
         // trimming): the child tool surface is the plain base tools.
@@ -436,8 +448,10 @@ impl AppState {
                 });
             }
         }
-        let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner(&config_snapshot);
+        let external_runner = bamboo_engine::external_agents::runtime::build_external_child_runner(
+            &config_snapshot,
+            Some(approval_registry.clone()),
+        );
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
@@ -708,6 +722,7 @@ impl AppState {
             connect_manager,
             tool_factory,
             permission_checker,
+            approval_registry,
             notification_service,
             session_watchers,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),

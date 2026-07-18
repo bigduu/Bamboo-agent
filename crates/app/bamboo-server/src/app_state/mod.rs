@@ -270,6 +270,8 @@ pub struct AppState {
     /// executors use. Retained so request handlers can record session grants
     /// when the user approves a permission prompt (see the respond handler).
     pub permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
+    pub approval_registry:
+        bamboo_engine::external_agents::approval_registry::SharedApprovalRegistry,
 
     /// Backend notification policy service (preferences + dedup + per-session
     /// relays). Classifies agent events into `AgentEvent::Notification` for
