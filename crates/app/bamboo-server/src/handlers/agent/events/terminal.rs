@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use actix_web::web;
 
 use crate::app_state::{AgentStatus, AppState};
@@ -11,6 +14,50 @@ use bamboo_engine::session_app::execute::{
 
 const PENDING_TURN_ID_KEY: &str = "execute.pending_turn_message_id";
 const PENDING_TURN_GRACE_SECS: i64 = 60;
+
+type StartupKey = (usize, String);
+static EXECUTE_STARTUPS: OnceLock<Mutex<HashMap<StartupKey, usize>>> = OnceLock::new();
+
+fn execute_startups() -> &'static Mutex<HashMap<StartupKey, usize>> {
+    EXECUTE_STARTUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn startup_key(state: &AppState, session_id: &str) -> StartupKey {
+    (state as *const AppState as usize, session_id.to_string())
+}
+
+pub(crate) struct ExecuteStartupGuard {
+    key: StartupKey,
+}
+
+impl Drop for ExecuteStartupGuard {
+    fn drop(&mut self) {
+        let mut startups = execute_startups().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = startups.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                startups.remove(&self.key);
+            }
+        }
+    }
+}
+
+pub(crate) fn begin_execute_startup(state: &AppState, session_id: &str) -> ExecuteStartupGuard {
+    let key = startup_key(state, session_id);
+    *execute_startups()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.clone())
+        .or_default() += 1;
+    ExecuteStartupGuard { key }
+}
+
+fn execute_startup_is_in_flight(state: &AppState, session_id: &str) -> bool {
+    execute_startups()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&startup_key(state, session_id))
+}
 
 pub(crate) fn mark_pending_turn(session: &mut Session) {
     if let Some(message) = session.messages.last() {
@@ -26,8 +73,18 @@ pub(crate) fn clear_pending_turn(session: &mut Session) {
     session.metadata.remove(PENDING_TURN_ID_KEY);
 }
 
-pub(crate) fn mark_startup_failed_if_owned(session: &mut Session, detail: &str) -> bool {
-    if !pending_turn_is_owned(session) {
+pub(crate) fn pending_turn_id(session: &Session) -> Option<String> {
+    pending_turn_is_owned(session)
+        .then(|| session.metadata.get(PENDING_TURN_ID_KEY).cloned())
+        .flatten()
+}
+
+pub(crate) fn mark_startup_failed_if_owned(
+    session: &mut Session,
+    expected_turn_id: &str,
+    detail: &str,
+) -> bool {
+    if pending_turn_id(session).as_deref() != Some(expected_turn_id) {
         return false;
     }
     session.set_last_run_status("error");
@@ -58,6 +115,14 @@ pub(crate) async fn terminal_event_if_ready(
     session_id: &str,
     runner_status: Option<AgentStatus>,
 ) -> Option<AgentEvent> {
+    // `/execute` may legitimately spend longer than the durable handoff grace
+    // in provider/image/storage preparation before it can reserve a runner.
+    // Never synthesize an abandoned-startup terminal while an in-process
+    // execute handler still owns this session. The guard disappears on every
+    // return path and naturally vanishes if the process crashes.
+    if execute_startup_is_in_flight(state.get_ref(), session_id) {
+        return None;
+    }
     let session = match state.storage.load_session(session_id).await {
         Ok(Some(session)) => Some(session),
         _ => None,
@@ -498,13 +563,49 @@ mod tests {
         ));
     }
 
+    #[actix_web::test]
+    async fn expired_pending_turn_stays_live_while_execute_startup_is_in_flight() {
+        let mut session = Session::new("slow-startup", "test-model");
+        session.add_message(Message::user("slow image preparation"));
+        mark_pending_turn(&mut session);
+        session.messages.last_mut().unwrap().created_at =
+            chrono::Utc::now() - chrono::Duration::seconds(PENDING_TURN_GRACE_SECS + 1);
+        let mut runtime = AgentRuntimeState::new("old-failed-run");
+        runtime.status = AgentStatusState::Failed;
+        session.agent_runtime_state = Some(runtime);
+        let (_dir, state) = state_with_session(session).await;
+
+        let guard = begin_execute_startup(state.get_ref(), "slow-startup");
+        let old_failure = Some(AgentStatus::Error("old run failed".to_string()));
+        assert!(
+            terminal_event_if_ready(&state, "slow-startup", old_failure.clone())
+                .await
+                .is_none()
+        );
+        // Reference counting matters when two execute requests overlap: one
+        // returning must not expose the other still-running preparation.
+        let second = begin_execute_startup(state.get_ref(), "slow-startup");
+        drop(guard);
+        assert!(
+            terminal_event_if_ready(&state, "slow-startup", old_failure.clone())
+                .await
+                .is_none()
+        );
+        drop(second);
+        assert!(terminal_event_if_ready(&state, "slow-startup", old_failure)
+            .await
+            .is_some());
+    }
+
     #[test]
     fn startup_failure_only_rolls_back_the_owned_turn() {
         let mut owned = Session::new("owned", "test-model");
         owned.add_message(Message::user("start me"));
         mark_pending_turn(&mut owned);
+        let owned_id = pending_turn_id(&owned).expect("owned turn id");
         assert!(mark_startup_failed_if_owned(
             &mut owned,
+            &owned_id,
             "provider rejected"
         ));
         assert_eq!(owned.last_run_status().as_deref(), Some("error"));
@@ -515,8 +616,14 @@ mod tests {
         let mut stale = Session::new("stale", "test-model");
         stale.add_message(Message::user("first"));
         mark_pending_turn(&mut stale);
+        let stale_id = pending_turn_id(&stale).expect("first turn id");
         stale.add_message(Message::user("newer turn"));
-        assert!(!mark_startup_failed_if_owned(&mut stale, "late rejection"));
+        mark_pending_turn(&mut stale);
+        assert!(!mark_startup_failed_if_owned(
+            &mut stale,
+            &stale_id,
+            "late rejection"
+        ));
         assert_eq!(stale.last_run_status().as_deref(), Some("pending"));
     }
 }

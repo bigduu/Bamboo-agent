@@ -15,8 +15,10 @@ pub(crate) use stream::Coalescer;
 // Reused by the v2 WS `agent.{sid}` forwarder to keep the channel open while
 // child sub-agents are still running (parity with the v1 SSE stream, which does
 // not close on the parent terminal while descendants survive).
+pub(crate) use terminal::{
+    begin_execute_startup, mark_pending_turn, mark_startup_failed_if_owned, pending_turn_id,
+};
 pub(crate) use terminal::{has_running_child, terminal_event_if_ready};
-pub(crate) use terminal::{mark_pending_turn, mark_startup_failed_if_owned};
 
 #[cfg(test)]
 mod tests;
