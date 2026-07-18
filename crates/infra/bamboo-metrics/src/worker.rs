@@ -356,14 +356,23 @@ mod tests {
             error: None,
         }));
 
-        // Wait for processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Verify data was written
-        let summary = storage
-            .summary(crate::types::MetricsDateFilter::default())
-            .await
-            .expect("get summary");
+        // Wait for the observable storage effect rather than a fixed sleep.
+        // Under the full integration suite the worker can be starved for more
+        // than 100ms, making the old timing assertion flaky.
+        let summary = tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
+            loop {
+                let summary = storage
+                    .summary(crate::types::MetricsDateFilter::default())
+                    .await
+                    .expect("get summary");
+                if summary.total_sessions == 1 {
+                    break summary;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("metrics worker should persist chat events");
         assert_eq!(summary.total_sessions, 1);
 
         // Stop worker
@@ -401,14 +410,20 @@ mod tests {
             error: None,
         }));
 
-        // Wait for processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Verify data was written
-        let summary = storage
-            .forward_summary(crate::types::ForwardMetricsFilter::default())
-            .await
-            .expect("get forward summary");
+        let summary = tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
+            loop {
+                let summary = storage
+                    .forward_summary(crate::types::ForwardMetricsFilter::default())
+                    .await
+                    .expect("get forward summary");
+                if summary.total_requests == 1 {
+                    break summary;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("metrics worker should persist forward events");
         assert_eq!(summary.total_requests, 1);
 
         // Stop worker
