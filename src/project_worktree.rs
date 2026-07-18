@@ -259,6 +259,23 @@ pub async fn gc_orphans(project_root: &Path, retention: Duration) -> Result<usiz
         ) {
             continue;
         }
+        // A heartbeat owned by this process is definitive liveness. Besides
+        // avoiding needless filesystem work, this closes the race where GC
+        // observes an old marker just as a delayed heartbeat is about to renew
+        // it (for example immediately after a machine resumes from sleep).
+        let heartbeat_is_live = {
+            let mut heartbeats = lease_heartbeats().lock().await;
+            if heartbeats
+                .get(&marker)
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                heartbeats.remove(&marker);
+            }
+            heartbeats.contains_key(&marker)
+        };
+        if heartbeat_is_live {
+            continue;
+        }
         let (Ok(metadata), Ok(marker_metadata)) =
             (entry.metadata().await, tokio::fs::metadata(&marker).await)
         else {
