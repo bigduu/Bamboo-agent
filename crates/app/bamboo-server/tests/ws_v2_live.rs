@@ -390,10 +390,6 @@ async fn subscribe_event_unsubscribe_roundtrip() {
 
     let mut root = bamboo_agent_core::Session::new(sid, "test-model");
     register_session(&server.state, &mut root).await;
-    // This scenario exercises live broadcast delivery, not completed-session
-    // replay. Keep the session explicitly running so the terminal forwarder
-    // cannot synthesize a `complete` frame before the token under test.
-    set_runner_status(&server.state, sid, AgentStatus::Running).await;
 
     let mut conn = connect_local(&server).await;
     let ch = format!("agent.{sid}");
@@ -828,10 +824,6 @@ async fn msgpack_subprotocol_subscribe_event_roundtrip() {
 
     let mut root = bamboo_agent_core::Session::new(sid, "test-model");
     register_session(&server.state, &mut root).await;
-    // This scenario exercises live msgpack delivery, not completed-session
-    // replay. Mark it running to avoid a synthesized terminal frame racing the
-    // token broadcast.
-    set_runner_status(&server.state, sid, AgentStatus::Running).await;
 
     let (mut conn, echoed) = connect_local_msgpack(&server).await;
     // The server MUST echo the selected subprotocol on the upgrade response.
