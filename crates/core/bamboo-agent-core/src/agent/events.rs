@@ -233,6 +233,9 @@ pub enum AgentEvent {
         session_id: String,
         /// Number of items to evaluate
         items_count: usize,
+        /// Task-list generation evaluated. Optional for older producers/frames.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
     },
 
     /// Emitted when task evaluation completes.
@@ -243,6 +246,19 @@ pub enum AgentEvent {
         updates_count: usize,
         /// Evaluation reasoning
         reasoning: String,
+        /// Task-list generation evaluated. Optional for backward compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+    },
+
+    /// Emitted when an unfinished task evaluation is stopped because its owning
+    /// run completed, suspended, or was cancelled.
+    TaskEvaluationCancelled {
+        session_id: String,
+        reason: String,
+        /// Task-list generation whose evaluation was cancelled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
     },
 
     /// Emitted when gold observe-only evaluation starts.
@@ -270,6 +286,9 @@ pub enum AgentEvent {
         /// Short reasoning summary
         reasoning: String,
     },
+
+    /// Emitted when an unfinished Gold evaluation is stopped with its owning run.
+    GoldEvaluationCancelled { session_id: String, reason: String },
 
     /// Emitted whenever the runtime goal state changes — a new status
     /// (active/complete/blocked/…), an incremented continuation count, or a
@@ -546,6 +565,24 @@ pub enum AgentEvent {
         resource: String,
     },
 
+    /// Durable, versioned approval lifecycle delta for a child agent.
+    ChildApprovalChanged {
+        parent_session_id: String,
+        child_session_id: String,
+        request_id: String,
+        version: u64,
+        /// `pending` | `approved` | `denied` | `expired` | `delivery_failed`.
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        tool_name: String,
+        permission: String,
+        resource: String,
+        created_at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_at: Option<String>,
+    },
+
     /// A per-run resource guardrail (token / tool-call / subagent budget)
     /// tripped and the run was gracefully stopped — issue #221.
     ///
@@ -629,8 +666,10 @@ impl AgentEvent {
             | AgentEvent::TaskListCompleted { session_id, .. }
             | AgentEvent::TaskEvaluationStarted { session_id, .. }
             | AgentEvent::TaskEvaluationCompleted { session_id, .. }
+            | AgentEvent::TaskEvaluationCancelled { session_id, .. }
             | AgentEvent::GoldEvaluationStarted { session_id, .. }
             | AgentEvent::GoldEvaluationCompleted { session_id, .. }
+            | AgentEvent::GoldEvaluationCancelled { session_id, .. }
             | AgentEvent::GoalStatusChanged { session_id, .. }
             | AgentEvent::PlanModeEntered { session_id, .. }
             | AgentEvent::PlanModeExited { session_id, .. }
@@ -655,6 +694,9 @@ impl AgentEvent {
                 parent_session_id, ..
             }
             | AgentEvent::SubAgentCompleted {
+                parent_session_id, ..
+            }
+            | AgentEvent::ChildApprovalChanged {
                 parent_session_id, ..
             } => Some(parent_session_id.as_str()),
             _ => None,
@@ -684,11 +726,14 @@ impl AgentEvent {
                 | AgentEvent::TaskListItemProgress { .. }
                 | AgentEvent::TaskListCompleted { .. }
                 | AgentEvent::TaskEvaluationCompleted { .. }
+                | AgentEvent::TaskEvaluationCancelled { .. }
+                | AgentEvent::GoldEvaluationCancelled { .. }
                 | AgentEvent::PlanModeEntered { .. }
                 | AgentEvent::PlanModeExited { .. }
                 | AgentEvent::PlanFileUpdated { .. }
                 | AgentEvent::SubAgentStarted { .. }
                 | AgentEvent::SubAgentCompleted { .. }
+                | AgentEvent::ChildApprovalChanged { .. }
                 | AgentEvent::NeedClarification { .. }
                 | AgentEvent::ToolApprovalRequested { .. }
                 | AgentEvent::ExecutionStarted { .. }
@@ -847,10 +892,52 @@ mod tests {
             session_id: "session-1".to_string(),
             updates_count: 2,
             reasoning: "Updated statuses".to_string(),
+            generation: Some(7),
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");
         assert_eq!(value["type"], "task_evaluation_completed");
+        assert_eq!(value["generation"], 7);
+    }
+
+    #[test]
+    fn task_evaluation_event_without_generation_remains_deserializable() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "task_evaluation_started",
+            "session_id": "session-1",
+            "items_count": 2
+        }))
+        .expect("legacy task evaluation frame should remain compatible");
+
+        assert!(matches!(
+            event,
+            AgentEvent::TaskEvaluationStarted {
+                generation: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluation_cancelled_events_serialize_as_terminal_lifecycle_events() {
+        let task = AgentEvent::TaskEvaluationCancelled {
+            session_id: "session-1".to_string(),
+            reason: "run_suspended".to_string(),
+            generation: Some(7),
+        };
+        let gold = AgentEvent::GoldEvaluationCancelled {
+            session_id: "session-1".to_string(),
+            reason: "run_completed".to_string(),
+        };
+
+        assert!(task.is_durable_change());
+        assert!(gold.is_durable_change());
+        let task_value = serde_json::to_value(task).unwrap();
+        let gold_value = serde_json::to_value(gold).unwrap();
+        assert_eq!(task_value["type"], "task_evaluation_cancelled");
+        assert_eq!(task_value["reason"], "run_suspended");
+        assert_eq!(gold_value["type"], "gold_evaluation_cancelled");
+        assert_eq!(gold_value["reason"], "run_completed");
     }
 
     #[test]
@@ -1061,6 +1148,28 @@ mod tests {
             value["parameters"],
             serde_json::json!({"file_path": "/tmp/test.txt"})
         );
+    }
+
+    #[test]
+    fn child_approval_changed_routes_to_parent_and_is_durable() {
+        let event = AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-1".into(),
+            child_session_id: "child-1".into(),
+            request_id: "req-1".into(),
+            version: 2,
+            status: "approved".into(),
+            reason: None,
+            tool_name: "Bash".into(),
+            permission: "execute".into(),
+            resource: "/tmp/x".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            resolved_at: Some("2026-01-01T00:00:01Z".into()),
+        };
+        assert_eq!(event.session_id(), Some("parent-1"));
+        assert!(event.is_durable_change());
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "child_approval_changed");
+        assert_eq!(value["status"], "approved");
     }
 
     #[test]

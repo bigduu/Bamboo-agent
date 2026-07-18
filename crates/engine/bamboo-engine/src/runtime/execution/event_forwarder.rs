@@ -28,8 +28,37 @@ pub type AccountFeedInbox = mpsc::Sender<(Option<String>, AgentEvent)>;
 fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, event: &AgentEvent) {
     if let Some(inbox) = inbox {
         if event.is_durable_change() {
-            let _ = inbox.try_send((Some(session_id.to_string()), event.clone()));
+            let route_session_id = event.session_id().unwrap_or(session_id);
+            let _ = inbox.try_send((Some(route_session_id.to_string()), event.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn child_approval_change_routes_to_parent_account_envelope() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let event = AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-1".into(),
+            child_session_id: "child-1".into(),
+            request_id: "req-1".into(),
+            version: 2,
+            status: "approved".into(),
+            reason: None,
+            tool_name: "Bash".into(),
+            permission: "execute".into(),
+            resource: "/tmp/x".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            resolved_at: Some("2026-01-01T00:00:01Z".into()),
+        };
+
+        mirror_to_account_feed(&Some(tx), "child-1", &event);
+        let (session_id, mirrored) = rx.recv().await.unwrap();
+        assert_eq!(session_id.as_deref(), Some("parent-1"));
+        assert!(matches!(mirrored, AgentEvent::ChildApprovalChanged { .. }));
     }
 }
 
