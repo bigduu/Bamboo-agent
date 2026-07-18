@@ -339,6 +339,11 @@ pub struct AppState {
     /// for an active agent execution.
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
 
+    /// Reference-counted execute handlers still preparing a runner, keyed by
+    /// session. This server-scoped registry closes the durable pending-turn
+    /// expiry race without leaking state across AppState instances/tests.
+    pub(crate) execute_startups: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+
     /// Session-scoped event streams (long-lived).
     ///
     /// Unlike `agent_runners`, these senders exist even when no agent execution is running.

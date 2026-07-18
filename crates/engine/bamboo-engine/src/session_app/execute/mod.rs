@@ -22,9 +22,10 @@ mod tests;
 
 pub use billing::{billable_user_turn_count, is_billable_user_turn, is_system_resume_message};
 pub use resume_markers::{
-    consume_pending_clarification_resume, consume_pending_conclusion_with_options_resume,
-    has_pending_clarification_resume, has_pending_conclusion_with_options_resume,
-    has_pending_retry_resume, has_pending_user_message,
+    clear_startup_handoff, consume_pending_clarification_resume,
+    consume_pending_conclusion_with_options_resume, has_pending_clarification_resume,
+    has_pending_conclusion_with_options_resume, has_pending_retry_resume, has_pending_user_message,
+    mark_startup_handoff, startup_handoff_at,
 };
 pub use sync::evaluate_client_sync;
 

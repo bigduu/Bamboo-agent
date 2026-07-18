@@ -27,8 +27,11 @@ use bamboo_engine::ImageFallbackConfig;
 use bamboo_llm::Config;
 
 /// The fields the engine's `ExecutePreparationOutcome::Ready` carries.
-pub(super) struct ReadyExecution {
+pub(super) struct ReadyExecution<'a> {
     pub session: bamboo_agent_core::Session,
+    pub startup_guard: &'a mut crate::handlers::agent::events::ExecuteStartupGuard,
+    /// Durable message id owned by the pending execute handoff, if any.
+    pub startup_turn_id: Option<String>,
     pub effective_model: String,
     pub effective_reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub model_source: &'static str,
@@ -46,7 +49,7 @@ pub(super) struct ReadyExecution {
 pub(super) async fn handle_execute_ready(
     state: &web::Data<AppState>,
     session_id: &str,
-    ready: ReadyExecution,
+    ready: ReadyExecution<'_>,
     config: &ExecutionConfigSnapshot,
     config_snapshot: &Config,
     image_fallback: Option<ImageFallbackConfig>,
@@ -87,9 +90,9 @@ pub(super) async fn handle_execute_ready(
     // The reservation owns this exact turn now. Moving the owned marker out of
     // `pending` before persistence prevents an old terminal runner from being
     // used to classify the newly-starting turn.
-    let startup_turn_id = crate::handlers::agent::events::pending_turn_id(&session);
     session.set_last_run_status("running");
     session.clear_last_run_error();
+    crate::handlers::agent::events::clear_pending_turn(&mut session);
 
     // ---- Save session before spawn (metadata-group merge) ----
     if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
@@ -97,9 +100,9 @@ pub(super) async fn handle_execute_ready(
             state,
             session_id,
             &run_id,
-            startup_turn_id.as_deref(),
-            &mut session,
+            ready.startup_turn_id.as_deref(),
             &error.to_string(),
+            ready.startup_guard,
         )
         .await;
         return internal_server_error_response(format!(
@@ -211,8 +214,8 @@ async fn rollback_startup(
     session_id: &str,
     run_id: &str,
     expected_turn_id: Option<&str>,
-    session: &mut bamboo_agent_core::Session,
     detail: &str,
+    startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
 ) {
     // Remove only our reservation. A concurrent retry may already have replaced
     // it, and must not be disturbed.
@@ -225,28 +228,19 @@ async fn rollback_startup(
     }
     drop(runners);
 
-    // Route through the same owned-turn failure transition used by preparation
-    // rejects. The marker still identifies this exact message; status is reset
-    // only to satisfy the transition's pending precondition.
-    if let Some(expected_turn_id) = expected_turn_id {
-        session.set_last_run_status("pending");
-        crate::handlers::agent::events::mark_startup_failed_if_owned(
-            session,
-            expected_turn_id,
-            detail,
-        );
-    } else {
-        session.set_last_run_status("error");
-        session.set_last_run_error(format!("Agent startup failed: {detail}"));
-    }
-    if state.persistence.merge_save_runtime(session).await.is_ok() {
-        state.sessions.insert(
-            session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
-        );
-    } else {
-        tracing::error!("[{session_id}] failed to persist execute startup rollback");
-    }
+    let Some(expected_turn_id) = expected_turn_id else {
+        return;
+    };
+    crate::handlers::agent::events::transition_startup_failure_if_owned(
+        state,
+        session_id,
+        crate::handlers::agent::events::StartupFailureTarget::WorkId {
+            work_id: expected_turn_id,
+            startup_guard,
+        },
+        detail,
+    )
+    .await;
 }
 
 /// #74: re-derive the "no interactive human approver" posture for a

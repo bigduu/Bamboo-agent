@@ -6,6 +6,7 @@ use bamboo_tools::permission::PermissionType;
 use chrono::Utc;
 
 use super::errors::RespondError;
+use super::execute::mark_startup_handoff;
 use super::provider_model::{derive_model_ref, persist_legacy_model_provider, persist_model_ref};
 use super::repository::SessionAccess;
 use super::types::RespondInput;
@@ -155,6 +156,7 @@ pub async fn submit_pending_response_with_source(
         CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY.to_string(),
         "true".to_string(),
     );
+    mark_startup_handoff(&mut session);
 
     // ---- Merge model/reasoning from request ----
     let request_model_ref = derive_model_ref(
