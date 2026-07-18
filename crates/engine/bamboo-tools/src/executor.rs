@@ -1261,6 +1261,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_delete_deny_overrides_bypass() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::DeleteOperation,
+            "rm child-to-preserve",
+            false,
+        ));
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
+        let call = make_tool_call("Bash", json!({"command": "rm child-to-preserve"}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-explicit-delete-deny"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = executor.execute_with_context(&call, ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
+            "explicit delete deny must beat bypass: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn interactive_gate_returns_synthesized_approval_pause() {
         // With an event sink present, a forced-ask rule that yields
         // `ConfirmationRequired` must resolve to the synthesized "awaiting

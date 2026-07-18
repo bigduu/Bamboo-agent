@@ -64,6 +64,18 @@ impl PermissionType {
     }
 }
 
+fn is_path_permission(perm_type: PermissionType) -> bool {
+    matches!(
+        perm_type,
+        PermissionType::WriteFile | PermissionType::DeleteOperation
+    )
+}
+
+fn should_normalize_path(perm_type: PermissionType, resource: &str) -> bool {
+    is_path_permission(perm_type)
+        && (perm_type == PermissionType::WriteFile || Path::new(resource).is_absolute())
+}
+
 /// Risk level for permission types
 ///
 /// Ordered `Low < Medium < High` (derived from declaration order), so a risk
@@ -140,9 +152,10 @@ impl PermissionRule {
 
         // For file-related permissions, normalize the path
         // For other permissions (HTTP, commands, etc.), match directly
-        let normalized_resource = match perm_type {
-            PermissionType::WriteFile => canonicalize_path_for_matching(resource),
-            _ => Some(resource.to_string()),
+        let normalized_resource = if should_normalize_path(perm_type, resource) {
+            canonicalize_path_for_matching(resource)
+        } else {
+            Some(resource.to_string())
         };
 
         let normalized_resource = match normalized_resource {
@@ -151,11 +164,10 @@ impl PermissionRule {
         };
 
         // Use globset for proper glob matching
-        let normalized_pattern = match perm_type {
-            PermissionType::WriteFile => {
-                canonicalize_path_pattern_for_matching(&self.resource_pattern)
-            }
-            _ => Some(self.resource_pattern.clone()),
+        let normalized_pattern = if should_normalize_path(perm_type, &self.resource_pattern) {
+            canonicalize_path_pattern_for_matching(&self.resource_pattern)
+        } else {
+            Some(self.resource_pattern.clone())
         };
         normalized_pattern
             .as_deref()
@@ -207,9 +219,10 @@ impl SessionGrant {
 
         // For file-related permissions, normalize the path
         // For other permissions (HTTP, commands, etc.), match directly
-        let normalized_resource = match perm_type {
-            PermissionType::WriteFile => canonicalize_path_for_matching(resource),
-            _ => Some(resource.to_string()),
+        let normalized_resource = if should_normalize_path(perm_type, resource) {
+            canonicalize_path_for_matching(resource)
+        } else {
+            Some(resource.to_string())
         };
 
         let normalized_resource = match normalized_resource {
@@ -217,11 +230,10 @@ impl SessionGrant {
             None => return false,
         };
 
-        let normalized_pattern = match perm_type {
-            PermissionType::WriteFile => {
-                canonicalize_path_pattern_for_matching(&self.resource_pattern)
-            }
-            _ => Some(self.resource_pattern.clone()),
+        let normalized_pattern = if should_normalize_path(perm_type, &self.resource_pattern) {
+            canonicalize_path_pattern_for_matching(&self.resource_pattern)
+        } else {
+            Some(self.resource_pattern.clone())
         };
         normalized_pattern
             .as_deref()
@@ -2238,6 +2250,17 @@ mod integration_tests {
         let config = PermissionConfig::new();
         config.grant_session_permission(PermissionType::WriteFile, alias.clone());
         assert!(config.is_session_granted(PermissionType::WriteFile, &canonical));
+
+        config.grant_session_permission(PermissionType::DeleteOperation, alias.clone());
+        assert!(config.is_session_granted(PermissionType::DeleteOperation, &canonical));
+
+        let delete_deny =
+            PermissionRule::new(PermissionType::DeleteOperation, alias.clone(), false);
+        assert!(delete_deny.matches(PermissionType::DeleteOperation, &canonical));
+
+        let command_deny =
+            PermissionRule::new(PermissionType::DeleteOperation, "rm ./relative-file", false);
+        assert!(command_deny.matches(PermissionType::DeleteOperation, "rm ./relative-file"));
 
         config.set_ask_rules([format!("Write({alias})")]);
         assert!(config
