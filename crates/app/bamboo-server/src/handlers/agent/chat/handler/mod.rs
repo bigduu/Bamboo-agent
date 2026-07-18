@@ -313,6 +313,8 @@ async fn handle_goal_command(
                 "runtime_kind": "gold_goal_resume"
             }));
             session.add_message(resume_msg);
+            session.set_last_run_status("pending");
+            session.clear_last_run_error();
         }
 
         state.save_and_cache_session(&mut session).await;

@@ -73,7 +73,7 @@ fn session_prevents_terminal_when_last_message_is_user() {
     let mut session = Session::new("sess-1", "test-model");
     session.add_message(Message::user("Hi"));
 
-    assert!(session_prevents_terminal_event(Some(&session)));
+    assert!(session_prevents_terminal_event(Some(&session), None));
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn session_prevents_terminal_when_pending_question_exists() {
         true,
     );
 
-    assert!(session_prevents_terminal_event(Some(&session)));
+    assert!(session_prevents_terminal_event(Some(&session), None));
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn session_prevents_terminal_when_runtime_is_suspended() {
     runtime.status = AgentStatusState::Suspended;
     session.agent_runtime_state = Some(runtime);
 
-    assert!(session_prevents_terminal_event(Some(&session)));
+    assert!(session_prevents_terminal_event(Some(&session), None));
 }
 
 #[test]
@@ -105,8 +105,8 @@ fn session_allows_terminal_when_not_waiting_for_user() {
     let mut session = Session::new("sess-4", "test-model");
     session.add_message(Message::assistant("done", None));
 
-    assert!(!session_prevents_terminal_event(Some(&session)));
-    assert!(!session_prevents_terminal_event(None));
+    assert!(!session_prevents_terminal_event(Some(&session), None));
+    assert!(!session_prevents_terminal_event(None, None));
 }
 
 #[test]

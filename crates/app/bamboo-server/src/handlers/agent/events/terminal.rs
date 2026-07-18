@@ -5,7 +5,9 @@ use bamboo_agent_core::agent::events::TokenUsage;
 use bamboo_agent_core::agent::Role;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::AgentStatusState;
-use bamboo_engine::session_app::execute::has_pending_user_message;
+use bamboo_engine::session_app::execute::{
+    has_pending_clarification_resume, has_pending_retry_resume,
+};
 
 pub(crate) async fn terminal_event_if_ready(
     state: &web::Data<AppState>,
@@ -72,7 +74,7 @@ pub(crate) async fn terminal_event_if_ready(
         return None;
     }
 
-    if session_prevents_terminal_event(session.as_ref()) {
+    if session_prevents_terminal_event(session.as_ref(), runner_status.as_ref()) {
         tracing::debug!(
             "[{}] terminal_event_if_ready -> None (pending user message / pending question / suspended) -> LIVE stream",
             session_id,
@@ -158,16 +160,19 @@ pub(super) fn terminal_event_for_sources(
     }
 }
 
-pub(super) fn session_prevents_terminal_event(session: Option<&Session>) -> bool {
+pub(super) fn session_prevents_terminal_event(
+    session: Option<&Session>,
+    runner_status: Option<&AgentStatus>,
+) -> bool {
     let Some(session) = session else {
         return false;
     };
 
-    if session
-        .messages
-        .last()
-        .is_some_and(|message| matches!(message.role, Role::User))
-    {
+    // A newly queued run is newer than a terminal runner/runtime snapshot. Chat
+    // persistence writes this marker together with the new User message, so a
+    // reconnect between POST /chat and POST /execute remains live even if the
+    // previous run was cancelled or failed.
+    if matches!(session.last_run_status().as_deref(), Some("pending")) {
         return true;
     }
 
@@ -186,14 +191,50 @@ pub(super) fn session_prevents_terminal_event(session: Option<&Session>) -> bool
     // a broadcast with no live subscriber, leaving the UI stuck on "thinking".
     // Mirror the resume decision, which uses this same predicate, so the window
     // [markers set] and [runner Running] tile with no gap.
-    if has_pending_user_message(session) {
+    if has_pending_clarification_resume(session) || has_pending_retry_resume(session) {
         return true;
     }
 
-    session
+    if session
         .agent_runtime_state
         .as_ref()
         .is_some_and(|runtime| matches!(runtime.status, AgentStatusState::Suspended))
+    {
+        return true;
+    }
+
+    let last_message_is_user = session
+        .messages
+        .last()
+        .is_some_and(|message| matches!(message.role, Role::User));
+    if !last_message_is_user {
+        return false;
+    }
+
+    // Cancellation/failure can happen before the model appends an Assistant
+    // message, leaving User as the last role. Those terminal sources are more
+    // authoritative than the role heuristic and must be replayed to a late
+    // subscriber. A genuinely newer User turn is protected by the `pending`
+    // marker above.
+    !terminal_failure_is_authoritative(session, runner_status)
+}
+
+fn terminal_failure_is_authoritative(
+    session: &Session,
+    runner_status: Option<&AgentStatus>,
+) -> bool {
+    match runner_status {
+        Some(AgentStatus::Cancelled | AgentStatus::Error(_)) => true,
+        // Any extant non-failure runner is the current source of truth; do not
+        // fall back to a stale persisted failure from an older run.
+        Some(_) => false,
+        None => session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+            matches!(
+                runtime.status,
+                AgentStatusState::Cancelled | AgentStatusState::Failed
+            )
+        }),
+    }
 }
 
 /// Whether the watched session still has any running **descendant** (transitive,
@@ -243,17 +284,19 @@ pub(crate) async fn has_running_child(state: &web::Data<AppState>, session_id: &
 mod tests {
     use super::*;
     use bamboo_agent_core::Message;
+    use bamboo_domain::AgentRuntimeState;
+    use tempfile::tempdir;
 
     #[test]
     fn no_session_does_not_prevent_terminal() {
-        assert!(!session_prevents_terminal_event(None));
+        assert!(!session_prevents_terminal_event(None, None));
     }
 
     #[test]
     fn last_user_message_prevents_terminal() {
         let mut session = Session::new("s-1", "test-model");
         session.add_message(Message::user("hello"));
-        assert!(session_prevents_terminal_event(Some(&session)));
+        assert!(session_prevents_terminal_event(Some(&session), None));
     }
 
     #[test]
@@ -261,7 +304,7 @@ mod tests {
         let mut session = Session::new("s-1", "test-model");
         session.add_message(Message::user("hello"));
         session.add_message(Message::assistant("done", None));
-        assert!(!session_prevents_terminal_event(Some(&session)));
+        assert!(!session_prevents_terminal_event(Some(&session), None));
     }
 
     /// Regression: after answering a `conclusion_with_options` question the answer
@@ -276,13 +319,106 @@ mod tests {
         session.add_message(Message::tool_result("ask-1", "Selected response: A"));
         // No pending question, last message is a tool result — looks "finished"...
         assert!(!session.has_pending_question());
-        assert!(!session_prevents_terminal_event(Some(&session)));
+        assert!(!session_prevents_terminal_event(Some(&session), None));
 
         // ...until the resume marker set by `submit_pending_response` is present.
         session.metadata.insert(
             "conclusion_with_options_resume_pending".to_string(),
             "true".to_string(),
         );
-        assert!(session_prevents_terminal_event(Some(&session)));
+        assert!(session_prevents_terminal_event(Some(&session), None));
+    }
+
+    async fn state_with_session(mut session: Session) -> (tempfile::TempDir, web::Data<AppState>) {
+        let dir = tempdir().expect("temporary app data");
+        let state = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        state.save_session(&mut session).await;
+        (dir, state)
+    }
+
+    #[actix_web::test]
+    async fn terminal_helper_replays_in_memory_cancelled_after_last_user() {
+        let mut session = Session::new("cancelled-user", "test-model");
+        session.add_message(Message::user("cancel before first token"));
+        // The in-memory terminal is authoritative even if persistence still
+        // reflects the run's prior phase.
+        session.set_last_run_status("running");
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(&state, "cancelled-user", Some(AgentStatus::Cancelled))
+            .await
+            .expect("cancelled run is terminal");
+        assert!(matches!(event, AgentEvent::Cancelled { .. }));
+    }
+
+    #[actix_web::test]
+    async fn terminal_helper_replays_in_memory_error_after_last_user() {
+        let mut session = Session::new("failed-user", "test-model");
+        session.add_message(Message::user("fail before first token"));
+        session.set_last_run_status("running");
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(
+            &state,
+            "failed-user",
+            Some(AgentStatus::Error("provider failed".to_string())),
+        )
+        .await
+        .expect("failed run is terminal");
+        assert!(matches!(event, AgentEvent::Error { message } if message == "provider failed"));
+    }
+
+    #[actix_web::test]
+    async fn terminal_helper_replays_persisted_cancelled_after_last_user() {
+        let mut session = Session::new("persisted-cancelled-user", "test-model");
+        session.add_message(Message::user("cancel before first token"));
+        session.set_last_run_status("cancelled");
+        let mut runtime = AgentRuntimeState::new("cancelled-run");
+        runtime.status = AgentStatusState::Cancelled;
+        session.agent_runtime_state = Some(runtime);
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(&state, "persisted-cancelled-user", None)
+            .await
+            .expect("persisted cancellation is terminal");
+        assert!(matches!(event, AgentEvent::Cancelled { .. }));
+    }
+
+    #[actix_web::test]
+    async fn terminal_helper_replays_persisted_failure_after_last_user() {
+        let mut session = Session::new("persisted-failed-user", "test-model");
+        session.add_message(Message::user("fail before first token"));
+        session.set_last_run_status("error");
+        let mut runtime = AgentRuntimeState::new("failed-run");
+        runtime.status = AgentStatusState::Failed;
+        session.agent_runtime_state = Some(runtime);
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(&state, "persisted-failed-user", None)
+            .await
+            .expect("persisted failure is terminal");
+        assert!(matches!(event, AgentEvent::Error { .. }));
+    }
+
+    #[actix_web::test]
+    async fn terminal_helper_keeps_new_user_after_old_failure_live() {
+        let mut session = Session::new("new-user-after-failure", "test-model");
+        session.add_message(Message::user("new request"));
+        session.set_last_run_status("pending");
+        let mut runtime = AgentRuntimeState::new("old-failed-run");
+        runtime.status = AgentStatusState::Failed;
+        session.agent_runtime_state = Some(runtime);
+        let (_dir, state) = state_with_session(session).await;
+
+        assert!(
+            terminal_event_if_ready(&state, "new-user-after-failure", None)
+                .await
+                .is_none(),
+            "new pending work must win over the old persisted failure"
+        );
     }
 }
