@@ -143,7 +143,7 @@ pub fn build_external_child_runner_with_registry(
                 extract_provider_credentials(config),
                 config.provider.clone(),
                 config
-                    .subagents
+                    .subagents()
                     .max_concurrent
                     .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
             );
@@ -217,7 +217,7 @@ fn build_local_actor_runner(
     config: &Config,
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
-    let sub = &config.subagents;
+    let sub = config.subagents();
 
     let (worker_bin, worker_args) = match &sub.worker_bin {
         Some(custom) => (
@@ -464,16 +464,16 @@ pub fn extract_provider_credentials(
             provider_type: Some(name.to_string()),
         });
     };
-    if let Some(c) = &config.providers.openai {
+    if let Some(c) = &config.providers().openai {
         push_legacy("openai", &c.api_key, c.base_url.clone());
     }
-    if let Some(c) = &config.providers.anthropic {
+    if let Some(c) = &config.providers().anthropic {
         push_legacy("anthropic", &c.api_key, c.base_url.clone());
     }
-    if let Some(c) = &config.providers.gemini {
+    if let Some(c) = &config.providers().gemini {
         push_legacy("gemini", &c.api_key, c.base_url.clone());
     }
-    if let Some(c) = &config.providers.bodhi {
+    if let Some(c) = &config.providers().bodhi {
         push_legacy("bodhi", &c.api_key, c.base_url.clone());
     }
 
@@ -535,7 +535,7 @@ mod extract_provider_credentials_tests {
     #[test]
     fn legacy_only_config_yields_credential() {
         let mut config = Config::default();
-        config.providers.anthropic = Some(AnthropicConfig {
+        config.providers_mut().anthropic = Some(AnthropicConfig {
             api_key: "sk-ant-legacy".to_string(),
             base_url: Some("https://api.anthropic.com".to_string()),
             ..Default::default()
@@ -556,7 +556,7 @@ mod extract_provider_credentials_tests {
     #[test]
     fn legacy_bodhi_config_yields_credential() {
         let mut config = Config::default();
-        config.providers.bodhi = Some(BodhiConfig {
+        config.providers_mut().bodhi = Some(BodhiConfig {
             api_key: "bhi_sk_legacy".to_string(),
             api_key_encrypted: None,
             base_url: None,
@@ -576,7 +576,7 @@ mod extract_provider_credentials_tests {
     #[test]
     fn legacy_config_with_empty_api_key_is_skipped() {
         let mut config = Config::default();
-        config.providers.openai = Some(OpenAIConfig::default());
+        config.providers_mut().openai = Some(OpenAIConfig::default());
         assert!(extract_provider_credentials(&config).is_empty());
     }
 
@@ -585,7 +585,7 @@ mod extract_provider_credentials_tests {
     #[test]
     fn legacy_and_instances_both_present_no_duplicates() {
         let mut config = Config::default();
-        config.providers.anthropic = Some(AnthropicConfig {
+        config.providers_mut().anthropic = Some(AnthropicConfig {
             api_key: "sk-ant-legacy".to_string(),
             ..Default::default()
         });

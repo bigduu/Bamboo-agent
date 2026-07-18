@@ -487,16 +487,14 @@ fn refresh_prompt_snapshot_from_session_ignores_topic_truncation_note_outside_co
 #[test]
 fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
     let _lock = crate::runtime::tests::env_cache_lock_acquire();
-    let config_with_env = bamboo_llm::Config {
-        env_vars: vec![bamboo_config::EnvVarEntry {
-            name: "TEST_TOOL_TOKEN".to_string(),
-            value: "hidden-value".to_string(),
-            secret: true,
-            value_encrypted: None,
-            description: Some("Runtime test token".to_string()),
-        }],
-        ..bamboo_llm::Config::default()
-    };
+    let mut config_with_env = bamboo_llm::Config::default();
+    config_with_env.env_vars = vec![bamboo_config::EnvVarEntry {
+        name: "TEST_TOOL_TOKEN".to_string(),
+        value: "hidden-value".to_string(),
+        secret: true,
+        value_encrypted: None,
+        description: Some("Runtime test token".to_string()),
+    }];
     config_with_env.publish_env_vars();
 
     let root = tempfile::tempdir().expect("temp dir");
@@ -587,16 +585,14 @@ fn prompt_assembly_report_component_values_match_sections() {
     use super::prompt_setup::{PromptAssemblyReport, PromptLayer, PromptSection};
 
     let _lock = crate::runtime::tests::env_cache_lock_acquire();
-    let config_with_env = bamboo_llm::Config {
-        env_vars: vec![bamboo_config::EnvVarEntry {
-            name: "TEST_TOOL_TOKEN".to_string(),
-            value: "hidden-value".to_string(),
-            secret: true,
-            value_encrypted: None,
-            description: Some("Runtime test token".to_string()),
-        }],
-        ..bamboo_llm::Config::default()
-    };
+    let mut config_with_env = bamboo_llm::Config::default();
+    config_with_env.env_vars = vec![bamboo_config::EnvVarEntry {
+        name: "TEST_TOOL_TOKEN".to_string(),
+        value: "hidden-value".to_string(),
+        secret: true,
+        value_encrypted: None,
+        description: Some("Runtime test token".to_string()),
+    }];
     config_with_env.publish_env_vars();
 
     let base_prompt = "Base prompt";
@@ -687,16 +683,14 @@ fn prompt_assembly_report_component_values_match_sections() {
 #[test]
 fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
     let _lock = crate::runtime::tests::env_cache_lock_acquire();
-    let config_with_env = bamboo_llm::Config {
-        env_vars: vec![bamboo_config::EnvVarEntry {
-            name: "TEST_PROMPT_ENVELOPE_TOKEN".to_string(),
-            value: "hidden-value".to_string(),
-            secret: true,
-            value_encrypted: None,
-            description: Some("Prompt envelope token".to_string()),
-        }],
-        ..bamboo_llm::Config::default()
-    };
+    let mut config_with_env = bamboo_llm::Config::default();
+    config_with_env.env_vars = vec![bamboo_config::EnvVarEntry {
+        name: "TEST_PROMPT_ENVELOPE_TOKEN".to_string(),
+        value: "hidden-value".to_string(),
+        secret: true,
+        value_encrypted: None,
+        description: Some("Prompt envelope token".to_string()),
+    }];
     config_with_env.publish_env_vars();
 
     let workspace = std::env::temp_dir().join("bamboo-prompt-envelope-workspace");

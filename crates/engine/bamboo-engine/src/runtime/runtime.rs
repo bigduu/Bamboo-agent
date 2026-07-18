@@ -702,7 +702,7 @@ impl AgentRuntime {
             image_fallback,
             app_data_dir,
             prompt_memory_flags: config
-                .memory
+                .memory()
                 .as_ref()
                 .map(PromptMemoryFlags::from)
                 .unwrap_or_default(),

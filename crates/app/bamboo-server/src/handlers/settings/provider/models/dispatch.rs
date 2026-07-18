@@ -27,7 +27,7 @@ pub(super) async fn fetch_models_for_provider(
         "copilot" => fetch_copilot_models(app_state).await,
         "openai" => {
             let openai =
-                config.providers.openai.as_ref().ok_or_else(|| {
+                config.providers().openai.as_ref().ok_or_else(|| {
                     AppError::BadRequest("OpenAI configuration required".to_string())
                 })?;
             ensure_api_key(openai.api_key.as_str())?;
@@ -41,7 +41,7 @@ pub(super) async fn fetch_models_for_provider(
             .await
         }
         "anthropic" => {
-            let anthropic = config.providers.anthropic.as_ref().ok_or_else(|| {
+            let anthropic = config.providers().anthropic.as_ref().ok_or_else(|| {
                 AppError::BadRequest("Anthropic configuration required".to_string())
             })?;
             ensure_api_key(anthropic.api_key.as_str())?;
@@ -56,7 +56,7 @@ pub(super) async fn fetch_models_for_provider(
         }
         "gemini" => {
             let gemini =
-                config.providers.gemini.as_ref().ok_or_else(|| {
+                config.providers().gemini.as_ref().ok_or_else(|| {
                     AppError::BadRequest("Gemini configuration required".to_string())
                 })?;
             ensure_api_key(gemini.api_key.as_str())?;

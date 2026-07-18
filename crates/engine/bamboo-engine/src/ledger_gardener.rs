@@ -150,7 +150,7 @@ async fn run_ledger_gardener_once_with_store(
     ledger: &LedgerStore,
 ) -> Result<Option<LedgerGardenerRunResult>, String> {
     let config_snapshot = ctx.dream.config.read().await.clone();
-    let memory_cfg = config_snapshot.memory.clone().unwrap_or_default();
+    let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
     if !memory_cfg.ledger_gardener_enabled {
         return Ok(None);
     }
@@ -431,7 +431,7 @@ pub fn spawn_ledger_gardener_task(ctx: LedgerGardenerContext) {
         let interval_secs = {
             let guard = ctx.dream.config.read().await;
             guard
-                .memory
+                .memory()
                 .as_ref()
                 .map(|memory| memory.ledger_gardener_interval_secs)
                 .filter(|secs| *secs > 0)
@@ -480,6 +480,12 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use futures::stream;
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
+
+    fn config_with_memory(memory: bamboo_config::MemoryConfig) -> Config {
+        let mut config = Config::default();
+        *config.memory_mut() = Some(memory);
+        config
+    }
 
     fn record(kind: RecordKind, status: RecordStatus) -> LedgerRecord {
         let mut record = LedgerRecord::new("rec_test", kind, "Test record");
@@ -648,13 +654,12 @@ mod tests {
                 "[{\"title\": \"Runs every morning\", \"content\": \"User keeps a morning run habit.\", \"type\": \"user\", \"tags\": [\"health\"]}]".to_string(),
             ])),
         });
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let bridge = Arc::new(RecordingBridge::default());
         let ctx = LedgerGardenerContext {
             dream: AutoDreamContext {

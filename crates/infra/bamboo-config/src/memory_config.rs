@@ -13,6 +13,19 @@ pub const FILE_NAME: &str = "memory.json";
 #[derive(Debug, Clone, Default)]
 pub struct MemoryConfigModule(pub Option<MemoryConfig>);
 
+impl std::ops::Deref for MemoryConfigModule {
+    type Target = Option<MemoryConfig>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MemoryConfigModule {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl MemoryConfigModule {
     pub(crate) fn load_sync(&mut self, data_dir: &Path) -> Result<bool> {
         if let Some(value) = load_sidecar(&data_dir.join(FILE_NAME))? {

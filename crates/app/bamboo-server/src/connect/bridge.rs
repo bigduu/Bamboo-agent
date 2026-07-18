@@ -1178,7 +1178,7 @@ mod tests {
         {
             let mut cfg = state.config.write().await;
             cfg.provider = "openai".to_string();
-            cfg.providers.openai = Some(bamboo_config::OpenAIConfig {
+            cfg.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
                 api_key: String::new(),
                 api_key_from_env: false,
                 api_key_encrypted: None,

@@ -88,6 +88,18 @@ pub fn resolve_default_run_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! test_config {
+        (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+        (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+        (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+        (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut config = Config::default();
+            $(test_config!(@assign config, $field, $value);)*
+            config
+        }};
+    }
     use bamboo_agent_core::tools::ToolSchema;
     use bamboo_agent_core::Message;
     use bamboo_config::{DefaultsConfig, FeatureFlags, OpenAIConfig, ProviderConfigs};
@@ -129,7 +141,7 @@ mod tests {
             sub_agent: None,
             subagent_models: HashMap::new(),
         };
-        Config {
+        test_config! {
             provider: "openai".to_string(),
             features: FeatureFlags {
                 provider_model_ref: true,
@@ -144,7 +156,6 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(defaults),
-            ..Config::default()
         }
     }
 

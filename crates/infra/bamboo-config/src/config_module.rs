@@ -243,12 +243,12 @@ mod tests {
 
         let config = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
         assert_eq!(
-            config.memory.unwrap().background_model.as_deref(),
+            config.memory.as_ref().unwrap().background_model.as_deref(),
             Some("sidecar")
         );
         assert_eq!(config.subagents.max_concurrent, Some(9));
         assert_eq!(
-            config.providers.openai.unwrap().model.as_deref(),
+            config.providers.openai.as_ref().unwrap().model.as_deref(),
             Some("sidecar")
         );
     }
@@ -274,7 +274,7 @@ mod tests {
             .collect();
 
         let mut changed = config;
-        changed.memory = Some(MemoryConfig {
+        changed.memory.0 = Some(MemoryConfig {
             background_model: Some("new-memory".into()),
             ..MemoryConfig::default()
         });
@@ -325,7 +325,7 @@ mod tests {
 
         let config = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
         assert_eq!(
-            config.memory.unwrap().background_model.as_deref(),
+            config.memory.as_ref().unwrap().background_model.as_deref(),
             Some("recovered")
         );
         assert_eq!(
@@ -413,13 +413,11 @@ mod tests {
         // The independently persisted modules must already be durable so a
         // failed root rewrite cannot discard the migration source of truth.
         std::fs::create_dir(dir.path().join("config.json")).unwrap();
-        let config = Config {
-            memory: Some(MemoryConfig {
-                background_model: Some("durable-before-root".into()),
-                ..MemoryConfig::default()
-            }),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.memory.0 = Some(MemoryConfig {
+            background_model: Some("durable-before-root".into()),
+            ..MemoryConfig::default()
+        });
 
         assert!(config.save_to_dir(dir.path().to_path_buf()).is_err());
         let memory: MemoryConfig =

@@ -76,7 +76,7 @@ pub(super) fn provider_validation_issue(
     match config.provider.as_str() {
         "openai" => provider_issue(
             config
-                .providers
+                .providers()
                 .openai
                 .as_ref()
                 .map(|provider| {
@@ -94,7 +94,7 @@ pub(super) fn provider_validation_issue(
         ),
         "anthropic" => provider_issue(
             config
-                .providers
+                .providers()
                 .anthropic
                 .as_ref()
                 .map(|provider| {
@@ -112,7 +112,7 @@ pub(super) fn provider_validation_issue(
         ),
         "gemini" => provider_issue(
             config
-                .providers
+                .providers()
                 .gemini
                 .as_ref()
                 .map(|provider| {

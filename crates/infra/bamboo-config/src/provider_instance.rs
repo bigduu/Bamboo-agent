@@ -170,12 +170,7 @@ mod tests {
     /// `Config::default()` is in-memory only — no filesystem/env bleed — so the
     /// remaining fields come from clean defaults.)
     fn clean_test_config() -> Config {
-        Config {
-            providers: crate::config::ProviderConfigs::default(),
-            provider_instances: std::collections::HashMap::new(),
-            default_provider_instance: None,
-            ..Config::default()
-        }
+        Config::default()
     }
 
     #[test]

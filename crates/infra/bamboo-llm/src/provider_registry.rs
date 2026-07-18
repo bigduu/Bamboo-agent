@@ -353,9 +353,10 @@ impl ProviderRegistry {
 /// Project an instance's credentials into the legacy `Config` provider slots
 /// so that `create_provider_by_name` can consume them.
 fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConfig) {
+    let providers = config.providers_mut();
     match instance.provider_type.as_str() {
         "openai" => {
-            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+            providers.openai = Some(bamboo_config::OpenAIConfig {
                 api_key: instance.api_key.clone(),
                 // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
                 // override, so it may be persisted normally. #253.
@@ -372,7 +373,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
             });
         }
         "anthropic" => {
-            config.providers.anthropic = Some(bamboo_config::AnthropicConfig {
+            providers.anthropic = Some(bamboo_config::AnthropicConfig {
                 api_key: instance.api_key.clone(),
                 // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
                 // override, so it may be persisted normally. #253.
@@ -397,7 +398,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
             });
         }
         "gemini" => {
-            config.providers.gemini = Some(bamboo_config::GeminiConfig {
+            providers.gemini = Some(bamboo_config::GeminiConfig {
                 api_key: instance.api_key.clone(),
                 // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
                 // override, so it may be persisted normally. #253.
@@ -414,8 +415,8 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
         }
         "copilot" => {
             // Copilot uses device auth; just set the model overrides.
-            let existing = config.providers.copilot.take();
-            config.providers.copilot = Some(bamboo_config::CopilotConfig {
+            let existing = providers.copilot.take();
+            providers.copilot = Some(bamboo_config::CopilotConfig {
                 enabled: true,
                 headless_auth: existing.as_ref().map(|c| c.headless_auth).unwrap_or(false),
                 model: instance.model.clone(),
@@ -428,7 +429,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
             });
         }
         "bodhi" => {
-            config.providers.bodhi = Some(bamboo_config::BodhiConfig {
+            providers.bodhi = Some(bamboo_config::BodhiConfig {
                 api_key: instance.api_key.clone(),
                 api_key_encrypted: instance.api_key_encrypted.clone(),
                 base_url: instance.base_url.clone(),
@@ -463,25 +464,25 @@ fn provider_is_configured(config: &Config, name: &str) -> bool {
     match name {
         "copilot" => true, // Copilot can be attempted without explicit config
         "openai" => config
-            .providers
+            .providers()
             .openai
             .as_ref()
             .map(|c| !c.api_key.is_empty())
             .unwrap_or(false),
         "anthropic" => config
-            .providers
+            .providers()
             .anthropic
             .as_ref()
             .map(|c| !c.api_key.is_empty())
             .unwrap_or(false),
         "gemini" => config
-            .providers
+            .providers()
             .gemini
             .as_ref()
             .map(|c| !c.api_key.is_empty())
             .unwrap_or(false),
         "bodhi" => config
-            .providers
+            .providers()
             .bodhi
             .as_ref()
             .map(|c| !c.api_key.is_empty())
@@ -513,12 +514,10 @@ mod tests {
 
     #[test]
     fn test_provider_is_configured() {
-        let config = Config {
-            providers: bamboo_config::ProviderConfigs {
-                openai: Some(test_openai_config()),
-                ..bamboo_config::ProviderConfigs::default()
-            },
-            ..Config::default()
+        let mut config = Config::default();
+        *config.providers_mut() = bamboo_config::ProviderConfigs {
+            openai: Some(test_openai_config()),
+            ..bamboo_config::ProviderConfigs::default()
         };
 
         assert!(provider_is_configured(&config, "copilot"));
@@ -529,16 +528,14 @@ mod tests {
 
     #[test]
     fn test_provider_is_configured_empty_key() {
-        let config = Config {
-            providers: bamboo_config::ProviderConfigs {
-                openai: Some(OpenAIConfig {
-                    api_key: String::new(),
-                    api_key_from_env: false,
-                    ..test_openai_config()
-                }),
-                ..bamboo_config::ProviderConfigs::default()
-            },
-            ..Config::default()
+        let mut config = Config::default();
+        *config.providers_mut() = bamboo_config::ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: String::new(),
+                api_key_from_env: false,
+                ..test_openai_config()
+            }),
+            ..bamboo_config::ProviderConfigs::default()
         };
 
         assert!(!provider_is_configured(&config, "openai"));
@@ -610,7 +607,7 @@ mod tests {
         apply_instance_to_config(&mut config, &instance);
 
         let openai = config
-            .providers
+            .providers()
             .openai
             .as_ref()
             .expect("openai should be set");
@@ -653,7 +650,7 @@ mod tests {
         apply_instance_to_config(&mut config, &instance);
 
         let anthropic = config
-            .providers
+            .providers()
             .anthropic
             .as_ref()
             .expect("anthropic should be set");
@@ -685,7 +682,7 @@ mod tests {
         apply_instance_to_config(&mut config, &instance);
 
         let anthropic = config
-            .providers
+            .providers()
             .anthropic
             .as_ref()
             .expect("anthropic should be set");

@@ -3,15 +3,26 @@ use std::collections::BTreeMap;
 use bamboo_config::{OpenAIConfig, ProviderConfigs};
 use bamboo_llm::Config;
 
+macro_rules! test_config {
+    (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+    (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+    (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+    (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+    ($($field:ident: $value:expr),* $(,)?) => {{
+        let mut config = Config::default();
+        $(test_config!(@assign config, $field, $value);)*
+        config
+    }};
+}
+
 use super::types::ProxyAuthPayload;
 use super::validation::provider_validation_issue;
 
 #[test]
 fn provider_validation_issue_returns_missing_key_path_for_unconfigured_openai() {
-    let config = Config {
+    let config = test_config! {
         provider: "openai".to_string(),
         providers: ProviderConfigs::default(),
-        ..Default::default()
     };
 
     let (path, message) = provider_validation_issue(&config, "invalid".to_string());
@@ -21,7 +32,7 @@ fn provider_validation_issue_returns_missing_key_path_for_unconfigured_openai() 
 
 #[test]
 fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
-    let config = Config {
+    let config = test_config! {
         provider: "openai".to_string(),
         providers: ProviderConfigs {
             openai: Some(OpenAIConfig {
@@ -39,7 +50,6 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
             }),
             ..Default::default()
         },
-        ..Default::default()
     };
 
     let (path, message) = provider_validation_issue(&config, "invalid provider setup".to_string());

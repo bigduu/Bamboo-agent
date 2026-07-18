@@ -70,16 +70,14 @@ mod tests {
     use bamboo_agent_core::{Message, Session};
 
     fn publish_test_env_context() {
-        let config = bamboo_llm::Config {
-            env_vars: vec![bamboo_config::EnvVarEntry {
-                name: "TEST_TOOL_TOKEN".to_string(),
-                value: "hidden-value".to_string(),
-                secret: true,
-                value_encrypted: None,
-                description: Some("Snapshot test token".to_string()),
-            }],
-            ..bamboo_llm::Config::default()
-        };
+        let mut config = bamboo_llm::Config::default();
+        config.env_vars = vec![bamboo_config::EnvVarEntry {
+            name: "TEST_TOOL_TOKEN".to_string(),
+            value: "hidden-value".to_string(),
+            secret: true,
+            value_encrypted: None,
+            description: Some("Snapshot test token".to_string()),
+        }];
         config.publish_env_vars();
     }
 

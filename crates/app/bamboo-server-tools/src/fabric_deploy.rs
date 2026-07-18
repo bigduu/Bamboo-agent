@@ -124,7 +124,7 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             (
                 self.node_snapshot(&cfg, node_id)?,
-                cfg.subagents.broker.clone(),
+                cfg.subagents().broker.clone(),
             )
         };
         if !node.enabled {
@@ -431,7 +431,7 @@ impl FabricDeployer {
             let cfg = self.config.read().await;
             (
                 self.node_snapshot(&cfg, node_id)?,
-                cfg.subagents.broker.clone(),
+                cfg.subagents().broker.clone(),
             )
         };
         let current = node.state.clone().unwrap_or_default();
@@ -1486,7 +1486,7 @@ mod health_check_tests {
     fn deployer_with(nodes: Vec<Node>, endpoint: &str) -> Arc<FabricDeployer> {
         let mut cfg = Config::default();
         cfg.cluster_fabric.nodes = nodes;
-        cfg.subagents.broker = Some(BrokerClientConfig {
+        cfg.subagents_mut().broker = Some(BrokerClientConfig {
             endpoint: endpoint.into(),
             token: "t".into(),
             token_encrypted: None,

@@ -475,8 +475,8 @@ impl BambooRuntimeExecutor {
                 // found via `current_exe()` inside build_local_actor_runner.
                 {
                     let mut cfg = config_for_stack.write().await;
-                    if cfg.subagents.fabric_dir.is_none() {
-                        cfg.subagents.fabric_dir = Some(spec.fabric_dir.clone());
+                    if cfg.subagents().fabric_dir.is_none() {
+                        cfg.subagents_mut().fabric_dir = Some(spec.fabric_dir.clone());
                     }
                 }
                 let external_runner = {
@@ -1196,7 +1196,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.provider, "anthropic");
-        let slot = config.providers.anthropic.expect("anthropic slot");
+        let slot = config
+            .providers()
+            .anthropic
+            .as_ref()
+            .expect("anthropic slot");
         assert_eq!(slot.api_key, "sk-test");
         assert_eq!(slot.model.as_deref(), Some("claude-test"));
     }
@@ -1208,7 +1212,7 @@ mod tests {
             build_isolated_config("openai", spec.secrets.provider_credentials.first(), &spec)
                 .unwrap();
         assert_eq!(config.provider, "openai");
-        let slot = config.providers.openai.expect("openai slot");
+        let slot = config.providers().openai.as_ref().expect("openai slot");
         assert_eq!(slot.api_key, "sk-oa");
     }
 

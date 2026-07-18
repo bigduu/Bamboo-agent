@@ -373,7 +373,7 @@ impl AppState {
         // with bounded backoff after a transient WebSocket drop instead of
         // permanently disabling proxied tools for the worker's lifetime.
         let mcp_proxy_shutdown = tokio_util::sync::CancellationToken::new();
-        if let Some(broker) = config_snapshot.subagents.broker.clone() {
+        if let Some(broker) = config_snapshot.subagents().broker.clone() {
             if !broker.endpoint.trim().is_empty() {
                 let backend: std::sync::Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
                     std::sync::Arc::new(bamboo_mcp::executor::McpToolExecutor::new(
@@ -391,7 +391,7 @@ impl AppState {
                 // set so a typo in `config.json` is surfaced at boot instead of
                 // silently granting nothing for the intended tool.
                 let role_entries: Vec<(String, Vec<String>)> = config_snapshot
-                    .subagents
+                    .subagents()
                     .mcp_role_allowlist
                     .iter()
                     .map(|e| (e.role.clone(), e.tools.clone()))
@@ -591,7 +591,7 @@ impl AppState {
             subagent_model_resolver,
             config.clone(),
             provider_registry.clone(),
-            config_snapshot.subagents.broker.clone(),
+            config_snapshot.subagents().broker.clone(),
             fabric_deployer.clone(),
             notification_relay_deps.clone(),
         );
@@ -802,7 +802,7 @@ async fn maybe_embed_broker(
         let endpoint = external.endpoint.trim().to_string();
         if broker_endpoint_reachable(&endpoint).await {
             tracing::info!(%endpoint, "using external broker from broker.json");
-            config.subagents.broker = Some(external);
+            config.subagents_mut().broker = Some(external);
             return None;
         }
         tracing::warn!(
@@ -843,7 +843,7 @@ async fn maybe_embed_broker(
 
     // Set the endpoint IN MEMORY ONLY — `subagents.broker` is `#[serde(skip)]`, so
     // this ephemeral loopback port is regenerated every boot and never touches disk.
-    config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
+    config.subagents_mut().broker = Some(bamboo_config::BrokerClientConfig {
         endpoint: format!("ws://127.0.0.1:{port}"),
         token,
         token_encrypted: None,

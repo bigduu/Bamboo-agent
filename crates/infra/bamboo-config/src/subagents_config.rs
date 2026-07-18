@@ -13,6 +13,19 @@ pub const FILE_NAME: &str = "subagents.json";
 #[derive(Debug, Clone, Default)]
 pub struct SubagentsConfigModule(pub SubagentsConfig);
 
+impl std::ops::Deref for SubagentsConfigModule {
+    type Target = SubagentsConfig;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SubagentsConfigModule {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl SubagentsConfigModule {
     pub(crate) fn load_sync(&mut self, data_dir: &Path) -> Result<bool> {
         if let Some(value) = load_sidecar(&data_dir.join(FILE_NAME))? {

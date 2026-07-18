@@ -133,7 +133,10 @@ pub(super) async fn redacted_config_json(
     // "configured" (mirrors the provider-API-key refresh above).
     config_for_response.refresh_notifications_encrypted()?;
     config_for_response.refresh_connect_platform_tokens_encrypted()?;
-    let value = serde_json::to_value(&config_for_response)?;
+    // The settings API and public `Serialize for Config` both retain the full
+    // compatibility shape, including sidecar domains. Only `save_to_dir`
+    // persists the modular root DTO separately from those sidecars.
+    let value = config_for_response.to_compatibility_value()?;
     let mut redacted = redact_config_for_api(value, &config_for_response);
 
     if let Some(model_limits) = read_model_limits_file(app_data_dir).await? {

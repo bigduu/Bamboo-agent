@@ -1144,7 +1144,8 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
 /// Contains all settings needed to run the agent, including provider credentials,
 /// proxy settings, model selection, and server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+#[doc(hidden)]
+pub struct ConfigValues {
     /// HTTP proxy URL (e.g., `http://proxy.example.com:8080`)
     #[serde(default)]
     pub http_proxy: String,
@@ -1173,10 +1174,6 @@ pub struct Config {
     /// Default model assignments (used when features.provider_model_ref is enabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<DefaultsConfig>,
-
-    /// Provider-specific configurations (legacy, single-instance per type).
-    #[serde(default)]
-    pub providers: ProviderConfigs,
 
     /// Multi-instance provider configurations keyed by instance id.
     ///
@@ -1253,20 +1250,6 @@ pub struct Config {
     #[serde(default)]
     pub features: FeatureFlags,
 
-    /// Memory/background summarization settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<MemoryConfig>,
-
-    /// Sub-agent execution settings.
-    ///
-    /// Sub-agents ALWAYS run as independent actor subprocesses (crash isolation,
-    /// true parallelism) — the in-process runtime was removed, so there is no
-    /// `runtime` toggle (a stray `runtime`/`overrides` key in an old config is
-    /// silently ignored). Most users need nothing here; the fields below
-    /// (`max_concurrent`, `broker`, remote/schedulable placements) are advanced.
-    #[serde(default)]
-    pub subagents: SubagentsConfig,
-
     /// Config-level default per-run token/tool-call/subagent budget (issue
     /// #221). `None` fields are unlimited. A per-request `ExecuteRequest`
     /// override may only tighten these ceilings, never loosen them; see
@@ -1318,19 +1301,441 @@ pub struct Config {
     /// typed (de)serialization.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
 
-    /// In-memory-only marker set when this `Config` was recovered from a
-    /// corrupt `config.json` at load time (salvage / `.bak` / defaults) and
-    /// has not yet been confirmed. Never persisted (`#[serde(skip)]`), so
-    /// every clean load starts at `None` and a fresh process only ever sees
-    /// it populated right after `Config::from_data_dir` hit corruption.
+impl Default for ConfigValues {
+    fn default() -> Self {
+        Self {
+            http_proxy: String::new(),
+            https_proxy: String::new(),
+            proxy_auth: None,
+            proxy_auth_encrypted: None,
+            headless_auth: false,
+            run_budget: RunBudgetConfig::default(),
+            cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
+            provider: default_provider(),
+            provider_instances: HashMap::new(),
+            default_provider_instance: None,
+            server: ServerConfig::default(),
+            keyword_masking: KeywordMaskingConfig::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            gemini_model_mapping: GeminiModelMapping::default(),
+            hooks: HooksConfig::default(),
+            tools: ToolsConfig::default(),
+            skills: SkillsConfig::default(),
+            env_vars: Vec::new(),
+            default_work_area: None,
+            access_control: None,
+            features: FeatureFlags::default(),
+            defaults: None,
+            mcp: bamboo_domain::mcp_config::McpConfig::default(),
+            notifications: NotificationsConfig::default(),
+            connect: ConnectConfig::default(),
+            plugin_trust: PluginTrustConfig::default(),
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// Network-facing root configuration. Flattening preserves the historical
+/// top-level JSON keys while making the persisted root structurally modular.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NetworkConfigSection {
+    #[serde(default)]
+    http_proxy: String,
+    #[serde(default)]
+    https_proxy: String,
+    #[serde(skip_serializing)]
+    proxy_auth: Option<ProxyAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_auth_encrypted: Option<String>,
+    #[serde(default)]
+    headless_auth: bool,
+    #[serde(default)]
+    server: ServerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderRoutingConfigSection {
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    defaults: Option<DefaultsConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    provider_instances: HashMap<String, ProviderInstanceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_provider_instance: Option<String>,
+}
+
+impl Default for ProviderRoutingConfigSection {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            defaults: None,
+            provider_instances: HashMap::new(),
+            default_provider_instance: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModelBehaviorConfigSection {
+    #[serde(default)]
+    keyword_masking: KeywordMaskingConfig,
+    #[serde(default)]
+    anthropic_model_mapping: AnthropicModelMapping,
+    #[serde(default)]
+    gemini_model_mapping: GeminiModelMapping,
+    #[serde(default)]
+    hooks: HooksConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolingConfigSection {
+    #[serde(default, skip_serializing_if = "ToolsConfig::is_empty")]
+    tools: ToolsConfig,
+    #[serde(default, skip_serializing_if = "SkillsConfig::is_empty")]
+    skills: SkillsConfig,
+    #[serde(default, rename = "mcpServers", alias = "mcp")]
+    mcp: bamboo_domain::mcp_config::McpConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WorkspaceConfigSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    env_vars: Vec<EnvVarEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_work_area: Option<DefaultWorkAreaConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_control: Option<AccessControlConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ExecutionConfigSection {
+    #[serde(default)]
+    features: FeatureFlags,
+    #[serde(default)]
+    run_budget: RunBudgetConfig,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty"
+    )]
+    cluster_fabric: crate::cluster_fabric::ClusterFabricConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IntegrationConfigSection {
+    #[serde(default)]
+    notifications: NotificationsConfig,
+    #[serde(default, skip_serializing_if = "connect_config_is_empty")]
+    connect: ConnectConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PluginSecurityConfigSection {
+    #[serde(default)]
+    plugin_trust: PluginTrustConfig,
+}
+
+// Count declarations from the same field list that defines each structural
+// budgeted type, so the constants cannot drift from the actual structs.
+macro_rules! count_fields {
+    ($($field:ident),* $(,)?) => {
+        <[()]>::len(&[$(count_fields!(@one $field)),*])
+    };
+    (@one $field:ident) => { () };
+}
+
+macro_rules! define_counted_struct {
+    (
+        $(#[$struct_meta:meta])*
+        $visibility:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_visibility:vis $field:ident: $field_type:ty
+            ),* $(,)?
+        }
+        count $count_visibility:vis $count_name:ident;
+    ) => {
+        $(#[$struct_meta])*
+        $visibility struct $name {
+            $(
+                $(#[$field_meta])*
+                $field_visibility $field: $field_type,
+            )*
+        }
+
+        $count_visibility const $count_name: usize = count_fields!($($field),*);
+    };
+}
+
+define_counted_struct! {
+    /// The root-only persistence DTO written to `config.json`.
     ///
-    /// [`Config::save_to_dir`] refuses to overwrite `config.json` while this
-    /// is `Some` and not `confirmed` — the corrupt original stays exactly as
-    /// it was on disk until [`Config::confirm_recovery`] (or
-    /// [`Config::confirm_recovery_and_save_to_dir`]) is called. #153.
-    #[serde(skip)]
-    pub recovery_status: Option<ConfigRecoveryStatus>,
+    /// Every section is flattened so existing documents keep their historical
+    /// top-level shape. The structural field count is nevertheless nine rather
+    /// than the Phase-#39 baseline of 31.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct ConfigRoot {
+        #[serde(flatten)]
+        network: NetworkConfigSection,
+        #[serde(flatten)]
+        provider_routing: ProviderRoutingConfigSection,
+        #[serde(flatten)]
+        model_behavior: ModelBehaviorConfigSection,
+        #[serde(flatten)]
+        tooling: ToolingConfigSection,
+        #[serde(flatten)]
+        workspace: WorkspaceConfigSection,
+        #[serde(flatten)]
+        execution: ExecutionConfigSection,
+        #[serde(flatten)]
+        integrations: IntegrationConfigSection,
+        #[serde(flatten)]
+        plugin_security: PluginSecurityConfigSection,
+        #[serde(default, flatten)]
+        extra: BTreeMap<String, Value>,
+    }
+    count pub PERSISTED_ROOT_FIELD_COUNT;
+}
+
+impl From<ConfigValues> for ConfigRoot {
+    fn from(values: ConfigValues) -> Self {
+        // Deliberately exhaustive: adding a runtime compatibility field must
+        // update its persisted section mapping or this conversion stops compiling.
+        let ConfigValues {
+            http_proxy,
+            https_proxy,
+            proxy_auth,
+            proxy_auth_encrypted,
+            headless_auth,
+            provider,
+            defaults,
+            provider_instances,
+            default_provider_instance,
+            server,
+            keyword_masking,
+            anthropic_model_mapping,
+            gemini_model_mapping,
+            hooks,
+            tools,
+            skills,
+            env_vars,
+            default_work_area,
+            access_control,
+            features,
+            run_budget,
+            cluster_fabric,
+            mcp,
+            notifications,
+            connect,
+            plugin_trust,
+            extra,
+        } = values;
+
+        Self {
+            network: NetworkConfigSection {
+                http_proxy,
+                https_proxy,
+                proxy_auth,
+                proxy_auth_encrypted,
+                headless_auth,
+                server,
+            },
+            provider_routing: ProviderRoutingConfigSection {
+                provider,
+                defaults,
+                provider_instances,
+                default_provider_instance,
+            },
+            model_behavior: ModelBehaviorConfigSection {
+                keyword_masking,
+                anthropic_model_mapping,
+                gemini_model_mapping,
+                hooks,
+            },
+            tooling: ToolingConfigSection { tools, skills, mcp },
+            workspace: WorkspaceConfigSection {
+                env_vars,
+                default_work_area,
+                access_control,
+            },
+            execution: ExecutionConfigSection {
+                features,
+                run_budget,
+                cluster_fabric,
+            },
+            integrations: IntegrationConfigSection {
+                notifications,
+                connect,
+            },
+            plugin_security: PluginSecurityConfigSection { plugin_trust },
+            extra,
+        }
+    }
+}
+
+impl From<ConfigRoot> for ConfigValues {
+    fn from(root: ConfigRoot) -> Self {
+        // Keep every root and section destructure exhaustive so a newly added
+        // persisted field cannot be silently omitted from the runtime view.
+        let ConfigRoot {
+            network,
+            provider_routing,
+            model_behavior,
+            tooling,
+            workspace,
+            execution,
+            integrations,
+            plugin_security,
+            extra,
+        } = root;
+        let NetworkConfigSection {
+            http_proxy,
+            https_proxy,
+            proxy_auth,
+            proxy_auth_encrypted,
+            headless_auth,
+            server,
+        } = network;
+        let ProviderRoutingConfigSection {
+            provider,
+            defaults,
+            provider_instances,
+            default_provider_instance,
+        } = provider_routing;
+        let ModelBehaviorConfigSection {
+            keyword_masking,
+            anthropic_model_mapping,
+            gemini_model_mapping,
+            hooks,
+        } = model_behavior;
+        let ToolingConfigSection { tools, skills, mcp } = tooling;
+        let WorkspaceConfigSection {
+            env_vars,
+            default_work_area,
+            access_control,
+        } = workspace;
+        let ExecutionConfigSection {
+            features,
+            run_budget,
+            cluster_fabric,
+        } = execution;
+        let IntegrationConfigSection {
+            notifications,
+            connect,
+        } = integrations;
+        let PluginSecurityConfigSection { plugin_trust } = plugin_security;
+
+        Self {
+            http_proxy,
+            https_proxy,
+            proxy_auth,
+            proxy_auth_encrypted,
+            headless_auth,
+            provider,
+            defaults,
+            provider_instances,
+            default_provider_instance,
+            server,
+            keyword_masking,
+            anthropic_model_mapping,
+            gemini_model_mapping,
+            hooks,
+            tools,
+            skills,
+            env_vars,
+            default_work_area,
+            access_control,
+            features,
+            run_budget,
+            cluster_fabric,
+            mcp,
+            notifications,
+            connect,
+            plugin_trust,
+            extra,
+        }
+    }
+}
+
+define_counted_struct! {
+    /// Runtime configuration facade. Phase-1 sidecar domains are typed modules;
+    /// the remaining values keep field-access compatibility through `Deref`.
+    #[derive(Debug, Clone)]
+    pub struct Config {
+        values: ConfigValues,
+        pub(crate) memory: crate::MemoryConfigModule,
+        pub(crate) subagents: crate::SubagentsConfigModule,
+        pub(crate) providers: crate::ProviderConfigsModule,
+        recovery_status: Option<ConfigRecoveryStatus>,
+    }
+    count pub CONFIG_FIELD_COUNT;
+}
+
+/// Auditable structural budgets from Issue #590.
+pub const PHASE_39_CONFIG_FIELD_BASELINE: usize = 31;
+const _: () = assert!(CONFIG_FIELD_COUNT * 2 <= PHASE_39_CONFIG_FIELD_BASELINE);
+const _: () = assert!(PERSISTED_ROOT_FIELD_COUNT * 2 <= PHASE_39_CONFIG_FIELD_BASELINE);
+
+impl std::ops::Deref for Config {
+    type Target = ConfigValues;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl std::ops::DerefMut for Config {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+impl Serialize for Config {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_compatibility_value()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let mut value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("config must be a JSON object"))?;
+        let memory = object
+            .remove("memory")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        let subagents = object
+            .remove("subagents")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        let providers = object
+            .remove("providers")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        let root: ConfigRoot = serde_json::from_value(value).map_err(D::Error::custom)?;
+
+        Ok(Self::from_parts(root.into(), memory, subagents, providers))
+    }
 }
 
 /// Where a [`ConfigRecoveryStatus`]'s recovered values came from. #153.
@@ -2151,6 +2556,70 @@ fn prompt_safe_env_vars_cache() -> &'static RwLock<Vec<PromptSafeEnvVarEntry>> {
 }
 
 impl Config {
+    fn from_parts(
+        values: ConfigValues,
+        memory: Option<MemoryConfig>,
+        subagents: SubagentsConfig,
+        providers: ProviderConfigs,
+    ) -> Self {
+        Self {
+            values,
+            memory: crate::MemoryConfigModule(memory),
+            subagents: crate::SubagentsConfigModule(subagents),
+            providers: crate::ProviderConfigsModule(providers),
+            recovery_status: None,
+        }
+    }
+
+    /// Compatibility accessor for independently persisted memory settings.
+    pub fn memory(&self) -> &Option<MemoryConfig> {
+        &self.memory.0
+    }
+
+    pub fn memory_mut(&mut self) -> &mut Option<MemoryConfig> {
+        &mut self.memory.0
+    }
+
+    /// Compatibility accessor for independently persisted sub-agent settings.
+    pub fn subagents(&self) -> &SubagentsConfig {
+        &self.subagents.0
+    }
+
+    pub fn subagents_mut(&mut self) -> &mut SubagentsConfig {
+        &mut self.subagents.0
+    }
+
+    /// Compatibility accessor for independently persisted legacy providers.
+    pub fn providers(&self) -> &ProviderConfigs {
+        &self.providers.0
+    }
+
+    pub fn providers_mut(&mut self) -> &mut ProviderConfigs {
+        &mut self.providers.0
+    }
+
+    /// Build the legacy full-config JSON view used by in-memory patching APIs.
+    ///
+    /// Public serde and patch/dot-path callers retain the historical full
+    /// configuration shape. This value is never the persistence representation:
+    /// [`Config::save_to_dir`] explicitly writes a root-only DTO plus sidecars.
+    pub fn to_compatibility_value(&self) -> serde_json::Result<Value> {
+        let mut value = serde_json::to_value(ConfigRoot::from(self.values.clone()))?;
+        let object = value
+            .as_object_mut()
+            .expect("ConfigRoot always serializes as a JSON object");
+        object.insert("memory".to_string(), serde_json::to_value(self.memory())?);
+        object.insert(
+            "subagents".to_string(),
+            serde_json::to_value(self.subagents())?,
+        );
+        object.insert(
+            "providers".to_string(),
+            serde_json::to_value(self.providers())?,
+        );
+        Ok(value)
+    }
+
     /// Load configuration from file with environment variable overrides
     ///
     /// Configuration loading order:
@@ -2238,25 +2707,25 @@ impl Config {
         // A malformed sidecar is never rewritten during load and the inline
         // value remains available, preventing a bad independent edit from
         // erasing the user's last usable configuration.
-        let mut memory_module = crate::MemoryConfigModule(config.memory.clone());
+        let mut memory_module = config.memory.clone();
         match memory_module.load_sync(&data_dir) {
-            Ok(true) => config.memory = memory_module.0,
+            Ok(true) => config.memory = memory_module,
             Ok(false) => {}
             Err(error) => tracing::warn!(
                 "Failed to load memory.json; using legacy config.json memory: {error}"
             ),
         }
-        let mut subagents_module = crate::SubagentsConfigModule(config.subagents.clone());
+        let mut subagents_module = config.subagents.clone();
         match subagents_module.load_sync(&data_dir) {
-            Ok(true) => config.subagents = subagents_module.0,
+            Ok(true) => config.subagents = subagents_module,
             Ok(false) => {}
             Err(error) => tracing::warn!(
                 "Failed to load subagents.json; using legacy config.json subagents: {error}"
             ),
         }
-        let mut providers_module = crate::ProviderConfigsModule(config.providers.clone());
+        let mut providers_module = config.providers.clone();
         match providers_module.load_sync(&data_dir) {
-            Ok(true) => config.providers = providers_module.0,
+            Ok(true) => config.providers = providers_module,
             Ok(false) => {}
             Err(error) => tracing::warn!(
                 "Failed to load providers.json; using legacy config.json providers: {error}"
@@ -2614,8 +3083,8 @@ impl Config {
         // if it parses, else a fresh default. This makes salvage >= the plain .bak
         // fallback in every case.
         let mut base = Self::load_backup(data_dir)
-            .and_then(|(backup, _generation)| serde_json::to_value(backup).ok())
-            .or_else(|| serde_json::to_value(Self::create_default()).ok())?;
+            .and_then(|(backup, _generation)| backup.to_compatibility_value().ok())
+            .or_else(|| Self::create_default().to_compatibility_value().ok())?;
         let base_obj = base.as_object_mut()?;
 
         let mut salvaged: Vec<String> = Vec::new();
@@ -3044,39 +3513,40 @@ impl Config {
 
     /// Create a default configuration without loading from file
     fn create_default() -> Self {
-        Config {
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            headless_auth: false,
-            subagents: SubagentsConfig::default(),
-            run_budget: RunBudgetConfig::default(),
-            cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
-            provider: default_provider(),
-            providers: ProviderConfigs::default(),
-            provider_instances: HashMap::new(),
-            default_provider_instance: None,
-            server: ServerConfig::default(),
-            keyword_masking: KeywordMaskingConfig::default(),
-            anthropic_model_mapping: AnthropicModelMapping::default(),
-            gemini_model_mapping: GeminiModelMapping::default(),
-            hooks: HooksConfig::default(),
-            tools: ToolsConfig::default(),
-            skills: SkillsConfig::default(),
-            env_vars: Vec::new(),
-            default_work_area: None,
-            access_control: None,
-            features: FeatureFlags::default(),
-            defaults: None,
-            memory: None,
-            mcp: bamboo_domain::mcp_config::McpConfig::default(),
-            notifications: NotificationsConfig::default(),
-            connect: ConnectConfig::default(),
-            plugin_trust: PluginTrustConfig::default(),
-            extra: BTreeMap::new(),
-            recovery_status: None,
-        }
+        Self::from_parts(
+            ConfigValues {
+                http_proxy: String::new(),
+                https_proxy: String::new(),
+                proxy_auth: None,
+                proxy_auth_encrypted: None,
+                headless_auth: false,
+                run_budget: RunBudgetConfig::default(),
+                cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
+                provider: default_provider(),
+                provider_instances: HashMap::new(),
+                default_provider_instance: None,
+                server: ServerConfig::default(),
+                keyword_masking: KeywordMaskingConfig::default(),
+                anthropic_model_mapping: AnthropicModelMapping::default(),
+                gemini_model_mapping: GeminiModelMapping::default(),
+                hooks: HooksConfig::default(),
+                tools: ToolsConfig::default(),
+                skills: SkillsConfig::default(),
+                env_vars: Vec::new(),
+                default_work_area: None,
+                access_control: None,
+                features: FeatureFlags::default(),
+                defaults: None,
+                mcp: bamboo_domain::mcp_config::McpConfig::default(),
+                notifications: NotificationsConfig::default(),
+                connect: ConnectConfig::default(),
+                plugin_trust: PluginTrustConfig::default(),
+                extra: BTreeMap::new(),
+            },
+            None,
+            SubagentsConfig::default(),
+            ProviderConfigs::default(),
+        )
     }
 
     /// Get the full server address (bind:port)
@@ -3091,12 +3561,12 @@ impl Config {
 
     /// Persist only the memory module, leaving every other config file untouched.
     pub fn save_memory_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
-        crate::MemoryConfigModule(self.memory.clone()).save_sync(data_dir)
+        self.memory.save_sync(data_dir)
     }
 
     /// Persist only the sub-agent module, leaving every other config file untouched.
     pub fn save_subagents_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
-        crate::SubagentsConfigModule(self.subagents.clone()).save_sync(data_dir)
+        self.subagents.save_sync(data_dir)
     }
 
     /// Persist only provider configuration. Provider plaintext keys are first
@@ -3104,7 +3574,7 @@ impl Config {
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         let mut config = self.clone();
         config.refresh_provider_api_keys_encrypted()?;
-        crate::ProviderConfigsModule(config.providers).save_sync(data_dir)
+        config.providers.save_sync(data_dir)
     }
 
     /// The pending config-corruption recovery, if `config.json` failed to
@@ -3217,13 +3687,10 @@ impl Config {
         // in-memory struct) — only the serialized DOCUMENT that becomes
         // config.json's bytes has the key stripped, and that's done on the
         // `serde_json::Value` here, not via `#[serde(skip)]` on the field.
-        let mut config_value =
-            serde_json::to_value(&to_save).context("Failed to serialize config to JSON")?;
+        let mut config_value = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+            .context("Failed to serialize root config DTO to JSON")?;
         if let Some(obj) = config_value.as_object_mut() {
             obj.remove("connect");
-            obj.remove("memory");
-            obj.remove("subagents");
-            obj.remove("providers");
         }
         let content = serde_json::to_string_pretty(&config_value)
             .context("Failed to serialize config to JSON")?;
@@ -3234,9 +3701,9 @@ impl Config {
         // either the new sidecars or the untouched inline values. Do this before
         // rotating root backups so a sidecar error cannot consume backup history
         // for a root document that was never rewritten.
-        crate::MemoryConfigModule(to_save.memory.clone()).save_sync(&data_dir)?;
-        crate::SubagentsConfigModule(to_save.subagents.clone()).save_sync(&data_dir)?;
-        crate::ProviderConfigsModule(to_save.providers.clone()).save_sync(&data_dir)?;
+        to_save.memory.save_sync(&data_dir)?;
+        to_save.subagents.save_sync(&data_dir)?;
+        to_save.providers.save_sync(&data_dir)?;
 
         // Back up the current on-disk config (last-known-good) before overwriting,
         // so corruption (a bad/partial write, external edit, disk issue) stays
@@ -4218,25 +4685,23 @@ mod tests {
     #[test]
     fn publish_env_vars_updates_prompt_safe_snapshot_without_secret_values() {
         let _lock = crate::test_support::env_cache_lock_acquire();
-        let config = Config {
-            env_vars: vec![
-                EnvVarEntry {
-                    name: "SECRET_TOKEN".to_string(),
-                    value: "top-secret".to_string(),
-                    secret: true,
-                    value_encrypted: None,
-                    description: Some("Service token".to_string()),
-                },
-                EnvVarEntry {
-                    name: "API_BASE".to_string(),
-                    value: "https://internal.example".to_string(),
-                    secret: false,
-                    value_encrypted: None,
-                    description: Some("Internal API base".to_string()),
-                },
-            ],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([
+            EnvVarEntry {
+                name: "SECRET_TOKEN".to_string(),
+                value: "top-secret".to_string(),
+                secret: true,
+                value_encrypted: None,
+                description: Some("Service token".to_string()),
+            },
+            EnvVarEntry {
+                name: "API_BASE".to_string(),
+                value: "https://internal.example".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: Some("Internal API base".to_string()),
+            },
+        ]);
 
         config.publish_env_vars();
 
@@ -4278,17 +4743,15 @@ mod tests {
         let _lock = crate::test_support::env_cache_lock_acquire();
 
         // Seed the global cache with a marker "owned" by the live config.
-        Config {
-            env_vars: vec![EnvVarEntry {
-                name: "BAMBOO_CACHE_OWNER_40".to_string(),
-                value: "live".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            }],
-            ..Default::default()
-        }
-        .publish_env_vars();
+        let mut live = Config::default();
+        live.env_vars.extend([EnvVarEntry {
+            name: "BAMBOO_CACHE_OWNER_40".to_string(),
+            value: "live".to_string(),
+            secret: false,
+            value_encrypted: None,
+            description: None,
+        }]);
+        live.publish_env_vars();
         assert_eq!(
             Config::current_env_vars()
                 .get("BAMBOO_CACHE_OWNER_40")
@@ -4462,6 +4925,60 @@ mod tests {
         assert_eq!(
             config.https_proxy, "https://kept-from-backup",
             "the backup baseline is preserved for fields not in (or invalid in) the corrupt file"
+        );
+    }
+
+    #[test]
+    fn salvage_preserves_legacy_inline_sidecars_from_backup_baseline() {
+        let temp = TempHome::new();
+        std::fs::write(
+            temp.path.join("config.json.bak"),
+            serde_json::json!({
+                "providers": {
+                    "anthropic": { "model": "claude-backup" }
+                },
+                "memory": {
+                    "auto_dream_enabled": true
+                },
+                "subagents": {
+                    "claude_code_model": "claude-code-backup"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!temp.path.join("providers.json").exists());
+        assert!(!temp.path.join("memory.json").exists());
+        assert!(!temp.path.join("subagents.json").exists());
+
+        let (salvaged, recovered_fields) = Config::salvage_partial(
+            r#"{"providers":"schema-invalid-provider-section"}"#,
+            &temp.path,
+        )
+        .expect("object-shaped corrupt config should be salvageable");
+
+        assert!(
+            recovered_fields.is_empty(),
+            "the schema-invalid provider field must not replace the backup baseline"
+        );
+        assert_eq!(
+            salvaged
+                .providers()
+                .anthropic
+                .as_ref()
+                .and_then(|provider| provider.model.as_deref()),
+            Some("claude-backup")
+        );
+        assert!(
+            salvaged
+                .memory()
+                .as_ref()
+                .expect("backup memory config survives")
+                .auto_dream_enabled
+        );
+        assert_eq!(
+            salvaged.subagents().claude_code_model.as_deref(),
+            Some("claude-code-backup")
         );
     }
 
@@ -5714,7 +6231,7 @@ mod tests {
             extra: BTreeMap::new(),
             api_key_from_env: false,
         });
-        config.memory = Some(MemoryConfig {
+        config.memory.0 = Some(MemoryConfig {
             background_model: Some("memory-fast".to_string()),
             ..MemoryConfig::default()
         });
@@ -5939,8 +6456,8 @@ mod tests {
 
     #[test]
     fn memory_config_preserves_auto_dream_dream_refine_and_prompt_flags() {
-        let config = Config {
-            memory: Some(MemoryConfig {
+        let legacy = serde_json::json!({
+            "memory": MemoryConfig {
                 background_model: Some("dream-fast".to_string()),
                 auto_dream_enabled: true,
                 auto_dream_interval_secs: 900,
@@ -5964,14 +6481,18 @@ mod tests {
                 memory_active_capacity: 500,
                 capacity_max_archivals_per_run: 10,
                 granularity_freshness_gardener_enabled: false,
-            }),
-            ..Config::default()
-        };
+            }
+        });
+        let config: Config = serde_json::from_value(legacy).unwrap();
 
-        let serialized = serde_json::to_string(&config).expect("config should serialize");
-        let roundtrip: Config =
-            serde_json::from_str(&serialized).expect("config should deserialize");
-        let memory = roundtrip.memory.expect("memory config should exist");
+        let serialized = serde_json::to_value(&config).expect("config should serialize");
+        assert!(serialized.get("memory").is_some());
+        let round_tripped: Config = serde_json::from_value(serialized).unwrap();
+        assert!(round_tripped
+            .memory()
+            .as_ref()
+            .is_some_and(|memory| memory.dream_refine_mode));
+        let memory = config.memory.as_ref().expect("memory config should exist");
         assert!(memory.auto_dream_enabled);
         assert!(!memory.project_prompt_injection);
         assert!(!memory.relevant_recall);
@@ -5997,7 +6518,7 @@ mod tests {
         assert_eq!(MemoryConfig::default().memory_active_capacity, 0);
         assert_eq!(MemoryConfig::default().capacity_max_archivals_per_run, 50);
         let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
-        let memory = parsed.memory.unwrap();
+        let memory = parsed.memory.as_ref().unwrap();
         assert_eq!(memory.memory_active_capacity, 0);
         assert_eq!(
             memory.capacity_max_archivals_per_run, 50,
@@ -6018,7 +6539,7 @@ mod tests {
 
         // A config that mentions `memory` but omits the flags must still be ON.
         let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
-        let memory = parsed.memory.expect("memory present");
+        let memory = parsed.memory.as_ref().expect("memory present");
         assert!(
             memory.auto_dream_enabled,
             "auto_dream on when field omitted"
@@ -6031,7 +6552,7 @@ mod tests {
         // An explicit opt-out is still honored.
         let opted_out: Config =
             serde_json::from_str(r#"{"memory":{"gardener_enabled":false}}"#).expect("parse");
-        assert!(!opted_out.memory.unwrap().gardener_enabled);
+        assert!(!opted_out.memory.as_ref().unwrap().gardener_enabled);
     }
 
     #[test]
@@ -6048,6 +6569,7 @@ mod tests {
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
         let memory = config
             .memory
+            .as_ref()
             .expect("memory config should be created by env overrides");
         assert!(!memory.project_prompt_injection);
         assert!(!memory.relevant_recall);
@@ -6136,12 +6658,10 @@ mod tests {
         let target = temp_home.path.join("workspace-default");
         std::fs::create_dir_all(&target).expect("default work area dir should exist");
 
-        let config = Config {
-            default_work_area: Some(DefaultWorkAreaConfig {
-                path: Some("~/workspace-default".to_string()),
-            }),
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.default_work_area.replace(DefaultWorkAreaConfig {
+            path: Some("~/workspace-default".to_string()),
+        });
 
         assert_eq!(config.get_default_work_area_path(), Some(target));
     }
@@ -6152,12 +6672,10 @@ mod tests {
         let temp_home = TempHome::new();
         let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
 
-        let config = Config {
-            default_work_area: Some(DefaultWorkAreaConfig {
-                path: Some("~/missing-default-work-area".to_string()),
-            }),
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.default_work_area.replace(DefaultWorkAreaConfig {
+            path: Some("~/missing-default-work-area".to_string()),
+        });
 
         assert!(config.get_default_work_area_path().is_none());
     }
@@ -6296,6 +6814,77 @@ mod tests {
     }
 
     #[test]
+    fn modular_root_and_public_serde_preserve_legacy_shape() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let input = serde_json::json!({
+            "http_proxy": "http://proxy.example",
+            "provider": "openai",
+            "mcp": { "servers": [] },
+            "future_extension": { "enabled": true },
+            "memory": { "background_model": "memory-model" },
+            "subagents": { "max_concurrent": 7 },
+            "providers": { "openai": { "model": "chat-model" } }
+        });
+
+        let config: Config = serde_json::from_value(input).unwrap();
+        let public = serde_json::to_value(&config).unwrap();
+        assert_eq!(public["http_proxy"], "http://proxy.example");
+        assert!(public.get("mcp").is_none());
+        assert!(public.get("mcpServers").is_some());
+        assert_eq!(public["future_extension"]["enabled"], true);
+        assert_eq!(public["memory"]["background_model"], "memory-model");
+        assert_eq!(public["subagents"]["max_concurrent"], 7);
+        assert_eq!(public["providers"]["openai"]["model"], "chat-model");
+
+        let round_tripped: Config = serde_json::from_value(public).unwrap();
+        assert_eq!(
+            round_tripped
+                .memory()
+                .as_ref()
+                .unwrap()
+                .background_model
+                .as_deref(),
+            Some("memory-model")
+        );
+        assert_eq!(round_tripped.subagents().max_concurrent, Some(7));
+        assert_eq!(
+            round_tripped
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("chat-model")
+        );
+        assert_eq!(round_tripped.extra["future_extension"]["enabled"], true);
+
+        round_tripped.save_to_dir(temp_home.path.clone()).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(temp_home.path.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["http_proxy"], "http://proxy.example");
+        assert!(persisted.get("mcpServers").is_some());
+        assert_eq!(persisted["future_extension"]["enabled"], true);
+        assert!(persisted.get("memory").is_none());
+        assert!(persisted.get("subagents").is_none());
+        assert!(persisted.get("providers").is_none());
+        for internal_section_name in [
+            "network",
+            "provider_routing",
+            "model_behavior",
+            "tooling",
+            "workspace",
+            "execution",
+            "integrations",
+            "plugin_security",
+        ] {
+            assert!(persisted.get(internal_section_name).is_none());
+        }
+    }
+
+    #[test]
     fn config_decrypts_proxy_auth_from_encrypted_field() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
@@ -6321,7 +6910,10 @@ mod tests {
 }}"#
         ));
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        let loaded_auth = config.proxy_auth.expect("proxy auth should be hydrated");
+        let loaded_auth = config
+            .proxy_auth
+            .as_ref()
+            .expect("proxy auth should be hydrated");
         assert_eq!(loaded_auth.username, "user");
         assert_eq!(loaded_auth.password, "pass");
         drop(key_guard);
@@ -6356,7 +6948,10 @@ mod tests {
         ));
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        let loaded_auth = config.proxy_auth.expect("proxy auth should be hydrated");
+        let loaded_auth = config
+            .proxy_auth
+            .as_ref()
+            .expect("proxy auth should be hydrated");
         assert_eq!(loaded_auth.username, "user");
         assert_eq!(loaded_auth.password, "pass");
         drop(key_guard);
@@ -6395,7 +6990,10 @@ mod tests {
         );
 
         let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
-        let loaded_auth = loaded.proxy_auth.expect("proxy auth should be hydrated");
+        let loaded_auth = loaded
+            .proxy_auth
+            .as_ref()
+            .expect("proxy auth should be hydrated");
         assert_eq!(loaded_auth.username, "user");
         assert_eq!(loaded_auth.password, "pass");
         drop(key_guard);
@@ -6448,6 +7046,7 @@ mod tests {
         let openai = loaded
             .providers
             .openai
+            .as_ref()
             .expect("openai config should be present");
         assert_eq!(openai.api_key, "sk-test-provider-key");
 
@@ -6570,39 +7169,37 @@ mod tests {
 
     #[test]
     fn env_vars_as_map_includes_only_non_empty_values() {
-        let config = Config {
-            env_vars: vec![
-                EnvVarEntry {
-                    name: "A".to_string(),
-                    value: "val_a".to_string(),
-                    secret: false,
-                    value_encrypted: None,
-                    description: None,
-                },
-                EnvVarEntry {
-                    name: "B".to_string(),
-                    value: "".to_string(), // empty → should be excluded
-                    secret: true,
-                    value_encrypted: None,
-                    description: None,
-                },
-                EnvVarEntry {
-                    name: "C".to_string(),
-                    value: "  ".to_string(), // whitespace-only → excluded
-                    secret: false,
-                    value_encrypted: None,
-                    description: None,
-                },
-                EnvVarEntry {
-                    name: "D".to_string(),
-                    value: "val_d".to_string(),
-                    secret: true,
-                    value_encrypted: Some("enc".to_string()),
-                    description: Some("desc".to_string()),
-                },
-            ],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([
+            EnvVarEntry {
+                name: "A".to_string(),
+                value: "val_a".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "B".to_string(),
+                value: "".to_string(), // empty → should be excluded
+                secret: true,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "C".to_string(),
+                value: "  ".to_string(), // whitespace-only → excluded
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "D".to_string(),
+                value: "val_d".to_string(),
+                secret: true,
+                value_encrypted: Some("enc".to_string()),
+                description: Some("desc".to_string()),
+            },
+        ]);
 
         let map = config.env_vars_as_map();
         assert_eq!(map.len(), 2);
@@ -6614,25 +7211,23 @@ mod tests {
 
     #[test]
     fn sanitize_env_vars_for_disk_clears_secret_plaintext() {
-        let mut config = Config {
-            env_vars: vec![
-                EnvVarEntry {
-                    name: "PLAIN".to_string(),
-                    value: "visible".to_string(),
-                    secret: false,
-                    value_encrypted: None,
-                    description: None,
-                },
-                EnvVarEntry {
-                    name: "SECRET".to_string(),
-                    value: "hidden_value".to_string(),
-                    secret: true,
-                    value_encrypted: Some("enc_data".to_string()),
-                    description: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([
+            EnvVarEntry {
+                name: "PLAIN".to_string(),
+                value: "visible".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "SECRET".to_string(),
+                value: "hidden_value".to_string(),
+                secret: true,
+                value_encrypted: Some("enc_data".to_string()),
+                description: None,
+            },
+        ]);
 
         config.sanitize_env_vars_for_disk();
 
@@ -6642,25 +7237,23 @@ mod tests {
 
     #[test]
     fn sanitize_env_vars_for_disk_preserves_encrypted() {
-        let mut config = Config {
-            env_vars: vec![
-                EnvVarEntry {
-                    name: "OPEN".to_string(),
-                    value: "val".to_string(),
-                    secret: false,
-                    value_encrypted: None,
-                    description: None,
-                },
-                EnvVarEntry {
-                    name: "HIDDEN".to_string(),
-                    value: "real_secret".to_string(),
-                    secret: true,
-                    value_encrypted: Some("enc".to_string()),
-                    description: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([
+            EnvVarEntry {
+                name: "OPEN".to_string(),
+                value: "val".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "HIDDEN".to_string(),
+                value: "real_secret".to_string(),
+                secret: true,
+                value_encrypted: Some("enc".to_string()),
+                description: None,
+            },
+        ]);
 
         config.sanitize_env_vars_for_disk();
 
@@ -6673,25 +7266,23 @@ mod tests {
 
     #[test]
     fn refresh_env_vars_encrypted_round_trip() {
-        let mut config = Config {
-            env_vars: vec![
-                EnvVarEntry {
-                    name: "TOKEN".to_string(),
-                    value: "my-secret-token".to_string(),
-                    secret: true,
-                    value_encrypted: None,
-                    description: Some("A token".to_string()),
-                },
-                EnvVarEntry {
-                    name: "PLAIN_VAR".to_string(),
-                    value: "hello".to_string(),
-                    secret: false,
-                    value_encrypted: None,
-                    description: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([
+            EnvVarEntry {
+                name: "TOKEN".to_string(),
+                value: "my-secret-token".to_string(),
+                secret: true,
+                value_encrypted: None,
+                description: Some("A token".to_string()),
+            },
+            EnvVarEntry {
+                name: "PLAIN_VAR".to_string(),
+                value: "hello".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+        ]);
 
         // Encrypt
         config
@@ -6729,16 +7320,14 @@ mod tests {
         // the same race in the other direction. With the lock held, one
         // publish is deterministic.
         let _lock = crate::test_support::env_cache_lock_acquire();
-        let config = Config {
-            env_vars: vec![EnvVarEntry {
-                name: "TEST_PUBLISH".to_string(),
-                value: "pub_value".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            }],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([EnvVarEntry {
+            name: "TEST_PUBLISH".to_string(),
+            value: "pub_value".to_string(),
+            secret: false,
+            value_encrypted: None,
+            description: None,
+        }]);
 
         config.publish_env_vars();
         assert_eq!(
@@ -6906,16 +7495,14 @@ mod tests {
 
     #[test]
     fn hydrate_skips_non_secret_entries() {
-        let mut config = Config {
-            env_vars: vec![EnvVarEntry {
-                name: "PLAIN".to_string(),
-                value: "original".to_string(),
-                secret: false,
-                value_encrypted: Some("should-be-ignored".to_string()),
-                description: None,
-            }],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([EnvVarEntry {
+            name: "PLAIN".to_string(),
+            value: "original".to_string(),
+            secret: false,
+            value_encrypted: Some("should-be-ignored".to_string()),
+            description: None,
+        }]);
 
         config.hydrate_env_vars_from_encrypted();
         // Non-secret entry should keep its original value
@@ -6933,25 +7520,23 @@ mod tests {
 
     #[test]
     fn serde_round_trip_with_env_vars() {
-        let config = Config {
-            env_vars: vec![
-                EnvVarEntry {
-                    name: "KEY1".to_string(),
-                    value: "val1".to_string(),
-                    secret: false,
-                    value_encrypted: None,
-                    description: Some("First key".to_string()),
-                },
-                EnvVarEntry {
-                    name: "KEY2".to_string(),
-                    value: "".to_string(), // on-disk secret has no plaintext
-                    secret: true,
-                    value_encrypted: Some("enc123".to_string()),
-                    description: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.env_vars.extend([
+            EnvVarEntry {
+                name: "KEY1".to_string(),
+                value: "val1".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: Some("First key".to_string()),
+            },
+            EnvVarEntry {
+                name: "KEY2".to_string(),
+                value: "".to_string(), // on-disk secret has no plaintext
+                secret: true,
+                value_encrypted: Some("enc123".to_string()),
+                description: None,
+            },
+        ]);
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();

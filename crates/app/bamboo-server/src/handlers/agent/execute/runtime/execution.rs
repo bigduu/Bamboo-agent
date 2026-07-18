@@ -254,10 +254,8 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
 
         runtime.block_on(async {
-            let cached_snapshot = Config {
-                provider: "cached-provider".to_string(),
-                ..Default::default()
-            };
+            let mut cached_snapshot = Config::default();
+            cached_snapshot.provider = "cached-provider".to_string();
 
             let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
             let cached_config = StdRwLock::new(cached_snapshot);

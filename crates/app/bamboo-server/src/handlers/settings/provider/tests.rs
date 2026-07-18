@@ -18,25 +18,23 @@ fn deep_merge_json(dst: &mut serde_json::Value, src: serde_json::Value) {
 }
 
 fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
-    let mut cfg = Config {
-        provider: "openai".to_string(),
-        providers: ProviderConfigs {
-            openai: Some(OpenAIConfig {
-                api_key: "sk-test".to_string(),
-                api_key_from_env: false,
-                api_key_encrypted: None,
-                base_url: None,
-                model: Some("gpt-4o".to_string()),
-                fast_model: None,
-                vision_model: None,
-                reasoning_effort: None,
-                responses_only_models: vec![],
-                request_overrides: None,
-                extra: Default::default(),
-            }),
-            ..ProviderConfigs::default()
-        },
-        ..Config::default()
+    let mut cfg = Config::default();
+    cfg.provider = "openai".to_string();
+    *cfg.providers_mut() = ProviderConfigs {
+        openai: Some(OpenAIConfig {
+            api_key: "sk-test".to_string(),
+            api_key_from_env: false,
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-4o".to_string()),
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        }),
+        ..ProviderConfigs::default()
     };
 
     cfg.mcp.servers = vec![

@@ -12,7 +12,7 @@ pub(super) async fn handle_get_provider_config(
     let mut config = app_state.config.read().await.clone();
     let provider = config.provider.clone();
     config.refresh_provider_api_keys_encrypted()?;
-    let providers = serde_json::to_value(&config.providers)?;
+    let providers = serde_json::to_value(config.providers())?;
     let masked_providers = redact_providers_for_api(providers, &config);
 
     let response = ProviderConfigResponse {

@@ -456,35 +456,37 @@ fn apply_api_key(config: &mut Config, api_key: &str) {
     // the assignment below (no `serde` trait import needed).
     let stanza = || serde_json::json!({ "api_key": api_key });
 
-    let applied = match config.provider.as_str() {
-        "openai" => match config.providers.openai.as_mut() {
+    let provider = config.provider.clone();
+    let providers = config.providers_mut();
+    let applied = match provider.as_str() {
+        "openai" => match providers.openai.as_mut() {
             Some(c) => {
                 c.api_key = api_key.to_string();
                 true
             }
             None => {
-                config.providers.openai = serde_json::from_value(stanza()).ok();
-                config.providers.openai.is_some()
+                providers.openai = serde_json::from_value(stanza()).ok();
+                providers.openai.is_some()
             }
         },
-        "anthropic" => match config.providers.anthropic.as_mut() {
+        "anthropic" => match providers.anthropic.as_mut() {
             Some(c) => {
                 c.api_key = api_key.to_string();
                 true
             }
             None => {
-                config.providers.anthropic = serde_json::from_value(stanza()).ok();
-                config.providers.anthropic.is_some()
+                providers.anthropic = serde_json::from_value(stanza()).ok();
+                providers.anthropic.is_some()
             }
         },
-        "gemini" => match config.providers.gemini.as_mut() {
+        "gemini" => match providers.gemini.as_mut() {
             Some(c) => {
                 c.api_key = api_key.to_string();
                 true
             }
             None => {
-                config.providers.gemini = serde_json::from_value(stanza()).ok();
-                config.providers.gemini.is_some()
+                providers.gemini = serde_json::from_value(stanza()).ok();
+                providers.gemini.is_some()
             }
         },
         _ => false,
@@ -515,20 +517,28 @@ mod tests {
             let mut config = Config::default();
             config.provider = provider.to_string();
             // Force the absent-stanza (fabricate) path.
-            config.providers.openai = None;
-            config.providers.anthropic = None;
-            config.providers.gemini = None;
+            config.providers_mut().openai = None;
+            config.providers_mut().anthropic = None;
+            config.providers_mut().gemini = None;
 
             apply_api_key(&mut config, "sk-test-123");
 
             let key = match provider {
-                "openai" => config.providers.openai.as_ref().map(|c| c.api_key.as_str()),
+                "openai" => config
+                    .providers()
+                    .openai
+                    .as_ref()
+                    .map(|c| c.api_key.as_str()),
                 "anthropic" => config
-                    .providers
+                    .providers()
                     .anthropic
                     .as_ref()
                     .map(|c| c.api_key.as_str()),
-                "gemini" => config.providers.gemini.as_ref().map(|c| c.api_key.as_str()),
+                "gemini" => config
+                    .providers()
+                    .gemini
+                    .as_ref()
+                    .map(|c| c.api_key.as_str()),
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -547,20 +557,24 @@ mod tests {
     fn provider_selection_before_api_key_routes_key_to_chosen_provider() {
         let mut config = Config::default();
         config.provider = "anthropic".to_string(); // config.json default
-        config.providers.openai = None;
-        config.providers.anthropic = None;
+        config.providers_mut().openai = None;
+        config.providers_mut().anthropic = None;
 
         // Simulate `.provider_name("openai")` (set first), then `.api_key(...)`.
         config.provider = "openai".to_string();
         apply_api_key(&mut config, "sk-openai-xyz");
 
         assert_eq!(
-            config.providers.openai.as_ref().map(|c| c.api_key.as_str()),
+            config
+                .providers()
+                .openai
+                .as_ref()
+                .map(|c| c.api_key.as_str()),
             Some("sk-openai-xyz"),
             "api_key must land on the selected provider (openai), not the default"
         );
         assert!(
-            config.providers.anthropic.is_none(),
+            config.providers().anthropic.is_none(),
             "the default provider must not receive the key"
         );
     }

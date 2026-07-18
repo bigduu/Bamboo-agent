@@ -13,7 +13,8 @@ pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
     let servers: Vec<McpServerApiRecord> = config
         .mcp
         .servers
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|server_cfg| {
             let runtime = state
                 .mcp_manager

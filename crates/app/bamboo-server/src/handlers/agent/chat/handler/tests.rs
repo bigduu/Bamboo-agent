@@ -352,7 +352,7 @@ mod optional_model_e2e {
         {
             let mut config = state.config.write().await;
             config.provider = "openai".to_string();
-            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
                 model: Some("gpt-configured-default".to_string()),
                 ..Default::default()
             });
@@ -395,7 +395,7 @@ mod optional_model_e2e {
         {
             let mut config = state.config.write().await;
             config.provider = "openai".to_string();
-            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
                 model: Some("gpt-configured-default".to_string()),
                 ..Default::default()
             });

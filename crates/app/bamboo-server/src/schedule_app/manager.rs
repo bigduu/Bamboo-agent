@@ -744,6 +744,17 @@ mod build_context_tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    macro_rules! test_config {
+        (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+        (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+        (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+        (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut config = Config::default();
+            $(test_config!(@assign config, $field, $value);)*
+            config
+        }};
+    }
     fn test_job() -> ScheduleRunJob {
         ScheduleRunJob {
             run_id: "run-1".to_string(),
@@ -758,7 +769,7 @@ mod build_context_tests {
 
     #[test]
     fn resolve_run_config_from_config_prefers_fast_model() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             defaults: None,
             features: bamboo_config::FeatureFlags {
@@ -781,7 +792,6 @@ mod build_context_tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let registry = Arc::new(ProviderRegistry::new(
@@ -795,7 +805,7 @@ mod build_context_tests {
 
     #[test]
     fn resolve_run_config_from_config_falls_back_to_default_model_when_fast_missing() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             defaults: Some(DefaultsConfig {
                 chat: ProviderModelRef::new("openai", "gpt-chat"),
@@ -814,7 +824,6 @@ mod build_context_tests {
                 ..Default::default()
             },
             providers: ProviderConfigs::default(),
-            ..Config::default()
         };
 
         let registry = Arc::new(ProviderRegistry::new(

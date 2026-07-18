@@ -251,9 +251,9 @@ mod comprehensive_config_tests {
         assert_eq!(config.http_proxy, "http://proxy:8080");
         assert_eq!(config.https_proxy, "https://proxy:8443");
         assert_eq!(config.provider, "openai");
-        assert!(config.providers.openai.is_some());
-        assert!(config.providers.anthropic.is_some());
-        assert!(config.providers.copilot.is_some());
+        assert!(config.providers().openai.is_some());
+        assert!(config.providers().anthropic.is_some());
+        assert!(config.providers().copilot.is_some());
         assert_eq!(config.server.port, 9999);
         assert_eq!(config.server.bind, "0.0.0.0");
         assert_eq!(config.server.workers, 16);
@@ -267,7 +267,7 @@ mod comprehensive_config_tests {
 
         let mut original = Config::from_data_dir(Some(temp.path.clone()));
         original.provider = "anthropic".to_string();
-        original.providers.anthropic = Some(bamboo_config::AnthropicConfig {
+        original.providers_mut().anthropic = Some(bamboo_config::AnthropicConfig {
             api_key: String::new(),
             api_key_from_env: false,
             api_key_encrypted: None,
@@ -291,7 +291,7 @@ mod comprehensive_config_tests {
         assert_eq!(loaded.provider, "anthropic");
         assert_eq!(
             loaded
-                .providers
+                .providers()
                 .anthropic
                 .as_ref()
                 .and_then(|c| c.model.as_deref()),
@@ -432,8 +432,8 @@ mod comprehensive_config_tests {
         let config = Config::new();
 
         // Provider config should be available
-        assert!(config.providers.copilot.is_some());
-        let copilot = config.providers.copilot.unwrap();
+        assert!(config.providers().copilot.is_some());
+        let copilot = config.providers().copilot.as_ref().unwrap();
         assert!(copilot.headless_auth);
     }
 }

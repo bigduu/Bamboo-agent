@@ -5,7 +5,8 @@
 //! The flow is deliberately conservative — it never writes a config file it
 //! cannot fully re-read:
 //!
-//! 1. Serialize the current (hydrated, in-memory) [`Config`] to JSON.
+//! 1. Project the current (hydrated, in-memory) [`Config`] into its explicit
+//!    compatibility JSON view, including independently persisted modules.
 //! 2. Apply the dot-path assignment onto that JSON tree.
 //! 3. Deserialize the patched JSON back into the typed [`Config`] — a type
 //!    mismatch fails here with the offending key in the error.
@@ -97,10 +98,12 @@ pub fn apply_dot_path_set(
     }
     guard_reserved_paths(&segments, key)?;
 
-    let before = serde_json::to_value(current).map_err(|e| DotPathError::InvalidValue {
-        key: key.to_string(),
-        message: format!("failed to serialize current config: {e}"),
-    })?;
+    let before = current
+        .to_compatibility_value()
+        .map_err(|e| DotPathError::InvalidValue {
+            key: key.to_string(),
+            message: format!("failed to serialize current config: {e}"),
+        })?;
     let old_value = resolve_path(&before, &segments).cloned();
 
     let mut patched = before;
@@ -129,10 +132,12 @@ pub fn apply_dot_path_set(
     // legitimately move (`enabled` ⇄ `disabled`, transport flattening).
     let mcp_subtree = matches!(segments[0], "mcpServers" | "mcp");
     if !mcp_subtree {
-        let after = serde_json::to_value(&config).map_err(|e| DotPathError::InvalidValue {
-            key: key.to_string(),
-            message: format!("failed to serialize updated config: {e}"),
-        })?;
+        let after = config
+            .to_compatibility_value()
+            .map_err(|e| DotPathError::InvalidValue {
+                key: key.to_string(),
+                message: format!("failed to serialize updated config: {e}"),
+            })?;
         match resolve_path(&after, &segments) {
             Some(round_tripped) if values_equivalent(round_tripped, &value) => {}
             Some(round_tripped) => {
@@ -677,6 +682,17 @@ mod tests {
             cipher_before,
             "an unrelated generic set must not churn or drop the stored ciphertext"
         );
+
+        let config_json: Value = serde_json::from_slice(
+            &std::fs::read(data_dir.join("config.json")).expect("root config exists"),
+        )
+        .expect("root config is valid JSON");
+        for sidecar_key in ["memory", "subagents", "providers"] {
+            assert!(
+                config_json.get(sidecar_key).is_none(),
+                "compatibility projection must not persist {sidecar_key} in config.json"
+            );
+        }
 
         // And the key still decrypts after the round-trip.
         let reloaded = Config::from_data_dir_without_env(Some(data_dir));

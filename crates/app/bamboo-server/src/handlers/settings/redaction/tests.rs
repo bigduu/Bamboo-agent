@@ -6,10 +6,22 @@ use bamboo_config::{OpenAIConfig, ProviderConfigs};
 use bamboo_llm::Config;
 use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
 
+macro_rules! test_config {
+    (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+    (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+    (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+    (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+    ($($field:ident: $value:expr),* $(,)?) => {{
+        let mut config = Config::default();
+        $(test_config!(@assign config, $field, $value);)*
+        config
+    }};
+}
+
 use super::{redact_config_for_api, redact_providers_for_api};
 
 fn config_with_openai_key() -> Config {
-    Config {
+    test_config! {
         providers: ProviderConfigs {
             openai: Some(OpenAIConfig {
                 api_key: String::new(),
@@ -26,7 +38,6 @@ fn config_with_openai_key() -> Config {
             }),
             ..ProviderConfigs::default()
         },
-        ..Default::default()
     }
 }
 
@@ -58,9 +69,8 @@ fn redact_config_masks_configured_provider_and_removes_proxy_encrypted_keys() {
 
 #[test]
 fn redact_providers_removes_unconfigured_api_key_fields() {
-    let config = Config {
+    let config = test_config! {
         providers: ProviderConfigs::default(),
-        ..Default::default()
     };
     let input = json!({
         "openai": {
