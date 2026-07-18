@@ -123,6 +123,9 @@ pub struct SessionIndexEntry {
     pub model_ref: Option<ProviderModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Workspace path mirrored from the session's typed runtime metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     /// Raw session-level Gold config JSON mirrored from `session.metadata["gold_config"]`.
     /// Kept as a string here to avoid making infrastructure depend on bamboo-engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,7 +205,7 @@ pub struct SessionsIndex {
 impl SessionsIndex {
     fn empty() -> Self {
         Self {
-            version: 2,
+            version: 3,
             updated_at: Utc::now(),
             sessions: HashMap::new(),
         }
@@ -246,7 +249,20 @@ impl SessionStoreV2 {
         let index = if index_path.exists() {
             let raw = fs::read_to_string(&index_path).await?;
             match serde_json::from_str::<SessionsIndex>(&raw) {
-                Ok(index) => index,
+                Ok(index) if index.version >= 3 => index,
+                Ok(index) => {
+                    tracing::info!(
+                        "migrating sessions index from version {} to version 3 by rebuilding from session.json",
+                        index.version
+                    );
+                    needs_rebuild = true;
+                    let mut rebuilding = SessionsIndex::empty();
+                    // Keep an old-version marker on every incremental rebuild
+                    // persist. If the process crashes mid-scan, the next boot
+                    // must resume instead of accepting a partial v3 index.
+                    rebuilding.version = index.version.min(2);
+                    rebuilding
+                }
                 Err(error) => {
                     // Best-effort backup so the corrupt bytes are preserved for
                     // forensics but no longer block the (about to be rebuilt)
@@ -270,7 +286,9 @@ impl SessionStoreV2 {
                         ),
                     }
                     needs_rebuild = true;
-                    SessionsIndex::empty()
+                    let mut rebuilding = SessionsIndex::empty();
+                    rebuilding.version = 0;
+                    rebuilding
                 }
             }
         } else {
@@ -418,7 +436,13 @@ impl SessionStoreV2 {
         // Re-materialize sessions.json even when nothing was recovered (we may
         // have renamed the only copy to sessions.json.bak), so the "index file
         // always exists after boot" invariant holds.
-        self.update_index(|_| Ok(())).await?;
+        self.update_index(|index| {
+            // Publishing version 3 is the commit point for a complete rebuild.
+            // `persist_index_locked` writes a temp file and atomically renames it.
+            index.version = 3;
+            Ok(())
+        })
+        .await?;
 
         tracing::info!("index rebuild from disk complete: recovered {recovered} session(s)");
 
@@ -790,6 +814,10 @@ impl SessionStoreV2 {
             .metadata
             .get("placement")
             .and_then(|v| serde_json::from_str::<SessionPlacement>(v).ok());
+        let workspace_path = session
+            .workspace_path_meta()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -806,6 +834,7 @@ impl SessionStoreV2 {
                     model: session.model.clone(),
                     model_ref: session.model_ref.clone(),
                     reasoning_effort: session.reasoning_effort,
+                    workspace_path,
                     gold_config_json,
                     created_by_schedule_id,
                     schedule_run_id,
@@ -1303,7 +1332,30 @@ impl Storage for SessionStoreV2 {
             return self.save_session(session).await;
         };
         let abs_dir = self.abs_path_from_rel(&rel);
-        self.write_runtime_sidecar(&abs_dir, session).await
+        self.write_runtime_sidecar(&abs_dir, session).await?;
+
+        // Workspace ownership is part of the list/index API contract. Runtime
+        // workspace updates must therefore be reflected without waiting for a
+        // later full session save. Avoid rewriting the global index when the
+        // normalized value did not change.
+        let workspace_path = session
+            .workspace_path_meta()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let workspace_changed = self
+            .get_index_entry(&session.id)
+            .await
+            .is_some_and(|entry| entry.workspace_path != workspace_path);
+        if workspace_changed {
+            self.update_index(|index| {
+                if let Some(entry) = index.sessions.get_mut(&session.id) {
+                    entry.workspace_path = workspace_path;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
@@ -1692,6 +1744,108 @@ mod tests {
             "a fresh sessions.json must be written after rebuild"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_index_migrates_workspace_paths_from_root_and_child_sessions() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+
+        {
+            let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+            let mut root = Session::new("workspace-root", "m");
+            root.set_workspace_path_meta("  /workspaces/root  ");
+            storage.save_session(&root).await?;
+
+            let mut child = Session::new_child_of("workspace-child", &root, "m", "child");
+            child.set_workspace_path_meta("/workspaces/child");
+            storage.save_session(&child).await?;
+
+            let legacy_without_workspace = Session::new("workspace-missing", "m");
+            storage.save_session(&legacy_without_workspace).await?;
+
+            // A malformed sibling must not prevent recovery of intact sessions.
+            let broken_dir = bamboo_home.join("sessions/broken");
+            tokio::fs::create_dir_all(&broken_dir).await?;
+            tokio::fs::write(broken_dir.join("session.json"), b"{ invalid json").await?;
+        }
+
+        let index_path = bamboo_home.join("sessions.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&index_path).await?)
+                .map_err(|error| other_io_error(error.to_string()))?;
+        legacy["version"] = serde_json::json!(2);
+        for entry in legacy["sessions"]
+            .as_object_mut()
+            .expect("sessions object")
+            .values_mut()
+        {
+            entry
+                .as_object_mut()
+                .expect("entry")
+                .remove("workspace_path");
+        }
+        tokio::fs::write(
+            &index_path,
+            serde_json::to_vec_pretty(&legacy)
+                .map_err(|error| other_io_error(error.to_string()))?,
+        )
+        .await?;
+
+        let migrated = SessionStoreV2::new(bamboo_home.clone()).await?;
+        assert_eq!(
+            migrated
+                .get_index_entry("workspace-root")
+                .await
+                .and_then(|entry| entry.workspace_path),
+            Some("/workspaces/root".to_string())
+        );
+        assert_eq!(
+            migrated
+                .get_index_entry("workspace-child")
+                .await
+                .and_then(|entry| entry.workspace_path),
+            Some("/workspaces/child".to_string())
+        );
+        assert!(migrated.get_index_entry("broken").await.is_none());
+        assert_eq!(
+            migrated
+                .get_index_entry("workspace-missing")
+                .await
+                .and_then(|entry| entry.workspace_path),
+            None
+        );
+
+        let persisted: SessionsIndex = serde_json::from_slice(&tokio::fs::read(index_path).await?)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        assert_eq!(persisted.version, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_path_updates_index_on_full_and_runtime_only_saves() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut session = Session::new("workspace-update", "m");
+        session.set_workspace_path_meta("  /workspaces/first  ");
+        storage.save_session(&session).await?;
+        assert_eq!(
+            storage
+                .get_index_entry(&session.id)
+                .await
+                .and_then(|entry| entry.workspace_path),
+            Some("/workspaces/first".to_string())
+        );
+
+        session.set_workspace_path_meta(" /workspaces/latest ");
+        storage.save_runtime_state(&session).await?;
+        assert_eq!(
+            storage
+                .get_index_entry(&session.id)
+                .await
+                .and_then(|entry| entry.workspace_path),
+            Some("/workspaces/latest".to_string())
+        );
         Ok(())
     }
 

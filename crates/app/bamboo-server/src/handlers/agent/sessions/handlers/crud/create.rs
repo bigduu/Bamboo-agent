@@ -208,6 +208,10 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::CREATED);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["session"]["workspace_path"].as_str(),
+            Some(workspace_path.as_str())
+        );
         let session_id = body["session"]["id"]
             .as_str()
             .expect("session id")
@@ -221,6 +225,34 @@ mod tests {
             .expect("session exists");
         assert_eq!(
             session.workspace_path_meta().as_deref(),
+            Some(workspace_path.as_str())
+        );
+
+        let list_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body: Value = test::read_body_json(list_resp).await;
+        assert_eq!(
+            list_body["sessions"][0]["workspace_path"].as_str(),
+            Some(workspace_path.as_str())
+        );
+
+        let detail_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail_resp.status(), StatusCode::OK);
+        let detail_body: Value = test::read_body_json(detail_resp).await;
+        assert_eq!(
+            detail_body["session"]["workspace_path"].as_str(),
             Some(workspace_path.as_str())
         );
     }

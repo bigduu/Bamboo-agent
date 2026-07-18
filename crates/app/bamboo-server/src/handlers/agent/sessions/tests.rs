@@ -21,6 +21,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         model: "gpt-4o".to_string(),
         model_ref: None,
         reasoning_effort: Some(ReasoningEffort::High),
+        workspace_path: Some("/workspaces/zenith".to_string()),
         gold_config_json: None,
         created_by_schedule_id: None,
         schedule_run_id: Some("run-123".to_string()),
@@ -45,6 +46,10 @@ fn session_summary_from_entry_includes_last_run_fields() {
     assert_eq!(summary.last_run_status.as_deref(), Some("completed"));
     assert_eq!(summary.last_run_error, None);
     assert_eq!(summary.schedule_run_id.as_deref(), Some("run-123"));
+    assert_eq!(
+        summary.workspace_path.as_deref(),
+        Some("/workspaces/zenith")
+    );
     assert_eq!(summary.subagent_type, None);
     assert!(summary.has_pending_question);
     assert_eq!(summary.running_child_count, 0);
@@ -66,6 +71,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         model: "gpt-4o".to_string(),
         model_ref: None,
         reasoning_effort: None,
+        workspace_path: None,
         gold_config_json: None,
         created_by_schedule_id: None,
         schedule_run_id: None,
