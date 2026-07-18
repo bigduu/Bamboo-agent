@@ -546,6 +546,24 @@ pub enum AgentEvent {
         resource: String,
     },
 
+    /// Durable, versioned approval lifecycle delta for a child agent.
+    ChildApprovalChanged {
+        parent_session_id: String,
+        child_session_id: String,
+        request_id: String,
+        version: u64,
+        /// `pending` | `approved` | `denied` | `expired` | `delivery_failed`.
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        tool_name: String,
+        permission: String,
+        resource: String,
+        created_at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_at: Option<String>,
+    },
+
     /// A per-run resource guardrail (token / tool-call / subagent budget)
     /// tripped and the run was gracefully stopped — issue #221.
     ///
@@ -656,6 +674,9 @@ impl AgentEvent {
             }
             | AgentEvent::SubAgentCompleted {
                 parent_session_id, ..
+            }
+            | AgentEvent::ChildApprovalChanged {
+                parent_session_id, ..
             } => Some(parent_session_id.as_str()),
             _ => None,
         }
@@ -689,6 +710,7 @@ impl AgentEvent {
                 | AgentEvent::PlanFileUpdated { .. }
                 | AgentEvent::SubAgentStarted { .. }
                 | AgentEvent::SubAgentCompleted { .. }
+                | AgentEvent::ChildApprovalChanged { .. }
                 | AgentEvent::NeedClarification { .. }
                 | AgentEvent::ToolApprovalRequested { .. }
                 | AgentEvent::ExecutionStarted { .. }
@@ -1061,6 +1083,28 @@ mod tests {
             value["parameters"],
             serde_json::json!({"file_path": "/tmp/test.txt"})
         );
+    }
+
+    #[test]
+    fn child_approval_changed_routes_to_parent_and_is_durable() {
+        let event = AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-1".into(),
+            child_session_id: "child-1".into(),
+            request_id: "req-1".into(),
+            version: 2,
+            status: "approved".into(),
+            reason: None,
+            tool_name: "Bash".into(),
+            permission: "execute".into(),
+            resource: "/tmp/x".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            resolved_at: Some("2026-01-01T00:00:01Z".into()),
+        };
+        assert_eq!(event.session_id(), Some("parent-1"));
+        assert!(event.is_durable_change());
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "child_approval_changed");
+        assert_eq!(value["status"], "approved");
     }
 
     #[test]

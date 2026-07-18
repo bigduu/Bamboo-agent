@@ -17,6 +17,8 @@ fn is_critical_event(event: &AgentEvent) -> bool {
             | AgentEvent::TaskListCompleted { .. }
             | AgentEvent::SubAgentStarted { .. }
             | AgentEvent::SubAgentCompleted { .. }
+            | AgentEvent::ChildApprovalRequested { .. }
+            | AgentEvent::ChildApprovalChanged { .. }
             | AgentEvent::BashCompleted { .. }
             | AgentEvent::SessionTitleUpdated { .. }
             | AgentEvent::SessionPinnedUpdated { .. }
@@ -82,7 +84,12 @@ pub(crate) fn spawn_event_forwarder(
                 // sink filters ephemeral events (tokens, etc.) internally, so
                 // this is near-free for the hot path. `session_id` is passed
                 // explicitly so terminal events (which carry no id) still route.
-                state.account_sink.record(Some(&session_id), &event);
+                // Parent-scoped child lifecycle/approval events carry their
+                // canonical routing id. Prefer it over the forwarder's source
+                // session so a child stream journals the delta under the parent
+                // account-feed envelope and reconnecting parent UIs see it.
+                let route_session_id = event.session_id().unwrap_or(&session_id);
+                state.account_sink.record(Some(route_session_id), &event);
 
                 // Always forward to the broadcast channel regardless of subscriber count.
                 // The broadcast channel's internal capacity (1000 slots) buffers events so
@@ -619,14 +626,29 @@ mod tests {
             })
             .await
             .unwrap();
+        mpsc_tx
+            .send(AgentEvent::ChildApprovalChanged {
+                parent_session_id: "parent-session".into(),
+                child_session_id: session_id.into(),
+                request_id: "req-1".into(),
+                version: 2,
+                status: "approved".into(),
+                reason: None,
+                tool_name: "Bash".into(),
+                permission: "execute".into(),
+                resource: "/tmp/x".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                resolved_at: Some("2026-01-01T00:00:01Z".into()),
+            })
+            .await
+            .unwrap();
         drop(mpsc_tx);
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         let journaled =
             bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
-        // Only the two durable events (TaskListUpdated, Complete) were journaled.
-        assert_eq!(journaled.len(), 2, "ephemeral Token must be excluded");
+        assert_eq!(journaled.len(), 3, "ephemeral Token must be excluded");
         assert!(matches!(
             journaled[0].event,
             AgentEvent::TaskListUpdated { .. }
@@ -634,9 +656,15 @@ mod tests {
         assert!(matches!(journaled[1].event, AgentEvent::Complete { .. }));
         // The terminal event routed to the right session via caller context.
         assert_eq!(journaled[1].session_id.as_deref(), Some(session_id));
+        assert_eq!(journaled[2].session_id.as_deref(), Some("parent-session"));
+        assert!(matches!(
+            journaled[2].event,
+            AgentEvent::ChildApprovalChanged { .. }
+        ));
         // Sequence numbers are monotonic and 1-based.
         assert_eq!(journaled[0].seq, 1);
         assert_eq!(journaled[1].seq, 2);
+        assert_eq!(journaled[2].seq, 3);
     }
 
     #[tokio::test]
