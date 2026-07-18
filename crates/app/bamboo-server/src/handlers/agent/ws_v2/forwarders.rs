@@ -51,7 +51,10 @@ use super::envelope::{
     feed_reset_control, gap_control, terminal_control, Encoding, OutFrame, ServerEnvelope,
 };
 use crate::app_state::{AgentStatus, AppState};
-use crate::handlers::agent::events::{has_running_child, terminal_event_if_ready, Coalescer};
+use crate::handlers::agent::events::{
+    has_running_child, reconcile_abandoned_startup, startup_reconcile_delay,
+    terminal_event_if_ready, Coalescer,
+};
 use crate::handlers::agent::stream::{plan_replay, ReplayPlan};
 
 /// What the driver sends to the WS writer: an already-encoded frame (a JSON text
@@ -216,6 +219,10 @@ pub(crate) fn spawn_agent_forwarder(
             }
         }
 
+        let initial_reconcile_delay = startup_reconcile_delay(&state, &session_id).await;
+        let startup_reconcile = tokio::time::sleep(initial_reconcile_delay);
+        tokio::pin!(startup_reconcile);
+
         if batch_ms == 0 {
             // Fast path: every event emitted immediately, byte-for-byte (desktop
             // default), with no buffering.
@@ -228,18 +235,21 @@ pub(crate) fn spawn_agent_forwarder(
             // every later child event. Hold the channel open and emit the
             // `terminal` control only once no running child is left.
             let mut awaiting_children = false;
-            let startup_reconcile = tokio::time::sleep(Duration::from_secs(61));
-            tokio::pin!(startup_reconcile);
             loop {
                 let received = tokio::select! {
                     received = receiver.recv() => received,
                     _ = &mut startup_reconcile => {
-                        if reconcile_abandoned_startup(&state, &session_id, &out, encoding, &ch, &seq).await {
-                            return;
+                        if reconcile_abandoned_startup(
+                            &state,
+                            &session_id,
+                            &receiver,
+                        ).await {
+                            let delay = startup_reconcile_delay(&state, &session_id).await;
+                            startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                            continue;
                         }
-                        // A real run won the race; this one-shot guard is no
-                        // longer needed for this forwarder.
-                        startup_reconcile.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+                        let delay = startup_reconcile_delay(&state, &session_id).await;
+                        startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
                         continue;
                     }
                 };
@@ -319,8 +329,6 @@ pub(crate) fn spawn_agent_forwarder(
         // See the fast-path comment: keep the channel open after the parent
         // terminal while child sub-agents still run.
         let mut awaiting_children = false;
-        let startup_reconcile = tokio::time::sleep(Duration::from_secs(61));
-        tokio::pin!(startup_reconcile);
 
         loop {
             let sleep_until = flush_deadline
@@ -328,10 +336,17 @@ pub(crate) fn spawn_agent_forwarder(
 
             tokio::select! {
                 _ = &mut startup_reconcile => {
-                    if reconcile_abandoned_startup(&state, &session_id, &out, encoding, &ch, &seq).await {
-                        return;
+                    if reconcile_abandoned_startup(
+                        &state,
+                        &session_id,
+                        &receiver,
+                    ).await {
+                        let delay = startup_reconcile_delay(&state, &session_id).await;
+                        startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                        continue;
                     }
-                    startup_reconcile.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+                    let delay = startup_reconcile_delay(&state, &session_id).await;
+                    startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
                 }
                 _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                     if let Some(pending) = coalescer.take_pending() {
@@ -431,35 +446,6 @@ pub(crate) fn spawn_agent_forwarder(
             }
         }
     })
-}
-
-async fn reconcile_abandoned_startup(
-    state: &web::Data<AppState>,
-    session_id: &str,
-    out: &OutboundTx,
-    encoding: Encoding,
-    ch: &str,
-    seq: &AgentSeq,
-) -> bool {
-    let runner_status = state
-        .agent_runners
-        .read()
-        .await
-        .get(session_id)
-        .map(|runner| runner.status.clone());
-    let Some(event) = terminal_event_if_ready(state, session_id, runner_status).await else {
-        return false;
-    };
-    if !emit_agent_event(out, encoding, ch, seq, event).await {
-        return true;
-    }
-    let _ = send_env(
-        out,
-        encoding,
-        ServerEnvelope::control(ch, seq.next(), terminal_control("complete")),
-    )
-    .await;
-    true
 }
 
 /// Spawn a one-shot `agent.{sid}` replay for a session that was already
@@ -951,5 +937,109 @@ mod tests {
                 .is_none(),
             "channel must close after the terminal control"
         );
+    }
+
+    #[tokio::test]
+    async fn live_ws_reconciles_abandoned_startup_in_both_batch_paths() {
+        for batch_ms in [0, 1_000] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+            let session_id = format!("ws-abandoned-{batch_ms}");
+            let mut session = bamboo_agent_core::Session::new(&session_id, "test-model");
+            session.add_message(bamboo_agent_core::Message::user("slow startup"));
+            crate::handlers::agent::events::mark_pending_turn(&mut session);
+            session.metadata.insert(
+                "execute.startup_handoff_at".to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+            );
+            state.save_session(&mut session).await;
+
+            let tx = state.get_session_event_sender(&session_id).await;
+            let rx = tx.subscribe();
+            tx.send(AgentEvent::Token {
+                content: "before-terminal".to_string(),
+            })
+            .expect("live receiver");
+            let guard =
+                crate::handlers::agent::events::begin_execute_startup(state.get_ref(), &session_id);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                drop(guard);
+            });
+
+            let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+            let handle = spawn_agent_forwarder(
+                state,
+                session_id.clone(),
+                out_tx,
+                Encoding::Json,
+                format!("agent.{session_id}"),
+                rx,
+                None,
+                Vec::new(),
+                batch_ms,
+            );
+
+            let token = next_json(&mut out_rx).await;
+            assert_eq!(token["event"]["content"], "before-terminal");
+            let terminal_event = next_json(&mut out_rx).await;
+            assert_eq!(terminal_event["event"]["type"], "error");
+            assert!(terminal_event["event"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("was not started")));
+            let terminal_control = next_json(&mut out_rx).await;
+            assert_eq!(terminal_control["control"]["type"], "terminal");
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("forwarder terminates")
+                .expect("forwarder task succeeds");
+            assert!(out_rx.try_recv().is_err(), "replay must be one-shot");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_ws_idle_probe_discovers_later_abandoned_turn() {
+        for batch_ms in [0, 1_000] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+            let session_id = format!("ws-late-pending-{batch_ms}");
+            let mut session = bamboo_agent_core::Session::new(&session_id, "test-model");
+            state.save_session(&mut session).await;
+            let sender = state.get_session_event_sender(&session_id).await;
+            let receiver = sender.subscribe();
+            let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+            let handle = spawn_agent_forwarder(
+                state.clone(),
+                session_id.clone(),
+                out_tx,
+                Encoding::Json,
+                format!("agent.{session_id}"),
+                receiver,
+                None,
+                Vec::new(),
+                batch_ms,
+            );
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            session.add_message(bamboo_agent_core::Message::user("never executed"));
+            crate::handlers::agent::events::mark_pending_turn(&mut session);
+            session.metadata.insert(
+                "execute.startup_handoff_at".to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+            );
+            state.save_session(&mut session).await;
+
+            let terminal_event = next_json(&mut out_rx).await;
+            assert_eq!(terminal_event["event"]["type"], "error");
+            assert!(terminal_event["event"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("was not started")));
+            let terminal_control = next_json(&mut out_rx).await;
+            assert_eq!(terminal_control["control"]["type"], "terminal");
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("forwarder terminates")
+                .expect("forwarder task succeeds");
+        }
     }
 }

@@ -6,6 +6,7 @@ use super::shared::{
 };
 use super::types::TruncateRequest;
 use crate::app_state::AppState;
+use bamboo_engine::session_app::execute::{clear_startup_handoff, mark_startup_handoff};
 use bamboo_engine::session_app::truncation::{
     sanitize_malformed_tool_chains, truncate_after_last_user, truncate_for_unresolved_tool_calls,
     unresolved_tool_call_ids,
@@ -45,6 +46,9 @@ pub async fn truncate_messages(
             let cleared_pending_flag = session.metadata.remove(RETRY_RESUME_PENDING_KEY).is_some();
             let cleared_reason_flag = session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
             let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
+            if cleared_retry_flags {
+                clear_startup_handoff(&mut session);
+            }
             (
                 removed,
                 session.messages.len(),
@@ -62,6 +66,7 @@ pub async fn truncate_messages(
                     RETRY_RESUME_REASON_KEY.to_string(),
                     "error_retry".to_string(),
                 );
+                mark_startup_handoff(&mut session);
                 (0, session.messages.len(), false, true)
             } else {
                 let removed_via_sanitization = sanitize_malformed_tool_chains(&mut session);
@@ -80,6 +85,7 @@ pub async fn truncate_messages(
                         RETRY_RESUME_REASON_KEY.to_string(),
                         "error_retry".to_string(),
                     );
+                    mark_startup_handoff(&mut session);
                     (
                         removed_via_sanitization,
                         session.messages.len(),
@@ -107,6 +113,9 @@ pub async fn truncate_messages(
                     let cleared_reason_flag =
                         session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
                     let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
+                    if cleared_retry_flags {
+                        clear_startup_handoff(&mut session);
+                    }
 
                     (
                         removed,

@@ -720,6 +720,7 @@ impl AppState {
             )),
             metrics_service,
             agent_runners,
+            execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
             account_sink,
             process_registry,

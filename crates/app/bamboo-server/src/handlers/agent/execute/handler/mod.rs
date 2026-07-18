@@ -27,19 +27,25 @@ pub async fn handler(
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
     let session_id = path.into_inner();
-    // Covers the preparation window before a Pending runner can be reserved.
-    // The RAII guard is released on every success/error return path.
-    let _startup_guard =
+    // Linearize startup ownership against an abandoned-turn reconciliation.
+    // Reconciliation holds the same persistence lock through its durable CAS
+    // and broadcast; whichever acquires it first becomes the authoritative
+    // transition for this turn.
+    let startup_lock = state.persistence.acquire_lock(&session_id).await;
+    // Protect the preparation window before `reserve_runner` can publish a
+    // Pending runner. Reference-counted RAII releases on every return/panic.
+    let mut startup_guard =
         crate::handlers::agent::events::begin_execute_startup(state.get_ref(), &session_id);
-    // Bind every later rejection to the exact user turn this execute request
-    // observed. A delayed failure from turn A must never poison newer turn B.
+    // Bind rejection rollback to the exact turn observed by this request. A
+    // delayed failure from turn A must never poison a newer turn B.
     let startup_turn_id = state
         .storage
         .load_session(&session_id)
         .await
         .ok()
         .flatten()
-        .and_then(|session| crate::handlers::agent::events::pending_turn_id(&session));
+        .and_then(|session| crate::handlers::agent::events::startup_work_id(&session));
+    drop(startup_lock);
     tracing::debug!(
         "[{}] Execute requested: model={:?}, model_ref={:?}, reasoning_effort={:?}, has_client_sync={}",
         session_id,
@@ -56,7 +62,14 @@ pub async fn handler(
     let image_fallback = match resolve_image_fallback(&config_snapshot) {
         Ok(value) => value,
         Err(error) => {
-            fail_pending_startup(&state, &session_id, startup_turn_id.as_deref(), &error).await;
+            fail_pending_startup(
+                &state,
+                &session_id,
+                startup_turn_id.as_deref(),
+                &error,
+                &mut startup_guard,
+            )
+            .await;
             return internal_server_error_response(error);
         }
     };
@@ -141,6 +154,7 @@ pub async fn handler(
                 &session_id,
                 startup_turn_id.as_deref(),
                 &format!("execute preparation failed: {error}"),
+                &mut startup_guard,
             )
             .await;
             return match error {
@@ -176,11 +190,14 @@ pub async fn handler(
             reasoning_source,
             is_child_session,
         } => {
+            let session = *session;
             ready::handle_execute_ready(
                 &state,
                 &session_id,
                 ready::ReadyExecution {
-                    session: *session,
+                    session,
+                    startup_guard: &mut startup_guard,
+                    startup_turn_id: startup_turn_id.clone(),
                     effective_model,
                     effective_reasoning_effort,
                     model_source,
@@ -239,13 +256,21 @@ pub async fn handler(
                 &session_id,
                 startup_turn_id.as_deref(),
                 "no model configured",
+                &mut startup_guard,
             )
             .await;
             bad_request_error_response("no model configured for session or provider")
         }
 
         bamboo_engine::session_app::types::ExecutePreparationOutcome::ImageFallbackError(error) => {
-            fail_pending_startup(&state, &session_id, startup_turn_id.as_deref(), &error).await;
+            fail_pending_startup(
+                &state,
+                &session_id,
+                startup_turn_id.as_deref(),
+                &error,
+                &mut startup_guard,
+            )
+            .await;
             bad_request_error_response(error)
         }
     }
@@ -256,30 +281,21 @@ async fn fail_pending_startup(
     session_id: &str,
     expected_turn_id: Option<&str>,
     detail: &str,
+    startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
 ) {
     let Some(expected_turn_id) = expected_turn_id else {
         return;
     };
-    let Ok(Some(mut session)) = state.storage.load_session(session_id).await else {
-        return;
-    };
-    // Ownership prevents a delayed/retried rejection from poisoning a later
-    // turn, and avoids treating an old runner Error as this turn's outcome.
-    if !crate::handlers::agent::events::mark_startup_failed_if_owned(
-        &mut session,
-        expected_turn_id,
+    crate::handlers::agent::events::transition_startup_failure_if_owned(
+        state,
+        session_id,
+        crate::handlers::agent::events::StartupFailureTarget::WorkId {
+            work_id: expected_turn_id,
+            startup_guard,
+        },
         detail,
-    ) {
-        return;
-    }
-    if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
-        tracing::error!("[{session_id}] failed to persist execute rejection: {error}");
-        return;
-    }
-    state.sessions.insert(
-        session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
-    );
+    )
+    .await;
 }
 
 /// Convert a crate's `ExecuteSyncReason` to the handler's `ExecuteSyncReason`.

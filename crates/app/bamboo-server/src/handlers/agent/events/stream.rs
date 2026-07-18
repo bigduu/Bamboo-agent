@@ -7,7 +7,7 @@ use bamboo_agent_core::AgentEvent;
 
 use crate::app_state::AppState;
 
-use super::terminal::has_running_child;
+use super::terminal::{has_running_child, reconcile_abandoned_startup, startup_reconcile_delay};
 
 /// Identifies which token-class channel a coalescible event belongs to.
 ///
@@ -228,6 +228,14 @@ pub(super) fn live_stream_response(
             // the terminal open and close only once no running child is left.
             let mut awaiting_children = false;
 
+            // A stream opened before or during the chat→execute handoff must
+            // eventually re-evaluate abandoned pending work. Active handoffs
+            // sleep until their durable grace ends; idle streams keep a slow
+            // probe so work written after subscription is still discovered.
+            let initial_reconcile_delay = startup_reconcile_delay(&state, &session_id).await;
+            let startup_reconcile = tokio::time::sleep(initial_reconcile_delay);
+            tokio::pin!(startup_reconcile);
+
             // Token coalescing (v2-P0). When `batch_ms == 0` we take the legacy
             // fast path below — every event is emitted immediately, byte-for-byte
             // unchanged, with no buffering and no added latency (desktop default).
@@ -240,6 +248,23 @@ pub(super) fn live_stream_response(
             if batch_ms == 0 {
                 loop {
                     tokio::select! {
+                        _ = &mut startup_reconcile => {
+                            if reconcile_abandoned_startup(
+                                &state,
+                                &session_id,
+                                &receiver,
+                            )
+                            .await
+                            {
+                                // The durable CAS queued one broadcast Error;
+                                // receive it through the normal ordered path.
+                                let delay = startup_reconcile_delay(&state, &session_id).await;
+                                startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                                continue;
+                            }
+                            let delay = startup_reconcile_delay(&state, &session_id).await;
+                            startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
                         _ = heartbeat.tick() => {
                             if awaiting_children && !has_running_child(&state, &session_id).await {
                                 yield Ok::<_, actix_web::Error>(web::Bytes::from(done_sse_data()));
@@ -308,6 +333,24 @@ pub(super) fn live_stream_response(
                         .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
 
                     tokio::select! {
+                        _ = &mut startup_reconcile => {
+                            if reconcile_abandoned_startup(
+                                &state,
+                                &session_id,
+                                &receiver,
+                            )
+                            .await
+                            {
+                                // The Error is now queued after any existing
+                                // broadcast frames; normal coalescing preserves
+                                // buffered-token ordering before terminal close.
+                                let delay = startup_reconcile_delay(&state, &session_id).await;
+                                startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                                continue;
+                            }
+                            let delay = startup_reconcile_delay(&state, &session_id).await;
+                            startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
                         _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                             if let Some(pending) = coalescer.take_pending() {
                                 if let Some(sse_data) = event_sse_data(&pending) {
@@ -437,7 +480,7 @@ fn is_terminal_event(event: &AgentEvent) -> bool {
 #[cfg(test)]
 mod coalesce_tests {
     use super::*;
-    use bamboo_agent_core::TokenUsage;
+    use bamboo_agent_core::{Message, Session, TokenUsage};
 
     fn token(content: &str) -> AgentEvent {
         AgentEvent::Token {
@@ -661,5 +704,133 @@ mod coalesce_tests {
         let value = serde_json::to_value(&merged).unwrap();
         assert_eq!(value["type"], "token");
         assert_eq!(value["content"], "foobar");
+    }
+
+    async fn abandoned_startup_stream_body(batch_ms: u64) -> String {
+        let dir = tempfile::tempdir().expect("temporary app data");
+        let state = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = format!("sse-abandoned-{batch_ms}");
+        let mut session = Session::new(&session_id, "test-model");
+        session.add_message(Message::user("slow startup"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        session.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+        );
+        state.save_session(&mut session).await;
+
+        let sender = state.get_session_event_sender(&session_id).await;
+        let receiver = sender.subscribe();
+        sender
+            .send(AgentEvent::Token {
+                content: "before-terminal".to_string(),
+            })
+            .expect("live receiver");
+        let startup_guard =
+            crate::handlers::agent::events::begin_execute_startup(state.get_ref(), &session_id);
+        let watcher_guard = crate::app_state::watchers::WatcherGuard::new(
+            state.session_watchers.clone(),
+            &session_id,
+        );
+        let response = live_stream_response(
+            None,
+            Vec::new(),
+            receiver,
+            state,
+            session_id,
+            batch_ms,
+            watcher_guard,
+        );
+
+        let release_slow_startup = async move {
+            // The first expired-turn reconcile fires while this guard is still
+            // held and must re-arm. Dropping it models a slow execute handler
+            // finally returning without reserving a runner.
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            drop(startup_guard);
+        };
+        let collect_body = actix_web::body::to_bytes(response.into_body());
+        let (_, bytes) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(release_slow_startup, collect_body)
+        })
+        .await
+        .expect("SSE abandoned-startup reconcile must terminate");
+        String::from_utf8(bytes.expect("read SSE body").to_vec()).expect("UTF-8 SSE")
+    }
+
+    #[actix_web::test]
+    async fn live_sse_reconciles_abandoned_startup_in_both_batch_paths() {
+        for batch_ms in [0, 1_000] {
+            let body = abandoned_startup_stream_body(batch_ms).await;
+            let token = body.find("before-terminal").expect("token frame");
+            let terminal = body
+                .find("was not started")
+                .expect("synthetic startup terminal");
+            let done = body.find("[DONE]").expect("done frame");
+            assert!(
+                token < terminal && terminal < done,
+                "batch_ms={batch_ms} must preserve token → terminal → DONE ordering: {body}"
+            );
+            assert_eq!(body.matches("was not started").count(), 1);
+            assert_eq!(body.matches("[DONE]").count(), 1);
+        }
+    }
+
+    #[actix_web::test]
+    async fn live_sse_idle_probe_discovers_later_abandoned_turn() {
+        for batch_ms in [0, 1_000] {
+            let dir = tempfile::tempdir().expect("temporary app data");
+            let state = web::Data::new(
+                AppState::new(dir.path().to_path_buf())
+                    .await
+                    .expect("app state"),
+            );
+            let session_id = format!("sse-late-pending-{batch_ms}");
+            let mut session = Session::new(&session_id, "test-model");
+            state.save_session(&mut session).await;
+            let sender = state.get_session_event_sender(&session_id).await;
+            let receiver = sender.subscribe();
+            let watcher_guard = crate::app_state::watchers::WatcherGuard::new(
+                state.session_watchers.clone(),
+                &session_id,
+            );
+            let response = live_stream_response(
+                None,
+                Vec::new(),
+                receiver,
+                state.clone(),
+                session_id.clone(),
+                batch_ms,
+                watcher_guard,
+            );
+
+            let write_late_turn = async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                session.add_message(Message::user("never executed"));
+                crate::handlers::agent::events::mark_pending_turn(&mut session);
+                session.metadata.insert(
+                    "execute.startup_handoff_at".to_string(),
+                    (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+                );
+                state.save_session(&mut session).await;
+            };
+            let collect_body = actix_web::body::to_bytes(response.into_body());
+            let (_, bytes) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(write_late_turn, collect_body)
+            })
+            .await
+            .expect("idle probe must discover late pending turn");
+            let body =
+                String::from_utf8(bytes.expect("read SSE body").to_vec()).expect("UTF-8 SSE");
+            assert!(
+                body.contains("was not started"),
+                "batch_ms={batch_ms}: {body}"
+            );
+            assert_eq!(body.matches("[DONE]").count(), 1);
+        }
     }
 }

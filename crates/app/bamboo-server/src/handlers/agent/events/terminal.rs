@@ -1,7 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use actix_web::web;
+use tokio::sync::broadcast;
 
 use crate::app_state::{AgentStatus, AppState};
 use bamboo_agent_core::agent::events::TokenUsage;
@@ -9,54 +10,81 @@ use bamboo_agent_core::agent::Role;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::AgentStatusState;
 use bamboo_engine::session_app::execute::{
-    has_pending_clarification_resume, has_pending_retry_resume,
+    clear_startup_handoff, consume_pending_clarification_resume, has_pending_clarification_resume,
+    has_pending_retry_resume, mark_startup_handoff, startup_handoff_at,
 };
 
 const PENDING_TURN_ID_KEY: &str = "execute.pending_turn_message_id";
 const PENDING_TURN_GRACE_SECS: i64 = 60;
+const STARTUP_FAILURE_PREFIX: &str = "Agent startup failed: ";
+const EXPIRED_STARTUP_RECHECK: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const IDLE_STARTUP_PROBE: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const IDLE_STARTUP_PROBE: Duration = Duration::from_millis(25);
 
-type StartupKey = (usize, String);
-static EXECUTE_STARTUPS: OnceLock<Mutex<HashMap<StartupKey, usize>>> = OnceLock::new();
-
-fn execute_startups() -> &'static Mutex<HashMap<StartupKey, usize>> {
-    EXECUTE_STARTUPS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn startup_key(state: &AppState, session_id: &str) -> StartupKey {
-    (state as *const AppState as usize, session_id.to_string())
-}
-
+/// Owns one in-process `/execute` preparation for a session. The registry is
+/// AppState-scoped (not process-global), and reference counting keeps an
+/// overlapping request protected until its last handler returns.
 pub(crate) struct ExecuteStartupGuard {
-    key: StartupKey,
+    startups: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    session_id: String,
+    active: bool,
+}
+
+impl ExecuteStartupGuard {
+    /// Release this request's preparation ownership and return the number of
+    /// other startup owners still active for the session.
+    pub(crate) fn release(&mut self) -> usize {
+        if !self.active {
+            return self
+                .startups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&self.session_id)
+                .copied()
+                .unwrap_or(0);
+        }
+        self.active = false;
+        let mut startups = self.startups.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = startups.get_mut(&self.session_id) {
+            *count -= 1;
+            if *count == 0 {
+                startups.remove(&self.session_id);
+                return 0;
+            }
+            return *count;
+        }
+        0
+    }
 }
 
 impl Drop for ExecuteStartupGuard {
     fn drop(&mut self) {
-        let mut startups = execute_startups().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = startups.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                startups.remove(&self.key);
-            }
-        }
+        self.release();
     }
 }
 
 pub(crate) fn begin_execute_startup(state: &AppState, session_id: &str) -> ExecuteStartupGuard {
-    let key = startup_key(state, session_id);
-    *execute_startups()
+    let mut startups = state
+        .execute_startups
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(key.clone())
-        .or_default() += 1;
-    ExecuteStartupGuard { key }
+        .unwrap_or_else(|e| e.into_inner());
+    *startups.entry(session_id.to_string()).or_default() += 1;
+    drop(startups);
+    ExecuteStartupGuard {
+        startups: state.execute_startups.clone(),
+        session_id: session_id.to_string(),
+        active: true,
+    }
 }
 
 fn execute_startup_is_in_flight(state: &AppState, session_id: &str) -> bool {
-    execute_startups()
+    state
+        .execute_startups
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&startup_key(state, session_id))
+        .contains_key(session_id)
 }
 
 pub(crate) fn mark_pending_turn(session: &mut Session) {
@@ -67,16 +95,40 @@ pub(crate) fn mark_pending_turn(session: &mut Session) {
     }
     session.set_last_run_status("pending");
     session.clear_last_run_error();
+    mark_startup_handoff(session);
 }
 
 pub(crate) fn clear_pending_turn(session: &mut Session) {
     session.metadata.remove(PENDING_TURN_ID_KEY);
+    clear_startup_handoff(session);
 }
 
 pub(crate) fn pending_turn_id(session: &Session) -> Option<String> {
-    pending_turn_is_owned(session)
-        .then(|| session.metadata.get(PENDING_TURN_ID_KEY).cloned())
-        .flatten()
+    if !matches!(session.last_run_status().as_deref(), Some("pending")) {
+        return None;
+    }
+    let message = session
+        .messages
+        .last()
+        .filter(|message| matches!(message.role, Role::User))?;
+    match session.metadata.get(PENDING_TURN_ID_KEY) {
+        Some(owner) if owner == &message.id => Some(owner.clone()),
+        Some(_) => None,
+        // Backward compatibility for a pending turn persisted before the
+        // ownership marker shipped: last-User id is still an exact CAS token.
+        None => Some(message.id.clone()),
+    }
+}
+
+/// Exact durable message token for any work accepted by `/execute`: a normal
+/// pending User turn or a clarification/retry resume whose last message is a
+/// tool result. Used as a compare-and-set owner across async preparation.
+pub(crate) fn startup_work_id(session: &Session) -> Option<String> {
+    pending_turn_id(session).or_else(|| {
+        (has_pending_clarification_resume(session) || has_pending_retry_resume(session))
+            .then(|| session.messages.last().map(|message| message.id.clone()))
+            .flatten()
+    })
 }
 
 pub(crate) fn mark_startup_failed_if_owned(
@@ -84,30 +136,182 @@ pub(crate) fn mark_startup_failed_if_owned(
     expected_turn_id: &str,
     detail: &str,
 ) -> bool {
-    if pending_turn_id(session).as_deref() != Some(expected_turn_id) {
+    if startup_work_id(session).as_deref() != Some(expected_turn_id) {
         return false;
     }
     session.set_last_run_status("error");
-    session.set_last_run_error(format!("Agent startup failed: {detail}"));
+    session.set_last_run_error(format!("{STARTUP_FAILURE_PREFIX}{detail}"));
     clear_pending_turn(session);
+    consume_pending_clarification_resume(session);
     true
 }
 
-pub(crate) fn pending_turn_is_owned(session: &Session) -> bool {
-    matches!(session.last_run_status().as_deref(), Some("pending"))
-        && session
-            .metadata
-            .get(PENDING_TURN_ID_KEY)
-            .zip(session.messages.last())
-            .is_some_and(|(owner, message)| owner == &message.id)
+pub(crate) enum StartupFailureTarget<'a> {
+    WorkId {
+        work_id: &'a str,
+        startup_guard: &'a mut ExecuteStartupGuard,
+    },
+    Abandoned(&'a broadcast::Receiver<AgentEvent>),
 }
 
-fn pending_turn_is_active(session: &Session) -> bool {
-    pending_turn_is_owned(session)
-        && session.messages.last().is_some_and(|message| {
-            chrono::Utc::now().signed_duration_since(message.created_at)
-                <= chrono::Duration::seconds(PENDING_TURN_GRACE_SECS)
-        })
+/// Atomically reject startup work if the latest durable session still belongs
+/// to `target`.
+///
+/// The per-session persistence lock covers the latest load, ownership CAS, raw
+/// save, cache replacement, and broadcast. A stale preparation/rollback can
+/// therefore never overwrite or notify after a newer chat turn is persisted.
+pub(crate) async fn transition_startup_failure_if_owned(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    target: StartupFailureTarget<'_>,
+    detail: &str,
+) -> bool {
+    let (mut expected_work_id, abandoned_receiver) = match target {
+        StartupFailureTarget::WorkId {
+            work_id,
+            startup_guard,
+        } => {
+            // Consume this failing request while holding the persistence lock.
+            // Only the last preparation failure may own the durable rollback;
+            // this prevents both premature failure and the dual-failure gap.
+            (Some((work_id, startup_guard)), None)
+        }
+        StartupFailureTarget::Abandoned(receiver) => (None, Some(receiver)),
+    };
+    if abandoned_receiver.is_some_and(|receiver| !receiver.is_empty()) {
+        return false;
+    }
+
+    let _session_guard = state.persistence.acquire_lock(session_id).await;
+    if let Some((_, startup_guard)) = expected_work_id.as_mut() {
+        if (*startup_guard).release() != 0 {
+            return false;
+        }
+    }
+    // An overlapping execute may already own this same durable work id but not
+    // yet have persisted the marker clear. Its live runner is authoritative.
+    if matches!(
+        state
+            .agent_runners
+            .read()
+            .await
+            .get(session_id)
+            .map(|runner| &runner.status),
+        Some(AgentStatus::Pending | AgentStatus::Running)
+    ) {
+        return false;
+    }
+    if let Some(receiver) = abandoned_receiver {
+        if !receiver.is_empty() || execute_startup_is_in_flight(state.get_ref(), session_id) {
+            return false;
+        }
+    }
+
+    let Ok(Some(mut session)) = state.storage.load_session(session_id).await else {
+        return false;
+    };
+    let expected_work_id = match expected_work_id {
+        Some((work_id, _)) => work_id.to_string(),
+        None => {
+            let Some(work_id) = startup_work_id(&session) else {
+                return false;
+            };
+            if startup_work_is_active(&session) {
+                return false;
+            }
+            work_id
+        }
+    };
+
+    // Execute registers its startup guard while holding this same persistence
+    // lock. Re-read all live ownership sources immediately before the CAS.
+    if matches!(
+        state
+            .agent_runners
+            .read()
+            .await
+            .get(session_id)
+            .map(|runner| &runner.status),
+        Some(AgentStatus::Pending | AgentStatus::Running)
+    ) {
+        return false;
+    }
+    if let Some(receiver) = abandoned_receiver {
+        if !receiver.is_empty() || execute_startup_is_in_flight(state.get_ref(), session_id) {
+            return false;
+        }
+    }
+
+    if !mark_startup_failed_if_owned(&mut session, &expected_work_id, detail) {
+        return false;
+    }
+    session.updated_at = chrono::Utc::now();
+    let message = session
+        .last_run_error()
+        .unwrap_or_else(|| format!("{STARTUP_FAILURE_PREFIX}{detail}"));
+    if let Err(error) = state.storage.save_session(&session).await {
+        tracing::error!("[{session_id}] failed to persist startup failure transition: {error}");
+        // A concrete execute request has already failed and released its last
+        // startup owner. Even if durable storage is unavailable, unblock its
+        // currently-connected client with the exact owned failure. An
+        // abandoned-startup probe must instead stay silent and retry: emitting
+        // without clearing its durable marker would create duplicate terminals.
+        if abandoned_receiver.is_none() {
+            let sender = state.get_session_event_sender(session_id).await;
+            let _ = sender.send(AgentEvent::Error { message });
+        }
+        return false;
+    }
+    state.sessions.insert(
+        session_id.to_string(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let sender = state.get_session_event_sender(session_id).await;
+    let _ = sender.send(AgentEvent::Error { message });
+    true
+}
+
+fn startup_work_is_active(session: &Session) -> bool {
+    let Some(started_at) = startup_work_started_at(session) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(started_at)
+        <= chrono::Duration::seconds(PENDING_TURN_GRACE_SECS)
+}
+
+fn startup_work_started_at(session: &Session) -> Option<chrono::DateTime<chrono::Utc>> {
+    startup_work_id(session)?;
+    startup_handoff_at(session)
+        .or_else(|| session.messages.last().map(|message| message.created_at))
+}
+
+fn startup_failure_message(session: &Session) -> Option<String> {
+    matches!(session.last_run_status().as_deref(), Some("error"))
+        .then(|| session.last_run_error())
+        .flatten()
+        .filter(|message| message.starts_with(STARTUP_FAILURE_PREFIX))
+}
+
+/// Delay until the next live-transport startup probe. Active work sleeps until
+/// its exact durable grace expires; idle transports probe infrequently so a
+/// later chat/retry written after subscription still arms reconciliation.
+pub(crate) async fn startup_reconcile_delay(
+    state: &web::Data<AppState>,
+    session_id: &str,
+) -> Duration {
+    let Some(session) = state.storage.load_session(session_id).await.ok().flatten() else {
+        return IDLE_STARTUP_PROBE;
+    };
+    let Some(started_at) = startup_work_started_at(&session) else {
+        return IDLE_STARTUP_PROBE;
+    };
+    let remaining = chrono::Duration::seconds(PENDING_TURN_GRACE_SECS)
+        - chrono::Utc::now().signed_duration_since(started_at);
+    if remaining <= chrono::Duration::zero() {
+        return EXPIRED_STARTUP_RECHECK;
+    }
+    let millis = remaining.num_milliseconds().max(1) as u64;
+    Duration::from_millis(millis + 25)
 }
 
 pub(crate) async fn terminal_event_if_ready(
@@ -115,11 +319,9 @@ pub(crate) async fn terminal_event_if_ready(
     session_id: &str,
     runner_status: Option<AgentStatus>,
 ) -> Option<AgentEvent> {
-    // `/execute` may legitimately spend longer than the durable handoff grace
-    // in provider/image/storage preparation before it can reserve a runner.
-    // Never synthesize an abandoned-startup terminal while an in-process
-    // execute handler still owns this session. The guard disappears on every
-    // return path and naturally vanishes if the process crashes.
+    // A slow but legitimate execute may outlive the durable handoff grace
+    // before it can reserve a runner. Its RAII owner wins until every
+    // overlapping handler returns; a crash naturally drops the whole AppState.
     if execute_startup_is_in_flight(state.get_ref(), session_id) {
         return None;
     }
@@ -204,6 +406,23 @@ pub(crate) async fn terminal_event_if_ready(
     Some(terminal_event_for_sources(session.as_ref(), runner_status))
 }
 
+/// Atomically consume an abandoned startup and enqueue its terminal error on
+/// the session broadcast. Each transport consumes that broadcast through its
+/// normal ordered receive path.
+pub(crate) async fn reconcile_abandoned_startup(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    receiver: &broadcast::Receiver<AgentEvent>,
+) -> bool {
+    transition_startup_failure_if_owned(
+        state,
+        session_id,
+        StartupFailureTarget::Abandoned(receiver),
+        "Agent execution was not started; please retry this turn",
+    )
+    .await
+}
+
 pub(super) fn session_has_terminal_evidence(
     session: Option<&Session>,
     runner_status: Option<&AgentStatus>,
@@ -249,12 +468,17 @@ pub(super) fn terminal_event_for_sources(
     session: Option<&Session>,
     runner_status: Option<AgentStatus>,
 ) -> AgentEvent {
-    if session
-        .is_some_and(|session| pending_turn_is_owned(session) && !pending_turn_is_active(session))
-    {
+    if session.is_some_and(|session| {
+        startup_work_id(session).is_some() && !startup_work_is_active(session)
+    }) {
         return AgentEvent::Error {
             message: "Agent execution was not started; please retry this turn".to_string(),
         };
+    }
+    // A startup rejection belongs to the newest durable handoff and must beat
+    // an old runner/runtime snapshot from the preceding run.
+    if let Some(message) = session.and_then(startup_failure_message) {
+        return AgentEvent::Error { message };
     }
     if runner_status.is_some() {
         return terminal_event_for_status(runner_status);
@@ -288,8 +512,21 @@ pub(super) fn session_prevents_terminal_event(
     // persistence writes this marker together with the new User message, so a
     // reconnect between POST /chat and POST /execute remains live even if the
     // previous run was cancelled or failed.
-    if pending_turn_is_active(session) {
+    if startup_work_is_active(session) {
         return true;
+    }
+
+    if startup_work_id(session).is_some() {
+        // The execute handoff (User turn or resume marker) outlived its grace
+        // without a runner. Old suspended/terminal state must not hide this
+        // abandoned work; an in-flight handler was already protected above.
+        return false;
+    }
+
+    // Durable startup rejection is terminal even when the previous run left a
+    // pending-question or Suspended runtime snapshot behind.
+    if startup_failure_message(session).is_some() {
+        return false;
     }
 
     if session.has_pending_question() {
@@ -344,12 +581,15 @@ fn terminal_failure_is_authoritative(
         // Any extant non-failure runner is the current source of truth; do not
         // fall back to a stale persisted failure from an older run.
         Some(_) => false,
-        None => session.agent_runtime_state.as_ref().is_some_and(|runtime| {
-            matches!(
-                runtime.status,
-                AgentStatusState::Cancelled | AgentStatusState::Failed
-            )
-        }),
+        None => {
+            startup_failure_message(session).is_some()
+                || session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+                    matches!(
+                        runtime.status,
+                        AgentStatusState::Cancelled | AgentStatusState::Failed
+                    )
+                })
+        }
     }
 }
 
@@ -456,6 +696,14 @@ mod tests {
         (dir, state)
     }
 
+    fn expire_startup_handoff(session: &mut Session) {
+        session.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            (chrono::Utc::now() - chrono::Duration::seconds(PENDING_TURN_GRACE_SECS + 1))
+                .to_rfc3339(),
+        );
+    }
+
     #[actix_web::test]
     async fn terminal_helper_replays_in_memory_cancelled_after_last_user() {
         let mut session = Session::new("cancelled-user", "test-model");
@@ -543,8 +791,7 @@ mod tests {
         let mut session = Session::new("abandoned-turn", "test-model");
         session.add_message(Message::user("never executed"));
         mark_pending_turn(&mut session);
-        session.messages.last_mut().unwrap().created_at =
-            chrono::Utc::now() - chrono::Duration::seconds(PENDING_TURN_GRACE_SECS + 1);
+        expire_startup_handoff(&mut session);
         let mut runtime = AgentRuntimeState::new("old-failed-run");
         runtime.status = AgentStatusState::Failed;
         session.agent_runtime_state = Some(runtime);
@@ -564,37 +811,214 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn expired_pending_turn_stays_live_while_execute_startup_is_in_flight() {
+    async fn abandoned_first_turn_needs_no_old_terminal_evidence() {
+        let mut session = Session::new("abandoned-first-turn", "test-model");
+        session.add_message(Message::user("never executed"));
+        mark_pending_turn(&mut session);
+        expire_startup_handoff(&mut session);
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(&state, "abandoned-first-turn", None)
+            .await
+            .expect("expired first turn is terminal");
+        assert!(matches!(
+            event,
+            AgentEvent::Error { message } if message.contains("was not started")
+        ));
+    }
+
+    #[actix_web::test]
+    async fn app_state_scoped_guard_refcounts_slow_overlapping_startups() {
         let mut session = Session::new("slow-startup", "test-model");
         session.add_message(Message::user("slow image preparation"));
         mark_pending_turn(&mut session);
-        session.messages.last_mut().unwrap().created_at =
-            chrono::Utc::now() - chrono::Duration::seconds(PENDING_TURN_GRACE_SECS + 1);
-        let mut runtime = AgentRuntimeState::new("old-failed-run");
-        runtime.status = AgentStatusState::Failed;
-        session.agent_runtime_state = Some(runtime);
+        expire_startup_handoff(&mut session);
         let (_dir, state) = state_with_session(session).await;
 
-        let guard = begin_execute_startup(state.get_ref(), "slow-startup");
-        let old_failure = Some(AgentStatus::Error("old run failed".to_string()));
-        assert!(
-            terminal_event_if_ready(&state, "slow-startup", old_failure.clone())
-                .await
-                .is_none()
-        );
-        // Reference counting matters when two execute requests overlap: one
-        // returning must not expose the other still-running preparation.
+        let first = begin_execute_startup(state.get_ref(), "slow-startup");
         let second = begin_execute_startup(state.get_ref(), "slow-startup");
-        drop(guard);
-        assert!(
-            terminal_event_if_ready(&state, "slow-startup", old_failure.clone())
-                .await
-                .is_none()
-        );
+        assert!(terminal_event_if_ready(&state, "slow-startup", None)
+            .await
+            .is_none());
+        drop(first);
+        assert!(terminal_event_if_ready(&state, "slow-startup", None)
+            .await
+            .is_none());
         drop(second);
-        assert!(terminal_event_if_ready(&state, "slow-startup", old_failure)
+        assert!(terminal_event_if_ready(&state, "slow-startup", None)
             .await
             .is_some());
+    }
+
+    #[actix_web::test]
+    async fn startup_failure_is_durable_terminal_without_runtime_state() {
+        let mut session = Session::new("startup-rejected", "test-model");
+        session.add_message(Message::user("start me"));
+        mark_pending_turn(&mut session);
+        let turn_id = pending_turn_id(&session).expect("owned turn");
+        assert!(mark_startup_failed_if_owned(
+            &mut session,
+            &turn_id,
+            "provider rejected"
+        ));
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(&state, "startup-rejected", None)
+            .await
+            .expect("startup rejection is terminal");
+        assert!(matches!(
+            event,
+            AgentEvent::Error { message } if message.contains("provider rejected")
+        ));
+    }
+
+    #[actix_web::test]
+    async fn startup_failure_after_suspended_resume_is_authoritative_terminal() {
+        let mut session = Session::new("suspended-resume-failed", "test-model");
+        session.add_message(Message::assistant("question", None));
+        session.add_message(Message::tool_result("ask-1", "answer"));
+        let mut runtime = AgentRuntimeState::new("old-suspended-run");
+        runtime.status = AgentStatusState::Suspended;
+        session.agent_runtime_state = Some(runtime);
+        session.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        mark_startup_handoff(&mut session);
+        let work_id = startup_work_id(&session).expect("resume work id");
+        assert!(mark_startup_failed_if_owned(
+            &mut session,
+            &work_id,
+            "resume provider rejected"
+        ));
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(&state, "suspended-resume-failed", None)
+            .await
+            .expect("durable startup rejection beats old Suspended state");
+        assert!(matches!(
+            event,
+            AgentEvent::Error { message } if message.contains("resume provider rejected")
+        ));
+    }
+
+    #[test]
+    fn newly_marked_retry_on_old_history_gets_a_fresh_grace_window() {
+        let mut session = Session::new("old-history-retry", "test-model");
+        session.add_message(Message::assistant("old failure", None));
+        session.messages.last_mut().unwrap().created_at =
+            chrono::Utc::now() - chrono::Duration::hours(6);
+        session
+            .metadata
+            .insert("retry_resume_pending".to_string(), "true".to_string());
+        mark_startup_handoff(&mut session);
+
+        assert!(startup_work_id(&session).is_some());
+        assert!(startup_work_is_active(&session));
+        assert!(session_prevents_terminal_event(Some(&session), None));
+    }
+
+    #[actix_web::test]
+    async fn concurrent_live_reconcilers_broadcast_abandoned_startup_once() {
+        let mut session = Session::new("multi-reconcile", "test-model");
+        session.add_message(Message::user("never executed"));
+        mark_pending_turn(&mut session);
+        session.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+        );
+        let (_dir, state) = state_with_session(session).await;
+        let sender = state.get_session_event_sender("multi-reconcile").await;
+        let mut first_rx = sender.subscribe();
+        let mut second_rx = sender.subscribe();
+
+        let (first, second) = tokio::join!(
+            reconcile_abandoned_startup(&state, "multi-reconcile", &first_rx),
+            reconcile_abandoned_startup(&state, "multi-reconcile", &second_rx),
+        );
+        if first == second {
+            let debug = state
+                .storage
+                .load_session("multi-reconcile")
+                .await
+                .expect("debug load")
+                .expect("debug session");
+            panic!(
+                "only one durable CAS may broadcast: first={first}, second={second}, status={:?}, work={:?}, handoff={:?}, error={:?}",
+                debug.last_run_status(),
+                startup_work_id(&debug),
+                startup_handoff_at(&debug),
+                debug.last_run_error(),
+            );
+        }
+        assert!(matches!(first_rx.try_recv(), Ok(AgentEvent::Error { .. })));
+        assert!(matches!(second_rx.try_recv(), Ok(AgentEvent::Error { .. })));
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+
+        let stored = state
+            .storage
+            .load_session("multi-reconcile")
+            .await
+            .expect("load session")
+            .expect("stored session");
+        assert!(startup_work_id(&stored).is_none());
+        assert!(startup_failure_message(&stored).is_some());
+    }
+
+    #[actix_web::test]
+    async fn newer_chat_waiting_on_session_lock_wins_before_reconcile() {
+        let mut session = Session::new("chat-reconcile-race", "test-model");
+        session.add_message(Message::user("abandoned first turn"));
+        mark_pending_turn(&mut session);
+        session.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+        );
+        let mut newer = session.clone();
+        newer.add_message(Message::user("newer turn"));
+        mark_pending_turn(&mut newer);
+        let newer_id = startup_work_id(&newer).expect("newer work id");
+        let (_dir, state) = state_with_session(session).await;
+        let sender = state.get_session_event_sender("chat-reconcile-race").await;
+        let reconcile_receiver = sender.subscribe();
+        let mut observer = sender.subscribe();
+
+        // Queue the chat save first, then reconciliation, behind the same
+        // per-session guard. FIFO lock acquisition makes the new turn durable
+        // before reconciliation re-evaluates it.
+        let blocker = state.persistence.acquire_lock("chat-reconcile-race").await;
+        let persistence = state.persistence.clone();
+        let save = tokio::spawn(async move {
+            persistence
+                .merge_save_runtime(&mut newer)
+                .await
+                .expect("save newer turn");
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let reconcile_state = state.clone();
+        let reconcile = tokio::spawn(async move {
+            reconcile_abandoned_startup(
+                &reconcile_state,
+                "chat-reconcile-race",
+                &reconcile_receiver,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(blocker);
+
+        save.await.expect("save task");
+        assert!(!reconcile.await.expect("reconcile task"));
+        let stored = state
+            .storage
+            .load_session("chat-reconcile-race")
+            .await
+            .expect("load session")
+            .expect("stored session");
+        assert_eq!(startup_work_id(&stored).as_deref(), Some(newer_id.as_str()));
+        assert_eq!(stored.last_run_status().as_deref(), Some("pending"));
+        assert!(observer.try_recv().is_err(), "new turn must not be closed");
     }
 
     #[test]
@@ -625,5 +1049,31 @@ mod tests {
             "late rejection"
         ));
         assert_eq!(stale.last_run_status().as_deref(), Some("pending"));
+
+        let mut legacy = Session::new("legacy", "test-model");
+        legacy.add_message(Message::user("persisted before owner marker"));
+        legacy.set_last_run_status("pending");
+        let legacy_id = pending_turn_id(&legacy).expect("legacy last-User ownership");
+        assert!(mark_startup_failed_if_owned(
+            &mut legacy,
+            &legacy_id,
+            "legacy startup rejected"
+        ));
+
+        let mut resume = Session::new("resume", "test-model");
+        resume.add_message(Message::assistant("question", None));
+        resume.add_message(Message::tool_result("ask-1", "answer"));
+        resume.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        let resume_id = startup_work_id(&resume).expect("resume work id");
+        assert!(mark_startup_failed_if_owned(
+            &mut resume,
+            &resume_id,
+            "resume persistence failed"
+        ));
+        assert!(!has_pending_clarification_resume(&resume));
+        assert_eq!(resume.last_run_status().as_deref(), Some("error"));
     }
 }
