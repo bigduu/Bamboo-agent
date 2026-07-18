@@ -141,6 +141,18 @@ pub fn resolve_effective_reasoning_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! test_config {
+        (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+        (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+        (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+        (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut config = Config::default();
+            $(test_config!(@assign config, $field, $value);)*
+            config
+        }};
+    }
     use bamboo_agent_core::tools::ToolSchema;
     use bamboo_agent_core::Message;
     use bamboo_config::{DefaultsConfig, FeatureFlags};
@@ -186,14 +198,13 @@ mod tests {
     }
 
     fn config_with_defaults(defaults: DefaultsConfig) -> Config {
-        Config {
+        test_config! {
             provider: "openai".to_string(),
             features: FeatureFlags {
                 provider_model_ref: true,
                 ..Default::default()
             },
             defaults: Some(defaults),
-            ..Config::default()
         }
     }
 
@@ -306,7 +317,7 @@ mod tests {
     #[test]
     fn legacy_mode_resolves_fast_from_provider_config() {
         // Flag OFF: no `defaults`, fast comes from the provider's global config.
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             features: FeatureFlags {
                 provider_model_ref: false,
@@ -329,7 +340,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let areas = resolve_global_area_models(&config, "openai", &test_registry());

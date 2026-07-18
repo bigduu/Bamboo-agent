@@ -121,7 +121,7 @@ mod tests {
             // route each `ProviderModelRef` through the live provider registry
             // (`ProviderModelRouter::route`), which only succeeds for a provider
             // that's actually registered — an API key is what registers it.
-            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
                 api_key: "test-key".to_string(),
                 ..Default::default()
             });
@@ -179,7 +179,7 @@ mod tests {
         {
             let mut config = state.config.write().await;
             config.provider = "openai".to_string();
-            config.providers.openai = Some(bamboo_config::OpenAIConfig {
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
                 api_key: "sk-super-secret-value".to_string(),
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()

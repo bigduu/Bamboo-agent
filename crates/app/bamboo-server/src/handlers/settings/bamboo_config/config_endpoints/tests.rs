@@ -47,7 +47,7 @@ fn connect_backup_file_path_appends_connect_json_bak_filename() {
 #[actix_web::test]
 async fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_auth() {
     let mut config = Config::default();
-    config.providers.openai = Some(OpenAIConfig {
+    config.providers_mut().openai = Some(OpenAIConfig {
         api_key: "sk-secret".to_string(),
         api_key_from_env: false,
         api_key_encrypted: None,

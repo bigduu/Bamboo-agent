@@ -2072,7 +2072,9 @@ fn serialize_config_for_cli(
     config.refresh_mcp_secrets_encrypted()?;
     config.normalize_tool_settings();
 
-    let mut value = serde_json::to_value(&config)?;
+    // CLI output and public Config serde retain the full compatibility view.
+    // Only save_to_dir persists a root DTO that excludes sidecar domains.
+    let mut value = config.to_compatibility_value()?;
     if !show_secrets {
         value = bamboo_agent::server::handlers::settings::redact_config_for_api(value, &config);
     }
@@ -2147,7 +2149,7 @@ mod tests {
             username: "alice".to_string(),
             password: "secret".to_string(),
         });
-        config.providers = ProviderConfigs {
+        *config.providers_mut() = ProviderConfigs {
             openai: Some(OpenAIConfig {
                 api_key: "sk-cli-secret".to_string(),
                 api_key_from_env: false,

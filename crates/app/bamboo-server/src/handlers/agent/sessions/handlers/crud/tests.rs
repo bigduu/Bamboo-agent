@@ -6,6 +6,18 @@ use bamboo_engine::session_app::session_create::{
 };
 use bamboo_llm::Config;
 
+macro_rules! test_config {
+    (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+    (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+    (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+    (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+    ($($field:ident: $value:expr),* $(,)?) => {{
+        let mut config = Config::default();
+        $(test_config!(@assign config, $field, $value);)*
+        config
+    }};
+}
+
 const BUILTIN_FALLBACK: &str = crate::app_state::DEFAULT_BASE_PROMPT;
 
 fn config_from_server(config: &Config) -> CreateSessionConfig {
@@ -19,9 +31,8 @@ fn config_from_server(config: &Config) -> CreateSessionConfig {
 
 #[test]
 fn model_from_request_uses_provider_default_when_absent_or_blank() {
-    let config = Config {
+    let config = test_config! {
         provider: "copilot".to_string(),
-        ..Config::default()
     };
     let expected = config
         .get_model()
@@ -83,10 +94,9 @@ fn build_new_session_applies_title_and_system_prompt_metadata() {
 
 #[test]
 fn build_new_session_uses_global_default_template_when_request_prompt_is_missing() {
-    let config = Config {
+    let config = test_config! {
         provider: "copilot".to_string(),
         providers: ProviderConfigs::default(),
-        ..Config::default()
     };
     let input = CreateSessionInput {
         id: "session-1".to_string(),
@@ -112,10 +122,9 @@ fn build_new_session_uses_global_default_template_when_request_prompt_is_missing
 
 #[test]
 fn reasoning_effort_from_request_falls_back_to_provider_default() {
-    let config = Config {
+    let config = test_config! {
         provider: "copilot".to_string(),
         providers: ProviderConfigs::default(),
-        ..Config::default()
     };
 
     assert_eq!(

@@ -2034,7 +2034,7 @@ mod tests {
     // `config_manager::build_merged_config` does around `deep_merge_json`,
     // minus the secret-specific composition (covered separately below).
     fn merge_and_deserialize(current: &Config, patch: Value) -> Config {
-        let mut merged = serde_json::to_value(current).unwrap();
+        let mut merged = current.to_compatibility_value().unwrap();
         deep_merge_json(&mut merged, patch);
         serde_json::from_value(merged).expect("merged config should deserialize")
     }

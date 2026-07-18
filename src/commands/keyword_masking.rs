@@ -23,7 +23,7 @@ pub async fn get_keyword_masking_config() -> Result<KeywordMaskingResponse, Stri
     let config = Config::new();
 
     Ok(KeywordMaskingResponse {
-        entries: config.keyword_masking.entries,
+        entries: config.keyword_masking.entries.clone(),
     })
 }
 

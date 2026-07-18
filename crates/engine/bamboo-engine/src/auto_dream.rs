@@ -623,7 +623,7 @@ async fn run_auto_dream_once_for_scope(
     };
 
     let config_snapshot = ctx.config.read().await.clone();
-    let memory_cfg = config_snapshot.memory.clone().unwrap_or_default();
+    let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
     if require_auto_dream_enabled && !memory_cfg.auto_dream_enabled {
         tracing::info!(
             target: DREAM_TRACING_TARGET,
@@ -885,7 +885,7 @@ pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
             .config
             .read()
             .await
-            .memory
+            .memory()
             .as_ref()
             .map(|memory| memory.auto_dream_interval_secs)
             .filter(|secs| *secs > 0)
@@ -919,6 +919,12 @@ mod tests {
 
     use bamboo_agent_core::storage::Storage;
     use bamboo_llm::{LLMError, LLMStream};
+
+    fn config_with_memory(memory: bamboo_config::MemoryConfig) -> Config {
+        let mut config = Config::default();
+        *config.memory_mut() = Some(memory);
+        config
+    }
 
     #[test]
     fn full_rebuild_marker_bootstraps_on_first_grounded_rebuild() {
@@ -1047,14 +1053,13 @@ mod tests {
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
             "{\"candidates\":[{\"title\":\"User prefers terse responses\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers terse responses and no recap.\",\"tags\":[\"preference\",\"style\"],\"session_id\":\"session-auto\",\"confidence\":\"high\"}]}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let mut session = bamboo_agent_core::Session::new("session-auto", "model");
         session.title = "Auto memory test".to_string();
@@ -1152,14 +1157,13 @@ mod tests {
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
             "{\"candidates\":[]}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let mut session = bamboo_agent_core::Session::new("session-empty", "model");
         session.metadata.insert(
@@ -1222,14 +1226,13 @@ mod tests {
             "## Current durable context\n- Durable signal found\n\n## Cross-session patterns\n- Prefer concise answers\n\n## Active threads to remember\n- Memory extraction\n\n## Stable constraints and preferences\n- Terse replies\n\n## Open risks or questions\n- None".to_string(),
             "{\"candidates\":[{\"title\":\"User prefers concise answers\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers concise answers and minimal recap.\",\"tags\":[\"preference\"],\"session_id\":\"session-dream-run\"}],\"ledger_candidates\":[{\"title\":\"Renew passport\",\"kind\":\"todo\",\"due_at\":\"2026-08-01T00:00:00Z\",\"starts_at\":null,\"excerpt\":\"I need to renew my passport before August\",\"session_id\":\"session-dream-run\",\"confidence\":\"high\"}]}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let mut session = bamboo_agent_core::Session::new("session-dream-run", "model");
         session.title = "Dream run test".to_string();
@@ -1534,14 +1537,13 @@ mod tests {
             "## Current durable context\n- Project A signal only\n\n## Cross-session patterns\n- Focus on project A\n\n## Active threads to remember\n- Ship project A\n\n## Stable constraints and preferences\n- Keep scope isolated\n\n## Open risks or questions\n- None".to_string(),
             "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"session-project-a\"}]}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let mut session_a = bamboo_agent_core::Session::new("session-project-a", "model");
         session_a.title = "Project A session".to_string();
@@ -1664,14 +1666,13 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let mut other_session = bamboo_agent_core::Session::new("session-other-project", "model");
         other_session.title = "Other project session".to_string();
@@ -1738,13 +1739,12 @@ mod tests {
             "## Current durable context\n- Manual project dream worked\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
             "{\"candidates\":[]}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let mut session = bamboo_agent_core::Session::new("session-manual-project-dream", "model");
         session.title = "Manual project dream session".to_string();
@@ -1813,14 +1813,13 @@ mod tests {
             "{\"candidates\":[]}".to_string(),
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let workspace = temp_dir.path().join("workspace-grounded-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
@@ -1923,14 +1922,13 @@ mod tests {
             "{\"candidates\":[]}".to_string(),
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let workspace = temp_dir.path().join("workspace-rebuild-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
@@ -2056,14 +2054,13 @@ Model: gpt-5-mini
             "{\"candidates\":[]}".to_string(),
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let workspace = temp_dir.path().join("workspace-refine-normalize");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
@@ -2136,14 +2133,13 @@ Model: gpt-5-mini
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
         // auto_dream is ON by default (L4), so disable it explicitly to keep
         // covering the disabled gate (not merely "no candidate sessions").
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: false,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let context = AutoDreamContext {
             session_store,
@@ -2170,14 +2166,13 @@ Model: gpt-5-mini
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
 
         let context = AutoDreamContext {
             session_store,

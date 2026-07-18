@@ -47,7 +47,7 @@ pub async fn create_provider_by_name(
         "copilot" => {
             // Get headless_auth from providers.copilot config, with fallback to deprecated root field
             let headless_auth = config
-                .providers
+                .providers()
                 .copilot
                 .as_ref()
                 .map(|c| c.headless_auth)
@@ -59,7 +59,7 @@ pub async fn create_provider_by_name(
                 headless_auth,
             );
 
-            if let Some(copilot_cfg) = config.providers.copilot.as_ref() {
+            if let Some(copilot_cfg) = config.providers().copilot.as_ref() {
                 if !copilot_cfg.responses_only_models.is_empty() {
                     provider = provider
                         .with_responses_only_models(copilot_cfg.responses_only_models.clone());
@@ -87,7 +87,7 @@ pub async fn create_provider_by_name(
 
         "openai" => {
             let openai_config = config
-                .providers
+                .providers()
                 .openai
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("OpenAI configuration required".to_string()))?;
@@ -118,7 +118,7 @@ pub async fn create_provider_by_name(
 
         "anthropic" => {
             let anthropic_config =
-                config.providers.anthropic.as_ref().ok_or_else(|| {
+                config.providers().anthropic.as_ref().ok_or_else(|| {
                     LLMError::Auth("Anthropic configuration required".to_string())
                 })?;
 
@@ -150,7 +150,7 @@ pub async fn create_provider_by_name(
 
         "gemini" => {
             let gemini_config = config
-                .providers
+                .providers()
                 .gemini
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("Gemini configuration required".to_string()))?;
@@ -176,7 +176,7 @@ pub async fn create_provider_by_name(
 
         "bodhi" => {
             let bodhi_config = config
-                .providers
+                .providers()
                 .bodhi
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("Bodhi configuration required".to_string()))?;
@@ -218,7 +218,7 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 
         "openai" => {
             let openai_config = config
-                .providers
+                .providers()
                 .openai
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("OpenAI configuration required".to_string()))?;
@@ -232,7 +232,7 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 
         "anthropic" => {
             let anthropic_config =
-                config.providers.anthropic.as_ref().ok_or_else(|| {
+                config.providers().anthropic.as_ref().ok_or_else(|| {
                     LLMError::Auth("Anthropic configuration required".to_string())
                 })?;
 
@@ -245,7 +245,7 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 
         "gemini" => {
             let gemini_config = config
-                .providers
+                .providers()
                 .gemini
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("Gemini configuration required".to_string()))?;
@@ -259,7 +259,7 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 
         "bodhi" => {
             let bodhi_config = config
-                .providers
+                .providers()
                 .bodhi
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("Bodhi configuration required".to_string()))?;
@@ -283,13 +283,16 @@ mod tests {
     use super::*;
     use bamboo_config::{AnthropicConfig, GeminiConfig, OpenAIConfig, ProviderConfigs};
 
+    fn config_with_provider(provider: &str, providers: ProviderConfigs) -> Config {
+        let mut config = Config::default();
+        config.provider = provider.to_string();
+        *config.providers_mut() = providers;
+        config
+    }
+
     #[tokio::test]
     async fn test_create_copilot_provider() {
-        let config = Config {
-            provider: "copilot".to_string(),
-            providers: ProviderConfigs::default(),
-            ..Config::default()
-        };
+        let config = config_with_provider("copilot", ProviderConfigs::default());
 
         let result = create_provider(&config).await;
         assert!(result.is_ok());
@@ -297,11 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_openai_provider_without_config() {
-        let config = Config {
-            provider: "openai".to_string(),
-            providers: ProviderConfigs::default(),
-            ..Config::default()
-        };
+        let config = config_with_provider("openai", ProviderConfigs::default());
 
         let result = create_provider(&config).await;
         assert!(result.is_err());
@@ -315,9 +314,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_openai_provider_with_empty_key() {
-        let config = Config {
-            provider: "openai".to_string(),
-            providers: ProviderConfigs {
+        let config = config_with_provider(
+            "openai",
+            ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: "".to_string(),
                     api_key_from_env: false,
@@ -333,8 +332,7 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
-        };
+        );
 
         let result = create_provider(&config).await;
         assert!(result.is_err());
@@ -348,9 +346,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_openai_provider_success() {
-        let config = Config {
-            provider: "openai".to_string(),
-            providers: ProviderConfigs {
+        let config = config_with_provider(
+            "openai",
+            ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: "sk-test123".to_string(),
                     api_key_from_env: false,
@@ -366,8 +364,7 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
-        };
+        );
 
         let result = create_provider(&config).await;
         assert!(result.is_ok());
@@ -375,9 +372,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_anthropic_provider_success() {
-        let config = Config {
-            provider: "anthropic".to_string(),
-            providers: ProviderConfigs {
+        let config = config_with_provider(
+            "anthropic",
+            ProviderConfigs {
                 anthropic: Some(AnthropicConfig {
                     api_key: "sk-ant-test123".to_string(),
                     api_key_from_env: false,
@@ -394,8 +391,7 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
-        };
+        );
 
         let result = create_provider(&config).await;
         assert!(result.is_ok());
@@ -403,9 +399,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_gemini_provider_success() {
-        let config = Config {
-            provider: "gemini".to_string(),
-            providers: ProviderConfigs {
+        let config = config_with_provider(
+            "gemini",
+            ProviderConfigs {
                 gemini: Some(GeminiConfig {
                     api_key: "AIza-test123".to_string(),
                     api_key_from_env: false,
@@ -420,8 +416,7 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
-        };
+        );
 
         let result = create_provider(&config).await;
         assert!(result.is_ok());
@@ -429,11 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_unknown_provider() {
-        let config = Config {
-            provider: "unknown".to_string(),
-            providers: ProviderConfigs::default(),
-            ..Config::default()
-        };
+        let config = config_with_provider("unknown", ProviderConfigs::default());
 
         let result = create_provider(&config).await;
         assert!(result.is_err());
@@ -447,22 +438,14 @@ mod tests {
 
     #[test]
     fn test_validate_copilot_config() {
-        let config = Config {
-            provider: "copilot".to_string(),
-            providers: ProviderConfigs::default(),
-            ..Config::default()
-        };
+        let config = config_with_provider("copilot", ProviderConfigs::default());
 
         assert!(validate_provider_config(&config).is_ok());
     }
 
     #[test]
     fn test_validate_openai_config_missing() {
-        let config = Config {
-            provider: "openai".to_string(),
-            providers: ProviderConfigs::default(),
-            ..Config::default()
-        };
+        let config = config_with_provider("openai", ProviderConfigs::default());
 
         let result = validate_provider_config(&config);
         assert!(result.is_err());

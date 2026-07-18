@@ -313,10 +313,8 @@ fn test_proxy_fingerprint_changes_on_proxy_or_auth_change() {
 async fn test_sse_transport_respects_proxy_settings_when_available() {
     // If the manager has access to global config, SSE client creation should
     // fail early when proxy URL is invalid (proving it attempted to apply proxy).
-    let cfg = Config {
-        http_proxy: "http://".to_string(), // invalid URL
-        ..Config::default()
-    };
+    let mut cfg = Config::default();
+    cfg.http_proxy = "http://".to_string(); // invalid URL
     let manager = McpServerManager::new_with_config(Arc::new(tokio::sync::RwLock::new(cfg)));
 
     let server = McpServerConfig {

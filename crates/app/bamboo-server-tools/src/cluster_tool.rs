@@ -426,7 +426,7 @@ mod tests {
         let (endpoint, _broker_dir) = start_broker().await;
         let mut config = Config::default();
         config.cluster_fabric.nodes = vec![local_node("n1")];
-        config.subagents.broker = Some(bamboo_config::BrokerClientConfig {
+        config.subagents_mut().broker = Some(bamboo_config::BrokerClientConfig {
             endpoint: endpoint.clone(),
             token: "t".into(),
             token_encrypted: None,

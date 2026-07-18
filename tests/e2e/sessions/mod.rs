@@ -31,5 +31,5 @@ async fn configure_openai_defaults(
 ) {
     let mut config = state.config.write().await;
     config.provider = "openai".to_string();
-    config.providers.openai = Some(openai_config_with(model, reasoning_effort));
+    config.providers_mut().openai = Some(openai_config_with(model, reasoning_effort));
 }

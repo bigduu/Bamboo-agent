@@ -262,7 +262,7 @@ pub fn run_config_set(
                 bail!("api_key must not be empty");
             }
             config
-                .providers
+                .providers_mut()
                 .bodhi
                 .get_or_insert_with(empty_provider)
                 .api_key = v.to_string();
@@ -436,21 +436,21 @@ fn set_provider_api_key(config: &mut Config, provider: &str, key: &str) -> Resul
     match provider {
         "anthropic" => {
             config
-                .providers
+                .providers_mut()
                 .anthropic
                 .get_or_insert_with(empty_provider)
                 .api_key = key.to_string()
         }
         "openai" => {
             config
-                .providers
+                .providers_mut()
                 .openai
                 .get_or_insert_with(empty_provider)
                 .api_key = key.to_string()
         }
         "gemini" => {
             config
-                .providers
+                .providers_mut()
                 .gemini
                 .get_or_insert_with(empty_provider)
                 .api_key = key.to_string()
@@ -465,21 +465,21 @@ fn set_provider_model(config: &mut Config, provider: &str, model: &str) -> Resul
     match provider {
         "anthropic" => {
             config
-                .providers
+                .providers_mut()
                 .anthropic
                 .get_or_insert_with(empty_provider)
                 .model = model
         }
         "openai" => {
             config
-                .providers
+                .providers_mut()
                 .openai
                 .get_or_insert_with(empty_provider)
                 .model = model
         }
         "gemini" => {
             config
-                .providers
+                .providers_mut()
                 .gemini
                 .get_or_insert_with(empty_provider)
                 .model = model
@@ -500,28 +500,28 @@ fn provider_credential_status(config: &Config, provider: &str) -> CredentialStat
     match provider {
         "anthropic" => key_status(
             config
-                .providers
+                .providers()
                 .anthropic
                 .as_ref()
                 .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
         ),
         "openai" => key_status(
             config
-                .providers
+                .providers()
                 .openai
                 .as_ref()
                 .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
         ),
         "gemini" => key_status(
             config
-                .providers
+                .providers()
                 .gemini
                 .as_ref()
                 .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
         ),
         "bodhi" => key_status(
             config
-                .providers
+                .providers()
                 .bodhi
                 .as_ref()
                 .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
@@ -677,13 +677,13 @@ mod tests {
         let mut config = default_config();
         set_provider_api_key(&mut config, "anthropic", "sk-ant-xyz").unwrap();
         set_provider_model(&mut config, "anthropic", "claude-x").unwrap();
-        let a = config.providers.anthropic.as_ref().unwrap();
+        let a = config.providers().anthropic.as_ref().unwrap();
         assert_eq!(a.api_key, "sk-ant-xyz");
         assert_eq!(a.model.as_deref(), Some("claude-x"));
 
         // Setting the model again must not wipe the key.
         set_provider_model(&mut config, "anthropic", "claude-y").unwrap();
-        let a = config.providers.anthropic.as_ref().unwrap();
+        let a = config.providers().anthropic.as_ref().unwrap();
         assert_eq!(a.api_key, "sk-ant-xyz");
         assert_eq!(a.model.as_deref(), Some("claude-y"));
     }
@@ -789,7 +789,7 @@ mod tests {
 
         let reloaded = Config::from_data_dir_without_env(Some(data_dir));
         assert_eq!(
-            reloaded.providers.anthropic.as_ref().unwrap().api_key,
+            reloaded.providers().anthropic.as_ref().unwrap().api_key,
             "sk-ant-setupcli-secret",
             "the stored key must still decrypt after a generic set"
         );

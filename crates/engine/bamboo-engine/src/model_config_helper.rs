@@ -117,7 +117,7 @@ pub fn get_default_model_for_provider(
     match provider_name.trim() {
         "copilot" => {
             let provider_model = config
-                .providers
+                .providers()
                 .copilot
                 .as_ref()
                 .and_then(|c| c.model.clone());
@@ -126,7 +126,7 @@ pub fn get_default_model_for_provider(
         }
         "openai" => {
             let openai_config = config
-                .providers
+                .providers()
                 .openai
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("OpenAI configuration required".to_string()))?;
@@ -137,7 +137,7 @@ pub fn get_default_model_for_provider(
         }
         "anthropic" => {
             let anthropic_config =
-                config.providers.anthropic.as_ref().ok_or_else(|| {
+                config.providers().anthropic.as_ref().ok_or_else(|| {
                     LLMError::Auth("Anthropic configuration required".to_string())
                 })?;
 
@@ -147,7 +147,7 @@ pub fn get_default_model_for_provider(
         }
         "gemini" => {
             let gemini_config = config
-                .providers
+                .providers()
                 .gemini
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("Gemini configuration required".to_string()))?;
@@ -187,22 +187,22 @@ pub fn get_schedule_model_from_config(config: &Config) -> Result<String, LLMErro
 pub fn get_fast_model_for_provider(config: &Config, provider_name: &str) -> Option<String> {
     let fast = match provider_name.trim() {
         "openai" => config
-            .providers
+            .providers()
             .openai
             .as_ref()
             .and_then(|c| c.fast_model.clone()),
         "anthropic" => config
-            .providers
+            .providers()
             .anthropic
             .as_ref()
             .and_then(|c| c.fast_model.clone()),
         "gemini" => config
-            .providers
+            .providers()
             .gemini
             .as_ref()
             .and_then(|c| c.fast_model.clone()),
         "copilot" => config
-            .providers
+            .providers()
             .copilot
             .as_ref()
             .and_then(|c| c.fast_model.clone()),
@@ -221,7 +221,7 @@ pub fn get_memory_background_model_for_provider(
     provider_name: &str,
 ) -> Option<String> {
     let configured = config
-        .memory
+        .memory()
         .as_ref()
         .and_then(|memory| memory.background_model.as_ref())
         .map(|value| value.trim())
@@ -618,6 +618,26 @@ mod tests {
     use bamboo_llm::{LLMProvider, LLMStream};
     use std::collections::HashMap;
 
+    macro_rules! test_config {
+        (@assign $config:ident, providers, $value:expr) => {
+            *$config.providers_mut() = $value;
+        };
+        (@assign $config:ident, memory, $value:expr) => {
+            *$config.memory_mut() = $value;
+        };
+        (@assign $config:ident, subagents, $value:expr) => {
+            *$config.subagents_mut() = $value;
+        };
+        (@assign $config:ident, $field:ident, $value:expr) => {
+            $config.$field = $value;
+        };
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut config = Config::default();
+            $(test_config!(@assign config, $field, $value);)*
+            config
+        }};
+    }
+
     struct NoopProvider;
 
     #[async_trait::async_trait]
@@ -641,7 +661,7 @@ mod tests {
 
     #[test]
     fn test_get_model_from_openai_config() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
@@ -659,7 +679,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let result = get_default_model_from_config(&config);
@@ -669,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_error_when_model_not_configured() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
@@ -687,7 +706,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let result = get_default_model_from_config(&config);
@@ -700,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_get_model_from_copilot_provider_config() {
-        let config = Config {
+        let config = test_config! {
             provider: "copilot".to_string(),
             providers: ProviderConfigs {
                 copilot: Some(CopilotConfig {
@@ -716,7 +734,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let result = get_default_model_from_config(&config);
@@ -726,10 +743,9 @@ mod tests {
 
     #[test]
     fn test_get_model_from_copilot_default_fallback() {
-        let config = Config {
+        let config = test_config! {
             provider: "copilot".to_string(),
             providers: ProviderConfigs::default(),
-            ..Config::default()
         };
 
         let result = get_default_model_from_config(&config);
@@ -739,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_get_default_model_for_specific_provider() {
-        let config = Config {
+        let config = test_config! {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
@@ -757,7 +773,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let result = get_default_model_for_provider(&config, "openai").expect("openai config");
@@ -766,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_get_fast_model_for_specific_provider() {
-        let config = Config {
+        let config = test_config! {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
@@ -784,7 +799,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         assert_eq!(
@@ -795,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_get_schedule_model_from_config_prefers_fast_model() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             defaults: None,
             features: bamboo_config::FeatureFlags {
@@ -818,7 +832,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let result = get_schedule_model_from_config(&config);
@@ -828,7 +841,7 @@ mod tests {
 
     #[test]
     fn test_get_schedule_model_from_config_falls_back_to_default_model() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             defaults: None,
             features: bamboo_config::FeatureFlags {
@@ -851,7 +864,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         let result = get_schedule_model_from_config(&config);
@@ -861,7 +873,7 @@ mod tests {
 
     #[test]
     fn test_get_schedule_model_from_config_prefers_defaults_fast_over_chat() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             features: bamboo_config::FeatureFlags {
                 provider_model_ref: true,
@@ -879,7 +891,6 @@ mod tests {
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
-            ..Default::default()
         };
 
         let result = get_schedule_model_from_config(&config);
@@ -889,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_get_reasoning_effort_for_specific_provider() {
-        let config = Config {
+        let config = test_config! {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
@@ -907,7 +918,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            ..Config::default()
         };
 
         assert_eq!(
@@ -917,7 +927,7 @@ mod tests {
     }
     #[test]
     fn resolve_subagent_model_ref_prefers_sub_agent_over_fast() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             features: bamboo_config::FeatureFlags {
                 provider_model_ref: true,
@@ -935,7 +945,6 @@ mod tests {
                 sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
                 subagent_models: HashMap::new(),
             }),
-            ..Default::default()
         };
 
         let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")
@@ -946,7 +955,7 @@ mod tests {
 
     #[test]
     fn resolve_subagent_model_ref_falls_back_to_fast_when_sub_agent_unset() {
-        let config = Config {
+        let config = test_config! {
             provider: "openai".to_string(),
             features: bamboo_config::FeatureFlags {
                 provider_model_ref: true,
@@ -964,7 +973,6 @@ mod tests {
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
-            ..Default::default()
         };
 
         let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")

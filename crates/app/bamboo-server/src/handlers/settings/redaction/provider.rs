@@ -20,19 +20,19 @@ pub(super) fn redact_provider_entry(name: &str, provider_cfg: &mut Value, config
 fn provider_is_configured(name: &str, config: &Config) -> bool {
     match name {
         "openai" => config
-            .providers
+            .providers()
             .openai
             .as_ref()
             .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
             .unwrap_or(false),
         "anthropic" => config
-            .providers
+            .providers()
             .anthropic
             .as_ref()
             .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
             .unwrap_or(false),
         "gemini" => config
-            .providers
+            .providers()
             .gemini
             .as_ref()
             .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())

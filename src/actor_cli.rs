@@ -497,10 +497,8 @@ mod tests {
     /// the configured default provider.
     #[test]
     fn resolve_model_colon_form() {
-        let config = Config {
-            provider: "anthropic".into(),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.provider = "anthropic".into();
         let m = resolve_model(&some("openai:gpt-4o"), &config)
             .unwrap()
             .unwrap();
@@ -512,10 +510,8 @@ mod tests {
     /// grammar `bamboo -p -m` uses (#246).
     #[test]
     fn resolve_model_bare_uses_config_default_provider() {
-        let config = Config {
-            provider: "openai".into(),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.provider = "openai".into();
         let m = resolve_model(&some("gpt-4o"), &config).unwrap().unwrap();
         assert_eq!(m.provider, "openai");
         assert_eq!(m.model, "gpt-4o");
@@ -542,13 +538,11 @@ mod tests {
     /// No `--model` falls back to `defaults.sub_agent`, then `defaults.chat`.
     #[test]
     fn resolve_model_falls_back_to_defaults_sub_agent() {
-        let config = Config {
-            defaults: Some(defaults_config(
-                ("anthropic", "claude-x"),
-                Some(("openai", "gpt-sub")),
-            )),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.defaults = Some(defaults_config(
+            ("anthropic", "claude-x"),
+            Some(("openai", "gpt-sub")),
+        ));
         let m = resolve_model(&None, &config).unwrap().unwrap();
         assert_eq!(m.provider, "openai");
         assert_eq!(m.model, "gpt-sub");
@@ -557,10 +551,8 @@ mod tests {
     /// No `--model` and no `defaults.sub_agent` falls back to `defaults.chat`.
     #[test]
     fn resolve_model_falls_back_to_defaults_chat() {
-        let config = Config {
-            defaults: Some(defaults_config(("anthropic", "claude-x"), None)),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.defaults = Some(defaults_config(("anthropic", "claude-x"), None));
         let m = resolve_model(&None, &config).unwrap().unwrap();
         assert_eq!(m.provider, "anthropic");
         assert_eq!(m.model, "claude-x");
@@ -570,10 +562,8 @@ mod tests {
     /// whether that's fatal).
     #[test]
     fn resolve_model_none_when_nothing_configured() {
-        let config = Config {
-            defaults: None,
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.defaults = None;
         assert_eq!(resolve_model(&None, &config).unwrap(), None);
     }
 

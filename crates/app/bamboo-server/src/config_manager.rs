@@ -43,7 +43,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
     for name in intents.providers.iter() {
         match name.as_str() {
             "openai" => {
-                if let Some(openai) = config.providers.openai.as_mut() {
+                if let Some(openai) = config.providers_mut().openai.as_mut() {
                     // Never encrypt/persist an env-sourced key — mirrors
                     // refresh_provider_api_keys_encrypted's guard (#253). Without
                     // it, an explicit `api_key: ""` clear of an env-sourced provider
@@ -66,7 +66,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                 }
             }
             "anthropic" => {
-                if let Some(anthropic) = config.providers.anthropic.as_mut() {
+                if let Some(anthropic) = config.providers_mut().anthropic.as_mut() {
                     // Skip env-sourced keys (see openai above). #373.
                     if !anthropic.api_key_from_env {
                         let api_key = anthropic.api_key.trim();
@@ -83,7 +83,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                 }
             }
             "gemini" => {
-                if let Some(gemini) = config.providers.gemini.as_mut() {
+                if let Some(gemini) = config.providers_mut().gemini.as_mut() {
                     // Skip env-sourced keys (see openai above). #373.
                     if !gemini.api_key_from_env {
                         let api_key = gemini.api_key.trim();
@@ -100,7 +100,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                 }
             }
             "bodhi" => {
-                if let Some(bodhi) = config.providers.bodhi.as_mut() {
+                if let Some(bodhi) = config.providers_mut().bodhi.as_mut() {
                     let api_key = bodhi.api_key.trim();
                     bodhi.api_key_encrypted = if api_key.is_empty() {
                         None
@@ -158,7 +158,8 @@ pub fn build_merged_config(
     let notification_intents = notification_secret_intents(&patch_obj);
     let connect_intents = connect_secret_intents(&patch_obj);
 
-    let mut merged = serde_json::to_value(current)
+    let mut merged = current
+        .to_compatibility_value()
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to serialize config: {e}")))?;
 
     deep_merge_json(&mut merged, Value::Object(patch_obj));
@@ -205,7 +206,7 @@ mod tests {
 
     fn env_sourced_openai_config() -> Config {
         let mut config = Config::default();
-        config.providers.openai = Some(OpenAIConfig {
+        config.providers_mut().openai = Some(OpenAIConfig {
             api_key: "sk-env-secret".to_string(),
             api_key_from_env: true,
             ..Default::default()
@@ -231,7 +232,7 @@ mod tests {
         let mut merged = build_merged_config(&current, patch).expect("merge");
         sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
 
-        let openai = merged.providers.openai.as_ref().unwrap();
+        let openai = merged.providers().openai.as_ref().unwrap();
         assert!(
             openai.api_key_encrypted.is_none(),
             "env secret must NOT be encrypted to disk on a clear"
@@ -252,7 +253,7 @@ mod tests {
         let mut merged = build_merged_config(&current, patch).expect("merge");
         sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
 
-        let openai = merged.providers.openai.as_ref().unwrap();
+        let openai = merged.providers().openai.as_ref().unwrap();
         assert_eq!(openai.api_key, "sk-brand-new", "explicit override wins");
         assert!(!openai.api_key_from_env, "override clears the env flag");
         assert!(
@@ -276,7 +277,7 @@ mod tests {
         let mut merged = build_merged_config(&current, patch).expect("merge");
         sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
 
-        let openai = merged.providers.openai.as_ref().unwrap();
+        let openai = merged.providers().openai.as_ref().unwrap();
         assert_eq!(
             openai.api_key, "sk-env-secret",
             "env key preserved across unrelated patch"
@@ -806,16 +807,16 @@ mod tests {
         // isolation): an `Option<String>` field written once must become
         // un-settable via a later PATCH.
         let mut current = Config::default();
-        current.subagents.claude_code_binary = Some("/usr/local/bin/claude".to_string());
-        current.subagents.executor = Some("claude_code".to_string());
+        current.subagents_mut().claude_code_binary = Some("/usr/local/bin/claude".to_string());
+        current.subagents_mut().executor = Some("claude_code".to_string());
 
         let patch: Map<String, Value> =
             serde_json::from_str(r#"{"subagents":{"claude_code_binary":null}}"#).unwrap();
         let merged = build_merged_config(&current, patch).expect("merge must not error");
 
-        assert_eq!(merged.subagents.claude_code_binary, None);
+        assert_eq!(merged.subagents().claude_code_binary, None);
         // Sibling field untouched by the patch survives — proves this was a
         // surgical field-level delete, not a whole-subtree reset.
-        assert_eq!(merged.subagents.executor, Some("claude_code".to_string()));
+        assert_eq!(merged.subagents().executor, Some("claude_code".to_string()));
     }
 }

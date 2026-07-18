@@ -6,22 +6,20 @@ use super::{client::resolve_headless_auth, status_logout::auth_status_from_token
 
 #[test]
 fn resolve_headless_auth_prefers_provider_specific_value() {
-    let config = Config {
-        headless_auth: false,
-        providers: ProviderConfigs {
-            copilot: Some(CopilotConfig {
-                enabled: true,
-                headless_auth: true,
-                model: None,
-                fast_model: None,
-                vision_model: None,
-                reasoning_effort: None,
-                responses_only_models: Vec::new(),
-                request_overrides: None,
-                extra: Default::default(),
-            }),
-            ..Default::default()
-        },
+    let mut config = Config::default();
+    config.headless_auth = false;
+    *config.providers_mut() = ProviderConfigs {
+        copilot: Some(CopilotConfig {
+            enabled: true,
+            headless_auth: true,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: Vec::new(),
+            request_overrides: None,
+            extra: Default::default(),
+        }),
         ..Default::default()
     };
 
@@ -31,7 +29,7 @@ fn resolve_headless_auth_prefers_provider_specific_value() {
 #[test]
 fn resolve_headless_auth_falls_back_to_legacy_root_field() {
     let mut config = Config::default();
-    config.providers.copilot = None;
+    config.providers_mut().copilot = None;
     config.headless_auth = true;
 
     assert!(resolve_headless_auth(&config));

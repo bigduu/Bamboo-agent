@@ -9,7 +9,7 @@ use bamboo_llm::Config;
 
 pub(super) fn resolve_headless_auth(config: &Config) -> bool {
     config
-        .providers
+        .providers()
         .copilot
         .as_ref()
         .map(|copilot| copilot.headless_auth)

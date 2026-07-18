@@ -167,7 +167,7 @@ async fn run_gardener_once_with_store(
     memory: &MemoryStore,
 ) -> Result<Option<GardenerRunResult>, String> {
     let config_snapshot = ctx.config.read().await.clone();
-    let memory_cfg = config_snapshot.memory.clone().unwrap_or_default();
+    let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
     if !memory_cfg.gardener_enabled {
         return Ok(None);
     }
@@ -300,7 +300,7 @@ async fn run_dedup_gardener_once_with_store(
     memory: &MemoryStore,
 ) -> Result<Option<DedupGardenerRunResult>, String> {
     let config_snapshot = ctx.config.read().await.clone();
-    let memory_cfg = config_snapshot.memory.clone().unwrap_or_default();
+    let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
     if !memory_cfg.dedup_gardener_enabled {
         return Ok(None);
     }
@@ -466,7 +466,7 @@ async fn run_capacity_gardener_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<CapacityGardenerRunResult>, String> {
-    let memory_cfg = ctx.config.read().await.memory.clone().unwrap_or_default();
+    let memory_cfg = ctx.config.read().await.memory().clone().unwrap_or_default();
     let capacity = memory_cfg.memory_active_capacity;
     if capacity == 0 {
         return Ok(None);
@@ -520,7 +520,7 @@ async fn run_freshness_gardener_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<FreshnessGardenerRunResult>, String> {
-    let memory_cfg = ctx.config.read().await.memory.clone().unwrap_or_default();
+    let memory_cfg = ctx.config.read().await.memory().clone().unwrap_or_default();
     if !memory_cfg.granularity_freshness_gardener_enabled {
         return Ok(None);
     }
@@ -627,7 +627,7 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
     tokio::spawn(async move {
         let (interval_secs, volume_trigger) = {
             let guard = ctx.config.read().await;
-            let memory = guard.memory.as_ref();
+            let memory = guard.memory().as_ref();
             let interval_secs = memory
                 .map(|memory| memory.gardener_interval_secs)
                 .filter(|secs| *secs > 0)
@@ -694,6 +694,12 @@ mod tests {
     use bamboo_llm::{LLMError, LLMStream, ProviderRegistry};
     use bamboo_memory::memory_store::DurableMemoryType;
     use bamboo_storage::SessionStoreV2;
+
+    fn config_with_memory(memory: bamboo_config::MemoryConfig) -> Config {
+        let mut config = Config::default();
+        *config.memory_mut() = Some(memory);
+        config
+    }
 
     #[test]
     fn gardener_trigger_fires_on_time_or_volume() {
@@ -762,16 +768,15 @@ mod tests {
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![
             "{\"pieces\":[{\"title\":\"Fact one\",\"type\":\"user\",\"content\":\"Fact one body.\",\"tags\":[]},{\"title\":\"Fact two\",\"type\":\"reference\",\"content\":\"Fact two body.\",\"tags\":[]}]}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 gardener_enabled: true,
                 gardener_min_sections: 2,
                 gardener_max_splits_per_run: 8,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
 
         let ctx = AutoDreamContext {
@@ -833,13 +838,12 @@ mod tests {
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
         // Gardener is ON by default (L4), so disable it explicitly to test the
         // disabled path.
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 gardener_enabled: false,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
         let ctx = AutoDreamContext {
             session_store,
@@ -865,16 +869,15 @@ mod tests {
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![
             "{\"same_fact\":true,\"merged\":{\"title\":\"Mobile release freeze is Tuesday\",\"type\":\"project\",\"content\":\"Mobile release freeze begins Tuesday for the release cut.\",\"tags\":[\"release\"]}}".to_string(),
         ]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 dedup_gardener_enabled: true,
                 dedup_gardener_min_score: 0.3,
                 dedup_gardener_max_merges_per_run: 8,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
 
         let ctx = AutoDreamContext {
@@ -942,13 +945,12 @@ mod tests {
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
         // Dedup gardener is ON by default (L4); disable it explicitly here.
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 dedup_gardener_enabled: false,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
         let ctx = AutoDreamContext {
             session_store,
@@ -1016,13 +1018,12 @@ mod tests {
         );
 
         // Capacity 2 → archive the 2 over-capacity memories.
-        let on_config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let on_config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 memory_active_capacity: 2,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let ctx_on = AutoDreamContext {
             session_store,
             storage,
@@ -1060,13 +1061,12 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
-        let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_config::MemoryConfig {
+        let config = Arc::new(RwLock::new(config_with_memory(
+            bamboo_config::MemoryConfig {
                 granularity_freshness_gardener_enabled: false,
                 ..bamboo_config::MemoryConfig::default()
-            }),
-            ..Config::default()
-        }));
+            },
+        )));
         let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
         let ctx = AutoDreamContext {
             session_store,

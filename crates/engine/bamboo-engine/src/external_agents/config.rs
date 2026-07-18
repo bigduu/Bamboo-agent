@@ -277,7 +277,7 @@ mod tests {
         // Sub-agents always run as actors: a type with no expert routing
         // resolves to the built-in local actor worker.
         let mut config = Config::default();
-        config.subagents = Default::default();
+        *config.subagents_mut() = Default::default();
         let metadata = resolve_runtime_metadata(&config, "unknown");
         assert_eq!(metadata.get("runtime.kind"), Some(&"external".to_string()));
         assert_eq!(

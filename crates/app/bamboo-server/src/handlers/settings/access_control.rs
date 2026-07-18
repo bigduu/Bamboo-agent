@@ -1315,6 +1315,17 @@ mod tests {
     use actix_web::test::TestRequest;
     use bamboo_config::AccessControlConfig;
 
+    macro_rules! test_config {
+        (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
+        (@assign $config:ident, memory, $value:expr) => { *$config.memory_mut() = $value; };
+        (@assign $config:ident, subagents, $value:expr) => { *$config.subagents_mut() = $value; };
+        (@assign $config:ident, $field:ident, $value:expr) => { $config.$field = $value; };
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut config = Config::default();
+            $(test_config!(@assign config, $field, $value);)*
+            config
+        }};
+    }
     #[test]
     fn loopback_request_is_local() {
         let req = TestRequest::default()
@@ -1379,7 +1390,7 @@ mod tests {
     fn password_hash_roundtrip_verifies() {
         let salt_hex = hex::encode([1_u8; 16]);
         let hash = compute_password_hash("secret", &salt_hex).unwrap();
-        let config = Config {
+        let config = test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: true,
                 password_hash: Some(hash),
@@ -1387,7 +1398,6 @@ mod tests {
                 updated_at: None,
                 devices: Vec::new(),
             }),
-            ..Config::default()
         };
 
         assert!(verify_password(&config, "secret"));
@@ -1399,7 +1409,7 @@ mod tests {
     fn config_with_password() -> Config {
         let salt_hex = hex::encode([1_u8; 16]);
         let hash = compute_password_hash("secret", &salt_hex).unwrap();
-        Config {
+        test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: true,
                 password_hash: Some(hash),
@@ -1407,7 +1417,6 @@ mod tests {
                 updated_at: None,
                 devices: Vec::new(),
             }),
-            ..Config::default()
         }
     }
 
@@ -1502,7 +1511,7 @@ mod tests {
     fn device_presence_requires_credential_even_without_password() {
         // A device paired but no root password still gates remote access.
         let (cred, _t) = issue_device_token("d");
-        let config = Config {
+        let config = test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: false,
                 password_hash: None,
@@ -1510,7 +1519,6 @@ mod tests {
                 updated_at: None,
                 devices: vec![cred],
             }),
-            ..Config::default()
         };
         assert!(build_access_status(&config, &remote_req()).requires_password);
         // Local still bypasses.
@@ -1562,7 +1570,7 @@ mod tests {
     fn request_is_authorized_remote_with_devices_and_no_creds_is_denied() {
         // Remote + a credential mechanism configured + no presented credential.
         let (cred, _t) = issue_device_token("d");
-        let config = Config {
+        let config = test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: false,
                 password_hash: None,
@@ -1570,7 +1578,6 @@ mod tests {
                 updated_at: None,
                 devices: vec![cred],
             }),
-            ..Config::default()
         };
         assert!(!request_is_authorized(&remote_req(), &config));
     }
