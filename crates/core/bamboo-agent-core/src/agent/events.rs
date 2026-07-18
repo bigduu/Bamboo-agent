@@ -569,6 +569,10 @@ pub enum AgentEvent {
     ChildApprovalChanged {
         parent_session_id: String,
         child_session_id: String,
+        /// Execution attempt that produced this approval. Older persisted
+        /// events predate attempt tracking and deserialize as attempt zero.
+        #[serde(default)]
+        child_attempt: u32,
         request_id: String,
         version: u64,
         /// `pending` | `approved` | `denied` | `expired` | `delivery_failed`.
@@ -1155,6 +1159,7 @@ mod tests {
         let event = AgentEvent::ChildApprovalChanged {
             parent_session_id: "parent-1".into(),
             child_session_id: "child-1".into(),
+            child_attempt: 3,
             request_id: "req-1".into(),
             version: 2,
             status: "approved".into(),
@@ -1170,6 +1175,18 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "child_approval_changed");
         assert_eq!(value["status"], "approved");
+        assert_eq!(value["child_attempt"], 3);
+
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("child_attempt");
+        let restored: AgentEvent = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            restored,
+            AgentEvent::ChildApprovalChanged {
+                child_attempt: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

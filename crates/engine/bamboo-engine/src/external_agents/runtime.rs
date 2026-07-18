@@ -72,7 +72,12 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
 /// needed. Expert `externalAgents` profiles add extra routers so
 /// `external.agent_id` metadata can pin specific roles to other agents. Returns
 /// a composite router that delegates to the first matching runner.
-pub fn build_external_child_runner(
+pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_with_registry(config, None)
+}
+
+/// Build the child runner with an AppState-scoped durable approval registry.
+pub fn build_external_child_runner_with_registry(
     config: &Config,
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
 ) -> Arc<dyn ExternalChildRunner> {

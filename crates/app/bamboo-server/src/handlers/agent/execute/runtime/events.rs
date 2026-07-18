@@ -630,6 +630,7 @@ mod tests {
             .send(AgentEvent::ChildApprovalChanged {
                 parent_session_id: "parent-session".into(),
                 child_session_id: session_id.into(),
+                child_attempt: 1,
                 request_id: "req-1".into(),
                 version: 2,
                 status: "approved".into(),

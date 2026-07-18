@@ -171,7 +171,7 @@ pub fn clear_pending_approvals_for(
             .collect()
     };
     for (request_id, record) in records {
-        finish_durable(
+        let durable = finish_durable(
             registry,
             &record.parent_session_id,
             child_id,
@@ -180,13 +180,16 @@ pub fn clear_pending_approvals_for(
             false,
             Some("child_disconnected"),
         );
-        emit_resolution(
-            child_id,
-            &request_id,
-            record,
-            "delivery_failed",
-            Some("child_disconnected"),
-        );
+        if registry.is_none() || durable.is_some() {
+            emit_resolution(
+                child_id,
+                &request_id,
+                record,
+                "delivery_failed",
+                Some("child_disconnected"),
+                durable.as_ref(),
+            );
+        }
     }
 }
 
@@ -199,7 +202,7 @@ pub fn expire_pending_approval(
     let Some(record) = record else {
         return false;
     };
-    finish_durable(
+    let durable = finish_durable(
         registry,
         &record.parent_session_id,
         child_id,
@@ -208,13 +211,16 @@ pub fn expire_pending_approval(
         false,
         Some("approval_timeout"),
     );
-    emit_resolution(
-        child_id,
-        request_id,
-        record,
-        "expired",
-        Some("approval_timeout"),
-    );
+    if registry.is_none() || durable.is_some() {
+        emit_resolution(
+            child_id,
+            request_id,
+            record,
+            "expired",
+            Some("approval_timeout"),
+            durable.as_ref(),
+        );
+    }
     true
 }
 
@@ -224,20 +230,29 @@ fn emit_resolution(
     record: PendingApproval,
     status: &str,
     reason: Option<&str>,
+    durable: Option<&DurableApproval>,
 ) {
     let now = chrono::Utc::now();
     let event = AgentEvent::ChildApprovalChanged {
         parent_session_id: record.parent_session_id,
         child_session_id: child_id.to_string(),
+        child_attempt: record.child_attempt,
         request_id: request_id.to_string(),
-        version: (now.timestamp_micros().max(0) as u64).max(record.version.saturating_add(1)),
+        version: durable.map_or_else(
+            || (now.timestamp_micros().max(0) as u64).max(record.version.saturating_add(1)),
+            |record| record.version,
+        ),
         status: status.to_string(),
         reason: reason.map(str::to_string),
         tool_name: record.tool_name,
         permission: record.permission,
         resource: record.resource,
         created_at: record.created_at,
-        resolved_at: Some(now.to_rfc3339()),
+        resolved_at: Some(
+            durable
+                .map(|record| record.updated_at.clone())
+                .unwrap_or_else(|| now.to_rfc3339()),
+        ),
     };
     match record.event_tx.try_send(event) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -285,7 +300,7 @@ pub fn deliver_approval_checked(
         }
     }
     let Some(record) = pending().lock().recover_poison().remove(&key) else {
-        finish_durable(
+        let _ = finish_durable(
             registry,
             &record.parent_session_id,
             child_id,
@@ -312,7 +327,7 @@ pub fn deliver_approval_checked(
     } else {
         "delivery_failed"
     };
-    finish_durable(
+    let durable = finish_durable(
         registry,
         &record.parent_session_id,
         child_id,
@@ -321,13 +336,16 @@ pub fn deliver_approval_checked(
         delivered,
         (!delivered).then_some("child_not_live"),
     );
-    emit_resolution(
-        child_id,
-        request_id,
-        record,
-        status,
-        (!delivered).then_some("child_not_live"),
-    );
+    if registry.is_none() || durable.is_some() {
+        emit_resolution(
+            child_id,
+            request_id,
+            record,
+            status,
+            (!delivered).then_some("child_not_live"),
+            durable.as_ref(),
+        );
+    }
     delivered
 }
 
@@ -339,9 +357,9 @@ fn finish_durable(
     request_id: &str,
     delivered: bool,
     reason: Option<&str>,
-) {
+) -> Option<DurableApproval> {
     if let Some(registry) = registry {
-        if let Err(error) = registry.lock().recover_poison().finish(
+        match registry.lock().recover_poison().finish(
             parent_id,
             child_id,
             child_attempt,
@@ -349,15 +367,20 @@ fn finish_durable(
             delivered,
             reason,
         ) {
-            tracing::error!("failed to persist child approval resolution: {error}");
+            Ok(record) => return record,
+            Err(error) => {
+                tracing::error!("failed to persist child approval resolution: {error}");
+            }
         }
     }
+    None
 }
 
 fn record_event(record: DurableApproval) -> AgentEvent {
     AgentEvent::ChildApprovalChanged {
         parent_session_id: record.parent_session_id,
         child_session_id: record.child_session_id,
+        child_attempt: record.child_attempt,
         request_id: record.request_id,
         version: record.version,
         status: match record.state {
@@ -705,6 +728,41 @@ mod tests {
             Some(AgentEvent::ChildApprovalChanged { status, .. }) if status == "denied"
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_resolution_uses_registry_version_and_attempt() {
+        let registry = registry();
+        let (wire_tx, _wire_rx) = mpsc::unbounded_channel();
+        let _guard = register("c-versioned", wire_tx, 7, Some(registry.clone()));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (pending_version, _) = register_pending_approval_observed(
+            Some(&registry),
+            "parent-versioned",
+            "c-versioned",
+            7,
+            "req-versioned",
+            "Bash",
+            "execute",
+            "/tmp/versioned",
+            event_tx,
+        );
+
+        assert!(deliver_approval_checked(
+            Some(&registry),
+            "c-versioned",
+            "req-versioned",
+            true,
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ChildApprovalChanged {
+                child_attempt: 7,
+                version,
+                status,
+                ..
+            }) if version == pending_version + 2 && status == "approved"
+        ));
     }
 
     #[tokio::test]

@@ -1216,6 +1216,7 @@ async fn drive(
                                     .send(AgentEvent::ChildApprovalChanged {
                                         parent_session_id: parent_session_id.to_string(),
                                         child_session_id: child_session_id.to_string(),
+                                        child_attempt,
                                         request_id: id,
                                         version: 1,
                                         status: "delivery_failed".to_string(),
@@ -1232,6 +1233,7 @@ async fn drive(
                             let _ = event_tx.send(AgentEvent::ChildApprovalChanged {
                                 parent_session_id: parent_session_id.to_string(),
                                 child_session_id: child_session_id.to_string(),
+                                child_attempt,
                                 request_id: id.clone(),
                                 version: approval_version,
                                 status: "pending".to_string(),
