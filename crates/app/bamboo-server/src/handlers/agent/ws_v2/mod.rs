@@ -69,10 +69,12 @@ use tokio_stream::StreamMap;
 use serde::Deserialize;
 
 use self::envelope::{
-    decode_client_frame, sys_keepalive_envelope, Channel, ClientFrame, Encoding, OutFrame,
-    SUBPROTOCOL_JSON, SUBPROTOCOL_MSGPACK,
+    decode_client_frame, pong_frame, sys_keepalive_envelope, Channel, ClientFrame, Encoding,
+    OutFrame, SUBPROTOCOL_JSON, SUBPROTOCOL_MSGPACK,
 };
-use self::forwarders::{spawn_agent_forwarder, spawn_feed_forwarder, OutboundTx};
+use self::forwarders::{
+    spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder, OutboundTx,
+};
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
 use crate::handlers::agent::stop::cancel_session;
@@ -83,6 +85,19 @@ use crate::handlers::agent::stop::cancel_session;
 /// queue of another, because each channel owns its own bounded buffer and the
 /// driver drains them with a fair merge.
 const OUTBOUND_BUFFER: usize = 64;
+
+/// Reserved connection-level queue for heartbeat/control frames. A capacity of
+/// one intentionally coalesces probes while the socket writer is busy.
+const SYS_CHANNEL: &str = "sys";
+const SYS_OUTBOUND_BUFFER: usize = 1;
+
+/// Best-effort enqueue for connection-level control traffic. Heartbeats are
+/// probes, so retaining an old one is never worth blocking the socket read loop.
+fn try_enqueue_sys(sys_tx: &mpsc::Sender<OutFrame>, frame: Option<OutFrame>) {
+    if let Some(frame) = frame {
+        let _ = sys_tx.try_send(frame);
+    }
+}
 
 /// WS ping interval. Each tick sends BOTH the protocol-level ping (server-side
 /// write probe) and the app-level `sys` keepalive data frame (client-side
@@ -364,6 +379,8 @@ async fn drive(
     // channel id and mutated together (see [`subscribe`] / unsubscribe / teardown).
     let mut forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut queues: StreamMap<String, ReceiverStream<OutFrame>> = StreamMap::new();
+    let (sys_tx, sys_rx) = mpsc::channel::<OutFrame>(SYS_OUTBOUND_BUFFER);
+    queues.insert(SYS_CHANNEL.to_string(), ReceiverStream::new(sys_rx));
     let mut ping = tokio::time::interval(ping_interval());
     ping.tick().await; // skip the immediate tick
 
@@ -448,7 +465,7 @@ async fn drive(
                     Some(Ok(Message::Text(text))) if encoding == Encoding::Json => {
                         let keep_open = handle_client_bytes(
                             &state, &mut forwarders, &mut queues,
-                            batch_ms, encoding, text.as_bytes(), &mut authorized,
+                            &sys_tx, batch_ms, encoding, text.as_bytes(), &mut authorized,
                         )
                         .await;
                         if !keep_open {
@@ -458,7 +475,7 @@ async fn drive(
                     Some(Ok(Message::Binary(bytes))) if encoding == Encoding::Msgpack => {
                         let keep_open = handle_client_bytes(
                             &state, &mut forwarders, &mut queues,
-                            batch_ms, encoding, &bytes, &mut authorized,
+                            &sys_tx, batch_ms, encoding, &bytes, &mut authorized,
                         )
                         .await;
                         if !keep_open {
@@ -515,6 +532,7 @@ async fn handle_client_bytes(
     state: &web::Data<AppState>,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    sys_tx: &mpsc::Sender<OutFrame>,
     batch_ms: u64,
     encoding: Encoding,
     bytes: &[u8],
@@ -528,7 +546,7 @@ async fn handle_client_bytes(
         }
     };
     handle_client_frame(
-        state, forwarders, queues, batch_ms, encoding, frame, authorized,
+        state, forwarders, queues, sys_tx, batch_ms, encoding, frame, authorized,
     )
     .await
 }
@@ -549,6 +567,7 @@ async fn handle_client_frame(
     state: &web::Data<AppState>,
     forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    sys_tx: &mpsc::Sender<OutFrame>,
     batch_ms: u64,
     encoding: Encoding,
     frame: ClientFrame,
@@ -561,6 +580,16 @@ async fn handle_client_frame(
         GateOutcome::Handled => return true,
         GateOutcome::Close => return false,
         GateOutcome::Dispatch => {}
+    }
+
+    // Like all server data, heartbeat acknowledgements are emitted only after
+    // authorization. They carry no channel envelope but share the connection's
+    // reserved sys queue and single socket writer.
+    if frame == ClientFrame::Ping {
+        // Drop-on-full is deliberate. The next client heartbeat retries, and
+        // the read loop must never wait behind a slow socket writer.
+        try_enqueue_sys(sys_tx, pong_frame(encoding));
+        return true;
     }
 
     // Authorized path: full dispatch.
@@ -604,6 +633,7 @@ async fn handle_client_frame(
             let cancelled = cancel_session(state, &session_id).await;
             tracing::debug!("ws_v2: stop {session_id} -> cancelled={cancelled}");
         }
+        ClientFrame::Ping => unreachable!("authorized ping handled above"),
         ClientFrame::Unknown => {
             tracing::debug!("ws_v2: ignoring unknown client frame type");
         }
@@ -688,6 +718,53 @@ async fn subscribe(
                 .map(|runner| runner.last_critical_events.clone())
                 .unwrap_or_default();
 
+            // Match the v1 SSE late-subscribe contract. A session that
+            // completed while this socket was half-open must replay cached
+            // state and a synthesized terminal exactly once, rather than open
+            // a live receiver that will never publish another event.
+            let runner_status = runner_snapshot.as_ref().map(|runner| runner.status.clone());
+            if can_attempt_terminal_replay(runner_status.as_ref(), &receiver) {
+                if let Some(terminal_event) =
+                    crate::handlers::agent::events::terminal_event_if_ready(
+                        state,
+                        &sid,
+                        runner_status.clone(),
+                    )
+                    .await
+                {
+                    // Storage and descendant checks above are asynchronous. A
+                    // new runner can be reserved while they run, before it has
+                    // emitted its first broadcast event. Re-read the runner so
+                    // that Pending/Running wins over the stale terminal
+                    // snapshot even while the receiver is still empty.
+                    let current_runner_status = {
+                        let runners = state.agent_runners.read().await;
+                        runners.get(&sid).map(|runner| runner.status.clone())
+                    };
+                    // We subscribed before the async storage/child checks. If a
+                    // live event arrived meanwhile, preserve its ordering by
+                    // handing the still-buffered receiver to the live forwarder
+                    // instead of sending a synthetic terminal ahead of it.
+                    if can_attempt_terminal_replay(current_runner_status.as_ref(), &receiver) {
+                        return finish_subscribe(
+                            forwarders,
+                            queues,
+                            ch,
+                            out_rx,
+                            spawn_agent_terminal_forwarder(
+                                out_tx,
+                                encoding,
+                                ch.to_string(),
+                                budget_event_to_replay,
+                                critical_events_to_replay,
+                                terminal_event,
+                            ),
+                            since,
+                        );
+                    }
+                }
+            }
+
             spawn_agent_forwarder(
                 state.clone(),
                 sid.clone(),
@@ -701,7 +778,29 @@ async fn subscribe(
             )
         }
     };
+    finish_subscribe(forwarders, queues, ch, out_rx, handle, since);
+}
 
+fn can_attempt_terminal_replay(
+    runner_status: Option<&crate::app_state::AgentStatus>,
+    receiver: &tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
+) -> bool {
+    matches!(
+        runner_status,
+        None | Some(crate::app_state::AgentStatus::Completed)
+            | Some(crate::app_state::AgentStatus::Cancelled)
+            | Some(crate::app_state::AgentStatus::Error(_))
+    ) && receiver.is_empty()
+}
+
+fn finish_subscribe(
+    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    ch: &str,
+    out_rx: mpsc::Receiver<OutFrame>,
+    handle: tokio::task::JoinHandle<()>,
+    since: Option<u64>,
+) {
     forwarders.insert(ch.to_string(), handle);
     // Register this channel's queue receiver into the fair-merge drain. Keyed by
     // the SAME channel id as `forwarders`, so unsubscribe/teardown drops both.
@@ -721,6 +820,17 @@ mod tests {
             device_id: device_id.map(str::to_string),
             token: token.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn sys_queue_is_best_effort_and_drops_when_full() {
+        let (tx, mut rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
+        let first = OutFrame::Text("first".into());
+        try_enqueue_sys(&tx, Some(first.clone()));
+        // Must return immediately and leave the already-queued frame intact.
+        try_enqueue_sys(&tx, Some(OutFrame::Text("newer".into())));
+        assert_eq!(rx.try_recv().unwrap(), first);
+        assert!(rx.try_recv().is_err());
     }
 
     // ── Subprotocol negotiation (v2-P3) ───────────────────────────────────────
@@ -803,6 +913,10 @@ mod tests {
             UnauthorizedAction::classify(&ClientFrame::Stop {
                 session_id: "s".into()
             }),
+            UnauthorizedAction::Ignore
+        );
+        assert_eq!(
+            UnauthorizedAction::classify(&ClientFrame::Ping),
             UnauthorizedAction::Ignore
         );
         assert_eq!(
@@ -902,5 +1016,121 @@ mod tests {
         let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
         assert_eq!(outcome, GateOutcome::Dispatch);
         assert!(authorized);
+    }
+
+    #[actix_web::test]
+    async fn ping_is_ignored_before_auth_and_enqueued_after_auth() {
+        let (state, _cred, _token) = app_state_with_device().await;
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
+
+        let mut authorized = false;
+        assert!(
+            handle_client_frame(
+                &state,
+                &mut forwarders,
+                &mut queues,
+                &sys_tx,
+                0,
+                Encoding::Json,
+                ClientFrame::Ping,
+                &mut authorized,
+            )
+            .await
+        );
+        assert!(
+            sys_rx.try_recv().is_err(),
+            "unauthorized ping must be silent"
+        );
+
+        authorized = true;
+        assert!(
+            handle_client_frame(
+                &state,
+                &mut forwarders,
+                &mut queues,
+                &sys_tx,
+                0,
+                Encoding::Json,
+                ClientFrame::Ping,
+                &mut authorized,
+            )
+            .await
+        );
+        assert_eq!(
+            sys_rx.try_recv().unwrap(),
+            OutFrame::Text(r#"{"type":"pong"}"#.into())
+        );
+    }
+
+    #[actix_web::test]
+    async fn client_cannot_subscribe_or_unsubscribe_reserved_sys_queue() {
+        let (state, _cred, _token) = app_state_with_device().await;
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        let (sys_tx, sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
+        queues.insert(SYS_CHANNEL.to_string(), ReceiverStream::new(sys_rx));
+        let mut authorized = true;
+
+        for frame in [
+            ClientFrame::Subscribe {
+                ch: SYS_CHANNEL.into(),
+                since: None,
+            },
+            ClientFrame::Unsubscribe {
+                ch: SYS_CHANNEL.into(),
+            },
+        ] {
+            assert!(
+                handle_client_frame(
+                    &state,
+                    &mut forwarders,
+                    &mut queues,
+                    &sys_tx,
+                    0,
+                    Encoding::Json,
+                    frame,
+                    &mut authorized,
+                )
+                .await
+            );
+            assert!(
+                queues.contains_key(SYS_CHANNEL),
+                "client channel operations must not remove reserved sys queue"
+            );
+        }
+
+        try_enqueue_sys(&sys_tx, pong_frame(Encoding::Json));
+        let (channel, frame) = queues.next().await.expect("sys queue remains drainable");
+        assert_eq!(channel, SYS_CHANNEL);
+        assert_eq!(frame, OutFrame::Text(r#"{"type":"pong"}"#.into()));
+    }
+
+    #[test]
+    fn queued_agent_event_blocks_synthetic_terminal_replay() {
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        assert!(can_attempt_terminal_replay(None, &rx));
+        tx.send(bamboo_agent_core::AgentEvent::Token {
+            content: "first-live-token".into(),
+        })
+        .expect("receiver is subscribed");
+        assert!(
+            !can_attempt_terminal_replay(None, &rx),
+            "a queued live frame must win the race with synthetic terminal replay"
+        );
+    }
+
+    #[test]
+    fn pending_or_running_runner_blocks_synthetic_terminal_replay() {
+        let (_tx, rx) = tokio::sync::broadcast::channel(4);
+        assert!(!can_attempt_terminal_replay(
+            Some(&crate::app_state::AgentStatus::Pending),
+            &rx,
+        ));
+        assert!(!can_attempt_terminal_replay(
+            Some(&crate::app_state::AgentStatus::Running),
+            &rx,
+        ));
     }
 }

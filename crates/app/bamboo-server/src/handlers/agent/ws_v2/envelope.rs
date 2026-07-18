@@ -43,6 +43,24 @@ pub(crate) enum OutFrame {
     Binary(Vec<u8>),
 }
 
+/// Encode the application-level heartbeat acknowledgement.
+///
+/// This deliberately is a top-level frame (`{"type":"pong"}`), not a
+/// channel envelope: clients use it to prove that a frame made a complete
+/// round trip through the application read loop.
+pub(crate) fn pong_frame(encoding: Encoding) -> Option<OutFrame> {
+    #[derive(Serialize)]
+    struct PongFrame {
+        r#type: &'static str,
+    }
+
+    let pong = PongFrame { r#type: "pong" };
+    match encoding {
+        Encoding::Json => serde_json::to_string(&pong).ok().map(OutFrame::Text),
+        Encoding::Msgpack => rmp_serde::to_vec_named(&pong).ok().map(OutFrame::Binary),
+    }
+}
+
 /// A server→client envelope.
 ///
 /// Serializes as one of two shapes sharing `{ch, seq}`:
@@ -217,6 +235,9 @@ pub(crate) enum ClientFrame {
     Unsubscribe { ch: String },
     /// Cancel a running session (the only `control` uplink in P1).
     Stop { session_id: String },
+    /// Application-level heartbeat probe. Unlike WebSocket protocol Ping/Pong,
+    /// this is visible to browser JavaScript and receives a top-level `pong`.
+    Ping,
     /// Any frame whose `type` is not recognized. The driver logs and ignores it
     /// rather than disconnecting.
     #[serde(other)]
@@ -362,6 +383,25 @@ mod tests {
     }
 
     #[test]
+    fn client_ping_and_json_pong_wire_shapes() {
+        let ping: ClientFrame = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
+        assert_eq!(ping, ClientFrame::Ping);
+        assert_eq!(
+            pong_frame(Encoding::Json),
+            Some(OutFrame::Text(r#"{"type":"pong"}"#.to_string()))
+        );
+    }
+
+    #[test]
+    fn msgpack_pong_is_a_top_level_named_map() {
+        let OutFrame::Binary(bytes) = pong_frame(Encoding::Msgpack).expect("encodes") else {
+            panic!("msgpack pong must be binary");
+        };
+        let value: Value = rmp_serde::from_slice(&bytes).expect("decodes");
+        assert_eq!(value, json!({ "type": "pong" }));
+    }
+
+    #[test]
     fn unknown_frame_type_maps_to_unknown_not_error() {
         // An unrecognized `type` must NOT fail the parse — it maps to Unknown so
         // the driver logs + continues instead of disconnecting.
@@ -469,6 +509,7 @@ mod tests {
             ClientFrame::Stop {
                 session_id: "s1".into(),
             },
+            ClientFrame::Ping,
         ] {
             // ClientFrame is Deserialize-only; encode the equivalent JSON Value to
             // msgpack (the same bytes a client would send) and decode it back.
@@ -483,6 +524,7 @@ mod tests {
                 ClientFrame::Stop { session_id } => {
                     json!({ "type": "stop", "session_id": session_id })
                 }
+                ClientFrame::Ping => json!({ "type": "ping" }),
                 ClientFrame::Unknown => unreachable!(),
             };
             let bytes = rmp_serde::to_vec_named(&as_json).expect("encode client frame as msgpack");
@@ -536,6 +578,7 @@ mod tests {
             Some(Channel::Agent("sess_abc".to_string()))
         );
         assert_eq!(Channel::parse("agent."), None);
+        assert_eq!(Channel::parse("sys"), None, "sys is connection-reserved");
         assert_eq!(Channel::parse("bogus"), None);
     }
 
