@@ -6,10 +6,13 @@
 //!
 //! # Configuration File
 //!
-//! Configuration is stored in `config.json` under the unified data directory
-//! (defaults to `${HOME}/.bamboo/`). Environment variables can override file values.
+//! Root configuration is stored in `config.json` under the unified data
+//! directory (defaults to `${HOME}/.bamboo/`). Memory, sub-agent, and legacy
+//! provider settings are independently persisted in `memory.json`,
+//! `subagents.json`, and `providers.json`. Environment variables can override
+//! file values.
 //!
-//! # Example (JSON)
+//! # Example `config.json`
 //!
 //! ```json
 //! {
@@ -17,16 +20,17 @@
 //!   "server": {
 //!     "port": 9562,
 //!     "bind": "127.0.0.1"
-//!   },
-//!   "providers": {
-//!     "anthropic": {
-//!       "api_key": "sk-ant-...",
-//!       "model": "claude-3-5-sonnet-20241022"
-//!     },
-//!     "openai": {
-//!       "api_key": "sk-...",
-//!       "base_url": "https://api.openai.com/v1"
-//!     }
+//!   }
+//! }
+//! ```
+//!
+//! # Example `providers.json`
+//!
+//! ```json
+//! {
+//!   "anthropic": {
+//!     "api_key_encrypted": "...",
+//!     "model": "claude-3-5-sonnet-20241022"
 //!   }
 //! }
 //! ```
@@ -36,8 +40,9 @@
 //! Configuration values are loaded in this order (later overrides earlier):
 //! 1. Code defaults (hardcoded default values)
 //! 2. Config file values (from `${HOME}/.bamboo/config.json`)
-//! 3. Environment variables (e.g., `BAMBOO_PORT`)
-//! 4. CLI arguments (e.g., `--port 9000`)
+//! 3. Independent sidecars (`memory.json`, `subagents.json`, `providers.json`)
+//! 4. Environment variables (e.g., `BAMBOO_PORT`)
+//! 5. CLI arguments (e.g., `--port 9000`)
 //!
 //! # Environment Variables
 //!
@@ -49,7 +54,7 @@
 //! - `BAMBOO_OPENAI_API_KEY` / `BAMBOO_ANTHROPIC_API_KEY` / `BAMBOO_GEMINI_API_KEY`:
 //!   Supply a provider's API key from the environment (in-memory only, never
 //!   persisted) — for 12-factor / secret-manager / CI deploys without a
-//!   plaintext key in config.json.
+//!   plaintext key in `providers.json`.
 
 use anyhow::{Context, Result};
 use bamboo_domain::poison::PoisonRecover;
@@ -3162,7 +3167,8 @@ impl Config {
 
     /// Save configuration to disk under the provided data directory.
     ///
-    /// Configuration is always stored as `{data_dir}/config.json`.
+    /// Root configuration is stored as `{data_dir}/config.json`; extracted
+    /// memory, sub-agent, and provider modules are stored in sibling sidecars.
     ///
     /// Refuses to write when this config carries an unconfirmed
     /// [`ConfigRecoveryStatus`] (#153) — i.e. it was recovered from a corrupt
@@ -3222,6 +3228,16 @@ impl Config {
         let content = serde_json::to_string_pretty(&config_value)
             .context("Failed to serialize config to JSON")?;
 
+        // Persist extracted modules before stripping their legacy inline
+        // representation from config.json. If the process crashes or the root
+        // rewrite fails during the first migration, the next load can still use
+        // either the new sidecars or the untouched inline values. Do this before
+        // rotating root backups so a sidecar error cannot consume backup history
+        // for a root document that was never rewritten.
+        crate::MemoryConfigModule(to_save.memory.clone()).save_sync(&data_dir)?;
+        crate::SubagentsConfigModule(to_save.subagents.clone()).save_sync(&data_dir)?;
+        crate::ProviderConfigsModule(to_save.providers.clone()).save_sync(&data_dir)?;
+
         // Back up the current on-disk config (last-known-good) before overwriting,
         // so corruption (a bad/partial write, external edit, disk issue) stays
         // recoverable via config.json.bak on the next load. Best-effort. Only
@@ -3246,9 +3262,6 @@ impl Config {
         write_atomic(&path, content.as_bytes())
             .with_context(|| format!("Failed to write config file: {:?}", path))?;
 
-        crate::MemoryConfigModule(to_save.memory.clone()).save_sync(&data_dir)?;
-        crate::SubagentsConfigModule(to_save.subagents.clone()).save_sync(&data_dir)?;
-        crate::ProviderConfigsModule(to_save.providers.clone()).save_sync(&data_dir)?;
         save_connect_config(&to_save.connect, &data_dir)?;
 
         Ok(())

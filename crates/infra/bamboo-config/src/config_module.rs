@@ -107,17 +107,42 @@ pub(crate) fn load_sidecar<T: DeserializeOwned>(path: &Path) -> Result<Option<T>
     }
 }
 
-pub(crate) fn save_sidecar<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn save_sidecar<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value)?;
-    // Retain one last-known-good generation. A malformed current sidecar is
-    // deliberately not promoted over the usable backup.
+    // Retain one last-known-good generation. Validate the current document
+    // against the module's schema rather than merely checking that it is JSON:
+    // a syntactically valid but type-invalid document must not replace a usable
+    // backup.
     if path.exists() {
         let current = std::fs::read(path)?;
-        if serde_json::from_slice::<serde_json::Value>(&current).is_ok() {
-            std::fs::copy(path, path.with_extension("json.bak"))?;
+        if serde_json::from_slice::<T>(&current).is_ok() {
+            crate::config::write_atomic(&path.with_extension("json.bak"), &current)?;
+        }
+    }
+    crate::config::write_atomic(path, &bytes)?;
+    Ok(())
+}
+
+/// Save a sidecar whose deserializer intentionally drops in-memory-only
+/// fields (for example provider plaintext API keys). The previous generation
+/// is parsed and reserialized before becoming the backup so a hand-written
+/// plaintext secret is never copied verbatim into `*.json.bak`.
+pub(crate) fn save_sidecar_with_sanitized_backup<T: Serialize + DeserializeOwned>(
+    path: &Path,
+    value: &T,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if path.exists() {
+        let current = std::fs::read(path)?;
+        if let Ok(previous) = serde_json::from_slice::<T>(&current) {
+            let sanitized = serde_json::to_vec_pretty(&previous)?;
+            crate::config::write_atomic(&path.with_extension("json.bak"), &sanitized)?;
         }
     }
     crate::config::write_atomic(path, &bytes)?;
@@ -131,7 +156,9 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use crate::{Config, MemoryConfig, OpenAIConfig};
+    use crate::{
+        Config, ConfigRegistry, MemoryConfig, OpenAIConfig, ProviderConfigs, ProviderConfigsModule,
+    };
 
     fn write_json(path: &Path, value: serde_json::Value) {
         std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
@@ -305,5 +332,104 @@ mod tests {
             std::fs::read(dir.path().join("memory.json")).unwrap(),
             b"{broken"
         );
+    }
+
+    #[test]
+    fn schema_invalid_sidecar_is_not_promoted_over_last_known_good_backup() {
+        let dir = TempDir::new().unwrap();
+        write_json(&dir.path().join("config.json"), json!({}));
+        write_json(
+            &dir.path().join("memory.json.bak"),
+            json!({"background_model": "recovered"}),
+        );
+        write_json(
+            &dir.path().join("memory.json"),
+            json!({"auto_dream_interval_secs": "not-a-number"}),
+        );
+
+        let config = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            config.memory.as_ref().unwrap().background_model.as_deref(),
+            Some("recovered")
+        );
+        config.save_memory_to_dir(dir.path()).unwrap();
+
+        let backup: MemoryConfig =
+            serde_json::from_slice(&std::fs::read(dir.path().join("memory.json.bak")).unwrap())
+                .unwrap();
+        assert_eq!(backup.background_model.as_deref(), Some("recovered"));
+    }
+
+    #[test]
+    fn provider_registry_save_encrypts_keys_and_sanitizes_backup() {
+        let _key = crate::encryption::set_test_encryption_key([29; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("providers.json"),
+            json!({"openai": {"api_key": "sk-old-plaintext", "model": "old"}}),
+        );
+
+        let providers = ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: "sk-new-plaintext".into(),
+                model: Some("new".into()),
+                ..OpenAIConfig::default()
+            }),
+            ..ProviderConfigs::default()
+        };
+        let mut registry = ConfigRegistry::new();
+        registry.register(ProviderConfigsModule(providers));
+        futures::executor::block_on(registry.save_module("providers", dir.path())).unwrap();
+
+        let current = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
+        assert!(!current.contains("sk-new-plaintext"));
+        assert!(current.contains("api_key_encrypted"));
+        let backup = std::fs::read_to_string(dir.path().join("providers.json.bak")).unwrap();
+        assert!(!backup.contains("sk-old-plaintext"));
+
+        let mut loaded = ConfigRegistry::new();
+        loaded.register(ProviderConfigsModule::default());
+        futures::executor::block_on(loaded.load_all(dir.path())).unwrap();
+        let module = loaded.module::<ProviderConfigsModule>("providers").unwrap();
+        assert_eq!(
+            module.0.openai.as_ref().unwrap().api_key,
+            "sk-new-plaintext"
+        );
+
+        // Config's compatibility path performs its historical hydration pass
+        // after module load. The module-level hydration above must remain
+        // idempotent when reached through that path.
+        let config = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            config.providers.openai.as_ref().unwrap().api_key,
+            "sk-new-plaintext"
+        );
+    }
+
+    #[test]
+    fn sidecars_are_durable_before_root_migration_rewrite() {
+        let dir = TempDir::new().unwrap();
+        // A directory at config.json forces the final atomic rename to fail.
+        // The independently persisted modules must already be durable so a
+        // failed root rewrite cannot discard the migration source of truth.
+        std::fs::create_dir(dir.path().join("config.json")).unwrap();
+        let config = Config {
+            memory: Some(MemoryConfig {
+                background_model: Some("durable-before-root".into()),
+                ..MemoryConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        assert!(config.save_to_dir(dir.path().to_path_buf()).is_err());
+        let memory: MemoryConfig =
+            serde_json::from_slice(&std::fs::read(dir.path().join("memory.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            memory.background_model.as_deref(),
+            Some("durable-before-root")
+        );
+        assert!(dir.path().join("subagents.json").exists());
+        assert!(dir.path().join("providers.json").exists());
     }
 }
