@@ -14,24 +14,32 @@ pub mod cluster_fabric;
 #[allow(clippy::module_inception)]
 pub mod config;
 pub mod config_crypto;
+pub mod config_module;
 pub mod dot_path;
 pub mod encryption;
 pub mod keyword_masking;
+pub mod memory_config;
 pub mod model_mapping;
 pub mod patch;
 pub mod paths;
+pub mod provider_configs;
 pub mod provider_instance;
 pub mod settings;
 pub mod settings_loader;
+pub mod subagents_config;
 
 pub use cluster_fabric::*;
 pub use config::*;
+pub use config_module::*;
 pub use encryption::*;
 pub use keyword_masking::*;
+pub use memory_config::MemoryConfigModule;
 pub use model_mapping::*;
 pub use paths::*;
+pub use provider_configs::ProviderConfigsModule;
 pub use provider_instance::synthesize_legacy_instances;
 pub use settings::PermissionMode;
+pub use subagents_config::SubagentsConfigModule;
 
 /// Test-only synchronization for tests that mutate process-global state
 /// (env vars, the encryption-key var, the env-vars snapshot). Tests across
