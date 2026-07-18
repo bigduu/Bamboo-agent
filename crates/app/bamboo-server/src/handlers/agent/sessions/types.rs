@@ -25,6 +25,8 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_run_id: Option<String>,
@@ -96,6 +98,7 @@ impl SessionSummary {
             model_ref: entry.model_ref,
             provider: None,
             reasoning_effort: entry.reasoning_effort,
+            workspace_path: entry.workspace_path,
             created_by_schedule_id: entry.created_by_schedule_id,
             schedule_run_id: entry.schedule_run_id,
             created_at: entry.created_at,
@@ -437,6 +440,7 @@ mod tests {
             model_ref: None,
             provider: None,
             reasoning_effort: Some(ReasoningEffort::Medium),
+            workspace_path: Some("/workspaces/zenith".to_string()),
             created_by_schedule_id: None,
             schedule_run_id: None,
             created_at: Utc::now(),
@@ -462,6 +466,7 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"session\""));
         assert!(json.contains("\"test-id\""));
+        assert!(json.contains("\"workspace_path\":\"/workspaces/zenith\""));
     }
 
     #[test]
@@ -481,6 +486,7 @@ mod tests {
             model_ref: None,
             provider: None,
             reasoning_effort: None,
+            workspace_path: Some("/workspaces/zenith".to_string()),
             created_by_schedule_id: None,
             schedule_run_id: None,
             created_at: Utc::now(),
@@ -612,6 +618,7 @@ mod tests {
             model_ref: None,
             provider: None,
             reasoning_effort: Some(ReasoningEffort::Low),
+            workspace_path: None,
             created_by_schedule_id: None,
             schedule_run_id: None,
             created_at: Utc::now(),
