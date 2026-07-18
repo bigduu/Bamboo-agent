@@ -1017,7 +1017,15 @@ async fn gc_stale_storage(root: PathBuf, fabric_dir: PathBuf, retention: std::ti
     let live_ids: std::collections::HashSet<String> = Fabric::at(&fabric_dir)
         .discover()
         .await
-        .map(|records| records.into_iter().map(|r| r.agent_id).collect())
+        // Storage directory names use the same safe component mapping as
+        // provisioning. Comparing raw Fabric ids would fail for `../`, Unicode,
+        // or Windows-reserved ids and could reap a still-live actor.
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| safe_child_storage_component(&record.agent_id))
+                .collect()
+        })
         .unwrap_or_default();
 
     let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
@@ -1237,5 +1245,16 @@ mod tests {
             .join(".bamboo/tmp/subagents");
         assert!(escaped.starts_with(&storage_root));
         assert_eq!(escaped.parent(), Some(storage_root.as_path()));
+    }
+
+    #[test]
+    fn live_fabric_ids_map_to_the_same_safe_storage_component() {
+        for id in ["ordinary-child", "../outside", "子代理", "CON"] {
+            let storage = safe_child_storage_component(id);
+            let live_components: std::collections::HashSet<_> =
+                [id].into_iter().map(safe_child_storage_component).collect();
+            assert!(live_components.contains(&storage), "id={id:?}");
+            assert!(!storage.contains(std::path::MAIN_SEPARATOR));
+        }
     }
 }

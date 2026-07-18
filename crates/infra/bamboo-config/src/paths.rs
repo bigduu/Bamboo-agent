@@ -298,7 +298,11 @@ pub fn ensure_project_runtime_dirs(project_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(project_tmp_dir(project_dir))?;
 
     let ignore_path = bamboo_dir.join(".gitignore");
-    let existing = std::fs::read_to_string(&ignore_path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&ignore_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     let mut content = existing.clone();
     for entry in ["worktree/", "tmp/", "settings.local.json"] {
         if !existing.lines().any(|line| line.trim() == entry) {
@@ -587,6 +591,23 @@ mod tests {
         for entry in ["worktree/", "tmp/", "settings.local.json"] {
             assert_eq!(ignore.lines().filter(|line| *line == entry).count(), 1);
         }
+    }
+
+    #[test]
+    fn project_runtime_gitignore_does_not_overwrite_invalid_existing_content() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let bamboo = project_bamboo_dir(&project);
+        std::fs::create_dir_all(&bamboo).expect("bamboo dir");
+        let ignore_path = bamboo.join(".gitignore");
+        let original = [0xff, 0xfe, b'x'];
+        std::fs::write(&ignore_path, original).expect("invalid utf8 ignore");
+
+        assert!(ensure_project_runtime_dirs(&project).is_err());
+        assert_eq!(
+            std::fs::read(ignore_path).expect("preserved ignore"),
+            original
+        );
     }
 
     #[test]
