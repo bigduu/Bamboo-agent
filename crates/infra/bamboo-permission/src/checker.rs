@@ -111,6 +111,20 @@ pub trait PermissionChecker: Send + Sync {
     /// Returns `true` if the operation requires user confirmation before proceeding.
     async fn needs_confirmation(&self, perm_type: PermissionType, resource: &str) -> bool;
 
+    async fn needs_confirmation_for_session(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        if self.permission_config().is_some_and(|config| {
+            config.consume_scoped_session_grant(session_id, perm_type, resource)
+        }) {
+            return false;
+        }
+        self.needs_confirmation(perm_type, resource).await
+    }
+
     /// Check if a permission is granted (without requesting confirmation)
     ///
     /// This method checks the whitelist and session grants but does not
@@ -132,6 +146,42 @@ pub trait PermissionChecker: Send + Sync {
     /// After granting, subsequent calls to `needs_confirmation` for the same
     /// permission type and matching resources will return `false`.
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String);
+
+    fn grant_scoped_session_permission(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource: String,
+    ) {
+        if let Some(config) = self.permission_config() {
+            config.grant_scoped_session_permission(session_id, perm_type, resource);
+        } else {
+            self.grant_session_permission(perm_type, resource);
+        }
+    }
+
+    fn grant_once(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        perm_type: PermissionType,
+        resource: String,
+    ) {
+        if let Some(config) = self.permission_config() {
+            config.grant_once(session_id, request_id, perm_type, resource);
+        }
+    }
+
+    fn consume_once(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        self.permission_config()
+            .is_some_and(|config| config.consume_once(session_id, request_id, perm_type, resource))
+    }
 
     /// Override the active permission mode at runtime.
     ///
@@ -183,6 +233,20 @@ pub trait PermissionChecker: Send + Sync {
         }
 
         // Request confirmation from user
+        self.request_confirmation(ctx).await
+    }
+
+    async fn check_or_request_for_session(
+        &self,
+        session_id: &str,
+        ctx: PermissionContext,
+    ) -> Result<bool, PermissionError> {
+        if !self
+            .needs_confirmation_for_session(session_id, ctx.permission_type, &ctx.resource)
+            .await
+        {
+            return Ok(true);
+        }
         self.request_confirmation(ctx).await
     }
 }
