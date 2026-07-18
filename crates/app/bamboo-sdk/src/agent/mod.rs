@@ -1413,7 +1413,16 @@ mod reexecute_and_child_approval_tests {
         // `external_agents::actor_adapter::drive` would.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _live_guard = bamboo_engine::external_agents::live::register("child-x", tx);
-        bamboo_engine::external_agents::live::register_pending_approval("child-x", "req-1");
+        let (approval_event_tx, _approval_event_rx) = tokio::sync::mpsc::channel(4);
+        bamboo_engine::external_agents::live::register_pending_approval_observed(
+            "parent-x",
+            "child-x",
+            "req-1",
+            "shell",
+            "execute",
+            "cargo test",
+            approval_event_tx,
+        );
 
         assert!(agent.answer_child_approval("child-x", "req-1", true));
         match rx.try_recv() {
