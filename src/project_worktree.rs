@@ -1,12 +1,25 @@
 //! Project-scoped Git worktree lifecycle.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub const WORKTREE_BRANCH_PREFIX: &str = "bamboo/";
 pub const WORKTREE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const WORKTREE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+static LEASE_HEARTBEATS: OnceLock<
+    tokio::sync::Mutex<HashMap<PathBuf, tokio::task::JoinHandle<()>>>,
+> = OnceLock::new();
+
+fn lease_heartbeats() -> &'static tokio::sync::Mutex<HashMap<PathBuf, tokio::task::JoinHandle<()>>>
+{
+    LEASE_HEARTBEATS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
 
 fn validate_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
@@ -59,6 +72,41 @@ fn ownership_marker(project_root: &Path, name: &str) -> PathBuf {
         .join(name)
 }
 
+async fn start_lease_heartbeat(marker: PathBuf, branch: String, interval: Duration) {
+    stop_lease_heartbeat(&marker).await;
+    let task_marker = marker.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            // Open an existing marker only. If normal cleanup deleted it, the
+            // heartbeat exits and can never recreate ownership metadata.
+            let Ok(mut file) = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&task_marker)
+                .await
+            else {
+                break;
+            };
+            if file.write_all(branch.as_bytes()).await.is_err()
+                || file.set_len(branch.len() as u64).await.is_err()
+                || file.flush().await.is_err()
+            {
+                break;
+            }
+        }
+    });
+    lease_heartbeats().lock().await.insert(marker, handle);
+}
+
+async fn stop_lease_heartbeat(marker: &Path) {
+    if let Some(handle) = lease_heartbeats().lock().await.remove(marker) {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectWorktree {
     pub project_root: PathBuf,
@@ -67,6 +115,14 @@ pub struct ProjectWorktree {
 }
 
 pub async fn create(workspace: &Path, name: &str) -> Result<ProjectWorktree, String> {
+    create_with_heartbeat_interval(workspace, name, WORKTREE_HEARTBEAT_INTERVAL).await
+}
+
+async fn create_with_heartbeat_interval(
+    workspace: &Path,
+    name: &str,
+    heartbeat_interval: Duration,
+) -> Result<ProjectWorktree, String> {
     let name = validate_name(name)?;
     let project_root = git_project_root(workspace).await?;
     bamboo_config::paths::ensure_project_runtime_dirs(&project_root)
@@ -121,6 +177,7 @@ pub async fn create(workspace: &Path, name: &str) -> Result<ProjectWorktree, Str
         let _ = git_output(&project_root, &["worktree", "remove", "--force", &path_arg]).await;
         return Err(format!("record worktree ownership: {error}"));
     }
+    start_lease_heartbeat(marker, branch.clone(), heartbeat_interval).await;
     Ok(ProjectWorktree {
         project_root,
         path,
@@ -160,6 +217,7 @@ pub async fn remove(workspace: &Path, name: &str) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    stop_lease_heartbeat(&marker).await;
     let _ = tokio::fs::remove_file(marker).await;
     prune(&project_root).await
 }
@@ -284,6 +342,7 @@ mod tests {
             0
         );
         assert!(stale.path.exists(), "fresh worktree must not be reaped");
+        stop_lease_heartbeat(&ownership_marker(&stale.project_root, "child_2")).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(gc_orphans(&project, Duration::ZERO).await.expect("gc"), 1);
         assert!(!stale.path.exists(), "expired owned worktree is reaped");
@@ -306,6 +365,36 @@ mod tests {
         );
         let mismatch_arg = mismatch.path.to_string_lossy().to_string();
         git(&project, &["worktree", "remove", "--force", &mismatch_arg]).await;
+        stop_lease_heartbeat(&ownership_marker(&mismatch.project_root, "mismatch")).await;
+    }
+
+    #[tokio::test]
+    async fn live_lease_prevents_reaping_until_heartbeat_stops() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("repo");
+        tokio::fs::create_dir_all(&project).await.expect("repo");
+        git(&project, &["init"]).await;
+        git(&project, &["config", "user.email", "test@example.com"]).await;
+        git(&project, &["config", "user.name", "Test"]).await;
+        tokio::fs::write(project.join("README.md"), "test")
+            .await
+            .expect("readme");
+        git(&project, &["add", "README.md"]).await;
+        git(&project, &["commit", "-m", "initial"]).await;
+
+        let worktree = create_with_heartbeat_interval(&project, "leased", Duration::from_millis(5))
+            .await
+            .expect("create leased worktree");
+        let retention = Duration::from_millis(30);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(gc_orphans(&project, retention).await.expect("live gc"), 0);
+        assert!(worktree.path.exists(), "live lease must prevent reaping");
+
+        let marker = ownership_marker(&worktree.project_root, "leased");
+        stop_lease_heartbeat(&marker).await;
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        assert_eq!(gc_orphans(&project, retention).await.expect("stale gc"), 1);
+        assert!(!worktree.path.exists(), "expired lease should be reaped");
     }
 
     #[tokio::test]
