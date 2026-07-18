@@ -36,7 +36,7 @@ fn load_settings_from_dirs(
     let mut settings = user;
 
     if let Some(proj_dir) = project_dir {
-        let project_bamboo = proj_dir.join(".bamboo");
+        let project_bamboo = paths::project_bamboo_dir(proj_dir);
 
         // 3. Project settings (shared, committed to git)
         let project_path = project_bamboo.join("settings.json");
@@ -127,7 +127,7 @@ mod tests {
 
         // Project settings
         let project_dir = temp.path().join("my_project");
-        let project_bamboo = project_dir.join(".bamboo");
+        let project_bamboo = paths::project_bamboo_dir(&project_dir);
         std::fs::create_dir_all(&project_bamboo).unwrap();
         write_settings(
             &project_bamboo,
@@ -156,7 +156,7 @@ mod tests {
 
         // Project settings
         let project_dir = temp.path().join("my_project");
-        let project_bamboo = project_dir.join(".bamboo");
+        let project_bamboo = paths::project_bamboo_dir(&project_dir);
         std::fs::create_dir_all(&project_bamboo).unwrap();
         write_settings(
             &project_bamboo,
@@ -194,7 +194,7 @@ mod tests {
 
         // Simulated project settings
         let project_dir = temp.path().join("my_project");
-        let project_bamboo = project_dir.join(".bamboo");
+        let project_bamboo = paths::project_bamboo_dir(&project_dir);
         std::fs::create_dir_all(&project_bamboo).unwrap();
         write_settings(
             &project_bamboo,

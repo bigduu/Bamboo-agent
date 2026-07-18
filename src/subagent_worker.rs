@@ -13,7 +13,7 @@
 //! the WebSocket verbatim (zero mapping).
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -44,17 +44,41 @@ const STORAGE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 
 /// Worker entry point: provision from stdin, build the executor, serve one run, clean up.
 pub async fn run() -> std::result::Result<(), String> {
     // Stage 1: provision (one JSON document on stdin; the parent closes the pipe).
-    let spec = ProvisionSpec::read_from_stdin()
+    let mut spec = ProvisionSpec::read_from_stdin()
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
 
+    // Preserve an explicit parent-selected storage root. Otherwise bind
+    // project workers to `<git-root>/.bamboo/tmp/subagents/<child-id>` and
+    // leave workspace-less broker/fabric workers in OS temp.
+    let uses_default_storage = spec.storage_dir.is_none();
+    if uses_default_storage {
+        spec.storage_dir = Some(
+            default_worker_storage_dir(spec.workspace.as_deref(), &spec.identity.child_id)
+                .await
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+
     // Best-effort housekeeping while we boot: expire stale sibling storage
-    // dirs (default retention 7 days) and stale fabric records.
-    // #217: the persistent data-dir subagents home, not `env::temp_dir()`.
-    tokio::spawn(gc_stale_storage(
-        bamboo_config::paths::subagents_dir(),
-        STORAGE_RETENTION,
-    ));
+    // dirs (default retention 7 days) while consulting the actual fabric for
+    // live leases, regardless of whether storage is project-scoped or in temp.
+    // An explicit storage directory is operator-owned. Its parent may contain
+    // unrelated directories, so never run sibling GC there.
+    if uses_default_storage {
+        let storage_root = spec
+            .storage_dir
+            .as_deref()
+            .and_then(|path| Path::new(path).parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+        tokio::spawn(gc_stale_storage(
+            storage_root,
+            PathBuf::from(&spec.fabric_dir),
+            STORAGE_RETENTION,
+        ));
+    }
     {
         let fab = Fabric::at(&spec.fabric_dir);
         tokio::spawn(async move {
@@ -200,14 +224,9 @@ impl BambooRuntimeExecutor {
     /// isolated storage/skills/metrics, builtin tools — never touching the user's
     /// `~/.bamboo` or persisting any secret.
     pub async fn build(spec: &ProvisionSpec) -> std::result::Result<Self, String> {
-        // #217: default under the persistent data-dir subagents home instead
-        // of `env::temp_dir()` (mirrors `resolve_claude_code_state_dir` in
-        // `claude_code_executor.rs`, which the doc comment there points at).
-        let storage_dir = spec
-            .storage_dir
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| bamboo_config::paths::subagents_dir().join(&spec.identity.child_id));
+        let storage_dir = spec.storage_dir.clone().map(PathBuf::from).unwrap_or(
+            default_worker_storage_dir(spec.workspace.as_deref(), &spec.identity.child_id).await,
+        );
         tokio::fs::create_dir_all(&storage_dir)
             .await
             .map_err(|e| format!("create storage dir: {e}"))?;
@@ -552,6 +571,77 @@ impl BambooRuntimeExecutor {
             child_runner,
         })
     }
+}
+
+pub(crate) async fn default_worker_storage_dir(workspace: Option<&str>, child_id: &str) -> PathBuf {
+    let child_component = safe_child_storage_component(child_id);
+    if let Some(workspace) = workspace.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Ok(project_root) =
+            crate::project_worktree::git_project_root(Path::new(workspace)).await
+        {
+            if bamboo_config::paths::ensure_project_runtime_dirs(&project_root).is_ok() {
+                return bamboo_config::paths::project_tmp_dir(&project_root)
+                    .join("subagents")
+                    .join(&child_component);
+            }
+        }
+    }
+    std::env::temp_dir()
+        .join("bamboo-subagents")
+        .join(child_component)
+}
+
+fn safe_child_storage_component(child_id: &str) -> String {
+    let safe = !child_id.is_empty()
+        && child_id.len() <= 80
+        && child_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    let windows_reserved = matches!(
+        child_id.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if safe && !windows_reserved {
+        return child_id.to_string();
+    }
+
+    // Hex encoding is injective and contains no path separators. Provisioned
+    // identities are small in practice; cap pathological input while retaining
+    // a hash of the complete value to avoid prefix collisions.
+    use std::hash::{Hash, Hasher};
+    let mut encoded = String::from("id-");
+    for byte in child_id.as_bytes().iter().take(80) {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    if child_id.len() > 80 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        child_id.hash(&mut hasher);
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "-{:016x}", hasher.finish());
+    }
+    encoded
 }
 
 /// Bridges the engine's task-local [`bamboo_tools::ApprovalProxy`] to the host
@@ -923,11 +1013,19 @@ impl ChildExecutor for BambooRuntimeExecutor {
 /// not expired) is never removed — dir mtime alone would misjudge a long-running
 /// actor (>retention) as stale, because file writes inside subdirectories do
 /// not bump the top-level directory's mtime.
-async fn gc_stale_storage(root: PathBuf, retention: std::time::Duration) {
-    let live_ids: std::collections::HashSet<String> = Fabric::at(&root)
+async fn gc_stale_storage(root: PathBuf, fabric_dir: PathBuf, retention: std::time::Duration) {
+    let live_ids: std::collections::HashSet<String> = Fabric::at(&fabric_dir)
         .discover()
         .await
-        .map(|records| records.into_iter().map(|r| r.agent_id).collect())
+        // Storage directory names use the same safe component mapping as
+        // provisioning. Comparing raw Fabric ids would fail for `../`, Unicode,
+        // or Windows-reserved ids and could reap a still-live actor.
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| safe_child_storage_component(&record.agent_id))
+                .collect()
+        })
         .unwrap_or_default();
 
     let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
@@ -1112,5 +1210,51 @@ mod tests {
         assert_eq!(config.provider, "openai");
         let slot = config.providers.openai.expect("openai slot");
         assert_eq!(slot.api_key, "sk-oa");
+    }
+
+    #[tokio::test]
+    async fn default_storage_is_project_scoped_only_for_git_workspaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        tokio::fs::create_dir_all(&project).await.expect("project");
+        let status = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .arg("init")
+            .status()
+            .await
+            .expect("git init");
+        assert!(status.success());
+
+        let project_storage = default_worker_storage_dir(project.to_str(), "child-project").await;
+        assert_eq!(
+            project_storage,
+            std::fs::canonicalize(&project)
+                .expect("canonical project")
+                .join(".bamboo/tmp/subagents/child-project")
+        );
+        let temp_storage = default_worker_storage_dir(None, "child-global").await;
+        assert_eq!(
+            temp_storage,
+            std::env::temp_dir().join("bamboo-subagents/child-global")
+        );
+
+        let escaped = default_worker_storage_dir(project.to_str(), "../outside").await;
+        let storage_root = std::fs::canonicalize(&project)
+            .expect("canonical project")
+            .join(".bamboo/tmp/subagents");
+        assert!(escaped.starts_with(&storage_root));
+        assert_eq!(escaped.parent(), Some(storage_root.as_path()));
+    }
+
+    #[test]
+    fn live_fabric_ids_map_to_the_same_safe_storage_component() {
+        for id in ["ordinary-child", "../outside", "子代理", "CON"] {
+            let storage = safe_child_storage_component(id);
+            let live_components: std::collections::HashSet<_> =
+                [id].into_iter().map(safe_child_storage_component).collect();
+            assert!(live_components.contains(&storage), "id={id:?}");
+            assert!(!storage.contains(std::path::MAIN_SEPARATOR));
+        }
     }
 }
