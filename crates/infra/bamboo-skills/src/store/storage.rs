@@ -8,6 +8,8 @@ use crate::types::{SkillDefinition, SkillResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillDirectorySource {
+    /// Cross-agent user skills discovered from `~/.agents/skills`.
+    Agents,
     Global,
     Project,
     /// `~/.bamboo/plugins/<plugin-id>/skills` — an installed plugin's skills,
@@ -37,24 +39,57 @@ pub async fn ensure_skills_dir(skills_dir: &Path) -> SkillResult<()> {
 }
 
 /// Recursively find all SKILL.md files in the skills directory
-async fn find_skill_files(dir: &Path) -> SkillResult<Vec<PathBuf>> {
+async fn find_skill_files(dir: &Path) -> Vec<PathBuf> {
     let mut skill_files = Vec::new();
-    let mut entries = fs::read_dir(dir).await?;
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!("Failed to read skill directory {:?}: {}", dir, error);
+            return skill_files;
+        }
+    };
 
-    while let Some(entry) = entries.next_entry().await? {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!("Failed while scanning skill directory {:?}: {}", dir, error);
+                break;
+            }
+        };
         let path = entry.path();
-
-        if path.is_dir() {
+        // Never follow directory symlinks: an external tree must not become
+        // part of skill discovery merely because it is linked below a root.
+        let is_real_dir = entry
+            .file_type()
+            .await
+            .map(|kind| kind.is_dir() && !kind.is_symlink())
+            .unwrap_or(false);
+        if is_real_dir {
             // Check if this directory contains SKILL.md
             let skill_file = path.join("SKILL.md");
             match fs::try_exists(&skill_file).await {
                 Ok(true) => {
-                    skill_files.push(skill_file);
+                    let is_regular_file = fs::symlink_metadata(&skill_file)
+                        .await
+                        .map(|metadata| {
+                            metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+                        })
+                        .unwrap_or(false);
+                    if is_regular_file {
+                        skill_files.push(skill_file);
+                    } else {
+                        warn!(
+                            "Ignoring symlinked or non-regular skill file: {:?}",
+                            skill_file
+                        );
+                    }
                     continue; // Don't recurse into skill directories
                 }
                 Ok(false) => {
                     // Not a skill directory, recurse into it
-                    let sub_skills = Box::pin(find_skill_files(&path)).await?;
+                    let sub_skills = Box::pin(find_skill_files(&path)).await;
                     skill_files.extend(sub_skills);
                 }
                 Err(_) => {
@@ -64,7 +99,7 @@ async fn find_skill_files(dir: &Path) -> SkillResult<Vec<PathBuf>> {
         }
     }
 
-    Ok(skill_files)
+    skill_files
 }
 
 pub async fn load_skills_from_discovery_dirs(
@@ -98,7 +133,7 @@ pub async fn load_skills_from_discovery_dirs(
             discovery.mode.as_deref().unwrap_or("generic")
         );
 
-        let skill_files = find_skill_files(&discovery.dir).await?;
+        let skill_files = find_skill_files(&discovery.dir).await;
         for skill_file in skill_files {
             match fs::read_to_string(&skill_file).await {
                 Ok(content) => match parse_markdown_skill(&skill_file, &content) {
@@ -203,4 +238,62 @@ pub async fn write_skill_file(skills_dir: &Path, skill: &SkillDefinition) -> Ski
     let content = render_skill_markdown(skill)?;
     fs::write(path, content).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_skill(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: test skill\n---\n\nFollow this skill.")
+    }
+
+    #[tokio::test]
+    async fn agents_source_recurses_and_bad_skill_does_not_block_good_skill() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let good = root.path().join("vendor/good");
+        let bad = root.path().join("bad");
+        fs::create_dir_all(&good).await.expect("good dir");
+        fs::create_dir_all(&bad).await.expect("bad dir");
+        fs::write(good.join("SKILL.md"), valid_skill("good"))
+            .await
+            .expect("good skill");
+        fs::write(bad.join("SKILL.md"), "not valid frontmatter")
+            .await
+            .expect("bad skill");
+
+        let records = load_skills_from_discovery_dirs(&[SkillDiscoveryDir {
+            dir: root.path().to_path_buf(),
+            source: SkillDirectorySource::Agents,
+            mode: None,
+        }])
+        .await
+        .expect("discovery survives invalid skill");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].skill.id, "good");
+        assert_eq!(records[0].source, SkillDirectorySource::Agents);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_source_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let skill = outside.path().join("escaped");
+        fs::create_dir_all(&skill).await.expect("skill dir");
+        fs::write(skill.join("SKILL.md"), valid_skill("escaped"))
+            .await
+            .expect("skill");
+        symlink(outside.path(), root.path().join("linked")).expect("symlink");
+
+        let records = load_skills_from_discovery_dirs(&[SkillDiscoveryDir {
+            dir: root.path().to_path_buf(),
+            source: SkillDirectorySource::Agents,
+            mode: None,
+        }])
+        .await
+        .expect("discovery");
+        assert!(records.is_empty());
+    }
 }

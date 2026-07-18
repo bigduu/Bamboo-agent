@@ -67,6 +67,11 @@ pub fn bamboo_dir_display() -> String {
     path_to_display_string(&bamboo_dir())
 }
 
+/// Conventional cross-agent skill directory (`~/.agents/skills`).
+pub fn agents_skills_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".agents").join("skills"))
+}
+
 /// Get config.json path (in data directory)
 pub fn config_json_path() -> PathBuf {
     bamboo_dir().join("config.json")
