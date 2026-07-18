@@ -175,6 +175,21 @@ async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation(
                 return Err(LLMError::Api("intentional fast-model failure".to_string()));
             }
 
+            // When the second chat round starts, the first task evaluator has
+            // already been spawned but may not have received executor time yet.
+            // Wait for that background request to enter the provider so this
+            // test observes the between-round refresh deterministically without
+            // relying on the finalize path to drain it.
+            if self.queue.lock().await.len() == 2 {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while self.fast_models.lock().await.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("first between-round task evaluation should start");
+            }
+
             let mut guard = self.queue.lock().await;
             if guard.is_empty() {
                 panic!("test provider queue exhausted");
