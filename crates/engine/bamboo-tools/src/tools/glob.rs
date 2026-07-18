@@ -49,6 +49,15 @@ impl GlobTool {
     }
 
     fn should_skip_dir(path: &Path) -> bool {
+        if path.file_name().and_then(|name| name.to_str()) == Some("worktree")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(".bamboo")
+        {
+            return true;
+        }
         path.file_name()
             .and_then(|name| name.to_str())
             .map(|name| SKIP_DIRS.contains(&name))
@@ -290,14 +299,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kept = dir.path().join("src").join("keep.txt");
         let skipped = dir.path().join("node_modules").join("skip.txt");
+        let worktree = dir
+            .path()
+            .join(".bamboo/worktree/child")
+            .join("duplicate.txt");
         tokio::fs::create_dir_all(kept.parent().unwrap())
             .await
             .unwrap();
         tokio::fs::create_dir_all(skipped.parent().unwrap())
             .await
             .unwrap();
+        tokio::fs::create_dir_all(worktree.parent().unwrap())
+            .await
+            .unwrap();
         tokio::fs::write(&kept, "ok").await.unwrap();
         tokio::fs::write(&skipped, "skip").await.unwrap();
+        tokio::fs::write(&worktree, "duplicate").await.unwrap();
 
         let tool = GlobTool::new();
         let out = tool
@@ -317,5 +334,6 @@ mod tests {
 
         assert!(result.result.contains("keep.txt"));
         assert!(!result.result.contains("node_modules"));
+        assert!(!result.result.contains("duplicate.txt"));
     }
 }

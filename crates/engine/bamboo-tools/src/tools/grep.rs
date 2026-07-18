@@ -128,6 +128,15 @@ impl GrepTool {
     }
 
     fn should_skip_dir(path: &Path) -> bool {
+        if path.file_name().and_then(|name| name.to_str()) == Some("worktree")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(".bamboo")
+        {
+            return true;
+        }
         path.file_name()
             .and_then(|name| name.to_str())
             .map(|name| SKIP_DIRS.contains(&name))
@@ -528,6 +537,30 @@ mod tests {
         let lines = result_lines(&result);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("match.rs"));
+    }
+
+    #[tokio::test]
+    async fn grep_skips_project_worktree_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("src/kept.txt");
+        let duplicate = dir.path().join(".bamboo/worktree/child/duplicate.txt");
+        tokio::fs::create_dir_all(kept.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(duplicate.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kept, "needle").await.unwrap();
+        tokio::fs::write(&duplicate, "needle").await.unwrap();
+
+        let result = run(
+            &GrepTool::new(),
+            json!({"pattern": "needle", "path": dir.path()}),
+        )
+        .await
+        .unwrap();
+        assert!(result.result.contains("kept.txt"));
+        assert!(!result.result.contains("duplicate.txt"));
     }
 
     #[tokio::test]

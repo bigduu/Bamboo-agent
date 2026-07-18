@@ -141,7 +141,18 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
     } else {
         None
     };
-    if let Some(spec) = piped_spec {
+    if let Some(mut spec) = piped_spec {
+        if spec.storage_dir.is_none() {
+            spec.storage_dir = Some(
+                crate::subagent_worker::default_worker_storage_dir(
+                    spec.workspace.as_deref(),
+                    &spec.identity.child_id,
+                )
+                .await
+                .to_string_lossy()
+                .to_string(),
+            );
+        }
         let me = AgentRef {
             session_id: spec.identity.child_id.clone(),
             role: Some(spec.identity.role.clone()),

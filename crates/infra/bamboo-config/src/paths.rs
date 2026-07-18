@@ -107,6 +107,16 @@ pub fn project_commands_dir(project_dir: &Path) -> PathBuf {
     project_bamboo_dir(project_dir).join("commands")
 }
 
+/// Root for Git worktrees owned by Bamboo for this project.
+pub fn project_worktree_dir(project_dir: &Path) -> PathBuf {
+    project_bamboo_dir(project_dir).join("worktree")
+}
+
+/// Root for project-bound scratch data.
+pub fn project_tmp_dir(project_dir: &Path) -> PathBuf {
+    project_bamboo_dir(project_dir).join("tmp")
+}
+
 /// Get the local plugin bundles root (`~/.bamboo/plugins`).
 ///
 /// Each installed plugin lives at `plugins_dir()/<plugin_id>/`, keeping the
@@ -280,9 +290,34 @@ pub fn user_settings_path() -> PathBuf {
     bamboo_dir().join("settings.json")
 }
 
-/// Get the project-level settings directory: `<project>/.bamboo`
+/// Ensure project runtime directories exist and incrementally maintain the
+/// local `.bamboo/.gitignore` without overwriting user-authored entries.
+pub fn ensure_project_runtime_dirs(project_dir: &Path) -> std::io::Result<()> {
+    let bamboo_dir = project_bamboo_dir(project_dir);
+    std::fs::create_dir_all(project_worktree_dir(project_dir))?;
+    std::fs::create_dir_all(project_tmp_dir(project_dir))?;
+
+    let ignore_path = bamboo_dir.join(".gitignore");
+    let existing = std::fs::read_to_string(&ignore_path).unwrap_or_default();
+    let mut content = existing.clone();
+    for entry in ["worktree/", "tmp/", "settings.local.json"] {
+        if !existing.lines().any(|line| line.trim() == entry) {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(entry);
+            content.push('\n');
+        }
+    }
+    if content != existing {
+        std::fs::write(ignore_path, content)?;
+    }
+    Ok(())
+}
+
+/// Backward-compatible settings name for [`project_bamboo_dir`].
 pub fn project_settings_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".bamboo")
+    project_bamboo_dir(project_dir)
 }
 
 /// Get the project-level settings file: `<project>/.bamboo/settings.json`
@@ -523,6 +558,35 @@ mod tests {
             commands_dir_in(Path::new("/data/bamboo")),
             PathBuf::from("/data/bamboo/commands")
         );
+    }
+
+    #[test]
+    fn project_runtime_paths_and_gitignore_are_scoped_and_incremental() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project_bamboo_dir(&project)).expect("bamboo dir");
+        std::fs::write(
+            project_bamboo_dir(&project).join(".gitignore"),
+            "custom-cache/\n",
+        )
+        .expect("custom ignore");
+
+        ensure_project_runtime_dirs(&project).expect("runtime dirs");
+        ensure_project_runtime_dirs(&project).expect("idempotent");
+
+        assert_eq!(
+            project_worktree_dir(&project),
+            project.join(".bamboo/worktree")
+        );
+        assert_eq!(project_tmp_dir(&project), project.join(".bamboo/tmp"));
+        assert!(project_worktree_dir(&project).is_dir());
+        assert!(project_tmp_dir(&project).is_dir());
+        let ignore = std::fs::read_to_string(project_bamboo_dir(&project).join(".gitignore"))
+            .expect("ignore");
+        assert!(ignore.contains("custom-cache/"));
+        for entry in ["worktree/", "tmp/", "settings.local.json"] {
+            assert_eq!(ignore.lines().filter(|line| *line == entry).count(), 1);
+        }
     }
 
     #[test]
