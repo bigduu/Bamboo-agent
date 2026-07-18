@@ -372,6 +372,20 @@ pub(crate) async fn terminal_event_if_ready(
         return None;
     }
 
+    // Admission must never synthesize an abandoned-startup terminal directly.
+    // The startup guard/runner/durable owner can change after the initial
+    // snapshots above, so a one-shot response here could close a subscriber
+    // while a concurrent `/execute` is legitimately starting the same work.
+    // Keep the transport live and let its periodic reconciler perform the
+    // per-session-lock exact-work CAS before broadcasting any Error.
+    if session.as_ref().and_then(startup_work_id).is_some() {
+        tracing::debug!(
+            "[{}] terminal_event_if_ready -> None (startup work requires locked reconcile) -> LIVE stream",
+            session_id,
+        );
+        return None;
+    }
+
     // Absence of an in-memory runner is not itself proof that a run finished:
     // a newly-created session is persisted before its runner is reserved. In
     // that window a subscriber must stay live for the first token instead of
@@ -468,13 +482,6 @@ pub(super) fn terminal_event_for_sources(
     session: Option<&Session>,
     runner_status: Option<AgentStatus>,
 ) -> AgentEvent {
-    if session.is_some_and(|session| {
-        startup_work_id(session).is_some() && !startup_work_is_active(session)
-    }) {
-        return AgentEvent::Error {
-            message: "Agent execution was not started; please retry this turn".to_string(),
-        };
-    }
     // A startup rejection belongs to the newest durable handoff and must beat
     // an old runner/runtime snapshot from the preceding run.
     if let Some(message) = session.and_then(startup_failure_message) {
@@ -512,15 +519,12 @@ pub(super) fn session_prevents_terminal_event(
     // persistence writes this marker together with the new User message, so a
     // reconnect between POST /chat and POST /execute remains live even if the
     // previous run was cancelled or failed.
-    if startup_work_is_active(session) {
-        return true;
-    }
-
     if startup_work_id(session).is_some() {
-        // The execute handoff (User turn or resume marker) outlived its grace
-        // without a runner. Old suspended/terminal state must not hide this
-        // abandoned work; an in-flight handler was already protected above.
-        return false;
+        // Admission never turns startup ownership into an unlocked synthetic
+        // terminal, even after the grace expires. The live transport's
+        // reconciler revalidates the exact durable work id under the canonical
+        // persistence lock and broadcasts the authoritative Error.
+        return true;
     }
 
     // Durable startup rejection is terminal even when the previous run left a
@@ -787,7 +791,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn terminal_helper_recovers_abandoned_pending_turn() {
+    async fn terminal_helper_defers_abandoned_pending_turn_to_locked_reconcile() {
         let mut session = Session::new("abandoned-turn", "test-model");
         session.add_message(Message::user("never executed"));
         mark_pending_turn(&mut session);
@@ -797,33 +801,46 @@ mod tests {
         session.agent_runtime_state = Some(runtime);
         let (_dir, state) = state_with_session(session).await;
 
-        let event = terminal_event_if_ready(
-            &state,
-            "abandoned-turn",
-            Some(AgentStatus::Error("old run failed".to_string())),
-        )
-        .await
-        .expect("expired pending handoff must become recoverable terminal state");
+        assert!(
+            terminal_event_if_ready(
+                &state,
+                "abandoned-turn",
+                Some(AgentStatus::Error("old run failed".to_string())),
+            )
+            .await
+            .is_none(),
+            "admission must stay live until the durable CAS"
+        );
+
+        let sender = state.get_session_event_sender("abandoned-turn").await;
+        let mut receiver = sender.subscribe();
+        assert!(reconcile_abandoned_startup(&state, "abandoned-turn", &receiver,).await);
         assert!(matches!(
-            event,
-            AgentEvent::Error { message } if message.contains("was not started")
+            receiver.try_recv(),
+            Ok(AgentEvent::Error { message }) if message.contains("was not started")
         ));
     }
 
     #[actix_web::test]
-    async fn abandoned_first_turn_needs_no_old_terminal_evidence() {
+    async fn abandoned_first_turn_waits_for_locked_reconcile() {
         let mut session = Session::new("abandoned-first-turn", "test-model");
         session.add_message(Message::user("never executed"));
         mark_pending_turn(&mut session);
         expire_startup_handoff(&mut session);
         let (_dir, state) = state_with_session(session).await;
 
-        let event = terminal_event_if_ready(&state, "abandoned-first-turn", None)
-            .await
-            .expect("expired first turn is terminal");
+        assert!(
+            terminal_event_if_ready(&state, "abandoned-first-turn", None)
+                .await
+                .is_none(),
+            "admission must not emit an unlocked synthetic terminal"
+        );
+        let sender = state.get_session_event_sender("abandoned-first-turn").await;
+        let mut receiver = sender.subscribe();
+        assert!(reconcile_abandoned_startup(&state, "abandoned-first-turn", &receiver,).await);
         assert!(matches!(
-            event,
-            AgentEvent::Error { message } if message.contains("was not started")
+            receiver.try_recv(),
+            Ok(AgentEvent::Error { message }) if message.contains("was not started")
         ));
     }
 
@@ -847,7 +864,10 @@ mod tests {
         drop(second);
         assert!(terminal_event_if_ready(&state, "slow-startup", None)
             .await
-            .is_some());
+            .is_none());
+        let sender = state.get_session_event_sender("slow-startup").await;
+        let receiver = sender.subscribe();
+        assert!(reconcile_abandoned_startup(&state, "slow-startup", &receiver,).await);
     }
 
     #[actix_web::test]
