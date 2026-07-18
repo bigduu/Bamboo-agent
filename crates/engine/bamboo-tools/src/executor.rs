@@ -1225,6 +1225,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_deny_overrides_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit-deny.txt");
+        let path_str = path.to_str().unwrap();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::WriteFile,
+            path_str,
+            false,
+        ));
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": path_str, "content": "blocked"}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-explicit-deny"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = executor.execute_with_context(&call, ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
+            "explicit deny must beat bypass: {result:?}"
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
     async fn interactive_gate_returns_synthesized_approval_pause() {
         // With an event sink present, a forced-ask rule that yields
         // `ConfirmationRequired` must resolve to the synthesized "awaiting

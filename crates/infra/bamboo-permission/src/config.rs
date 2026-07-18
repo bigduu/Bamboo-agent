@@ -151,7 +151,15 @@ impl PermissionRule {
         };
 
         // Use globset for proper glob matching
-        match_glob_pattern(&self.resource_pattern, &normalized_resource)
+        let normalized_pattern = match perm_type {
+            PermissionType::WriteFile => {
+                canonicalize_path_pattern_for_matching(&self.resource_pattern)
+            }
+            _ => Some(self.resource_pattern.clone()),
+        };
+        normalized_pattern
+            .as_deref()
+            .is_some_and(|pattern| match_glob_pattern(pattern, &normalized_resource))
     }
 }
 
@@ -209,8 +217,55 @@ impl SessionGrant {
             None => return false,
         };
 
-        match_glob_pattern(&self.resource_pattern, &normalized_resource)
+        let normalized_pattern = match perm_type {
+            PermissionType::WriteFile => {
+                canonicalize_path_pattern_for_matching(&self.resource_pattern)
+            }
+            _ => Some(self.resource_pattern.clone()),
+        };
+        normalized_pattern
+            .as_deref()
+            .is_some_and(|pattern| match_glob_pattern(pattern, &normalized_resource))
     }
+}
+
+/// Canonicalize the static prefix of a file matcher without changing its glob
+/// suffix. This makes `/tmp/**` and `/private/tmp/**` the same matcher on macOS
+/// while preserving component boundaries and never widening an invalid rule.
+pub(crate) fn canonicalize_path_pattern_for_matching(pattern: &str) -> Option<String> {
+    let normalized = normalize_path_separators(pattern.trim());
+    if normalized.is_empty() || has_path_traversal(&normalized) {
+        return None;
+    }
+
+    let first_glob = normalized.find(['*', '?', '[', '{']);
+    let Some(first_glob) = first_glob else {
+        // Keep legacy filename-only patterns such as `*.rs`; path-like exact
+        // matchers must be absolute and canonical.
+        return if Path::new(&normalized).is_absolute() {
+            canonicalize_path_for_matching(&normalized)
+        } else {
+            Some(normalized)
+        };
+    };
+
+    // A filename-only glob has no filesystem prefix to canonicalize.
+    let Some(separator) = normalized[..first_glob].rfind('/') else {
+        return Some(normalized);
+    };
+    let prefix = if separator == 0 {
+        "/"
+    } else {
+        &normalized[..separator]
+    };
+    if !Path::new(prefix).is_absolute() {
+        // Legacy relative rules have no workspace identity. Preserve their
+        // exact historical semantics (without widening); traversal was already
+        // rejected above.
+        return Some(normalized);
+    }
+    let canonical_prefix = canonicalize_path_for_matching(prefix)?;
+    Some(format!("{}{}", canonical_prefix, &normalized[separator..]))
 }
 
 /// Canonicalize a resource path before permission matching.
@@ -2163,5 +2218,31 @@ mod integration_tests {
             PermissionType::ExecuteCommand,
             "git status"
         ));
+    }
+
+    #[test]
+    fn file_matchers_canonicalize_static_prefixes_without_widening() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let alias_path = temp.path().join("future.txt");
+        let canonical_path = std::fs::canonicalize(temp.path())
+            .expect("canonical temp")
+            .join("future.txt");
+        let alias = alias_path.to_string_lossy().to_string();
+        let canonical = canonical_path.to_string_lossy().to_string();
+
+        let config = PermissionConfig::new();
+        config.grant_session_permission(PermissionType::WriteFile, alias.clone());
+        assert!(config.is_session_granted(PermissionType::WriteFile, &canonical));
+
+        config.set_ask_rules([format!("Write({alias})")]);
+        assert!(config
+            .requires_forced_confirmation("Write", &serde_json::json!({"file_path": canonical})));
+
+        let traversal = format!("{}/../escape.txt", temp.path().display());
+        let deny = PermissionRule::new(PermissionType::WriteFile, traversal, false);
+        assert!(
+            !deny.matches(PermissionType::WriteFile, &alias),
+            "a traversal matcher must fail closed rather than normalize broader"
+        );
     }
 }
