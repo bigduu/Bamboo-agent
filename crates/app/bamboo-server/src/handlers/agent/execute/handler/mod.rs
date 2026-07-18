@@ -120,6 +120,12 @@ pub async fn handler(
     {
         Ok(outcome) => outcome,
         Err(error) => {
+            fail_pending_startup(
+                &state,
+                &session_id,
+                &format!("execute preparation failed: {error}"),
+            )
+            .await;
             return match error {
                 bamboo_engine::session_app::errors::ExecutePreparationError::NotFound(_) => {
                     tracing::warn!("[{session_id}] Execute session not found");
@@ -211,13 +217,34 @@ pub async fn handler(
         }
 
         bamboo_engine::session_app::types::ExecutePreparationOutcome::ModelRequired => {
+            fail_pending_startup(&state, &session_id, "no model configured").await;
             bad_request_error_response("no model configured for session or provider")
         }
 
         bamboo_engine::session_app::types::ExecutePreparationOutcome::ImageFallbackError(error) => {
+            fail_pending_startup(&state, &session_id, &error).await;
             bad_request_error_response(error)
         }
     }
+}
+
+async fn fail_pending_startup(state: &web::Data<AppState>, session_id: &str, detail: &str) {
+    let Ok(Some(mut session)) = state.storage.load_session(session_id).await else {
+        return;
+    };
+    // Ownership prevents a delayed/retried rejection from poisoning a later
+    // turn, and avoids treating an old runner Error as this turn's outcome.
+    if !crate::handlers::agent::events::mark_startup_failed_if_owned(&mut session, detail) {
+        return;
+    }
+    if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
+        tracing::error!("[{session_id}] failed to persist execute rejection: {error}");
+        return;
+    }
+    state.sessions.insert(
+        session_id.to_string(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
 }
 
 /// Convert a crate's `ExecuteSyncReason` to the handler's `ExecuteSyncReason`.

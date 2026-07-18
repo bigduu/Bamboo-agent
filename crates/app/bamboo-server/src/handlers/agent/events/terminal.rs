@@ -9,6 +9,50 @@ use bamboo_engine::session_app::execute::{
     has_pending_clarification_resume, has_pending_retry_resume,
 };
 
+const PENDING_TURN_ID_KEY: &str = "execute.pending_turn_message_id";
+const PENDING_TURN_GRACE_SECS: i64 = 60;
+
+pub(crate) fn mark_pending_turn(session: &mut Session) {
+    if let Some(message) = session.messages.last() {
+        session
+            .metadata
+            .insert(PENDING_TURN_ID_KEY.to_string(), message.id.clone());
+    }
+    session.set_last_run_status("pending");
+    session.clear_last_run_error();
+}
+
+pub(crate) fn clear_pending_turn(session: &mut Session) {
+    session.metadata.remove(PENDING_TURN_ID_KEY);
+}
+
+pub(crate) fn mark_startup_failed_if_owned(session: &mut Session, detail: &str) -> bool {
+    if !pending_turn_is_owned(session) {
+        return false;
+    }
+    session.set_last_run_status("error");
+    session.set_last_run_error(format!("Agent startup failed: {detail}"));
+    clear_pending_turn(session);
+    true
+}
+
+pub(crate) fn pending_turn_is_owned(session: &Session) -> bool {
+    matches!(session.last_run_status().as_deref(), Some("pending"))
+        && session
+            .metadata
+            .get(PENDING_TURN_ID_KEY)
+            .zip(session.messages.last())
+            .is_some_and(|(owner, message)| owner == &message.id)
+}
+
+fn pending_turn_is_active(session: &Session) -> bool {
+    pending_turn_is_owned(session)
+        && session.messages.last().is_some_and(|message| {
+            chrono::Utc::now().signed_duration_since(message.created_at)
+                <= chrono::Duration::seconds(PENDING_TURN_GRACE_SECS)
+        })
+}
+
 pub(crate) async fn terminal_event_if_ready(
     state: &web::Data<AppState>,
     session_id: &str,
@@ -140,6 +184,13 @@ pub(super) fn terminal_event_for_sources(
     session: Option<&Session>,
     runner_status: Option<AgentStatus>,
 ) -> AgentEvent {
+    if session
+        .is_some_and(|session| pending_turn_is_owned(session) && !pending_turn_is_active(session))
+    {
+        return AgentEvent::Error {
+            message: "Agent execution was not started; please retry this turn".to_string(),
+        };
+    }
     if runner_status.is_some() {
         return terminal_event_for_status(runner_status);
     }
@@ -172,7 +223,7 @@ pub(super) fn session_prevents_terminal_event(
     // persistence writes this marker together with the new User message, so a
     // reconnect between POST /chat and POST /execute remains live even if the
     // previous run was cancelled or failed.
-    if matches!(session.last_run_status().as_deref(), Some("pending")) {
+    if pending_turn_is_active(session) {
         return true;
     }
 
@@ -408,7 +459,7 @@ mod tests {
     async fn terminal_helper_keeps_new_user_after_old_failure_live() {
         let mut session = Session::new("new-user-after-failure", "test-model");
         session.add_message(Message::user("new request"));
-        session.set_last_run_status("pending");
+        mark_pending_turn(&mut session);
         let mut runtime = AgentRuntimeState::new("old-failed-run");
         runtime.status = AgentStatusState::Failed;
         session.agent_runtime_state = Some(runtime);
@@ -420,5 +471,52 @@ mod tests {
                 .is_none(),
             "new pending work must win over the old persisted failure"
         );
+    }
+
+    #[actix_web::test]
+    async fn terminal_helper_recovers_abandoned_pending_turn() {
+        let mut session = Session::new("abandoned-turn", "test-model");
+        session.add_message(Message::user("never executed"));
+        mark_pending_turn(&mut session);
+        session.messages.last_mut().unwrap().created_at =
+            chrono::Utc::now() - chrono::Duration::seconds(PENDING_TURN_GRACE_SECS + 1);
+        let mut runtime = AgentRuntimeState::new("old-failed-run");
+        runtime.status = AgentStatusState::Failed;
+        session.agent_runtime_state = Some(runtime);
+        let (_dir, state) = state_with_session(session).await;
+
+        let event = terminal_event_if_ready(
+            &state,
+            "abandoned-turn",
+            Some(AgentStatus::Error("old run failed".to_string())),
+        )
+        .await
+        .expect("expired pending handoff must become recoverable terminal state");
+        assert!(matches!(
+            event,
+            AgentEvent::Error { message } if message.contains("was not started")
+        ));
+    }
+
+    #[test]
+    fn startup_failure_only_rolls_back_the_owned_turn() {
+        let mut owned = Session::new("owned", "test-model");
+        owned.add_message(Message::user("start me"));
+        mark_pending_turn(&mut owned);
+        assert!(mark_startup_failed_if_owned(
+            &mut owned,
+            "provider rejected"
+        ));
+        assert_eq!(owned.last_run_status().as_deref(), Some("error"));
+        assert!(owned
+            .last_run_error()
+            .is_some_and(|error| error.contains("provider rejected")));
+
+        let mut stale = Session::new("stale", "test-model");
+        stale.add_message(Message::user("first"));
+        mark_pending_turn(&mut stale);
+        stale.add_message(Message::user("newer turn"));
+        assert!(!mark_startup_failed_if_owned(&mut stale, "late rejection"));
+        assert_eq!(stale.last_run_status().as_deref(), Some("pending"));
     }
 }

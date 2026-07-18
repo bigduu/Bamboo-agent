@@ -53,8 +53,7 @@ pub(super) async fn append_user_message(
     // before POST /execute reserves a Pending runner; without this marker, the
     // previous run's Cancelled/Failed runtime snapshot can be mistaken for the
     // terminal state of this new request.
-    session.set_last_run_status("pending");
-    session.clear_last_run_error();
+    crate::handlers::agent::events::mark_pending_turn(session);
 
     Ok(())
 }

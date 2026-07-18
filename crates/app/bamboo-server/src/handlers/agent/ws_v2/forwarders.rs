@@ -228,8 +228,22 @@ pub(crate) fn spawn_agent_forwarder(
             // every later child event. Hold the channel open and emit the
             // `terminal` control only once no running child is left.
             let mut awaiting_children = false;
+            let startup_reconcile = tokio::time::sleep(Duration::from_secs(61));
+            tokio::pin!(startup_reconcile);
             loop {
-                match receiver.recv().await {
+                let received = tokio::select! {
+                    received = receiver.recv() => received,
+                    _ = &mut startup_reconcile => {
+                        if reconcile_abandoned_startup(&state, &session_id, &out, encoding, &ch, &seq).await {
+                            return;
+                        }
+                        // A real run won the race; this one-shot guard is no
+                        // longer needed for this forwarder.
+                        startup_reconcile.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+                        continue;
+                    }
+                };
+                match received {
                     Ok(event) => {
                         let is_terminal = is_terminal_event(&event);
                         let is_child_completed =
@@ -305,12 +319,20 @@ pub(crate) fn spawn_agent_forwarder(
         // See the fast-path comment: keep the channel open after the parent
         // terminal while child sub-agents still run.
         let mut awaiting_children = false;
+        let startup_reconcile = tokio::time::sleep(Duration::from_secs(61));
+        tokio::pin!(startup_reconcile);
 
         loop {
             let sleep_until = flush_deadline
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
 
             tokio::select! {
+                _ = &mut startup_reconcile => {
+                    if reconcile_abandoned_startup(&state, &session_id, &out, encoding, &ch, &seq).await {
+                        return;
+                    }
+                    startup_reconcile.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+                }
                 _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                     if let Some(pending) = coalescer.take_pending() {
                         if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
@@ -409,6 +431,35 @@ pub(crate) fn spawn_agent_forwarder(
             }
         }
     })
+}
+
+async fn reconcile_abandoned_startup(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+) -> bool {
+    let runner_status = state
+        .agent_runners
+        .read()
+        .await
+        .get(session_id)
+        .map(|runner| runner.status.clone());
+    let Some(event) = terminal_event_if_ready(state, session_id, runner_status).await else {
+        return false;
+    };
+    if !emit_agent_event(out, encoding, ch, seq, event).await {
+        return true;
+    }
+    let _ = send_env(
+        out,
+        encoding,
+        ServerEnvelope::control(ch, seq.next(), terminal_control("complete")),
+    )
+    .await;
+    true
 }
 
 /// Spawn a one-shot `agent.{sid}` replay for a session that was already
