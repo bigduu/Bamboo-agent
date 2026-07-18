@@ -1042,6 +1042,7 @@ dependencies = [
  "base64",
  "chrono",
  "dirs",
+ "futures",
  "hex",
  "rand 0.10.2",
  "regex",

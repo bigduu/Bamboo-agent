@@ -28,6 +28,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+futures = "0.3"
 
 [features]
 test-utils = []
