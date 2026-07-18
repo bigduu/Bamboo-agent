@@ -265,7 +265,12 @@ pub(crate) fn canonicalize_path_pattern_for_matching(pattern: &str) -> Option<St
         return Some(normalized);
     }
     let canonical_prefix = canonicalize_path_for_matching(prefix)?;
-    Some(format!("{}{}", canonical_prefix, &normalized[separator..]))
+    let suffix = &normalized[separator..];
+    if canonical_prefix.ends_with('/') && suffix.starts_with('/') {
+        Some(format!("{}{}", canonical_prefix, &suffix[1..]))
+    } else {
+        Some(format!("{canonical_prefix}{suffix}"))
+    }
 }
 
 /// Canonicalize a resource path before permission matching.
@@ -2243,6 +2248,11 @@ mod integration_tests {
         assert!(
             !deny.matches(PermissionType::WriteFile, &alias),
             "a traversal matcher must fail closed rather than normalize broader"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            canonicalize_path_pattern_for_matching("/**").as_deref(),
+            Some("/**")
         );
     }
 }
