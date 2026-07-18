@@ -264,6 +264,40 @@ async fn next_sys_keepalive(conn: &mut WsConn) -> Value {
     }
 }
 
+/// Receive an application-level pong and assert its negotiated WS frame kind.
+/// Interleaved protocol heartbeats and legacy `sys` keepalives are ignored.
+async fn next_app_pong(conn: &mut WsConn, msgpack: bool) -> Value {
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, conn.next())
+            .await
+            .expect("application pong did not arrive before timeout")
+            .expect("connection closed while waiting for application pong")
+            .expect("ws protocol error");
+        let value: Value = match frame {
+            ws::Frame::Text(bytes) if !msgpack => {
+                serde_json::from_slice(&bytes).expect("pong is JSON")
+            }
+            ws::Frame::Binary(bytes) if msgpack => {
+                rmp_serde::from_slice(&bytes).expect("pong is msgpack")
+            }
+            ws::Frame::Text(bytes) => panic!(
+                "msgpack pong must be BINARY, got text: {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+            ws::Frame::Binary(_) => panic!("JSON pong must be TEXT"),
+            ws::Frame::Ping(_) | ws::Frame::Pong(_) => continue,
+            ws::Frame::Close(_) => panic!("connection closed before application pong"),
+            other => panic!("unexpected ws frame: {other:?}"),
+        };
+        if value["ch"] == "sys" {
+            continue;
+        }
+        return value;
+    }
+}
+
 /// Assert the connection is closed (or yields no more data) within [`RECV_TIMEOUT`]
 /// — i.e. a Close frame or stream end, and never another text envelope.
 async fn expect_closed(conn: &mut WsConn) {
@@ -894,6 +928,37 @@ async fn sys_keepalive_not_sent_to_unauthorized_connection() {
     // no sys keepalive may be served before authorization, and the deadline
     // (1.5s here) spans several ping ticks (200ms), so a leak would surface.
     expect_closed(&mut conn).await;
+
+    server.stop().await;
+}
+
+// ── Scenario 7: application Ping/Pong ACK (#588) ───────────────────────────
+
+/// The default JSON transport accepts a browser-visible ping and returns the
+/// exact top-level pong as a TEXT frame (no channel envelope fields).
+#[actix_web::test]
+async fn json_ping_returns_top_level_text_pong() {
+    let server = TestServer::start(|_| {}).await;
+    let mut conn = connect_local(&server).await;
+
+    send_json(&mut conn, json!({"type": "ping"})).await;
+    let pong = next_app_pong(&mut conn, false).await;
+    assert_eq!(pong, json!({"type": "pong"}));
+
+    server.stop().await;
+}
+
+/// A negotiated MessagePack connection accepts a binary named-map ping and
+/// returns the same top-level pong as a BINARY named map.
+#[actix_web::test]
+async fn msgpack_ping_returns_top_level_binary_pong() {
+    let server = TestServer::start(|_| {}).await;
+    let (mut conn, subprotocol) = connect_local_msgpack(&server).await;
+    assert_eq!(subprotocol.as_deref(), Some("bamboo.v2.msgpack"));
+
+    send_msgpack(&mut conn, json!({"type": "ping"})).await;
+    let pong = next_app_pong(&mut conn, true).await;
+    assert_eq!(pong, json!({"type": "pong"}));
 
     server.stop().await;
 }
