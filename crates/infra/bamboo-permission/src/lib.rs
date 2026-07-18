@@ -34,6 +34,7 @@ pub mod bash_security;
 pub mod checker;
 pub mod config;
 pub mod hierarchy;
+pub mod policy;
 pub mod rule_parser;
 pub mod storage;
 pub mod tool_permissions;
@@ -51,6 +52,10 @@ pub use config::{
     SerializablePermissionConfig, SessionGrant,
 };
 pub use hierarchy::PermissionRuleSet;
+pub use policy::{
+    PermissionDecision, PermissionDecisionKind, PermissionMatcher, PermissionMatcherKind,
+    PermissionReasonCode, PermissionRequest,
+};
 pub use rule_parser::ParsedRule;
 pub use storage::PermissionStorage;
 pub use tool_permissions::{check_permissions, check_tool_rules, is_delete_command};

@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 
+use crate::config::{canonicalize_path_for_matching, canonicalize_path_pattern_for_matching};
+
 use crate::config::match_glob_pattern;
 
 /// Match a pattern against a target string with support for prefix/suffix/infix wildcards.
@@ -200,7 +202,24 @@ impl ParsedRule {
             _ => None,
         };
 
+        let is_path_tool = matches!(
+            tool_name_lower.as_str(),
+            "write" | "edit" | "read" | "apply_patch" | "notebookedit"
+        );
         match target {
+            Some(target_str) if is_path_tool => {
+                let normalized_pattern = canonicalize_path_pattern_for_matching(pattern);
+                let normalized_target = if std::path::Path::new(target_str).is_absolute() {
+                    canonicalize_path_for_matching(target_str)
+                } else if !target_str.split(['/', '\\']).any(|part| part == "..") {
+                    Some(target_str.to_string())
+                } else {
+                    None
+                };
+                normalized_pattern
+                    .zip(normalized_target)
+                    .is_some_and(|(pattern, target)| match_tool_pattern(&pattern, &target))
+            }
             Some(target_str) => match_tool_pattern(pattern, target_str),
             None => {
                 // Fallback: match against stringified args

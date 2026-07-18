@@ -548,8 +548,10 @@ impl Agent {
             submit_pending_response(self, input).await?;
 
         if let Some(checker) = &self.permission_checker {
-            for (perm_type, resource) in &permission_grants {
-                checker.grant_session_permission(*perm_type, resource.clone());
+            if let Some(request_id) = session.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY) {
+                for (perm_type, resource) in &permission_grants {
+                    checker.grant_once(&session.id, request_id, *perm_type, resource.clone());
+                }
             }
         }
 
@@ -977,14 +979,14 @@ mod approval_and_session_tests {
             .is_none());
     }
 
-    /// A stub `PermissionChecker` that only records `grant_session_permission`
+    /// A stub `PermissionChecker` that records one-shot grants
     /// calls, so the test can assert `Agent::answer` applies the permission
     /// grants `submit_pending_response` extracts from an approved permission
     /// prompt — mirroring what the HTTP `/respond` handler does explicitly for
     /// `state.permission_checker`.
     #[derive(Default)]
     struct RecordingPermissionChecker {
-        grants: StdMutex<Vec<(PermissionType, String)>>,
+        grants: StdMutex<Vec<(String, String, PermissionType, String)>>,
     }
 
     #[async_trait]
@@ -1001,7 +1003,22 @@ mod approval_and_session_tests {
         }
 
         fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
-            self.grants.lock().unwrap().push((perm_type, resource));
+            panic!("legacy unscoped grant used: {perm_type:?} {resource}");
+        }
+
+        fn grant_once(
+            &self,
+            session_id: &str,
+            request_id: &str,
+            perm_type: PermissionType,
+            resource: String,
+        ) {
+            self.grants.lock().unwrap().push((
+                session_id.to_string(),
+                request_id.to_string(),
+                perm_type,
+                resource,
+            ));
         }
 
         fn set_permission_mode(&self, _mode: PermissionMode) {}
@@ -1070,7 +1087,12 @@ mod approval_and_session_tests {
         let recorded = checker.grants.lock().unwrap();
         assert_eq!(
             *recorded,
-            vec![(PermissionType::WriteFile, "/tmp/example.txt".to_string())]
+            vec![(
+                "sess-permission".to_string(),
+                "call-perm-1".to_string(),
+                PermissionType::WriteFile,
+                "/tmp/example.txt".to_string()
+            )]
         );
     }
 

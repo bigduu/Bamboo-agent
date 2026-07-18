@@ -362,9 +362,14 @@ impl Responder for EngineResponder {
         // permission grant so the resumed re-execution of the gated tool
         // passes the check without re-prompting.
         for (perm_type, resource) in &permission_grants {
-            self.ctx
-                .permission_checker
-                .grant_session_permission(*perm_type, resource.clone());
+            if let Some(request_id) = session.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY) {
+                self.ctx.permission_checker.grant_once(
+                    session_id,
+                    request_id,
+                    *perm_type,
+                    resource.clone(),
+                );
+            }
         }
 
         // Subscribe BEFORE triggering resume so the `ExecutionStarted` event

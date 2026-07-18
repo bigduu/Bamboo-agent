@@ -64,6 +64,18 @@ impl PermissionType {
     }
 }
 
+fn is_path_permission(perm_type: PermissionType) -> bool {
+    matches!(
+        perm_type,
+        PermissionType::WriteFile | PermissionType::DeleteOperation
+    )
+}
+
+fn should_normalize_path(perm_type: PermissionType, resource: &str) -> bool {
+    is_path_permission(perm_type)
+        && (perm_type == PermissionType::WriteFile || Path::new(resource).is_absolute())
+}
+
 /// Risk level for permission types
 ///
 /// Ordered `Low < Medium < High` (derived from declaration order), so a risk
@@ -140,9 +152,10 @@ impl PermissionRule {
 
         // For file-related permissions, normalize the path
         // For other permissions (HTTP, commands, etc.), match directly
-        let normalized_resource = match perm_type {
-            PermissionType::WriteFile => canonicalize_path_for_matching(resource),
-            _ => Some(resource.to_string()),
+        let normalized_resource = if should_normalize_path(perm_type, resource) {
+            canonicalize_path_for_matching(resource)
+        } else {
+            Some(resource.to_string())
         };
 
         let normalized_resource = match normalized_resource {
@@ -151,7 +164,14 @@ impl PermissionRule {
         };
 
         // Use globset for proper glob matching
-        match_glob_pattern(&self.resource_pattern, &normalized_resource)
+        let normalized_pattern = if should_normalize_path(perm_type, &self.resource_pattern) {
+            canonicalize_path_pattern_for_matching(&self.resource_pattern)
+        } else {
+            Some(self.resource_pattern.clone())
+        };
+        normalized_pattern
+            .as_deref()
+            .is_some_and(|pattern| match_glob_pattern(pattern, &normalized_resource))
     }
 }
 
@@ -199,9 +219,10 @@ impl SessionGrant {
 
         // For file-related permissions, normalize the path
         // For other permissions (HTTP, commands, etc.), match directly
-        let normalized_resource = match perm_type {
-            PermissionType::WriteFile => canonicalize_path_for_matching(resource),
-            _ => Some(resource.to_string()),
+        let normalized_resource = if should_normalize_path(perm_type, resource) {
+            canonicalize_path_for_matching(resource)
+        } else {
+            Some(resource.to_string())
         };
 
         let normalized_resource = match normalized_resource {
@@ -209,7 +230,58 @@ impl SessionGrant {
             None => return false,
         };
 
-        match_glob_pattern(&self.resource_pattern, &normalized_resource)
+        let normalized_pattern = if should_normalize_path(perm_type, &self.resource_pattern) {
+            canonicalize_path_pattern_for_matching(&self.resource_pattern)
+        } else {
+            Some(self.resource_pattern.clone())
+        };
+        normalized_pattern
+            .as_deref()
+            .is_some_and(|pattern| match_glob_pattern(pattern, &normalized_resource))
+    }
+}
+
+/// Canonicalize the static prefix of a file matcher without changing its glob
+/// suffix. This makes `/tmp/**` and `/private/tmp/**` the same matcher on macOS
+/// while preserving component boundaries and never widening an invalid rule.
+pub(crate) fn canonicalize_path_pattern_for_matching(pattern: &str) -> Option<String> {
+    let normalized = normalize_path_separators(pattern.trim());
+    if normalized.is_empty() || has_path_traversal(&normalized) {
+        return None;
+    }
+
+    let first_glob = normalized.find(['*', '?', '[', '{']);
+    let Some(first_glob) = first_glob else {
+        // Keep legacy filename-only patterns such as `*.rs`; path-like exact
+        // matchers must be absolute and canonical.
+        return if Path::new(&normalized).is_absolute() {
+            canonicalize_path_for_matching(&normalized)
+        } else {
+            Some(normalized)
+        };
+    };
+
+    // A filename-only glob has no filesystem prefix to canonicalize.
+    let Some(separator) = normalized[..first_glob].rfind('/') else {
+        return Some(normalized);
+    };
+    let prefix = if separator == 0 {
+        "/"
+    } else {
+        &normalized[..separator]
+    };
+    if !Path::new(prefix).is_absolute() {
+        // Legacy relative rules have no workspace identity. Preserve their
+        // exact historical semantics (without widening); traversal was already
+        // rejected above.
+        return Some(normalized);
+    }
+    let canonical_prefix = canonicalize_path_for_matching(prefix)?;
+    let suffix = &normalized[separator..];
+    if canonical_prefix.ends_with('/') && suffix.starts_with('/') {
+        Some(format!("{}{}", canonical_prefix, &suffix[1..]))
+    } else {
+        Some(format!("{canonical_prefix}{suffix}"))
     }
 }
 
@@ -599,6 +671,10 @@ pub struct PermissionConfig {
     /// used to resolve a *match*, however, because matching is glob-based — see
     /// [`PermissionConfig::is_session_granted`].
     session_grants: DashMap<PermissionType, HashMap<String, SessionGrant>>,
+    /// Grants keyed by stable session id. New interactive approvals use this
+    /// map; the unscoped map above remains only for API compatibility.
+    scoped_session_grants: DashMap<String, DashMap<PermissionType, HashMap<String, SessionGrant>>>,
+    one_shot_grants: DashMap<(String, String), Vec<(PermissionType, String)>>,
     /// Default session grant duration (default: 30 minutes)
     session_grant_duration: Duration,
     /// Whether permission checks are enabled
@@ -630,6 +706,8 @@ impl PermissionConfig {
         Self {
             whitelist: DashMap::new(),
             session_grants: DashMap::new(),
+            scoped_session_grants: DashMap::new(),
+            one_shot_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(30 * 60), // 30 minutes
             enabled: AtomicBool::new(true),
             mode: RwLock::new(PermissionMode::Default),
@@ -643,6 +721,8 @@ impl PermissionConfig {
         Self {
             whitelist: DashMap::new(),
             session_grants: DashMap::new(),
+            scoped_session_grants: DashMap::new(),
+            one_shot_grants: DashMap::new(),
             session_grant_duration: session_duration,
             enabled: AtomicBool::new(enabled),
             mode: RwLock::new(PermissionMode::Default),
@@ -753,6 +833,23 @@ impl PermissionConfig {
             .any(|rule| rule.matches_tool_call(tool_name, args))
     }
 
+    /// Whether the forced confirmation came from Bamboo's non-configurable
+    /// hard-dangerous backstop rather than a user configured ask rule.
+    pub fn is_hard_dangerous(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        if tool_name.eq_ignore_ascii_case("js_repl") {
+            return true;
+        }
+        tool_name.eq_ignore_ascii_case("Bash")
+            && args
+                .get("command")
+                .and_then(|value| value.as_str())
+                .is_some_and(|command| {
+                    crate::bash_security::analyze_command(command).verdict
+                        == crate::bash_security::BashVerdict::Deny
+                        || crate::bash_security::super_dangerous_reason(command).is_some()
+                })
+    }
+
     /// Get the session grant duration
     pub fn session_grant_duration(&self) -> Duration {
         self.session_grant_duration
@@ -832,9 +929,110 @@ impl PermissionConfig {
         false
     }
 
+    pub fn grant_scoped_session_permission(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource_pattern: impl Into<String>,
+    ) {
+        let grant = SessionGrant::new(resource_pattern, self.session_grant_duration);
+        let pattern = grant.resource_pattern.clone();
+        let session = self
+            .scoped_session_grants
+            .entry(session_id.to_string())
+            .or_default();
+        let mut grants = session.entry(perm_type).or_default();
+        grants.retain(|_, grant| !grant.is_expired());
+        grants.insert(pattern, grant);
+    }
+
+    pub fn is_scoped_session_granted(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        self.scoped_session_grants
+            .get(session_id)
+            .and_then(|session| session.get(&perm_type).map(|grants| grants.clone()))
+            .is_some_and(|grants| {
+                grants
+                    .values()
+                    .any(|grant| !grant.is_expired() && grant.matches(perm_type, resource))
+            })
+    }
+
+    /// Consume a one-shot grant bound to one session. Legacy `Approve` maps to
+    /// this path and therefore authorizes only the parked re-execution.
+    pub fn consume_scoped_session_grant(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        let Some(session) = self.scoped_session_grants.get(session_id) else {
+            return false;
+        };
+        let Some(mut grants) = session.get_mut(&perm_type) else {
+            return false;
+        };
+        let matched = grants.iter().find_map(|(pattern, grant)| {
+            (!grant.is_expired() && grant.matches(perm_type, resource)).then(|| pattern.clone())
+        });
+        matched.is_some_and(|pattern| grants.remove(&pattern).is_some())
+    }
+
+    pub fn grant_once(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        perm_type: PermissionType,
+        resource: String,
+    ) {
+        let mut grants = self
+            .one_shot_grants
+            .entry((session_id.to_string(), request_id.to_string()))
+            .or_default();
+        if !grants
+            .iter()
+            .any(|grant| grant.0 == perm_type && grant.1 == resource)
+        {
+            grants.push((perm_type, resource));
+        }
+    }
+
+    pub fn consume_once(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        let key = (session_id.to_string(), request_id.to_string());
+        let Some(mut grants) = self.one_shot_grants.get_mut(&key) else {
+            return false;
+        };
+        let Some(index) = grants
+            .iter()
+            .position(|grant| grant.0 == perm_type && grant.1 == resource)
+        else {
+            return false;
+        };
+        grants.swap_remove(index);
+        let empty = grants.is_empty();
+        drop(grants);
+        if empty {
+            self.one_shot_grants
+                .remove_if(&key, |_, grants| grants.is_empty());
+        }
+        true
+    }
+
     /// Clear all session grants
     pub fn clear_session_grants(&self) {
         self.session_grants.clear();
+        self.scoped_session_grants.clear();
+        self.one_shot_grants.clear();
     }
 
     /// Clean up expired session grants.
@@ -922,6 +1120,8 @@ impl PermissionConfig {
         Self {
             whitelist,
             session_grants: DashMap::new(),
+            scoped_session_grants: DashMap::new(),
+            one_shot_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(config.session_grant_duration_secs),
             enabled: AtomicBool::new(config.enabled),
             mode: RwLock::new(mode),
@@ -1893,6 +2093,189 @@ mod integration_tests {
         assert_eq!(
             restored.ask_rule_patterns(),
             vec!["Bash(rm -rf *)".to_string(), "Read".to_string()]
+        );
+    }
+
+    #[test]
+    fn scoped_session_grants_do_not_leak_between_sessions() {
+        let config = PermissionConfig::new();
+        config.grant_scoped_session_permission(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git status",
+        );
+        assert!(config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "session-b",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+        assert!(config.consume_scoped_session_grant(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+        assert!(!config.consume_scoped_session_grant(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+
+        config.grant_once(
+            "session-a",
+            "call-1",
+            PermissionType::ExecuteCommand,
+            "git status".into(),
+        );
+        assert!(!config.consume_once(
+            "session-b",
+            "call-1",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+        assert!(!config.consume_once(
+            "session-a",
+            "call-2",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+
+        config.grant_once(
+            "session-a",
+            "multi",
+            PermissionType::WriteFile,
+            "/tmp/a".into(),
+        );
+        config.grant_once(
+            "session-a",
+            "multi",
+            PermissionType::ExecuteCommand,
+            "cargo test".into(),
+        );
+        assert!(!config.consume_once(
+            "session-a",
+            "multi",
+            PermissionType::WriteFile,
+            "/tmp/not-a"
+        ));
+        assert!(config.consume_once(
+            "session-a",
+            "multi",
+            PermissionType::ExecuteCommand,
+            "cargo test"
+        ));
+        assert!(config.consume_once("session-a", "multi", PermissionType::WriteFile, "/tmp/a"));
+
+        config.grant_once(
+            "session-a",
+            "duplicate",
+            PermissionType::ExecuteCommand,
+            "cargo test".into(),
+        );
+        config.grant_once(
+            "session-a",
+            "duplicate",
+            PermissionType::ExecuteCommand,
+            "cargo test".into(),
+        );
+        assert!(config.consume_once(
+            "session-a",
+            "duplicate",
+            PermissionType::ExecuteCommand,
+            "cargo test"
+        ));
+        assert!(!config.consume_once(
+            "session-a",
+            "duplicate",
+            PermissionType::ExecuteCommand,
+            "cargo test"
+        ));
+
+        let config = std::sync::Arc::new(config);
+        config.grant_once(
+            "session-a",
+            "concurrent",
+            PermissionType::ExecuteCommand,
+            "cargo test".into(),
+        );
+        let successes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let config = config.clone();
+                    scope.spawn(move || {
+                        config.consume_once(
+                            "session-a",
+                            "concurrent",
+                            PermissionType::ExecuteCommand,
+                            "cargo test",
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("consumer"))
+                .filter(|consumed| *consumed)
+                .count()
+        });
+        assert_eq!(successes, 1, "a one-shot grant must be consumed once");
+        assert!(config.consume_once(
+            "session-a",
+            "call-1",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+        assert!(!config.consume_once(
+            "session-a",
+            "call-1",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+    }
+
+    #[test]
+    fn file_matchers_canonicalize_static_prefixes_without_widening() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let alias_path = temp.path().join("future.txt");
+        let canonical_path = std::fs::canonicalize(temp.path())
+            .expect("canonical temp")
+            .join("future.txt");
+        let alias = alias_path.to_string_lossy().to_string();
+        let canonical = canonical_path.to_string_lossy().to_string();
+
+        let config = PermissionConfig::new();
+        config.grant_session_permission(PermissionType::WriteFile, alias.clone());
+        assert!(config.is_session_granted(PermissionType::WriteFile, &canonical));
+
+        config.grant_session_permission(PermissionType::DeleteOperation, alias.clone());
+        assert!(config.is_session_granted(PermissionType::DeleteOperation, &canonical));
+
+        let delete_deny =
+            PermissionRule::new(PermissionType::DeleteOperation, alias.clone(), false);
+        assert!(delete_deny.matches(PermissionType::DeleteOperation, &canonical));
+
+        let command_deny =
+            PermissionRule::new(PermissionType::DeleteOperation, "rm ./relative-file", false);
+        assert!(command_deny.matches(PermissionType::DeleteOperation, "rm ./relative-file"));
+
+        config.set_ask_rules([format!("Write({alias})")]);
+        assert!(config
+            .requires_forced_confirmation("Write", &serde_json::json!({"file_path": canonical})));
+
+        let traversal = format!("{}/../escape.txt", temp.path().display());
+        let deny = PermissionRule::new(PermissionType::WriteFile, traversal, false);
+        assert!(
+            !deny.matches(PermissionType::WriteFile, &alias),
+            "a traversal matcher must fail closed rather than normalize broader"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            canonicalize_path_pattern_for_matching("/**").as_deref(),
+            Some("/**")
         );
     }
 }

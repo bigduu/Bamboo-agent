@@ -377,14 +377,44 @@ impl ToolExecutor for BuiltinToolExecutor {
             // mode (scoped per-session via its runtime state).
             let force_ask = permission_checker.requires_forced_confirmation(&tool_name, &args);
             for context in contexts {
+                // Explicit deny is a non-overridable policy outcome. Evaluate it
+                // before forced confirmation, remembered grants, and bypass.
+                if permission_checker
+                    .permission_config()
+                    .is_some_and(|config| {
+                        config.is_whitelist_allowed(context.permission_type, &context.resource)
+                            == Some(false)
+                    })
+                {
+                    return Err(ToolError::Execution(format!(
+                        "Permission denied by explicit policy for: {}",
+                        context.resource
+                    )));
+                }
+                if ctx.session_id.is_some_and(|session_id| {
+                    permission_checker.consume_once(
+                        session_id,
+                        &call.id,
+                        context.permission_type,
+                        &context.resource,
+                    )
+                }) {
+                    continue;
+                }
                 if ctx.bypass_permissions && !force_ask {
                     continue;
                 }
                 let resource = context.resource.clone();
+                let operation_summary = context.operation_description.clone();
+                let risk_level = context.risk_level();
                 // Forced confirmations route through `check_or_request_forced`
                 // so the active mode/bypass cannot suppress the prompt.
                 let decision = if force_ask {
                     permission_checker.check_or_request_forced(context).await
+                } else if let Some(session_id) = ctx.session_id {
+                    permission_checker
+                        .check_or_request_for_session(session_id, context)
+                        .await
                 } else {
                     permission_checker.check_or_request(context).await
                 };
@@ -451,6 +481,39 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 permission_type.description(),
                                 resource
                             );
+                            let effective_mode = permission_checker
+                                .permission_config()
+                                .map(|config| config.mode())
+                                .unwrap_or(bamboo_config::settings::PermissionMode::Default);
+                            let permission_request = crate::permission::PermissionRequest {
+                                request_id: call.id.clone(),
+                                session_id: ctx.session_id.unwrap_or_default().to_string(),
+                                workspace_path: None,
+                                tool_name: tool_name.clone(),
+                                permission_type,
+                                resource: resource.clone(),
+                                operation_summary,
+                                risk_level,
+                                reason_code: if permission_checker.permission_config().is_some_and(
+                                    |config| config.is_hard_dangerous(&tool_name, &args),
+                                ) {
+                                    crate::permission::PermissionReasonCode::HardDangerous
+                                } else if force_ask {
+                                    crate::permission::PermissionReasonCode::ConfiguredAlwaysAsk
+                                } else {
+                                    crate::permission::PermissionReasonCode::RiskThreshold
+                                },
+                                effective_mode,
+                                bypass_requested: ctx.bypass_permissions,
+                                policy_revision: 0,
+                                allowed_decisions:
+                                    crate::permission::PermissionRequest::migration_decisions(),
+                                suggested_matchers: vec![crate::permission::PermissionMatcher {
+                                    id: "exact_resource".to_string(),
+                                    kind: crate::permission::PermissionMatcherKind::ExactResource,
+                                    value: resource.clone(),
+                                }],
+                            };
                             let payload = serde_json::json!({
                                 "status": "awaiting_permission_approval",
                                 "question": question,
@@ -458,6 +521,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 "resource": resource,
                                 "options": ["Approve", "Deny"],
                                 "allow_custom": false,
+                                "permission_request": permission_request,
                             });
                             // Permission-gate synthesized question stays on
                             // the Completed→sniff path for now (a later Phase B
@@ -1161,6 +1225,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_deny_overrides_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit-deny.txt");
+        let path_str = path.to_str().unwrap();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::WriteFile,
+            path_str,
+            false,
+        ));
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": path_str, "content": "blocked"}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-explicit-deny"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = executor.execute_with_context(&call, ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
+            "explicit deny must beat bypass: {result:?}"
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_delete_deny_overrides_bypass() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::DeleteOperation,
+            "rm child-to-preserve",
+            false,
+        ));
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
+        let call = make_tool_call("Bash", json!({"command": "rm child-to-preserve"}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-explicit-delete-deny"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = executor.execute_with_context(&call, ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
+            "explicit delete deny must beat bypass: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn interactive_gate_returns_synthesized_approval_pause() {
         // With an event sink present, a forced-ask rule that yields
         // `ConfirmationRequired` must resolve to the synthesized "awaiting
@@ -1201,6 +1334,16 @@ mod tests {
             "interactive gate must return the request_permissions pause result"
         );
         assert!(result.result.contains("awaiting_permission_approval"));
+        let payload: serde_json::Value = serde_json::from_str(&result.result).expect("payload");
+        let request = &payload["permission_request"];
+        assert_eq!(request["request_id"], call.id);
+        assert_eq!(request["session_id"], "s-interactive");
+        assert_eq!(request["reason_code"], "configured_always_ask");
+        assert_eq!(
+            request["allowed_decisions"],
+            json!(["allow_once", "deny_once"])
+        );
+        assert_eq!(payload["options"], json!(["Approve", "Deny"]));
         assert!(fs::metadata("/etc/gated.conf").await.is_err());
 
         let ev = rx.recv().await.expect("approval event should be emitted");

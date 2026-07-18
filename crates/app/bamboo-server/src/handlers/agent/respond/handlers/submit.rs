@@ -34,7 +34,7 @@ pub async fn submit_response(
         reasoning_effort: req.reasoning_effort,
     };
 
-    let (_session, user_response, plan_mode_transition, permission_grants) =
+    let (session, user_response, plan_mode_transition, permission_grants) =
         match bamboo_engine::session_app::respond::submit_pending_response(state.as_ref(), input)
             .await
         {
@@ -73,9 +73,17 @@ pub async fn submit_response(
     // prompting again. `state.permission_checker` shares the same PermissionConfig
     // the tool executor checks against.
     for (perm_type, resource) in &permission_grants {
-        state
-            .permission_checker
-            .grant_session_permission(*perm_type, resource.clone());
+        if let Some(request_id) = session
+            .metadata
+            .get(bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+        {
+            state.permission_checker.grant_once(
+                &session_id,
+                request_id,
+                *perm_type,
+                resource.clone(),
+            );
+        }
         tracing::info!(
             "[{}] Granted session permission {:?} for: {}",
             session_id,
@@ -128,7 +136,7 @@ pub async fn submit_response(
     let resume_config = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
         &config_snapshot,
         &state.provider_registry,
-        &_session,
+        &session,
         None,
     );
 
