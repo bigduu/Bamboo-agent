@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandType {
+    /// Markdown commands and stored prompt presets.
+    Prompt,
     /// Workflow commands from markdown files.
     Workflow,
     /// Skill commands defined in the skill system.
@@ -13,7 +15,7 @@ pub enum CommandType {
 }
 
 /// Represents a unified command item from workflows, skills, and MCP tools.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct CommandItem {
     pub id: String,
     pub name: String,
@@ -26,6 +28,20 @@ pub struct CommandItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListCommandsQuery {
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GetCommandQuery {
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 /// Response structure for listing all available commands.
@@ -43,6 +59,9 @@ mod tests {
     fn test_command_type_serialization() {
         let workflow = CommandType::Workflow;
         assert_eq!(serde_json::to_string(&workflow).unwrap(), "\"workflow\"");
+
+        let prompt = CommandType::Prompt;
+        assert_eq!(serde_json::to_string(&prompt).unwrap(), "\"prompt\"");
 
         let skill = CommandType::Skill;
         assert_eq!(serde_json::to_string(&skill).unwrap(), "\"skill\"");

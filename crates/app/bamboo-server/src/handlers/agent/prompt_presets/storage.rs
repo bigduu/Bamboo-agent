@@ -30,6 +30,12 @@ pub(crate) async fn load_store(path: &Path) -> Result<PromptPresetStore, AppErro
     Ok(store)
 }
 
+pub(crate) async fn load_stored_presets(
+    app_data_dir: &Path,
+) -> Result<Vec<StoredPromptPreset>, AppError> {
+    Ok(load_store(&store_file_path(app_data_dir)).await?.prompts)
+}
+
 /// # Non-atomic write (known, deferred gap)
 ///
 /// This writes `path` in place (`fs::write`), so a hard kill mid-write can

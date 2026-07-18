@@ -82,6 +82,26 @@ pub fn workflows_dir() -> PathBuf {
     bamboo_dir().join("workflows")
 }
 
+/// Get the global markdown slash-command directory (`{bamboo_dir}/commands`).
+pub fn commands_dir() -> PathBuf {
+    commands_dir_in(&bamboo_dir())
+}
+
+/// Resolve a commands directory below an explicit Bamboo data directory.
+pub fn commands_dir_in(bamboo_data_dir: &Path) -> PathBuf {
+    bamboo_data_dir.join("commands")
+}
+
+/// Get the project-local Bamboo configuration directory.
+pub fn project_bamboo_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".bamboo")
+}
+
+/// Get the project-local markdown slash-command directory.
+pub fn project_commands_dir(project_dir: &Path) -> PathBuf {
+    project_bamboo_dir(project_dir).join("commands")
+}
+
 /// Get the local plugin bundles root (`~/.bamboo/plugins`).
 ///
 /// Each installed plugin lives at `plugins_dir()/<plugin_id>/`, keeping the
@@ -484,6 +504,20 @@ mod tests {
     fn test_workflows_dir() {
         let path = workflows_dir();
         assert!(path.ends_with("workflows"));
+    }
+
+    #[test]
+    fn project_command_paths_are_scoped_below_project_bamboo_dir() {
+        let project = Path::new("/workspace/project");
+        assert_eq!(project_bamboo_dir(project), project.join(".bamboo"));
+        assert_eq!(
+            project_commands_dir(project),
+            project.join(".bamboo/commands")
+        );
+        assert_eq!(
+            commands_dir_in(Path::new("/data/bamboo")),
+            PathBuf::from("/data/bamboo/commands")
+        );
     }
 
     #[test]
