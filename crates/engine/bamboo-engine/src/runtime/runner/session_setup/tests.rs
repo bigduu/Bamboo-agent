@@ -501,6 +501,7 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
 
     let root = tempfile::tempdir().expect("temp dir");
     let workspace = root.path().join("project");
+    std::fs::create_dir_all(root.path().join(".git")).expect("git marker");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     std::fs::write(root.path().join("AGENTS.md"), "Workspace policy").expect("agents file");
 
