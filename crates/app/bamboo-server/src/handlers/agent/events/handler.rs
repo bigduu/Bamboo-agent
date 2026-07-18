@@ -139,3 +139,75 @@ pub async fn handler(
         watcher_guard,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::Responder;
+    use bamboo_agent_core::{Message, Session};
+    use std::time::Duration;
+
+    #[actix_web::test]
+    async fn expired_startup_admission_waits_for_locked_live_reconcile() {
+        let dir = tempfile::tempdir().expect("temporary app data");
+        let state = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "sse-admission-startup-race";
+        let mut session = Session::new(session_id, "test-model");
+        session.add_message(Message::user("slow startup"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        session.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+        );
+        state.save_session(&mut session).await;
+
+        // Models `/execute` registering after admission began but before an
+        // unlocked synthetic terminal could be emitted. The subscriber must
+        // remain live until the owner leaves and the locked reconciler wins.
+        let startup_guard =
+            crate::handlers::agent::events::begin_execute_startup(state.get_ref(), session_id);
+        let request = actix_web::test::TestRequest::get().to_http_request();
+        let response = handler(
+            state.clone(),
+            web::Path::from(session_id.to_string()),
+            web::Query(EventsQuery::default()),
+            request.clone(),
+        )
+        .await
+        .respond_to(&request);
+        let collect = actix_web::body::to_bytes(response.into_body());
+        tokio::pin!(collect);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), &mut collect)
+                .await
+                .is_err(),
+            "an in-flight execute owner must prevent admission from closing"
+        );
+        drop(startup_guard);
+
+        let bytes = tokio::time::timeout(Duration::from_secs(2), &mut collect)
+            .await
+            .expect("locked reconcile closes the SSE stream");
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(_) => panic!("read SSE body"),
+        };
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
+        assert!(body.contains("was not started"), "{body}");
+        assert_eq!(body.matches("[DONE]").count(), 1);
+
+        let stored = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load session")
+            .expect("stored session");
+        assert_eq!(stored.last_run_status().as_deref(), Some("error"));
+        assert!(crate::handlers::agent::events::startup_work_id(&stored).is_none());
+    }
+}

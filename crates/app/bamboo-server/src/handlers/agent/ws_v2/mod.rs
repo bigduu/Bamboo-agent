@@ -1169,4 +1169,80 @@ mod tests {
             "the post-await re-read must observe the newly Running runner"
         );
     }
+
+    #[actix_web::test]
+    async fn expired_startup_subscribe_waits_for_locked_live_reconcile() {
+        let dir = tempdir().expect("temporary app data");
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let session_id = "ws-admission-startup-race";
+        let channel = format!("agent.{session_id}");
+        let mut session = bamboo_agent_core::Session::new(session_id, "test-model");
+        session.add_message(bamboo_agent_core::Message::user("slow startup"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        session.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+        );
+        state.save_session(&mut session).await;
+
+        // Exercise the real WS admission function, not just the forwarder. An
+        // execute owner appearing around the async terminal checks must force a
+        // live subscription until the locked exact-work CAS can run.
+        let startup_guard =
+            crate::handlers::agent::events::begin_execute_startup(state.get_ref(), session_id);
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        subscribe(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            &channel,
+            None,
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), queues.next())
+                .await
+                .is_err(),
+            "an in-flight execute owner must prevent a one-shot terminal"
+        );
+        drop(startup_guard);
+
+        let (_, terminal_event) = tokio::time::timeout(Duration::from_secs(2), queues.next())
+            .await
+            .expect("locked reconcile emits startup failure")
+            .expect("agent queue remains installed");
+        let OutFrame::Text(terminal_event) = terminal_event else {
+            panic!("JSON subscription must emit text frames");
+        };
+        let terminal_event: serde_json::Value =
+            serde_json::from_str(&terminal_event).expect("terminal event JSON");
+        assert_eq!(terminal_event["event"]["type"], "error");
+        assert!(terminal_event["event"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("was not started")));
+
+        let (_, terminal_control) = tokio::time::timeout(Duration::from_secs(2), queues.next())
+            .await
+            .expect("terminal control follows failure")
+            .expect("agent queue drains terminal control");
+        let OutFrame::Text(terminal_control) = terminal_control else {
+            panic!("JSON subscription must emit text frames");
+        };
+        let terminal_control: serde_json::Value =
+            serde_json::from_str(&terminal_control).expect("terminal control JSON");
+        assert_eq!(terminal_control["control"]["type"], "terminal");
+
+        let stored = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load session")
+            .expect("stored session");
+        assert_eq!(stored.last_run_status().as_deref(), Some("error"));
+        assert!(crate::handlers::agent::events::startup_work_id(&stored).is_none());
+    }
 }
