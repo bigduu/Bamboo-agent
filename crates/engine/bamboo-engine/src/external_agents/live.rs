@@ -9,7 +9,7 @@
 //! live, callers fall back to the durable `pending_injected_messages` queue.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::poison::PoisonRecover;
@@ -25,7 +25,7 @@ type LiveKey = (ScopeId, String, u32);
 type PendingKey = (ScopeId, String, String, u32, String);
 
 fn scope_id(registry: Option<&SharedApprovalRegistry>) -> ScopeId {
-    registry.map_or(0, |registry| Arc::as_ptr(registry) as usize)
+    registry.map_or(0, |registry| registry.lock().recover_poison().scope_id())
 }
 
 fn map() -> &'static Mutex<HashMap<LiveKey, mpsc::UnboundedSender<ParentFrame>>> {
@@ -551,7 +551,7 @@ mod tests {
     use super::*;
 
     fn registry() -> SharedApprovalRegistry {
-        Arc::new(Mutex::new(
+        std::sync::Arc::new(Mutex::new(
             ApprovalRegistry::open(tempfile::tempdir().unwrap().keep().join("registry.json"))
                 .unwrap(),
         ))

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,7 @@ struct RegistryFile {
 
 #[derive(Debug)]
 pub struct ApprovalRegistry {
+    scope_id: usize,
     path: PathBuf,
     revision: u64,
     records: HashMap<(String, String, u32, String), DurableApproval>,
@@ -87,6 +89,7 @@ impl ApprovalRegistry {
                     ));
                 }
                 Ok(Self {
+                    scope_id: next_scope_id(),
                     path,
                     revision: file.revision,
                     records: file
@@ -107,6 +110,7 @@ impl ApprovalRegistry {
                 })
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
+                scope_id: next_scope_id(),
                 path,
                 revision: 0,
                 records: HashMap::new(),
@@ -136,6 +140,11 @@ impl ApprovalRegistry {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Stable process-local identity used to isolate ephemeral live state.
+    pub fn scope_id(&self) -> usize {
+        self.scope_id
     }
 
     pub fn record_decision(
@@ -253,6 +262,11 @@ impl ApprovalRegistry {
     }
 }
 
+fn next_scope_id() -> usize {
+    static NEXT_SCOPE_ID: AtomicUsize = AtomicUsize::new(1);
+    NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 fn approval_key(
     parent_id: &str,
     child_id: &str,
@@ -302,8 +316,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::copy(path, &backup)?;
         File::open(&backup)?.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    File::open(parent)?.sync_all()?;
+    replace_file(&tmp, path)?;
+    sync_parent(parent)?;
     Ok(())
 }
 
@@ -322,8 +336,39 @@ fn replace_primary(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    std::fs::rename(tmp, path)?;
+    replace_file(&tmp, path)?;
+    sync_parent(parent)
+}
+
+#[cfg(not(windows))]
+fn sync_parent(parent: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
+}
+
+// Opening directories for fsync is not supported by std on Windows.
+#[cfg(windows)]
+fn sync_parent(_parent: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+// Windows rename does not replace an existing destination. The durable backup
+// is synced before this fallback, so a crash in the remove/rename window still
+// recovers fail-closed from the LKG file on the next boot.
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    match std::fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if destination.exists() => {
+            std::fs::remove_file(destination)?;
+            std::fs::rename(source, destination).map_err(|_| error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
