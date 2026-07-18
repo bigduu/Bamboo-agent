@@ -69,6 +69,7 @@ pub async fn evaluate_task_progress(
         .send(AgentEvent::TaskEvaluationStarted {
             session_id: session_id.to_string(),
             items_count: in_progress_count,
+            generation: Some(ctx.version),
         })
         .await;
 
@@ -110,10 +111,14 @@ pub async fn evaluate_task_progress(
             .await
             .map_err(|error| AgentError::LLM(error.to_string()))?;
 
-            Ok(
-                outcomes::build_success_result(stream_output, event_tx, session_id, prompt_tokens)
-                    .await,
+            Ok(outcomes::build_success_result(
+                stream_output,
+                event_tx,
+                session_id,
+                prompt_tokens,
+                ctx.version,
             )
+            .await)
         }
         Err(error) => {
             tracing::warn!("[{}] Task evaluation failed: {}", session_id, error);
