@@ -155,7 +155,7 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
 }
 
 #[tokio::test]
-async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
+async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation() {
     struct RecordingRoundProvider {
         queue: Mutex<Vec<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
         fast_models: Mutex<Vec<String>>,
@@ -225,8 +225,9 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
         .expect("register Task tool")
         .build();
 
-    // Task evaluation now fires only on Task-tool writes, so each round must issue
-    // a Task call to exercise the per-round auxiliary fast-model refresh.
+    // Task evaluation fires only on Task-tool writes. Two writes also exercise
+    // coalescing while the first auxiliary request is in flight; normal
+    // finalization intentionally cancels the queued final-round snapshot (#593).
     let tool_call = |id: &str| bamboo_agent_core::tools::ToolCall {
         id: id.to_string(),
         tool_type: "function".to_string(),
@@ -296,8 +297,19 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
     .expect("agent loop should succeed");
 
     let fast_models = provider.fast_models.lock().await.clone();
-    assert_eq!(
-        fast_models,
-        vec!["fast-2".to_string(), "fast-3".to_string()]
+    // `fast-1` was resolved at startup; the between-round refresh must select
+    // `fast-2` for the first evaluation. Depending on scheduling, that request
+    // may finish before the next round polls it, allowing the second write to
+    // launch with `fast-3`; otherwise it remains queued and is cancelled at
+    // finalization. Both are valid, and neither requires a finalize-time drain.
+    assert!(
+        matches!(
+            fast_models.as_slice(),
+            [first] if first == "fast-2"
+        ) || matches!(
+            fast_models.as_slice(),
+            [first, second] if first == "fast-2" && second == "fast-3"
+        ),
+        "between-round evaluations must use refreshed fast models in order, got {fast_models:?}"
     );
 }
