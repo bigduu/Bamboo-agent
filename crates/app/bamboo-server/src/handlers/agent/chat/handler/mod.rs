@@ -313,6 +313,7 @@ async fn handle_goal_command(
                 "runtime_kind": "gold_goal_resume"
             }));
             session.add_message(resume_msg);
+            crate::handlers::agent::events::mark_pending_turn(&mut session);
         }
 
         state.save_and_cache_session(&mut session).await;

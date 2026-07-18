@@ -23,7 +23,7 @@ use actix_web::{web, App, HttpServer};
 use awc::ws;
 use bamboo_agent_core::AgentEvent;
 use bamboo_config::{AccessControlConfig, DeviceCredential};
-use bamboo_domain::SessionKind;
+use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
 use bamboo_server::routes::configure_routes;
 use bamboo_server::{AgentRunner, AgentStatus, AppState};
 use futures::{SinkExt, StreamExt};
@@ -604,6 +604,49 @@ async fn completed_session_late_subscribe_replays_terminal_once() {
     assert_eq!(terminal_control["ch"], ch);
     assert_eq!(terminal_control["seq"], 2);
     assert_eq!(terminal_control["control"]["type"], "terminal");
+
+    server.stop().await;
+}
+
+/// #588 follow-up regression: cancellation may finish before any Assistant
+/// message is appended, so the durable transcript still ends in User. The
+/// persisted terminal runtime must beat that role heuristic and replay exactly
+/// one Cancelled event followed by exactly one terminal control.
+#[actix_web::test]
+async fn cancelled_last_user_late_subscribe_replays_terminal_once() {
+    let server = TestServer::start(|_| {}).await;
+    let sid = "sess_cancelled_before_assistant";
+
+    let mut root = bamboo_agent_core::Session::new(sid, "test-model");
+    root.add_message(bamboo_agent_core::Message::user("start then cancel"));
+    root.set_last_run_status("cancelled");
+    let mut runtime = AgentRuntimeState::new("cancelled-run");
+    runtime.status = AgentStatusState::Cancelled;
+    root.agent_runtime_state = Some(runtime);
+    register_session(&server.state, &mut root).await;
+
+    let mut conn = connect_local(&server).await;
+    let ch = format!("agent.{sid}");
+    send_json(&mut conn, json!({"type": "subscribe", "ch": ch})).await;
+
+    let terminal_event = next_envelope(&mut conn)
+        .await
+        .expect("late subscriber receives persisted cancellation");
+    assert_eq!(terminal_event["ch"], ch);
+    assert_eq!(terminal_event["seq"], 1);
+    assert_eq!(terminal_event["event"]["type"], "cancelled");
+
+    let terminal_control = next_envelope(&mut conn)
+        .await
+        .expect("late subscriber receives terminal control");
+    assert_eq!(terminal_control["ch"], ch);
+    assert_eq!(terminal_control["seq"], 2);
+    assert_eq!(terminal_control["control"]["type"], "terminal");
+
+    match tokio::time::timeout(Duration::from_millis(400), next_envelope(&mut conn)).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(extra)) => panic!("terminal replay must be one-shot, got extra envelope: {extra}"),
+    }
 
     server.stop().await;
 }

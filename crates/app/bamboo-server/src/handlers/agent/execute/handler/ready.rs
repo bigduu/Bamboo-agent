@@ -84,8 +84,24 @@ pub(super) async fn handle_execute_ready(
             }
         };
 
+    // The reservation owns this exact turn now. Moving the owned marker out of
+    // `pending` before persistence prevents an old terminal runner from being
+    // used to classify the newly-starting turn.
+    let startup_turn_id = crate::handlers::agent::events::pending_turn_id(&session);
+    session.set_last_run_status("running");
+    session.clear_last_run_error();
+
     // ---- Save session before spawn (metadata-group merge) ----
     if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
+        rollback_startup(
+            state,
+            session_id,
+            &run_id,
+            startup_turn_id.as_deref(),
+            &mut session,
+            &error.to_string(),
+        )
+        .await;
         return internal_server_error_response(format!(
             "Failed to persist session config before execute: {}",
             error
@@ -188,6 +204,49 @@ pub(super) async fn handle_execute_ready(
     });
 
     started_response(session_id, sync_info, run_id)
+}
+
+async fn rollback_startup(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    run_id: &str,
+    expected_turn_id: Option<&str>,
+    session: &mut bamboo_agent_core::Session,
+    detail: &str,
+) {
+    // Remove only our reservation. A concurrent retry may already have replaced
+    // it, and must not be disturbed.
+    let mut runners = state.agent_runners.write().await;
+    if runners
+        .get(session_id)
+        .is_some_and(|runner| runner.run_id == run_id)
+    {
+        runners.remove(session_id);
+    }
+    drop(runners);
+
+    // Route through the same owned-turn failure transition used by preparation
+    // rejects. The marker still identifies this exact message; status is reset
+    // only to satisfy the transition's pending precondition.
+    if let Some(expected_turn_id) = expected_turn_id {
+        session.set_last_run_status("pending");
+        crate::handlers::agent::events::mark_startup_failed_if_owned(
+            session,
+            expected_turn_id,
+            detail,
+        );
+    } else {
+        session.set_last_run_status("error");
+        session.set_last_run_error(format!("Agent startup failed: {detail}"));
+    }
+    if state.persistence.merge_save_runtime(session).await.is_ok() {
+        state.sessions.insert(
+            session_id.to_string(),
+            std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+    } else {
+        tracing::error!("[{session_id}] failed to persist execute startup rollback");
+    }
 }
 
 /// #74: re-derive the "no interactive human approver" posture for a
