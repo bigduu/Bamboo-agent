@@ -38,9 +38,8 @@ use bamboo_metrics::{
 
 use super::super::to_event_token_usage;
 use super::gold::{
-    apply_completed_gold_evaluation, drain_in_flight_gold_evaluation, evaluate_gold_terminal,
-    poll_completed_gold_evaluation, spawn_gold_evaluation_if_needed,
-    start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
+    apply_completed_gold_evaluation, evaluate_gold_terminal, poll_completed_gold_evaluation,
+    spawn_gold_evaluation_if_needed, start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
 use crate::runtime::runner::state_bridge;
 
@@ -715,37 +714,6 @@ async fn poll_completed_task_evaluation(state: &mut LoopRunState) {
     }
 }
 
-async fn drain_in_flight_task_evaluation(state: &mut LoopRunState) {
-    if state.task_evaluation.completed.is_some() {
-        return;
-    }
-
-    let Some(in_flight) = state.task_evaluation.in_flight.take() else {
-        return;
-    };
-
-    match in_flight.join_handle.await {
-        Ok(Some(result)) => {
-            state.task_evaluation.completed = Some(result);
-        }
-        Ok(None) => {
-            tracing::debug!(
-                "[{}] Async task evaluation cancelled while draining round {}",
-                state.session_id,
-                in_flight.request.round_number
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                "[{}] Async task evaluation join failed while draining round {}: {}",
-                state.session_id,
-                in_flight.request.round_number,
-                error
-            );
-        }
-    }
-}
-
 async fn apply_completed_task_evaluation(
     session: &mut Session,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -868,20 +836,53 @@ fn spawn_task_evaluation_request(
 
 /// Abort any in-flight async Gold/Task evaluation and clear its slot.
 ///
-/// Called on EVERY early return from [`run_pipeline`] (cancellation,
-/// terminal-error, no-outcome, overflow-recovery failure). The happy path
-/// instead *drains* (awaits + applies) these handles after the loop; the early
-/// returns skip that drain, so without an explicit abort the `JoinHandle` would
-/// simply be dropped — which DETACHES (not aborts) the tokio task, letting a
-/// cancelled run keep executing a full LLM request to completion and fire a late
-/// event onto the ended stream (issue #347). `abort()` drops the eval future at
-/// its next await point, stopping the spend.
-fn abort_in_flight_evaluations(state: &mut LoopRunState) {
+/// Called whenever a run stops. Dropping a `JoinHandle` detaches the task, so we
+/// must abort unfinished evaluations even on normal completion/suspension. This
+/// keeps issue #347's no-detached-request guarantee without making finalization
+/// wait for an auxiliary LLM request (issue #593).
+async fn abort_in_flight_evaluations(
+    state: &mut LoopRunState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    reason: &'static str,
+) {
+    let task_was_running = state.task_evaluation.in_flight.is_some();
+    let task_generation = state
+        .task_evaluation
+        .in_flight
+        .as_ref()
+        .map(|in_flight| in_flight.request.based_on_task_context_version);
+    let gold_was_running = state.gold_evaluation.in_flight.is_some();
     if let Some(in_flight) = state.task_evaluation.in_flight.take() {
         in_flight.join_handle.abort();
     }
     if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
         in_flight.join_handle.abort();
+    }
+    // Queued snapshots belong to this run. A later run rebuilds an evaluation
+    // request from the current task-list generation instead of replaying stale
+    // work captured before completion/suspension.
+    state.task_evaluation.queued_request = None;
+    state.gold_evaluation.queued_request = None;
+
+    // A Started event may already be visible to clients. Always close that
+    // lifecycle explicitly so a reconnecting/current UI never remains stuck in
+    // "evaluating" after the owning run has reached a terminal/suspended state.
+    if task_was_running {
+        let _ = event_tx
+            .send(AgentEvent::TaskEvaluationCancelled {
+                session_id: state.session_id.clone(),
+                reason: reason.to_string(),
+                generation: task_generation,
+            })
+            .await;
+    }
+    if gold_was_running {
+        let _ = event_tx
+            .send(AgentEvent::GoldEvaluationCancelled {
+                session_id: state.session_id.clone(),
+                reason: reason.to_string(),
+            })
+            .await;
     }
 }
 
@@ -1474,7 +1475,7 @@ pub(super) async fn run_pipeline(
             // dropped (detached, not aborted) and the eval would keep running its
             // LLM request to completion — wasted spend + a late event onto the
             // already-ended stream (issue #347).
-            abort_in_flight_evaluations(state);
+            abort_in_flight_evaluations(state, event_tx, "run_cancelled").await;
             return Err(AgentError::Cancelled);
         }
 
@@ -1559,7 +1560,12 @@ pub(super) async fn run_pipeline(
                                     // Early exit before the post-loop drain — abort
                                     // any in-flight eval so it does not detach and
                                     // keep spending (issue #347).
-                                    abort_in_flight_evaluations(state);
+                                    abort_in_flight_evaluations(
+                                        state,
+                                        event_tx,
+                                        "terminal_error",
+                                    )
+                                    .await;
                                     return Err(error);
                                 }
                             };
@@ -1783,7 +1789,7 @@ pub(super) async fn run_pipeline(
             );
             // Early exit before the post-loop drain — abort in-flight evals so a
             // terminal error does not leave an eval detached and spending (#347).
-            abort_in_flight_evaluations(state);
+            abort_in_flight_evaluations(state, event_tx, "terminal_error").await;
             return Err(error);
         }
 
@@ -1801,7 +1807,7 @@ pub(super) async fn run_pipeline(
                 &error,
             );
             // Early exit before the post-loop drain — abort in-flight evals (#347).
-            abort_in_flight_evaluations(state);
+            abort_in_flight_evaluations(state, event_tx, "run_stopped").await;
             return Err(error);
         };
 
@@ -2153,33 +2159,20 @@ pub(super) async fn run_pipeline(
         }
     }
 
-    drain_in_flight_task_evaluation(state).await;
+    // Harvest results that are already ready, but never turn run finalization
+    // into a barrier on an auxiliary evaluator. Unfinished and queued work is
+    // cancelled below; generation checks still reject any completed stale
+    // snapshot before it can mutate the task list.
+    poll_completed_task_evaluation(state).await;
     apply_completed_task_evaluation(session, event_tx, config, state).await;
-    // A task evaluation may have been queued during the final round but never
-    // spawned because the in-flight slot was still busy when the loop ended.
-    // Run it now (spawn + drain) so the last round's progress is actually
-    // evaluated instead of being silently dropped — this also makes the
-    // between-rounds refresh behavior deterministic regardless of scheduling.
-    if state.task_evaluation.in_flight.is_none() {
-        if let Some(request) = state.task_evaluation.queued_request.take() {
-            let eval_provider = state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone());
-            spawn_task_evaluation_request(
-                state,
-                event_tx,
-                request,
-                eval_provider,
-                cancel_token.clone(),
-            );
-            drain_in_flight_task_evaluation(state).await;
-            apply_completed_task_evaluation(session, event_tx, config, state).await;
-        }
-    }
-    drain_in_flight_gold_evaluation(state).await;
+    poll_completed_gold_evaluation(state).await;
     apply_completed_gold_evaluation(session, config, state).await;
+    let evaluation_stop_reason = if session.metadata.contains_key("runtime.suspend_reason") {
+        "run_suspended"
+    } else {
+        "run_completed"
+    };
+    abort_in_flight_evaluations(state, event_tx, evaluation_stop_reason).await;
 
     Ok(sent_complete)
 }
@@ -5381,7 +5374,7 @@ mod tests {
         let config = eval_abort_config();
         let mut session = Session::new("session-eval-terminal", "model");
         let mut state = e2e_loop_state("session-eval-terminal");
-        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         // Never cancelled: the terminal error, not a cancel, drives the early exit.
         let cancel = CancellationToken::new();
 
@@ -5408,6 +5401,20 @@ mod tests {
             state.gold_evaluation.in_flight.is_none(),
             "the in-flight Gold eval slot must be aborted+cleared on the terminal early-exit"
         );
+        let mut saw_cancelled = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                AgentEvent::GoldEvaluationCancelled { ref reason, .. }
+                    if reason == "terminal_error"
+            ) {
+                saw_cancelled = true;
+            }
+        }
+        assert!(
+            saw_cancelled,
+            "an observed evaluation start must receive an explicit terminal cancellation event"
+        );
 
         // Release the (aborted) eval and confirm it does NOT complete. Without the
         // abort, the detached eval would wake here and fire `finished`.
@@ -5422,6 +5429,74 @@ mod tests {
             !gold_completed.load(Ordering::SeqCst),
             "aborted Gold eval must not complete its LLM request"
         );
+    }
+
+    /// The normal-finalization seam is not an auxiliary-evaluation barrier. It
+    /// aborts a blocked evaluation, drops the coalesced queued snapshot, and
+    /// emits a terminal lifecycle event without polling the blocked future.
+    #[tokio::test]
+    async fn abort_helper_is_nonblocking_for_completion_and_suspension() {
+        let mut session = Session::new("session-eval-complete", "model");
+        let mut state = e2e_loop_state("session-eval-complete");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = crate::runtime::gold_evaluation::AsyncGoldEvaluationRequest {
+            session_id: session.id.clone(),
+            round_number: 1,
+            model_name: "fast".to_string(),
+            reasoning_effort: None,
+            checkpoint: bamboo_agent_core::GoldCheckpoint::PostRound,
+            session_snapshot: session.clone(),
+            task_context_snapshot: None,
+            gold_config: crate::runtime::config::GoldConfig::default(),
+        };
+        state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            request: request.clone(),
+            join_handle: tokio::spawn(std::future::pending()),
+        });
+        state.gold_evaluation.queued_request = Some(request.clone());
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::abort_in_flight_evaluations(&mut state, &tx, "run_completed"),
+        )
+        .await
+        .expect("normal finalization waited for the blocked Gold evaluation");
+
+        assert!(state.gold_evaluation.in_flight.is_none());
+        assert!(state.gold_evaluation.queued_request.is_none());
+        let mut saw_cancelled = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                AgentEvent::GoldEvaluationCancelled { ref reason, .. }
+                    if reason == "run_completed"
+            ) {
+                saw_cancelled = true;
+            }
+        }
+        assert!(saw_cancelled);
+
+        // waiting_for_children / awaiting_clarification both converge on the
+        // same post-loop suspension finalizer (`runtime.suspend_reason` selects
+        // this reason). Exercise that seam with another blocked request.
+        state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            request: request.clone(),
+            join_handle: tokio::spawn(std::future::pending()),
+        });
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::abort_in_flight_evaluations(&mut state, &tx, "run_suspended"),
+        )
+        .await
+        .expect("suspension finalization waited for the blocked Gold evaluation");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationCancelled { reason, .. })
+                if reason == "run_suspended"
+        ));
+        // Keep the session alive through the assertion: the finalizer must not
+        // require or mutate it to stop auxiliary work.
+        session.metadata.insert("verified".into(), "true".into());
     }
 
     // ---- Guardian final-message review context (issue #400) ----
