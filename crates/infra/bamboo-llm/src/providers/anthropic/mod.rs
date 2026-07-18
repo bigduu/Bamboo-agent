@@ -582,7 +582,7 @@ pub fn build_anthropic_request_with_cache_blocks(
     }
     let thinking_enabled = requested_thinking.is_some() && !thinking_downgraded;
 
-    let (mut system, mut anthropic_messages, message_ids) = messages_to_anthropic_json(
+    let (mut system, mut anthropic_messages, source_spans) = messages_to_anthropic_json(
         messages,
         system_blocks,
         thinking_enabled,
@@ -615,18 +615,26 @@ pub fn build_anthropic_request_with_cache_blocks(
     }
 
     if budget > 0 && !plan.breakpoint_message_ids.is_empty() {
-        let mut breakpoint_indices: Vec<usize> = message_ids
+        let mut breakpoint_targets: Vec<(usize, usize)> = source_spans
             .iter()
             .enumerate()
-            .filter_map(|(idx, ids)| ids.iter().any(|id| plan.is_breakpoint(id)).then_some(idx))
+            .filter_map(|(message_idx, spans)| {
+                // When several marked sources coalesce into one output message,
+                // the last marked source closes the largest stable prefix.
+                spans
+                    .iter()
+                    .rev()
+                    .find(|span| plan.is_breakpoint(&span.id))
+                    .map(|span| (message_idx, span.last_block))
+            })
             .collect();
         // Keep only the breakpoints closest to the end of the conversation.
-        if breakpoint_indices.len() > budget {
-            breakpoint_indices = breakpoint_indices.split_off(breakpoint_indices.len() - budget);
+        if breakpoint_targets.len() > budget {
+            breakpoint_targets = breakpoint_targets.split_off(breakpoint_targets.len() - budget);
         }
-        for idx in breakpoint_indices {
-            if let Some(message) = anthropic_messages.get_mut(idx) {
-                add_cache_control_to_last_block(message, ttl);
+        for (message_idx, block_idx) in breakpoint_targets {
+            if let Some(message) = anthropic_messages.get_mut(message_idx) {
+                add_cache_control_to_block(message, block_idx, ttl);
             }
         }
     }
@@ -669,16 +677,20 @@ fn cache_control_value(ttl: CacheTtl) -> Value {
     }
 }
 
-/// Add a `cache_control` breakpoint to the last content block of an Anthropic
-/// message, creating an incremental cache point at that conversation turn.
-fn add_cache_control_to_last_block(message: &mut Value, ttl: CacheTtl) {
-    if let Some(last_block) = message
-        .get_mut("content")
-        .and_then(|c| c.as_array_mut())
-        .and_then(|blocks| blocks.last_mut())
-        .and_then(|block| block.as_object_mut())
-    {
-        last_block.insert("cache_control".to_string(), cache_control_value(ttl));
+/// Add a breakpoint to a specific source-owned block. If a malformed/changed
+/// rendering makes the recorded index invalid, fall back defensively to the
+/// message's last block rather than dropping caching entirely.
+fn add_cache_control_to_block(message: &mut Value, block_idx: usize, ttl: CacheTtl) {
+    let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    let target = if block_idx < blocks.len() {
+        blocks.get_mut(block_idx)
+    } else {
+        blocks.last_mut()
+    };
+    if let Some(block) = target.and_then(Value::as_object_mut) {
+        block.insert("cache_control".to_string(), cache_control_value(ttl));
     }
 }
 
@@ -768,9 +780,9 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 
 /// Convert internal messages to the Anthropic wire shape.
 ///
-/// Returns the optional `system` block array, the message array, and a parallel
-/// vector of the originating message id for each output message (so the caller
-/// can place cache breakpoints by id, robust to the tool-result merging below).
+/// Returns the optional `system` block array, the message array, and parallel
+/// source spans recording where each source message's own rendered contribution
+/// ends (so breakpoints remain stable through same-role/tool-result merging).
 ///
 /// When `system_blocks` is non-empty it is the canonical, structured source for
 /// the system field (each block → its own text block); otherwise the system field
@@ -778,18 +790,24 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 ///
 /// `thinking_enabled`/`thinking_replay_always` gate `thinking`-block replay on
 /// assistant turns — see [`build_anthropic_request_with_cache_blocks`] (#520).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSpan {
+    id: String,
+    last_block: usize,
+}
+
 fn messages_to_anthropic_json(
     messages: &[Message],
     system_blocks: &[PromptBlock],
     thinking_enabled: bool,
     thinking_replay_always: bool,
-) -> (Option<Value>, Vec<Value>, Vec<Vec<String>>) {
+) -> (Option<Value>, Vec<Value>, Vec<Vec<SourceSpan>>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
-    // One entry per OUTPUT message: the source message id(s) folded into it. A
-    // single output message can carry several ids after same-role coalescing
-    // (#101); a cache breakpoint on ANY of them lands on that message.
-    let mut out_ids: Vec<Vec<String>> = Vec::new();
+    // One entry per OUTPUT message: every source folded into it and the exact
+    // last block contributed by that source. A cache breakpoint therefore ends
+    // at the marked stable source, not at a later volatile coalesced tail.
+    let mut out_spans: Vec<Vec<SourceSpan>> = Vec::new();
 
     // Keep only the MOST RECENT tool-result image (e.g. screenshot); older ones
     // are dropped from the request to control context size, since a conversation
@@ -828,8 +846,8 @@ fn messages_to_anthropic_json(
                 // following any user turn — fold into that same user message, with
                 // every tool_result for one assistant tool_use turn in one message
                 // as the API requires. The merged-into message keeps its original
-                // id, so a cache breakpoint on that turn still maps (its id stays in
-                // `out_ids`; the merged-in message's id is intentionally dropped).
+                // source span, so a cache breakpoint on that turn still maps to
+                // the precise block where that source contribution ends.
                 if let Some(last) = out.last_mut() {
                     let same_role = last.get("role").and_then(|r| r.as_str())
                         == msg_json.get("role").and_then(|r| r.as_str());
@@ -846,27 +864,36 @@ fn messages_to_anthropic_json(
                             // conversation, but coalescing must not itself produce an
                             // invalid block order. User merges carry no thinking
                             // blocks, so this is a no-op there.) #101.
-                            last_content.extend(
-                                new_content
-                                    .iter()
-                                    .filter(|block| {
-                                        block.get("type").and_then(|t| t.as_str())
-                                            != Some("thinking")
-                                    })
-                                    .cloned(),
-                            );
-                            // Record the merged-in id on the SAME output message so a
-                            // cache breakpoint targeting it still lands here — its
-                            // content now lives at the end of this message. #101.
-                            if let Some(last_ids) = out_ids.last_mut() {
-                                last_ids.push(m.id.clone());
+                            let appended: Vec<Value> = new_content
+                                .iter()
+                                .filter(|block| {
+                                    block.get("type").and_then(|t| t.as_str()) != Some("thinking")
+                                })
+                                .cloned()
+                                .collect();
+                            last_content.extend(appended);
+                            // Record exactly where this source's contribution
+                            // ends, not merely which merged output owns it.
+                            if let Some(last_spans) = out_spans.last_mut() {
+                                last_spans.push(SourceSpan {
+                                    id: m.id.clone(),
+                                    last_block: last_content.len().saturating_sub(1),
+                                });
                             }
                             continue;
                         }
                     }
                 }
+                let last_block = msg_json
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|blocks| blocks.len().saturating_sub(1))
+                    .unwrap_or(0);
                 out.push(msg_json);
-                out_ids.push(vec![m.id.clone()]);
+                out_spans.push(vec![SourceSpan {
+                    id: m.id.clone(),
+                    last_block,
+                }]);
             }
         }
     }
@@ -883,7 +910,7 @@ fn messages_to_anthropic_json(
             .then(|| json!([{ "type": "text", "text": system_parts.join("\n\n") }]))
     });
 
-    (system, out, out_ids)
+    (system, out, out_spans)
 }
 
 /// Whether a message carries at least one image in its content parts.
@@ -1950,8 +1977,8 @@ mod anthropic_request_building {
         // message carries its source id(s); here no same-role coalescing occurs so
         // each slot holds exactly one id.
         assert_eq!(out_ids.len(), 2);
-        assert_eq!(out_ids[0], vec![user_id]);
-        assert_eq!(out_ids[1], vec![assistant_id]);
+        assert_eq!(out_ids[0][0].id, user_id);
+        assert_eq!(out_ids[1][0].id, assistant_id);
 
         // (d) KEY INVARIANT: the parallel id vector stays in lockstep with the
         // messages array, so cache-breakpoint placement by id never desyncs.
@@ -2303,6 +2330,100 @@ mod anthropic_request_building {
     }
 
     #[test]
+    fn breakpoint_stays_before_volatile_same_role_tail() {
+        let stable = Message::user("stable conversation prefix");
+        let stable_id = stable.id.clone();
+        let messages = vec![stable, Message::user("volatile task list / memory / goal")];
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![stable_id],
+            ttl: crate::cache::CacheTtl::Extended,
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+        assert!(blocks[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn multi_block_source_span_ends_on_its_own_last_block() {
+        let stable = Message::user_with_parts(
+            "",
+            vec![
+                bamboo_domain::MessagePart::Text { text: "one".into() },
+                bamboo_domain::MessagePart::Text { text: "two".into() },
+            ],
+        );
+        let stable_id = stable.id.clone();
+        let messages = vec![stable, Message::user("volatile")];
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![stable_id],
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert!(blocks[0].get("cache_control").is_none());
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn last_marked_span_wins_inside_one_coalesced_message() {
+        let first = Message::user("stable one");
+        let second = Message::user("stable two");
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![first.id.clone(), second.id.clone()],
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &[first, second, Message::user("volatile")],
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert!(blocks[0].get("cache_control").is_none());
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn out_of_range_source_span_falls_back_to_last_block() {
+        let mut message = serde_json::json!({"role":"user","content":[{"type":"text","text":"x"}]});
+        super::add_cache_control_to_block(
+            &mut message,
+            usize::MAX,
+            crate::cache::CacheTtl::Default,
+        );
+        assert_eq!(message["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
     fn stable_prefix_caches_system_and_relocated_tool_guide() {
         // Mirrors a prompt-lanes request: a static system identity, the relocated
         // tool/server guide as its own fixed prefix message, then the
@@ -2347,7 +2468,8 @@ mod anthropic_request_building {
             "static system identity must be cached"
         );
 
-        // After system extraction the messages are [guide, earlier, assistant, tail].
+        // Guide + earlier user turn coalesce. The guide's marker must stay on
+        // its own block, before the later conversation content.
         let msgs = out["messages"].as_array().unwrap();
         let cc = |m: &serde_json::Value| -> bool {
             m["content"]
@@ -2357,9 +2479,15 @@ mod anthropic_request_building {
                 .unwrap_or(false)
         };
         // The relocated guide closes the stable prefix and is cached.
-        assert!(cc(&msgs[0]), "relocated tool guide must be cached");
-        // A middle conversation turn must NOT be cached.
-        assert!(!cc(&msgs[1]), "middle turn must not be cached");
+        let prefix_blocks = msgs[0]["content"].as_array().unwrap();
+        assert!(
+            prefix_blocks[0].get("cache_control").is_some(),
+            "relocated tool guide must be cached"
+        );
+        assert!(
+            prefix_blocks[1].get("cache_control").is_none(),
+            "volatile conversation content must remain outside the stable prefix"
+        );
         // The rolling conversation tail is cached.
         assert!(cc(msgs.last().unwrap()), "conversation tail must be cached");
     }
@@ -2428,7 +2556,8 @@ mod anthropic_request_building {
             2,
             "both tool results present in merged message"
         );
-        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1].get("cache_control").is_none());
     }
 
     #[test]
