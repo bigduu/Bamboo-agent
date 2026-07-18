@@ -411,6 +411,42 @@ pub(crate) fn spawn_agent_forwarder(
     })
 }
 
+/// Spawn a one-shot `agent.{sid}` replay for a session that was already
+/// terminal when the client subscribed. This mirrors the v1 SSE terminal
+/// response: cached critical state, budget state, synthesized terminal event,
+/// then exactly one terminal control before the per-channel queue closes.
+pub(crate) fn spawn_agent_terminal_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    budget_event_to_replay: Option<AgentEvent>,
+    critical_events_to_replay: Vec<AgentEvent>,
+    terminal_event: AgentEvent,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let seq = AgentSeq::default();
+        for event in critical_events_to_replay {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                return;
+            }
+        }
+        if let Some(event) = budget_event_to_replay {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                return;
+            }
+        }
+        if !emit_agent_event(&out, encoding, &ch, &seq, terminal_event).await {
+            return;
+        }
+        let _ = send_env(
+            &out,
+            encoding,
+            ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
+        )
+        .await;
+    })
+}
+
 /// What the agent forwarder should do after a broadcast-lag recovery attempt.
 #[derive(Debug, PartialEq, Eq)]
 enum LagOutcome {
@@ -598,6 +634,38 @@ mod tests {
         assert!(!is_terminal_event(&AgentEvent::Token {
             content: "x".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn completed_subscription_replays_state_then_one_terminal_control() {
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let handle = spawn_agent_terminal_forwarder(
+            out_tx,
+            Encoding::Json,
+            "agent.done".to_string(),
+            None,
+            vec![AgentEvent::Token {
+                content: "critical-state".into(),
+            }],
+            AgentEvent::Complete {
+                usage: Default::default(),
+            },
+        );
+
+        let replay = next_json(&mut out_rx).await;
+        assert_eq!(replay["seq"], 1);
+        assert_eq!(replay["event"]["content"], "critical-state");
+        let terminal_event = next_json(&mut out_rx).await;
+        assert_eq!(terminal_event["seq"], 2);
+        assert_eq!(terminal_event["event"]["type"], "complete");
+        let terminal_control = next_json(&mut out_rx).await;
+        assert_eq!(terminal_control["seq"], 3);
+        assert_eq!(terminal_control["control"]["type"], "terminal");
+        handle.await.expect("one-shot forwarder completes");
+        assert!(
+            out_rx.recv().await.is_none(),
+            "terminal control is emitted once"
+        );
     }
 
     #[test]

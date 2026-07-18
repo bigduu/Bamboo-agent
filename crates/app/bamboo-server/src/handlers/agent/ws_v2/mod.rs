@@ -72,7 +72,9 @@ use self::envelope::{
     decode_client_frame, pong_frame, sys_keepalive_envelope, Channel, ClientFrame, Encoding,
     OutFrame, SUBPROTOCOL_JSON, SUBPROTOCOL_MSGPACK,
 };
-use self::forwarders::{spawn_agent_forwarder, spawn_feed_forwarder, OutboundTx};
+use self::forwarders::{
+    spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder, OutboundTx,
+};
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
 use crate::handlers::agent::stop::cancel_session;
@@ -716,6 +718,38 @@ async fn subscribe(
                 .map(|runner| runner.last_critical_events.clone())
                 .unwrap_or_default();
 
+            // Match the v1 SSE late-subscribe contract. A session that
+            // completed while this socket was half-open must replay cached
+            // state and a synthesized terminal exactly once, rather than open
+            // a live receiver that will never publish another event.
+            let runner_status = runner_snapshot.as_ref().map(|runner| runner.status.clone());
+            if !matches!(runner_status, Some(crate::app_state::AgentStatus::Running)) {
+                if let Some(terminal_event) =
+                    crate::handlers::agent::events::terminal_event_if_ready(
+                        state,
+                        &sid,
+                        runner_status,
+                    )
+                    .await
+                {
+                    return finish_subscribe(
+                        forwarders,
+                        queues,
+                        ch,
+                        out_rx,
+                        spawn_agent_terminal_forwarder(
+                            out_tx,
+                            encoding,
+                            ch.to_string(),
+                            budget_event_to_replay,
+                            critical_events_to_replay,
+                            terminal_event,
+                        ),
+                        since,
+                    );
+                }
+            }
+
             spawn_agent_forwarder(
                 state.clone(),
                 sid.clone(),
@@ -729,7 +763,17 @@ async fn subscribe(
             )
         }
     };
+    finish_subscribe(forwarders, queues, ch, out_rx, handle, since);
+}
 
+fn finish_subscribe(
+    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    ch: &str,
+    out_rx: mpsc::Receiver<OutFrame>,
+    handle: tokio::task::JoinHandle<()>,
+    since: Option<u64>,
+) {
     forwarders.insert(ch.to_string(), handle);
     // Register this channel's queue receiver into the fair-merge drain. Keyed by
     // the SAME channel id as `forwarders`, so unsubscribe/teardown drops both.
