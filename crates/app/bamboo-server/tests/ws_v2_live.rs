@@ -574,6 +574,40 @@ async fn agent_terminal_without_child_closes_channel() {
     server.stop().await;
 }
 
+/// #588 regression guard: a session that completed while the prior socket was
+/// half-open has durable assistant history but no in-memory runner after a
+/// restart. A late subscription must receive the synthesized completion and
+/// terminal control without waiting for another broadcast event.
+#[actix_web::test]
+async fn completed_session_late_subscribe_replays_terminal_once() {
+    let server = TestServer::start(|_| {}).await;
+    let sid = "sess_completed_offline";
+
+    let mut root = bamboo_agent_core::Session::new(sid, "test-model");
+    root.add_message(bamboo_agent_core::Message::assistant("finished", None));
+    register_session(&server.state, &mut root).await;
+
+    let mut conn = connect_local(&server).await;
+    let ch = format!("agent.{sid}");
+    send_json(&mut conn, json!({"type": "subscribe", "ch": ch})).await;
+
+    let terminal_event = next_envelope(&mut conn)
+        .await
+        .expect("late subscriber receives synthesized completion");
+    assert_eq!(terminal_event["ch"], ch);
+    assert_eq!(terminal_event["seq"], 1);
+    assert_eq!(terminal_event["event"]["type"], "complete");
+
+    let terminal_control = next_envelope(&mut conn)
+        .await
+        .expect("late subscriber receives terminal control");
+    assert_eq!(terminal_control["ch"], ch);
+    assert_eq!(terminal_control["seq"], 2);
+    assert_eq!(terminal_control["control"]["type"], "terminal");
+
+    server.stop().await;
+}
+
 // ── Scenario 3b: terminal WITH a running child holds the channel open ─────────
 
 /// #186 regression guard: an agent terminal while a child sub-agent is still

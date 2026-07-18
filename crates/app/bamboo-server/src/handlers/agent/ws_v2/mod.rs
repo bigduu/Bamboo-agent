@@ -723,30 +723,36 @@ async fn subscribe(
             // state and a synthesized terminal exactly once, rather than open
             // a live receiver that will never publish another event.
             let runner_status = runner_snapshot.as_ref().map(|runner| runner.status.clone());
-            if !matches!(runner_status, Some(crate::app_state::AgentStatus::Running)) {
+            if can_attempt_terminal_replay(runner_status.as_ref(), &receiver) {
                 if let Some(terminal_event) =
                     crate::handlers::agent::events::terminal_event_if_ready(
                         state,
                         &sid,
-                        runner_status,
+                        runner_status.clone(),
                     )
                     .await
                 {
-                    return finish_subscribe(
-                        forwarders,
-                        queues,
-                        ch,
-                        out_rx,
-                        spawn_agent_terminal_forwarder(
-                            out_tx,
-                            encoding,
-                            ch.to_string(),
-                            budget_event_to_replay,
-                            critical_events_to_replay,
-                            terminal_event,
-                        ),
-                        since,
-                    );
+                    // We subscribed before the async storage/child checks. If a
+                    // live event arrived meanwhile, preserve its ordering by
+                    // handing the still-buffered receiver to the live forwarder
+                    // instead of sending a synthetic terminal ahead of it.
+                    if can_attempt_terminal_replay(runner_status.as_ref(), &receiver) {
+                        return finish_subscribe(
+                            forwarders,
+                            queues,
+                            ch,
+                            out_rx,
+                            spawn_agent_terminal_forwarder(
+                                out_tx,
+                                encoding,
+                                ch.to_string(),
+                                budget_event_to_replay,
+                                critical_events_to_replay,
+                                terminal_event,
+                            ),
+                            since,
+                        );
+                    }
                 }
             }
 
@@ -764,6 +770,13 @@ async fn subscribe(
         }
     };
     finish_subscribe(forwarders, queues, ch, out_rx, handle, since);
+}
+
+fn can_attempt_terminal_replay(
+    runner_status: Option<&crate::app_state::AgentStatus>,
+    receiver: &tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
+) -> bool {
+    !matches!(runner_status, Some(crate::app_state::AgentStatus::Running)) && receiver.is_empty()
 }
 
 fn finish_subscribe(
@@ -1078,5 +1091,19 @@ mod tests {
         let (channel, frame) = queues.next().await.expect("sys queue remains drainable");
         assert_eq!(channel, SYS_CHANNEL);
         assert_eq!(frame, OutFrame::Text(r#"{"type":"pong"}"#.into()));
+    }
+
+    #[test]
+    fn queued_agent_event_blocks_synthetic_terminal_replay() {
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        assert!(can_attempt_terminal_replay(None, &rx));
+        tx.send(bamboo_agent_core::AgentEvent::Token {
+            content: "first-live-token".into(),
+        })
+        .expect("receiver is subscribed");
+        assert!(
+            !can_attempt_terminal_replay(None, &rx),
+            "a queued live frame must win the race with synthetic terminal replay"
+        );
     }
 }

@@ -45,6 +45,19 @@ pub(crate) async fn terminal_event_if_ready(
         );
     }
 
+    // Absence of an in-memory runner is not itself proof that a run finished:
+    // a newly-created session is persisted before its runner is reserved. In
+    // that window a subscriber must stay live for the first token instead of
+    // receiving a synthetic Complete. Require positive durable/in-memory
+    // evidence of a prior run before considering the one-shot terminal path.
+    if !session_has_terminal_evidence(session.as_ref(), runner_status.as_ref()) {
+        tracing::debug!(
+            "[{}] terminal_event_if_ready -> None (session has not started) -> LIVE stream",
+            session_id,
+        );
+        return None;
+    }
+
     if session_prevents_terminal_event(session.as_ref()) {
         tracing::debug!(
             "[{}] terminal_event_if_ready -> None (pending user message / pending question / suspended) -> LIVE stream",
@@ -64,6 +77,30 @@ pub(crate) async fn terminal_event_if_ready(
         session_id,
     );
     Some(terminal_event_for_status(runner_status))
+}
+
+pub(super) fn session_has_terminal_evidence(
+    session: Option<&Session>,
+    runner_status: Option<&AgentStatus>,
+) -> bool {
+    if matches!(
+        runner_status,
+        Some(AgentStatus::Completed | AgentStatus::Cancelled | AgentStatus::Error(_))
+    ) {
+        return true;
+    }
+    let Some(session) = session else {
+        return false;
+    };
+    if !session.messages.is_empty() {
+        return true;
+    }
+    session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+        matches!(
+            runtime.status,
+            AgentStatusState::Completed | AgentStatusState::Cancelled | AgentStatusState::Failed
+        )
+    })
 }
 
 pub(super) fn terminal_event_for_status(runner_status: Option<AgentStatus>) -> AgentEvent {

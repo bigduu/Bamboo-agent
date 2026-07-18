@@ -1,4 +1,6 @@
-use super::terminal::{session_prevents_terminal_event, terminal_event_for_status};
+use super::terminal::{
+    session_has_terminal_evidence, session_prevents_terminal_event, terminal_event_for_status,
+};
 use crate::app_state::AgentStatus;
 use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
@@ -73,8 +75,23 @@ fn session_prevents_terminal_when_runtime_is_suspended() {
 
 #[test]
 fn session_allows_terminal_when_not_waiting_for_user() {
-    let session = Session::new("sess-4", "test-model");
+    let mut session = Session::new("sess-4", "test-model");
+    session.add_message(Message::assistant("done", None));
 
     assert!(!session_prevents_terminal_event(Some(&session)));
     assert!(!session_prevents_terminal_event(None));
+}
+
+#[test]
+fn terminal_evidence_rejects_unstarted_session_but_accepts_completed_history() {
+    let empty = Session::new("empty", "test-model");
+    assert!(!session_has_terminal_evidence(Some(&empty), None));
+
+    let mut with_history = Session::new("done", "test-model");
+    with_history.add_message(Message::assistant("done", None));
+    assert!(session_has_terminal_evidence(Some(&with_history), None));
+    assert!(session_has_terminal_evidence(
+        Some(&empty),
+        Some(&AgentStatus::Completed),
+    ));
 }
