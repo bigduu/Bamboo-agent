@@ -138,6 +138,7 @@ mod tests {
 
         let root = tempfile::tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git marker");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
         std::fs::write(root.path().join("AGENTS.md"), "Snapshot instruction policy")
             .expect("agents file");

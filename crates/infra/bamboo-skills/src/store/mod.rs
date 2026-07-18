@@ -165,6 +165,19 @@ impl SkillStore {
         let mut dirs = Vec::new();
         let active_mode = self.effective_mode(mode_override);
 
+        // Enable the conventional user-level source for the production store.
+        // Custom/test stores remain hermetic instead of reading the developer's
+        // real home directory unexpectedly.
+        if self.config.skills_dir == bamboo_config::paths::bamboo_dir().join("skills") {
+            if let Some(dir) = bamboo_config::paths::agents_skills_dir() {
+                dirs.push(SkillDiscoveryDir {
+                    dir,
+                    source: SkillDirectorySource::Agents,
+                    mode: None,
+                });
+            }
+        }
+
         dirs.push(SkillDiscoveryDir {
             dir: self.config.skills_dir.clone(),
             source: SkillDirectorySource::Global,
@@ -220,7 +233,7 @@ impl SkillStore {
                 // plugins, or two dirs at the same precedence, shipping the
                 // same skill id) — the winner is decided only by discovery
                 // order, so surface it at WARN. Legitimate precedence
-                // overrides (project > global > plugin, or mode-specific >
+                // overrides (project > Bamboo global > ~/.agents > plugin, or mode-specific >
                 // generic) are expected and stay at debug.
                 let existing_meta = resolved_meta.get(&skill_id);
                 let is_ambiguous_collision = existing_meta.is_some_and(|existing| {
@@ -275,7 +288,8 @@ impl SkillStore {
     }
 
     /// Precedence rank: higher wins when two discovery dirs provide the same
-    /// skill id. Plugin-provided skills sit BELOW both Global and Project so
+    /// skill id. `~/.agents` augments Bamboo without shadowing Bamboo-owned
+    /// global/project definitions; plugin skills remain the lowest tier.
     /// an installed plugin can never silently shadow a user's own global or
     /// project skill of the same id; within the same source tier, a
     /// mode-specific candidate still overrides a generic one (unchanged from
@@ -283,8 +297,9 @@ impl SkillStore {
     fn source_rank(source: SkillDirectorySource) -> u8 {
         match source {
             SkillDirectorySource::Plugin => 0,
-            SkillDirectorySource::Global => 1,
-            SkillDirectorySource::Project => 2,
+            SkillDirectorySource::Agents => 1,
+            SkillDirectorySource::Global => 2,
+            SkillDirectorySource::Project => 3,
         }
     }
 
@@ -918,8 +933,28 @@ mod tests {
 
     use tokio::fs;
 
-    use super::SkillStore;
+    use super::{SkillCandidateMeta, SkillStore};
+    use crate::store::storage::SkillDirectorySource;
     use crate::types::SkillStoreConfig;
+
+    #[test]
+    fn agents_skill_precedence_is_below_bamboo_global_and_above_plugin() {
+        let agents = SkillCandidateMeta {
+            source: SkillDirectorySource::Agents,
+            mode: None,
+        };
+        let global = SkillCandidateMeta {
+            source: SkillDirectorySource::Global,
+            mode: None,
+        };
+        let plugin = SkillCandidateMeta {
+            source: SkillDirectorySource::Plugin,
+            mode: None,
+        };
+        assert!(SkillStore::should_override_skill(&agents, &global));
+        assert!(SkillStore::should_override_skill(&plugin, &agents));
+        assert!(!SkillStore::should_override_skill(&global, &agents));
+    }
 
     async fn write_skill(
         skills_root: &Path,

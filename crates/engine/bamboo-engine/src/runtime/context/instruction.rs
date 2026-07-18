@@ -1,5 +1,6 @@
 //! Instruction layer: loads instruction files (AGENTS.md, CLAUDE.md) from workspace.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use bamboo_config::paths;
@@ -18,7 +19,28 @@ pub struct InstructionFile {
 }
 
 fn read_trimmed_file(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!("Failed to inspect instruction file {:?}: {}", path, error);
+            return None;
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        tracing::warn!(
+            "Ignoring non-regular or symlinked instruction file: {:?}",
+            path
+        );
+        return None;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!("Failed to read instruction file {:?}: {}", path, error);
+            return None;
+        }
+    };
     let truncated = if bytes.len() > MAX_INSTRUCTION_BYTES_PER_FILE {
         &bytes[..MAX_INSTRUCTION_BYTES_PER_FILE]
     } else {
@@ -37,14 +59,20 @@ fn canonical_dir_or_self(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(candidate).ok()
 }
 
-fn ancestor_dirs(start: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+fn scoped_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut leaf_to_root = Vec::new();
     let Some(mut current) = canonical_dir_or_self(start) else {
-        return dirs;
+        return leaf_to_root;
     };
+    let canonical_start = current.clone();
+    let mut found_workspace_boundary = false;
 
     loop {
-        dirs.push(current.clone());
+        leaf_to_root.push(current.clone());
+        if current.join(".git").exists() {
+            found_workspace_boundary = true;
+            break;
+        }
         let Some(parent) = current.parent() else {
             break;
         };
@@ -53,16 +81,23 @@ fn ancestor_dirs(start: &Path) -> Vec<PathBuf> {
         }
         current = parent.to_path_buf();
     }
-
-    dirs
+    if !found_workspace_boundary {
+        return vec![canonical_start];
+    }
+    leaf_to_root.reverse();
+    leaf_to_root
 }
 
 pub fn collect_instruction_files(workspace_path: &Path) -> Vec<InstructionFile> {
     let mut files = Vec::new();
 
-    for dir in ancestor_dirs(workspace_path) {
+    let mut seen = HashSet::new();
+    for dir in scoped_dirs(workspace_path) {
         for file_name in INSTRUCTION_FILE_NAMES {
             let candidate = dir.join(file_name);
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
             let Some(content) = read_trimmed_file(&candidate) else {
                 continue;
             };
@@ -119,6 +154,7 @@ mod tests {
     fn build_instruction_prompt_context_collects_workspace_and_ancestor_files() {
         let root = tempfile::tempdir().expect("temp dir");
         let nested = root.path().join("nested/project");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git marker");
         std::fs::create_dir_all(&nested).expect("nested dir");
         std::fs::write(root.path().join("AGENTS.md"), "root agents").expect("agents");
         std::fs::write(root.path().join("CLAUDE.md"), "root claude").expect("claude");
@@ -137,5 +173,49 @@ mod tests {
     fn build_instruction_prompt_context_returns_none_when_no_files_exist() {
         let root = tempfile::tempdir().expect("temp dir");
         assert!(build_instruction_prompt_context(root.path().to_string_lossy().as_ref()).is_none());
+    }
+
+    #[test]
+    fn instructions_are_root_to_leaf_and_stop_at_git_workspace_boundary() {
+        let outer = tempfile::tempdir().expect("temp dir");
+        std::fs::write(outer.path().join("AGENTS.md"), "outside").expect("outside");
+        let repo = outer.path().join("repo");
+        let nested = repo.join("src/feature");
+        std::fs::create_dir_all(repo.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(repo.join("AGENTS.md"), "root rule").expect("root");
+        std::fs::write(repo.join("src/AGENTS.md"), "nested rule").expect("nested rule");
+
+        let files = collect_instruction_files(&nested);
+        let contents: Vec<_> = files.iter().map(|file| file.content.as_str()).collect();
+        assert_eq!(contents, vec!["root rule", "nested rule"]);
+        assert!(files.iter().all(|file| !file.content.contains("outside")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_instruction_file_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git marker");
+        let outside = tempfile::NamedTempFile::new().expect("outside");
+        std::fs::write(outside.path(), "outside policy").expect("write outside");
+        symlink(outside.path(), root.path().join("AGENTS.md")).expect("symlink");
+        assert!(collect_instruction_files(root.path()).is_empty());
+    }
+
+    #[test]
+    fn git_worktree_file_is_a_workspace_boundary() {
+        let outer = tempfile::tempdir().expect("outer");
+        std::fs::write(outer.path().join("AGENTS.md"), "outside").expect("outside");
+        let worktree = outer.path().join(".bamboo/worktree/task");
+        std::fs::create_dir_all(worktree.join("src")).expect("worktree");
+        std::fs::write(worktree.join(".git"), "gitdir: /repo/.git/worktrees/task")
+            .expect("git file");
+        std::fs::write(worktree.join("AGENTS.md"), "worktree root").expect("agents");
+
+        let files = collect_instruction_files(&worktree.join("src"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, "worktree root");
     }
 }
