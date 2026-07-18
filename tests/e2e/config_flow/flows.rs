@@ -5,6 +5,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let state = crate::e2e::common::create_test_app().await;
     let data_dir = state.app_data_dir.clone();
     let config_path = data_dir.join("config.json");
+    let providers_path = data_dir.join("providers.json");
 
     let app = test::init_service(
         App::new()
@@ -108,10 +109,9 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    let cfg = read_config_json(&config_path);
-    let openai_encrypted_before = cfg
-        .get("providers")
-        .and_then(|p| p.get("openai"))
+    let providers = read_config_json(&providers_path);
+    let openai_encrypted_before = providers
+        .get("openai")
         .and_then(|o| o.get("api_key_encrypted"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -131,10 +131,9 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    let cfg = read_config_json(&config_path);
-    let openai_encrypted_after = cfg
-        .get("providers")
-        .and_then(|p| p.get("openai"))
+    let providers = read_config_json(&providers_path);
+    let openai_encrypted_after = providers
+        .get("openai")
         .and_then(|o| o.get("api_key_encrypted"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
