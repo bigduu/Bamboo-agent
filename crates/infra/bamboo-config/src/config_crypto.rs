@@ -578,10 +578,48 @@ impl Config {
         }
     }
 
+    /// Resolve secret env values from the isolated credential store. A
+    /// configured reference must resolve; silently publishing an empty value
+    /// would make Bash/session behavior diverge from durable metadata.
+    pub fn hydrate_env_var_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        for entry in &mut self.env_vars {
+            if !entry.secret {
+                entry.credential_ref = None;
+                entry.configured = !entry.value.is_empty();
+                continue;
+            }
+            let Some(reference) = entry.credential_ref.as_ref() else {
+                entry.configured = false;
+                continue;
+            };
+            match store.resolve(reference)? {
+                Some(secret) => {
+                    entry.value = secret.expose().to_string();
+                    entry.configured = true;
+                }
+                None if entry.configured => {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "referenced env credential is unavailable".to_string(),
+                    ));
+                }
+                None => {
+                    entry.value.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Re-encrypt secret env vars before persisting to disk.
     pub fn refresh_env_vars_encrypted(&mut self) -> Result<()> {
         for entry in &mut self.env_vars {
-            if entry.secret && !entry.value.trim().is_empty() {
+            if entry.secret && entry.credential_ref.is_some() {
+                entry.value_encrypted = None;
+            } else if entry.secret && !entry.value.trim().is_empty() {
                 entry.value_encrypted = Some(
                     crate::encryption::encrypt(&entry.value)
                         .with_context(|| format!("Failed to encrypt env var '{}'", entry.name))?,
@@ -598,6 +636,10 @@ impl Config {
         for entry in &mut self.env_vars {
             if entry.secret {
                 entry.value = String::new();
+                entry.value_encrypted = None;
+            } else {
+                entry.credential_ref = None;
+                entry.configured = !entry.value.is_empty();
             }
         }
     }

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config_store::{
@@ -133,8 +134,24 @@ pub(crate) struct PreparedCredentialMigration {
 pub(crate) struct PreparedProviderCredentialUpdate {
     pub bytes: Vec<u8>,
     pub expected_revision: u64,
+    pub revision: u64,
     pub touched_refs: Vec<CredentialRef>,
     pub required_refs: Vec<CredentialRef>,
+}
+
+impl PreparedProviderCredentialUpdate {
+    pub(crate) fn advance_revision_for_domain_change(&mut self) -> ConfigStoreResult<()> {
+        if self.revision != self.expected_revision {
+            return Ok(());
+        }
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+        })?;
+        let mut envelope: Value = serde_json::from_slice(&self.bytes)?;
+        envelope["revision"] = Value::from(self.revision);
+        self.bytes = serde_json::to_vec_pretty(&envelope)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,6 +556,7 @@ impl CredentialStore {
         Ok(Some(PreparedProviderCredentialUpdate {
             bytes,
             expected_revision: health.revision,
+            revision,
             touched_refs: touched_refs.into_iter().collect(),
             required_refs,
         }))
@@ -625,9 +643,150 @@ impl CredentialStore {
         Ok(PreparedProviderCredentialUpdate {
             bytes,
             expected_revision: health.revision,
+            revision,
             touched_refs: vec![reference],
             required_refs,
         })
+    }
+
+    /// Prepare an exact env credential update. `env_intents` is the complete
+    /// set of names explicitly upserted, replaced, converted, or deleted by
+    /// the caller; untouched entries and their custom legacy references are
+    /// never rewritten.
+    pub(crate) fn prepare_env_var_intents(
+        &self,
+        config: &mut crate::Config,
+        env_intents: &BTreeSet<String>,
+        persisted_refs: &BTreeMap<String, CredentialRef>,
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        if env_intents.is_empty() {
+            return Ok(None);
+        }
+        let mut seen = BTreeSet::new();
+        if config
+            .env_vars
+            .iter()
+            .any(|entry| !seen.insert(entry.name.clone()))
+        {
+            return Err(ConfigStoreError::Validation(
+                "environment variable names must be unique".to_string(),
+            ));
+        }
+        let candidate_counts = config_credential_ref_counts(config)?;
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for env update".to_string(),
+            ));
+        }
+        let mut touched_refs = BTreeSet::new();
+        let mut required_refs = BTreeSet::new();
+        let mut changed = false;
+        for name in env_intents {
+            let existing_ref = persisted_refs.get(name).cloned();
+            let canonical = crate::credential_ref("env", name, "value")?;
+            let entry_index = config.env_vars.iter().position(|entry| &entry.name == name);
+            let candidate_ref =
+                entry_index.and_then(|index| config.env_vars[index].credential_ref.clone());
+            if let Some(candidate_ref) = candidate_ref.as_ref() {
+                if Some(candidate_ref) != existing_ref.as_ref() {
+                    return Err(ConfigStoreError::Validation(
+                        "env credential reference is server-managed".to_string(),
+                    ));
+                }
+            }
+            let reference = existing_ref.clone().unwrap_or(canonical);
+            touched_refs.insert(reference.clone());
+
+            let self_consumer = usize::from(candidate_ref.as_ref() == Some(&reference));
+            let retained_consumers = candidate_counts
+                .get(&reference)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(self_consumer);
+            let secret = entry_index
+                .filter(|index| config.env_vars[*index].secret)
+                .map(|index| config.env_vars[index].value.clone())
+                .filter(|value| !value.is_empty());
+            let keep_existing = entry_index.is_some_and(|index| {
+                let entry = &config.env_vars[index];
+                entry.secret && entry.configured && entry.value.is_empty()
+            });
+            if existing_ref.is_none()
+                && (document.entries.contains_key(&reference) || retained_consumers > 0)
+            {
+                return Err(ConfigStoreError::Validation(
+                    "canonical env credential reference is already in use".to_string(),
+                ));
+            }
+            if keep_existing {
+                if !document.entries.contains_key(&reference) {
+                    return Err(ConfigStoreError::Validation(
+                        "configured env credential is unavailable".to_string(),
+                    ));
+                }
+                required_refs.insert(reference.clone());
+            } else if let Some(secret) = secret.as_deref() {
+                if crate::patch::is_masked_api_key(secret) {
+                    return Err(ConfigStoreError::Validation(
+                        "env credential value must not be a mask".to_string(),
+                    ));
+                }
+                let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
+                    ConfigStoreError::Validation("credential encryption failed".to_string())
+                })?;
+                document.entries.insert(
+                    reference.clone(),
+                    CredentialEntry {
+                        ciphertext,
+                        source: CredentialSource::User,
+                        updated_at: Utc::now(),
+                        key_version: ENCRYPTION_KEY_VERSION,
+                        migration_generation: None,
+                    },
+                );
+                changed = true;
+                required_refs.insert(reference.clone());
+            } else if retained_consumers == 0 {
+                changed |= document.entries.remove(&reference).is_some();
+            }
+
+            if let Some(index) = entry_index {
+                let entry = &mut config.env_vars[index];
+                entry.value_encrypted = None;
+                if entry.secret {
+                    entry.credential_ref = Some(reference.clone());
+                    entry.configured = keep_existing || secret.is_some();
+                } else {
+                    entry.credential_ref = None;
+                    entry.configured = !entry.value.is_empty();
+                }
+            }
+        }
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(
+            &document,
+            &required_refs.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision,
+            touched_refs: touched_refs.into_iter().collect(),
+            required_refs: required_refs.into_iter().collect(),
+        }))
     }
 
     pub fn resolve(
@@ -1050,6 +1209,11 @@ fn config_credential_ref_counts(
     }
     for instance in config.provider_instances.values() {
         if let Some(reference) = instance.credential_ref.as_ref() {
+            add(reference);
+        }
+    }
+    for entry in &config.env_vars {
+        if let Some(reference) = entry.credential_ref.as_ref() {
             add(reference);
         }
     }

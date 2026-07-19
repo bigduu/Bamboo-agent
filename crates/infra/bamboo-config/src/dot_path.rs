@@ -251,6 +251,11 @@ fn guard_reserved_paths(segments: &[&str], key: &str) -> Result<(), DotPathError
                  automatically)"
             ),
         }),
+        ["env_vars", ..] => Err(DotPathError::Unsupported {
+            key: key.to_string(),
+            reason: "environment variables are managed by the dedicated revisioned env API"
+                .to_string(),
+        }),
         ["notifications", "ntfy", "token"] | ["notifications", "bark", "device_key"] => {
             Err(DotPathError::SecretPath {
                 key: key.to_string(),

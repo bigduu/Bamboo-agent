@@ -78,6 +78,7 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                 }
                 // Never expose encrypted material via API.
                 obj.remove("value_encrypted");
+                obj.remove("credential_ref");
             }
         }
     }

@@ -71,22 +71,30 @@ use bamboo_domain::ReasoningEffort;
 
 /// A user-managed environment variable that is injected into Bash tool processes.
 ///
-/// Secret entries are encrypted at rest: `value` is empty on disk and populated
-/// in memory after hydration from `value_encrypted`.
+/// Secret entries are stored by reference in the isolated credential store:
+/// `value` is runtime-only for those entries, while `credential_ref` and
+/// `configured` are the only secret metadata persisted in ordinary config.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvVarEntry {
     /// Variable name (must match `^[A-Za-z_][A-Za-z0-9_]*$`).
     pub name: String,
     /// Plaintext value – populated in memory after hydration.
     /// For `secret=true` entries this field is empty on disk.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub value: String,
     /// Whether this variable contains sensitive data (token, password, etc.).
     #[serde(default)]
     pub secret: bool,
-    /// Encrypted ciphertext (only present on disk for secret entries).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy inline ciphertext, accepted on read only so startup migration can
+    /// extract it. New serializers never emit this field.
+    #[serde(default, skip_serializing)]
     pub value_encrypted: Option<String>,
+    /// Stable isolated-store reference for secret entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Durable status metadata; never inferred from a public mask.
+    #[serde(default)]
+    pub configured: bool,
     /// Optional human-readable description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -2791,6 +2799,16 @@ impl Config {
         }
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_env_var_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "env credential hydration unavailable");
+                for entry in &mut config.env_vars {
+                    if entry.secret {
+                        entry.value.clear();
+                    }
+                }
+            }
+        }
         // Decrypt encrypted cluster-fabric SSH secrets into in-memory plaintext.
         config.hydrate_cluster_fabric_from_encrypted();
         // Decrypt the encrypted broker token into in-memory plaintext.
@@ -3807,6 +3825,15 @@ impl Config {
         {
             anyhow::bail!(
                 "proxy auth requires the isolated credential transaction before persistence"
+            );
+        }
+        if self.env_vars.iter().any(|entry| {
+            entry.secret
+                && entry.credential_ref.is_none()
+                && (entry.configured || !entry.value.is_empty() || entry.value_encrypted.is_some())
+        }) {
+            anyhow::bail!(
+                "secret env vars require the isolated credential transaction before persistence"
             );
         }
 
@@ -4937,6 +4964,8 @@ mod tests {
                 value: "top-secret".to_string(),
                 secret: true,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: Some("Service token".to_string()),
             },
             EnvVarEntry {
@@ -4944,6 +4973,8 @@ mod tests {
                 value: "https://internal.example".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: Some("Internal API base".to_string()),
             },
         ]);
@@ -4994,6 +5025,8 @@ mod tests {
             value: "live".to_string(),
             secret: false,
             value_encrypted: None,
+            credential_ref: None,
+            configured: true,
             description: None,
         }]);
         live.publish_env_vars();
@@ -7237,6 +7270,41 @@ mod tests {
     }
 
     #[test]
+    fn config_save_refuses_configured_secret_env_without_ref_before_any_write() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let mut config = Config::default();
+        config.env_vars.push(EnvVarEntry {
+            name: "TOKEN".to_string(),
+            value: String::new(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let path = temp_home.path.join("config.json");
+
+        let error = config.save_to_dir(temp_home.path.clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("isolated credential transaction"));
+        assert!(
+            !path.exists(),
+            "a rejected dangling ref must not create config.json"
+        );
+
+        let original = br#"{"preserve":"original"}"#;
+        std::fs::write(&path, original).unwrap();
+        config.save_to_dir(temp_home.path.clone()).unwrap_err();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "a rejected dangling ref must not modify an existing config.json"
+        );
+    }
+
+    #[test]
     fn config_save_persists_provider_reference_and_isolates_plaintext() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
@@ -7541,6 +7609,8 @@ mod tests {
                 value: "val_a".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7548,6 +7618,8 @@ mod tests {
                 value: "".to_string(), // empty → should be excluded
                 secret: true,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: false,
                 description: None,
             },
             EnvVarEntry {
@@ -7555,6 +7627,8 @@ mod tests {
                 value: "  ".to_string(), // whitespace-only → excluded
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7562,6 +7636,8 @@ mod tests {
                 value: "val_d".to_string(),
                 secret: true,
                 value_encrypted: Some("enc".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: Some("desc".to_string()),
             },
         ]);
@@ -7583,6 +7659,8 @@ mod tests {
                 value: "visible".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7590,6 +7668,8 @@ mod tests {
                 value: "hidden_value".to_string(),
                 secret: true,
                 value_encrypted: Some("enc_data".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
         ]);
@@ -7601,7 +7681,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_env_vars_for_disk_preserves_encrypted() {
+    fn sanitize_env_vars_for_disk_removes_legacy_encrypted() {
         let mut config = Config::default();
         config.env_vars.extend([
             EnvVarEntry {
@@ -7609,6 +7689,8 @@ mod tests {
                 value: "val".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7616,6 +7698,8 @@ mod tests {
                 value: "real_secret".to_string(),
                 secret: true,
                 value_encrypted: Some("enc".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
         ]);
@@ -7624,53 +7708,50 @@ mod tests {
 
         // Plain value untouched
         assert_eq!(config.env_vars[0].value, "val");
-        // Secret plaintext cleared, but encrypted preserved
+        // Secret plaintext and legacy ciphertext are removed.
         assert_eq!(config.env_vars[1].value, "");
-        assert_eq!(config.env_vars[1].value_encrypted.as_deref(), Some("enc"));
+        assert!(config.env_vars[1].value_encrypted.is_none());
     }
 
     #[test]
-    fn refresh_env_vars_encrypted_round_trip() {
-        let mut config = Config::default();
-        config.env_vars.extend([
-            EnvVarEntry {
-                name: "TOKEN".to_string(),
-                value: "my-secret-token".to_string(),
-                secret: true,
-                value_encrypted: None,
-                description: Some("A token".to_string()),
-            },
-            EnvVarEntry {
-                name: "PLAIN_VAR".to_string(),
-                value: "hello".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-        ]);
-
-        // Encrypt
-        config
-            .refresh_env_vars_encrypted()
-            .expect("encryption should succeed");
-
-        // Secret should now have encrypted value
-        assert!(config.env_vars[0].value_encrypted.is_some());
-        // Plain should have no encrypted value
-        assert!(config.env_vars[1].value_encrypted.is_none());
-
-        // Save encrypted value for later comparison
-        let encrypted = config.env_vars[0].value_encrypted.clone().unwrap();
-        assert_ne!(encrypted, "my-secret-token"); // shouldn't be plaintext
-
-        // Clear plaintext (simulating disk write)
-        config.sanitize_env_vars_for_disk();
-        assert_eq!(config.env_vars[0].value, "");
-
-        // Hydrate (simulating disk read)
+    fn legacy_env_ciphertext_is_read_but_never_serialized() {
+        let ciphertext = crate::encryption::encrypt("my-secret-token").unwrap();
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "env_vars": [{
+                "name": "TOKEN",
+                "secret": true,
+                "value_encrypted": ciphertext
+            }]
+        }))
+        .unwrap();
         config.hydrate_env_vars_from_encrypted();
         assert_eq!(config.env_vars[0].value, "my-secret-token");
-        assert_eq!(config.env_vars[1].value, "hello"); // plain untouched
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized["env_vars"][0].get("value_encrypted").is_none());
+    }
+
+    #[test]
+    fn configured_env_ref_missing_from_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::credential_ref("env", "TOKEN", "value").unwrap();
+        let mut config = Config::default();
+        config.env_vars.push(EnvVarEntry {
+            name: "TOKEN".to_string(),
+            value: String::new(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: Some(reference),
+            configured: true,
+            description: None,
+        });
+        let error = config
+            .hydrate_env_var_credentials_from_store(dir.path())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("referenced env credential is unavailable"));
+        assert!(config.env_vars[0].configured);
+        assert!(config.env_vars[0].value.is_empty());
     }
 
     #[test]
@@ -7691,6 +7772,8 @@ mod tests {
             value: "pub_value".to_string(),
             secret: false,
             value_encrypted: None,
+            credential_ref: None,
+            configured: true,
             description: None,
         }]);
 
@@ -7866,6 +7949,8 @@ mod tests {
             value: "original".to_string(),
             secret: false,
             value_encrypted: Some("should-be-ignored".to_string()),
+            credential_ref: None,
+            configured: true,
             description: None,
         }]);
 
@@ -7892,6 +7977,8 @@ mod tests {
                 value: "val1".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: Some("First key".to_string()),
             },
             EnvVarEntry {
@@ -7899,6 +7986,8 @@ mod tests {
                 value: "".to_string(), // on-disk secret has no plaintext
                 secret: true,
                 value_encrypted: Some("enc123".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
         ]);
@@ -7912,10 +8001,7 @@ mod tests {
         assert!(!restored.env_vars[0].secret);
         assert_eq!(restored.env_vars[1].name, "KEY2");
         assert!(restored.env_vars[1].secret);
-        assert_eq!(
-            restored.env_vars[1].value_encrypted.as_deref(),
-            Some("enc123")
-        );
+        assert!(restored.env_vars[1].value_encrypted.is_none());
     }
 
     // ---- defaults.* model resolution tests ----

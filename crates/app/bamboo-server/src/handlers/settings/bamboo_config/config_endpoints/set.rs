@@ -15,6 +15,11 @@ pub async fn set_bamboo_config(
 ) -> Result<HttpResponse, AppError> {
     let patch = payload.into_inner();
     let mut patch_obj = config_manager::assert_json_object(patch)?;
+    if patch_obj.contains_key("env_vars") {
+        return Err(AppError::BadRequest(
+            "env_vars must be changed through the dedicated revisioned env-vars API".to_string(),
+        ));
+    }
     let model_limits_patch = take_model_limits_patch(&mut patch_obj);
     config_manager::sanitize_root_patch(&mut patch_obj);
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
@@ -78,4 +83,41 @@ pub async fn set_bamboo_config(
     }
 
     Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http::StatusCode, test, App};
+
+    #[actix_web::test]
+    async fn root_patch_rejects_env_vars_instead_of_silently_dropping_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/config", web::post().to(set_bamboo_config))
+                .route(
+                    "/config/validate",
+                    web::post().to(crate::handlers::settings::validate_bamboo_config_patch),
+                ),
+        )
+        .await;
+        for uri in ["/config", "/config/validate"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(uri)
+                    .set_json(serde_json::json!({
+                        "env_vars": [{"name": "TOKEN", "value": "secret", "secret": true}]
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("revisioned env-vars API"));
+        }
+    }
 }

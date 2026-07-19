@@ -22,6 +22,11 @@ pub async fn validate_bamboo_config_patch(
 ) -> Result<HttpResponse, AppError> {
     let patch = payload.into_inner();
     let mut patch_obj = config_manager::assert_json_object(patch)?;
+    if patch_obj.contains_key("env_vars") {
+        return Err(AppError::BadRequest(
+            "env_vars must be changed through the dedicated revisioned env-vars API".to_string(),
+        ));
+    }
     config_manager::sanitize_root_patch(&mut patch_obj);
 
     let current = app_state.config.read().await.clone();

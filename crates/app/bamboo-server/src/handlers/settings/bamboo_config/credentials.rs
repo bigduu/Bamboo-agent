@@ -56,7 +56,7 @@ pub async fn replace_credential(
 ) -> Result<HttpResponse, AppError> {
     let credential_ref = parse_credential_ref(path.into_inner())?;
     let _io = app_state.config_io_lock.lock().await;
-    reject_active_proxy_ref(&app_state, &credential_ref).await?;
+    reject_managed_credential_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
         .replace(
@@ -77,7 +77,7 @@ pub async fn clear_credential(
 ) -> Result<HttpResponse, AppError> {
     let credential_ref = parse_credential_ref(path.into_inner())?;
     let _io = app_state.config_io_lock.lock().await;
-    reject_active_proxy_ref(&app_state, &credential_ref).await?;
+    reject_managed_credential_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
         .clear(&credential_ref, payload.expected_revision)
@@ -130,21 +130,24 @@ fn parse_credential_ref(value: String) -> Result<CredentialRef, AppError> {
         .map_err(|_| AppError::BadRequest("invalid credential reference".to_string()))
 }
 
-async fn reject_active_proxy_ref(
+async fn reject_managed_credential_ref(
     app_state: &AppState,
     credential_ref: &CredentialRef,
 ) -> Result<(), AppError> {
-    if app_state
-        .config
-        .read()
-        .await
-        .proxy_auth_credential_ref
-        .as_ref()
-        == Some(credential_ref)
-    {
+    let config = app_state.config.read().await;
+    if config.proxy_auth_credential_ref.as_ref() == Some(credential_ref) {
         return Err(AppError::BadRequest(
             "active proxy credentials must be changed through the revisioned proxy-auth API"
                 .to_string(),
+        ));
+    }
+    if config
+        .env_vars
+        .iter()
+        .any(|entry| entry.credential_ref.as_ref() == Some(credential_ref))
+    {
+        return Err(AppError::BadRequest(
+            "env credentials must be changed through the revisioned env-vars API".to_string(),
         ));
     }
     Ok(())
@@ -427,5 +430,66 @@ mod tests {
                 .map(|auth| auth.username.as_str()),
             Some("active")
         );
+    }
+
+    #[actix_web::test]
+    async fn generic_mutations_reject_env_refs_without_changing_any_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let reference = CredentialRef::parse("env.TOKEN.value").unwrap();
+        state
+            .credential_store
+            .replace(reference.clone(), "env-secret", CredentialSource::User, 0)
+            .unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.env_vars.push(bamboo_config::EnvVarEntry {
+                name: "TOKEN".to_string(),
+                value: "env-secret".to_string(),
+                secret: true,
+                value_encrypted: None,
+                credential_ref: Some(reference.clone()),
+                configured: true,
+                description: None,
+            });
+            config.publish_env_vars();
+        }
+        let before_store = std::fs::read(state.credential_store.path()).unwrap();
+        let before_runtime = bamboo_config::Config::current_env_vars();
+        let before_config = state.config.read().await.clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::put().to(replace_credential),
+                )
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::delete().to(clear_credential),
+                ),
+        )
+        .await;
+        for request in [
+            test::TestRequest::put()
+                .uri("/credentials/env.TOKEN.value")
+                .set_json(serde_json::json!({"expected_revision": 1, "value": "bad"}))
+                .to_request(),
+            test::TestRequest::delete()
+                .uri("/credentials/env.TOKEN.value")
+                .set_json(serde_json::json!({"expected_revision": 1}))
+                .to_request(),
+        ] {
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                actix_web::http::StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            before_store
+        );
+        assert_eq!(bamboo_config::Config::current_env_vars(), before_runtime);
+        assert_eq!(state.config.read().await.env_vars, before_config.env_vars);
     }
 }

@@ -66,6 +66,7 @@ enum MigrationState {
 #[serde(rename_all = "snake_case")]
 enum ExactTransactionScope {
     ProxyAuth,
+    EnvVars,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,9 @@ struct StagedFile {
     /// Metadata publication is forbidden until each of these refs decrypts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     required_credential_refs: Vec<String>,
+    /// Exact env transactions use names for per-entry three-way config merge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    touched_env_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,12 +127,14 @@ struct ExtractedSecret {
     value: LegacySecret,
     migration_generation: u64,
     kind: ExtractedSecretKind,
+    env_owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtractedSecretKind {
     Other,
     ProxyAuth,
+    EnvVar,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -152,6 +158,22 @@ enum MigrationFault {
     AfterExactCredentialRebaseStage,
     AfterExactCredentialRebaseManifest,
     AfterExactProxyConfigRebaseManifestExternalWrite,
+}
+
+#[cfg(feature = "test-utils")]
+type EnvTransactionTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(feature = "test-utils")]
+static ENV_TRANSACTION_TEST_HOOK: std::sync::Mutex<Option<EnvTransactionTestHook>> =
+    std::sync::Mutex::new(None);
+
+/// Install a one-shot hook immediately after an env exact manifest commits.
+/// Test-only: production builds have no hook or timing branch.
+#[cfg(feature = "test-utils")]
+pub fn set_env_transaction_test_hook(hook: impl FnOnce(&Path) + Send + 'static) {
+    *ENV_TRANSACTION_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
 }
 
 /// Extract provider/MCP sidecar secrets into the isolated credential store.
@@ -251,6 +273,8 @@ pub fn persist_proxy_auth_credential_transaction_at_revision(
         &BTreeSet::from(["__proxy_auth".to_string()]),
         &BTreeSet::new(),
         Some(expected_revision),
+        &BTreeSet::new(),
+        None,
         None,
     );
     #[cfg(not(test))]
@@ -259,6 +283,39 @@ pub fn persist_proxy_auth_credential_transaction_at_revision(
         config,
         &BTreeSet::from(["__proxy_auth".to_string()]),
         &BTreeSet::new(),
+        Some(expected_revision),
+        &BTreeSet::new(),
+        None,
+    )
+}
+
+/// Persist secret env values and their root metadata as one recoverable exact
+/// transaction guarded by the credential document revision.
+pub fn persist_env_var_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    env_intents: &BTreeSet<String>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    #[cfg(test)]
+    return persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        env_intents,
+        Some(expected_revision),
+        None,
+    );
+    #[cfg(not(test))]
+    persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        env_intents,
         Some(expected_revision),
     )
 }
@@ -285,6 +342,8 @@ pub fn persist_provider_instance_credential_transaction(
         provider_intents,
         provider_instance_intents,
         None,
+        &BTreeSet::new(),
+        None,
         None,
     )
     .map(|_| ());
@@ -294,6 +353,8 @@ pub fn persist_provider_instance_credential_transaction(
         config,
         provider_intents,
         provider_instance_intents,
+        None,
+        &BTreeSet::new(),
         None,
     )
     .map(|_| ())
@@ -315,22 +376,35 @@ fn persist_provider_credential_transaction_inner(
             .contains("__proxy_auth")
             .then(|| CredentialStore::open(data_dir).revision_unchecked())
             .transpose()?,
+        &BTreeSet::new(),
+        None,
         fault,
     )
     .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_provider_credential_transaction_with_instances_inner(
     data_dir: &Path,
     config: &mut crate::Config,
     provider_intents: &BTreeSet<String>,
     provider_instance_intents: &BTreeSet<String>,
     proxy_expected_revision: Option<u64>,
+    env_intents: &BTreeSet<String>,
+    env_expected_revision: Option<u64>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
     let proxy_only = provider_intents.len() == 1
         && provider_intents.contains("__proxy_auth")
         && provider_instance_intents.is_empty();
+    let env_only = provider_intents.is_empty()
+        && provider_instance_intents.is_empty()
+        && !env_intents.is_empty();
+    if !env_intents.is_empty() && !env_only {
+        return Err(ConfigStoreError::Validation(
+            "env credentials must be updated in their own transaction".to_string(),
+        ));
+    }
     std::fs::create_dir_all(data_dir)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -353,14 +427,26 @@ fn persist_provider_credential_transaction_with_instances_inner(
     let providers_original = read_target_or_empty(&data_dir.join(PROVIDERS_FILE))?;
     let config_original = read_target_or_empty(&data_dir.join(CONFIG_FILE))?;
     let persisted_instance_refs = provider_instance_refs_from_document(&config_original)?;
+    let persisted_env_refs = env_refs_from_document(&config_original)?;
+    if env_only {
+        for name in env_intents {
+            if let Some(reference) = persisted_env_refs.get(name) {
+                ensure_env_ref_exclusive(data_dir, reference.as_str(), name)?;
+            }
+        }
+    }
     let store = CredentialStore::open(data_dir);
-    let Some(prepared) = store.prepare_provider_api_key_intents(
-        config,
-        provider_intents,
-        provider_instance_intents,
-        &persisted_instance_refs,
-    )?
-    else {
+    let prepared = if env_only {
+        store.prepare_env_var_intents(config, env_intents, &persisted_env_refs)?
+    } else {
+        store.prepare_provider_api_key_intents(
+            config,
+            provider_intents,
+            provider_instance_intents,
+            &persisted_instance_refs,
+        )?
+    };
+    let Some(mut prepared) = prepared else {
         return store.revision_unchecked();
     };
     if proxy_only {
@@ -376,9 +462,27 @@ fn persist_provider_credential_transaction_with_instances_inner(
             });
         }
     }
+    if env_only {
+        let expected = env_expected_revision.ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "env credential revision precondition is required".to_string(),
+            )
+        })?;
+        if prepared.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: prepared.expected_revision,
+            });
+        }
+    }
     let (config_bytes, provider_bytes) = if proxy_only {
         (
             prepare_proxy_auth_config_document(&config_original, config)?,
+            providers_original.clone(),
+        )
+    } else if env_only {
+        (
+            prepare_env_var_config_document(&config_original, config)?,
             providers_original.clone(),
         )
     } else {
@@ -386,11 +490,21 @@ fn persist_provider_credential_transaction_with_instances_inner(
             .prepare_provider_transaction_documents(&providers_original)
             .map_err(|error| ConfigStoreError::Validation(error.to_string()))?
     };
+    let env_domain_changed = env_only && env_var_domain_changed(&config_original, &config_bytes)?;
+    if env_domain_changed {
+        prepared.advance_revision_for_domain_change()?;
+    }
     if store.revision_unchecked()? != prepared.expected_revision {
         return Err(ConfigStoreError::Conflict {
             expected: prepared.expected_revision,
             actual: store.revision_unchecked()?,
         });
+    }
+    // A true env-domain no-op keeps the CAS revision and avoids publishing an
+    // event or rewriting either durable member. Any credential or config
+    // semantic change advances the one shared revision exactly once.
+    if env_only && !env_domain_changed && prepared.revision == prepared.expected_revision {
+        return Ok(prepared.revision);
     }
 
     let transaction_id = Uuid::new_v4().to_string();
@@ -427,7 +541,7 @@ fn persist_provider_credential_transaction_with_instances_inner(
         .map(|reference| reference.as_str().to_string())
         .collect();
     credential_file.transaction_base_sha256 = credential_file.original_sha256.clone();
-    if !proxy_only {
+    if !proxy_only && !env_only {
         stage_file(
             &stage_dir,
             &backup_dir,
@@ -453,6 +567,12 @@ fn persist_provider_credential_transaction_with_instances_inner(
         None,
         &mut staged,
     )?;
+    if env_only {
+        staged
+            .last_mut()
+            .expect("env transaction stages config last")
+            .touched_env_names = env_intents.iter().cloned().collect();
+    }
     restrict_directory_files_to_owner(&stage_dir)?;
     restrict_directory_files_to_owner(&backup_dir)?;
     sync_dir(&stage_dir)?;
@@ -467,7 +587,13 @@ fn persist_provider_credential_transaction_with_instances_inner(
         transaction_id,
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
-        exact_scope: proxy_only.then_some(ExactTransactionScope::ProxyAuth),
+        exact_scope: if proxy_only {
+            Some(ExactTransactionScope::ProxyAuth)
+        } else if env_only {
+            Some(ExactTransactionScope::EnvVars)
+        } else {
+            None
+        },
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -504,6 +630,16 @@ fn persist_provider_credential_transaction_with_instances_inner(
         }
     }
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    #[cfg(feature = "test-utils")]
+    if env_only {
+        if let Some(hook) = ENV_TRANSACTION_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            hook(data_dir);
+        }
+    }
     #[cfg(test)]
     if matches!(
         fault,
@@ -598,6 +734,7 @@ fn migrate_inner(
         .filter_map(Option::as_ref)
         .map(|section| (section.bytes.as_slice(), section.name == CONFIG_FILE))
         .collect::<Vec<_>>();
+    ensure_legacy_env_extractions_are_safe(data_dir, &extracted, &prospective_documents)?;
     ensure_legacy_proxy_extractions_are_safe(
         data_dir,
         &credential_store,
@@ -606,7 +743,11 @@ fn migrate_inner(
     )?;
     ensure_backup_legacy_proxy_extractions_are_safe(data_dir, &credential_store)?;
     if providers.is_none() && mcp.is_none() && provider_instances.is_none() {
-        scrub_provider_instance_credentials_from_backups(data_dir, &BTreeSet::new())?;
+        scrub_provider_instance_credentials_from_backups(
+            data_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )?;
         return Ok(CredentialMigrationOutcome {
             migrated_credentials: 0,
             resumed: false,
@@ -708,6 +849,11 @@ fn resolve_extracted_secrets(
         // also makes a fresh plan after an uncommitted crash idempotent.
         let status = store.status_unchecked(&secret.credential_ref)?;
         if status.configured && status.source != crate::CredentialSource::Migrated {
+            if secret.kind == ExtractedSecretKind::EnvVar {
+                return Err(ConfigStoreError::Validation(
+                    "legacy env credential target is already user-managed".to_string(),
+                ));
+            }
             continue;
         }
         let value = match secret.value {
@@ -752,6 +898,85 @@ fn ensure_legacy_proxy_extractions_are_safe(
         }
     }
     Ok(())
+}
+
+fn ensure_legacy_env_extractions_are_safe(
+    data_dir: &Path,
+    extracted: &[ExtractedSecret],
+    prospective_documents: &[(&[u8], bool)],
+) -> ConfigStoreResult<()> {
+    for secret in extracted
+        .iter()
+        .filter(|secret| secret.kind == ExtractedSecretKind::EnvVar)
+    {
+        let owner = secret.env_owner.as_deref().ok_or_else(|| {
+            ConfigStoreError::Validation("legacy env credential owner is missing".to_string())
+        })?;
+        ensure_env_ref_exclusive(data_dir, secret.credential_ref.as_str(), owner)?;
+        for (bytes, _) in prospective_documents {
+            let value: Value = serde_json::from_slice(bytes)?;
+            if contains_other_env_credential_consumer(&value, secret.credential_ref.as_str(), owner)
+            {
+                return Err(ConfigStoreError::Validation(
+                    "env credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_env_ref_exclusive(
+    data_dir: &Path,
+    reference: &str,
+    owner: &str,
+) -> ConfigStoreResult<()> {
+    for name in [
+        CONFIG_FILE,
+        PROVIDERS_FILE,
+        MCP_FILE,
+        "config.json.bak",
+        "config.json.bak.1",
+        "config.json.bak.2",
+    ] {
+        let bytes = read_target_or_empty(&data_dir.join(name))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) if name.starts_with("config.json.bak") => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if contains_other_env_credential_consumer(&value, reference, owner) {
+            return Err(ConfigStoreError::Validation(
+                "env credential reference is shared by another consumer".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contains_other_env_credential_consumer(value: &Value, reference: &str, owner: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            let owned_env_entry = object.get("name").and_then(Value::as_str) == Some(owner)
+                && object.contains_key("secret");
+            object.iter().any(|(key, child)| {
+                if owned_env_entry && key == "credential_ref" {
+                    return false;
+                }
+                (key == "credential_ref" && child.as_str() == Some(reference))
+                    || (key.ends_with("_credential_refs")
+                        && contains_string_value(child, reference))
+                    || contains_other_env_credential_consumer(child, reference, owner)
+            })
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|child| contains_other_env_credential_consumer(child, reference, owner)),
+        _ => false,
+    }
 }
 
 fn ensure_backup_legacy_proxy_extractions_are_safe(
@@ -894,6 +1119,7 @@ fn plan_provider_section(
                 .expect("one provider credential exists"),
             migration_generation,
             kind: ExtractedSecretKind::Other,
+            env_owner: None,
         });
         changed = true;
     }
@@ -944,6 +1170,31 @@ fn provider_instance_refs_from_document(
         .collect()
 }
 
+fn env_refs_from_document(bytes: &[u8]) -> ConfigStoreResult<BTreeMap<String, CredentialRef>> {
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let root: Value = serde_json::from_slice(bytes)?;
+    let Some(entries) = root.get("env_vars").and_then(Value::as_array) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut refs = BTreeMap::new();
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(raw) = entry.get("credential_ref") {
+            let raw = raw.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "env credential reference must be a string".to_string(),
+                )
+            })?;
+            refs.insert(name.to_string(), CredentialRef::parse(raw.to_string())?);
+        }
+    }
+    Ok(refs)
+}
+
 fn plan_provider_instance_section(
     data_dir: &Path,
     extracted: &mut Vec<ExtractedSecret>,
@@ -971,7 +1222,10 @@ fn plan_provider_instance_section(
             extracted.extend(root_extracted);
             Ok(planned)
         }
-        Err(ConfigStoreError::Validation(message)) if message.starts_with("legacy proxy auth") => {
+        Err(ConfigStoreError::Validation(message))
+            if message.starts_with("legacy proxy auth")
+                || message.starts_with("legacy env credential") =>
+        {
             Err(ConfigStoreError::Validation(message))
         }
         // Root-config corruption recovery runs after migration readiness. Do
@@ -994,6 +1248,7 @@ fn plan_provider_instance_document(
     })?;
     let migration_generation = minimum_generation;
     let mut changed = migrate_proxy_auth(object, extracted, migration_generation)?;
+    changed |= migrate_env_vars(object, extracted, migration_generation)?;
     if let Some(instances) = object.get_mut("provider_instances") {
         let instances = instances.as_object_mut().ok_or_else(|| {
             ConfigStoreError::Validation("provider_instances must be an object".to_string())
@@ -1018,13 +1273,14 @@ fn plan_provider_instance_document(
                 Value::String(reference.as_str().to_string()),
             );
             extracted.push(ExtractedSecret {
-                credential_ref: reference,
+                credential_ref: reference.clone(),
                 value: plaintext
                     .map(LegacySecret::Plaintext)
                     .or_else(|| ciphertext.map(LegacySecret::Ciphertext))
                     .expect("one provider-instance credential exists"),
                 migration_generation,
                 kind: ExtractedSecretKind::Other,
+                env_owner: None,
             });
             changed = true;
         }
@@ -1039,6 +1295,87 @@ fn plan_provider_instance_document(
         original,
         migration_generation,
     }))
+}
+
+fn migrate_env_vars(
+    object: &mut Map<String, Value>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    let Some(entries) = object.get_mut("env_vars").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for entry in entries {
+        let entry = entry.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("env var entry must be an object".to_string())
+        })?;
+        if !entry
+            .get("secret")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            changed |= entry.remove("value_encrypted").is_some();
+            changed |= entry.remove("credential_ref").is_some();
+            changed |= entry.remove("configured").is_some();
+            continue;
+        }
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ConfigStoreError::Validation("env var name is missing".to_string()))?
+            .to_string();
+        let had_plaintext_field = entry.contains_key("value");
+        let had_ciphertext_field = entry.contains_key("value_encrypted");
+        let previous_ref = entry.get("credential_ref").cloned();
+        let previous_configured = entry.get("configured").cloned();
+        let plaintext = take_nonempty_string(entry, "value")?;
+        let ciphertext = take_nonempty_string(entry, "value_encrypted")?;
+        let value = match (plaintext, ciphertext) {
+            (Some(plaintext), Some(ciphertext)) => {
+                let decrypted = crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                    ConfigStoreError::Validation(
+                        "legacy env credential could not be decrypted".to_string(),
+                    )
+                })?;
+                if plaintext != decrypted {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential fields contain conflicting values".to_string(),
+                    ));
+                }
+                Some(LegacySecret::Plaintext(plaintext))
+            }
+            (Some(plaintext), None) => Some(LegacySecret::Plaintext(plaintext)),
+            (None, Some(ciphertext)) => Some(LegacySecret::Ciphertext(ciphertext)),
+            (None, None) => None,
+        };
+        let reference =
+            existing_or_generated_ref(entry.get("credential_ref"), "env", &name, "value")?;
+        entry.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        let configured = value.is_some()
+            || entry
+                .get("configured")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        entry.insert("configured".to_string(), Value::Bool(configured));
+        if let Some(value) = value {
+            extracted.push(ExtractedSecret {
+                credential_ref: reference.clone(),
+                value,
+                migration_generation,
+                kind: ExtractedSecretKind::EnvVar,
+                env_owner: Some(name.clone()),
+            });
+        }
+        changed |= had_plaintext_field
+            || had_ciphertext_field
+            || previous_ref.as_ref() != Some(&Value::String(reference.as_str().to_string()))
+            || previous_configured.as_ref() != Some(&Value::Bool(configured));
+    }
+    Ok(changed)
 }
 
 fn migrate_proxy_auth(
@@ -1106,6 +1443,7 @@ fn migrate_proxy_auth(
         value: LegacySecret::Plaintext(secret),
         migration_generation,
         kind: ExtractedSecretKind::ProxyAuth,
+        env_owner: None,
     });
     Ok(true)
 }
@@ -1232,6 +1570,7 @@ fn migrate_mcp_transport(
                     .expect("one header credential exists"),
                 migration_generation,
                 kind: ExtractedSecretKind::Other,
+                env_owner: None,
             });
             changed = true;
         }
@@ -1301,6 +1640,7 @@ fn migrate_named_secret_map(
                 value,
                 migration_generation,
                 kind: ExtractedSecretKind::Other,
+                env_owner: None,
             });
         }
     }
@@ -1467,6 +1807,7 @@ fn stage_file(
         transaction_base_sha256: None,
         touched_credential_refs: Vec::new(),
         required_credential_refs: Vec::new(),
+        touched_env_names: Vec::new(),
     });
     Ok(())
 }
@@ -1495,6 +1836,93 @@ fn prepare_proxy_auth_config_document(
         )
     })?;
     Ok(serde_json::to_vec_pretty(&document)?)
+}
+
+fn prepare_env_var_config_document(
+    current: &[u8],
+    candidate: &crate::Config,
+) -> ConfigStoreResult<Vec<u8>> {
+    let mut root = parse_config_root_object(
+        current,
+        "config.json is invalid during env credential transaction",
+    )?;
+    let current_entries = root
+        .get("env_vars")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let object = entry.as_object()?.clone();
+            let name = object.get("name")?.as_str()?.to_string();
+            Some((name, object))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = Vec::with_capacity(candidate.env_vars.len());
+    for mut entry in candidate.env_vars.clone() {
+        if entry.secret {
+            if entry.credential_ref.is_none() {
+                return Err(ConfigStoreError::Validation(
+                    "secret env credential metadata is incomplete".to_string(),
+                ));
+            }
+            entry.value.clear();
+            entry.value_encrypted = None;
+        } else {
+            entry.credential_ref = None;
+            entry.configured = !entry.value.is_empty();
+        }
+        let mut durable = current_entries
+            .get(&entry.name)
+            .cloned()
+            .unwrap_or_default();
+        for key in [
+            "name",
+            "value",
+            "secret",
+            "value_encrypted",
+            "credential_ref",
+            "configured",
+            "description",
+        ] {
+            durable.remove(key);
+        }
+        let typed = serde_json::to_value(entry)?;
+        durable.extend(
+            typed
+                .as_object()
+                .expect("env var serializes as object")
+                .clone(),
+        );
+        entries.push(Value::Object(durable));
+    }
+    if entries.is_empty() {
+        root.remove("env_vars");
+    } else {
+        root.insert("env_vars".to_string(), Value::Array(entries));
+    }
+    let document = Value::Object(root);
+    serde_json::from_value::<crate::Config>(document.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json is invalid during env credential transaction".to_string(),
+        )
+    })?;
+    Ok(serde_json::to_vec_pretty(&document)?)
+}
+
+fn env_var_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult<bool> {
+    fn domain(bytes: &[u8]) -> ConfigStoreResult<Vec<Value>> {
+        let root = parse_config_root_object(
+            bytes,
+            "config.json is invalid during env credential transaction",
+        )?;
+        Ok(root
+            .get("env_vars")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    Ok(domain(current)? != domain(candidate)?)
 }
 
 fn parse_config_root_object(
@@ -1730,6 +2158,71 @@ fn abort_proxy_exact_transaction(
     sync_dir(data_dir)
 }
 
+fn rollback_env_config_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let (_initial_file, initial_staged) =
+        initial_exact_transaction_member(data_dir, manifest, CONFIG_FILE)?;
+    let staged = parse_config_root_object(
+        &initial_staged,
+        "staged env config transaction document is invalid",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    let target = data_dir.join(CONFIG_FILE);
+    for _ in 0..16 {
+        let current = read_target_or_empty(&target)?;
+        let current_hash = sha256(&current);
+        let mut object = parse_config_root_object(
+            &current,
+            "config.json changed to an invalid document during env rollback",
+        )?;
+        if object.get("env_vars") != staged.get("env_vars") {
+            return Ok(());
+        }
+        match original.get("env_vars").cloned() {
+            Some(entries) => {
+                object.insert("env_vars".to_string(), entries);
+            }
+            None => {
+                object.remove("env_vars");
+            }
+        }
+        let rolled_back = serde_json::to_vec_pretty(&Value::Object(object))?;
+        if AtomicFileStore::new(&target)
+            .write_bytes_if_hash_with_backup(&current_hash, &rolled_back)?
+        {
+            return Ok(());
+        }
+    }
+    Err(ConfigStoreError::Validation(
+        "env config transaction rollback could not obtain a stable document".to_string(),
+    ))
+}
+
+fn abort_env_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::EnvVars) {
+        return Ok(());
+    }
+    rollback_env_config_member(data_dir, manifest)?;
+    rollback_proxy_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
+}
+
 fn ensure_proxy_consumers_or_abort(
     data_dir: &Path,
     manifest: &MigrationManifest,
@@ -1794,7 +2287,7 @@ fn install_pending(
                     .write_bytes_if_hash_with_backup(expected, &staged)?
                 {
                     if file.name == CONFIG_FILE
-                        && install_rebased_proxy_config_member(
+                        && install_rebased_exact_config_member(
                             data_dir,
                             manifest,
                             file_index,
@@ -1863,6 +2356,258 @@ fn install_pending(
         }
     }
     Ok(())
+}
+
+fn install_rebased_exact_config_member(
+    data_dir: &Path,
+    manifest: &mut MigrationManifest,
+    file_index: usize,
+    #[cfg(test)] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<bool> {
+    if manifest.exact_scope == Some(ExactTransactionScope::EnvVars) {
+        return install_rebased_env_config_member(data_dir, manifest, file_index);
+    }
+    install_rebased_proxy_config_member(
+        data_dir,
+        manifest,
+        file_index,
+        #[cfg(test)]
+        fault,
+    )
+}
+
+fn install_rebased_env_config_member(
+    data_dir: &Path,
+    manifest: &mut MigrationManifest,
+    file_index: usize,
+) -> ConfigStoreResult<bool> {
+    let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
+    let file = manifest.files[file_index].clone();
+    let staged_bytes = std::fs::read(stage_dir.join(&file.staged_name))?;
+    let staged = parse_config_root_object(
+        &staged_bytes,
+        "staged env config transaction document is invalid",
+    )?;
+    let target = data_dir.join(CONFIG_FILE);
+    let current = read_target_or_empty(&target)?;
+    let current_hash = sha256(&current);
+    let mut current_object = parse_config_root_object(
+        &current,
+        "config.json changed to an invalid document during committed env transaction",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original_object = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    let current_entries = env_entry_map(&current_object)?;
+    let original_entries = env_entry_map(&original_object)?;
+    let staged_entries = env_entry_map(&staged)?;
+    let touched_names = file
+        .touched_env_names
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if touched_names.is_empty() {
+        return Err(ConfigStoreError::Validation(
+            "committed env transaction is missing touched names".to_string(),
+        ));
+    }
+    let mut merged_entries = current_entries.clone();
+    let required_refs = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .map(|file| {
+            file.required_credential_refs
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    for name in &touched_names {
+        let current_entry = current_entries.get(name);
+        let original_entry = original_entries.get(name);
+        let staged_entry = staged_entries.get(name);
+        if current_entry == staged_entry {
+            continue;
+        }
+        match staged_entry {
+            Some(staged_entry) => {
+                match merge_env_entry_three_way(current_entry, original_entry, staged_entry)? {
+                    Some(merged) => {
+                        merged_entries.insert(name.clone(), merged);
+                    }
+                    None => {
+                        let current_ref = current_entry
+                            .and_then(|entry| entry.get("credential_ref"))
+                            .and_then(Value::as_str);
+                        if current_ref.is_some_and(|reference| required_refs.contains(reference)) {
+                            // The external same-name winner still consumes the
+                            // credential required by the transaction. Keep both;
+                            // rolling the credential back could manufacture a
+                            // dangling configured reference.
+                            continue;
+                        }
+                        abort_env_exact_transaction(data_dir, manifest)?;
+                        return Err(ConfigStoreError::Validation(
+                            "env metadata changed during committed transaction".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                if env_known_fields(current_entry) == env_known_fields(original_entry) {
+                    merged_entries.remove(name);
+                } else if current_entry.is_some() {
+                    let current_ref = current_entry
+                        .and_then(|entry| entry.get("credential_ref"))
+                        .and_then(Value::as_str);
+                    if !current_ref.is_some_and(|reference| required_refs.contains(reference)) {
+                        abort_env_exact_transaction(data_dir, manifest)?;
+                        return Err(ConfigStoreError::Validation(
+                            "env metadata changed during committed transaction".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut ordered = Vec::new();
+    let mut emitted = BTreeSet::new();
+    if let Some(current_array) = current_object.get("env_vars").and_then(Value::as_array) {
+        for entry in current_array {
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(merged) = merged_entries.get(name) {
+                ordered.push(merged.clone());
+                emitted.insert(name.to_string());
+            }
+        }
+    }
+    if let Some(staged_array) = staged.get("env_vars").and_then(Value::as_array) {
+        for entry in staged_array {
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !emitted.contains(name) {
+                if let Some(merged) = merged_entries.get(name) {
+                    ordered.push(merged.clone());
+                    emitted.insert(name.to_string());
+                }
+            }
+        }
+    }
+    if ordered.is_empty() {
+        current_object.remove("env_vars");
+    } else {
+        current_object.insert("env_vars".to_string(), Value::Array(ordered));
+    }
+    let rebased = Value::Object(current_object);
+    serde_json::from_value::<crate::Config>(rebased.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed env transaction"
+                .to_string(),
+        )
+    })?;
+    let rebased = serde_json::to_vec_pretty(&rebased)?;
+    let staged_name = format!("{CONFIG_FILE}.rebase.{}", Uuid::new_v4());
+    AtomicFileStore::new(stage_dir.join(&staged_name)).write_bytes_without_backup(&rebased)?;
+    sync_dir(&stage_dir)?;
+    let file = &mut manifest.files[file_index];
+    file.staged_name = staged_name;
+    file.sha256 = sha256(&rebased);
+    file.original_sha256 = Some(current_hash.clone());
+    write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
+    if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
+        return Err(ConfigStoreError::Validation(
+            "config.json changed repeatedly during committed env transaction".to_string(),
+        ));
+    }
+    Ok(true)
+}
+
+const ENV_ENTRY_KNOWN_KEYS: [&str; 7] = [
+    "name",
+    "value",
+    "secret",
+    "value_encrypted",
+    "credential_ref",
+    "configured",
+    "description",
+];
+
+fn env_entry_map(object: &Map<String, Value>) -> ConfigStoreResult<BTreeMap<String, Value>> {
+    let mut entries = BTreeMap::new();
+    let Some(array) = object.get("env_vars").and_then(Value::as_array) else {
+        return Ok(entries);
+    };
+    for entry in array {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ConfigStoreError::Validation("env var name is missing".to_string()))?;
+        if entries.insert(name.to_string(), entry.clone()).is_some() {
+            return Err(ConfigStoreError::Validation(
+                "environment variable names must be unique".to_string(),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn env_known_fields(entry: Option<&Value>) -> Option<Map<String, Value>> {
+    let object = entry?.as_object()?;
+    Some(
+        ENV_ENTRY_KNOWN_KEYS
+            .iter()
+            .filter_map(|key| {
+                object
+                    .get(*key)
+                    .cloned()
+                    .map(|value| ((*key).to_string(), value))
+            })
+            .collect(),
+    )
+}
+
+/// Returns `None` for a true same-field three-way conflict. Unknown fields are
+/// always taken from the current document so forward-compatible metadata is
+/// not normalized away by an env credential update.
+fn merge_env_entry_three_way(
+    current: Option<&Value>,
+    original: Option<&Value>,
+    staged: &Value,
+) -> ConfigStoreResult<Option<Value>> {
+    let staged = staged.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation("staged env entry is not an object".to_string())
+    })?;
+    let current_object = current.and_then(Value::as_object);
+    let original_object = original.and_then(Value::as_object);
+    let mut merged = current_object.cloned().unwrap_or_default();
+    for key in ENV_ENTRY_KNOWN_KEYS {
+        let current_value = current_object.and_then(|object| object.get(key));
+        let original_value = original_object.and_then(|object| object.get(key));
+        let staged_value = staged.get(key);
+        let chosen = if current_value == staged_value || current_value == original_value {
+            staged_value
+        } else if staged_value == original_value {
+            current_value
+        } else {
+            return Ok(None);
+        };
+        match chosen {
+            Some(value) => {
+                merged.insert(key.to_string(), value.clone());
+            }
+            None => {
+                merged.remove(key);
+            }
+        }
+    }
+    Ok(Some(Value::Object(merged)))
 }
 
 fn install_rebased_proxy_config_member(
@@ -2254,7 +2999,12 @@ fn rebase_changed_section(
 
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
     let proxy_clear_tombstones = proxy_clear_tombstones_from_manifest(&manifest);
-    scrub_provider_instance_credentials_from_backups(data_dir, &proxy_clear_tombstones)?;
+    let env_clear_tombstones = env_clear_tombstones_from_manifest(&manifest);
+    scrub_provider_instance_credentials_from_backups(
+        data_dir,
+        &proxy_clear_tombstones,
+        &env_clear_tombstones,
+    )?;
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
@@ -2275,9 +3025,28 @@ fn proxy_clear_tombstones_from_manifest(manifest: &MigrationManifest) -> BTreeSe
         .collect()
 }
 
+fn env_clear_tombstones_from_manifest(manifest: &MigrationManifest) -> BTreeSet<String> {
+    if manifest.exact_scope != Some(ExactTransactionScope::EnvVars) {
+        return BTreeSet::new();
+    }
+    let Some(file) = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+    else {
+        return BTreeSet::new();
+    };
+    file.touched_credential_refs
+        .iter()
+        .filter(|reference| !file.required_credential_refs.contains(reference))
+        .cloned()
+        .collect()
+}
+
 fn scrub_provider_instance_credentials_from_backups(
     data_dir: &Path,
     proxy_clear_tombstones: &BTreeSet<String>,
+    env_clear_tombstones: &BTreeSet<String>,
 ) -> ConfigStoreResult<()> {
     let store = CredentialStore::open(data_dir);
     for suffix in ["bak", "bak.1", "bak.2"] {
@@ -2296,6 +3065,7 @@ fn scrub_provider_instance_credentials_from_backups(
             &store,
             &mut root,
             proxy_clear_tombstones,
+            env_clear_tombstones,
         )? {
             continue;
         }
@@ -2310,6 +3080,7 @@ fn scrub_provider_instance_credentials(
     store: &CredentialStore,
     root: &mut Value,
     proxy_clear_tombstones: &BTreeSet<String>,
+    env_clear_tombstones: &BTreeSet<String>,
 ) -> ConfigStoreResult<bool> {
     let Some(object) = root.as_object_mut() else {
         return Ok(false);
@@ -2321,6 +3092,37 @@ fn scrub_provider_instance_credentials(
         } else {
             migrate_proxy_auth(object, &mut extracted, 1)?
         };
+    changed |= migrate_env_vars(object, &mut extracted, 1)?;
+    if let Some(entries) = object.get_mut("env_vars").and_then(Value::as_array_mut) {
+        for entry in entries {
+            let Some(entry) = entry.as_object_mut() else {
+                continue;
+            };
+            if entry
+                .get("credential_ref")
+                .and_then(Value::as_str)
+                .is_some_and(|reference| env_clear_tombstones.contains(reference))
+            {
+                entry.insert("configured".to_string(), Value::Bool(false));
+            }
+        }
+    }
+    let mut pending = Vec::with_capacity(extracted.len());
+    for secret in extracted.drain(..) {
+        if secret.kind == ExtractedSecretKind::EnvVar {
+            if env_clear_tombstones.contains(secret.credential_ref.as_str()) {
+                continue;
+            }
+            let status = store.status_unchecked(&secret.credential_ref)?;
+            if status.configured && status.source != crate::CredentialSource::Migrated {
+                // The live store is authoritative; the backup was already
+                // rewritten to metadata above, so never replay its stale copy.
+                continue;
+            }
+        }
+        pending.push(secret);
+    }
+    extracted = pending;
     if let Some(instances) = object
         .get_mut("provider_instances")
         .and_then(Value::as_object_mut)
@@ -2365,6 +3167,7 @@ fn scrub_provider_instance_credentials(
                         value,
                         migration_generation: 1,
                         kind: ExtractedSecretKind::Other,
+                        env_owner: None,
                     });
                 } else {
                     instance.remove("api_key");
@@ -2512,6 +3315,15 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                     .find(|file| file.name == CREDENTIALS_FILE)
                     .is_some_and(|file| file.touched_credential_refs.len() == 1)
         }
+        (true, Some(ExactTransactionScope::EnvVars)) => {
+            manifest.files.len() == 2
+                && unique.contains(CONFIG_FILE)
+                && manifest
+                    .files
+                    .iter()
+                    .find(|file| file.name == CREDENTIALS_FILE)
+                    .is_some_and(|file| !file.touched_credential_refs.is_empty())
+        }
         (true, None) => manifest.files.len() == 3 && unique.contains(PROVIDERS_FILE),
         (false, Some(_)) => false,
     };
@@ -2584,9 +3396,15 @@ fn valid_staged_name(file: &StagedFile) -> bool {
 
 fn valid_credential_ref_metadata(file: &StagedFile) -> bool {
     if file.name != CREDENTIALS_FILE || file.install_mode != InstallMode::Exact {
+        let env_names = file.touched_env_names.iter().collect::<BTreeSet<_>>();
         return file.transaction_base_sha256.is_none()
             && file.touched_credential_refs.is_empty()
-            && file.required_credential_refs.is_empty();
+            && file.required_credential_refs.is_empty()
+            && (file.touched_env_names.is_empty()
+                || (file.name == CONFIG_FILE
+                    && file.install_mode == InstallMode::Exact
+                    && env_names.len() == file.touched_env_names.len()
+                    && file.touched_env_names.iter().all(|name| !name.is_empty())));
     }
     let touched = file.touched_credential_refs.iter().collect::<BTreeSet<_>>();
     let required = file
@@ -2600,6 +3418,7 @@ fn valid_credential_ref_metadata(file: &StagedFile) -> bool {
         && touched
             .iter()
             .all(|value| CredentialRef::parse((*value).clone()).is_ok())
+        && file.touched_env_names.is_empty()
 }
 
 fn validated_stage_dir(data_dir: &Path, name: &str) -> ConfigStoreResult<PathBuf> {
@@ -4661,6 +5480,7 @@ mod tests {
             transaction_base_sha256: None,
             touched_credential_refs: Vec::new(),
             required_credential_refs: Vec::new(),
+            touched_env_names: Vec::new(),
         };
         let traversal = MigrationManifest {
             version: MIGRATION_VERSION,
@@ -4998,6 +5818,8 @@ mod tests {
             &BTreeSet::new(),
             &instance_intents,
             None,
+            &BTreeSet::new(),
+            None,
             None,
         )
         .unwrap();
@@ -5067,6 +5889,8 @@ mod tests {
             &mut candidate,
             &BTreeSet::new(),
             &BTreeSet::from(["work".to_string()]),
+            None,
+            &BTreeSet::new(),
             None,
             Some(MigrationFault::AfterExactCommitCredentialClearRace),
         )
@@ -5578,5 +6402,618 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("definitely-secret-bad-cipher"));
         assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn legacy_secret_env_migrates_to_ref_and_scrubs_backups_idempotently() {
+        let _key = crate::encryption::set_test_encryption_key([0x91; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ciphertext = crate::encryption::encrypt("legacy-env-secret").unwrap();
+        let legacy = serde_json::json!({
+            "future_root": {"kept": true},
+            "env_vars": [{
+                "name": "PRIVATE_TOKEN",
+                "secret": true,
+                "value_encrypted": ciphertext,
+                "future_entry": "kept"
+            }]
+        });
+        for name in [CONFIG_FILE, "config.json.bak"] {
+            std::fs::write(
+                dir.path().join(name),
+                serde_json::to_vec_pretty(&legacy).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let first = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(first.migrated_credentials, 1);
+        let reference = credential_ref("env", "PRIVATE_TOKEN", "value").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "legacy-env-secret"
+        );
+        for name in [CONFIG_FILE, "config.json.bak"] {
+            let document: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(name)).unwrap()).unwrap();
+            let entry = &document["env_vars"][0];
+            assert_eq!(entry["credential_ref"], reference.as_str());
+            assert_eq!(entry["configured"], true);
+            assert!(entry.get("value").is_none());
+            assert!(entry.get("value_encrypted").is_none());
+            assert_eq!(entry["future_entry"], "kept");
+            assert_eq!(document["future_root"]["kept"], true);
+        }
+        let revision = CredentialStore::open(dir.path()).revision().unwrap();
+        let second = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(second.migrated_credentials, 0);
+        assert_eq!(
+            CredentialStore::open(dir.path()).revision().unwrap(),
+            revision
+        );
+    }
+
+    #[test]
+    fn legacy_env_plaintext_and_ciphertext_must_agree_before_any_write() {
+        let _key = crate::encryption::set_test_encryption_key([0x94; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let conflicting = serde_json::json!({
+            "env_vars": [{
+                "name": "TOKEN", "secret": true, "value": "plain-winner",
+                "value_encrypted": crate::encryption::encrypt("different").unwrap()
+            }]
+        });
+        let bytes = serde_json::to_vec_pretty(&conflicting).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &bytes).unwrap();
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("conflicting values"));
+        assert_eq!(std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(), bytes);
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+
+        let matching = serde_json::json!({
+            "env_vars": [{
+                "name": "TOKEN", "secret": true, "value": "same",
+                "value_encrypted": crate::encryption::encrypt("same").unwrap()
+            }]
+        });
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&matching).unwrap(),
+        )
+        .unwrap();
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(outcome.migrated_credentials, 1);
+        let revision = CredentialStore::open(dir.path()).revision().unwrap();
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path()).revision().unwrap(),
+            revision
+        );
+    }
+
+    #[test]
+    fn non_secret_env_legacy_ciphertext_is_scrubbed_from_root_and_backup() {
+        let _key = crate::encryption::set_test_encryption_key([0x95; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = serde_json::json!({
+            "env_vars": [{
+                "name": "PUBLIC", "secret": false, "value": "visible",
+                "value_encrypted": "must-not-remain"
+            }]
+        });
+        for name in [CONFIG_FILE, "config.json.bak"] {
+            std::fs::write(
+                dir.path().join(name),
+                serde_json::to_vec_pretty(&legacy).unwrap(),
+            )
+            .unwrap();
+        }
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        for name in [CONFIG_FILE, "config.json.bak"] {
+            let bytes = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            assert!(!bytes.contains("value_encrypted"));
+            assert!(!bytes.contains("must-not-remain"));
+            assert!(bytes.contains("visible"));
+        }
+    }
+
+    #[test]
+    fn env_exact_transaction_enforces_cas_and_recovers_once_after_manifest() {
+        let _key = crate::encryption::set_test_encryption_key([0x92; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let mut candidate = crate::Config::default();
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: "TOKEN".to_string(),
+            value: "winner".to_string(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let intents = BTreeSet::from(["TOKEN".to_string()]);
+        let error = persist_provider_credential_transaction_with_instances_inner(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &intents,
+            Some(0),
+            Some(MigrationFault::AfterManifest),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigStoreError::Io(_)));
+        assert!(dir.path().join(MANIFEST_FILE).exists());
+
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+        let reference = credential_ref("env", "TOKEN", "value").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "winner"
+        );
+        let revision = CredentialStore::open(dir.path()).revision().unwrap();
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path()).revision().unwrap(),
+            revision
+        );
+
+        let stale = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(stale, ConfigStoreError::Conflict { actual, .. } if actual == revision));
+    }
+
+    #[test]
+    fn env_domain_revision_advances_for_public_metadata_order_and_delete_but_not_noop() {
+        let _key = crate::encryption::set_test_encryption_key([0x9a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let mut candidate = crate::Config::default();
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: "FIRST".to_string(),
+            value: "one".to_string(),
+            secret: false,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let first_intent = BTreeSet::from(["FIRST".to_string()]);
+        assert_eq!(
+            persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &first_intent,
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        candidate.env_vars[0].description = Some("metadata".to_string());
+        assert_eq!(
+            persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &first_intent,
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let stale = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &first_intent,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            stale,
+            ConfigStoreError::Conflict { actual: 2, .. }
+        ));
+        let bytes_before_noop = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        assert_eq!(
+            persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &first_intent,
+                2,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            bytes_before_noop
+        );
+
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: "SECOND".to_string(),
+            value: "two".to_string(),
+            secret: false,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let both = BTreeSet::from(["FIRST".to_string(), "SECOND".to_string()]);
+        assert_eq!(
+            persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &both,
+                2,
+            )
+            .unwrap(),
+            3
+        );
+        candidate.env_vars.swap(0, 1);
+        assert_eq!(
+            persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &both,
+                3,
+            )
+            .unwrap(),
+            4
+        );
+        candidate.env_vars.retain(|entry| entry.name != "FIRST");
+        assert_eq!(
+            persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &first_intent,
+                4,
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(CredentialStore::open(dir.path()).revision().unwrap(), 5);
+    }
+
+    fn crash_env_transaction_after_credentials(
+        dir: &Path,
+        name: &str,
+        value: &str,
+    ) -> CredentialRef {
+        std::fs::write(dir.join(CONFIG_FILE), b"{}").unwrap();
+        let mut candidate = crate::Config::default();
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: name.to_string(),
+            value: value.to_string(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let error = persist_provider_credential_transaction_with_instances_inner(
+            dir,
+            &mut candidate,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::from([name.to_string()]),
+            Some(0),
+            Some(MigrationFault::AfterCredentials),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigStoreError::Io(_)));
+        credential_ref("env", name, "value").unwrap()
+    }
+
+    #[test]
+    fn committed_env_recovery_merges_unrelated_name_and_same_name_future_metadata() {
+        let _key = crate::encryption::set_test_encryption_key([0x97; 32]);
+        for same_name_future_metadata in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let reference = crash_env_transaction_after_credentials(dir.path(), "TOKEN", "winner");
+            let external = if same_name_future_metadata {
+                serde_json::json!({
+                    "external_root": true,
+                    "env_vars": [{
+                        "name": "TOKEN", "secret": true,
+                        "credential_ref": reference.as_str(), "configured": true,
+                        "future_metadata": {"kept": true}
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "external_root": true,
+                    "env_vars": [{"name": "OTHER", "value": "external", "secret": false}]
+                })
+            };
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec_pretty(&external).unwrap(),
+            )
+            .unwrap();
+            migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+            let root: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(root["external_root"], true);
+            let entries = root["env_vars"].as_array().unwrap();
+            assert!(entries.iter().any(|entry| entry["name"] == "TOKEN"));
+            if same_name_future_metadata {
+                assert_eq!(entries[0]["future_metadata"]["kept"], true);
+            } else {
+                assert!(entries.iter().any(|entry| entry["name"] == "OTHER"));
+            }
+            assert_eq!(
+                CredentialStore::open(dir.path())
+                    .resolve(&reference)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                "winner"
+            );
+            let revision = CredentialStore::open(dir.path()).revision().unwrap();
+            migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+            assert_eq!(
+                CredentialStore::open(dir.path()).revision().unwrap(),
+                revision
+            );
+        }
+    }
+
+    #[test]
+    fn same_name_custom_ref_winner_compensates_touched_credential_without_dangling() {
+        let _key = crate::encryption::set_test_encryption_key([0x98; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let touched = crash_env_transaction_after_credentials(dir.path(), "TOKEN", "staged");
+        let custom = credential_ref("env_external", "TOKEN", "value").unwrap();
+        CredentialStore::open(dir.path())
+            .replace_unchecked(
+                custom.clone(),
+                "external-winner",
+                crate::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "env_vars": [{
+                    "name": "TOKEN", "secret": true,
+                    "credential_ref": custom.as_str(), "configured": true,
+                    "description": "external metadata"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("env metadata changed"));
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&touched)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&custom)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "external-winner"
+        );
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["env_vars"][0]["credential_ref"], custom.as_str());
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(root["env_vars"][0]["configured"], true);
+    }
+
+    #[test]
+    fn env_clear_or_delete_recovery_restores_credential_for_same_name_external_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0x99; 32]);
+        for delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let reference = credential_ref("env", "TOKEN", "value").unwrap();
+            CredentialStore::open(dir.path())
+                .replace(
+                    reference.clone(),
+                    "original-secret",
+                    crate::CredentialSource::User,
+                    0,
+                )
+                .unwrap();
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "env_vars": [{
+                        "name": "TOKEN", "secret": true,
+                        "credential_ref": reference.as_str(), "configured": true,
+                        "description": "original"
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut candidate =
+                crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+            if delete {
+                candidate.env_vars.clear();
+            } else {
+                candidate.env_vars[0].value.clear();
+                candidate.env_vars[0].configured = false;
+                candidate.env_vars[0].description = Some("transaction-clear".to_string());
+            }
+            let error = persist_provider_credential_transaction_with_instances_inner(
+                dir.path(),
+                &mut candidate,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                None,
+                &BTreeSet::from(["TOKEN".to_string()]),
+                Some(1),
+                Some(MigrationFault::AfterCredentials),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ConfigStoreError::Io(_)));
+            assert!(!std::fs::read_to_string(dir.path().join(CREDENTIALS_FILE))
+                .unwrap()
+                .contains(reference.as_str()));
+
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "env_vars": [{
+                        "name": "TOKEN", "secret": true,
+                        "credential_ref": reference.as_str(), "configured": true,
+                        "description": if delete { "external-readd" } else { "external-clear-winner" }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let recovery = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+            assert!(recovery.to_string().contains("env metadata changed"));
+            assert!(!dir.path().join(MANIFEST_FILE).exists());
+            assert_eq!(
+                CredentialStore::open(dir.path())
+                    .resolve(&reference)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                "original-secret"
+            );
+            let root: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(root["env_vars"][0]["configured"], true);
+            assert_eq!(
+                root["env_vars"][0]["description"],
+                if delete {
+                    "external-readd"
+                } else {
+                    "external-clear-winner"
+                }
+            );
+            migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+            assert!(!dir.path().join(MANIFEST_FILE).exists());
+            assert!(CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn env_clear_rejects_a_reference_shared_by_another_consumer() {
+        let _key = crate::encryption::set_test_encryption_key([0x93; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = credential_ref("shared", "owner", "secret").unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "env_vars": [{
+                    "name": "TOKEN", "secret": true,
+                    "credential_ref": shared.as_str(), "configured": true
+                }],
+                "provider_instances": {"other": {
+                    "provider_type": "openai", "model": "gpt-test",
+                    "credential_ref": shared.as_str()
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                shared.clone(),
+                "shared-value",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.env_vars.clear();
+        let revision = CredentialStore::open(dir.path()).revision().unwrap();
+        let error = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::from(["TOKEN".to_string()]),
+            revision,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shared by another consumer"));
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&shared)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "shared-value"
+        );
+    }
+
+    #[test]
+    fn ownerless_canonical_env_credential_cannot_be_cleared_by_non_secret_create() {
+        let _key = crate::encryption::set_test_encryption_key([0x96; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let canonical = credential_ref("env", "TOKEN", "value").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                canonical.clone(),
+                "generic-owner",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut candidate = crate::Config::default();
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: "TOKEN".to_string(),
+            value: "public".to_string(),
+            secret: false,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let error = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::from(["TOKEN".to_string()]),
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already in use"));
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&canonical)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "generic-owner"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap())
+                .unwrap(),
+            serde_json::json!({})
+        );
     }
 }

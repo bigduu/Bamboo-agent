@@ -201,6 +201,10 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     patch_obj.remove("http_proxy_auth_encrypted");
     patch_obj.remove("https_proxy_auth_encrypted");
     patch_obj.remove("data_dir");
+    // Env values and storage metadata are managed by the revisioned env API.
+    // Dropping the whole domain prevents mask/ref/configured spoofing through
+    // the permissive root PATCH surface.
+    patch_obj.remove("env_vars");
 
     // Never allow clients to set encrypted key material directly.
     if let Some(providers) = patch_obj

@@ -70,7 +70,7 @@ default. The full field list of `Config`:
 | `hooks` | `HooksConfig` | Request preflight hooks; today just `image_fallback` (text-only-model image handling). |
 | `tools` | `ToolsConfig` | `{ disabled: Vec<String> }` — tool names omitted from every session's schema globally. |
 | `skills` | `SkillsConfig` | `{ disabled: Vec<String> }` — skill ids excluded from selection/loading globally. |
-| `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes (`{name, value, secret, value_encrypted}`); `secret: true` entries are encrypted at rest. |
+| `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
 | `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
@@ -82,6 +82,19 @@ default. The full field list of `Config`:
 | `connect` | `ConnectConfig` | **Not actually stored here** — see [connect](#connect--the-im-bridge). |
 | `plugin_trust` | `PluginTrustConfig` | Plugin install trust policy. See below. |
 | `extra` | `BTreeMap<String, Value>` | Catch-all flatten for keys not (yet) promoted to a typed field — `permissions`, `externalAgents`, `subagentRouting`, setup-wizard state, etc. live here. Round-trips losslessly even for fields this version of Bamboo doesn't know about. |
+
+Env variable writes use the dedicated revisioned `/bamboo/env-vars` API. Its
+`revision` is the env-domain CAS revision stored in the credential envelope;
+every semantic env change (including metadata, public values, ordering, and
+deletes) advances it once, while a true no-op keeps it and emits no change
+event. `config.json` participates in the same recoverable manifest transaction
+and is hash-CAS protected. Secret
+inputs use three states: omitted `value` keeps an existing secret, `value: ""`
+explicitly clears it, and a non-empty value replaces it. Masks and client-sent
+`credential_ref`/`configured`/`value_encrypted` fields are rejected. Existing
+Lotus builds do not yet send this revision or omit `value` for metadata-only
+edits; updating that client contract is deferred to the Lotus follow-up and is
+not part of Bamboo Issue #597.
 
 ## Providers
 
