@@ -606,7 +606,7 @@ fn migrate_inner(
     )?;
     ensure_backup_legacy_proxy_extractions_are_safe(data_dir, &credential_store)?;
     if providers.is_none() && mcp.is_none() && provider_instances.is_none() {
-        scrub_provider_instance_credentials_from_backups(data_dir)?;
+        scrub_provider_instance_credentials_from_backups(data_dir, &BTreeSet::new())?;
         return Ok(CredentialMigrationOutcome {
             migrated_credentials: 0,
             resumed: false,
@@ -772,7 +772,9 @@ fn ensure_backup_legacy_proxy_extractions_are_safe(
             continue;
         };
         let mut extracted = Vec::new();
-        migrate_proxy_auth(object, &mut extracted, 1)?;
+        if !scrub_authoritative_or_tombstoned_proxy_auth(object, store, &BTreeSet::new())? {
+            migrate_proxy_auth(object, &mut extracted, 1)?;
+        }
         ensure_legacy_proxy_extractions_are_safe(
             data_dir,
             store,
@@ -781,6 +783,70 @@ fn ensure_backup_legacy_proxy_extractions_are_safe(
         )?;
     }
     Ok(())
+}
+
+fn scrub_authoritative_or_tombstoned_proxy_auth(
+    object: &mut Map<String, Value>,
+    store: &CredentialStore,
+    proxy_clear_tombstones: &BTreeSet<String>,
+) -> ConfigStoreResult<bool> {
+    let had_legacy = [
+        "proxy_auth",
+        "proxy_auth_encrypted",
+        "http_proxy_auth_encrypted",
+        "https_proxy_auth_encrypted",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    if !had_legacy {
+        return Ok(false);
+    }
+    let tombstone_reference = proxy_clear_tombstones
+        .iter()
+        .next()
+        .map(|reference| CredentialRef::parse(reference.clone()))
+        .transpose()?;
+    let reference = match tombstone_reference.as_ref() {
+        Some(reference) => reference.clone(),
+        None => object
+            .get("proxy_auth_credential_ref")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        ConfigStoreError::Validation(
+                            "proxy auth credential reference must be a string".to_string(),
+                        )
+                    })
+                    .and_then(|value| CredentialRef::parse(value.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(credential_ref("proxy", "default", "auth")?),
+    };
+    let authoritative = if tombstone_reference.is_some() {
+        true
+    } else {
+        let status = store.status_unchecked(&reference)?;
+        status.configured && status.source != crate::CredentialSource::Migrated
+    };
+    if !authoritative {
+        return Ok(false);
+    }
+    // The store value or exact clear is authoritative. Scrub the stale backup
+    // by metadata only: do not decrypt, normalize, or compare its secret.
+    for key in [
+        "proxy_auth",
+        "proxy_auth_encrypted",
+        "http_proxy_auth_encrypted",
+        "https_proxy_auth_encrypted",
+    ] {
+        object.remove(key);
+    }
+    object.insert(
+        "proxy_auth_credential_ref".to_string(),
+        Value::String(reference.as_str().to_string()),
+    );
+    Ok(true)
 }
 
 fn plan_provider_section(
@@ -2187,14 +2253,32 @@ fn rebase_changed_section(
 }
 
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
-    scrub_provider_instance_credentials_from_backups(data_dir)?;
+    let proxy_clear_tombstones = proxy_clear_tombstones_from_manifest(&manifest);
+    scrub_provider_instance_credentials_from_backups(data_dir, &proxy_clear_tombstones)?;
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
     cleanup_transaction_dirs(data_dir, &manifest)
 }
 
-fn scrub_provider_instance_credentials_from_backups(data_dir: &Path) -> ConfigStoreResult<()> {
+fn proxy_clear_tombstones_from_manifest(manifest: &MigrationManifest) -> BTreeSet<String> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ProxyAuth) {
+        return BTreeSet::new();
+    }
+    manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .filter(|file| file.required_credential_refs.is_empty())
+        .into_iter()
+        .flat_map(|file| file.touched_credential_refs.iter().cloned())
+        .collect()
+}
+
+fn scrub_provider_instance_credentials_from_backups(
+    data_dir: &Path,
+    proxy_clear_tombstones: &BTreeSet<String>,
+) -> ConfigStoreResult<()> {
     let store = CredentialStore::open(data_dir);
     for suffix in ["bak", "bak.1", "bak.2"] {
         let path = data_dir.join(format!("{CONFIG_FILE}.{suffix}"));
@@ -2207,7 +2291,12 @@ fn scrub_provider_instance_credentials_from_backups(data_dir: &Path) -> ConfigSt
             Ok(root) => root,
             Err(_) => continue,
         };
-        if !scrub_provider_instance_credentials(data_dir, &store, &mut root)? {
+        if !scrub_provider_instance_credentials(
+            data_dir,
+            &store,
+            &mut root,
+            proxy_clear_tombstones,
+        )? {
             continue;
         }
         AtomicFileStore::new(path)
@@ -2220,12 +2309,18 @@ fn scrub_provider_instance_credentials(
     data_dir: &Path,
     store: &CredentialStore,
     root: &mut Value,
+    proxy_clear_tombstones: &BTreeSet<String>,
 ) -> ConfigStoreResult<bool> {
     let Some(object) = root.as_object_mut() else {
         return Ok(false);
     };
     let mut extracted = Vec::new();
-    let mut changed = migrate_proxy_auth(object, &mut extracted, 1)?;
+    let mut changed =
+        if scrub_authoritative_or_tombstoned_proxy_auth(object, store, proxy_clear_tombstones)? {
+            true
+        } else {
+            migrate_proxy_auth(object, &mut extracted, 1)?
+        };
     if let Some(instances) = object
         .get_mut("provider_instances")
         .and_then(Value::as_object_mut)
@@ -3015,6 +3110,79 @@ mod tests {
     }
 
     #[test]
+    fn proxy_clear_tombstone_scrubs_a_late_backup_without_reimporting_secret() {
+        let _key = crate::encryption::set_test_encryption_key([0xa7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let cleared_ref = CredentialRef::parse("proxy.custom.auth").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                cleared_ref.clone(),
+                &serde_json::to_string(&crate::ProxyAuth {
+                    username: "current-user".to_string(),
+                    password: "current-password".to_string(),
+                })
+                .unwrap(),
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "proxy_auth_credential_ref": cleared_ref.as_str()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut candidate = crate::Config::default();
+        candidate.proxy_auth_credential_ref = Some(cleared_ref.clone());
+        candidate.proxy_auth = None;
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterConfig),
+        )
+        .is_err());
+        assert!(store.resolve_unchecked(&cleared_ref).unwrap().is_none());
+
+        let late_ciphertext = crate::encryption::encrypt(
+            &serde_json::to_string(&crate::ProxyAuth {
+                username: "late-backup-user".to_string(),
+                password: "late-backup-password".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let late_backup = dir.path().join("config.json.bak.2");
+        std::fs::write(
+            &late_backup,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "proxy_auth_encrypted": late_ciphertext
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+        assert!(store.resolve_unchecked(&cleared_ref).unwrap().is_none());
+        let backup: Value = serde_json::from_slice(&std::fs::read(&late_backup).unwrap()).unwrap();
+        assert!(backup.get("proxy_auth_encrypted").is_none());
+        assert_eq!(backup["proxy_auth_credential_ref"], cleared_ref.as_str());
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert!(loaded.proxy_auth.is_none());
+        assert!(store.resolve(&cleared_ref).unwrap().is_none());
+        assert!(store
+            .resolve(&credential_ref("proxy", "default", "auth").unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn proxy_auth_replace_detaches_from_shared_provider_ref_without_overwrite() {
         let _key = crate::encryption::set_test_encryption_key([0x96; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -3659,44 +3827,78 @@ mod tests {
     }
 
     #[test]
-    fn backup_only_proxy_auth_is_not_scrubbed_when_canonical_is_user_managed() {
+    fn user_managed_proxy_auth_scrubs_stale_backup_and_keeps_provider_sidecar_ready() {
         let _key = crate::encryption::set_test_encryption_key([0x9f; 32]);
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
         let canonical = credential_ref("proxy", "default", "auth").unwrap();
-        CredentialStore::open(dir.path())
+        let authoritative = serde_json::to_string(&crate::ProxyAuth {
+            username: "authoritative-user".to_string(),
+            password: "authoritative-password".to_string(),
+        })
+        .unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
             .replace(
-                canonical,
-                "not-a-proxy-auth-document",
+                canonical.clone(),
+                &authoritative,
                 crate::CredentialSource::User,
                 0,
             )
             .unwrap();
-        let ciphertext = crate::encryption::encrypt(
-            &serde_json::json!({"username": "backup-user", "password": "backup-secret"})
-                .to_string(),
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "proxy_auth_credential_ref": canonical.as_str(),
+                "providers": {
+                    "openai": {"model": "root-stale-model"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "openai": {
+                    "api_key": "provider-sidecar-secret",
+                    "model": "sidecar-authoritative-model"
+                }
+            }))
+            .unwrap(),
         )
         .unwrap();
         let backup_path = dir.path().join("config.json.bak");
         std::fs::write(
             &backup_path,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "proxy_auth_encrypted": ciphertext
+                "proxy_auth_encrypted": "invalid-stale-ciphertext-must-not-be-decrypted"
             }))
             .unwrap(),
         )
         .unwrap();
-        let backup_before = std::fs::read(&backup_path).unwrap();
-        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
 
-        let error = migrate_provider_mcp_credentials(dir.path()).unwrap_err();
-        assert!(error.to_string().contains("already user-managed"));
-        assert_eq!(std::fs::read(&backup_path).unwrap(), backup_before);
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let auth = loaded
+            .proxy_auth
+            .as_ref()
+            .expect("user proxy auth hydrated");
+        assert_eq!(auth.username, "authoritative-user");
+        assert_eq!(auth.password, "authoritative-password");
+        let openai = loaded.providers.openai.as_ref().expect("sidecar loaded");
+        assert_eq!(openai.model.as_deref(), Some("sidecar-authoritative-model"));
+        assert_eq!(openai.api_key, "provider-sidecar-secret");
         assert_eq!(
-            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
-            credentials_before
+            store.resolve(&canonical).unwrap().unwrap().expose(),
+            authoritative
         );
-        assert_no_migration_transaction_artifacts(dir.path());
+        assert_eq!(
+            store.status(&canonical).unwrap().source,
+            crate::CredentialSource::User
+        );
+        let backup: Value = serde_json::from_slice(&std::fs::read(&backup_path).unwrap()).unwrap();
+        assert!(backup.get("proxy_auth_encrypted").is_none());
+        assert_eq!(backup["proxy_auth_credential_ref"], canonical.as_str());
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
     }
 
     #[test]
