@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use bamboo_agent_core::tools::{handle_tool_result_with_agentic_support, ToolHandlingOutcome};
 use bamboo_agent_core::AgentEvent;
 
@@ -99,7 +97,10 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
         ctx.event_tx,
         ctx.session,
         ctx.tools.as_ref(),
-        ctx.config.composition_executor.as_ref().map(Arc::clone),
+        // Legacy ad-hoc CompositionExecutor dispatch is intentionally disabled
+        // in the agent runtime. Catalog-pinned workflow_run is the single
+        // production orchestration authority (#578).
+        None,
     )
     .await;
 

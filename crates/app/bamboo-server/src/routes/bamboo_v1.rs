@@ -1,6 +1,6 @@
 use actix_web::{dev::HttpServiceFactory, web};
 
-use crate::handlers::{command, copilot_auth, settings, skill, tools, workspace};
+use crate::handlers::{command, copilot_auth, settings, skill, tools, workflow_runs, workspace};
 
 /// Builds the full Bamboo internal route table (commands / settings / skills /
 /// tools / workspace / copilot-auth / provider-catalog / provider-instances /
@@ -37,6 +37,26 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
         .route(
             "/bamboo/workflow-catalog",
             web::get().to(settings::list_workflow_catalog),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-runs",
+            web::post().to(workflow_runs::start),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-runs/{run_id}",
+            web::get().to(workflow_runs::get),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-runs/{run_id}/events",
+            web::get().to(workflow_runs::events),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-runs/{run_id}/cancel",
+            web::post().to(workflow_runs::cancel),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-runs/{run_id}/restart",
+            web::post().to(workflow_runs::restart),
         )
         .route("/bamboo/workflows", web::get().to(settings::list_workflows))
         .route(

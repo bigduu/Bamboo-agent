@@ -43,4 +43,5 @@ pub mod openai;
 pub mod settings;
 pub mod skill;
 pub mod tools;
+pub mod workflow_runs;
 pub mod workspace;

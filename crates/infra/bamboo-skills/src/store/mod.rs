@@ -1103,7 +1103,6 @@ impl SkillStore {
                                 skills.insert(id.clone(), skill.clone());
                                 roots.insert(id.clone(), record.skill_root.clone());
                                 let mut entry = previous_entry.clone();
-                                entry.revision = revision;
                                 entry.status = WorkflowStatus::Invalid;
                                 entry.last_error = Some(error);
                                 entry
@@ -1123,7 +1122,6 @@ impl SkillStore {
                             let mut entry = previous_entry.cloned().unwrap_or_else(|| {
                                 entry_from_skill(skill, record.source, revision, Default::default())
                             });
-                            entry.revision = revision;
                             entry.status = WorkflowStatus::Invalid;
                             entry.last_error = Some(record.error.clone());
                             entry
@@ -1145,6 +1143,96 @@ impl SkillStore {
     pub async fn workflow_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         self.catalog.read().await.clone()
+    }
+
+    /// Pin every new-format orchestration definition from one validated store
+    /// publication. `workflow.yaml` bytes come from the immutable resource
+    /// snapshot (including LKG recovery), never from a second filesystem read.
+    pub async fn pin_workflow_definition_bundle(
+        &self,
+        root_id: &str,
+        root_revision: u64,
+    ) -> SkillResult<bamboo_domain::WorkflowDefinitionBundle> {
+        if let Err(error) = self.reload().await {
+            tracing::warn!(
+                "Failed to reload workflows before bundle pin; using LKG publication: {error}"
+            );
+        }
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        let catalog = self.catalog.read().await;
+        let resources = self.skill_resources.read().await;
+        let mut definitions = BTreeMap::new();
+        for entry in catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.winner && entry.kind == WorkflowKind::Orchestration)
+        {
+            let Some(bytes) = resources
+                .get(&entry.id)
+                .and_then(|resources| resources.get("workflow.yaml"))
+            else {
+                continue;
+            };
+            let value: serde_yaml::Value = serde_yaml::from_slice(bytes)
+                .map_err(|_| SkillError::Validation("invalid pinned workflow yaml".to_string()))?;
+            if value.get("workflow_schema").is_none() {
+                // Legacy definitions stay catalog-visible but are not executable
+                // by the versioned #578 runtime.
+                continue;
+            }
+            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_slice(bytes)
+                .map_err(|_| SkillError::Validation("invalid pinned workflow definition".into()))?;
+            bamboo_domain::CompiledWorkflow::compile(definition.clone())
+                .map_err(|_| SkillError::Validation("invalid pinned workflow definition".into()))?;
+            if definition.id != entry.id || definition.revision != entry.revision {
+                return Err(SkillError::Validation(
+                    "workflow identity does not match its catalog entry".to_string(),
+                ));
+            }
+            definitions.insert(
+                bamboo_domain::WorkflowDefinitionBundle::key(&definition.id, definition.revision),
+                definition,
+            );
+        }
+        let root_key = bamboo_domain::WorkflowDefinitionBundle::key(root_id, root_revision);
+        if !definitions.contains_key(&root_key) {
+            return Err(SkillError::NotFound(format!("{root_id}@{root_revision}")));
+        }
+
+        // Persist only the transitive closure reachable from the selected root.
+        // Keeping every orchestration definition in the publication would copy
+        // unrelated workflow contents into each run snapshot and unnecessarily
+        // amplify its durable storage footprint.
+        let mut reachable = BTreeMap::new();
+        let mut pending = vec![root_key];
+        while let Some(key) = pending.pop() {
+            if reachable.contains_key(&key) {
+                continue;
+            }
+            let definition = definitions.get(&key).cloned().ok_or_else(|| {
+                SkillError::Validation(format!("pinned workflow dependency is missing: {key}"))
+            })?;
+            for step in &definition.steps {
+                if let bamboo_domain::WorkflowStepKind::Workflow {
+                    workflow_id,
+                    revision,
+                    ..
+                } = &step.kind
+                {
+                    pending.push(bamboo_domain::WorkflowDefinitionBundle::key(
+                        workflow_id,
+                        *revision,
+                    ));
+                }
+            }
+            reachable.insert(key, definition);
+        }
+        Ok(bamboo_domain::WorkflowDefinitionBundle {
+            publication_revision: catalog.revision,
+            root_id: root_id.to_string(),
+            root_revision,
+            definitions: reachable,
+        })
     }
 
     /// Return definitions, roots, immutable resource bytes, and metadata from one
@@ -2566,6 +2654,12 @@ mod tests {
         Ok(skill_dir)
     }
 
+    fn orchestration_yaml(id: &str, revision: u64) -> String {
+        format!(
+            "workflow_schema: 1\nid: {id}\nrevision: {revision}\ninput_schema:\n  type: object\n  properties:\n    path:\n      type: string\n  required: [path]\n  additionalProperties: false\nsteps:\n  - id: inspect\n    type: tool\n    tool: read_file\n    args:\n      path:\n        from: args\n        pointer: /path\n    capabilities: [read]\n    output_schema:\n      type: object\n      additionalProperties: true\nplan:\n  type: step\n  step: inspect\nbudgets:\n  max_concurrency: 1\n  max_agents: 0\n  max_steps: 4\n  max_retries: 1\n  max_nesting_depth: 2\n  wall_time_ms: 10000\n"
+        )
+    }
+
     async fn materialize_legacy_builtin(skills_dir: &Path, bundle: &BuiltinSkillBundle) {
         write_skill_file(skills_dir, &bundle.skill)
             .await
@@ -3395,6 +3489,107 @@ Use this skill for testing.
         assert!(!public_error.contains(PRIVATE_RESOURCE));
         assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
         assert!(!public_error.contains(root.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn new_orchestration_definition_is_compiled_and_pinned_from_one_publication() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("data/skills");
+        let root = write_skill(&skills_dir, "review-flow", "review", "Instructions")
+            .await
+            .expect("skill");
+        fs::write(
+            root.join("workflow.yaml"),
+            orchestration_yaml("review-flow", 42),
+        )
+        .await
+        .expect("workflow yaml");
+        let unrelated = write_skill(&skills_dir, "unrelated-flow", "other", "Unrelated")
+            .await
+            .expect("unrelated skill");
+        fs::write(
+            unrelated.join("workflow.yaml"),
+            orchestration_yaml("unrelated-flow", 9),
+        )
+        .await
+        .expect("unrelated workflow yaml");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+
+        let catalog = store.workflow_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review-flow")
+            .expect("catalog entry");
+        assert_eq!(entry.kind, crate::WorkflowKind::Orchestration);
+        assert_eq!(entry.revision, 42);
+        assert_eq!(
+            entry.argument_schema["properties"]["path"]["type"],
+            "string"
+        );
+
+        let bundle = store
+            .pin_workflow_definition_bundle("review-flow", 42)
+            .await
+            .expect("pinned definition");
+        assert_eq!(bundle.publication_revision, catalog.revision);
+        assert_eq!(bundle.root().expect("root").id, "review-flow");
+        assert_eq!(bundle.root().expect("root").revision, 42);
+        assert_eq!(
+            bundle.definitions.len(),
+            1,
+            "unrelated definitions must not be persisted in this run bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_new_definition_keeps_exact_lkg_bytes_and_definition_revision() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("data/skills");
+        let root = write_skill(&skills_dir, "steady-flow", "review", "Original")
+            .await
+            .expect("skill");
+        fs::write(
+            root.join("workflow.yaml"),
+            orchestration_yaml("steady-flow", 7),
+        )
+        .await
+        .expect("workflow yaml");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let original = store
+            .pin_workflow_definition_bundle("steady-flow", 7)
+            .await
+            .expect("original pin");
+
+        fs::write(
+            root.join("workflow.yaml"),
+            "workflow_schema: 1\nid: steady-flow\nrevision: 8\nsteps: []\n",
+        )
+        .await
+        .expect("invalid replacement");
+        store.reload().await.expect("invalid reload isolated");
+        let entry = store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "steady-flow")
+            .expect("LKG entry");
+        assert_eq!(entry.status, WorkflowStatus::Invalid);
+        assert_eq!(entry.revision, 7, "invalid bytes cannot advance identity");
+        let pinned = store
+            .pin_workflow_definition_bundle("steady-flow", 7)
+            .await
+            .expect("LKG remains executable");
+        assert_eq!(pinned.root(), original.root());
     }
 
     #[tokio::test]

@@ -216,6 +216,20 @@ impl SkillManager {
         }
     }
 
+    /// Build an immutable workflow bundle from one global/workspace publication.
+    /// The workspace argument must be derived from trusted server-side session state.
+    pub async fn pin_workflow_definition_bundle(
+        &self,
+        workspace: Option<&Path>,
+        root_id: &str,
+        root_revision: u64,
+    ) -> SkillResult<bamboo_domain::WorkflowDefinitionBundle> {
+        self.store_for_workspace(workspace)
+            .await?
+            .pin_workflow_definition_bundle(root_id, root_revision)
+            .await
+    }
+
     fn filter_skills_for_selection(
         skills: Vec<SkillDefinition>,
         catalog: &WorkflowCatalogSnapshot,
