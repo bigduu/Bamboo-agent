@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Default, Deserialize)]
+pub struct WorkflowCatalogQuery {
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Workflow list item for API responses.
 #[derive(Serialize)]
 pub(super) struct WorkflowListItem {

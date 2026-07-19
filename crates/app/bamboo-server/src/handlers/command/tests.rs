@@ -1,22 +1,36 @@
 use actix_web::{http::StatusCode, web};
-use bamboo_skills::types::SkillDefinition;
+use bamboo_skills::{WorkflowCatalogEntry, WorkflowKind, WorkflowSource, WorkflowStatus};
 
 use std::collections::HashSet;
 
 use super::handlers::{append_unique, expand_arguments};
-use super::sources::{list_markdown_commands, skill_to_command};
+use super::sources::{catalog_entry_to_command, list_markdown_commands};
 use super::types::CommandItem;
 
 #[test]
-fn skill_to_command_maps_core_fields() {
-    let skill =
-        SkillDefinition::new("sample", "Sample", "Demo skill", "Use me").with_tool_ref("read_file");
-    let command = skill_to_command(&skill);
+fn catalog_entry_to_command_maps_metadata_without_prompt() {
+    let entry = WorkflowCatalogEntry {
+        id: "sample".into(),
+        name: "Sample".into(),
+        description: "Demo skill".into(),
+        kind: WorkflowKind::Instruction,
+        source: WorkflowSource::Project,
+        revision: 7,
+        version: "1".into(),
+        invocation_policy: serde_json::json!({"explicit": true}),
+        argument_schema: serde_json::json!({"type": "object"}),
+        status: WorkflowStatus::Valid,
+        last_error: None,
+        winner: true,
+        shadowed_candidates: vec![],
+    };
+    let command = catalog_entry_to_command(&entry);
 
     assert_eq!(command.id, "skill-sample");
     assert_eq!(command.name, "sample");
     assert_eq!(command.display_name, "Sample");
     assert_eq!(command.command_type, "skill");
+    assert!(command.metadata.get("prompt").is_none());
 }
 
 #[tokio::test]
@@ -196,16 +210,20 @@ async fn project_command_is_listed_and_namespace_route_expands_arguments() {
             .await
             .expect("app state"),
     );
+    let mut session = bamboo_agent_core::Session::new("workspace-session", "test-model");
+    session.set_workspace_path_meta(project.path().to_string_lossy().to_string());
+    app_state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(app_state)
             .configure(super::config),
     )
     .await;
-    let workspace_path = project.path().to_string_lossy();
-
     let list = actix_web::test::TestRequest::get()
-        .uri(&format!("/commands?workspace_path={workspace_path}"))
+        .uri("/commands?session_id=workspace-session")
         .to_request();
     let list_body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, list).await;
     assert!(list_body["commands"]
@@ -215,10 +233,39 @@ async fn project_command_is_listed_and_namespace_route_expands_arguments() {
         .any(|command| command["name"] == "db/migrate"));
 
     let get = actix_web::test::TestRequest::get()
-        .uri(&format!(
-            "/commands/prompt/db/migrate?workspace_path={workspace_path}&arguments=production"
-        ))
+        .uri("/commands/prompt/db/migrate?session_id=workspace-session&arguments=production")
         .to_request();
     let get_body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, get).await;
     assert_eq!(get_body["content"], "Migrate production safely");
+}
+
+#[actix_web::test]
+async fn arbitrary_workspace_path_is_rejected_for_list_and_get() {
+    let data = tempfile::tempdir().expect("data dir");
+    let outside = tempfile::tempdir().expect("outside");
+    let app_state = web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(app_state)
+            .configure(super::config),
+    )
+    .await;
+    for uri in [
+        format!("/commands?workspace_path={}", outside.path().display()),
+        format!(
+            "/commands/prompt/secret?workspace_path={}",
+            outside.path().display()
+        ),
+    ] {
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get().uri(&uri).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

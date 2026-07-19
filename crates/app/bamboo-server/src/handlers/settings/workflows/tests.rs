@@ -1,5 +1,230 @@
 use super::validation::is_safe_workflow_name;
 
+#[actix_web::test]
+async fn workflow_catalog_api_returns_metadata_without_skill_body() {
+    let data = tempfile::tempdir().expect("data dir");
+    let skill = data.path().join("skills/review");
+    tokio::fs::create_dir_all(&skill).await.expect("skill dir");
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Reviews changes\n---\nTOP SECRET INSTRUCTIONS\n",
+    )
+    .await
+    .expect("skill");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let request = actix_web::test::TestRequest::get()
+        .uri("/catalog")
+        .to_request();
+    let body = actix_web::test::call_and_read_body(&app, request).await;
+    let text = std::str::from_utf8(&body).expect("utf8 response");
+    assert!(text.contains("Reviews changes"));
+    assert!(text.contains("\"revision\""));
+    assert!(!text.contains("TOP SECRET INSTRUCTIONS"));
+    assert!(!text.contains("SKILL.md"));
+}
+
+#[actix_web::test]
+async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
+    let data = tempfile::tempdir().expect("data dir");
+    let skill = data.path().join("skills/global-review");
+    tokio::fs::create_dir_all(&skill).await.expect("skill dir");
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: global-review\ndescription: Global review workflow\n---\nGlobal body\n",
+    )
+    .await
+    .expect("skill");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session = bamboo_agent_core::Session::new("global-session", "test-model");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let request = actix_web::test::TestRequest::get()
+        .uri("/catalog?session_id=global-session")
+        .to_request();
+    let response = actix_web::test::call_service(&app, request).await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert!(body["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .any(|entry| entry["id"] == "global-review"));
+}
+
+#[actix_web::test]
+async fn legacy_api_writes_through_bundle_and_bridges_catalog_event() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut account_events = state.account_sink.subscribe();
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .route(
+                "/workflows",
+                actix_web::web::post().to(super::save_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::get().to(super::get_workflow),
+            ),
+    )
+    .await;
+    for content in ["First body", "Second body"] {
+        let request = actix_web::test::TestRequest::post()
+            .uri("/workflows")
+            .set_json(serde_json::json!({"name": "legacy", "content": content}))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert!(response.status().is_success());
+    }
+    let request = actix_web::test::TestRequest::get()
+        .uri("/workflows/legacy")
+        .to_request();
+    let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+    assert_eq!(body["content"], "Second body");
+    assert!(
+        tokio::fs::read_to_string(data.path().join("skills/legacy/SKILL.md"))
+            .await
+            .expect("adapter bundle")
+            .contains("Second body")
+    );
+
+    let bridged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut workflow_changes = 0;
+        loop {
+            let event = account_events.recv().await.expect("account event");
+            if matches!(
+                event.event,
+                bamboo_agent_core::AgentEvent::WorkflowChanged { .. }
+            ) {
+                workflow_changes += 1;
+                if workflow_changes == 2 {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(bridged.is_ok(), "workflow.changed must reach account feed");
+}
+
+#[actix_web::test]
+async fn concurrent_legacy_updates_leave_source_and_bundle_consistent() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/workflows",
+        actix_web::web::post().to(super::save_workflow),
+    ))
+    .await;
+    let first = actix_web::test::TestRequest::post()
+        .uri("/workflows")
+        .set_json(serde_json::json!({"name": "race", "content": "body one"}))
+        .to_request();
+    let second = actix_web::test::TestRequest::post()
+        .uri("/workflows")
+        .set_json(serde_json::json!({"name": "race", "content": "body two"}))
+        .to_request();
+    let (first, second) = tokio::join!(
+        actix_web::test::call_service(&app, first),
+        actix_web::test::call_service(&app, second)
+    );
+    assert!(first.status().is_success());
+    assert!(second.status().is_success());
+    let source = tokio::fs::read_to_string(data.path().join("workflows/race.md"))
+        .await
+        .expect("source");
+    let bundle = tokio::fs::read_to_string(data.path().join("skills/race/SKILL.md"))
+        .await
+        .expect("bundle");
+    assert!(bundle.contains(&source));
+    let mut entries = tokio::fs::read_dir(data.path().join("workflows"))
+        .await
+        .expect("workflow dir");
+    while let Some(entry) = entries.next_entry().await.expect("entry") {
+        assert!(!entry.file_name().to_string_lossy().ends_with(".tmp"));
+    }
+}
+
+#[actix_web::test]
+async fn legacy_api_preserves_names_outside_skill_id_grammar() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/workflows",
+                actix_web::web::get().to(super::list_workflows),
+            )
+            .route(
+                "/workflows",
+                actix_web::web::post().to(super::save_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::get().to(super::get_workflow),
+            ),
+    )
+    .await;
+    let name = "发布 Workflow_v2";
+    let request = actix_web::test::TestRequest::post()
+        .uri("/workflows")
+        .set_json(serde_json::json!({"name": name, "content": "Original body"}))
+        .to_request();
+    let response = actix_web::test::call_service(&app, request).await;
+    assert!(response.status().is_success());
+
+    let request = actix_web::test::TestRequest::get()
+        .uri("/workflows")
+        .to_request();
+    let listed: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+    assert!(listed
+        .as_array()
+        .expect("workflow list")
+        .iter()
+        .any(|item| item["name"] == name));
+
+    let request = actix_web::test::TestRequest::get()
+        .uri("/workflows/%E5%8F%91%E5%B8%83%20Workflow_v2")
+        .to_request();
+    let loaded: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+    assert_eq!(loaded["name"], name);
+    assert_eq!(loaded["content"], "Original body");
+}
+
 #[test]
 fn safe_workflow_name_accepts_normal_names() {
     assert!(is_safe_workflow_name("my-workflow_01"));

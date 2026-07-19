@@ -1,7 +1,9 @@
 //! Agent skill management (re-exported from bamboo-agent-skill crate).
 
 pub mod access_control;
+pub mod catalog;
 pub mod context;
+pub mod legacy;
 pub mod resource_helpers;
 pub mod runtime_metadata;
 pub mod selection;
@@ -9,10 +11,16 @@ pub mod session_port;
 pub mod store;
 pub mod types;
 
+pub use catalog::{
+    ShadowedWorkflowCandidate, WorkflowCatalogEntry, WorkflowCatalogEvent,
+    WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource,
+    WorkflowStatus,
+};
 pub use store::{SkillStore, SkillUpdate};
 pub use types::*;
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 const MAX_UNSELECTED_SKILLS_IN_CONTEXT: usize = 24;
@@ -164,7 +172,9 @@ impl SkillManager {
 
     /// Initialize the manager.
     pub async fn initialize(&self) -> SkillResult<()> {
-        self.store.initialize().await
+        self.store.initialize().await?;
+        self.store.start_live_reload();
+        Ok(())
     }
 
     /// Get the underlying store.
@@ -172,18 +182,29 @@ impl SkillManager {
         &self.store
     }
 
-    pub(crate) async fn list_skills_for_selection(
+    /// Resolve the shared global store or an isolated workspace store.
+    /// Callers at API/runtime boundaries must derive `workspace` from trusted
+    /// server-side session state rather than request/tool arguments.
+    pub async fn store_for_workspace(
         &self,
+        workspace: Option<&Path>,
+    ) -> SkillResult<Arc<SkillStore>> {
+        match workspace {
+            Some(workspace) => self.store.skill_store_for_workspace(workspace).await,
+            None => Ok(self.store.clone()),
+        }
+    }
+
+    async fn list_skills_for_selection_from_store(
+        store: &SkillStore,
         disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
     ) -> Vec<SkillDefinition> {
         let skills = if selected_skill_mode.is_some() {
-            self.store
-                .list_skills_for_mode(None, selected_skill_mode)
-                .await
+            store.list_skills_for_mode(None, selected_skill_mode).await
         } else {
-            self.store.list_skills(None, true).await
+            store.list_skills(None, true).await
         };
         let skills = filter_disabled_skills(skills, disabled_skill_ids);
         let Some(selected_skill_ids) = selected_skill_ids else {
@@ -219,6 +240,21 @@ impl SkillManager {
         }
 
         filtered
+    }
+
+    pub(crate) async fn list_skills_for_selection(
+        &self,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+    ) -> Vec<SkillDefinition> {
+        Self::list_skills_for_selection_from_store(
+            self.store.as_ref(),
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+        )
+        .await
     }
 
     /// Build system prompt context from a selected subset of skills.
@@ -279,6 +315,31 @@ impl SkillManager {
         }
 
         skills
+    }
+
+    /// Resolve prompt-visible skills against the same isolated store used by a
+    /// session's workspace catalog.
+    pub async fn resolve_skills_for_request_in_workspace_with_mode(
+        &self,
+        workspace: &Path,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+    ) -> SkillResult<Vec<SkillDefinition>> {
+        let store = self.store.skill_store_for_workspace(workspace).await?;
+        let mut skills = Self::list_skills_for_selection_from_store(
+            store.as_ref(),
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+        )
+        .await;
+
+        if selected_skill_ids.is_none() {
+            skills = shortlist_skills_for_context(skills, request_hint);
+        }
+        Ok(skills)
     }
 
     /// Build system prompt context from a selected subset of skills with mode and user request hint.
@@ -351,6 +412,32 @@ impl SkillManager {
 
         tools.sort();
         tools
+    }
+
+    /// Get allowed tools from the winner set of a server-resolved session workspace.
+    pub async fn get_allowed_tools_for_workspace_selection_with_mode(
+        &self,
+        workspace: &Path,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+    ) -> SkillResult<Vec<String>> {
+        let store = self.store.skill_store_for_workspace(workspace).await?;
+        let skills = Self::list_skills_for_selection_from_store(
+            store.as_ref(),
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+        )
+        .await;
+        let mut tools: Vec<String> = skills
+            .into_iter()
+            .flat_map(|skill| skill.tool_refs)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        tools.sort();
+        Ok(tools)
     }
 
     /// Get allowed tool refs from all skills.

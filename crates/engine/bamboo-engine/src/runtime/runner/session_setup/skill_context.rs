@@ -1,4 +1,5 @@
 use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::Session;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct SkillContextLoadResult {
@@ -11,18 +12,43 @@ pub(super) struct SkillContextLoadResult {
 
 pub(super) async fn load_skill_context(
     config: &AgentLoopConfig,
+    session: &Session,
     session_id: &str,
     request_hint: &str,
 ) -> SkillContextLoadResult {
     if let Some(skill_manager) = config.skill_manager.as_ref() {
-        let selected_skills: Vec<bamboo_skills::SkillDefinition> = skill_manager
-            .resolve_skills_for_request_with_mode(
-                &config.disabled_skill_ids,
-                config.selected_skill_ids.as_deref(),
-                config.selected_skill_mode.as_deref(),
-                Some(request_hint),
-            )
-            .await;
+        let selected_skills: Vec<bamboo_skills::SkillDefinition> =
+            if let Some(workspace) = session.workspace_path_meta() {
+                match skill_manager
+                    .resolve_skills_for_request_in_workspace_with_mode(
+                        std::path::Path::new(&workspace),
+                        &config.disabled_skill_ids,
+                        config.selected_skill_ids.as_deref(),
+                        config.selected_skill_mode.as_deref(),
+                        Some(request_hint),
+                    )
+                    .await
+                {
+                    Ok(skills) => skills,
+                    Err(error) => {
+                        tracing::warn!(
+                            "[{}] Failed to resolve session workspace skills: {}",
+                            session_id,
+                            error
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                skill_manager
+                    .resolve_skills_for_request_with_mode(
+                        &config.disabled_skill_ids,
+                        config.selected_skill_ids.as_deref(),
+                        config.selected_skill_mode.as_deref(),
+                        Some(request_hint),
+                    )
+                    .await
+            };
         let selected_ids = selected_skills
             .iter()
             .map(|skill| skill.id.clone())

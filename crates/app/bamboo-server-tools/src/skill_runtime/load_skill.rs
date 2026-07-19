@@ -78,19 +78,13 @@ impl Tool for LoadSkillTool {
             .map_err(skill_access_error_to_tool_error)?;
         let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id()).await;
 
-        let skill = self
-            .access
-            .skill_manager
-            .store()
-            .get_skill_for_mode(skill_id, skill_mode.as_deref())
+        let store = self.access.skill_store(ctx.session_id()).await?;
+        let (skill, skill_root) = store
+            .get_skill_with_root_for_mode(skill_id, skill_mode.as_deref())
             .await
             .map_err(|err| {
                 ToolError::Execution(format!("Failed to load skill '{skill_id}': {err}"))
             })?;
-        let skill_root = self
-            .access
-            .skill_root(skill_id, skill_mode.as_deref())
-            .await?;
         let resources = list_skill_resource_paths(&skill_root).map_err(|err| {
             ToolError::Execution(format!("Failed to list skill resources: {err}"))
         })?;

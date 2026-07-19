@@ -627,6 +627,27 @@ pub enum AgentEvent {
         message: String,
     },
 
+    /// A workflow catalog definition was added, changed, shadowed, or removed.
+    WorkflowChanged {
+        workflow_id: String,
+        revision: u64,
+        scope: String,
+    },
+
+    /// A workflow bundle became invalid while its last-known-good definition stays active.
+    WorkflowInvalid {
+        workflow_id: String,
+        revision: u64,
+        scope: String,
+    },
+
+    /// A previously invalid workflow bundle parsed successfully again.
+    WorkflowRecovered {
+        workflow_id: String,
+        revision: u64,
+        scope: String,
+    },
+
     /// A user-facing notification derived from agent activity by the backend
     /// notification policy. Clients render this (e.g. an OS desktop notification)
     /// after applying their own presence checks (window focus). The decision of
@@ -745,6 +766,9 @@ impl AgentEvent {
                 | AgentEvent::Complete { .. }
                 | AgentEvent::Cancelled { .. }
                 | AgentEvent::Error { .. }
+                | AgentEvent::WorkflowChanged { .. }
+                | AgentEvent::WorkflowInvalid { .. }
+                | AgentEvent::WorkflowRecovered { .. }
         )
     }
 }
@@ -1260,6 +1284,32 @@ mod tests {
                 assert_eq!(plan_file_path, None);
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_catalog_events_are_durable_and_account_scoped() {
+        for event in [
+            AgentEvent::WorkflowChanged {
+                workflow_id: "review".to_string(),
+                revision: 2,
+                scope: "global".to_string(),
+            },
+            AgentEvent::WorkflowInvalid {
+                workflow_id: "review".to_string(),
+                revision: 3,
+                scope: "workspace:1234".to_string(),
+            },
+            AgentEvent::WorkflowRecovered {
+                workflow_id: "review".to_string(),
+                revision: 4,
+                scope: "workspace:1234".to_string(),
+            },
+        ] {
+            assert!(event.is_durable_change());
+            assert_eq!(event.session_id(), None);
+            let encoded = serde_json::to_string(&event).expect("serialize");
+            let _: AgentEvent = serde_json::from_str(&encoded).expect("deserialize");
         }
     }
 }

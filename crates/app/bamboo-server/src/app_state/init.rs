@@ -113,9 +113,9 @@ pub async fn init_storage(
 
 /// Initialize the skill manager with workspace directory and active mode from environment.
 pub async fn init_skill_manager(data_dir: &Path) -> Arc<SkillManager> {
-    let project_dir = std::env::var_os("BAMBOO_WORKSPACE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
+    // A server process may serve several unrelated workspaces. Never treat its cwd as a
+    // project root; session-scoped catalog requests provide the workspace explicitly.
+    let project_dir = std::env::var_os("BAMBOO_WORKSPACE_DIR").map(PathBuf::from);
     let active_mode = std::env::var("BAMBOO_SKILL_MODE")
         .ok()
         .map(|value| value.trim().to_string())

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::store::parser::parse_markdown_skill;
+use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillError, SkillResult};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
@@ -9,6 +10,72 @@ include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
 pub struct BuiltinSkillBundle {
     pub skill: crate::types::SkillDefinition,
     pub files: HashMap<String, Vec<u8>>,
+}
+
+/// Archive the pre-catalog global materialization only when every file proves
+/// byte-for-byte ownership by the embedded bundle. The atomic directory rename
+/// is recoverable and never recursively deletes files; any user-added, removed,
+/// or edited file makes the directory a user override and leaves it untouched.
+pub async fn archive_exact_legacy_materialization(
+    global_skills_dir: &Path,
+    bundle: &BuiltinSkillBundle,
+) -> SkillResult<bool> {
+    let legacy_root = global_skills_dir.join(&bundle.skill.id);
+    if !tokio::fs::try_exists(&legacy_root).await? {
+        return Ok(false);
+    }
+
+    let mut expected = bundle.files.clone();
+    expected.insert(
+        "SKILL.md".to_string(),
+        render_skill_markdown(&bundle.skill)?.into_bytes(),
+    );
+    let mut actual = HashMap::new();
+    for entry in walkdir::WalkDir::new(&legacy_root).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return Ok(false),
+        };
+        if entry.path() == legacy_root {
+            continue;
+        }
+        if !entry.file_type().is_file() || entry.file_type().is_symlink() {
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            return Ok(false);
+        }
+        let relative = match entry.path().strip_prefix(&legacy_root) {
+            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+            Err(_) => return Ok(false),
+        };
+        actual.insert(relative, tokio::fs::read(entry.path()).await?);
+    }
+
+    if actual != expected {
+        return Ok(false);
+    }
+
+    static ARCHIVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let archive_parent = global_skills_dir
+        .parent()
+        .unwrap_or(global_skills_dir)
+        .join("legacy-builtins-v1")
+        .join(&bundle.skill.id);
+    tokio::fs::create_dir_all(&archive_parent).await?;
+    for _ in 0..16 {
+        let sequence = ARCHIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let archive = archive_parent.join(format!("{}-{sequence}", std::process::id()));
+        match tokio::fs::rename(&legacy_root, &archive).await {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Another initializer won the rename, or a competing writer changed
+            // the source path. Either way, do not remove or overwrite anything.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn discover_skill_roots() -> Vec<String> {
