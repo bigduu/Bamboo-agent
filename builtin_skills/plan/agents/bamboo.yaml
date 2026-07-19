@@ -1,0 +1,10 @@
+version: "1"
+invocation_policy:
+  explicit: true
+  automatic: false
+argument_schema:
+  type: object
+  properties:
+    goal:
+      type: string
+  additionalProperties: false

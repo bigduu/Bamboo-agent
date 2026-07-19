@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::runtime_metadata::{
     LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
     LOADED_SKILL_IDS_METADATA_KEY, SELECTED_SKILL_IDS_METADATA_KEY,
-    SELECTED_SKILL_MODE_METADATA_KEY,
+    SELECTED_SKILL_MODE_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
 };
 use crate::selection::parse_selected_skill_ids_metadata;
 pub use crate::session_port::SkillSessionPort;
@@ -60,6 +60,10 @@ pub fn serialize_loaded_skill_ids(ids: &HashSet<String>) -> String {
 }
 
 pub fn extract_skill_allowlist(metadata: &HashMap<String, String>) -> Option<HashSet<String>> {
+    if let Some(raw) = metadata.get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY) {
+        return Some(parse_loaded_skill_ids(raw));
+    }
+
     metadata
         .get(SELECTED_SKILL_IDS_METADATA_KEY)
         .and_then(|raw| parse_selected_skill_ids_metadata(raw))
@@ -106,11 +110,15 @@ pub async fn ensure_skill_allowed(
     };
 
     let Some(metadata) = port.load_session_metadata(session_id).await else {
-        return Ok(());
+        return Err(SkillAccessError::SessionNotFound(format!(
+            "Session '{session_id}' was not found while verifying skill selection"
+        )));
     };
 
     let Some(allowlist) = extract_skill_allowlist(&metadata) else {
-        return Ok(());
+        return Err(SkillAccessError::NotAllowed(format!(
+            "Skill '{skill_id}' cannot load because this request has no published skill selection"
+        )));
     };
 
     if allowlist.contains(skill_id) {
@@ -263,6 +271,29 @@ mod tests {
         let allowlist = extract_skill_allowlist(&metadata).unwrap();
         assert!(allowlist.contains("pdf"));
         assert!(allowlist.contains("skill-creator"));
+    }
+
+    #[test]
+    fn runtime_advertised_ids_override_requested_ids_and_preserve_empty_allowlist() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            SELECTED_SKILL_IDS_METADATA_KEY.to_string(),
+            r#"["plan"]"#.to_string(),
+        );
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            r#"["review"]"#.to_string(),
+        );
+        let allowlist = extract_skill_allowlist(&metadata).expect("runtime allowlist");
+        assert_eq!(allowlist, HashSet::from(["review".to_string()]));
+
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            "[]".to_string(),
+        );
+        assert!(extract_skill_allowlist(&metadata)
+            .expect("empty runtime allowlist")
+            .is_empty());
     }
 
     #[test]

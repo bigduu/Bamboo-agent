@@ -1,0 +1,12 @@
+[
+  {"query":"This integration test hangs after reconnect on macOS. Reproduce it and tell me the actual root cause before changing code.","should_trigger":true},
+  {"query":"The server returns 404 only for project workflows; trace the request path and fix the bug if you can prove it.","should_trigger":true},
+  {"query":"CI is flaky in test_startup_reconcile. Compare passing and failing logs and isolate the race.","should_trigger":true},
+  {"query":"Why does this process leak memory after every sync? Build a minimal reproducer and investigate.","should_trigger":true},
+  {"query":"Users report the UI stays in running after completion. Diagnose the state transition and verify the repair.","should_trigger":true},
+  {"query":"Review the retry module for bugs and security issues, but do not modify it.","should_trigger":false},
+  {"query":"Add a new export button to the conversation toolbar.","should_trigger":false},
+  {"query":"Explain what exponential backoff means with a small example.","should_trigger":false},
+  {"query":"Plan the migration from JSON files to SQLite, including rollback.","should_trigger":false},
+  {"query":"Simplify this parser while preserving all current behavior.","should_trigger":false}
+]

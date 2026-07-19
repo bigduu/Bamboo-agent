@@ -1,0 +1,12 @@
+[
+  {"query":"Explore the persistence code and give me a step-by-step migration plan to SQLite, with rollback and test gates. Do not edit files.","should_trigger":true},
+  {"query":"Before we implement typed workflow activation, map the affected APIs, dependencies, risks, and delivery sequence.","should_trigger":true},
+  {"query":"Plan how to split this monolith into crates without breaking downstream callers.","should_trigger":true},
+  {"query":"I need an implementation-ready plan for adding offline sync, including schema changes and staged rollout.","should_trigger":true},
+  {"query":"Decompose issue #580 into reviewable commits and list exact validation for each stage.","should_trigger":true},
+  {"query":"Rename this local variable and run the unit test.","should_trigger":false},
+  {"query":"What did we finish on this branch today?","should_trigger":false},
+  {"query":"Explain the current request routing at a high level.","should_trigger":false},
+  {"query":"The reconnect test fails intermittently; find and fix the race.","should_trigger":false},
+  {"query":"Review this PR and report any blocking findings.","should_trigger":false}
+]

@@ -82,6 +82,19 @@ pub(crate) async fn prepare_session_for_loop(
                 mode.clone(),
             );
         }
+
+        // Runtime tools authorize skill loads through the shared session repository.
+        // Publish this run's resolved IDs before the first model/tool call so they
+        // never observe a missing or previous-run allowlist from the cache.
+        if let Some(persistence) = config.persistence.as_ref() {
+            if let Err(error) = persistence.save_runtime_session(session).await {
+                tracing::warn!(
+                    "[{}] Failed to publish runtime skill selection before execution: {}",
+                    session_id,
+                    error
+                );
+            }
+        }
     }
 
     let tool_schemas =

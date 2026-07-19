@@ -153,8 +153,34 @@ pub fn load_builtin_skill_bundles() -> SkillResult<Vec<BuiltinSkillBundle>> {
 }
 
 #[cfg(test)]
+pub(super) const WORKFLOW_BUILTINS: [(&str, bool); 5] = [
+    ("debug", true),
+    ("plan", false),
+    ("research", true),
+    ("review", true),
+    ("simplify", true),
+];
+
+#[cfg(test)]
 mod tests {
-    use super::load_builtin_skill_bundles;
+    use std::collections::HashSet;
+
+    use serde::Deserialize;
+
+    use super::{load_builtin_skill_bundles, WORKFLOW_BUILTINS};
+
+    #[derive(Deserialize)]
+    struct TriggerEval {
+        query: String,
+        should_trigger: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct ScenarioEval {
+        kind: String,
+        prompt: String,
+        expectations: Vec<String>,
+    }
 
     #[test]
     fn builtin_skill_creator_bundle_includes_scripts() {
@@ -192,6 +218,146 @@ mod tests {
                     .any(|tool_ref| tool_ref == tool),
                 "personal-assistant must allow the {tool} tool, got {:?}",
                 assistant.skill.tool_refs
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_builtins_embed_metadata_and_balanced_trigger_evals() {
+        let bundles = load_builtin_skill_bundles().expect("load builtin bundles");
+
+        for (id, automatic) in WORKFLOW_BUILTINS {
+            let bundle = bundles
+                .iter()
+                .find(|bundle| bundle.skill.id == id)
+                .unwrap_or_else(|| panic!("missing {id} builtin"));
+            let description = bundle.skill.description.to_lowercase();
+            assert!(description.contains("use "), "{id} needs positive triggers");
+            assert!(
+                description.contains("do not use"),
+                "{id} needs negative trigger boundaries"
+            );
+            assert!(!bundle.skill.prompt.is_empty(), "{id} needs instructions");
+            assert!(
+                bundle.skill.tool_refs.is_empty(),
+                "{id} must not grant tools"
+            );
+
+            let bamboo_metadata = std::str::from_utf8(
+                bundle
+                    .files
+                    .get("agents/bamboo.yaml")
+                    .unwrap_or_else(|| panic!("{id} needs Bamboo metadata")),
+            )
+            .expect("utf8 Bamboo metadata");
+            let bamboo_metadata: serde_yaml::Value =
+                serde_yaml::from_str(bamboo_metadata).expect("valid Bamboo metadata");
+            assert_eq!(bamboo_metadata["version"].as_str(), Some("1"));
+            assert_eq!(
+                bamboo_metadata["invocation_policy"]["explicit"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                bamboo_metadata["invocation_policy"]["automatic"].as_bool(),
+                Some(automatic)
+            );
+
+            let trigger_evals: Vec<TriggerEval> = serde_json::from_slice(
+                bundle
+                    .files
+                    .get("evals/trigger-evals.json")
+                    .unwrap_or_else(|| panic!("{id} needs trigger evals")),
+            )
+            .expect("valid trigger evals");
+            assert!(
+                trigger_evals
+                    .iter()
+                    .filter(|eval| eval.should_trigger)
+                    .count()
+                    >= 5,
+                "{id} needs at least five positive trigger evals"
+            );
+            assert!(
+                trigger_evals
+                    .iter()
+                    .filter(|eval| !eval.should_trigger)
+                    .count()
+                    >= 5,
+                "{id} needs at least five negative trigger evals"
+            );
+            let unique_queries = trigger_evals
+                .iter()
+                .map(|eval| eval.query.trim())
+                .collect::<HashSet<_>>();
+            assert_eq!(unique_queries.len(), trigger_evals.len());
+            assert!(unique_queries.iter().all(|query| !query.is_empty()));
+        }
+    }
+
+    #[test]
+    fn workflow_builtins_cover_runtime_failure_scenarios() {
+        const REQUIRED_SCENARIOS: [&str; 5] = [
+            "success",
+            "missing_input",
+            "tool_failure",
+            "permission_denied",
+            "context_compaction",
+        ];
+        let bundles = load_builtin_skill_bundles().expect("load builtin bundles");
+
+        for (id, _) in WORKFLOW_BUILTINS {
+            let bundle = bundles
+                .iter()
+                .find(|bundle| bundle.skill.id == id)
+                .unwrap_or_else(|| panic!("missing {id} builtin"));
+            let scenarios: Vec<ScenarioEval> = serde_json::from_slice(
+                bundle
+                    .files
+                    .get("evals/scenarios.json")
+                    .unwrap_or_else(|| panic!("{id} needs scenario evals")),
+            )
+            .expect("valid scenario evals");
+            let kinds = scenarios
+                .iter()
+                .map(|scenario| scenario.kind.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(scenarios.len(), REQUIRED_SCENARIOS.len());
+            assert!(
+                REQUIRED_SCENARIOS.iter().all(|kind| kinds.contains(kind)),
+                "{id} scenario coverage was {kinds:?}"
+            );
+            assert!(scenarios.iter().all(|scenario| {
+                !scenario.prompt.trim().is_empty()
+                    && !scenario.expectations.is_empty()
+                    && scenario
+                        .expectations
+                        .iter()
+                        .all(|expectation| !expectation.trim().is_empty())
+            }));
+        }
+    }
+
+    #[test]
+    fn workflow_builtin_bodies_stay_out_of_initial_skill_context() {
+        let bundles = load_builtin_skill_bundles().expect("load builtin bundles");
+        let workflow_skills = bundles
+            .iter()
+            .filter(|bundle| {
+                WORKFLOW_BUILTINS
+                    .iter()
+                    .any(|(id, _)| *id == bundle.skill.id)
+            })
+            .map(|bundle| bundle.skill.clone())
+            .collect::<Vec<_>>();
+        let context = crate::context::build_skill_context(&workflow_skills);
+
+        for skill in workflow_skills {
+            assert!(context.contains(&skill.description));
+            assert!(context.contains(&format!("skill_id: `{}`", skill.id)));
+            assert!(
+                !context.contains(&skill.prompt),
+                "{} instructions leaked into initial context",
+                skill.id
             );
         }
     }

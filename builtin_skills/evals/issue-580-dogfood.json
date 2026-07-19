@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "issue": "bigduu/Bamboo-agent#580",
+  "recorded_at": "2026-07-19",
+  "summary": {
+    "forward_test_runs": 6,
+    "forward_test_contract_passes": 6,
+    "observed_false_triggers": 0,
+    "observed_trigger_opportunities": 6,
+    "files_modified_by_workflows": 0,
+    "runtime_dogfood_complete": false
+  },
+  "runs": [
+    {
+      "target": "bamboo",
+      "workflow": "review",
+      "task": "Review the five-builtin implementation diff before publication",
+      "result": "pass_after_iteration",
+      "contract": "Severity-ordered findings included code evidence, impact, and verification",
+      "failure_analysis": [
+        "The first review found that automatic=false was catalog metadata only and was not enforced by runtime selection",
+        "The implementation was updated to filter automatic and explicit selection against one validated catalog snapshot",
+        "Runtime policy tests were added before the review was repeated"
+      ]
+    },
+    {
+      "target": "bamboo",
+      "workflow": "debug",
+      "task": "Investigate a reported uppercase builtin-name validation failure",
+      "result": "pass",
+      "contract": "Separated the reported symptom from current evidence and did not claim a root cause that could not be reproduced",
+      "failure_analysis": [
+        "The current lowercase bundle names did not reproduce the prior report"
+      ]
+    },
+    {
+      "target": "bamboo",
+      "workflow": "plan",
+      "task": "Plan a future manual-only security-review builtin",
+      "result": "pass",
+      "contract": "Produced ordered scope, dependencies, risks, verification, and rollback points without implementing the request",
+      "failure_analysis": [
+        "The plan independently identified invocation-policy enforcement as a prerequisite"
+      ]
+    },
+    {
+      "target": "bamboo",
+      "workflow": "research",
+      "task": "Determine which host metadata file controls Bamboo and Codex invocation policy",
+      "result": "pass",
+      "contract": "Used primary public documentation and repository evidence while separating facts from implementation inference",
+      "failure_analysis": [
+        "Bamboo reads agents/bamboo.yaml while Codex reads agents/openai.yaml; both are required for cross-host behavior"
+      ]
+    },
+    {
+      "target": "bamboo",
+      "workflow": "simplify",
+      "task": "Remove duplicate workflow-builtin inventories from tests without changing behavior",
+      "result": "pass",
+      "contract": "Proposed the smallest behavior-preserving consolidation and named the equivalence tests",
+      "failure_analysis": [
+        "A shared test-only inventory was adopted instead of coupling tests to the broader production embedding whitelist"
+      ]
+    },
+    {
+      "target": "lotus",
+      "workflow": "review",
+      "task": "Review live Lotus origin/main against Issue #119 workflow UI acceptance criteria",
+      "result": "pass_with_dependency_findings",
+      "contract": "Reported five severity-ordered findings with immutable file-line evidence, impact, verification, and explicit dependency boundaries",
+      "failure_analysis": [
+        "Typed activation and workflow-run UI remain blocked by Bamboo #579 and #578",
+        "The review was static and read-only; end-to-end UI execution remains for Lotus #119"
+      ]
+    }
+  ],
+  "limitations": [
+    "The workflow instructions were forward-tested by isolated agents reading the exact bundle files, not by a packaged Bamboo binary with a live model provider",
+    "Trigger fixtures are deterministic bundle checks; live model-selection precision still depends on provider behavior",
+    "The Lotus run traced live origin/main source and tests but did not operate the UI",
+    "Bamboo and Lotus runtime dogfood acceptance remains incomplete and must not be inferred from these forward-test counts"
+  ]
+}

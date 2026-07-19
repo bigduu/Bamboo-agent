@@ -1,0 +1,12 @@
+[
+  {"query":"Research the current WebSocket authentication recommendations in the relevant RFCs and OWASP guidance, with direct links.","should_trigger":true},
+  {"query":"Compare the latest stable Tokio cancellation primitives for this server design using official docs and source evidence.","should_trigger":true},
+  {"query":"Investigate whether Claude Code exposes a public workflow API; distinguish documented facts from our product inference.","should_trigger":true},
+  {"query":"Use the repository and primary documentation to determine which persistence guarantees we actually provide today.","should_trigger":true},
+  {"query":"Evaluate SQLite versus redb for this workload using current upstream documentation, maintenance status, and constraints.","should_trigger":true},
+  {"query":"What is a mutex? Give me a short explanation.","should_trigger":false},
+  {"query":"Implement a WebSocket ping endpoint in this crate.","should_trigger":false},
+  {"query":"Review the five changed Rust files for regressions.","should_trigger":false},
+  {"query":"The test suite fails with UnsupportedCertVersion; reproduce and fix it.","should_trigger":false},
+  {"query":"Summarize the design document I pasted above without looking up anything else.","should_trigger":false}
+]

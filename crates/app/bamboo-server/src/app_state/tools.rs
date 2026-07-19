@@ -31,9 +31,7 @@ pub(super) fn build_base_tools(
     permission_checker: Arc<PermissionChecker>,
     mcp_manager: Arc<McpServerManager>,
     skill_manager: Arc<SkillManager>,
-    storage: Arc<dyn Storage>,
-    persistence: Arc<LockedSessionStore>,
-    sessions: bamboo_engine::SessionCache,
+    session_repo: bamboo_engine::SessionRepository,
     app_data_dir: PathBuf,
     notification_service: Arc<bamboo_notification::NotificationService>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -61,14 +59,6 @@ pub(super) fn build_base_tools(
         builtin_tools,
         mcp_tools,
     ));
-
-    // One framework-owned session coordinator, shared by every tool that needs
-    // to load/persist sessions — instead of each re-rolling the cache+storage dance.
-    let session_repo = bamboo_engine::SessionRepository::new(
-        sessions.clone(),
-        storage.clone(),
-        persistence.clone(),
-    );
 
     let memory_tool = Arc::new(crate::tools::MemoryTool::new(
         session_repo.clone(),
