@@ -166,6 +166,12 @@ accepting genuinely newer legacy input. Pending or malformed manifests are a
 fail-closed state: provider/MCP loaders, startup health, watchers and typed writes
 retain their current snapshot until recovery finishes; they never read a partial
 transaction member.
+Only `NotFound` means migration metadata is absent; permission, directory and
+other read failures are redacted fail-closed errors. Before planning a new
+transaction under the migration lock, Bamboo removes orphan stage/backup
+directories only when their name is the exact managed prefix plus a canonical
+UUID and no valid manifest or journal references them. Symlinks, non-UUID names
+and referenced transactions are never traversed or removed.
 
 This is intentionally not the full legacy-root migration. Provider instances in
 `config.json`, broker/env/notification/cluster secrets, and the remaining section

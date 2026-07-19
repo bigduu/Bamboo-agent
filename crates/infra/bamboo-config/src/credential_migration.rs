@@ -89,6 +89,7 @@ struct ExtractedSecret {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MigrationFault {
     None,
+    AfterStaging,
     AfterJournal,
     AfterManifest,
     AfterCredentials,
@@ -116,7 +117,7 @@ pub fn migrate_provider_mcp_credentials(
 /// retain their existing runtime rather than guessing which files committed.
 pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> ConfigStoreResult<()> {
     let path = data_dir.as_ref().join(MANIFEST_FILE);
-    let Ok(bytes) = std::fs::read(path) else {
+    let Some(bytes) = read_optional_migration_file(&path)? else {
         return Ok(());
     };
     let manifest: MigrationManifest = serde_json::from_slice(&bytes).map_err(|_| {
@@ -156,6 +157,7 @@ fn migrate_inner(
     lock.lock_exclusive()?;
     let _lock = MigrationLock(lock);
 
+    cleanup_orphan_transaction_dirs(data_dir)?;
     if let Some(outcome) = recover_committed(
         data_dir,
         #[cfg(test)]
@@ -216,6 +218,10 @@ fn migrate_inner(
     restrict_directory_files_to_owner(&backup_dir)?;
     sync_dir(&stage_dir)?;
     sync_dir(&backup_dir)?;
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterStaging) {
+        return Err(injected_fault());
+    }
 
     let manifest = MigrationManifest {
         version: MIGRATION_VERSION,
@@ -695,7 +701,7 @@ fn recover_committed(
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<Option<CredentialMigrationOutcome>> {
     let path = data_dir.join(MANIFEST_FILE);
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Some(bytes) = read_optional_migration_file(&path)? else {
         return Ok(None);
     };
     let mut manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
@@ -877,7 +883,7 @@ fn cleanup_transaction_dirs(
 
 fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
     let journal_path = data_dir.join(JOURNAL_FILE);
-    let Ok(bytes) = std::fs::read(&journal_path) else {
+    let Some(bytes) = read_optional_migration_file(&journal_path)? else {
         return Ok(());
     };
     let journal: MigrationManifest = serde_json::from_slice(&bytes)?;
@@ -892,6 +898,59 @@ fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
     }
     remove_file_if_exists(&journal_path)?;
     sync_dir(data_dir)
+}
+
+fn cleanup_orphan_transaction_dirs(data_dir: &Path) -> ConfigStoreResult<()> {
+    let mut referenced = BTreeSet::new();
+    for file in [MANIFEST_FILE, JOURNAL_FILE] {
+        let Some(bytes) = read_optional_migration_file(&data_dir.join(file))? else {
+            continue;
+        };
+        let manifest: MigrationManifest = serde_json::from_slice(&bytes).map_err(|_| {
+            ConfigStoreError::Validation("credential migration metadata is unavailable".to_string())
+        })?;
+        validate_manifest(&manifest).map_err(|_| {
+            ConfigStoreError::Validation("credential migration metadata is unavailable".to_string())
+        })?;
+        referenced.insert(manifest.stage_dir.clone());
+        referenced.insert(format!("{BACKUP_PREFIX}{}", manifest.transaction_id));
+    }
+
+    let mut removed = false;
+    for entry in std::fs::read_dir(data_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if referenced.contains(&name) || !is_strict_transaction_dir_name(&name) {
+            continue;
+        }
+        std::fs::remove_dir_all(entry.path())?;
+        removed = true;
+    }
+    if removed {
+        sync_dir(data_dir)?;
+    }
+    Ok(())
+}
+
+fn is_strict_transaction_dir_name(name: &str) -> bool {
+    [STAGE_PREFIX, BACKUP_PREFIX].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|suffix| Uuid::parse_str(suffix).ok().map(|uuid| (suffix, uuid)))
+            .is_some_and(|(suffix, uuid)| uuid.to_string() == suffix)
+    })
+}
+
+fn read_optional_migration_file(path: &Path) -> ConfigStoreResult<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ConfigStoreError::Validation(
+            "credential migration metadata is unavailable".to_string(),
+        )),
+    }
 }
 
 fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
@@ -1092,10 +1151,10 @@ mod tests {
         assert!(!std::fs::read_dir(dir)
             .unwrap()
             .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(BACKUP_PREFIX)));
+            .any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && is_strict_transaction_dir_name(&entry.file_name().to_string_lossy())
+            }));
     }
 
     fn assert_no_legacy_plaintext(dir: &Path) {
@@ -1219,6 +1278,98 @@ mod tests {
         assert!(!dir.path().join(CREDENTIALS_FILE).exists());
         migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
         assert_migrated(dir.path());
+    }
+
+    #[test]
+    fn crash_after_staging_cleans_only_strict_unreferenced_orphans_on_every_retry() {
+        let _key = crate::encryption::set_test_encryption_key([0x6f; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        install_fixture(dir.path());
+        let non_uuid_stage = dir.path().join(format!("{STAGE_PREFIX}not-a-uuid"));
+        let non_uuid_backup = dir.path().join(format!("{BACKUP_PREFIX}not-a-uuid"));
+        std::fs::create_dir(&non_uuid_stage).unwrap();
+        std::fs::create_dir(&non_uuid_backup).unwrap();
+
+        #[cfg(unix)]
+        let (external, external_link) = {
+            use std::os::unix::fs::symlink;
+            let external = tempfile::tempdir().unwrap();
+            std::fs::write(external.path().join("must-survive"), b"sentinel").unwrap();
+            let external_link = dir.path().join(format!("{STAGE_PREFIX}{}", Uuid::new_v4()));
+            symlink(external.path(), &external_link).unwrap();
+            (external, external_link)
+        };
+
+        let strict_dir_count = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .filter(|entry| {
+                    is_strict_transaction_dir_name(&entry.file_name().to_string_lossy())
+                })
+                .count()
+        };
+        assert!(migrate_with_fault(dir.path(), MigrationFault::AfterStaging).is_err());
+        assert_eq!(strict_dir_count(), 2);
+        assert!(migrate_with_fault(dir.path(), MigrationFault::AfterStaging).is_err());
+        assert_eq!(strict_dir_count(), 2, "orphan pairs must not accumulate");
+
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(strict_dir_count(), 0);
+        assert!(non_uuid_stage.exists());
+        assert!(non_uuid_backup.exists());
+        #[cfg(unix)]
+        {
+            assert!(std::fs::symlink_metadata(&external_link).is_ok());
+            assert_eq!(
+                std::fs::read(external.path().join("must-survive")).unwrap(),
+                b"sentinel"
+            );
+        }
+        assert_migrated(dir.path());
+    }
+
+    #[test]
+    fn non_not_found_manifest_and_journal_read_errors_fail_closed_and_redacted() {
+        let _key = crate::encryption::set_test_encryption_key([0x70; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"providers":{"openai":{"model":"root-lkg"}}}"#,
+        )
+        .unwrap();
+        install_fixture(dir.path());
+        std::fs::create_dir(dir.path().join(MANIFEST_FILE)).unwrap();
+
+        for error in [
+            ensure_provider_mcp_migration_ready(dir.path()).unwrap_err(),
+            recover_committed(dir.path(), Some(MigrationFault::None)).unwrap_err(),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("migration"));
+            assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+            assert!(!rendered.contains("sk-provider-plain"));
+        }
+        let loaded = crate::Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            loaded.providers.openai.as_ref().unwrap().model.as_deref(),
+            Some("root-lkg"),
+            "provider target must not be consumed when manifest cannot be read"
+        );
+
+        let journal_dir = tempfile::tempdir().unwrap();
+        install_fixture(journal_dir.path());
+        std::fs::create_dir(journal_dir.path().join(JOURNAL_FILE)).unwrap();
+        for error in [
+            discard_uncommitted(journal_dir.path()).unwrap_err(),
+            migrate_with_fault(journal_dir.path(), MigrationFault::None).unwrap_err(),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("migration"));
+            assert!(!rendered.contains(journal_dir.path().to_string_lossy().as_ref()));
+            assert!(!rendered.contains("sk-provider-plain"));
+        }
     }
 
     #[test]
