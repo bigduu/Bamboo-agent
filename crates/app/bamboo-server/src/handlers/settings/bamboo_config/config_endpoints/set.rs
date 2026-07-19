@@ -20,6 +20,12 @@ pub async fn set_bamboo_config(
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
     let effects = config_manager::effects_for_root_patch(&patch_obj);
     let provider_credential_intents = api_key_intents.providers.clone();
+    if !provider_credential_intents.is_empty() && model_limits_patch.is_some() {
+        return Err(AppError::BadRequest(
+            "provider credential updates cannot be combined with model_limits changes; split the request"
+                .to_string(),
+        ));
+    }
 
     // Apply the patch under the config write lock to avoid clobbering concurrent updates.
     let new_config = app_state

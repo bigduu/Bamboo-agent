@@ -1432,6 +1432,39 @@ impl AppState {
                 let was_off = cfg.plugin_trust.enforcement_is_off();
                 let mut candidate = cfg.clone();
                 update(&mut candidate)?;
+                for (name, current, updated) in [
+                    (
+                        "memory",
+                        serde_json::to_value(cfg.memory()),
+                        serde_json::to_value(candidate.memory()),
+                    ),
+                    (
+                        "subagents",
+                        serde_json::to_value(cfg.subagents()),
+                        serde_json::to_value(candidate.subagents()),
+                    ),
+                    (
+                        "connect",
+                        serde_json::to_value(&cfg.connect),
+                        serde_json::to_value(&candidate.connect),
+                    ),
+                ] {
+                    let current = current.map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "Failed to compare {name} config: {error}"
+                        ))
+                    })?;
+                    let updated = updated.map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "Failed to compare {name} config: {error}"
+                        ))
+                    })?;
+                    if current != updated {
+                        return Err(AppError::BadRequest(format!(
+                            "provider credential updates cannot be combined with {name} changes; split the request"
+                        )));
+                    }
+                }
                 candidate.assign_connect_platform_ids();
                 candidate.refresh_encrypted_secrets().map_err(|error| {
                     AppError::InternalError(anyhow::anyhow!(

@@ -285,6 +285,152 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     assert_eq!(limits[0]["max_context_tokens"], 128000);
 }
 
+fn transaction_file_snapshot(data_dir: &std::path::Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    [
+        "credentials.json",
+        "providers.json",
+        "config.json",
+        "memory.json",
+        "subagents.json",
+        "connect.json",
+        "model_limits.json",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), std::fs::read(data_dir.join(name)).ok()))
+    .collect()
+}
+
+#[actix_web::test]
+async fn provider_credential_patch_rejects_changed_sidecars_and_model_limits_without_mutation() {
+    use crate::app_state::AppState;
+    use actix_web::{http::StatusCode, test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+    let baseline_files = transaction_file_snapshot(&data_dir);
+    let baseline_live = app_state
+        .config
+        .read()
+        .await
+        .to_compatibility_value()
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    for (section, extra) in [
+        (
+            "memory",
+            serde_json::json!({"memory": {"background_model": "memory-model"}}),
+        ),
+        (
+            "subagents",
+            serde_json::json!({"subagents": {"max_concurrent": 3}}),
+        ),
+        (
+            "connect",
+            serde_json::json!({"connect": {"platforms": [{
+                "type": "telegram", "token": "tg-mixed-secret", "allow_from": ["u1"]
+            }]}}),
+        ),
+        (
+            "model_limits",
+            serde_json::json!({"model_limits": [{
+                "model_pattern": "gpt-*", "max_context_tokens": 1000,
+                "max_output_tokens": 100
+            }]}),
+        ),
+    ] {
+        let mut payload = serde_json::json!({
+            "provider": "openai",
+            "providers": {"openai": {"api_key": "sk-mixed-secret", "model": "gpt-test"}}
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let request = test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(payload)
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{section}");
+        assert_eq!(
+            transaction_file_snapshot(&data_dir),
+            baseline_files,
+            "{section}"
+        );
+        assert_eq!(
+            app_state
+                .config
+                .read()
+                .await
+                .to_compatibility_value()
+                .unwrap(),
+            baseline_live,
+            "{section}"
+        );
+    }
+}
+
+#[actix_web::test]
+async fn provider_credential_full_payload_allows_unchanged_sidecars() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+    let mut payload = app_state
+        .config
+        .read()
+        .await
+        .to_compatibility_value()
+        .unwrap();
+    let object = payload.as_object_mut().unwrap();
+    object.insert("provider".to_string(), serde_json::json!("openai"));
+    object.insert(
+        "providers".to_string(),
+        serde_json::json!({"openai": {
+            "api_key": "sk-full-payload", "model": "gpt-test"
+        }}),
+    );
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+    let request = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(payload)
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert!(response.status().is_success());
+    let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+    assert_eq!(
+        app_state
+            .credential_store
+            .resolve(&reference)
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "sk-full-payload"
+    );
+    assert!(data_dir.join("credentials.json").exists());
+}
+
 /// End-to-end: POST an ntfy token, confirm the GET response masks it, then
 /// POST again with the masked placeholder unchanged (as the UI would on an
 /// unrelated field edit) — the exact-mask keep-on-save rule must resolve that
