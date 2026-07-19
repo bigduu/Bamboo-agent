@@ -2,7 +2,8 @@ use super::{LoadSkillTool, ReadSkillResourceTool};
 use bamboo_skills::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
 use bamboo_skills::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
-    SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_ACTIVATION_GENERATION_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -217,6 +218,135 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
     )
     .await
     .expect("explicitly advertised plan skill should load on the next run");
+}
+
+#[tokio::test]
+async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_catalog() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let skills_dir = temp_dir.path().join("skills");
+    for (id, prompt) in [("review-demo", "review N"), ("plan-demo", "plan N")] {
+        let root = skills_dir.join(id);
+        std::fs::create_dir_all(root.join("references")).expect("skill root");
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {id}\n---\n{prompt}\n"),
+        )
+        .expect("skill definition");
+        std::fs::write(
+            root.join("references/value.txt"),
+            format!("{prompt} resource"),
+        )
+        .expect("skill resource");
+    }
+    let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: skills_dir.clone(),
+        project_dir: None,
+        active_mode: None,
+    }));
+    skill_manager
+        .initialize()
+        .await
+        .expect("initialize manager");
+    let session_id = "runtime-pinned-generation";
+    let review_ids = vec!["review-demo".to_string()];
+    let descriptor = skill_manager
+        .store()
+        .pin_current_activation(session_id, &review_ids, None)
+        .await
+        .expect("pin review N");
+    let mut session = Session::new(session_id, "model");
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        serde_json::to_string(&review_ids).expect("review ids"),
+    );
+    session.metadata.insert(
+        SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        descriptor.catalog_revision.to_string(),
+    );
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        serde_json::to_string(&descriptor.skill_revisions).expect("review revisions"),
+    );
+    let sessions = test_session_cache(session_id, &session);
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage.save_session(&session).await.expect("save session");
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
+    let tool = LoadSkillTool::new(
+        skill_manager.clone(),
+        Arc::new(RwLock::new(Config::default())),
+        repo.clone(),
+    );
+    let read_tool = ReadSkillResourceTool::new(
+        skill_manager.clone(),
+        Arc::new(RwLock::new(Config::default())),
+        repo.clone(),
+    );
+    let context = ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id: "runtime-pinned-load",
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+
+    std::fs::write(
+        skills_dir.join("review-demo/SKILL.md"),
+        "---\nname: review-demo\ndescription: review N+1\n---\nreview N+1\n",
+    )
+    .expect("publish review N+1");
+    std::fs::write(
+        skills_dir.join("review-demo/references/value.txt"),
+        "review N+1 resource",
+    )
+    .expect("publish resource N+1");
+    skill_manager.store().reload().await.expect("reload N+1");
+    let mut stale_edit = repo.load(session_id).await.expect("cached session");
+    stale_edit.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["plan-demo"]"#.to_string(),
+    );
+    repo.save(&mut stale_edit).await.expect("save stale edit");
+
+    let ToolOutcome::Completed(loaded) = tool
+        .invoke(
+            serde_json::json!({"skill_id": "review-demo"}),
+            context.to_tool_ctx(),
+        )
+        .await
+        .expect("pinned review remains authoritative")
+    else {
+        panic!("load_skill should complete")
+    };
+    let loaded: serde_json::Value = serde_json::from_str(&loaded.result).expect("load result");
+    assert_eq!(loaded["instructions"], "review N");
+    let ToolOutcome::Completed(resource) = read_tool
+        .invoke(
+            serde_json::json!({
+                "skill_id": "review-demo",
+                "resource_path": "references/value.txt"
+            }),
+            context.to_tool_ctx(),
+        )
+        .await
+        .expect("pinned resource ignores stale allowlist")
+    else {
+        panic!("read_skill_resource should complete")
+    };
+    let resource: serde_json::Value =
+        serde_json::from_str(&resource.result).expect("resource result");
+    assert_eq!(resource["content"], "review N resource");
+    let error = tool
+        .invoke(
+            serde_json::json!({"skill_id": "plan-demo"}),
+            context.to_tool_ctx(),
+        )
+        .await
+        .expect_err("stale allowlist must not switch the active generation");
+    assert!(error.to_string().contains("does not match"));
 }
 
 #[tokio::test]
@@ -641,6 +771,10 @@ async fn session_workspace_catalog_selection_and_runtime_roots_are_isolated() {
             "runtime root {skill_root} must stay under {}",
             expected_workspace.display()
         );
+        if session_id == "workspace-session-one" {
+            std::fs::remove_dir_all(&workspace_one)
+                .expect("delete workspace after immutable activation is loaded");
+        }
 
         let ToolOutcome::Completed(resource) = read_tool
             .invoke(

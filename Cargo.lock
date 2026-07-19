@@ -1448,6 +1448,7 @@ dependencies = [
  "bamboo-config",
  "bamboo-domain",
  "bamboo-infrastructure",
+ "libc",
  "notify",
  "serde",
  "serde_json",

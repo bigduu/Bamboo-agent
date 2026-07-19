@@ -103,7 +103,7 @@ pub(super) async fn initialize_loop_state(
     initial_message: &str,
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
-) -> LoopRunState {
+) -> super::super::Result<LoopRunState> {
     let debug_logger = DebugLogger::new(tracing::enabled!(tracing::Level::DEBUG));
     let session_id = session.id.clone();
     let metrics_collector = config.metrics_collector.clone();
@@ -137,6 +137,10 @@ pub(super) async fn initialize_loop_state(
 
     let auxiliary_models = resolve_auxiliary_models(config);
 
+    let must_resume_pinned_activation = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|previous| matches!(previous.status, AgentStatusState::Suspended));
     let mut runtime_state = AgentRuntimeState::new(&session_id);
     // "Bypass permissions" is a per-session sticky toggle (set via PATCH /sessions
     // and persisted in runtime.json). Each run rebuilds a fresh runtime state, so
@@ -171,10 +175,11 @@ pub(super) async fn initialize_loop_state(
         metrics_collector.as_ref(),
         &session_id,
         &debug_logger,
+        must_resume_pinned_activation,
     )
-    .await;
+    .await?;
 
-    LoopRunState {
+    Ok(LoopRunState {
         session_id,
         model_name,
         metrics_collector,
@@ -185,14 +190,55 @@ pub(super) async fn initialize_loop_state(
         gold_evaluation: GoldEvaluationState::default(),
         auxiliary_models,
         runtime_state,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_auxiliary_models, OverflowRecoveryState};
+    use super::{initialize_loop_state, resolve_auxiliary_models, OverflowRecoveryState};
     use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
+    use async_trait::async_trait;
+    use bamboo_agent_core::tools::{
+        FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema,
+    };
+    use bamboo_agent_core::Session;
+    use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+    use bamboo_skills::runtime_metadata::{
+        LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_ACTIVATION_GENERATION_KEY,
+        SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY, SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
+        SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+    };
+    use bamboo_skills::{SkillManager, SkillStoreConfig};
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
+
+    struct SuccessfulLoadSkill;
+
+    #[async_trait]
+    impl ToolExecutor for SuccessfulLoadSkill {
+        async fn execute(
+            &self,
+            _call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                result: serde_json::json!({"instructions": "pinned"}).to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "load_skill".to_string(),
+                    description: "load".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }]
+        }
+    }
 
     #[test]
     fn overflow_recovery_state_tracks_recoveries_and_resets() {
@@ -267,5 +313,148 @@ mod tests {
 
         assert_eq!(first.summarization_model_name.as_deref(), Some("sum-1"));
         assert_eq!(second.summarization_model_name.as_deref(), Some("sum-2"));
+    }
+
+    #[tokio::test]
+    async fn startup_reuses_retained_activation_and_explicit_selection_supersedes_it() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        for (id, prompt) in [("review-demo", "review N"), ("plan-demo", "plan N")] {
+            let root = skills_dir.join(id);
+            tokio::fs::create_dir_all(&root).await.expect("skill root");
+            tokio::fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: {id}\n---\n{prompt}\n"),
+            )
+            .await
+            .expect("skill definition");
+        }
+        let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+            skills_dir: skills_dir.clone(),
+            ..Default::default()
+        }));
+        manager.initialize().await.expect("initialize");
+        let tools = SuccessfulLoadSkill;
+        let review_config = AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: Some(vec!["review-demo".to_string()]),
+            disabled_skill_ids: BTreeSet::new(),
+            ..Default::default()
+        };
+        let mut session = Session::new("retained-session", "model");
+        initialize_loop_state(&mut session, "review", &review_config, &tools)
+            .await
+            .expect("initial activation");
+        let pinned_generation = session
+            .metadata
+            .get(SKILL_RUNTIME_ACTIVATION_GENERATION_KEY)
+            .cloned()
+            .expect("pinned generation metadata");
+        let pinned_revisions = session
+            .metadata
+            .get(SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY)
+            .cloned()
+            .expect("pinned revision metadata");
+        assert_eq!(
+            manager
+                .store()
+                .pinned_activation_skills("retained-session")
+                .await
+                .expect("review pin")
+                .0[0]
+                .prompt,
+            "review N"
+        );
+
+        tokio::fs::write(
+            skills_dir.join("review-demo/SKILL.md"),
+            "---\nname: review-demo\ndescription: review N+1\n---\nreview N+1\n",
+        )
+        .await
+        .expect("review N+1");
+        manager.store().reload().await.expect("reload N+1");
+        let mut suspended = AgentRuntimeState::new("retained-session");
+        suspended.status = AgentStatusState::Suspended;
+        session.agent_runtime_state = Some(suspended);
+        session.metadata.remove(LOADED_SKILL_IDS_METADATA_KEY);
+        let continuation_config = AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            disabled_skill_ids: BTreeSet::new(),
+            ..Default::default()
+        };
+        initialize_loop_state(
+            &mut session,
+            "plain clarification reply",
+            &continuation_config,
+            &tools,
+        )
+        .await
+        .expect("suspended continuation");
+        assert_eq!(
+            manager
+                .store()
+                .pinned_activation_skills("retained-session")
+                .await
+                .expect("retained review pin")
+                .0[0]
+                .prompt,
+            "review N",
+            "startup overwrites Suspended with Initializing, but retained pin must still win"
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+                .map(String::as_str),
+            Some("explicit")
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(SKILL_RUNTIME_ACTIVATION_GENERATION_KEY),
+            Some(&pinned_generation)
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY),
+            Some(&pinned_revisions)
+        );
+        assert!(!session
+            .metadata
+            .contains_key(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY));
+        assert_eq!(
+            session
+                .metadata
+                .get(LOADED_SKILL_IDS_METADATA_KEY)
+                .map(String::as_str),
+            Some("[\"review-demo\"]"),
+            "retained explicit activation must deterministically preload again"
+        );
+
+        let plan_config = AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: Some(vec!["plan-demo".to_string()]),
+            disabled_skill_ids: BTreeSet::new(),
+            ..Default::default()
+        };
+        initialize_loop_state(&mut session, "plan instead", &plan_config, &tools)
+            .await
+            .expect("superseding activation");
+        let (skills, descriptor) = manager
+            .store()
+            .pinned_activation_skills("retained-session")
+            .await
+            .expect("superseding plan pin");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "plan-demo");
+        assert_eq!(
+            descriptor
+                .skill_revisions
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["plan-demo"]
+        );
     }
 }

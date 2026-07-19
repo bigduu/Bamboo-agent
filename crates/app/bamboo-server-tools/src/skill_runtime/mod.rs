@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 
 use bamboo_llm::Config;
 use bamboo_skills::access_control::{SkillAccessError, SkillSessionPort};
+use bamboo_skills::runtime_metadata::validate_pinned_activation_metadata;
 use bamboo_skills::{SkillManager, SkillStore};
 
 use bamboo_agent_core::tools::ToolError;
@@ -47,19 +48,6 @@ impl SkillToolAccess {
         self.session_repo.load(session_id?).await
     }
 
-    pub(super) async fn skill_root(
-        &self,
-        skill_id: &str,
-        skill_mode: Option<&str>,
-        session_id: Option<&str>,
-    ) -> Result<PathBuf, ToolError> {
-        self.skill_store(session_id)
-            .await?
-            .get_skill_root_for_mode(skill_id, skill_mode)
-            .await
-            .map_err(|err| ToolError::Execution(format!("Failed to resolve skill root: {err}")))
-    }
-
     pub(super) async fn skill_store(
         &self,
         session_id: Option<&str>,
@@ -85,6 +73,45 @@ impl SkillToolAccess {
                 ToolError::Execution(format!("Failed to resolve session skill store: {error}"))
             })
     }
+}
+
+/// Validate Bamboo runner-owned immutable activation metadata. Returns `false`
+/// only for legacy/direct-tool callers that have no generation marker and may
+/// establish their pin lazily.
+pub(super) async fn validate_runtime_activation(
+    access: &SkillToolAccess,
+    store: &SkillStore,
+    session_id: &str,
+    skill_id: &str,
+) -> Result<bool, ToolError> {
+    let session = access
+        .session_for_context(Some(session_id))
+        .await
+        .ok_or_else(|| ToolError::Execution(format!("Session '{session_id}' not found")))?;
+    let descriptor = store.activation_descriptor(session_id).await;
+    let validated =
+        validate_pinned_activation_metadata(&session.metadata, descriptor.as_ref(), Some(skill_id))
+            .map_err(ToolError::Execution)?;
+    if validated {
+        bamboo_skills::access_control::ensure_skill_enabled(access, skill_id)
+            .await
+            .map_err(skill_access_error_to_tool_error)?;
+    }
+    Ok(validated)
+}
+
+pub(super) async fn validate_runtime_activation_descriptor(
+    access: &SkillToolAccess,
+    descriptor: &bamboo_skills::SkillActivationDescriptor,
+    session_id: &str,
+    skill_id: &str,
+) -> Result<bool, ToolError> {
+    let session = access
+        .session_for_context(Some(session_id))
+        .await
+        .ok_or_else(|| ToolError::Execution(format!("Session '{session_id}' not found")))?;
+    validate_pinned_activation_metadata(&session.metadata, Some(descriptor), Some(skill_id))
+        .map_err(ToolError::Execution)
 }
 
 #[async_trait]

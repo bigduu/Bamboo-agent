@@ -5,12 +5,13 @@ use chrono::Utc;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{Message, PromptSnapshot, Session};
+use bamboo_agent_core::{AgentError, Message, PromptSnapshot, Session};
 use bamboo_metrics::MetricsCollector;
 use bamboo_skills::runtime_metadata::{
+    SKILL_RUNTIME_ACTIVATION_ERROR_KEY, SKILL_RUNTIME_ACTIVATION_GENERATION_KEY,
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY,
-    SKILL_RUNTIME_SELECTION_COUNT_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
-    SKILL_RUNTIME_SELECTION_TRACE_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY, SKILL_RUNTIME_SELECTION_COUNT_KEY,
+    SKILL_RUNTIME_SELECTION_SOURCE_KEY, SKILL_RUNTIME_SELECTION_TRACE_KEY,
 };
 use bamboo_tools::exposure::activated_discoverable_tools;
 
@@ -30,6 +31,7 @@ pub fn refresh_prompt_snapshot(session: &mut Session) {
     prompt_setup::refresh_prompt_snapshot_from_session(session)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_session_for_loop(
     session: &mut Session,
     initial_message: &str,
@@ -38,9 +40,38 @@ pub(crate) async fn prepare_session_for_loop(
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
     debug_logger: &DebugLogger,
-) -> Option<TaskLoopContext> {
-    let skill_result =
-        skill_context::load_skill_context(config, session, session_id, initial_message).await;
+    must_resume_pinned_activation: bool,
+) -> super::Result<Option<TaskLoopContext>> {
+    let skill_result = match skill_context::load_skill_context(
+        config,
+        session,
+        session_id,
+        initial_message,
+        must_resume_pinned_activation,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            session.metadata.insert(
+                SKILL_RUNTIME_ACTIVATION_ERROR_KEY.to_string(),
+                error.clone(),
+            );
+            if let Some(persistence) = config.persistence.as_ref() {
+                if let Err(save_error) = persistence.save_runtime_session(session).await {
+                    tracing::warn!(
+                        "[{}] Failed to persist workflow activation setup error: {}",
+                        session_id,
+                        save_error
+                    );
+                }
+            }
+            return Err(AgentError::Tool(format!(
+                "Workflow activation failed before model execution: {error}"
+            )));
+        }
+    };
+    session.metadata.remove(SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
     let mut skill_context = skill_result.context.clone();
 
     if let Some(source) = skill_result.selection_source.as_deref() {
@@ -66,6 +97,20 @@ pub(crate) async fn prepare_session_for_loop(
             SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
             serde_json::to_string(&skill_result.selected_skill_ids).unwrap_or("[]".to_string()),
         );
+        if let Some(revision) = skill_result.catalog_revision {
+            session.metadata.insert(
+                SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+                revision.to_string(),
+            );
+        } else {
+            session
+                .metadata
+                .remove(SKILL_RUNTIME_ACTIVATION_GENERATION_KEY);
+        }
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+            serde_json::to_string(&skill_result.skill_revisions).unwrap_or("{}".to_string()),
+        );
         session.metadata.insert(
             SKILL_RUNTIME_SELECTION_TRACE_KEY.to_string(),
             serde_json::json!({
@@ -81,6 +126,10 @@ pub(crate) async fn prepare_session_for_loop(
                 SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY.to_string(),
                 mode.clone(),
             );
+        } else {
+            session
+                .metadata
+                .remove(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY);
         }
 
         skill_context::reset_explicit_activation_state(session, &skill_result);
@@ -90,25 +139,48 @@ pub(crate) async fn prepare_session_for_loop(
         // never observe a missing or previous-run allowlist from the cache.
         if let Some(persistence) = config.persistence.as_ref() {
             if let Err(error) = persistence.save_runtime_session(session).await {
-                tracing::warn!(
-                    "[{}] Failed to publish runtime skill selection before execution: {}",
-                    session_id,
-                    error
-                );
+                if let Some(skill_manager) = config.skill_manager.as_ref() {
+                    let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+                    let _ = skill_manager
+                        .release_activation_for_workspace(session_id, workspace.as_deref())
+                        .await;
+                }
+                return Err(AgentError::Tool(format!(
+                    "Workflow activation metadata could not be published before tool/model execution: {error}"
+                )));
             }
         }
 
-        if let Some(activated_context) =
-            skill_context::activate_explicit_skill(tools, session, session_id, &skill_result).await
-        {
+        let explicit_activation =
+            match skill_context::activate_explicit_skill(tools, session, session_id, &skill_result)
+                .await
+            {
+                Ok(activation) => activation,
+                Err(error) => {
+                    if let Some(skill_manager) = config.skill_manager.as_ref() {
+                        let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+                        let _ = skill_manager
+                            .release_activation_for_workspace(session_id, workspace.as_deref())
+                            .await;
+                    }
+                    return Err(AgentError::Tool(format!(
+                        "Explicit workflow activation failed before model execution: {error}"
+                    )));
+                }
+            };
+        if let Some(activated_context) = explicit_activation {
             skill_context = activated_context;
             if let Some(persistence) = config.persistence.as_ref() {
                 if let Err(error) = persistence.save_runtime_session(session).await {
-                    tracing::warn!(
-                        "[{}] Failed to publish explicit skill activation before execution: {}",
-                        session_id,
-                        error
-                    );
+                    if let Some(skill_manager) = config.skill_manager.as_ref() {
+                        let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+                        let _ = skill_manager
+                            .release_activation_for_workspace(session_id, workspace.as_deref())
+                            .await;
+                    }
+                    return Err(AgentError::Tool(format!(
+                        "Explicit workflow loaded-state could not be published before model execution: {error}"
+                    )));
                 }
             }
         }
@@ -151,7 +223,7 @@ pub(crate) async fn prepare_session_for_loop(
     if task_context.is_some() {
         tracing::debug!("[{}] TaskLoopContext initialized", session_id);
     }
-    task_context
+    Ok(task_context)
 }
 
 #[cfg(test)]

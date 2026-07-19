@@ -92,6 +92,14 @@ pub fn display_relative_path(path: &Path) -> String {
 /// Skips `SKILL.md` (the skill definition) and non-file entries.
 /// Returns sorted, deduplicated relative paths.
 pub fn list_skill_resource_paths(skill_root: &Path) -> std::io::Result<Vec<String>> {
+    list_skill_resource_paths_bounded(skill_root, usize::MAX, usize::MAX)
+}
+
+pub fn list_skill_resource_paths_bounded(
+    skill_root: &Path,
+    max_resources: usize,
+    max_relative_path_bytes: usize,
+) -> std::io::Result<Vec<String>> {
     if !skill_root.exists() {
         return Ok(Vec::new());
     }
@@ -113,7 +121,20 @@ pub fn list_skill_resource_paths(skill_root: &Path) -> std::io::Result<Vec<Strin
             continue;
         }
 
-        resources.push(display_relative_path(relative));
+        let displayed = display_relative_path(relative);
+        if displayed.len() > max_relative_path_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow resource relative path exceeds limit",
+            ));
+        }
+        if resources.len() >= max_resources {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow resource count exceeds limit",
+            ));
+        }
+        resources.push(displayed);
     }
 
     resources.sort();
@@ -161,5 +182,14 @@ mod tests {
         assert_eq!(start, 1);
         assert_eq!(end, 2);
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn bounded_resource_listing_rejects_count_and_path_limits_while_streaming() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(directory.path().join("one.txt"), "one").expect("one");
+        std::fs::write(directory.path().join("two.txt"), "two").expect("two");
+        assert!(list_skill_resource_paths_bounded(directory.path(), 1, 1024).is_err());
+        assert!(list_skill_resource_paths_bounded(directory.path(), 2, 3).is_err());
     }
 }
