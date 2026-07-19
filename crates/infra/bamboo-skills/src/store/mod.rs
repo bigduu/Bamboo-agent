@@ -2224,6 +2224,8 @@ Use this skill for testing.
 
     #[tokio::test]
     async fn invalid_reload_retains_lkg_and_emits_invalid_then_recovered() {
+        const PRIVATE_FIELD: &str = "private-lkg-frontmatter-field";
+        const PRIVATE_INSTRUCTIONS: &str = "Private LKG replacement instructions";
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("data/skills");
         let root = write_skill(&skills_dir, "steady", "original", "Original prompt")
@@ -2236,7 +2238,12 @@ Use this skill for testing.
         store.initialize().await.expect("initialize");
         let mut events = store.subscribe_workflow_catalog();
 
-        fs::write(root.join("SKILL.md"), "not valid frontmatter")
+        fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\nname: steady\ndescription: changed too early\n{PRIVATE_FIELD}: secret\n---\n{PRIVATE_INSTRUCTIONS}\n"
+            ),
+        )
             .await
             .expect("break skill");
         store.reload().await.expect("invalid reload is isolated");
@@ -2250,7 +2257,11 @@ Use this skill for testing.
             .find(|entry| entry.id == "steady")
             .expect("invalid entry");
         assert_eq!(invalid.status, WorkflowStatus::Invalid);
-        assert!(invalid.last_error.is_some());
+        let public_error = invalid.last_error.as_deref().expect("public error");
+        assert!(public_error.starts_with("SKILL.md:"));
+        assert!(!public_error.contains(PRIVATE_FIELD));
+        assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
+        assert!(!public_error.contains(root.to_string_lossy().as_ref()));
         assert_eq!(
             events.recv().await.expect("invalid event").kind,
             WorkflowCatalogEventKind::Invalid
@@ -2281,6 +2292,8 @@ Use this skill for testing.
 
     #[tokio::test]
     async fn invalid_workflow_yaml_retains_orchestration_lkg_metadata() {
+        const PRIVATE_RESOURCE: &str = "/private/resources/lkg-reference.md";
+        const PRIVATE_INSTRUCTIONS: &str = "NEW BODY MUST NOT ACTIVATE";
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("data/skills");
         let root = write_skill(&skills_dir, "orchestrate", "orchestrates", "Instructions")
@@ -2309,11 +2322,18 @@ Use this skill for testing.
 
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: orchestrate\ndescription: changed too early\n---\nNEW BODY MUST NOT ACTIVATE\n",
+            format!(
+                "---\nname: orchestrate\ndescription: changed too early\n---\n{PRIVATE_INSTRUCTIONS}\n"
+            ),
         )
         .await
         .expect("change instructions");
-        fs::write(root.join("workflow.yaml"), "version: 3\n")
+        fs::write(
+            root.join("workflow.yaml"),
+            format!(
+                "id: orchestrate\nname: Orchestrate\ndescription: Runs tools\nversion: '3'\ncomposition:\n  type: {PRIVATE_RESOURCE}\n"
+            ),
+        )
             .await
             .expect("break workflow yaml");
         store.reload().await.expect("isolated invalid metadata");
@@ -2330,21 +2350,33 @@ Use this skill for testing.
         let active = store.get_skill("orchestrate").await.expect("LKG active");
         assert_eq!(active.description, "orchestrates");
         assert_eq!(active.prompt, "Instructions");
-        assert!(!invalid
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains('/'));
+        let public_error = invalid.last_error.as_deref().expect("public error");
+        assert!(public_error.starts_with("workflow.yaml:"));
+        assert!(!public_error.contains(PRIVATE_RESOURCE));
+        assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
+        assert!(!public_error.contains(root.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
     async fn first_invalid_bundle_never_enters_active_skill_store() {
+        const PRIVATE_RESOURCE: &str = "/private/resources/first-load-reference.md";
+        const PRIVATE_INSTRUCTIONS: &str = "Secret body";
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("data/skills");
-        let root = write_skill(&skills_dir, "never-active", "invalid bundle", "Secret body")
-            .await
-            .expect("skill");
-        fs::write(root.join("workflow.yaml"), "version: 1\n")
+        let root = write_skill(
+            &skills_dir,
+            "never-active",
+            "invalid bundle",
+            PRIVATE_INSTRUCTIONS,
+        )
+        .await
+        .expect("skill");
+        fs::write(
+            root.join("workflow.yaml"),
+            format!(
+                "id: never-active\nname: Never active\ndescription: Invalid workflow\nversion: '1'\ncomposition:\n  type: {PRIVATE_RESOURCE}\n"
+            ),
+        )
             .await
             .expect("invalid workflow metadata");
         let store = SkillStore::new(SkillStoreConfig {
@@ -2356,18 +2388,98 @@ Use this skill for testing.
             .await
             .expect("initialize isolates invalid");
         assert!(store.get_skill("never-active").await.is_err());
-        let entry = store
-            .workflow_catalog_snapshot()
-            .await
+        let snapshot = store.workflow_catalog_snapshot().await;
+        let serialized = serde_json::to_string(&snapshot).expect("serialize catalog");
+        let entry = snapshot
             .entries
             .into_iter()
             .find(|entry| entry.id == "never-active")
             .expect("invalid diagnostic entry");
         assert_eq!(entry.status, WorkflowStatus::Invalid);
-        assert!(!entry
+        let public_error = entry.last_error.as_deref().expect("public error");
+        assert!(public_error.starts_with("workflow.yaml:"));
+        assert!(!public_error.contains(PRIVATE_RESOURCE));
+        assert!(!serialized.contains(PRIVATE_INSTRUCTIONS));
+        assert!(!serialized.contains(directory.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn invalid_skill_catalog_error_does_not_echo_private_frontmatter() {
+        const PRIVATE_FIELD: &str = "private-catalog-frontmatter-field";
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("data/skills");
+        let root = skills_dir.join("private-skill");
+        fs::create_dir_all(&root).await.expect("skill root");
+        fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\nname: private-skill\ndescription: Private skill\n{PRIVATE_FIELD}: secret\n---\nPrivate instructions\n"
+            ),
+        )
+        .await
+        .expect("invalid skill");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+
+        store.initialize().await.expect("isolate invalid skill");
+        let serialized = serde_json::to_string(&store.workflow_catalog_snapshot().await)
+            .expect("serialize catalog");
+
+        assert!(
+            !serialized.contains(PRIVATE_FIELD),
+            "catalog leaked: {serialized}"
+        );
+        assert!(!serialized.contains("Private instructions"));
+        assert!(!serialized.contains(root.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn shadowed_invalid_skill_error_is_also_sanitized() {
+        const PRIVATE_FIELD: &str = "private-shadowed-frontmatter-field";
+        const PRIVATE_INSTRUCTIONS: &str = "Private shadowed instructions";
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let skills_dir = data_dir.join("skills");
+        write_skill(&skills_dir, "shared-skill", "winner", "Winner instructions")
+            .await
+            .expect("winner skill");
+        let shadowed_root = data_dir.join("plugins/shadowed-plugin/skills/shared-skill");
+        fs::create_dir_all(&shadowed_root)
+            .await
+            .expect("shadowed skill root");
+        fs::write(
+            shadowed_root.join("SKILL.md"),
+            format!(
+                "---\nname: shared-skill\ndescription: shadowed\n{PRIVATE_FIELD}: secret\n---\n{PRIVATE_INSTRUCTIONS}\n"
+            ),
+        )
+        .await
+        .expect("invalid shadowed skill");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+
+        store.initialize().await.expect("initialize");
+        let snapshot = store.workflow_catalog_snapshot().await;
+        let serialized = serde_json::to_string(&snapshot).expect("serialize catalog");
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == "shared-skill")
+            .expect("winner entry");
+
+        assert_eq!(entry.shadowed_candidates.len(), 1);
+        let public_error = entry.shadowed_candidates[0]
             .last_error
-            .unwrap_or_default()
-            .contains(directory.path().to_string_lossy().as_ref()));
+            .as_deref()
+            .expect("shadowed public error");
+        assert!(public_error.starts_with("SKILL.md:"));
+        assert!(!serialized.contains(PRIVATE_FIELD));
+        assert!(!serialized.contains(PRIVATE_INSTRUCTIONS));
+        assert!(!serialized.contains(shadowed_root.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]

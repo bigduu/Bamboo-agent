@@ -218,16 +218,19 @@ pub(super) async fn list_prompt_presets_as_commands(data_dir: &Path) -> Vec<Comm
 }
 
 pub(super) fn catalog_entry_to_command(entry: &WorkflowCatalogEntry) -> CommandItem {
-    let (id_prefix, command_type) = match entry.kind {
-        bamboo_skills::WorkflowKind::Instruction => ("skill", "skill"),
-        bamboo_skills::WorkflowKind::Orchestration => ("workflow", "workflow"),
-    };
+    // Until the WorkflowRun engine owns orchestration activation (#578), every catalog bundle is
+    // selected through its canonical SKILL.md instruction entrypoint. Advertising an
+    // orchestration bundle as a legacy `workflow` makes Lotus fetch
+    // `/commands/workflow/{id}`, whose compatibility handler only serves
+    // `${BAMBOO_DATA_DIR}/workflows/{id}.md`; a bundle-local workflow.yaml therefore becomes a
+    // visible command that always fails on selection. Keep the future execution semantic in
+    // metadata.kind without pretending the legacy prompt-workflow adapter can execute it.
     CommandItem {
-        id: format!("{id_prefix}-{}", entry.id),
+        id: format!("skill-{}", entry.id),
         name: entry.id.clone(),
         display_name: entry.name.clone(),
         description: entry.description.clone(),
-        command_type: command_type.to_string(),
+        command_type: "skill".to_string(),
         category: None,
         tags: None,
         metadata: serde_json::json!({
