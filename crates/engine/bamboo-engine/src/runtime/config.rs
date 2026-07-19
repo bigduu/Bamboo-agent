@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bamboo_agent_core::composition::CompositionExecutor;
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolSchema;
@@ -343,7 +342,6 @@ pub struct AgentLoopConfig {
     pub(crate) selected_skill_mode: Option<String>,
     pub(crate) additional_tool_schemas: Vec<ToolSchema>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
-    pub(crate) composition_executor: Option<Arc<CompositionExecutor>>,
     pub(crate) skill_manager: Option<Arc<SkillManager>>,
     /// If true, skip appending the initial user message (already present in session).
     pub(crate) skip_initial_user_message: bool,
@@ -510,7 +508,6 @@ impl Default for AgentLoopConfig {
             selected_skill_mode: None,
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
-            composition_executor: None,
             skill_manager: None,
             skip_initial_user_message: false,
             storage: None,

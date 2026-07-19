@@ -93,6 +93,7 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
     let relative_paths = [
         "/commands",
         "/bamboo/workflows",
+        "/sessions/session/workflow-runs/example",
         "/bamboo/setup/status",
         "/bamboo/config",
         "/bamboo/access/status",
@@ -206,6 +207,40 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+    for (method, uri) in [
+        ("POST", "/api/v1/sessions/session/workflow-runs"),
+        ("GET", "/api/v1/sessions/session/workflow-runs/example"),
+        ("POST", "/v1/sessions/session/workflow-runs/example/cancel"),
+    ] {
+        let req = match method {
+            "POST" => test::TestRequest::post(),
+            _ => test::TestRequest::get(),
+        }
+        .uri(uri)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
 }
 
 /// `/api/v1/plugins` (Wave 2 § HTTP agent, `PLUGIN_PLAN.md`) added no new

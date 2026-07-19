@@ -307,6 +307,18 @@ impl AppState {
             ledger_schedule_bridge.clone(),
         );
 
+        // The workflow engine executes against the base tool surface. The
+        // caller-facing workflow_run tool is overlaid onto the root surface
+        // later, preventing a workflow from recursively dispatching itself.
+        let workflow_runs = crate::workflow::WorkflowRunAccess::new(
+            &data_dir,
+            base_tools.clone(),
+            skill_manager.clone(),
+            session_repo.clone(),
+        )
+        .await
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
         // owns handles to both maps.
@@ -644,6 +656,11 @@ impl AppState {
             fabric_deployer.clone(),
             notification_relay_deps.clone(),
         );
+        let workflow_run_tool =
+            Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
+            crate::tools::OverlayToolExecutor::new(tools, workflow_run_tool),
+        );
 
         child_completion_coordinator
             .set_root_tools(tools.clone())
@@ -778,6 +795,7 @@ impl AppState {
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             mcp_proxy_shutdown,
             skill_manager,
+            workflow_runs,
             mcp_manager,
             service_manager,
             boot_reconcile_services_handle: tokio::sync::Mutex::new(Some(
