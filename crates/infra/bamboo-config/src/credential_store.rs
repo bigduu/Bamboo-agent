@@ -789,6 +789,178 @@ impl CredentialStore {
         }))
     }
 
+    /// Prepare an exact notification update. Metadata for both channels is
+    /// committed with the credential document; only channels named in
+    /// `secret_intents` may replace or clear credential material.
+    pub(crate) fn prepare_notification_intents(
+        &self,
+        config: &mut crate::Config,
+        secret_intents: &BTreeSet<String>,
+        persisted_refs: &BTreeMap<String, CredentialRef>,
+        reset_domain: bool,
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        if !secret_intents
+            .iter()
+            .all(|channel| matches!(channel.as_str(), "ntfy" | "bark"))
+        {
+            return Err(ConfigStoreError::Validation(
+                "notification credential intent is invalid".to_string(),
+            ));
+        }
+        let candidate_counts = config_credential_ref_counts(config)?;
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for notification update".to_string(),
+            ));
+        }
+        let mut touched_refs = BTreeSet::new();
+        let mut required_refs = BTreeSet::new();
+        let mut changed = false;
+        for channel in ["ntfy", "bark"] {
+            let existing_ref = persisted_refs.get(channel).cloned();
+            let canonical = credential_ref(
+                "notification",
+                channel,
+                if channel == "ntfy" {
+                    "token"
+                } else {
+                    "device_key"
+                },
+            )?;
+            let (candidate_ref, secret, configured) = if channel == "ntfy" {
+                (
+                    config.notifications.ntfy.credential_ref.clone(),
+                    config.notifications.ntfy.token.clone(),
+                    config.notifications.ntfy.configured,
+                )
+            } else {
+                (
+                    config.notifications.bark.credential_ref.clone(),
+                    config.notifications.bark.device_key.clone(),
+                    config.notifications.bark.configured,
+                )
+            };
+            if let Some(candidate_ref) = candidate_ref.as_ref() {
+                if Some(candidate_ref) != existing_ref.as_ref() {
+                    return Err(ConfigStoreError::Validation(
+                        "notification credential reference is server-managed".to_string(),
+                    ));
+                }
+            }
+            let binds_reference =
+                existing_ref.is_some() || secret_intents.contains(channel) || configured;
+            if !binds_reference {
+                if channel == "ntfy" {
+                    config.notifications.ntfy.credential_ref = None;
+                    config.notifications.ntfy.token_encrypted = None;
+                    config.notifications.ntfy.configured = false;
+                } else {
+                    config.notifications.bark.credential_ref = None;
+                    config.notifications.bark.device_key_encrypted = None;
+                    config.notifications.bark.configured = false;
+                }
+                continue;
+            }
+            let reference = existing_ref.clone().unwrap_or(canonical);
+            if existing_ref.is_none()
+                && (document.entries.contains_key(&reference)
+                    || candidate_counts.get(&reference).copied().unwrap_or(0) > 0)
+            {
+                return Err(ConfigStoreError::Validation(
+                    "canonical notification credential reference is already in use".to_string(),
+                ));
+            }
+            if secret_intents.contains(channel) {
+                touched_refs.insert(reference.clone());
+                let value = secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if let Some(value) = value {
+                    if crate::patch::is_masked_api_key(value) {
+                        return Err(ConfigStoreError::Validation(
+                            "notification credential value must not be a mask".to_string(),
+                        ));
+                    }
+                    let ciphertext = crate::encryption::encrypt(value).map_err(|_| {
+                        ConfigStoreError::Validation("credential encryption failed".to_string())
+                    })?;
+                    document.entries.insert(
+                        reference.clone(),
+                        CredentialEntry {
+                            ciphertext,
+                            source: CredentialSource::User,
+                            updated_at: Utc::now(),
+                            key_version: ENCRYPTION_KEY_VERSION,
+                            migration_generation: None,
+                        },
+                    );
+                    changed = true;
+                } else if !configured {
+                    let self_consumers = usize::from(candidate_ref.as_ref() == Some(&reference));
+                    let other_consumers = candidate_counts
+                        .get(&reference)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(self_consumers);
+                    if other_consumers == 0 {
+                        changed |= document.entries.remove(&reference).is_some();
+                    }
+                }
+            }
+            let configured = if secret_intents.contains(channel) {
+                secret
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || configured
+            } else {
+                configured
+            };
+            if configured {
+                required_refs.insert(reference.clone());
+            }
+            if channel == "ntfy" {
+                config.notifications.ntfy.credential_ref = (!reset_domain).then_some(reference);
+                config.notifications.ntfy.token_encrypted = None;
+                config.notifications.ntfy.configured = configured;
+            } else {
+                config.notifications.bark.credential_ref = (!reset_domain).then_some(reference);
+                config.notifications.bark.device_key_encrypted = None;
+                config.notifications.bark.configured = configured;
+            }
+        }
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(
+            &document,
+            &required_refs.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        let touched_refs = touched_refs.into_iter().collect::<Vec<_>>();
+        let required_refs = required_refs
+            .into_iter()
+            .filter(|reference| touched_refs.contains(reference))
+            .collect();
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision,
+            touched_refs,
+            required_refs,
+        }))
+    }
+
     pub fn resolve(
         &self,
         credential_ref: &CredentialRef,
@@ -983,6 +1155,7 @@ impl CredentialStore {
         current: &[u8],
         touched_refs: &[String],
         required_refs: &[String],
+        preserve_staged_revision_bump: bool,
     ) -> ConfigStoreResult<(Vec<u8>, u64, Vec<String>)> {
         let original = Self::parse_transaction_document(original, true)?;
         let staged = Self::parse_transaction_document(staged, false)?;
@@ -994,6 +1167,8 @@ impl CredentialStore {
             .collect::<BTreeSet<_>>();
         let mut merged = current_document.data.clone();
         let mut changed = false;
+        let staged_revision_bump =
+            preserve_staged_revision_bump && staged.revision > original.revision;
 
         for reference in touched_refs {
             let original_entry = original.data.entries.get(&reference);
@@ -1027,7 +1202,7 @@ impl CredentialStore {
             .iter()
             .map(|reference| reference.as_str().to_string())
             .collect::<Vec<_>>();
-        if !changed {
+        if !changed && !staged_revision_bump {
             return Ok((current.to_vec(), expected_revision, remaining_required));
         }
         let revision = current_document.revision.checked_add(1).ok_or_else(|| {
@@ -1181,7 +1356,7 @@ impl CredentialStore {
     }
 }
 
-fn config_credential_ref_counts(
+pub(crate) fn config_credential_ref_counts(
     config: &crate::Config,
 ) -> ConfigStoreResult<BTreeMap<CredentialRef, usize>> {
     let mut counts = BTreeMap::<CredentialRef, usize>::new();
@@ -1216,6 +1391,12 @@ fn config_credential_ref_counts(
         if let Some(reference) = entry.credential_ref.as_ref() {
             add(reference);
         }
+    }
+    if let Some(reference) = config.notifications.ntfy.credential_ref.as_ref() {
+        add(reference);
+    }
+    if let Some(reference) = config.notifications.bark.credential_ref.as_ref() {
+        add(reference);
     }
     for server in &config.mcp.servers {
         match &server.transport {

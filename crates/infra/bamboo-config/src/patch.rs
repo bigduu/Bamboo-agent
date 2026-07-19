@@ -543,21 +543,10 @@ pub fn notification_secret_intents(patch_obj: &Map<String, Value>) -> Notificati
     intents
 }
 
-/// Make an explicit `token: ""` / `device_key: ""` clear actually clear.
-///
-/// Generalizes [`clear_provider_ciphertext_for_explicit_clears`] (#521) to
-/// notification-channel secrets: `notifications.ntfy.token_encrypted` /
-/// `notifications.bark.device_key_encrypted` are NOT `skip_serializing` (only
-/// `skip_serializing_if = "Option::is_none"`), so the merge round-trip in
-/// `config_manager::build_merged_config` carries the live config's ciphertext
-/// straight into the merged value even when the patch explicitly cleared the
-/// plaintext. `hydrate_notifications_from_encrypted` would then refill the
-/// plaintext from that ciphertext, and the subsequent
-/// `Config::refresh_notifications_encrypted` (which deliberately preserves
-/// ciphertext when plaintext is empty, #268) would leave it in place —
-/// silently undoing the clear. For every field the patch explicitly touched
-/// whose merged plaintext is empty (a clear, not a set), drop the
-/// round-tripped ciphertext BEFORE hydration so nothing refills it.
+/// Make an explicit `token: ""` / `device_key: ""` clear actually clear when
+/// processing legacy in-memory ciphertext. New writes never serialize those
+/// ciphertext fields, but an old loaded config can still carry them until its
+/// migration completes.
 pub fn clear_notification_ciphertext_for_explicit_clears(
     merged: &mut Config,
     intents: &NotificationSecretIntents,
@@ -586,6 +575,23 @@ pub fn clear_notification_ciphertext_for_explicit_clears(
             .is_empty()
     {
         merged.notifications.bark.device_key_encrypted = None;
+    }
+}
+
+/// Restore store-hydrated notification plaintext after a compatibility JSON
+/// round-trip for fields the patch did not explicitly replace or clear.
+/// Credential references and configured metadata are serialized, but secret
+/// plaintext is deliberately not.
+pub fn preserve_unpatched_notification_secrets(
+    merged: &mut Config,
+    current: &Config,
+    intents: &NotificationSecretIntents,
+) {
+    if !intents.ntfy_token {
+        merged.notifications.ntfy.token = current.notifications.ntfy.token.clone();
+    }
+    if !intents.bark_device_key {
+        merged.notifications.bark.device_key = current.notifications.bark.device_key.clone();
     }
 }
 
@@ -2362,11 +2368,9 @@ mod tests {
 
     #[test]
     fn null_ntfy_token_clears_roundtripped_ciphertext_via_clear_intents() {
-        // Full composition: the merge leaves `token_encrypted` behind (only
-        // `token` was null-deleted, not the whole `ntfy` object), so
-        // `clear_notification_ciphertext_for_explicit_clears` must strip it
-        // once the intent is recognized — otherwise hydration would refill
-        // the "deleted" plaintext straight from the stale ciphertext.
+        // Full composition: neither plaintext nor legacy ciphertext survives
+        // the JSON round-trip; the clear-intent pass remains idempotent for a
+        // config loaded from older in-memory state.
         let mut current = Config::default();
         current.notifications.ntfy.token = Some("existing-token".to_string());
         current.notifications.ntfy.token_encrypted = Some("existing-ct".to_string());
@@ -2376,10 +2380,9 @@ mod tests {
         assert!(intents.ntfy_token);
 
         let mut merged = merge_and_deserialize(&current, patch);
-        assert_eq!(
-            merged.notifications.ntfy.token_encrypted.as_deref(),
-            Some("existing-ct"),
-            "the merge alone leaves the round-tripped ciphertext behind"
+        assert!(
+            merged.notifications.ntfy.token_encrypted.is_none(),
+            "legacy notification ciphertext is no longer serialized through the merge"
         );
 
         clear_notification_ciphertext_for_explicit_clears(&mut merged, &intents);

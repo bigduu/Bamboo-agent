@@ -67,6 +67,7 @@ enum MigrationState {
 enum ExactTransactionScope {
     ProxyAuth,
     EnvVars,
+    Notifications,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +136,8 @@ enum ExtractedSecretKind {
     Other,
     ProxyAuth,
     EnvVar,
+    NotificationNtfy,
+    NotificationBark,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -275,6 +278,10 @@ pub fn persist_proxy_auth_credential_transaction_at_revision(
         Some(expected_revision),
         &BTreeSet::new(),
         None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
         None,
     );
     #[cfg(not(test))]
@@ -285,6 +292,10 @@ pub fn persist_proxy_auth_credential_transaction_at_revision(
         &BTreeSet::new(),
         Some(expected_revision),
         &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
         None,
     )
 }
@@ -306,6 +317,10 @@ pub fn persist_env_var_credential_transaction_at_revision(
         None,
         env_intents,
         Some(expected_revision),
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
         None,
     );
     #[cfg(not(test))]
@@ -316,6 +331,67 @@ pub fn persist_env_var_credential_transaction_at_revision(
         &BTreeSet::new(),
         None,
         env_intents,
+        Some(expected_revision),
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+    )
+}
+
+/// Persist the complete notification metadata domain and explicitly touched
+/// ntfy/Bark credentials in one recoverable exact transaction.
+pub fn persist_notification_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    secret_intents: &BTreeSet<String>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    persist_notification_credential_transaction_at_revision_with_reset(
+        data_dir,
+        config,
+        secret_intents,
+        false,
+        expected_revision,
+    )
+}
+
+/// Notification transaction variant used by the root compatibility API's
+/// explicit `notifications: null` domain reset.
+pub fn persist_notification_credential_transaction_at_revision_with_reset(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    secret_intents: &BTreeSet<String>,
+    reset_domain: bool,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    #[cfg(test)]
+    return persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        true,
+        secret_intents,
+        reset_domain,
+        Some(expected_revision),
+        None,
+    );
+    #[cfg(not(test))]
+    persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        true,
+        secret_intents,
+        reset_domain,
         Some(expected_revision),
     )
 }
@@ -344,6 +420,10 @@ pub fn persist_provider_instance_credential_transaction(
         None,
         &BTreeSet::new(),
         None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
         None,
     )
     .map(|_| ());
@@ -355,6 +435,10 @@ pub fn persist_provider_instance_credential_transaction(
         provider_instance_intents,
         None,
         &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
         None,
     )
     .map(|_| ())
@@ -378,6 +462,10 @@ fn persist_provider_credential_transaction_inner(
             .transpose()?,
         &BTreeSet::new(),
         None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
         fault,
     )
     .map(|_| ())
@@ -392,6 +480,10 @@ fn persist_provider_credential_transaction_with_instances_inner(
     proxy_expected_revision: Option<u64>,
     env_intents: &BTreeSet<String>,
     env_expected_revision: Option<u64>,
+    notification_transaction: bool,
+    notification_intents: &BTreeSet<String>,
+    notification_reset: bool,
+    notification_expected_revision: Option<u64>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
     let proxy_only = provider_intents.len() == 1
@@ -400,9 +492,18 @@ fn persist_provider_credential_transaction_with_instances_inner(
     let env_only = provider_intents.is_empty()
         && provider_instance_intents.is_empty()
         && !env_intents.is_empty();
+    let notification_only = provider_intents.is_empty()
+        && provider_instance_intents.is_empty()
+        && env_intents.is_empty()
+        && notification_transaction;
     if !env_intents.is_empty() && !env_only {
         return Err(ConfigStoreError::Validation(
             "env credentials must be updated in their own transaction".to_string(),
+        ));
+    }
+    if !notification_intents.is_empty() && !notification_only {
+        return Err(ConfigStoreError::Validation(
+            "notification credentials must be updated in their own transaction".to_string(),
         ));
     }
     std::fs::create_dir_all(data_dir)?;
@@ -428,6 +529,7 @@ fn persist_provider_credential_transaction_with_instances_inner(
     let config_original = read_target_or_empty(&data_dir.join(CONFIG_FILE))?;
     let persisted_instance_refs = provider_instance_refs_from_document(&config_original)?;
     let persisted_env_refs = env_refs_from_document(&config_original)?;
+    let persisted_notification_refs = notification_refs_from_document(&config_original)?;
     if env_only {
         for name in env_intents {
             if let Some(reference) = persisted_env_refs.get(name) {
@@ -435,9 +537,45 @@ fn persist_provider_credential_transaction_with_instances_inner(
             }
         }
     }
+    if notification_only {
+        for channel in ["ntfy", "bark"] {
+            let configured = if channel == "ntfy" {
+                config.notifications.ntfy.configured
+            } else {
+                config.notifications.bark.configured
+            };
+            if !persisted_notification_refs.contains_key(channel)
+                && !notification_intents.contains(channel)
+                && !configured
+            {
+                continue;
+            }
+            let reference =
+                persisted_notification_refs
+                    .get(channel)
+                    .cloned()
+                    .unwrap_or(credential_ref(
+                        "notification",
+                        channel,
+                        if channel == "ntfy" {
+                            "token"
+                        } else {
+                            "device_key"
+                        },
+                    )?);
+            ensure_notification_ref_exclusive(data_dir, reference.as_str(), channel)?;
+        }
+    }
     let store = CredentialStore::open(data_dir);
     let prepared = if env_only {
         store.prepare_env_var_intents(config, env_intents, &persisted_env_refs)?
+    } else if notification_only {
+        store.prepare_notification_intents(
+            config,
+            notification_intents,
+            &persisted_notification_refs,
+            notification_reset,
+        )?
     } else {
         store.prepare_provider_api_key_intents(
             config,
@@ -475,6 +613,19 @@ fn persist_provider_credential_transaction_with_instances_inner(
             });
         }
     }
+    if notification_only {
+        let expected = notification_expected_revision.ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "notification credential revision precondition is required".to_string(),
+            )
+        })?;
+        if prepared.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: prepared.expected_revision,
+            });
+        }
+    }
     let (config_bytes, provider_bytes) = if proxy_only {
         (
             prepare_proxy_auth_config_document(&config_original, config)?,
@@ -485,13 +636,20 @@ fn persist_provider_credential_transaction_with_instances_inner(
             prepare_env_var_config_document(&config_original, config)?,
             providers_original.clone(),
         )
+    } else if notification_only {
+        (
+            prepare_notification_config_document(&config_original, config, notification_reset)?,
+            providers_original.clone(),
+        )
     } else {
         config
             .prepare_provider_transaction_documents(&providers_original)
             .map_err(|error| ConfigStoreError::Validation(error.to_string()))?
     };
     let env_domain_changed = env_only && env_var_domain_changed(&config_original, &config_bytes)?;
-    if env_domain_changed {
+    let notification_domain_changed =
+        notification_only && notification_domain_changed(&config_original, &config_bytes)?;
+    if env_domain_changed || notification_domain_changed {
         prepared.advance_revision_for_domain_change()?;
     }
     if store.revision_unchecked()? != prepared.expected_revision {
@@ -503,7 +661,9 @@ fn persist_provider_credential_transaction_with_instances_inner(
     // A true env-domain no-op keeps the CAS revision and avoids publishing an
     // event or rewriting either durable member. Any credential or config
     // semantic change advances the one shared revision exactly once.
-    if env_only && !env_domain_changed && prepared.revision == prepared.expected_revision {
+    if (env_only && !env_domain_changed || notification_only && !notification_domain_changed)
+        && prepared.revision == prepared.expected_revision
+    {
         return Ok(prepared.revision);
     }
 
@@ -541,7 +701,7 @@ fn persist_provider_credential_transaction_with_instances_inner(
         .map(|reference| reference.as_str().to_string())
         .collect();
     credential_file.transaction_base_sha256 = credential_file.original_sha256.clone();
-    if !proxy_only && !env_only {
+    if !proxy_only && !env_only && !notification_only {
         stage_file(
             &stage_dir,
             &backup_dir,
@@ -591,6 +751,8 @@ fn persist_provider_credential_transaction_with_instances_inner(
             Some(ExactTransactionScope::ProxyAuth)
         } else if env_only {
             Some(ExactTransactionScope::EnvVars)
+        } else if notification_only {
+            Some(ExactTransactionScope::Notifications)
         } else {
             None
         },
@@ -735,6 +897,7 @@ fn migrate_inner(
         .map(|section| (section.bytes.as_slice(), section.name == CONFIG_FILE))
         .collect::<Vec<_>>();
     ensure_legacy_env_extractions_are_safe(data_dir, &extracted, &prospective_documents)?;
+    ensure_legacy_notification_extractions_are_safe(data_dir, &extracted, &prospective_documents)?;
     ensure_legacy_proxy_extractions_are_safe(
         data_dir,
         &credential_store,
@@ -745,6 +908,7 @@ fn migrate_inner(
     if providers.is_none() && mcp.is_none() && provider_instances.is_none() {
         scrub_provider_instance_credentials_from_backups(
             data_dir,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )?;
@@ -924,6 +1088,94 @@ fn ensure_legacy_env_extractions_are_safe(
         }
     }
     Ok(())
+}
+
+fn ensure_legacy_notification_extractions_are_safe(
+    data_dir: &Path,
+    extracted: &[ExtractedSecret],
+    prospective_documents: &[(&[u8], bool)],
+) -> ConfigStoreResult<()> {
+    for secret in extracted.iter().filter(|secret| {
+        matches!(
+            secret.kind,
+            ExtractedSecretKind::NotificationNtfy | ExtractedSecretKind::NotificationBark
+        )
+    }) {
+        let channel = match secret.kind {
+            ExtractedSecretKind::NotificationNtfy => "ntfy",
+            ExtractedSecretKind::NotificationBark => "bark",
+            _ => unreachable!("filtered above"),
+        };
+        for name in [PROVIDERS_FILE, MCP_FILE, CONFIG_FILE] {
+            let bytes = read_target_or_empty(&data_dir.join(name))?;
+            if notification_document_has_other_consumer(
+                &bytes,
+                secret.credential_ref.as_str(),
+                channel,
+                name == CONFIG_FILE,
+            )? {
+                return Err(ConfigStoreError::Validation(
+                    "notification credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+        for (bytes, config_root) in prospective_documents {
+            if notification_document_has_other_consumer(
+                bytes,
+                secret.credential_ref.as_str(),
+                channel,
+                *config_root,
+            )? {
+                return Err(ConfigStoreError::Validation(
+                    "notification credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn notification_document_has_other_consumer(
+    bytes: &[u8],
+    reference: &str,
+    channel: &str,
+    config_root: bool,
+) -> ConfigStoreResult<bool> {
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    if config_root {
+        if let Some(config) = value
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .and_then(|notifications| notifications.get_mut(channel))
+            .and_then(Value::as_object_mut)
+        {
+            if config.get("credential_ref").and_then(Value::as_str) == Some(reference) {
+                config.remove("credential_ref");
+            }
+        }
+    }
+    Ok(contains_notification_credential_reference(
+        &value, reference,
+    ))
+}
+
+fn contains_notification_credential_reference(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_notification_credential_reference(value, expected)),
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let credential_field = key == "credential_ref"
+                || key.ends_with("_credential_ref")
+                || key.ends_with("_credential_refs");
+            (credential_field && contains_string_value(value, expected))
+                || contains_notification_credential_reference(value, expected)
+        }),
+        _ => false,
+    }
 }
 
 fn ensure_env_ref_exclusive(
@@ -1195,6 +1447,32 @@ fn env_refs_from_document(bytes: &[u8]) -> ConfigStoreResult<BTreeMap<String, Cr
     Ok(refs)
 }
 
+fn notification_refs_from_document(
+    bytes: &[u8],
+) -> ConfigStoreResult<BTreeMap<String, CredentialRef>> {
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let root: Value = serde_json::from_slice(bytes)?;
+    let mut refs = BTreeMap::new();
+    for channel in ["ntfy", "bark"] {
+        let Some(raw) = root
+            .get("notifications")
+            .and_then(|value| value.get(channel))
+            .and_then(|value| value.get("credential_ref"))
+        else {
+            continue;
+        };
+        let raw = raw.as_str().ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "notification credential reference must be a string".to_string(),
+            )
+        })?;
+        refs.insert(channel.to_string(), CredentialRef::parse(raw.to_string())?);
+    }
+    Ok(refs)
+}
+
 fn plan_provider_instance_section(
     data_dir: &Path,
     extracted: &mut Vec<ExtractedSecret>,
@@ -1224,7 +1502,8 @@ fn plan_provider_instance_section(
         }
         Err(ConfigStoreError::Validation(message))
             if message.starts_with("legacy proxy auth")
-                || message.starts_with("legacy env credential") =>
+                || message.starts_with("legacy env credential")
+                || message.starts_with("legacy notification credential") =>
         {
             Err(ConfigStoreError::Validation(message))
         }
@@ -1249,6 +1528,7 @@ fn plan_provider_instance_document(
     let migration_generation = minimum_generation;
     let mut changed = migrate_proxy_auth(object, extracted, migration_generation)?;
     changed |= migrate_env_vars(object, extracted, migration_generation)?;
+    changed |= migrate_notification_credentials(object, extracted, migration_generation)?;
     if let Some(instances) = object.get_mut("provider_instances") {
         let instances = instances.as_object_mut().ok_or_else(|| {
             ConfigStoreError::Validation("provider_instances must be an object".to_string())
@@ -1372,6 +1652,94 @@ fn migrate_env_vars(
         }
         changed |= had_plaintext_field
             || had_ciphertext_field
+            || previous_ref.as_ref() != Some(&Value::String(reference.as_str().to_string()))
+            || previous_configured.as_ref() != Some(&Value::Bool(configured));
+    }
+    Ok(changed)
+}
+
+fn migrate_notification_credentials(
+    object: &mut Map<String, Value>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    let Some(notifications) = object
+        .get_mut("notifications")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for (channel, plaintext_key, ciphertext_key, field) in [
+        ("ntfy", "token", "token_encrypted", "token"),
+        ("bark", "device_key", "device_key_encrypted", "device_key"),
+    ] {
+        let Some(config) = notifications
+            .get_mut(channel)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let had_plaintext = config.contains_key(plaintext_key);
+        let had_ciphertext = config.contains_key(ciphertext_key);
+        let previous_ref = config.get("credential_ref").cloned();
+        let previous_configured = config.get("configured").cloned();
+        let plaintext = take_nonempty_string(config, plaintext_key)?;
+        let ciphertext = take_nonempty_string(config, ciphertext_key)?;
+        let secret = match (plaintext, ciphertext) {
+            (Some(plaintext), Some(ciphertext)) => {
+                let decrypted = crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                    ConfigStoreError::Validation(
+                        "legacy notification credential could not be decrypted".to_string(),
+                    )
+                })?;
+                if plaintext != decrypted {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy notification credential fields contain conflicting values"
+                            .to_string(),
+                    ));
+                }
+                Some(LegacySecret::Plaintext(plaintext))
+            }
+            (Some(plaintext), None) => Some(LegacySecret::Plaintext(plaintext)),
+            (None, Some(ciphertext)) => Some(LegacySecret::Ciphertext(ciphertext)),
+            (None, None) => None,
+        };
+        let configured = secret.is_some()
+            || config
+                .get("configured")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if secret.is_none() && previous_ref.is_none() && !configured {
+            changed |= had_plaintext || had_ciphertext;
+            continue;
+        }
+        let reference = existing_or_generated_ref(
+            config.get("credential_ref"),
+            "notification",
+            channel,
+            field,
+        )?;
+        config.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        config.insert("configured".to_string(), Value::Bool(configured));
+        if let Some(secret) = secret {
+            extracted.push(ExtractedSecret {
+                credential_ref: reference.clone(),
+                value: secret,
+                migration_generation,
+                kind: if channel == "ntfy" {
+                    ExtractedSecretKind::NotificationNtfy
+                } else {
+                    ExtractedSecretKind::NotificationBark
+                },
+                env_owner: None,
+            });
+        }
+        changed |= had_plaintext
+            || had_ciphertext
             || previous_ref.as_ref() != Some(&Value::String(reference.as_str().to_string()))
             || previous_configured.as_ref() != Some(&Value::Bool(configured));
     }
@@ -1909,6 +2277,81 @@ fn prepare_env_var_config_document(
     Ok(serde_json::to_vec_pretty(&document)?)
 }
 
+fn prepare_notification_config_document(
+    original: &[u8],
+    candidate: &crate::Config,
+    reset_domain: bool,
+) -> ConfigStoreResult<Vec<u8>> {
+    let mut root = parse_config_root_object(
+        original,
+        "config.json is invalid during notification credential transaction",
+    )?;
+    let candidate_notifications = serde_json::to_value(&candidate.notifications)?;
+    let candidate_notifications = candidate_notifications.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation(
+            "notification config transaction document is invalid".to_string(),
+        )
+    })?;
+    if reset_domain {
+        root.insert(
+            "notifications".to_string(),
+            Value::Object(candidate_notifications.clone()),
+        );
+        let value = Value::Object(root);
+        serde_json::from_value::<crate::Config>(value.clone()).map_err(|_| {
+            ConfigStoreError::Validation(
+                "config.json is invalid during notification credential transaction".to_string(),
+            )
+        })?;
+        return Ok(serde_json::to_vec_pretty(&value)?);
+    }
+    let notifications = root
+        .entry("notifications".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "notifications must be an object during credential transaction".to_string(),
+            )
+        })?;
+    for channel in ["desktop", "ntfy", "bark"] {
+        let candidate_channel = candidate_notifications
+            .get(channel)
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "notification channel config transaction document is invalid".to_string(),
+                )
+            })?;
+        let channel_object = notifications
+            .entry(channel.to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(format!(
+                    "notification channel '{channel}' must be an object"
+                ))
+            })?;
+        for (key, value) in candidate_channel {
+            channel_object.insert(key.clone(), value.clone());
+        }
+        if channel == "ntfy" {
+            channel_object.remove("token");
+            channel_object.remove("token_encrypted");
+        } else if channel == "bark" {
+            channel_object.remove("device_key");
+            channel_object.remove("device_key_encrypted");
+        }
+    }
+    let value = Value::Object(root);
+    serde_json::from_value::<crate::Config>(value.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json is invalid during notification credential transaction".to_string(),
+        )
+    })?;
+    Ok(serde_json::to_vec_pretty(&value)?)
+}
+
 fn env_var_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult<bool> {
     fn domain(bytes: &[u8]) -> ConfigStoreResult<Vec<Value>> {
         let root = parse_config_root_object(
@@ -1923,6 +2366,18 @@ fn env_var_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult
     }
 
     Ok(domain(current)? != domain(candidate)?)
+}
+
+fn notification_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult<bool> {
+    let current = parse_config_root_object(
+        current,
+        "config.json is invalid during notification credential transaction",
+    )?;
+    let candidate = parse_config_root_object(
+        candidate,
+        "config.json is invalid during notification credential transaction",
+    )?;
+    Ok(current.get("notifications") != candidate.get("notifications"))
 }
 
 fn parse_config_root_object(
@@ -2223,6 +2678,71 @@ fn abort_env_exact_transaction(
     sync_dir(data_dir)
 }
 
+fn rollback_notification_config_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let (_initial_file, initial_staged) =
+        initial_exact_transaction_member(data_dir, manifest, CONFIG_FILE)?;
+    let staged = parse_config_root_object(
+        &initial_staged,
+        "staged notification config transaction document is invalid",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    let target = data_dir.join(CONFIG_FILE);
+    for _ in 0..16 {
+        let current = read_target_or_empty(&target)?;
+        let current_hash = sha256(&current);
+        let mut object = parse_config_root_object(
+            &current,
+            "config.json changed to an invalid document during notification rollback",
+        )?;
+        if object.get("notifications") != staged.get("notifications") {
+            return Ok(());
+        }
+        match original.get("notifications").cloned() {
+            Some(value) => {
+                object.insert("notifications".to_string(), value);
+            }
+            None => {
+                object.remove("notifications");
+            }
+        }
+        let rolled_back = serde_json::to_vec_pretty(&Value::Object(object))?;
+        if AtomicFileStore::new(&target)
+            .write_bytes_if_hash_with_backup(&current_hash, &rolled_back)?
+        {
+            return Ok(());
+        }
+    }
+    Err(ConfigStoreError::Validation(
+        "notification config rollback could not obtain a stable document".to_string(),
+    ))
+}
+
+fn abort_notification_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::Notifications) {
+        return Ok(());
+    }
+    rollback_notification_config_member(data_dir, manifest)?;
+    rollback_proxy_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
+}
+
 fn ensure_proxy_consumers_or_abort(
     data_dir: &Path,
     manifest: &MigrationManifest,
@@ -2234,6 +2754,74 @@ fn ensure_proxy_consumers_or_abort(
     Ok(())
 }
 
+fn ensure_notification_ref_exclusive(
+    data_dir: &Path,
+    reference: &str,
+    channel: &str,
+) -> ConfigStoreResult<()> {
+    for name in [PROVIDERS_FILE, MCP_FILE, CONFIG_FILE] {
+        let bytes = read_target_or_empty(&data_dir.join(name))?;
+        if notification_document_has_other_consumer(
+            &bytes,
+            reference,
+            channel,
+            name == CONFIG_FILE,
+        )? {
+            return Err(ConfigStoreError::Validation(
+                "notification credential reference is shared by another consumer".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_notification_consumers_or_abort(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::Notifications) {
+        return Ok(());
+    }
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let (_, staged_config) = initial_exact_transaction_member(data_dir, manifest, CONFIG_FILE)?;
+    let mut refs = notification_refs_from_document(&staged_config)?;
+    for (channel, reference) in
+        notification_refs_from_document(&read_target_or_empty(&data_dir.join(CONFIG_FILE))?)?
+    {
+        refs.entry(channel).or_insert(reference);
+    }
+    for reference in &credential_file.touched_credential_refs {
+        let channel = refs
+            .iter()
+            .find_map(|(channel, candidate)| {
+                (candidate.as_str() == reference).then_some(channel.as_str())
+            })
+            .or_else(|| {
+                (reference == "notification.ntfy.token")
+                    .then_some("ntfy")
+                    .or_else(|| (reference == "notification.bark.device_key").then_some("bark"))
+            })
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "committed notification transaction reference is invalid".to_string(),
+                )
+            })?;
+        if let Err(error) = ensure_notification_ref_exclusive(data_dir, reference, channel) {
+            abort_notification_exact_transaction(data_dir, manifest)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn install_pending(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
@@ -2241,6 +2829,7 @@ fn install_pending(
 ) -> ConfigStoreResult<()> {
     validate_manifest(manifest)?;
     ensure_proxy_consumers_or_abort(data_dir, manifest)?;
+    ensure_notification_consumers_or_abort(data_dir, manifest)?;
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let names = manifest
         .files
@@ -2367,6 +2956,9 @@ fn install_rebased_exact_config_member(
     if manifest.exact_scope == Some(ExactTransactionScope::EnvVars) {
         return install_rebased_env_config_member(data_dir, manifest, file_index);
     }
+    if manifest.exact_scope == Some(ExactTransactionScope::Notifications) {
+        return install_rebased_notification_config_member(data_dir, manifest, file_index);
+    }
     install_rebased_proxy_config_member(
         data_dir,
         manifest,
@@ -2374,6 +2966,71 @@ fn install_rebased_exact_config_member(
         #[cfg(test)]
         fault,
     )
+}
+
+fn install_rebased_notification_config_member(
+    data_dir: &Path,
+    manifest: &mut MigrationManifest,
+    file_index: usize,
+) -> ConfigStoreResult<bool> {
+    let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
+    let file = manifest.files[file_index].clone();
+    let staged_bytes = std::fs::read(stage_dir.join(&file.staged_name))?;
+    let staged = parse_config_root_object(
+        &staged_bytes,
+        "staged notification config transaction document is invalid",
+    )?;
+    let target = data_dir.join(CONFIG_FILE);
+    let current = read_target_or_empty(&target)?;
+    let current_hash = sha256(&current);
+    let mut current_object = parse_config_root_object(
+        &current,
+        "config.json changed to an invalid document during committed notification transaction",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original_object = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    if current_object.get("notifications") != original_object.get("notifications")
+        && current_object.get("notifications") != staged.get("notifications")
+    {
+        abort_notification_exact_transaction(data_dir, manifest)?;
+        return Err(ConfigStoreError::Validation(
+            "notification metadata changed during committed transaction".to_string(),
+        ));
+    }
+    match staged.get("notifications").cloned() {
+        Some(value) => {
+            current_object.insert("notifications".to_string(), value);
+        }
+        None => {
+            current_object.remove("notifications");
+        }
+    }
+    let rebased = Value::Object(current_object);
+    serde_json::from_value::<crate::Config>(rebased.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed notification transaction"
+                .to_string(),
+        )
+    })?;
+    let rebased = serde_json::to_vec_pretty(&rebased)?;
+    let staged_name = format!("{CONFIG_FILE}.rebase.{}", Uuid::new_v4());
+    AtomicFileStore::new(stage_dir.join(&staged_name)).write_bytes_without_backup(&rebased)?;
+    sync_dir(&stage_dir)?;
+    let file = &mut manifest.files[file_index];
+    file.staged_name = staged_name;
+    file.sha256 = sha256(&rebased);
+    file.original_sha256 = Some(current_hash.clone());
+    write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
+    if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
+        return Err(ConfigStoreError::Validation(
+            "config.json changed repeatedly during committed notification transaction".to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 fn install_rebased_env_config_member(
@@ -2864,11 +3521,24 @@ fn install_exact_credential_member(
             }
             continue;
         }
-        if file.touched_credential_refs.is_empty() {
+        if file.touched_credential_refs.is_empty()
+            && manifest.exact_scope != Some(ExactTransactionScope::Notifications)
+        {
             return Err(ConfigStoreError::Validation(
                 "committed credential transaction cannot be safely rebased".to_string(),
             ));
         }
+        let preserve_notification_domain_revision =
+            if manifest.exact_scope == Some(ExactTransactionScope::Notifications) {
+                let (_, staged_config) =
+                    initial_exact_transaction_member(data_dir, manifest, CONFIG_FILE)?;
+                let original_config = read_encrypted_migration_backup(
+                    &validated_backup_dir(data_dir, &manifest.transaction_id)?.join(CONFIG_FILE),
+                )?;
+                notification_domain_changed(&original_config, &staged_config)?
+            } else {
+                false
+            };
         let (rebased, current_revision, remaining_required_refs) =
             CredentialStore::merge_exact_transaction_documents(
                 &original,
@@ -2876,6 +3546,7 @@ fn install_exact_credential_member(
                 &current,
                 &file.touched_credential_refs,
                 &file.required_credential_refs,
+                preserve_notification_domain_revision,
             )?;
         let staged_name = format!("{CREDENTIALS_FILE}.rebase.{}", Uuid::new_v4());
         AtomicFileStore::new(stage_dir.join(&staged_name))
@@ -3000,10 +3671,12 @@ fn rebase_changed_section(
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
     let proxy_clear_tombstones = proxy_clear_tombstones_from_manifest(&manifest);
     let env_clear_tombstones = env_clear_tombstones_from_manifest(&manifest);
+    let notification_clear_tombstones = notification_clear_tombstones_from_manifest(&manifest);
     scrub_provider_instance_credentials_from_backups(
         data_dir,
         &proxy_clear_tombstones,
         &env_clear_tombstones,
+        &notification_clear_tombstones,
     )?;
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
@@ -3043,10 +3716,29 @@ fn env_clear_tombstones_from_manifest(manifest: &MigrationManifest) -> BTreeSet<
         .collect()
 }
 
+fn notification_clear_tombstones_from_manifest(manifest: &MigrationManifest) -> BTreeSet<String> {
+    if manifest.exact_scope != Some(ExactTransactionScope::Notifications) {
+        return BTreeSet::new();
+    }
+    let Some(file) = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+    else {
+        return BTreeSet::new();
+    };
+    file.touched_credential_refs
+        .iter()
+        .filter(|reference| !file.required_credential_refs.contains(reference))
+        .cloned()
+        .collect()
+}
+
 fn scrub_provider_instance_credentials_from_backups(
     data_dir: &Path,
     proxy_clear_tombstones: &BTreeSet<String>,
     env_clear_tombstones: &BTreeSet<String>,
+    notification_clear_tombstones: &BTreeSet<String>,
 ) -> ConfigStoreResult<()> {
     let store = CredentialStore::open(data_dir);
     for suffix in ["bak", "bak.1", "bak.2"] {
@@ -3066,6 +3758,7 @@ fn scrub_provider_instance_credentials_from_backups(
             &mut root,
             proxy_clear_tombstones,
             env_clear_tombstones,
+            notification_clear_tombstones,
         )? {
             continue;
         }
@@ -3081,6 +3774,7 @@ fn scrub_provider_instance_credentials(
     root: &mut Value,
     proxy_clear_tombstones: &BTreeSet<String>,
     env_clear_tombstones: &BTreeSet<String>,
+    notification_clear_tombstones: &BTreeSet<String>,
 ) -> ConfigStoreResult<bool> {
     let Some(object) = root.as_object_mut() else {
         return Ok(false);
@@ -3093,6 +3787,7 @@ fn scrub_provider_instance_credentials(
             migrate_proxy_auth(object, &mut extracted, 1)?
         };
     changed |= migrate_env_vars(object, &mut extracted, 1)?;
+    changed |= migrate_notification_credentials(object, &mut extracted, 1)?;
     if let Some(entries) = object.get_mut("env_vars").and_then(Value::as_array_mut) {
         for entry in entries {
             let Some(entry) = entry.as_object_mut() else {
@@ -3107,6 +3802,23 @@ fn scrub_provider_instance_credentials(
             }
         }
     }
+    for channel in ["ntfy", "bark"] {
+        let Some(config) = object
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .and_then(|notifications| notifications.get_mut(channel))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if config
+            .get("credential_ref")
+            .and_then(Value::as_str)
+            .is_some_and(|reference| notification_clear_tombstones.contains(reference))
+        {
+            config.insert("configured".to_string(), Value::Bool(false));
+        }
+    }
     let mut pending = Vec::with_capacity(extracted.len());
     for secret in extracted.drain(..) {
         if secret.kind == ExtractedSecretKind::EnvVar {
@@ -3117,6 +3829,18 @@ fn scrub_provider_instance_credentials(
             if status.configured && status.source != crate::CredentialSource::Migrated {
                 // The live store is authoritative; the backup was already
                 // rewritten to metadata above, so never replay its stale copy.
+                continue;
+            }
+        }
+        if matches!(
+            secret.kind,
+            ExtractedSecretKind::NotificationNtfy | ExtractedSecretKind::NotificationBark
+        ) {
+            if notification_clear_tombstones.contains(secret.credential_ref.as_str()) {
+                continue;
+            }
+            let status = store.status_unchecked(&secret.credential_ref)?;
+            if status.configured && status.source != crate::CredentialSource::Migrated {
                 continue;
             }
         }
@@ -3189,6 +3913,11 @@ fn scrub_provider_instance_credentials(
     ensure_legacy_proxy_extractions_are_safe(
         data_dir,
         store,
+        &extracted,
+        &[(prospective.as_slice(), true)],
+    )?;
+    ensure_legacy_notification_extractions_are_safe(
+        data_dir,
         &extracted,
         &[(prospective.as_slice(), true)],
     )?;
@@ -3323,6 +4052,9 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                     .iter()
                     .find(|file| file.name == CREDENTIALS_FILE)
                     .is_some_and(|file| !file.touched_credential_refs.is_empty())
+        }
+        (true, Some(ExactTransactionScope::Notifications)) => {
+            manifest.files.len() == 2 && unique.contains(CONFIG_FILE)
         }
         (true, None) => manifest.files.len() == 3 && unique.contains(PROVIDERS_FILE),
         (false, Some(_)) => false,
@@ -5820,6 +6552,10 @@ mod tests {
             None,
             &BTreeSet::new(),
             None,
+            false,
+            &BTreeSet::new(),
+            false,
+            None,
             None,
         )
         .unwrap();
@@ -5891,6 +6627,10 @@ mod tests {
             &BTreeSet::from(["work".to_string()]),
             None,
             &BTreeSet::new(),
+            None,
+            false,
+            &BTreeSet::new(),
+            false,
             None,
             Some(MigrationFault::AfterExactCommitCredentialClearRace),
         )
@@ -6546,6 +7286,10 @@ mod tests {
             None,
             &intents,
             Some(0),
+            false,
+            &BTreeSet::new(),
+            false,
+            None,
             Some(MigrationFault::AfterManifest),
         )
         .unwrap_err();
@@ -6714,6 +7458,10 @@ mod tests {
             None,
             &BTreeSet::from([name.to_string()]),
             Some(0),
+            false,
+            &BTreeSet::new(),
+            false,
+            None,
             Some(MigrationFault::AfterCredentials),
         )
         .unwrap_err();
@@ -6867,6 +7615,10 @@ mod tests {
                 None,
                 &BTreeSet::from(["TOKEN".to_string()]),
                 Some(1),
+                false,
+                &BTreeSet::new(),
+                false,
+                None,
                 Some(MigrationFault::AfterCredentials),
             )
             .unwrap_err();
@@ -7014,6 +7766,472 @@ mod tests {
             serde_json::from_slice::<Value>(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap())
                 .unwrap(),
             serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn legacy_notification_secrets_migrate_to_refs_and_scrub_root_backups() {
+        let _key = crate::encryption::set_test_encryption_key([0xa1; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let bark_cipher = crate::encryption::encrypt("bark-legacy-secret").unwrap();
+        let root = serde_json::json!({
+            "notifications": {
+                "desktop": {"enabled": true},
+                "ntfy": {
+                    "enabled": true,
+                    "topic": "alerts",
+                    "token": "ntfy-legacy-secret",
+                    "unknown_channel_field": {"kept": true}
+                },
+                "bark": {
+                    "enabled": true,
+                    "device_key_encrypted": bark_cipher
+                }
+            },
+            "unknown_root": {"kept": true}
+        });
+        let bytes = serde_json::to_vec_pretty(&root).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &bytes).unwrap();
+        std::fs::write(dir.path().join("config.json.bak"), &bytes).unwrap();
+
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+        let migrated = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(!migrated.contains("ntfy-legacy-secret"));
+        assert!(!migrated.contains("bark-legacy-secret"));
+        assert!(!migrated.contains("token_encrypted"));
+        assert!(!migrated.contains("device_key_encrypted"));
+        let root: Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(
+            root["notifications"]["ntfy"]["credential_ref"],
+            "notification.ntfy.token"
+        );
+        assert_eq!(
+            root["notifications"]["bark"]["credential_ref"],
+            "notification.bark.device_key"
+        );
+        assert_eq!(
+            root["notifications"]["ntfy"]["unknown_channel_field"]["kept"],
+            true
+        );
+        assert_eq!(root["unknown_root"]["kept"], true);
+        let backup = std::fs::read_to_string(dir.path().join("config.json.bak")).unwrap();
+        assert!(!backup.contains("ntfy-legacy-secret"));
+        assert!(!backup.contains("token_encrypted"));
+
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            loaded.notifications.ntfy.token.as_deref(),
+            Some("ntfy-legacy-secret")
+        );
+        assert_eq!(
+            loaded.notifications.bark.device_key.as_deref(),
+            Some("bark-legacy-secret")
+        );
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap(),
+            migrated
+        );
+    }
+
+    #[test]
+    fn backup_only_notification_secret_is_migrated_and_scrubbed() {
+        let _key = crate::encryption::set_test_encryption_key([0xa4; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), br#"{"unknown_root":true}"#).unwrap();
+        std::fs::write(
+            dir.path().join("config.json.bak"),
+            br#"{"notifications":{"ntfy":{"token":"backup-only-secret"}}}"#,
+        )
+        .unwrap();
+
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+
+        let backup = std::fs::read_to_string(dir.path().join("config.json.bak")).unwrap();
+        assert!(!backup.contains("backup-only-secret"));
+        assert!(!backup.contains("\"token\""));
+        let backup: Value = serde_json::from_str(&backup).unwrap();
+        assert_eq!(
+            backup["notifications"]["ntfy"]["credential_ref"],
+            "notification.ntfy.token"
+        );
+        assert_eq!(backup["notifications"]["ntfy"]["configured"], true);
+        let reference = credential_ref("notification", "ntfy", "token").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "backup-only-secret"
+        );
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["unknown_root"], true);
+        assert!(root.get("notifications").is_none());
+    }
+
+    #[test]
+    fn notification_exact_transaction_supports_cas_metadata_and_clear() {
+        let _key = crate::encryption::set_test_encryption_key([0xa2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "unknown_root":{"kept":true},
+                "notifications":{
+                    "future_channel":{"kept":true},
+                    "ntfy":{"future_metadata":{"kept":true}}
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.notifications.ntfy.enabled = true;
+        candidate.notifications.ntfy.topic = "alerts".to_string();
+        candidate.notifications.ntfy.token = Some("new-ntfy-secret".to_string());
+        candidate.notifications.ntfy.configured = true;
+        let revision = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::from(["ntfy".to_string()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(revision, 1);
+
+        let mut metadata =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        metadata.notifications.ntfy.topic = "renamed".to_string();
+        let revision = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut metadata,
+            &BTreeSet::new(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&credential_ref("notification", "ntfy", "token").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "new-ntfy-secret"
+        );
+
+        let mut clear =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        clear.notifications.ntfy.token = None;
+        clear.notifications.ntfy.configured = false;
+        let revision = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut clear,
+            &BTreeSet::from(["ntfy".to_string()]),
+            2,
+        )
+        .unwrap();
+        assert_eq!(revision, 3);
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&credential_ref("notification", "ntfy", "token").unwrap())
+            .unwrap()
+            .is_none());
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["unknown_root"]["kept"], true);
+        assert_eq!(root["notifications"]["future_channel"]["kept"], true);
+        assert_eq!(
+            root["notifications"]["ntfy"]["future_metadata"]["kept"],
+            true
+        );
+        assert_eq!(root["notifications"]["ntfy"]["configured"], false);
+        assert!(root["notifications"]["ntfy"].get("token").is_none());
+        assert!(root["notifications"]["ntfy"]
+            .get("token_encrypted")
+            .is_none());
+
+        let mut stale = clear;
+        stale.notifications.ntfy.token = Some("stale-secret".to_string());
+        stale.notifications.ntfy.configured = true;
+        let error = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut stale,
+            &BTreeSet::from(["ntfy".to_string()]),
+            2,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict { actual: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn metadata_only_notification_update_does_not_claim_unbound_canonical_ref() {
+        let _key = crate::encryption::set_test_encryption_key([0xa7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let canonical = credential_ref("notification", "ntfy", "token").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                canonical.clone(),
+                "unbound-foreign-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.notifications.ntfy.topic = "metadata-only".to_string();
+
+        let revision = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(revision, 2);
+        assert!(candidate.notifications.ntfy.credential_ref.is_none());
+        assert!(!candidate.notifications.ntfy.configured);
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert_eq!(loaded.notifications.ntfy.topic, "metadata-only");
+        assert!(loaded.notifications.ntfy.credential_ref.is_none());
+        assert!(loaded.notifications.ntfy.token.is_none());
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&canonical)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "unbound-foreign-secret"
+        );
+    }
+
+    #[test]
+    fn fresh_metadata_only_notification_update_keeps_unconfigured_refs_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.notifications.ntfy.topic = "metadata-only".to_string();
+
+        let revision = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(revision, 1);
+        assert!(candidate.notifications.ntfy.credential_ref.is_none());
+        assert!(candidate.notifications.bark.credential_ref.is_none());
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert!(root["notifications"]["ntfy"]
+            .get("credential_ref")
+            .is_none());
+        assert!(root["notifications"]["bark"]
+            .get("credential_ref")
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_notification_domain_reset_drops_unknown_fields_and_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "notifications": {
+                    "future_channel": {"kept_on_patch": true},
+                    "ntfy": {"future_metadata": true}
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut candidate = crate::Config::default();
+        let revision = persist_notification_credential_transaction_at_revision_with_reset(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::from(["ntfy".to_string(), "bark".to_string()]),
+            true,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(revision, 1);
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert!(root["notifications"].get("future_channel").is_none());
+        assert!(root["notifications"]["ntfy"]
+            .get("future_metadata")
+            .is_none());
+        assert!(root["notifications"]["ntfy"]
+            .get("credential_ref")
+            .is_none());
+        assert!(root["notifications"]["bark"]
+            .get("credential_ref")
+            .is_none());
+        assert_eq!(
+            candidate.notifications,
+            crate::NotificationsConfig::default()
+        );
+    }
+
+    #[test]
+    fn metadata_only_notification_update_rejects_an_existing_shared_ref() {
+        let _key = crate::encryption::set_test_encryption_key([0xa8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = CredentialRef::parse("shared.notification.ref").unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "proxy_auth_credential_ref": shared,
+                "notifications": {
+                    "ntfy": {"credential_ref": shared, "configured": true}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                shared.clone(),
+                "shared-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut candidate: crate::Config =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+
+        let error = persist_notification_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            1,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("shared by another consumer"));
+    }
+
+    #[test]
+    fn notification_consumer_scan_ignores_plain_strings_but_finds_credential_fields() {
+        let reference = "notification.ntfy.token";
+        let harmless = serde_json::to_vec(&serde_json::json!({
+            "description": reference,
+            "nested": {"model": reference},
+            "notifications": {"ntfy": {"credential_ref": reference}}
+        }))
+        .unwrap();
+        assert!(
+            !notification_document_has_other_consumer(&harmless, reference, "ntfy", true).unwrap()
+        );
+
+        let real_consumer = serde_json::to_vec(&serde_json::json!({
+            "description": reference,
+            "proxy_auth_credential_ref": reference,
+            "notifications": {"ntfy": {"credential_ref": reference}}
+        }))
+        .unwrap();
+        assert!(
+            notification_document_has_other_consumer(&real_consumer, reference, "ntfy", true)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_only_notification_rebase_preserves_unrelated_write_and_bumps_revision() {
+        let _key = crate::encryption::set_test_encryption_key([0xa9; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.notifications.ntfy.topic = "metadata-after-race".to_string();
+
+        let revision = persist_provider_credential_transaction_with_instances_inner(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::new(),
+            None,
+            true,
+            &BTreeSet::new(),
+            false,
+            Some(0),
+            Some(MigrationFault::AfterExactCommitUnrelatedCredentialRace),
+        )
+        .unwrap();
+
+        assert_eq!(revision, 2);
+        assert_eq!(CredentialStore::open(dir.path()).revision().unwrap(), 2);
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&credential_ref("provider", "anthropic", "api_key").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-unrelated-winner"
+        );
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert_eq!(loaded.notifications.ntfy.topic, "metadata-after-race");
+        assert!(loaded.notifications.ntfy.credential_ref.is_none());
+    }
+
+    #[test]
+    fn committed_notification_transaction_rebases_unrelated_root_edit() {
+        let _key = crate::encryption::set_test_encryption_key([0xa3; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), br#"{"server":{"port":9562}}"#).unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.notifications.bark.enabled = true;
+        candidate.notifications.bark.device_key = Some("bark-transaction-secret".to_string());
+        candidate.notifications.bark.configured = true;
+        let error = persist_provider_credential_transaction_with_instances_inner(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::new(),
+            None,
+            true,
+            &BTreeSet::from(["bark".to_string()]),
+            false,
+            Some(0),
+            Some(MigrationFault::AfterManifest),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigStoreError::Io(_)));
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{"server":{"port":9999},"external":{"kept":true}}"#,
+        )
+        .unwrap();
+
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["server"]["port"], 9999);
+        assert_eq!(root["external"]["kept"], true);
+        assert_eq!(
+            root["notifications"]["bark"]["credential_ref"],
+            "notification.bark.device_key"
+        );
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&credential_ref("notification", "bark", "device_key").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "bark-transaction-secret"
         );
     }
 }

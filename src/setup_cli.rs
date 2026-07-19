@@ -250,6 +250,7 @@ pub fn run_config_set(
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
     let mut provider_credential_intents = BTreeSet::new();
     let mut provider_instance_credential_intents = BTreeSet::new();
+    let mut notification_credential_intents = BTreeSet::new();
 
     let parts: Vec<&str> = key.split('.').collect();
     // `Some(outcome)` = generic dot-path set (validated new config inside);
@@ -312,6 +313,8 @@ pub fn run_config_set(
                 bail!("token must not be empty");
             }
             config.notifications.ntfy.token = Some(v.to_string());
+            config.notifications.ntfy.configured = true;
+            notification_credential_intents.insert("ntfy".to_string());
             None
         }
         ["notifications", "bark", "device_key"] => {
@@ -320,6 +323,8 @@ pub fn run_config_set(
                 bail!("device_key must not be empty");
             }
             config.notifications.bark.device_key = Some(v.to_string());
+            config.notifications.bark.configured = true;
+            notification_credential_intents.insert("bark".to_string());
             None
         }
         // Generic, validated dot-path set for every other key. Secret paths
@@ -356,7 +361,17 @@ pub fn run_config_set(
         Some(out) => out.config,
         None => config,
     };
-    if !provider_credential_intents.is_empty() || !provider_instance_credential_intents.is_empty() {
+    if !notification_credential_intents.is_empty() {
+        let revision = bamboo_config::CredentialStore::open(&data_dir).revision()?;
+        bamboo_config::persist_notification_credential_transaction_at_revision(
+            &data_dir,
+            &mut to_save,
+            &notification_credential_intents,
+            revision,
+        )?;
+    } else if !provider_credential_intents.is_empty()
+        || !provider_instance_credential_intents.is_empty()
+    {
         bamboo_config::persist_provider_instance_credential_transaction(
             &data_dir,
             &mut to_save,
@@ -826,6 +841,46 @@ mod tests {
             reloaded.providers().anthropic.as_ref().unwrap().api_key,
             "sk-ant-setupcli-secret",
             "the stored key must still decrypt after a generic set"
+        );
+    }
+
+    #[test]
+    fn config_set_notification_secret_uses_isolated_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        run_config_set(
+            "notifications.ntfy.token",
+            "ntfy-setupcli-secret",
+            Some(data_dir.clone()),
+            false,
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(data_dir.join("config.json")).unwrap();
+        assert!(!raw.contains("ntfy-setupcli-secret"));
+        assert!(!raw.contains("token_encrypted"));
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            root["notifications"]["ntfy"]["credential_ref"],
+            "notification.ntfy.token"
+        );
+        assert_eq!(root["notifications"]["ntfy"]["configured"], true);
+        let credentials = std::fs::read_to_string(data_dir.join("credentials.json")).unwrap();
+        assert!(!credentials.contains("ntfy-setupcli-secret"));
+
+        run_config_set(
+            "notifications.ntfy.topic",
+            "alerts",
+            Some(data_dir.clone()),
+            false,
+        )
+        .unwrap();
+        let reloaded = Config::from_data_dir_without_env(Some(data_dir));
+        assert_eq!(reloaded.notifications.ntfy.topic, "alerts");
+        assert_eq!(
+            reloaded.notifications.ntfy.token.as_deref(),
+            Some("ntfy-setupcli-secret")
         );
     }
 

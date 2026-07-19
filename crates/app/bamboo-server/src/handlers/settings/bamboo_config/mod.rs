@@ -1,5 +1,6 @@
 mod config_endpoints;
 mod credentials;
+mod notifications;
 mod proxy_auth;
 mod sections;
 mod tools;
@@ -17,6 +18,7 @@ pub use credentials::{
     clear_credential, get_credential_status, get_live_config_health, list_credentials,
     replace_credential,
 };
+pub use notifications::get_notification_config;
 pub use proxy_auth::{get_proxy_auth_status, set_proxy_auth};
 pub use sections::{get_mcp_section, get_provider_section, put_mcp_section, put_provider_section};
 pub use tools::get_bamboo_tools;

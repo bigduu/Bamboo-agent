@@ -150,6 +150,14 @@ async fn reject_managed_credential_ref(
             "env credentials must be changed through the revisioned env-vars API".to_string(),
         ));
     }
+    if config.notifications.ntfy.credential_ref.as_ref() == Some(credential_ref)
+        || config.notifications.bark.credential_ref.as_ref() == Some(credential_ref)
+    {
+        return Err(AppError::BadRequest(
+            "notification credentials must be changed through the revisioned notification config API"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 

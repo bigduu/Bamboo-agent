@@ -686,10 +686,9 @@ impl Config {
 
     // ── Notification channel secrets (ntfy token, Bark device key) ─────
 
-    /// Decrypt notification-channel secrets into in-memory plaintext after
-    /// loading config. Mirrors [`Config::hydrate_provider_api_keys_from_encrypted`]:
-    /// the plaintext fields are `#[serde(skip_serializing)]` (never on disk), so
-    /// this is the only way they get populated after a fresh load.
+    /// Decrypt legacy notification-channel ciphertext into memory so the
+    /// credential migration can move it into the isolated store. New writes
+    /// never serialize these ciphertext fields.
     pub fn hydrate_notifications_from_encrypted(&mut self) {
         let ntfy = &mut self.notifications.ntfy;
         if ntfy
@@ -724,29 +723,122 @@ impl Config {
         }
     }
 
-    /// Re-encrypt notification-channel secrets from current in-memory plaintext
-    /// before persisting to disk. Mirrors
-    /// [`Config::refresh_provider_api_keys_encrypted`]: an empty/absent
-    /// plaintext leaves any existing ciphertext intact (a redacted round-trip
-    /// where the client never re-sent the secret keeps it).
-    pub fn refresh_notifications_encrypted(&mut self) -> Result<()> {
+    /// Resolve notification channel credentials after legacy migration. A
+    /// configured reference must resolve; callers treat any failure as a
+    /// fail-closed notification configuration instead of silently disabling
+    /// authentication for a protected endpoint.
+    pub fn hydrate_notification_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        let reference_counts = crate::credential_store::config_credential_ref_counts(self)?;
+        for reference in [
+            self.notifications.ntfy.credential_ref.as_ref(),
+            self.notifications.bark.credential_ref.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if reference_counts.get(reference).copied() != Some(1) {
+                return Err(crate::ConfigStoreError::Validation(
+                    "notification credential reference is shared by another config consumer"
+                        .to_string(),
+                ));
+            }
+        }
+        let store = crate::CredentialStore::open(data_dir);
         let ntfy = &mut self.notifications.ntfy;
-        let token = ntfy.token.as_deref().unwrap_or("").trim();
-        if !token.is_empty() {
-            ntfy.token_encrypted =
-                Some(crate::encryption::encrypt(token).context("Failed to encrypt ntfy token")?);
+        if let Some(reference) = ntfy.credential_ref.as_ref() {
+            match store.resolve(reference)? {
+                Some(secret) => {
+                    ntfy.token = Some(secret.expose().to_string());
+                    ntfy.configured = true;
+                }
+                None if ntfy.configured => {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "referenced ntfy credential is unavailable".to_string(),
+                    ));
+                }
+                None => ntfy.token = None,
+            }
+        } else if ntfy.configured {
+            return Err(crate::ConfigStoreError::Validation(
+                "configured ntfy credential reference is missing".to_string(),
+            ));
         }
 
         let bark = &mut self.notifications.bark;
-        let device_key = bark.device_key.as_deref().unwrap_or("").trim();
-        if !device_key.is_empty() {
-            bark.device_key_encrypted = Some(
-                crate::encryption::encrypt(device_key)
-                    .context("Failed to encrypt Bark device key")?,
-            );
+        if let Some(reference) = bark.credential_ref.as_ref() {
+            match store.resolve(reference)? {
+                Some(secret) => {
+                    bark.device_key = Some(secret.expose().to_string());
+                    bark.configured = true;
+                }
+                None if bark.configured => {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "referenced Bark credential is unavailable".to_string(),
+                    ));
+                }
+                None => bark.device_key = None,
+            }
+        } else if bark.configured {
+            return Err(crate::ConfigStoreError::Validation(
+                "configured Bark credential reference is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maintain legacy in-memory ciphertext compatibility until credential
+    /// migration runs. New writes sanitize these fields and persist only a
+    /// credential reference plus configured metadata.
+    pub fn refresh_notifications_encrypted(&mut self) -> Result<()> {
+        let ntfy = &mut self.notifications.ntfy;
+        if ntfy.credential_ref.is_some() {
+            ntfy.token_encrypted = None;
+            ntfy.configured = ntfy
+                .token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || ntfy.configured;
+        } else {
+            let token = ntfy.token.as_deref().unwrap_or("").trim();
+            if !token.is_empty() {
+                ntfy.token_encrypted = Some(
+                    crate::encryption::encrypt(token).context("Failed to encrypt ntfy token")?,
+                );
+            }
+        }
+
+        let bark = &mut self.notifications.bark;
+        if bark.credential_ref.is_some() {
+            bark.device_key_encrypted = None;
+            bark.configured = bark
+                .device_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || bark.configured;
+        } else {
+            let device_key = bark.device_key.as_deref().unwrap_or("").trim();
+            if !device_key.is_empty() {
+                bark.device_key_encrypted = Some(
+                    crate::encryption::encrypt(device_key)
+                        .context("Failed to encrypt Bark device key")?,
+                );
+            }
         }
 
         Ok(())
+    }
+
+    /// Clear notification plaintext and legacy ciphertext before ordinary
+    /// root serialization. Only credential references and configured metadata
+    /// may leave the process.
+    pub fn sanitize_notifications_for_disk(&mut self) {
+        self.notifications.ntfy.token = None;
+        self.notifications.ntfy.token_encrypted = None;
+        self.notifications.bark.device_key = None;
+        self.notifications.bark.device_key_encrypted = None;
     }
 
     // ── bamboo-connect platform tokens (Telegram bot token, etc.) ───────

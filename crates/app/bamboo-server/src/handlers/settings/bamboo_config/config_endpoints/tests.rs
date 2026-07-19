@@ -548,6 +548,93 @@ async fn provider_credential_full_payload_allows_unchanged_sidecars() {
     assert!(data_dir.join("credentials.json").exists());
 }
 
+#[actix_web::test]
+async fn redacted_full_payload_provider_update_preserves_notification_credential() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app_state = web::Data::new(state);
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let set_notification = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "notifications": {
+                "ntfy": {
+                    "enabled": true,
+                    "topic": "full-payload-alerts",
+                    "token": "full-payload-notification-secret"
+                }
+            }
+        }))
+        .to_request();
+    assert!(test::call_service(&app, set_notification)
+        .await
+        .status()
+        .is_success());
+
+    let reference = bamboo_config::credential_ref("notification", "ntfy", "token").unwrap();
+    let before = app_state.config.read().await.notifications.ntfy.clone();
+    assert_eq!(before.credential_ref.as_ref(), Some(&reference));
+    let mut full_payload: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/bamboo/config").to_request(),
+    )
+    .await;
+    assert_eq!(
+        full_payload["notifications"]["ntfy"]["token"],
+        "****...****"
+    );
+    full_payload["provider"] = serde_json::json!("openai");
+    full_payload["providers"] = serde_json::json!({
+        "openai": {"api_key": "sk-provider-from-full-payload", "model": "gpt-test"}
+    });
+
+    let update = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(full_payload)
+        .to_request();
+    let update = test::call_service(&app, update).await;
+    let status = update.status();
+    let body = String::from_utf8(test::read_body(update).await.to_vec()).unwrap();
+    assert!(
+        status.is_success(),
+        "full update failed with {status}: {body}"
+    );
+
+    let after = app_state.config.read().await.notifications.ntfy.clone();
+    assert_eq!(after.enabled, before.enabled);
+    assert_eq!(after.topic, before.topic);
+    assert_eq!(after.credential_ref, before.credential_ref);
+    assert_eq!(after.configured, before.configured);
+    assert_eq!(
+        after.token.as_deref(),
+        Some("full-payload-notification-secret")
+    );
+    assert_eq!(
+        app_state
+            .credential_store
+            .resolve(&reference)
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "full-payload-notification-secret"
+    );
+    let root = std::fs::read_to_string(temp_dir.path().join("config.json")).unwrap();
+    assert!(!root.contains("full-payload-notification-secret"));
+    assert!(!root.contains("token_encrypted"));
+}
+
 /// End-to-end: POST an ntfy token, confirm the GET response masks it, then
 /// POST again with the masked placeholder unchanged (as the UI would on an
 /// unrelated field edit) — the exact-mask keep-on-save rule must resolve that
@@ -590,14 +677,17 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
     let post_resp = test::call_service(&app, post).await;
     assert!(post_resp.status().is_success(), "set config should succeed");
 
-    // The stored config.json must hold ciphertext, never the plaintext token.
+    // The stored config.json holds only isolated-store metadata, never the
+    // plaintext token, legacy ciphertext, or a UI mask.
     let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
         .await
         .expect("config.json should exist after set");
     assert!(
-        config_text.contains("token_encrypted"),
-        "ntfy token must be persisted encrypted"
+        config_text.contains("notification.ntfy.token"),
+        "ntfy token must persist through a stable credential reference"
     );
+    assert!(!config_text.contains("token_encrypted"));
+    assert!(!config_text.contains("****...****"));
     assert!(
         !config_text.contains("tk-real-secret"),
         "plaintext ntfy token must never be persisted"

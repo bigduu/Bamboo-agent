@@ -298,8 +298,8 @@ Key `notifications` (`NotificationsConfig`):
 {
   "notifications": {
     "desktop": { "enabled": true },
-    "ntfy": { "enabled": true, "base_url": "https://ntfy.sh", "topic": "my-bamboo-alerts", "token": "..." },
-    "bark": { "enabled": false, "base_url": "https://api.day.app", "device_key": "..." }
+    "ntfy": { "enabled": true, "base_url": "https://ntfy.sh", "topic": "my-bamboo-alerts", "credential_ref": "notification.ntfy.token", "configured": true },
+    "bark": { "enabled": false, "base_url": "https://api.day.app", "credential_ref": "notification.bark.device_key", "configured": false }
   }
 }
 ```
@@ -307,8 +307,25 @@ Key `notifications` (`NotificationsConfig`):
 `desktop.enabled: Option<bool>` — `None` auto-detects (on for a standalone
 `bamboo serve`, off when running under a `--parent-pid` sidecar, since the
 host app usually owns notifications there). `ntfy`/`bark` are push-relay
-channels; `ntfy.token`/`bark.device_key` are secrets, encrypted at rest as
-`token_encrypted`/`device_key_encrypted`. All three channels feed the same
+channels; `ntfy.token`/`bark.device_key` live only in the isolated encrypted
+credential store. Ordinary `config.json` and parseable rotated backups contain
+only stable `credential_ref`/`configured` metadata, never plaintext,
+ciphertext, or a UI mask. Legacy plaintext/ciphertext is migrated idempotently
+through the recoverable config/credential manifest.
+
+`GET /bamboo/config/notifications` returns the current credential revision,
+health, source, channel metadata, and per-channel configured/source/update
+status without a secret slot. Notification updates use `POST /bamboo/config`
+with only `expected_revision` and `notifications` in the request. Omitting a
+secret keeps it, `null` or `""` clears it, and a non-empty string replaces it;
+masks and client-supplied `credential_ref`/`configured`/ciphertext are rejected.
+Notification changes cannot be combined with another root domain in one call.
+`"notifications": null` is an explicit domain reset: both credentials are
+cleared and notification metadata returns to defaults in the same transaction.
+`bamboo config set notifications.ntfy.token ...` and the Bark equivalent route
+through the same manifest transaction.
+
+All three channels feed the same
 `AgentEvent::Notification` category/priority policy — see
 `crates/infra/bamboo-notification`.
 

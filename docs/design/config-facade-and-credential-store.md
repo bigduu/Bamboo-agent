@@ -118,7 +118,8 @@ content-derived value in the quarantine filename.
 | MCP stdio secret environment value | `mcp.<server>.env_<name>` |
 | MCP HTTP/SSE auth header | `mcp.<server>.header_<name>` |
 | user environment entry with `secret=true` | `env.<name>.value` |
-| ntfy token / Bark device key | `notification.<channel>.token` |
+| ntfy token | `notification.ntfy.token` |
+| Bark device key | `notification.bark.device_key` |
 | cluster password/private key/passphrase | `cluster.<host>.<field>` |
 | external broker bearer token | `broker.external.bearer_token` |
 | access password/device token | verifier only; plaintext is never persisted |
@@ -148,7 +149,8 @@ Migration must be idempotent and manifest-gated:
 6. on restart, discard an uncommitted stage or resume from the manifest; never
    infer completion from the presence of one section file.
 
-Provider, provider-instance and MCP credentials now use the first manifest-gated
+Provider, provider-instance, MCP, proxy, secret env and notification credentials
+now use the manifest-gated
 migration slice. It stages and fsyncs `credentials.json` plus each affected member
 of `providers.json`, `mcp.json`, and `config.json`, installs a pending manifest as
 the commit point, and finishes or resumes every member before `Config` reads any
@@ -184,10 +186,21 @@ writes share the same exact credentials/providers/root transaction. Client-owned
 precedes live publication, and generic saves fail closed if an unreferenced
 instance secret would re-enter `config.json`.
 
-This is intentionally not the full legacy-root migration. Proxy, broker,
-env/notification/cluster secrets and the remaining section split still require the
-broader inventory transaction. Compatibility PATCH and dot-path operations must
-not claim that all secrets have moved.
+Notification ntfy/Bark updates use their own exact credentials/root transaction
+scope. The complete notification subtree is hash-CAS/revision protected; a
+committed transaction rebases unrelated root edits, rejects a competing
+notification-domain edit, and rolls back both members on an unsafe consumer
+conflict. Parseable root backup generations are scrubbed only after their secret
+is durably represented in the credential store. Runtime hydration fails closed
+when configured refs are missing or corrupt. Root PATCH requires an expected
+credential revision, uses omission/clear/replace semantics, and rejects masks or
+client-owned ref/configured metadata; the metadata GET never exposes secret
+material.
+
+This is intentionally not the full legacy-root migration. Broker and cluster
+secrets and the remaining section split still require the broader inventory
+transaction. Compatibility PATCH and dot-path operations must not claim that all
+secrets have moved.
 
 ## Server integration status
 

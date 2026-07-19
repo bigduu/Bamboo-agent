@@ -95,6 +95,8 @@ mod tests {
             topic: "bamboo-alerts".to_string(),
             token: Some("tk".to_string()),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         };
         let sink = NtfySink::from_config(&config);
         assert_eq!(sink.base_url, "https://ntfy.example.com");

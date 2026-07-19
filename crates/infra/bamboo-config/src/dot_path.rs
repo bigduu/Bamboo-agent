@@ -259,9 +259,15 @@ fn guard_reserved_paths(segments: &[&str], key: &str) -> Result<(), DotPathError
         ["notifications", "ntfy", "token"] | ["notifications", "bark", "device_key"] => {
             Err(DotPathError::SecretPath {
                 key: key.to_string(),
-                guidance: "notification-channel secrets are encrypted at rest; the CLI \
-                           routes this key through the dedicated setter automatically"
+                guidance: "notification-channel secrets use the isolated credential store; the \
+                           CLI routes this key through the dedicated transaction automatically"
                     .to_string(),
+            })
+        }
+        ["notifications", "ntfy" | "bark", "credential_ref" | "configured"] => {
+            Err(DotPathError::Unsupported {
+                key: key.to_string(),
+                reason: "notification credential metadata is server-managed".to_string(),
             })
         }
         ["subagents", "broker", ..] => Err(DotPathError::Unsupported {

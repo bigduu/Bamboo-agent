@@ -154,6 +154,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::clear_credential),
         )
         .route(
+            "/bamboo/config/notifications",
+            web::get().to(settings::get_notification_config),
+        )
+        .route(
             "/bamboo/proxy-auth",
             web::post().to(settings::set_proxy_auth),
         )

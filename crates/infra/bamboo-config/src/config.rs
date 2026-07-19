@@ -721,14 +721,19 @@ pub struct NtfyChannelConfig {
     /// Access token for a protected/self-hosted ntfy instance (public ntfy.sh
     /// topics need none).
     ///
-    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
-    /// never serialized and is hydrated in memory on load (mirrors
-    /// [`EnvVarEntry`] / [`BrokerClientConfig::token`]).
+    /// Secret plaintext hydrated in memory from the isolated credential store;
+    /// never serialized in ordinary config.
     #[serde(default, skip_serializing)]
     pub token: Option<String>,
-    /// Encrypted ciphertext of `token` (the at-rest representation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy encrypted ciphertext accepted only for migration.
+    #[serde(default, skip_serializing)]
     pub token_encrypted: Option<String>,
+    /// Stable isolated credential-store reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Whether the referenced credential is expected to exist.
+    #[serde(default)]
+    pub configured: bool,
 }
 
 impl Default for NtfyChannelConfig {
@@ -739,6 +744,8 @@ impl Default for NtfyChannelConfig {
             topic: String::new(),
             token: None,
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         }
     }
 }
@@ -757,14 +764,19 @@ pub struct BarkChannelConfig {
     pub base_url: String,
     /// Bark device key identifying the target iOS device.
     ///
-    /// Secret: encrypted at rest in `device_key_encrypted`; this plaintext
-    /// field is never serialized and is hydrated in memory on load (mirrors
-    /// [`NtfyChannelConfig::token`]).
+    /// Secret plaintext hydrated in memory from the isolated credential store;
+    /// never serialized in ordinary config.
     #[serde(default, skip_serializing)]
     pub device_key: Option<String>,
-    /// Encrypted ciphertext of `device_key` (the at-rest representation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy encrypted ciphertext accepted only for migration.
+    #[serde(default, skip_serializing)]
     pub device_key_encrypted: Option<String>,
+    /// Stable isolated credential-store reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Whether the referenced credential is expected to exist.
+    #[serde(default)]
+    pub configured: bool,
 }
 
 impl Default for BarkChannelConfig {
@@ -774,6 +786,8 @@ impl Default for BarkChannelConfig {
             base_url: default_bark_base_url(),
             device_key: None,
             device_key_encrypted: None,
+            credential_ref: None,
+            configured: false,
         }
     }
 }
@@ -1282,9 +1296,8 @@ pub struct ConfigValues {
     pub mcp: bamboo_domain::mcp_config::McpConfig,
 
     /// Notification delivery channels (desktop + push-relay services).
-    /// Secrets (ntfy token, Bark device key) are encrypted at rest — see
-    /// [`Config::hydrate_notifications_from_encrypted`] /
-    /// [`Config::refresh_notifications_encrypted`].
+    /// Secrets (ntfy token, Bark device key) live in the isolated credential
+    /// store; only stable references/configured metadata persist here.
     #[serde(default)]
     pub notifications: NotificationsConfig,
 
@@ -2815,6 +2828,20 @@ impl Config {
         config.hydrate_broker_token_from_encrypted();
         // Decrypt encrypted notification-channel secrets into in-memory plaintext.
         config.hydrate_notifications_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_notification_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "notification credential hydration unavailable");
+                config.notifications.ntfy.token = None;
+                config.notifications.bark.device_key = None;
+            }
+        } else {
+            // A pending or unreadable credential migration means the isolated
+            // store is not authoritative yet. Legacy plaintext/ciphertext may
+            // remain on disk for recovery, but notification sinks must not use
+            // it in this process.
+            config.notifications.ntfy.token = None;
+            config.notifications.bark.device_key = None;
+        }
         // Merge the standalone connect.json (#455) onto `config.connect`,
         // migrating a legacy inline `connect` key from config.json (#453
         // state) when present. MUST run before the token hydration below so
@@ -3666,6 +3693,7 @@ impl Config {
         to_save.ensure_provider_instance_credentials_isolated()?;
         to_save.sanitize_mcp_credential_refs_for_disk();
         to_save.sanitize_env_vars_for_disk();
+        to_save.sanitize_notifications_for_disk();
         to_save.sanitize_cluster_fabric_for_disk();
         to_save.assign_connect_platform_ids();
         to_save.normalize_tool_settings();
@@ -3836,6 +3864,30 @@ impl Config {
                 "secret env vars require the isolated credential transaction before persistence"
             );
         }
+        if [
+            (
+                &self.notifications.ntfy.token,
+                &self.notifications.ntfy.token_encrypted,
+                &self.notifications.ntfy.credential_ref,
+            ),
+            (
+                &self.notifications.bark.device_key,
+                &self.notifications.bark.device_key_encrypted,
+                &self.notifications.bark.credential_ref,
+            ),
+        ]
+        .iter()
+        .any(|(plaintext, ciphertext, reference)| {
+            reference.is_none()
+                && (plaintext
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || ciphertext.is_some())
+        }) {
+            anyhow::bail!(
+                "notification secrets require the isolated credential transaction before persistence"
+            );
+        }
 
         let path = data_dir.join("config.json");
 
@@ -3855,6 +3907,7 @@ impl Config {
         to_save.ensure_provider_instance_credentials_isolated()?;
         to_save.sanitize_mcp_credential_refs_for_disk();
         to_save.sanitize_env_vars_for_disk();
+        to_save.sanitize_notifications_for_disk();
         to_save.sanitize_cluster_fabric_for_disk();
         to_save.assign_connect_platform_ids();
         to_save.normalize_tool_settings();
@@ -7755,6 +7808,88 @@ mod tests {
     }
 
     #[test]
+    fn configured_notification_ref_missing_from_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::credential_ref("notification", "ntfy", "token").unwrap();
+        let mut config = Config::default();
+        config.notifications.ntfy.credential_ref = Some(reference);
+        config.notifications.ntfy.configured = true;
+
+        let error = config
+            .hydrate_notification_credentials_from_store(dir.path())
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("referenced ntfy credential is unavailable"));
+        assert!(config.notifications.ntfy.configured);
+        assert!(config.notifications.ntfy.token.is_none());
+    }
+
+    #[test]
+    fn notification_hydration_rejects_shared_ref_but_accepts_exclusive_custom_ref() {
+        let _key = crate::encryption::set_test_encryption_key([0xa5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::CredentialRef::parse("custom.notification.secret").unwrap();
+        crate::CredentialStore::open(dir.path())
+            .replace(
+                reference.clone(),
+                "exclusive-notification-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.notifications.ntfy.credential_ref = Some(reference.clone());
+        config.notifications.ntfy.configured = true;
+        config.proxy_auth_credential_ref = Some(reference.clone());
+        let error = config
+            .hydrate_notification_credentials_from_store(dir.path())
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered
+            .contains("notification credential reference is shared by another config consumer"));
+        assert!(!rendered.contains(reference.as_str()));
+        assert!(config.notifications.ntfy.token.is_none());
+
+        config.proxy_auth_credential_ref = None;
+        config
+            .hydrate_notification_credentials_from_store(dir.path())
+            .unwrap();
+        assert_eq!(
+            config.notifications.ntfy.token.as_deref(),
+            Some("exclusive-notification-secret")
+        );
+    }
+
+    #[test]
+    fn pending_migration_keeps_legacy_notification_bytes_but_fails_runtime_closed() {
+        let _key = crate::encryption::set_test_encryption_key([0xa6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ntfy = crate::encryption::encrypt("legacy-ntfy-secret").unwrap();
+        let bark = crate::encryption::encrypt("legacy-bark-secret").unwrap();
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "notifications": {
+                "ntfy": { "enabled": true, "token_encrypted": ntfy },
+                "bark": { "enabled": true, "device_key_encrypted": bark }
+            }
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), &bytes).unwrap();
+        std::fs::create_dir(dir.path().join("config-credential-migration.json")).unwrap();
+
+        let loaded = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+
+        assert!(loaded.notifications.ntfy.token.is_none());
+        assert!(loaded.notifications.bark.device_key.is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
     fn publish_and_current_env_vars_round_trip() {
         // `publish_env_vars` REPLACES the process-global env-vars cache
         // wholesale, so every test that touches that cache must hold the
@@ -7860,9 +7995,12 @@ mod tests {
             topic: "bamboo-alerts".to_string(),
             token: Some("tk_super_secret".to_string()),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         };
 
-        // Persist path: encrypt (what save_to_dir does).
+        // Legacy compatibility path: retain a readable ciphertext until the
+        // credential migration moves the secret into the isolated store.
         config.refresh_notifications_encrypted().unwrap();
         assert!(config.notifications.ntfy.token_encrypted.is_some());
         assert_ne!(
@@ -7870,17 +8008,15 @@ mod tests {
             Some("tk_super_secret")
         );
 
-        // `token` is `#[serde(skip_serializing)]` — never lands on disk, only
-        // the ciphertext does.
+        // Neither plaintext nor legacy ciphertext is serializable.
         let json = serde_json::to_string(&config.notifications.ntfy).unwrap();
         assert!(
             !json.contains("tk_super_secret"),
             "plaintext token must never be serialized"
         );
-        assert!(json.contains("token_encrypted"));
+        assert!(!json.contains("token_encrypted"));
 
-        // Load path: simulate a fresh load (plaintext gone, ciphertext present)
-        // and confirm hydrate restores the plaintext.
+        // Legacy load path restores plaintext for migration.
         config.notifications.ntfy.token = None;
         config.hydrate_notifications_from_encrypted();
         assert_eq!(
@@ -7897,6 +8033,8 @@ mod tests {
             base_url: "https://api.day.app".to_string(),
             device_key: Some("dk_super_secret".to_string()),
             device_key_encrypted: None,
+            credential_ref: None,
+            configured: false,
         };
 
         config.refresh_notifications_encrypted().unwrap();
@@ -7911,7 +8049,7 @@ mod tests {
             !json.contains("dk_super_secret"),
             "plaintext device key must never be serialized"
         );
-        assert!(json.contains("device_key_encrypted"));
+        assert!(!json.contains("device_key_encrypted"));
 
         config.notifications.bark.device_key = None;
         config.hydrate_notifications_from_encrypted();
@@ -7923,8 +8061,8 @@ mod tests {
 
     #[test]
     fn notification_secrets_empty_refresh_preserves_ciphertext() {
-        // A redacted round-trip (plaintext empty/absent) must not wipe the
-        // stored ciphertext for either channel.
+        // The legacy compatibility helper retains already-loaded ciphertext;
+        // ordinary persistence sanitizes it before writing.
         let mut config = Config::default();
         config.notifications.ntfy.token_encrypted = Some("existing-ntfy-cipher".to_string());
         config.notifications.bark.device_key_encrypted = Some("existing-bark-cipher".to_string());
