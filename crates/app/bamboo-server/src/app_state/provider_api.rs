@@ -212,6 +212,22 @@ mod tests {
         assert!(!schemas.is_empty(), "Root tools should not be empty");
     }
 
+    #[tokio::test]
+    async fn workflow_run_tool_is_root_only_and_cannot_recursively_dispatch_itself() {
+        let (_temp, state) = make_state().await;
+        let names = |surface| {
+            state
+                .tools_for(surface)
+                .list_tools()
+                .into_iter()
+                .map(|schema| schema.function.name)
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert!(names(ToolSurface::Root).contains("workflow_run"));
+        assert!(!names(ToolSurface::Base).contains("workflow_run"));
+        assert!(!names(ToolSurface::Child).contains("workflow_run"));
+    }
+
     // ---- get_all_tool_schemas ----
 
     #[tokio::test]

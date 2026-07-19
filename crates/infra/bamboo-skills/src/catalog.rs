@@ -107,6 +107,8 @@ struct BambooWorkflowMetadata {
     // A composition is sufficient to classify legacy WorkflowDefinition YAML.
     #[serde(default)]
     composition: Option<serde_yaml::Value>,
+    #[serde(default)]
+    workflow_schema: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,7 @@ pub(crate) struct BundleMetadata {
     pub version: String,
     pub invocation_policy: serde_json::Value,
     pub argument_schema: serde_json::Value,
+    pub definition_revision: Option<u64>,
 }
 
 impl Default for BundleMetadata {
@@ -124,6 +127,7 @@ impl Default for BundleMetadata {
             version: "1".to_string(),
             invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
             argument_schema: serde_json::json!({"type": "object", "additionalProperties": true}),
+            definition_revision: None,
         }
     }
 }
@@ -179,11 +183,18 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
         serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
     let is_workflow_definition = path.ends_with("workflow.yaml");
     if is_workflow_definition {
-        let definition: bamboo_domain::WorkflowDefinition =
-            serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
-        definition
-            .validate()
-            .map_err(|error| public_validation_error(display_name, error))?;
+        if metadata.workflow_schema.is_some() {
+            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_str(&raw)
+                .map_err(|error| public_yaml_error(display_name, error))?;
+            bamboo_domain::CompiledWorkflow::compile(definition.clone())
+                .map_err(|error| public_validation_error(display_name, error))?;
+        } else {
+            let definition: bamboo_domain::WorkflowDefinition = serde_yaml::from_str(&raw)
+                .map_err(|error| public_yaml_error(display_name, error))?;
+            definition
+                .validate()
+                .map_err(|error| public_validation_error(display_name, error))?;
+        }
     }
     let mut result = BundleMetadata {
         kind: if metadata.composition.is_some() || is_workflow_definition {
@@ -193,6 +204,13 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
         },
         ..Default::default()
     };
+    if is_workflow_definition && metadata.workflow_schema.is_some() {
+        let definition: bamboo_domain::WorkflowRunDefinition =
+            serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
+        result.version = definition.workflow_schema.to_string();
+        result.argument_schema = definition.input_schema.clone();
+        result.definition_revision = Some(definition.revision);
+    }
     if let Some(version) = metadata.version.and_then(yaml_scalar_to_string) {
         result.version = version;
     }
@@ -217,7 +235,7 @@ pub(crate) fn entry_from_skill(
         description: skill.description.clone(),
         kind: metadata.kind,
         source: source.into(),
-        revision,
+        revision: metadata.definition_revision.unwrap_or(revision),
         version: metadata.version,
         invocation_policy: metadata.invocation_policy,
         argument_schema: metadata.argument_schema,

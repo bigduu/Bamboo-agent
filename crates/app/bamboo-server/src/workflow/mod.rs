@@ -8,6 +8,10 @@
 //! and cache.
 
 mod loader;
+mod run;
+
+pub(crate) use run::public_workflow_snapshot;
+pub use run::{WorkflowRunAccess, WorkflowRunTool};
 
 #[cfg(test)]
 mod tests;

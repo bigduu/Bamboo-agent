@@ -301,6 +301,10 @@ pub struct AppState {
     /// validation, and execution.
     pub skill_manager: Arc<SkillManager>,
 
+    /// Durable, recovered workflow-run boundary. It owns the production engine
+    /// plus server-derived session/catalog trust adapters.
+    pub workflow_runs: crate::workflow::WorkflowRunAccess,
+
     /// MCP server manager for external tool servers
     ///
     /// Handles lifecycle of Model Context Protocol servers,

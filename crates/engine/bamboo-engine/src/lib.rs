@@ -20,7 +20,13 @@ pub mod session_repository;
 pub use session_repository::SessionRepository;
 pub mod title_gen;
 pub mod token_usage_log;
+pub mod workflow_run;
 pub use token_usage_log::TokenUsageRecord;
+pub use workflow_run::{
+    AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
+    WorkflowDefinitionPort, WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine,
+    WorkflowRunError, WorkflowRunRepository, WorkflowSecretMaterial, WorkflowSecretResolverPort,
+};
 
 pub use app_context::AgentSessionContext;
 pub use runtime::execution::agent_spawn::{read_cached_session, SessionCache};

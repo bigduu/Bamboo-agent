@@ -193,7 +193,9 @@ pub(super) async fn execute_tool_call_only(
         match bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
             ctx.tool_call,
             ctx.tools.as_ref(),
-            ctx.config.composition_executor.as_ref().map(Arc::clone),
+            // Agent execution does not route through the legacy composition
+            // runtime; catalog-pinned workflow_run is the sole orchestrator.
+            None,
             tool_ctx,
         )
         .await
