@@ -258,8 +258,11 @@ impl CredentialStore {
         source: CredentialSource,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        self.ensure_transaction_ready()?;
-        self.replace_unchecked(credential_ref, secret, source, expected_revision)
+        let data_dir = self.path().parent().unwrap_or_else(|| Path::new("."));
+        crate::with_provider_mcp_migration_lock(data_dir, || {
+            self.ensure_transaction_ready()?;
+            self.replace_unchecked(credential_ref, secret, source, expected_revision)
+        })
     }
 
     pub(crate) fn replace_unchecked(
@@ -308,7 +311,18 @@ impl CredentialStore {
         credential_ref: &CredentialRef,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        self.ensure_transaction_ready()?;
+        let data_dir = self.path().parent().unwrap_or_else(|| Path::new("."));
+        crate::with_provider_mcp_migration_lock(data_dir, || {
+            self.ensure_transaction_ready()?;
+            self.clear_unchecked(credential_ref, expected_revision)
+        })
+    }
+
+    pub(crate) fn clear_unchecked(
+        &self,
+        credential_ref: &CredentialRef,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
         let mut document = self.load_document()?;
         document.entries.remove(credential_ref);
         let revision = self
@@ -634,13 +648,15 @@ impl CredentialStore {
         current: &[u8],
         touched_refs: &[String],
         required_refs: &[String],
-    ) -> ConfigStoreResult<(Vec<u8>, u64)> {
+    ) -> ConfigStoreResult<(Vec<u8>, u64, Vec<String>)> {
         let original = Self::parse_transaction_document(original, true)?;
         let staged = Self::parse_transaction_document(staged, false)?;
         let current_document = Self::parse_transaction_document(current, false)?;
         let expected_revision = current_document.revision;
         let touched_refs = parse_credential_ref_list(touched_refs)?;
-        let required_refs = parse_credential_ref_list(required_refs)?;
+        let mut required_refs = parse_credential_ref_list(required_refs)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let mut merged = current_document.data.clone();
         let mut changed = false;
 
@@ -648,6 +664,13 @@ impl CredentialStore {
             let original_entry = original.data.entries.get(&reference);
             let current_entry = current_document.data.entries.get(&reference);
             if current_entry != original_entry {
+                // A later clear of this exact ref is a valid current winner.
+                // Metadata may retain the stable ref (ordinary credential
+                // clear already has that behavior), so runtime health degrades
+                // instead of leaving the transaction permanently pending.
+                if current_entry.is_none() {
+                    required_refs.remove(&reference);
+                }
                 continue;
             }
             match staged.data.entries.get(&reference) {
@@ -663,9 +686,14 @@ impl CredentialStore {
             }
         }
         validate_document(&merged).map_err(ConfigStoreError::Validation)?;
+        let required_refs = required_refs.into_iter().collect::<Vec<_>>();
         ensure_required_entries(&merged, &required_refs)?;
+        let remaining_required = required_refs
+            .iter()
+            .map(|reference| reference.as_str().to_string())
+            .collect::<Vec<_>>();
         if !changed {
-            return Ok((current.to_vec(), expected_revision));
+            return Ok((current.to_vec(), expected_revision, remaining_required));
         }
         let revision = current_document.revision.checked_add(1).ok_or_else(|| {
             ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
@@ -675,7 +703,7 @@ impl CredentialStore {
             "revision": revision,
             "data": merged,
         }))?;
-        Ok((bytes, expected_revision))
+        Ok((bytes, expected_revision, remaining_required))
     }
 
     pub(crate) fn ensure_required_refs_in_bytes(

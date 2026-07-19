@@ -125,6 +125,7 @@ enum MigrationFault {
     BeforeExactCommitCredentialRace,
     AfterExactCommitCredentialRace,
     AfterExactCommitUnrelatedCredentialRace,
+    AfterExactCommitCredentialClearRace,
     AfterExactCredentialRebaseStage,
     AfterExactCredentialRebaseManifest,
 }
@@ -161,6 +162,26 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
         ));
     }
     Ok(())
+}
+
+/// Serialize public credential mutations with provider/MCP exact
+/// transactions. Keeping `ensure -> load -> CAS` under this lock closes the
+/// window where a writer could pass the pending-manifest guard and commit a
+/// same-ref clear after the transaction's durable commit point.
+pub(crate) fn with_provider_mcp_migration_lock<T>(
+    data_dir: &Path,
+    operation: impl FnOnce() -> ConfigStoreResult<T>,
+) -> ConfigStoreResult<T> {
+    std::fs::create_dir_all(data_dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join(LOCK_FILE))?;
+    lock.lock_exclusive()?;
+    let _lock = MigrationLock(lock);
+    operation()
 }
 
 /// Persist a legacy provider-key update as one manifest-gated transaction.
@@ -297,7 +318,7 @@ fn persist_provider_credential_transaction_inner(
     #[cfg(test)]
     if fault == Some(MigrationFault::BeforeExactCommitCredentialRace) {
         let reference = credential_ref("provider", "openai", "api_key")?;
-        store.replace(
+        store.replace_unchecked(
             reference,
             "concurrent-winner",
             crate::CredentialSource::User,
@@ -330,26 +351,33 @@ fn persist_provider_credential_transaction_inner(
         Some(
             MigrationFault::AfterExactCommitCredentialRace
                 | MigrationFault::AfterExactCommitUnrelatedCredentialRace
+                | MigrationFault::AfterExactCommitCredentialClearRace
                 | MigrationFault::AfterExactCredentialRebaseStage
                 | MigrationFault::AfterExactCredentialRebaseManifest
         )
     ) {
-        let same_ref = fault == Some(MigrationFault::AfterExactCommitCredentialRace);
+        let clear_same_ref = fault == Some(MigrationFault::AfterExactCommitCredentialClearRace);
+        let same_ref =
+            clear_same_ref || fault == Some(MigrationFault::AfterExactCommitCredentialRace);
         let reference = credential_ref(
             "provider",
             if same_ref { "openai" } else { "anthropic" },
             "api_key",
         )?;
-        store.replace_unchecked(
-            reference,
-            if same_ref {
-                "concurrent-post-commit-winner"
-            } else {
-                "concurrent-unrelated-winner"
-            },
-            crate::CredentialSource::User,
-            prepared.expected_revision,
-        )?;
+        if clear_same_ref {
+            store.clear_unchecked(&reference, prepared.expected_revision)?;
+        } else {
+            store.replace_unchecked(
+                reference,
+                if same_ref {
+                    "concurrent-post-commit-winner"
+                } else {
+                    "concurrent-unrelated-winner"
+                },
+                crate::CredentialSource::User,
+                prepared.expected_revision,
+            )?;
+        }
     }
     #[cfg(test)]
     if fault == Some(MigrationFault::AfterManifest) {
@@ -1137,13 +1165,14 @@ fn install_exact_credential_member(
                 "committed credential transaction cannot be safely rebased".to_string(),
             ));
         }
-        let (rebased, current_revision) = CredentialStore::merge_exact_transaction_documents(
-            &original,
-            &staged,
-            &current,
-            &file.touched_credential_refs,
-            &file.required_credential_refs,
-        )?;
+        let (rebased, current_revision, remaining_required_refs) =
+            CredentialStore::merge_exact_transaction_documents(
+                &original,
+                &staged,
+                &current,
+                &file.touched_credential_refs,
+                &file.required_credential_refs,
+            )?;
         let staged_name = format!("{CREDENTIALS_FILE}.rebase.{}", Uuid::new_v4());
         AtomicFileStore::new(stage_dir.join(&staged_name))
             .sensitive(true)
@@ -1158,6 +1187,7 @@ fn install_exact_credential_member(
         file.sha256 = sha256(&rebased);
         file.original_sha256 = Some(current_hash);
         file.expected_revision = Some(current_revision);
+        file.required_credential_refs = remaining_required_refs;
         write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
         #[cfg(test)]
         if fault == Some(MigrationFault::AfterExactCredentialRebaseManifest) {
@@ -2411,6 +2441,54 @@ mod tests {
         let provider = loaded.providers.openai.as_ref().unwrap();
         assert_eq!(provider.model.as_deref(), Some("transaction-model"));
         assert_eq!(provider.credential_ref.as_ref(), Some(&reference));
+    }
+
+    #[test]
+    fn provider_transaction_finishes_when_a_post_commit_clear_wins_the_same_ref() {
+        let _key = crate::encryption::set_test_encryption_key([0x7d; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                reference.clone(),
+                "previous-openai-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let (mut candidate, intents) = provider_transaction_candidate("transaction-loses-to-clear");
+
+        persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterExactCommitCredentialClearRace),
+        )
+        .unwrap();
+
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+        assert!(store.resolve(&reference).unwrap().is_none());
+        let providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(PROVIDERS_FILE)).unwrap())
+                .unwrap();
+        let provider_data = providers.get("data").unwrap_or(&providers);
+        assert_eq!(
+            provider_data["openai"]["model"],
+            Value::String("transaction-model".to_string())
+        );
+        assert_eq!(
+            provider_data["openai"]["credential_ref"],
+            Value::String(reference.as_str().to_string())
+        );
+        let loaded = crate::Config::from_data_dir(Some(dir.path().to_path_buf()));
+        assert!(
+            loaded.providers.openai.is_none(),
+            "missing ref must fail closed"
+        );
     }
 
     #[test]
