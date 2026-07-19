@@ -6,6 +6,7 @@ use crate::runtime_metadata::{
     LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
     LOADED_SKILL_IDS_METADATA_KEY, SELECTED_SKILL_IDS_METADATA_KEY,
     SELECTED_SKILL_MODE_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY,
 };
 use crate::selection::parse_selected_skill_ids_metadata;
 pub use crate::session_port::SkillSessionPort;
@@ -72,7 +73,8 @@ pub fn extract_skill_allowlist(metadata: &HashMap<String, String>) -> Option<Has
 
 pub fn extract_skill_mode(metadata: &HashMap<String, String>) -> Option<String> {
     let mode = metadata
-        .get(SELECTED_SKILL_MODE_METADATA_KEY)
+        .get(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY)
+        .or_else(|| metadata.get(SELECTED_SKILL_MODE_METADATA_KEY))
         .or_else(|| metadata.get("mode"))?;
     let trimmed = mode.trim();
     if trimmed.is_empty() {
@@ -98,12 +100,7 @@ pub async fn ensure_skill_allowed(
     skill_id: &str,
     session_id: Option<&str>,
 ) -> Result<(), SkillAccessError> {
-    let disabled = port.disabled_skill_ids().await;
-    if disabled.contains(skill_id) {
-        return Err(SkillAccessError::NotAllowed(format!(
-            "Skill '{skill_id}' is globally disabled in Bamboo settings"
-        )));
-    }
+    ensure_skill_enabled(port, skill_id).await?;
 
     let Some(session_id) = session_id else {
         return Ok(());
@@ -128,6 +125,19 @@ pub async fn ensure_skill_allowed(
     Err(SkillAccessError::NotAllowed(format!(
         "Skill '{skill_id}' is not selected for this request"
     )))
+}
+
+pub async fn ensure_skill_enabled(
+    port: &dyn SkillSessionPort,
+    skill_id: &str,
+) -> Result<(), SkillAccessError> {
+    let disabled = port.disabled_skill_ids().await;
+    if disabled.contains(skill_id) {
+        return Err(SkillAccessError::NotAllowed(format!(
+            "Skill '{skill_id}' is globally disabled in Bamboo settings"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn ensure_skill_loaded(
@@ -303,5 +313,21 @@ mod tests {
         metadata.insert("skill_mode".to_string(), "code".to_string());
 
         assert_eq!(extract_skill_mode(&metadata).as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn extract_skill_mode_prefers_runtime_mode_over_requested_mode() {
+        let mut metadata = HashMap::new();
+        metadata.insert("mode".to_string(), "ask".to_string());
+        metadata.insert(
+            SELECTED_SKILL_MODE_METADATA_KEY.to_string(),
+            "code".to_string(),
+        );
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY.to_string(),
+            "review".to_string(),
+        );
+
+        assert_eq!(extract_skill_mode(&metadata).as_deref(), Some("review"));
     }
 }

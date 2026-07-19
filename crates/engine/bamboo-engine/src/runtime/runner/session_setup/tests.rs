@@ -7,7 +7,10 @@ use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
 use bamboo_agent_core::{Message, Session};
 use bamboo_domain::RuntimeSessionPersistence;
-use bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY;
+use bamboo_skills::runtime_metadata::{
+    SKILL_RUNTIME_ACTIVATION_GENERATION_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
+};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use chrono::Utc;
 use std::sync::{Arc, Mutex};
@@ -127,8 +130,10 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
         None,
         "selection-publish",
         &crate::runtime::runner::logging::DebugLogger::new(false),
+        false,
     )
-    .await;
+    .await
+    .expect("session setup");
 
     let current_ids = session
         .metadata
@@ -175,8 +180,10 @@ async fn session_setup_preloads_one_explicit_skill_before_model_execution() {
         None,
         "explicit-review",
         &crate::runtime::runner::logging::DebugLogger::new(false),
+        false,
     )
-    .await;
+    .await
+    .expect("session setup");
 
     let calls = tools.calls.lock().expect("recording tool lock");
     assert_eq!(calls.len(), 1);
@@ -213,6 +220,72 @@ async fn session_setup_preloads_one_explicit_skill_before_model_execution() {
             .metadata
             .get("skill_runtime_loaded_skill_ids")
             .is_some_and(|ids| ids == "[\"review\"]")
+    }));
+}
+
+#[tokio::test]
+async fn pin_failure_clears_stale_runtime_selection_and_revision_metadata() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize skills");
+    let review = vec!["review".to_string()];
+    for index in 0..256 {
+        manager
+            .store()
+            .pin_current_activation(&format!("capacity-{index}"), &review, None)
+            .await
+            .expect("fill active snapshot capacity");
+    }
+    let persistence = Arc::new(RecordingPersistence::default());
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager),
+        selected_skill_ids: Some(review),
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: Vec::new(),
+    };
+    let mut session = Session::new("over-capacity", "model");
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["plan"]"#.to_string(),
+    );
+    session.metadata.insert(
+        SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        "999".to_string(),
+    );
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        r#"{"plan":999}"#.to_string(),
+    );
+
+    super::prepare_session_for_loop(
+        &mut session,
+        "review",
+        &config,
+        &tools,
+        None,
+        "over-capacity",
+        &crate::runtime::runner::logging::DebugLogger::new(false),
+        false,
+    )
+    .await
+    .expect_err("capacity failure must reject the run before model execution");
+
+    assert!(session
+        .metadata
+        .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
+        .is_some_and(|message| message.contains("capacity")));
+    let saved = persistence.sessions.lock().expect("recording lock");
+    assert!(saved.iter().any(|published| {
+        published
+            .metadata
+            .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
+            .is_some_and(|message| message.contains("capacity"))
     }));
 }
 

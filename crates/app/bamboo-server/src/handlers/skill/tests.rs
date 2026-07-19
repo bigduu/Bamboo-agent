@@ -155,3 +155,78 @@ async fn get_available_workflows_maps_listing_failures_to_internal_error() {
         other => panic!("expected internal error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn filtered_tools_rejects_runner_marker_when_pinned_snapshot_is_missing() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let app_state = web::Data::new(
+        AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("missing-tools-pin", "model");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        "42".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        r#"{"review":9}"#.to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["review"]"#.to_string(),
+    );
+    app_state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
+    app_state.save_session(&mut session).await;
+
+    let error = super::get_filtered_tools(
+        app_state.clone(),
+        web::Query(FilteredToolsQuery {
+            session_id: Some("missing-tools-pin".to_string()),
+            chat_id: None,
+        }),
+    )
+    .await
+    .expect_err("runner marker must not fall back to live tools");
+    match error {
+        AppError::BadRequest(message) => assert!(message.contains("retry as a new activation")),
+        other => panic!("expected bad request, got {other:?}"),
+    }
+
+    let descriptor = app_state
+        .skill_manager
+        .store()
+        .pin_current_activation("mismatched-tools-pin", &["review".to_string()], None)
+        .await
+        .expect("real activation");
+    let mut mismatched = bamboo_agent_core::Session::new("mismatched-tools-pin", "model");
+    mismatched.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        descriptor.catalog_revision.saturating_add(1).to_string(),
+    );
+    mismatched.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        serde_json::to_string(&descriptor.skill_revisions).expect("revisions"),
+    );
+    app_state.sessions.insert(
+        mismatched.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(mismatched.clone())),
+    );
+    app_state.save_session(&mut mismatched).await;
+    let mismatch_error = super::get_filtered_tools(
+        app_state,
+        web::Query(FilteredToolsQuery {
+            session_id: Some("mismatched-tools-pin".to_string()),
+            chat_id: None,
+        }),
+    )
+    .await
+    .expect_err("mismatched marker must not fall back to live tools");
+    assert!(
+        matches!(mismatch_error, AppError::BadRequest(message) if message.contains("does not match"))
+    );
+}

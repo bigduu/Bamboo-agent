@@ -7,12 +7,14 @@ use tokio::sync::RwLock;
 
 use bamboo_llm::Config;
 use bamboo_skills::access_control;
-use bamboo_skills::resource_helpers::list_skill_resource_paths;
 use bamboo_skills::SkillManager;
 
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 
-use super::{skill_access_error_to_tool_error, SkillToolAccess};
+use super::{
+    skill_access_error_to_tool_error, validate_runtime_activation,
+    validate_runtime_activation_descriptor, SkillToolAccess,
+};
 
 #[derive(Debug, Deserialize)]
 struct LoadSkillArgs {
@@ -73,21 +75,61 @@ impl Tool for LoadSkillTool {
             ));
         }
 
-        access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id())
-            .await
-            .map_err(skill_access_error_to_tool_error)?;
-        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id()).await;
-
+        let session_id = ctx.session_id().ok_or_else(|| {
+            ToolError::Execution("load_skill requires a session_id in tool context".to_string())
+        })?;
         let store = self.access.skill_store(ctx.session_id()).await?;
-        let (skill, skill_root) = store
-            .get_skill_with_root_for_mode(skill_id, skill_mode.as_deref())
+        if !validate_runtime_activation(&self.access, store.as_ref(), session_id, skill_id).await? {
+            access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id())
+                .await
+                .map_err(skill_access_error_to_tool_error)?;
+            let skill_mode =
+                access_control::selected_skill_mode(&self.access, ctx.session_id()).await;
+            let selected_ids =
+                access_control::selected_skill_allowlist(&self.access, ctx.session_id())
+                    .await
+                    .ok_or_else(|| {
+                        ToolError::Execution(
+                            "load_skill cannot pin a request with no published skill selection"
+                                .to_string(),
+                        )
+                    })?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            let session = self
+                .access
+                .session_for_context(Some(session_id))
+                .await
+                .ok_or_else(|| ToolError::Execution(format!("Session '{session_id}' not found")))?;
+            let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+            self.access
+                .skill_manager
+                .pin_current_activation_for_workspace(
+                    session_id,
+                    workspace.as_deref(),
+                    &selected_ids,
+                    skill_mode.as_deref(),
+                )
+                .await
+                .map_err(|err| {
+                    ToolError::Execution(format!(
+                        "Failed to pin workflow activation for '{skill_id}': {err}"
+                    ))
+                })?;
+        }
+        let (skill, skill_root, revision, resources, payload_descriptor) = store
+            .get_pinned_skill_with_root_and_descriptor(session_id, skill_id)
             .await
             .map_err(|err| {
                 ToolError::Execution(format!("Failed to load skill '{skill_id}': {err}"))
             })?;
-        let resources = list_skill_resource_paths(&skill_root).map_err(|err| {
-            ToolError::Execution(format!("Failed to list skill resources: {err}"))
-        })?;
+        validate_runtime_activation_descriptor(
+            &self.access,
+            &payload_descriptor,
+            session_id,
+            skill_id,
+        )
+        .await?;
         let canonical_skill_root = tokio::fs::canonicalize(&skill_root)
             .await
             .unwrap_or(skill_root);
@@ -99,6 +141,7 @@ impl Tool for LoadSkillTool {
             success: true,
             result: json!({
                 "skill_id": skill.id,
+                "revision": revision,
                 "name": skill.name,
                 "description": skill.description,
                 "license": skill.license,

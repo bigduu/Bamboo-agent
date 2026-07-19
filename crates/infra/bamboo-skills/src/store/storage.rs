@@ -1,10 +1,72 @@
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillDefinition, SkillError, SkillResult};
+
+fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow resource is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .attributes(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow resource is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "workflow file is a symbolic link",
+            ));
+        }
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow resource is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+}
+
+pub(crate) async fn open_skill_file_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let owned = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || open_file_no_follow(&owned))
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("workflow file open task failed: {error}"))
+        })??;
+    Ok(tokio::fs::File::from_std(file))
+}
 
 fn public_skill_error(error: &SkillError) -> String {
     match error {
@@ -74,7 +136,7 @@ pub async fn ensure_skills_dir(skills_dir: &Path) -> SkillResult<()> {
 }
 
 /// Recursively find all SKILL.md files in the skills directory
-async fn find_skill_files(dir: &Path) -> Vec<PathBuf> {
+async fn find_skill_files(dir: &Path, max_candidates: usize) -> Vec<PathBuf> {
     let mut skill_files = Vec::new();
     let mut entries = match fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -114,6 +176,9 @@ async fn find_skill_files(dir: &Path) -> Vec<PathBuf> {
                         .unwrap_or(false);
                     if is_regular_file {
                         skill_files.push(skill_file);
+                        if skill_files.len() > max_candidates {
+                            break;
+                        }
                     } else {
                         warn!(
                             "Ignoring symlinked or non-regular skill file: {:?}",
@@ -124,8 +189,14 @@ async fn find_skill_files(dir: &Path) -> Vec<PathBuf> {
                 }
                 Ok(false) => {
                     // Not a skill directory, recurse into it
-                    let sub_skills = Box::pin(find_skill_files(&path)).await;
+                    let remaining = max_candidates
+                        .saturating_add(1)
+                        .saturating_sub(skill_files.len());
+                    let sub_skills = Box::pin(find_skill_files(&path, remaining)).await;
                     skill_files.extend(sub_skills);
+                    if skill_files.len() > max_candidates {
+                        break;
+                    }
                 }
                 Err(_) => {
                     debug!("Cannot check {:?}, skipping", path);
@@ -148,6 +219,15 @@ pub async fn load_skills_from_discovery_dirs(
 /// Discover every candidate and preserve per-bundle failures for catalog LKG handling.
 pub async fn load_skills_from_discovery_dirs_detailed(
     discovery_dirs: &[SkillDiscoveryDir],
+) -> SkillResult<SkillLoadReport> {
+    load_skills_from_discovery_dirs_detailed_with_limits(discovery_dirs, 8 * 1024 * 1024, 1024)
+        .await
+}
+
+pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
+    discovery_dirs: &[SkillDiscoveryDir],
+    max_skill_file_bytes: usize,
+    max_skill_candidates: usize,
 ) -> SkillResult<SkillLoadReport> {
     let mut report = SkillLoadReport::default();
 
@@ -177,10 +257,58 @@ pub async fn load_skills_from_discovery_dirs_detailed(
             discovery.mode.as_deref().unwrap_or("generic")
         );
 
-        let mut skill_files = find_skill_files(&discovery.dir).await;
+        let mut skill_files = find_skill_files(&discovery.dir, max_skill_candidates).await;
+        if skill_files.len() > max_skill_candidates
+            || report
+                .loaded
+                .len()
+                .saturating_add(report.failed.len())
+                .saturating_add(skill_files.len())
+                > max_skill_candidates
+        {
+            return Err(SkillError::Storage(format!(
+                "workflow catalog candidate count exceeds limit ({max_skill_candidates})"
+            )));
+        }
         skill_files.sort();
         for skill_file in skill_files {
-            match fs::read_to_string(&skill_file).await {
+            let metadata_bytes = fs::metadata(&skill_file).await?.len() as usize;
+            if metadata_bytes > max_skill_file_bytes {
+                let skill_root = skill_file
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                report.failed.push(FailedSkillRecord {
+                    skill_id: skill_root.file_name().and_then(|name| name.to_str()).map(str::to_string),
+                    skill_root,
+                    skill_file,
+                    source: discovery.source,
+                    mode: discovery.mode.clone(),
+                    error: format!("SKILL.md exceeds per-file limit ({metadata_bytes} > {max_skill_file_bytes} bytes)"),
+                });
+                continue;
+            }
+            let file = open_skill_file_no_follow(&skill_file).await?;
+            let mut bytes = Vec::with_capacity(metadata_bytes.min(max_skill_file_bytes));
+            file.take(max_skill_file_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > max_skill_file_bytes {
+                let skill_root = skill_file
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                report.failed.push(FailedSkillRecord {
+                    skill_id: skill_root.file_name().and_then(|name| name.to_str()).map(str::to_string),
+                    skill_root,
+                    skill_file,
+                    source: discovery.source,
+                    mode: discovery.mode.clone(),
+                    error: format!("SKILL.md exceeds per-file limit after read ({} > {max_skill_file_bytes} bytes)", bytes.len()),
+                });
+                continue;
+            }
+            match String::from_utf8(bytes) {
                 Ok(content) => match parse_markdown_skill(&skill_file, &content) {
                     Ok(skill) => {
                         let skill_root = skill_file

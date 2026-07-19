@@ -61,6 +61,23 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
         None => vec![session_id.clone()],
     };
 
+    // Deletion is terminal, unlike a resumable stop/suspension. Release every
+    // root/child activation before removing session state so immutable snapshot
+    // capacity cannot leak even if a runner never reaches its own finalizer.
+    for id in &ids_to_cancel {
+        if let Err(error) = state
+            .skill_manager
+            .release_activation_for_workspace(id, None)
+            .await
+        {
+            tracing::warn!(
+                "[{}] Failed to release deleted workflow activation snapshot: {}",
+                id,
+                error
+            );
+        }
+    }
+
     let cancelled_runner = {
         let mut runners = state.agent_runners.write().await;
         let mut cancelled = false;
@@ -139,4 +156,63 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
     Ok(HttpResponse::NotFound().json(serde_json::json!({
         "error": crate::error::error_value("Session not found")
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::Session;
+
+    #[tokio::test]
+    async fn deleting_root_releases_root_and_child_workflow_activations() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(directory.path().to_path_buf())
+            .await
+            .expect("app state");
+        let root = Session::new("delete-root", "model");
+        let child = Session::new_child_of("delete-child", &root, "model", "child");
+        state
+            .session_store
+            .save_session(&root)
+            .await
+            .expect("save root index");
+        state
+            .session_store
+            .save_session(&child)
+            .await
+            .expect("save child index");
+        state.sessions.insert(
+            root.id.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(root.clone())),
+        );
+        state.sessions.insert(
+            child.id.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(child.clone())),
+        );
+        let ids = vec!["review".to_string()];
+        for session_id in [&root.id, &child.id] {
+            state
+                .skill_manager
+                .store()
+                .pin_current_activation(session_id, &ids, None)
+                .await
+                .expect("pin workflow activation");
+        }
+        let state = web::Data::new(state);
+
+        let response = handler(state.clone(), web::Path::from(root.id.clone()))
+            .await
+            .expect("delete response");
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        for session_id in [&root.id, &child.id] {
+            assert!(state
+                .skill_manager
+                .store()
+                .activation_descriptor(session_id)
+                .await
+                .is_none());
+        }
+    }
 }

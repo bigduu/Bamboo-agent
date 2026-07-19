@@ -1,5 +1,6 @@
 use actix_web::{web, HttpResponse};
 use bamboo_agent_core::tools::ToolSchema;
+use bamboo_skills::runtime_metadata::validate_pinned_activation_metadata;
 use bamboo_tools::BuiltinToolExecutor;
 use tracing::{debug, info};
 
@@ -33,18 +34,13 @@ pub async fn get_filtered_tools(
     let selected_skill_ids = session.as_ref().and_then(|session| {
         session
             .metadata
-            .get("selected_skill_ids")
+            .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+            .or_else(|| session.metadata.get("selected_skill_ids"))
             .and_then(|raw| bamboo_skills::selection::parse_selected_skill_ids_metadata(raw))
     });
-    let selected_skill_mode = session.as_ref().and_then(|session| {
-        session
-            .metadata
-            .get("skill_mode")
-            .or_else(|| session.metadata.get("mode"))
-            .map(|mode| mode.trim())
-            .filter(|mode| !mode.is_empty())
-            .map(str::to_string)
-    });
+    let selected_skill_mode = session
+        .as_ref()
+        .and_then(|session| bamboo_skills::access_control::extract_skill_mode(&session.metadata));
     let workspace = session
         .as_ref()
         .and_then(|session| session.workspace_path_meta())
@@ -53,7 +49,45 @@ pub async fn get_filtered_tools(
         let config = state.config.read().await;
         config.disabled_skill_ids()
     };
-    let allowed_tools = if let Some(workspace) = workspace.as_deref() {
+    let mut runner_owned_activation = false;
+    let pinned_allowed_tools = match (session_id, session.as_ref()) {
+        (Some(activation_id), Some(session)) => {
+            let store = state
+                .skill_manager
+                .as_ref()
+                .store_for_workspace(workspace.as_deref())
+                .await
+                .map_err(|error| {
+                    AppError::BadRequest(format!("Invalid session workspace: {error}"))
+                })?;
+            let pinned = store
+                .pinned_allowed_tools_with_descriptor(activation_id, &disabled_skill_ids)
+                .await;
+            runner_owned_activation = validate_pinned_activation_metadata(
+                &session.metadata,
+                pinned.as_ref().map(|(_, descriptor)| descriptor),
+                None,
+            )
+            .map_err(AppError::BadRequest)?;
+            let tools = pinned.map(|(tools, _)| tools);
+            if runner_owned_activation && tools.is_none() {
+                return Err(AppError::BadRequest(
+                    "Pinned workflow activation is unavailable; retry as a new activation"
+                        .to_string(),
+                ));
+            }
+            tools
+        }
+        _ => None,
+    };
+    let allowed_tools = if let Some(tools) = pinned_allowed_tools {
+        tools
+    } else if runner_owned_activation {
+        return Err(AppError::BadRequest(
+            "Pinned workflow activation tools are unavailable; retry as a new activation"
+                .to_string(),
+        ));
+    } else if let Some(workspace) = workspace.as_deref() {
         state
             .skill_manager
             .as_ref()

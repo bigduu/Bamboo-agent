@@ -47,9 +47,10 @@ pub(crate) async fn run_agent_loop_with_config(
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
     async {
         let mut state: LoopRunState =
-            initialize_loop_state(session, initial_message.as_str(), &config, tools.as_ref()).await;
+            initialize_loop_state(session, initial_message.as_str(), &config, tools.as_ref())
+                .await?;
 
-        let sent_complete = run_pipeline(
+        let pipeline_result = run_pipeline(
             session,
             &event_tx,
             llm,
@@ -58,7 +59,31 @@ pub(crate) async fn run_agent_loop_with_config(
             &config,
             &mut state,
         )
-        .await?;
+        .await;
+
+        let sent_complete = match pipeline_result {
+            Ok(sent_complete) => sent_complete,
+            Err(error) => {
+                // Errors and cancellation are terminal for this activation but must
+                // not flow through normal finalization: that would emit a false
+                // Complete event and stamp the runtime state Completed. Release only
+                // the immutable workflow snapshot, then preserve the original error.
+                if let Some(skill_manager) = config.skill_manager.as_ref() {
+                    let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+                    if let Err(release_error) = skill_manager
+                        .release_activation_for_workspace(&state.session_id, workspace.as_deref())
+                        .await
+                    {
+                        tracing::warn!(
+                            "[{}] Failed to release errored workflow activation snapshot: {}",
+                            state.session_id,
+                            release_error
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         super::session_finalize::finalize_session(
             state.task_context,

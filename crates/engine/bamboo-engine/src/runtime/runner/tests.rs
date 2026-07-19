@@ -328,3 +328,460 @@ async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation(
         "between-round evaluations must use refreshed fast models in order, got {fast_models:?}"
     );
 }
+
+#[tokio::test]
+async fn cancelled_pipeline_releases_activation_without_false_completion() {
+    struct NeverCalledProvider;
+
+    #[async_trait]
+    impl LLMProvider for NeverCalledProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("pre-cancelled pipeline must not call the provider")
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let skill_root = directory.path().join("skills/cancel-demo");
+    tokio::fs::create_dir_all(&skill_root)
+        .await
+        .expect("skill root");
+    tokio::fs::write(
+        skill_root.join("SKILL.md"),
+        "---\nname: cancel-demo\ndescription: cancel\n---\ncancel\n",
+    )
+    .await
+    .expect("skill");
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.expect("initialize");
+    manager
+        .store()
+        .pin_current_activation("cancelled-activation", &["cancel-demo".to_string()], None)
+        .await
+        .expect("pin activation");
+    let mut session = Session::new("cancelled-activation", "model");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "auto".to_string(),
+    );
+    let config = AgentLoopConfig {
+        skill_manager: Some(manager.clone()),
+        model_name: Some("model".to_string()),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+    let result = super::run_agent_loop_with_config(
+        &mut session,
+        "cancel".to_string(),
+        event_tx,
+        Arc::new(NeverCalledProvider),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        cancel,
+        config,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(bamboo_agent_core::AgentError::Cancelled)
+    ));
+    assert!(manager
+        .store()
+        .activation_descriptor("cancelled-activation")
+        .await
+        .is_none());
+    assert!(!session.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Completed)
+    }));
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(
+            !matches!(event, bamboo_agent_core::AgentEvent::Complete { .. }),
+            "cancelled pipeline must not emit Complete"
+        );
+    }
+}
+
+#[tokio::test]
+async fn suspended_restart_without_retained_snapshot_fails_before_provider_call() {
+    struct NeverCalledProvider;
+
+    #[async_trait]
+    impl LLMProvider for NeverCalledProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("missing suspended snapshot must fail before the provider is called")
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let skill_root = directory.path().join("skills/restart-demo");
+    tokio::fs::create_dir_all(&skill_root)
+        .await
+        .expect("skill root");
+    tokio::fs::write(
+        skill_root.join("SKILL.md"),
+        "---\nname: restart-demo\ndescription: restart\n---\nrestart N+1\n",
+    )
+    .await
+    .expect("skill");
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.expect("initialize");
+
+    let mut session = Session::new("restart-missing-pin", "model");
+    let mut suspended = bamboo_domain::AgentRuntimeState::new("restart-missing-pin");
+    suspended.status = bamboo_domain::AgentStatusState::Suspended;
+    session.agent_runtime_state = Some(suspended);
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        "7".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        r#"{"restart-demo":3}"#.to_string(),
+    );
+    let config = AgentLoopConfig {
+        skill_manager: Some(manager.clone()),
+        selected_skill_ids: Some(vec!["restart-demo".to_string()]),
+        model_name: Some("model".to_string()),
+        ..Default::default()
+    };
+    let (event_tx, _event_rx) = mpsc::channel(4);
+    let result = super::run_agent_loop_with_config(
+        &mut session,
+        "continue".to_string(),
+        event_tx,
+        Arc::new(NeverCalledProvider),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        CancellationToken::new(),
+        config,
+    )
+    .await;
+
+    let bamboo_agent_core::AgentError::Tool(message) = result.expect_err("restart must fail")
+    else {
+        panic!("expected workflow setup error")
+    };
+    assert!(message.contains("before model execution"));
+    assert!(message.contains("retry as a new activation"));
+    assert!(session
+        .metadata
+        .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
+        .is_some_and(|message| message.contains("Suspended workflow snapshot is unavailable")));
+    assert!(manager
+        .store()
+        .activation_descriptor("restart-missing-pin")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn suspended_restart_with_empty_selection_does_not_require_snapshot() {
+    struct CalledProvider(std::sync::atomic::AtomicBool);
+
+    #[async_trait]
+    impl LLMProvider for CalledProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("continued".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.expect("initialize");
+    let mut session = Session::new("restart-empty-selection", "model");
+    let mut suspended = bamboo_domain::AgentRuntimeState::new("restart-empty-selection");
+    suspended.status = bamboo_domain::AgentStatusState::Suspended;
+    session.agent_runtime_state = Some(suspended);
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        "7".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        "{}".to_string(),
+    );
+    let provider = Arc::new(CalledProvider(std::sync::atomic::AtomicBool::new(false)));
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    super::run_agent_loop_with_config(
+        &mut session,
+        "continue".to_string(),
+        event_tx,
+        provider.clone(),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            skill_manager: Some(manager),
+            selected_skill_ids: Some(Vec::new()),
+            model_name: Some("model".to_string()),
+            max_rounds: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("empty selection continuation");
+    assert!(provider.0.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn activation_metadata_persistence_failure_releases_pin_before_provider_call() {
+    struct FailingPersistence;
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for FailingPersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected persistence failure"))
+        }
+    }
+    struct NeverCalledProvider;
+    #[async_trait]
+    impl LLMProvider for NeverCalledProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("persistence failure must stop before provider execution")
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.expect("initialize");
+    let mut session = Session::new("persistence-failure", "model");
+    let (event_tx, _event_rx) = mpsc::channel(4);
+    let result = super::run_agent_loop_with_config(
+        &mut session,
+        "review".to_string(),
+        event_tx,
+        Arc::new(NeverCalledProvider),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: Some(vec!["review".to_string()]),
+            persistence: Some(Arc::new(FailingPersistence)),
+            model_name: Some("model".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result
+        .expect_err("setup must fail closed")
+        .to_string()
+        .contains("could not be published before tool/model execution"));
+    assert!(manager
+        .store()
+        .activation_descriptor("persistence-failure")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin() {
+    struct FailSecondSave(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for FailSecondSave {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("second save failed"))
+            }
+        }
+    }
+    struct SuccessfulLoad;
+    #[async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for SuccessfulLoad {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                result: "pinned instructions".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "load_skill".to_string(),
+                    description: "load".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }]
+        }
+    }
+    struct NeverCalled;
+    #[async_trait]
+    impl LLMProvider for NeverCalled {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("second persistence failure must stop before provider")
+        }
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.expect("initialize");
+    let mut session = Session::new("post-preload-save-failure", "model");
+    let (event_tx, _event_rx) = mpsc::channel(4);
+    let result = super::run_agent_loop_with_config(
+        &mut session,
+        "review".to_string(),
+        event_tx,
+        Arc::new(NeverCalled),
+        Arc::new(SuccessfulLoad),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: Some(vec!["review".to_string()]),
+            persistence: Some(Arc::new(FailSecondSave(
+                std::sync::atomic::AtomicUsize::new(0),
+            ))),
+            model_name: Some("model".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result
+        .expect_err("post preload save must fail")
+        .to_string()
+        .contains("loaded-state could not be published"));
+    assert!(manager
+        .store()
+        .activation_descriptor("post-preload-save-failure")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() {
+    struct UnsuccessfulLoad;
+    #[async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for UnsuccessfulLoad {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            Ok(ToolResult {
+                success: false,
+                result: "injected preload failure".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "load_skill".to_string(),
+                    description: "load".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }]
+        }
+    }
+    struct NeverCalled;
+    #[async_trait]
+    impl LLMProvider for NeverCalled {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("unsuccessful explicit preload must stop before provider")
+        }
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.expect("initialize");
+    let mut session = Session::new("unsuccessful-preload", "model");
+    let (event_tx, _event_rx) = mpsc::channel(4);
+    let result = super::run_agent_loop_with_config(
+        &mut session,
+        "review".to_string(),
+        event_tx,
+        Arc::new(NeverCalled),
+        Arc::new(UnsuccessfulLoad),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: Some(vec!["review".to_string()]),
+            model_name: Some("model".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result
+        .expect_err("preload must fail closed")
+        .to_string()
+        .contains("preload was unsuccessful"));
+    assert!(manager
+        .store()
+        .activation_descriptor("unsuccessful-preload")
+        .await
+        .is_none());
+}

@@ -16,7 +16,10 @@ use bamboo_skills::SkillManager;
 
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 
-use super::{skill_access_error_to_tool_error, SkillToolAccess, MAX_RESOURCE_CONTENT_CHARS};
+use super::{
+    skill_access_error_to_tool_error, validate_runtime_activation,
+    validate_runtime_activation_descriptor, SkillToolAccess, MAX_RESOURCE_CONTENT_CHARS,
+};
 
 #[derive(Debug, Deserialize)]
 struct ReadSkillResourceArgs {
@@ -94,13 +97,20 @@ impl Tool for ReadSkillResourceTool {
             ));
         }
 
-        access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id())
-            .await
-            .map_err(skill_access_error_to_tool_error)?;
+        let session_id = ctx.session_id().ok_or_else(|| {
+            ToolError::Execution(
+                "read_skill_resource requires a session_id in tool context".to_string(),
+            )
+        })?;
+        let store = self.access.skill_store(ctx.session_id()).await?;
+        if !validate_runtime_activation(&self.access, store.as_ref(), session_id, skill_id).await? {
+            access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id())
+                .await
+                .map_err(skill_access_error_to_tool_error)?;
+        }
         access_control::ensure_skill_loaded(&self.access, skill_id, ctx.session_id())
             .await
             .map_err(skill_access_error_to_tool_error)?;
-        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id()).await;
 
         let resource_path = normalize_relative_resource_path(&parsed.resource_path)
             .map_err(ToolError::InvalidArguments)?;
@@ -111,16 +121,8 @@ impl Tool for ReadSkillResourceTool {
             ));
         }
 
-        let skill_root = self
-            .access
-            .skill_root(skill_id, skill_mode.as_deref(), ctx.session_id())
-            .await?;
-        let canonical_root = tokio::fs::canonicalize(&skill_root).await.map_err(|_| {
-            ToolError::Execution(format!(
-                "Skill directory not found for '{skill_id}'. Load the skill list first."
-            ))
-        })?;
-        let canonical_resource = tokio::fs::canonicalize(skill_root.join(&resource_path))
+        let (bytes, payload_descriptor) = store
+            .read_pinned_skill_resource_with_descriptor(session_id, skill_id, &resource_path)
             .await
             .map_err(|_| {
                 ToolError::Execution(format!(
@@ -129,26 +131,13 @@ impl Tool for ReadSkillResourceTool {
                     display_relative_path(&resource_path)
                 ))
             })?;
-
-        if !canonical_resource.starts_with(&canonical_root) {
-            return Err(ToolError::InvalidArguments(
-                "resource_path must stay inside the skill directory".to_string(),
-            ));
-        }
-
-        let metadata = tokio::fs::metadata(&canonical_resource)
-            .await
-            .map_err(|err| ToolError::Execution(format!("Failed to stat resource: {err}")))?;
-        if !metadata.is_file() {
-            return Err(ToolError::InvalidArguments(format!(
-                "resource_path must reference a file: {}",
-                display_relative_path(&resource_path)
-            )));
-        }
-
-        let bytes = tokio::fs::read(&canonical_resource)
-            .await
-            .map_err(|err| ToolError::Execution(format!("Failed to read skill resource: {err}")))?;
+        validate_runtime_activation_descriptor(
+            &self.access,
+            &payload_descriptor,
+            session_id,
+            skill_id,
+        )
+        .await?;
         let size_bytes = bytes.len();
 
         let result = match String::from_utf8(bytes) {

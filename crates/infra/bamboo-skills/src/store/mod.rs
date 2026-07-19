@@ -51,10 +51,12 @@ pub mod builtin;
 pub mod parser;
 pub mod storage;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -66,13 +68,312 @@ use crate::catalog::{
 use crate::store::builtin::{archive_exact_legacy_materialization, load_builtin_skill_bundles};
 use crate::store::parser::render_skill_markdown;
 use crate::store::storage::{
-    discover_plugin_skill_dirs, ensure_skills_dir, load_skills_from_discovery_dirs_detailed,
+    discover_plugin_skill_dirs, ensure_skills_dir,
+    load_skills_from_discovery_dirs_detailed_with_limits, open_skill_file_no_follow,
     write_skill_file, FailedSkillRecord, LoadedSkillRecord, SkillDirectorySource,
     SkillDiscoveryDir,
 };
 use crate::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
 };
+
+const MAX_PINNED_SKILL_ACTIVATIONS: usize = 256;
+const MAX_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WORKFLOW_SKILL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_WORKFLOW_PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RETAINED_WORKFLOW_BYTES: usize = 256 * 1024 * 1024;
+const MAX_WORKFLOW_RESOURCES_PER_SKILL: usize = 1024;
+const MAX_WORKFLOW_RESOURCES_PER_PUBLICATION: usize = 4096;
+const MAX_WORKFLOW_RESOURCE_PATH_BYTES: usize = 1024;
+const MAX_WORKFLOWS_PER_PUBLICATION: usize = 1024;
+const MAX_CACHED_WORKSPACE_STORES: usize = 64;
+const MAX_CACHED_WORKSPACE_ALIASES: usize = 256;
+const MAX_CACHED_MODE_STORES: usize = 16;
+static NEXT_SKILL_STORE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkillSnapshotLimits {
+    pub(crate) max_file_bytes: usize,
+    pub(crate) max_skill_bytes: usize,
+    pub(crate) max_publication_bytes: usize,
+    pub(crate) max_retained_bytes: usize,
+}
+
+impl Default for SkillSnapshotLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: MAX_WORKFLOW_FILE_BYTES,
+            max_skill_bytes: MAX_WORKFLOW_SKILL_BYTES,
+            max_publication_bytes: MAX_WORKFLOW_PUBLICATION_BYTES,
+            max_retained_bytes: MAX_RETAINED_WORKFLOW_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActivationBudgetCharge {
+    definition_bytes: usize,
+    resources: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Default)]
+struct RetainedResourceBudgetState {
+    total_bytes: usize,
+    activations: HashMap<String, ActivationBudgetCharge>,
+    publications: HashMap<u64, ActivationBudgetCharge>,
+    resources: HashMap<usize, (usize, usize)>,
+}
+
+#[derive(Debug, Default)]
+struct RetainedResourceBudget {
+    state: Mutex<RetainedResourceBudgetState>,
+}
+
+impl RetainedResourceBudget {
+    fn replace(
+        &self,
+        activation_id: &str,
+        definition_bytes: usize,
+        resources: Vec<(usize, usize)>,
+        limit: usize,
+    ) -> SkillResult<()> {
+        let mut state = self.state.lock().expect("workflow retained budget lock");
+        if !state.activations.contains_key(activation_id)
+            && state.activations.len() >= MAX_PINNED_SKILL_ACTIVATIONS
+        {
+            return Err(SkillError::Storage(format!(
+                "global active workflow snapshot capacity ({MAX_PINNED_SKILL_ACTIVATIONS}) reached"
+            )));
+        }
+        let old = state.activations.get(activation_id);
+        let old_definition_bytes = old.map(|charge| charge.definition_bytes).unwrap_or(0);
+        let old_resource_ids: HashSet<usize> = old
+            .map(|charge| charge.resources.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default();
+        let mut projected = state.total_bytes.saturating_sub(old_definition_bytes);
+        for resource_id in &old_resource_ids {
+            if state
+                .resources
+                .get(resource_id)
+                .is_some_and(|(_, references)| *references == 1)
+            {
+                projected = projected.saturating_sub(state.resources[resource_id].0);
+            }
+        }
+        projected = projected.saturating_add(definition_bytes);
+        for (resource_id, bytes) in &resources {
+            let remains_after_replace =
+                state
+                    .resources
+                    .get(resource_id)
+                    .is_some_and(|(_, references)| {
+                        *references > usize::from(old_resource_ids.contains(resource_id))
+                    });
+            if !remains_after_replace {
+                projected = projected.saturating_add(*bytes);
+            }
+        }
+        if projected > limit {
+            return Err(SkillError::Storage(format!(
+                "retained workflow snapshot budget exceeded ({projected} > {limit} bytes)"
+            )));
+        }
+
+        if let Some(old) = state.activations.remove(activation_id) {
+            state.total_bytes = state.total_bytes.saturating_sub(old.definition_bytes);
+            for (resource_id, _) in old.resources {
+                if let Some((bytes, references)) = state.resources.get_mut(&resource_id) {
+                    *references -= 1;
+                    if *references == 0 {
+                        let bytes = *bytes;
+                        state.resources.remove(&resource_id);
+                        state.total_bytes = state.total_bytes.saturating_sub(bytes);
+                    }
+                }
+            }
+        }
+        state.total_bytes = state.total_bytes.saturating_add(definition_bytes);
+        for (resource_id, bytes) in &resources {
+            if !state.resources.contains_key(resource_id) {
+                state.total_bytes = state.total_bytes.saturating_add(*bytes);
+                state.resources.insert(*resource_id, (*bytes, 0));
+            }
+            state
+                .resources
+                .get_mut(resource_id)
+                .expect("retained resource charge")
+                .1 += 1;
+        }
+        state.activations.insert(
+            activation_id.to_string(),
+            ActivationBudgetCharge {
+                definition_bytes,
+                resources,
+            },
+        );
+        Ok(())
+    }
+
+    fn release(&self, activation_id: &str) {
+        let mut state = self.state.lock().expect("workflow retained budget lock");
+        let Some(old) = state.activations.remove(activation_id) else {
+            return;
+        };
+        state.total_bytes = state.total_bytes.saturating_sub(old.definition_bytes);
+        for (resource_id, _) in old.resources {
+            if let Some((bytes, references)) = state.resources.get_mut(&resource_id) {
+                *references -= 1;
+                if *references == 0 {
+                    let bytes = *bytes;
+                    state.resources.remove(&resource_id);
+                    state.total_bytes = state.total_bytes.saturating_sub(bytes);
+                }
+            }
+        }
+    }
+
+    fn replace_publication(
+        &self,
+        store_token: u64,
+        definition_bytes: usize,
+        resources: Vec<(usize, usize)>,
+        limit: usize,
+    ) -> SkillResult<()> {
+        let mut state = self.state.lock().expect("workflow retained budget lock");
+        let old = state.publications.get(&store_token);
+        let old_definition_bytes = old.map(|charge| charge.definition_bytes).unwrap_or(0);
+        let old_resource_ids: HashSet<usize> = old
+            .map(|charge| charge.resources.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default();
+        let mut projected = state.total_bytes.saturating_sub(old_definition_bytes);
+        for resource_id in &old_resource_ids {
+            if state
+                .resources
+                .get(resource_id)
+                .is_some_and(|(_, refs)| *refs == 1)
+            {
+                projected = projected.saturating_sub(state.resources[resource_id].0);
+            }
+        }
+        projected = projected.saturating_add(definition_bytes);
+        for (resource_id, bytes) in &resources {
+            let remains = state.resources.get(resource_id).is_some_and(|(_, refs)| {
+                *refs > usize::from(old_resource_ids.contains(resource_id))
+            });
+            if !remains {
+                projected = projected.saturating_add(*bytes);
+            }
+        }
+        if projected > limit {
+            return Err(SkillError::Storage(format!(
+                "global workflow snapshot budget exceeded ({projected} > {limit} bytes)"
+            )));
+        }
+        if let Some(old) = state.publications.remove(&store_token) {
+            Self::remove_charge(&mut state, old);
+        }
+        Self::add_charge(&mut state, definition_bytes, &resources);
+        state.publications.insert(
+            store_token,
+            ActivationBudgetCharge {
+                definition_bytes,
+                resources,
+            },
+        );
+        Ok(())
+    }
+
+    fn release_publication(&self, store_token: u64) {
+        let mut state = self.state.lock().expect("workflow retained budget lock");
+        if let Some(old) = state.publications.remove(&store_token) {
+            Self::remove_charge(&mut state, old);
+        }
+    }
+
+    fn remove_charge(state: &mut RetainedResourceBudgetState, charge: ActivationBudgetCharge) {
+        state.total_bytes = state.total_bytes.saturating_sub(charge.definition_bytes);
+        for (resource_id, _) in charge.resources {
+            if let Some((bytes, references)) = state.resources.get_mut(&resource_id) {
+                *references -= 1;
+                if *references == 0 {
+                    let bytes = *bytes;
+                    state.resources.remove(&resource_id);
+                    state.total_bytes = state.total_bytes.saturating_sub(bytes);
+                }
+            }
+        }
+    }
+
+    fn add_charge(
+        state: &mut RetainedResourceBudgetState,
+        definition_bytes: usize,
+        resources: &[(usize, usize)],
+    ) {
+        state.total_bytes = state.total_bytes.saturating_add(definition_bytes);
+        for (resource_id, bytes) in resources {
+            if !state.resources.contains_key(resource_id) {
+                state.total_bytes = state.total_bytes.saturating_add(*bytes);
+                state.resources.insert(*resource_id, (*bytes, 0));
+            }
+            state
+                .resources
+                .get_mut(resource_id)
+                .expect("resource charge")
+                .1 += 1;
+        }
+    }
+}
+
+pub(crate) type SkillResourceSnapshot = std::sync::Arc<HashMap<String, std::sync::Arc<Vec<u8>>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillActivationDescriptor {
+    pub catalog_revision: u64,
+    pub skill_revisions: BTreeMap<SkillId, u64>,
+    pub selected_skill_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PinnedSkillDefinition {
+    definition: Arc<SkillDefinition>,
+    root: PathBuf,
+    revision: u64,
+    resources: SkillResourceSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct PinnedSkillActivation {
+    catalog_revision: u64,
+    selected_skill_mode: Option<String>,
+    skills: HashMap<SkillId, PinnedSkillDefinition>,
+}
+
+#[derive(Debug, Default)]
+struct PinnedSkillActivations {
+    by_id: HashMap<String, PinnedSkillActivation>,
+}
+
+impl PinnedSkillActivations {
+    fn insert(
+        &mut self,
+        activation_id: String,
+        activation: PinnedSkillActivation,
+    ) -> SkillResult<()> {
+        if !self.by_id.contains_key(&activation_id)
+            && self.by_id.len() >= MAX_PINNED_SKILL_ACTIVATIONS
+        {
+            return Err(SkillError::Storage(format!(
+                "active workflow snapshot capacity ({MAX_PINNED_SKILL_ACTIVATIONS}) reached"
+            )));
+        }
+        self.by_id.insert(activation_id, activation);
+        Ok(())
+    }
+
+    fn remove(&mut self, activation_id: &str) -> Option<PinnedSkillActivation> {
+        self.by_id.remove(activation_id)
+    }
+}
 
 fn invalid_placeholder(
     id: &str,
@@ -109,6 +410,127 @@ fn stable_workspace_hash(path: &Path) -> u64 {
         })
 }
 
+async fn snapshot_skill_resources(
+    roots: &HashMap<SkillId, PathBuf>,
+    definitions: &HashMap<SkillId, SkillDefinition>,
+    catalog_entries: &[WorkflowCatalogEntry],
+    previous: &HashMap<SkillId, SkillResourceSnapshot>,
+    limits: SkillSnapshotLimits,
+) -> SkillResult<HashMap<SkillId, SkillResourceSnapshot>> {
+    let mut snapshots = HashMap::with_capacity(roots.len());
+    let mut publication_bytes = 0usize;
+    let mut publication_resource_count = 0usize;
+    for (skill_id, root) in roots {
+        let definition_bytes = definitions
+            .get(skill_id)
+            .and_then(|definition| serde_json::to_vec(definition).ok())
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let reuses_last_known_good = catalog_entries
+            .iter()
+            .find(|entry| entry.id == *skill_id)
+            .is_some_and(|entry| entry.status == WorkflowStatus::Invalid);
+        if reuses_last_known_good {
+            if let Some(resources) = previous.get(skill_id) {
+                let resource_bytes = resources.values().map(|bytes| bytes.len()).sum::<usize>();
+                let skill_bytes = definition_bytes.saturating_add(resource_bytes);
+                if skill_bytes > limits.max_skill_bytes {
+                    return Err(SkillError::Storage(format!(
+                        "workflow '{skill_id}' snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
+                        limits.max_skill_bytes
+                    )));
+                }
+                publication_bytes = publication_bytes.saturating_add(skill_bytes);
+                publication_resource_count =
+                    publication_resource_count.saturating_add(resources.len());
+                if publication_bytes > limits.max_publication_bytes
+                    || publication_resource_count > MAX_WORKFLOW_RESOURCES_PER_PUBLICATION
+                {
+                    return Err(SkillError::Storage(
+                        "workflow catalog publication exceeds snapshot limits".to_string(),
+                    ));
+                }
+                snapshots.insert(skill_id.clone(), resources.clone());
+                continue;
+            }
+        }
+        let skill_markdown_bytes = tokio::fs::metadata(root.join("SKILL.md"))
+            .await
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
+        if skill_markdown_bytes > limits.max_file_bytes {
+            return Err(SkillError::Storage(format!(
+                "workflow '{skill_id}' SKILL.md exceeds per-file limit ({skill_markdown_bytes} > {} bytes)",
+                limits.max_file_bytes
+            )));
+        }
+        let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
+            root,
+            MAX_WORKFLOW_RESOURCES_PER_SKILL,
+            MAX_WORKFLOW_RESOURCE_PATH_BYTES,
+        )?;
+        let mut resources = HashMap::with_capacity(paths.len());
+        let mut resource_bytes = 0usize;
+        for relative_path in paths {
+            let resource = root.join(&relative_path);
+            let file_bytes = tokio::fs::metadata(&resource).await?.len() as usize;
+            if file_bytes > limits.max_file_bytes {
+                return Err(SkillError::Storage(format!(
+                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({file_bytes} > {} bytes)",
+                    limits.max_file_bytes
+                )));
+            }
+            let file = open_skill_file_no_follow(&resource).await?;
+            let mut bytes = Vec::with_capacity(file_bytes.min(limits.max_file_bytes));
+            file.take(limits.max_file_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > limits.max_file_bytes {
+                return Err(SkillError::Storage(format!(
+                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({} > {} bytes)",
+                    bytes.len(),
+                    limits.max_file_bytes
+                )));
+            }
+            resource_bytes = resource_bytes.saturating_add(bytes.len());
+            let projected_skill_bytes = definition_bytes
+                .saturating_add(skill_markdown_bytes)
+                .saturating_add(resource_bytes);
+            if projected_skill_bytes > limits.max_skill_bytes {
+                return Err(SkillError::Storage(format!(
+                    "workflow '{skill_id}' snapshot exceeds per-skill limit ({projected_skill_bytes} > {} bytes)",
+                    limits.max_skill_bytes
+                )));
+            }
+            resources.insert(relative_path, std::sync::Arc::new(bytes));
+        }
+        let skill_bytes = definition_bytes
+            .saturating_add(skill_markdown_bytes)
+            .saturating_add(resource_bytes);
+        if skill_bytes > limits.max_skill_bytes {
+            return Err(SkillError::Storage(format!(
+                "workflow '{skill_id}' snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
+                limits.max_skill_bytes
+            )));
+        }
+        publication_bytes = publication_bytes.saturating_add(skill_bytes);
+        if publication_bytes > limits.max_publication_bytes {
+            return Err(SkillError::Storage(format!(
+                "workflow catalog publication exceeds limit ({publication_bytes} > {} bytes)",
+                limits.max_publication_bytes
+            )));
+        }
+        publication_resource_count = publication_resource_count.saturating_add(resources.len());
+        if publication_resource_count > MAX_WORKFLOW_RESOURCES_PER_PUBLICATION {
+            return Err(SkillError::Storage(format!(
+                "workflow catalog resource count exceeds limit ({publication_resource_count} > {MAX_WORKFLOW_RESOURCES_PER_PUBLICATION})"
+            )));
+        }
+        snapshots.insert(skill_id.clone(), std::sync::Arc::new(resources));
+    }
+    Ok(snapshots)
+}
+
 /// Persistent storage for skills with in-memory caching.
 ///
 /// Manages a collection of skills loaded from Markdown files on disk.
@@ -130,19 +552,28 @@ fn stable_workspace_hash(path: &Path) -> u64 {
 /// println!("Skill: {}", skill.name);
 /// ```
 pub struct SkillStore {
+    store_token: u64,
     /// Serializes publication and observation of the correlated snapshot maps below.
     snapshot_publish_lock: RwLock<()>,
     /// In-memory cache of loaded skills, keyed by skill ID.
     skills: RwLock<HashMap<SkillId, SkillDefinition>>,
     /// Root directory of each loaded skill (keyed by skill ID).
     skill_roots: RwLock<HashMap<SkillId, PathBuf>>,
+    /// Immutable bytes for every resource in the currently published generation.
+    /// Activations retain these snapshots after a watcher publishes a newer bundle.
+    skill_resources: RwLock<HashMap<SkillId, SkillResourceSnapshot>>,
     catalog: RwLock<WorkflowCatalogSnapshot>,
+    /// Session/activation-scoped immutable workflow generations. The cache is bounded,
+    /// and normal runtime finalization explicitly removes completed activations.
+    pinned_activations: RwLock<PinnedSkillActivations>,
     next_revision: AtomicU64,
     watcher_started: AtomicBool,
     catalog_events: tokio::sync::broadcast::Sender<WorkflowCatalogEvent>,
     reload_lock: tokio::sync::Mutex<()>,
     mode_stores: RwLock<HashMap<String, std::sync::Arc<SkillStore>>>,
     workspace_stores: RwLock<HashMap<PathBuf, std::sync::Arc<SkillStore>>>,
+    retained_budget: Arc<RetainedResourceBudget>,
+    snapshot_limits: SkillSnapshotLimits,
 
     /// Configuration specifying the skills directory path.
     config: SkillStoreConfig,
@@ -322,20 +753,49 @@ impl SkillStore {
     /// let store = SkillStore::new(config);
     /// ```
     pub fn new(config: SkillStoreConfig) -> Self {
+        Self::new_with_shared_snapshot_state(
+            config,
+            Arc::new(RetainedResourceBudget::default()),
+            SkillSnapshotLimits::default(),
+        )
+    }
+
+    fn new_with_shared_snapshot_state(
+        config: SkillStoreConfig,
+        retained_budget: Arc<RetainedResourceBudget>,
+        snapshot_limits: SkillSnapshotLimits,
+    ) -> Self {
         let (catalog_events, _) = tokio::sync::broadcast::channel(128);
         Self {
+            store_token: NEXT_SKILL_STORE_TOKEN.fetch_add(1, Ordering::Relaxed),
             snapshot_publish_lock: RwLock::new(()),
             skills: RwLock::new(HashMap::new()),
             skill_roots: RwLock::new(HashMap::new()),
+            skill_resources: RwLock::new(HashMap::new()),
             catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
+            pinned_activations: RwLock::new(PinnedSkillActivations::default()),
             next_revision: AtomicU64::new(1),
             watcher_started: AtomicBool::new(false),
             catalog_events,
             reload_lock: tokio::sync::Mutex::new(()),
             mode_stores: RwLock::new(HashMap::new()),
             workspace_stores: RwLock::new(HashMap::new()),
+            retained_budget,
+            snapshot_limits,
             config,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_snapshot_limits(
+        config: SkillStoreConfig,
+        snapshot_limits: SkillSnapshotLimits,
+    ) -> Self {
+        Self::new_with_shared_snapshot_state(
+            config,
+            Arc::new(RetainedResourceBudget::default()),
+            snapshot_limits,
+        )
     }
 
     /// Initialize the store, loading skills from disk.
@@ -415,13 +875,19 @@ impl SkillStore {
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
         dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
-        let report = load_skills_from_discovery_dirs_detailed(&dirs).await?;
+        let report = load_skills_from_discovery_dirs_detailed_with_limits(
+            &dirs,
+            self.snapshot_limits.max_file_bytes,
+            MAX_WORKFLOWS_PER_PUBLICATION,
+        )
+        .await?;
 
-        let (previous_skills, previous_roots, previous_catalog) = {
+        let (previous_skills, previous_roots, previous_resources, previous_catalog) = {
             let _snapshot_guard = self.snapshot_publish_lock.read().await;
             (
                 self.skills.read().await.clone(),
                 self.skill_roots.read().await.clone(),
+                self.skill_resources.read().await.clone(),
                 self.catalog.read().await.clone(),
             )
         };
@@ -437,11 +903,20 @@ impl SkillStore {
             )
             .await;
         let count = resolved_skills.len();
+        let resolved_resources = snapshot_skill_resources(
+            &resolved_roots,
+            &resolved_skills,
+            &entries,
+            &previous_resources,
+            self.snapshot_limits,
+        )
+        .await?;
         let definition_changed: HashSet<String> = resolved_skills
             .iter()
             .filter(|(id, skill)| {
                 previous_skills.get(*id) != Some(*skill)
                     || previous_roots.get(*id) != resolved_roots.get(*id)
+                    || previous_resources.get(*id) != resolved_resources.get(*id)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -469,18 +944,51 @@ impl SkillStore {
         comparable_previous.revision = revision;
         if resolved_skills == previous_skills
             && resolved_roots == previous_roots
+            && resolved_resources == previous_resources
             && next_catalog == comparable_previous
         {
             return Ok(count);
         }
-        self.next_revision.fetch_add(1, Ordering::SeqCst);
-        {
-            // Definition, root, and metadata become visible as one immutable generation.
-            let _snapshot_guard = self.snapshot_publish_lock.write().await;
-            *self.skills.write().await = resolved_skills;
-            *self.skill_roots.write().await = resolved_roots;
-            *self.catalog.write().await = next_catalog.clone();
+        let publication_definition_bytes = resolved_skills
+            .values()
+            .map(|skill| {
+                serde_json::to_vec(skill)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum::<usize>();
+        let mut publication_resources = HashMap::<usize, usize>::new();
+        for snapshot in resolved_resources.values() {
+            for bytes in snapshot.values() {
+                publication_resources
+                    .entry(Arc::as_ptr(bytes) as usize)
+                    .or_insert(bytes.len());
+            }
         }
+        // Acquire every async publication guard before changing the synchronous
+        // shared budget. After `replace_publication` succeeds there are no await
+        // points until all correlated maps and the revision are committed.
+        let _snapshot_guard = self.snapshot_publish_lock.write().await;
+        let mut skills_guard = self.skills.write().await;
+        let mut roots_guard = self.skill_roots.write().await;
+        let mut resources_guard = self.skill_resources.write().await;
+        let mut catalog_guard = self.catalog.write().await;
+        self.retained_budget.replace_publication(
+            self.store_token,
+            publication_definition_bytes,
+            publication_resources.into_iter().collect(),
+            self.snapshot_limits.max_retained_bytes,
+        )?;
+        self.next_revision.fetch_add(1, Ordering::SeqCst);
+        *skills_guard = resolved_skills;
+        *roots_guard = resolved_roots;
+        *resources_guard = resolved_resources;
+        *catalog_guard = next_catalog.clone();
+        drop(catalog_guard);
+        drop(resources_guard);
+        drop(roots_guard);
+        drop(skills_guard);
+        drop(_snapshot_guard);
         self.publish_catalog_events(&previous_catalog, &next_catalog, &definition_changed);
 
         Ok(count)
@@ -639,11 +1147,18 @@ impl SkillStore {
         self.catalog.read().await.clone()
     }
 
-    /// Return prompt-visible skills and their catalog metadata from one validated snapshot.
-    pub(crate) async fn skills_and_catalog_for_mode(
+    /// Return definitions, roots, immutable resource bytes, and metadata from one
+    /// validated publication. Callers that create an activation must pin directly
+    /// from this tuple rather than resolving any component from the live store again.
+    pub(crate) async fn activation_source_for_mode(
         &self,
         mode_override: Option<&str>,
-    ) -> SkillResult<(Vec<SkillDefinition>, WorkflowCatalogSnapshot)> {
+    ) -> SkillResult<(
+        Vec<SkillDefinition>,
+        HashMap<SkillId, PathBuf>,
+        HashMap<SkillId, SkillResourceSnapshot>,
+        WorkflowCatalogSnapshot,
+    )> {
         let mode_store = self.skill_store_for_mode(mode_override).await?;
         let store = mode_store.as_deref().unwrap_or(self);
         if let Err(error) = store.reload().await {
@@ -662,8 +1177,395 @@ impl SkillStore {
             .cloned()
             .collect::<Vec<_>>();
         skills.sort_by_key(|skill| skill.name.clone());
+        let roots = store.skill_roots.read().await.clone();
+        let resources = store.skill_resources.read().await.clone();
         let catalog = store.catalog.read().await.clone();
+        Ok((skills, roots, resources, catalog))
+    }
+
+    /// Return prompt-visible skills and their catalog metadata from one validated snapshot.
+    pub(crate) async fn skills_and_catalog_for_mode(
+        &self,
+        mode_override: Option<&str>,
+    ) -> SkillResult<(Vec<SkillDefinition>, WorkflowCatalogSnapshot)> {
+        let (skills, _, _, catalog) = self.activation_source_for_mode(mode_override).await?;
         Ok((skills, catalog))
+    }
+
+    pub(crate) async fn pin_activation_from_source(
+        &self,
+        activation_id: &str,
+        mode_override: Option<&str>,
+        selected_skills: &[SkillDefinition],
+        roots: &HashMap<SkillId, PathBuf>,
+        resources: &HashMap<SkillId, SkillResourceSnapshot>,
+        catalog: &WorkflowCatalogSnapshot,
+    ) -> SkillResult<SkillActivationDescriptor> {
+        let catalog_entries = catalog
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect::<HashMap<_, _>>();
+        let mut pinned_skills = HashMap::with_capacity(selected_skills.len());
+        let mut skill_revisions = BTreeMap::new();
+        let mut definition_bytes = 0usize;
+        let mut retained_resources = HashMap::<usize, usize>::new();
+        for skill in selected_skills {
+            let root = roots
+                .get(&skill.id)
+                .cloned()
+                .ok_or_else(|| SkillError::NotFound(skill.id.clone()))?;
+            let resource_snapshot = resources
+                .get(&skill.id)
+                .cloned()
+                .ok_or_else(|| SkillError::NotFound(skill.id.clone()))?;
+            let revision = catalog_entries
+                .get(skill.id.as_str())
+                .map(|entry| entry.revision)
+                .ok_or_else(|| SkillError::NotFound(skill.id.clone()))?;
+            skill_revisions.insert(skill.id.clone(), revision);
+            definition_bytes = definition_bytes.saturating_add(
+                serde_json::to_vec(skill)
+                    .map(|serialized| serialized.len())
+                    .unwrap_or(0),
+            );
+            for bytes in resource_snapshot.values() {
+                retained_resources
+                    .entry(Arc::as_ptr(bytes) as usize)
+                    .or_insert(bytes.len());
+            }
+            pinned_skills.insert(
+                skill.id.clone(),
+                PinnedSkillDefinition {
+                    definition: Arc::new(skill.clone()),
+                    root,
+                    revision,
+                    resources: resource_snapshot,
+                },
+            );
+        }
+
+        let mut activations = self.pinned_activations.write().await;
+        if !activations.by_id.contains_key(activation_id)
+            && activations.by_id.len() >= MAX_PINNED_SKILL_ACTIVATIONS
+        {
+            return Err(SkillError::Storage(format!(
+                "active workflow snapshot capacity ({MAX_PINNED_SKILL_ACTIVATIONS}) reached"
+            )));
+        }
+        self.retained_budget.replace(
+            activation_id,
+            definition_bytes,
+            retained_resources.into_iter().collect(),
+            self.snapshot_limits.max_retained_bytes,
+        )?;
+        activations.insert(
+            activation_id.to_string(),
+            PinnedSkillActivation {
+                catalog_revision: catalog.revision,
+                selected_skill_mode: self.effective_mode(mode_override),
+                skills: pinned_skills,
+            },
+        )?;
+        Ok(SkillActivationDescriptor {
+            catalog_revision: catalog.revision,
+            skill_revisions,
+            selected_skill_mode: self.effective_mode(mode_override),
+        })
+    }
+
+    /// Lazily establish an activation for non-runner callers. The agent runtime pins
+    /// during selection, before the first model/tool call; this fallback preserves the
+    /// same invariant for SDK and direct-tool integrations.
+    pub async fn pin_current_activation(
+        &self,
+        activation_id: &str,
+        selected_skill_ids: &[String],
+        mode_override: Option<&str>,
+    ) -> SkillResult<SkillActivationDescriptor> {
+        if let Some(descriptor) = self.activation_descriptor(activation_id).await {
+            let requested = selected_skill_ids
+                .iter()
+                .map(|id| id.trim())
+                .filter(|id| !id.is_empty())
+                .collect::<HashSet<_>>();
+            let pinned = descriptor
+                .skill_revisions
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            if requested == pinned
+                && descriptor.selected_skill_mode == self.effective_mode(mode_override)
+            {
+                return Ok(descriptor);
+            }
+        }
+        let (skills, roots, resources, catalog) =
+            self.activation_source_for_mode(mode_override).await?;
+        let selected = selected_skill_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect::<HashSet<_>>();
+        let selected_skills = skills
+            .into_iter()
+            .filter(|skill| selected.contains(skill.id.as_str()))
+            .collect::<Vec<_>>();
+        if selected_skills.len() != selected.len() {
+            let missing = selected_skill_ids
+                .iter()
+                .find(|id| !selected_skills.iter().any(|skill| &skill.id == *id))
+                .cloned()
+                .unwrap_or_default();
+            return Err(SkillError::NotFound(missing));
+        }
+        self.pin_activation_from_source(
+            activation_id,
+            mode_override,
+            &selected_skills,
+            &roots,
+            &resources,
+            &catalog,
+        )
+        .await
+    }
+
+    pub async fn activation_descriptor(
+        &self,
+        activation_id: &str,
+    ) -> Option<SkillActivationDescriptor> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations.by_id.get(activation_id)?;
+        Some(SkillActivationDescriptor {
+            catalog_revision: activation.catalog_revision,
+            skill_revisions: activation
+                .skills
+                .iter()
+                .map(|(id, skill)| (id.clone(), skill.revision))
+                .collect(),
+            selected_skill_mode: activation.selected_skill_mode.clone(),
+        })
+    }
+
+    pub async fn pinned_activation_skills(
+        &self,
+        activation_id: &str,
+    ) -> Option<(Vec<SkillDefinition>, SkillActivationDescriptor)> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations.by_id.get(activation_id)?;
+        let mut skills = activation
+            .skills
+            .values()
+            .map(|skill| skill.definition.as_ref().clone())
+            .collect::<Vec<_>>();
+        skills.sort_by(|left, right| left.id.cmp(&right.id));
+        let descriptor = SkillActivationDescriptor {
+            catalog_revision: activation.catalog_revision,
+            skill_revisions: activation
+                .skills
+                .iter()
+                .map(|(id, skill)| (id.clone(), skill.revision))
+                .collect(),
+            selected_skill_mode: activation.selected_skill_mode.clone(),
+        };
+        Some((skills, descriptor))
+    }
+
+    pub async fn get_pinned_skill_with_root(
+        &self,
+        activation_id: &str,
+        skill_id: &str,
+    ) -> SkillResult<(SkillDefinition, PathBuf, u64, Vec<String>)> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations
+            .by_id
+            .get(activation_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let pinned = activation
+            .skills
+            .get(skill_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let mut resource_paths = pinned.resources.keys().cloned().collect::<Vec<_>>();
+        resource_paths.sort();
+        Ok((
+            pinned.definition.as_ref().clone(),
+            pinned.root.clone(),
+            pinned.revision,
+            resource_paths,
+        ))
+    }
+
+    pub async fn get_pinned_skill_with_root_and_descriptor(
+        &self,
+        activation_id: &str,
+        skill_id: &str,
+    ) -> SkillResult<(
+        SkillDefinition,
+        PathBuf,
+        u64,
+        Vec<String>,
+        SkillActivationDescriptor,
+    )> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations
+            .by_id
+            .get(activation_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let pinned = activation
+            .skills
+            .get(skill_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let mut resource_paths = pinned.resources.keys().cloned().collect::<Vec<_>>();
+        resource_paths.sort();
+        let descriptor = SkillActivationDescriptor {
+            catalog_revision: activation.catalog_revision,
+            skill_revisions: activation
+                .skills
+                .iter()
+                .map(|(id, skill)| (id.clone(), skill.revision))
+                .collect(),
+            selected_skill_mode: activation.selected_skill_mode.clone(),
+        };
+        Ok((
+            pinned.definition.as_ref().clone(),
+            pinned.root.clone(),
+            pinned.revision,
+            resource_paths,
+            descriptor,
+        ))
+    }
+
+    pub async fn read_pinned_skill_resource(
+        &self,
+        activation_id: &str,
+        skill_id: &str,
+        resource_path: &Path,
+    ) -> SkillResult<Vec<u8>> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations
+            .by_id
+            .get(activation_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let pinned = activation
+            .skills
+            .get(skill_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let key = crate::resource_helpers::display_relative_path(resource_path);
+        pinned
+            .resources
+            .get(&key)
+            .map(|bytes| bytes.as_ref().clone())
+            .ok_or_else(|| SkillError::NotFound(format!("{skill_id}/{key}")))
+    }
+
+    pub async fn read_pinned_skill_resource_with_descriptor(
+        &self,
+        activation_id: &str,
+        skill_id: &str,
+        resource_path: &Path,
+    ) -> SkillResult<(Vec<u8>, SkillActivationDescriptor)> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations
+            .by_id
+            .get(activation_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let pinned = activation
+            .skills
+            .get(skill_id)
+            .ok_or_else(|| SkillError::NotFound(skill_id.to_string()))?;
+        let key = crate::resource_helpers::display_relative_path(resource_path);
+        let bytes = pinned
+            .resources
+            .get(&key)
+            .map(|bytes| bytes.as_ref().clone())
+            .ok_or_else(|| SkillError::NotFound(format!("{skill_id}/{key}")))?;
+        let descriptor = SkillActivationDescriptor {
+            catalog_revision: activation.catalog_revision,
+            skill_revisions: activation
+                .skills
+                .iter()
+                .map(|(id, skill)| (id.clone(), skill.revision))
+                .collect(),
+            selected_skill_mode: activation.selected_skill_mode.clone(),
+        };
+        Ok((bytes, descriptor))
+    }
+
+    pub async fn pinned_allowed_tools(
+        &self,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+    ) -> Option<Vec<String>> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations.by_id.get(activation_id)?;
+        let mut tools = activation
+            .skills
+            .iter()
+            .filter(|(skill_id, _)| !disabled_skill_ids.contains(*skill_id))
+            .map(|(_, skill)| skill)
+            .flat_map(|skill| skill.definition.tool_refs.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        tools.sort();
+        Some(tools)
+    }
+
+    pub async fn pinned_allowed_tools_with_descriptor(
+        &self,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+    ) -> Option<(Vec<String>, SkillActivationDescriptor)> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations.by_id.get(activation_id)?;
+        let mut tools = activation
+            .skills
+            .iter()
+            .filter(|(skill_id, _)| !disabled_skill_ids.contains(*skill_id))
+            .flat_map(|(_, skill)| skill.definition.tool_refs.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        tools.sort();
+        let descriptor = SkillActivationDescriptor {
+            catalog_revision: activation.catalog_revision,
+            skill_revisions: activation
+                .skills
+                .iter()
+                .map(|(id, skill)| (id.clone(), skill.revision))
+                .collect(),
+            selected_skill_mode: activation.selected_skill_mode.clone(),
+        };
+        Some((tools, descriptor))
+    }
+
+    pub async fn release_activation(&self, activation_id: &str) {
+        let mut activations = self.pinned_activations.write().await;
+        // Hold the removed activation (and therefore its last resource Arcs)
+        // through budget release. This prevents allocator address reuse from
+        // turning raw Arc-pointer identity accounting into an ABA collision.
+        let removed = activations.remove(activation_id);
+        if removed.is_some() {
+            self.retained_budget.release(activation_id);
+        }
+        drop(removed);
+    }
+
+    /// Release a session pin without depending on its workspace still existing.
+    /// Session IDs are unique across scopes, so clearing the root and every cached
+    /// workspace store is both safe and robust to deleted/unmounted projects.
+    pub async fn release_activation_across_cached_scopes(&self, activation_id: &str) {
+        self.release_activation(activation_id).await;
+        let workspace_stores = self
+            .workspace_stores
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for store in workspace_stores {
+            store.release_activation(activation_id).await;
+        }
     }
 
     pub fn subscribe_workflow_catalog(
@@ -692,11 +1594,20 @@ impl SkillStore {
         if let Some(store) = stores.get(&mode).cloned() {
             return Ok(Some(store));
         }
-        let store = std::sync::Arc::new(SkillStore::new(SkillStoreConfig {
-            skills_dir: self.config.skills_dir.clone(),
-            project_dir: self.config.project_dir.clone(),
-            active_mode: Some(mode.clone()),
-        }));
+        if stores.len() >= MAX_CACHED_MODE_STORES {
+            return Err(SkillError::Storage(format!(
+                "cached workflow mode store capacity ({MAX_CACHED_MODE_STORES}) reached"
+            )));
+        }
+        let store = std::sync::Arc::new(SkillStore::new_with_shared_snapshot_state(
+            SkillStoreConfig {
+                skills_dir: self.config.skills_dir.clone(),
+                project_dir: self.config.project_dir.clone(),
+                active_mode: Some(mode.clone()),
+            },
+            self.retained_budget.clone(),
+            self.snapshot_limits,
+        ));
         store.load().await?;
         store.start_live_reload();
 
@@ -778,19 +1689,70 @@ impl SkillStore {
         &self,
         workspace: &Path,
     ) -> SkillResult<std::sync::Arc<SkillStore>> {
+        let requested_workspace = workspace.to_path_buf();
+        // Keep the server-owned path as an alias. Once an activation has pinned
+        // immutable bytes, deleting the workspace must not make its store
+        // unreachable merely because canonicalization now fails.
+        if let Some(store) = self
+            .workspace_stores
+            .read()
+            .await
+            .get(&requested_workspace)
+            .cloned()
+        {
+            return Ok(store);
+        }
         let workspace = tokio::fs::canonicalize(workspace).await?;
-        if let Some(store) = self.workspace_stores.read().await.get(&workspace).cloned() {
+        let cached_canonical = self.workspace_stores.read().await.get(&workspace).cloned();
+        if let Some(store) = cached_canonical {
+            let mut stores = self.workspace_stores.write().await;
+            if !stores.contains_key(&requested_workspace)
+                && stores.len() >= MAX_CACHED_WORKSPACE_ALIASES
+            {
+                return Err(SkillError::Storage(format!(
+                    "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
+                )));
+            }
+            stores.insert(requested_workspace, store.clone());
             return Ok(store);
         }
         let mut stores = self.workspace_stores.write().await;
         if let Some(store) = stores.get(&workspace).cloned() {
+            if !stores.contains_key(&requested_workspace)
+                && stores.len() >= MAX_CACHED_WORKSPACE_ALIASES
+            {
+                return Err(SkillError::Storage(format!(
+                    "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
+                )));
+            }
+            stores.insert(requested_workspace, store.clone());
             return Ok(store);
         }
-        let store = std::sync::Arc::new(SkillStore::new(SkillStoreConfig {
-            skills_dir: self.config.skills_dir.clone(),
-            project_dir: Some(workspace.clone()),
-            active_mode: self.config.active_mode.clone(),
-        }));
+        let unique_store_count = stores
+            .values()
+            .map(Arc::as_ptr)
+            .collect::<HashSet<_>>()
+            .len();
+        if unique_store_count >= MAX_CACHED_WORKSPACE_STORES {
+            return Err(SkillError::Storage(format!(
+                "cached workflow workspace store capacity ({MAX_CACHED_WORKSPACE_STORES}) reached"
+            )));
+        }
+        let new_aliases = 1 + usize::from(requested_workspace != workspace);
+        if stores.len().saturating_add(new_aliases) > MAX_CACHED_WORKSPACE_ALIASES {
+            return Err(SkillError::Storage(format!(
+                "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
+            )));
+        }
+        let store = std::sync::Arc::new(SkillStore::new_with_shared_snapshot_state(
+            SkillStoreConfig {
+                skills_dir: self.config.skills_dir.clone(),
+                project_dir: Some(workspace.clone()),
+                active_mode: self.config.active_mode.clone(),
+            },
+            self.retained_budget.clone(),
+            self.snapshot_limits,
+        ));
         store.load().await?;
         store.start_live_reload();
 
@@ -810,7 +1772,21 @@ impl SkillStore {
             }
         });
         stores.insert(workspace, store.clone());
+        stores.insert(requested_workspace, store.clone());
         Ok(store)
+    }
+
+    pub(crate) async fn cached_workspace_stores(&self) -> Vec<std::sync::Arc<SkillStore>> {
+        let mut unique = Vec::new();
+        for store in self.workspace_stores.read().await.values() {
+            if !unique
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, store))
+            {
+                unique.push(store.clone());
+            }
+        }
+        unique
     }
 
     /// Resolve an isolated catalog view for a specific session workspace without changing the
@@ -1412,6 +2388,12 @@ impl SkillStore {
     }
 }
 
+impl Drop for SkillStore {
+    fn drop(&mut self) {
+        self.retained_budget.release_publication(self.store_token);
+    }
+}
+
 impl Default for SkillStore {
     fn default() -> Self {
         Self::new(SkillStoreConfig::default())
@@ -1540,6 +2522,7 @@ impl SkillUpdate {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use tokio::fs;
 
@@ -2732,5 +3715,690 @@ Use this skill for testing.
                 .description,
             "one changed"
         );
+    }
+
+    #[tokio::test]
+    async fn activation_pins_definition_revision_and_resources_across_reload() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = write_skill(&skills_dir, "revision-demo", "revision N", "prompt N")
+            .await
+            .expect("skill N");
+        fs::create_dir_all(skill_dir.join("references"))
+            .await
+            .expect("references");
+        fs::write(skill_dir.join("references/value.txt"), "resource N")
+            .await
+            .expect("resource N");
+        let store = Arc::new(SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        }));
+        store.initialize().await.expect("initialize");
+        let ids = vec!["revision-demo".to_string()];
+
+        let revision_n = store
+            .pin_current_activation("session-n", &ids, None)
+            .await
+            .expect("pin N");
+        let (_, _, pinned_revision_n, _) = store
+            .get_pinned_skill_with_root("session-n", "revision-demo")
+            .await
+            .expect("pinned N");
+        assert_eq!(
+            revision_n.skill_revisions["revision-demo"],
+            pinned_revision_n
+        );
+
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let reader_observed_n = Arc::new(tokio::sync::Notify::new());
+        let writer_published_n1 = Arc::new(tokio::sync::Notify::new());
+        let reader = {
+            let store = store.clone();
+            let start = start.clone();
+            let reader_observed_n = reader_observed_n.clone();
+            let writer_published_n1 = writer_published_n1.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                let before = store
+                    .get_pinned_skill_with_root("session-n", "revision-demo")
+                    .await
+                    .expect("reader observes N before replacement");
+                reader_observed_n.notify_one();
+                writer_published_n1.notified().await;
+                let after = store
+                    .get_pinned_skill_with_root("session-n", "revision-demo")
+                    .await
+                    .expect("reader retains N after replacement");
+                let resource = store
+                    .read_pinned_skill_resource(
+                        "session-n",
+                        "revision-demo",
+                        Path::new("references/value.txt"),
+                    )
+                    .await
+                    .expect("reader retains resource N");
+                (before, after, resource)
+            })
+        };
+        let writer = {
+            let store = store.clone();
+            let start = start.clone();
+            let reader_observed_n = reader_observed_n.clone();
+            let writer_published_n1 = writer_published_n1.clone();
+            let ids = ids.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                reader_observed_n.notified().await;
+                let staged_skill = skill_dir.join("SKILL.md.next");
+                fs::write(
+                    &staged_skill,
+                    "---\nname: revision-demo\ndescription: revision N+1\n---\nprompt N+1\n",
+                )
+                .await
+                .expect("stage N+1");
+                fs::rename(&staged_skill, skill_dir.join("SKILL.md"))
+                    .await
+                    .expect("publish skill N+1");
+                let staged_resource = skill_dir.join("references/value.txt.next");
+                fs::write(&staged_resource, "resource N+1")
+                    .await
+                    .expect("stage resource N+1");
+                fs::rename(&staged_resource, skill_dir.join("references/value.txt"))
+                    .await
+                    .expect("publish resource N+1");
+                store.reload().await.expect("reload N+1");
+                let revision = store
+                    .pin_current_activation("session-n1", &ids, None)
+                    .await
+                    .expect("pin N+1");
+                let new_activation = store
+                    .get_pinned_skill_with_root("session-n1", "revision-demo")
+                    .await
+                    .expect("new activation N+1");
+                let resource = store
+                    .read_pinned_skill_resource(
+                        "session-n1",
+                        "revision-demo",
+                        Path::new("references/value.txt"),
+                    )
+                    .await
+                    .expect("new resource N+1");
+                writer_published_n1.notify_one();
+                (revision, new_activation, resource)
+            })
+        };
+
+        let (before, after, active_resource) = reader.await.expect("reader task");
+        let (revision_n1, new_activation, new_resource) = writer.await.expect("writer task");
+        assert_eq!(before.0.prompt, "prompt N");
+        assert_eq!(after.0.prompt, "prompt N");
+        assert_eq!(before.2, pinned_revision_n);
+        assert_eq!(after.2, pinned_revision_n);
+        assert_eq!(active_resource, b"resource N");
+        assert_eq!(new_activation.0.prompt, "prompt N+1");
+        assert!(new_activation.2 > after.2);
+        assert_eq!(
+            revision_n1.skill_revisions["revision-demo"],
+            new_activation.2
+        );
+        assert_eq!(new_resource, b"resource N+1");
+    }
+
+    #[tokio::test]
+    async fn activation_capacity_does_not_evict_live_sessions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        write_skill(&skills_dir, "bounded", "bounded", "bounded")
+            .await
+            .expect("skill");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let ids = vec!["bounded".to_string()];
+        for index in 0..super::MAX_PINNED_SKILL_ACTIVATIONS {
+            store
+                .pin_current_activation(&format!("active-{index}"), &ids, None)
+                .await
+                .expect("capacity slot");
+        }
+        let error = store
+            .pin_current_activation("over-capacity", &ids, None)
+            .await
+            .expect_err("must reject instead of evicting a live activation");
+        assert!(error.to_string().contains("capacity"));
+        assert!(store.activation_descriptor("active-0").await.is_some());
+
+        store.release_activation("active-0").await;
+        store
+            .pin_current_activation("after-release", &ids, None)
+            .await
+            .expect("released slot is reusable");
+    }
+
+    #[tokio::test]
+    async fn invalid_transition_preserves_lkg_definition_and_resources_until_recovery() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = write_skill(&skills_dir, "lkg-demo", "valid N", "prompt N")
+            .await
+            .expect("skill N");
+        fs::create_dir_all(skill_dir.join("references"))
+            .await
+            .expect("references");
+        fs::write(skill_dir.join("references/value.txt"), "resource N")
+            .await
+            .expect("resource N");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: skills_dir.clone(),
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let ids = vec!["lkg-demo".to_string()];
+        store
+            .pin_current_activation("active-n", &ids, None)
+            .await
+            .expect("active N");
+
+        fs::write(skill_dir.join("SKILL.md"), "---\nname: [\n")
+            .await
+            .expect("corrupt skill");
+        fs::write(skill_dir.join("references/value.txt"), "corrupt resource")
+            .await
+            .expect("corrupt resource");
+        store.reload().await.expect("publish invalid LKG");
+        store
+            .pin_current_activation("invalid-new", &ids, None)
+            .await
+            .expect("pin retained LKG");
+        assert_eq!(
+            store
+                .get_pinned_skill_with_root("invalid-new", "lkg-demo")
+                .await
+                .expect("retained definition")
+                .0
+                .prompt,
+            "prompt N"
+        );
+        assert_eq!(
+            store
+                .read_pinned_skill_resource(
+                    "invalid-new",
+                    "lkg-demo",
+                    Path::new("references/value.txt"),
+                )
+                .await
+                .expect("retained resource"),
+            b"resource N"
+        );
+
+        write_skill(&skills_dir, "lkg-demo", "valid N+1", "prompt N+1")
+            .await
+            .expect("recover skill");
+        fs::write(skill_dir.join("references/value.txt"), "resource N+1")
+            .await
+            .expect("recover resource");
+        store.reload().await.expect("recover N+1");
+        store
+            .pin_current_activation("recovered-new", &ids, None)
+            .await
+            .expect("pin recovered");
+        assert_eq!(
+            store
+                .get_pinned_skill_with_root("active-n", "lkg-demo")
+                .await
+                .expect("old active N")
+                .0
+                .prompt,
+            "prompt N"
+        );
+        assert_eq!(
+            store
+                .get_pinned_skill_with_root("recovered-new", "lkg-demo")
+                .await
+                .expect("new recovered N+1")
+                .0
+                .prompt,
+            "prompt N+1"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_activation_replaces_same_ids_when_mode_changes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        write_skill(&skills_dir, "mode-demo", "default", "default prompt")
+            .await
+            .expect("default skill");
+        write_skill(
+            &directory.path().join("skills-fast"),
+            "mode-demo",
+            "fast",
+            "fast prompt",
+        )
+        .await
+        .expect("fast skill");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let ids = vec!["mode-demo".to_string()];
+        store
+            .pin_current_activation("mode-session", &ids, None)
+            .await
+            .expect("default pin");
+        let descriptor = store
+            .pin_current_activation("mode-session", &ids, Some("fast"))
+            .await
+            .expect("mode replacement");
+        assert_eq!(descriptor.selected_skill_mode.as_deref(), Some("fast"));
+        assert_eq!(
+            store
+                .get_pinned_skill_with_root("mode-session", "mode-demo")
+                .await
+                .expect("fast activation")
+                .0
+                .prompt,
+            "fast prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_allowed_tools_use_pinned_definition_and_honor_live_disabled_skills() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = skills_dir.join("tools-demo");
+        fs::create_dir_all(&skill_dir).await.expect("skill root");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: tools-demo\ndescription: tools N\nallowed-tools:\n  - read_file\n---\ntools N\n",
+        )
+        .await
+        .expect("tools N");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let ids = vec!["tools-demo".to_string()];
+        store
+            .pin_current_activation("tools-n", &ids, None)
+            .await
+            .expect("pin tools N");
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: tools-demo\ndescription: tools N+1\nallowed-tools:\n  - write_file\n---\ntools N+1\n",
+        )
+        .await
+        .expect("tools N+1");
+        store.reload().await.expect("reload tools N+1");
+        assert_eq!(
+            store
+                .pinned_allowed_tools("tools-n", &std::collections::BTreeSet::new())
+                .await
+                .expect("pinned tools"),
+            vec!["Read"]
+        );
+        assert_eq!(
+            store
+                .pinned_allowed_tools(
+                    "tools-n",
+                    &std::collections::BTreeSet::from(["tools-demo".to_string()]),
+                )
+                .await
+                .expect("disabled pinned tools"),
+            Vec::<String>::new()
+        );
+        store
+            .pin_current_activation("tools-n1", &ids, None)
+            .await
+            .expect("pin tools N+1");
+        assert_eq!(
+            store
+                .pinned_allowed_tools("tools-n1", &std::collections::BTreeSet::new())
+                .await
+                .expect("new tools"),
+            vec!["Write"]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_does_not_require_cached_workspace_to_still_exist() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        let project_skills = workspace.join(".bamboo/skills");
+        write_skill(
+            &project_skills,
+            "workspace-release",
+            "workspace release",
+            "workspace release",
+        )
+        .await
+        .expect("workspace skill");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let workspace_store = store
+            .skill_store_for_workspace(&workspace)
+            .await
+            .expect("workspace store");
+        workspace_store
+            .pin_current_activation(
+                "deleted-workspace-session",
+                &["workspace-release".to_string()],
+                None,
+            )
+            .await
+            .expect("workspace activation");
+        fs::remove_dir_all(&workspace)
+            .await
+            .expect("delete workspace");
+
+        let cached_after_delete = store
+            .skill_store_for_workspace(&workspace)
+            .await
+            .expect("deleted workspace must resolve cached immutable store");
+        assert!(Arc::ptr_eq(&workspace_store, &cached_after_delete));
+        assert_eq!(
+            cached_after_delete
+                .get_pinned_skill_with_root("deleted-workspace-session", "workspace-release")
+                .await
+                .expect("pinned definition after delete")
+                .0
+                .prompt,
+            "workspace release"
+        );
+
+        store
+            .release_activation_across_cached_scopes("deleted-workspace-session")
+            .await;
+        assert!(workspace_store
+            .activation_descriptor("deleted-workspace-session")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_reload_keeps_previous_publication_and_retained_budget_is_reusable() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = write_skill(&skills_dir, "bounded-bytes", "bounded", "prompt N")
+            .await
+            .expect("skill");
+        fs::create_dir_all(skill_dir.join("references"))
+            .await
+            .expect("references");
+        fs::write(skill_dir.join("references/value.txt"), vec![b'a'; 32])
+            .await
+            .expect("resource N");
+        let store = SkillStore::new_with_snapshot_limits(
+            SkillStoreConfig {
+                skills_dir,
+                ..Default::default()
+            },
+            super::SkillSnapshotLimits {
+                max_file_bytes: 128,
+                max_skill_bytes: 512,
+                max_publication_bytes: 4096,
+                max_retained_bytes: 2048,
+            },
+        );
+        store.reload().await.expect("publish N");
+        let catalog_n = store.workflow_catalog_snapshot().await;
+        let ids = vec!["bounded-bytes".to_string()];
+        store
+            .pin_current_activation("bounded-active", &ids, None)
+            .await
+            .expect("pin N");
+        fs::write(skill_dir.join("references/value.txt"), vec![b'b'; 129])
+            .await
+            .expect("oversize resource");
+        let error = store.reload().await.expect_err("oversize reload rejected");
+        assert!(error.to_string().contains("per-file limit"));
+        assert_eq!(store.workflow_catalog_snapshot().await, catalog_n);
+        assert_eq!(
+            store
+                .get_pinned_skill_with_root("bounded-active", "bounded-bytes")
+                .await
+                .expect("old pin")
+                .0
+                .prompt,
+            "prompt N"
+        );
+
+        store.release_activation("bounded-active").await;
+        store
+            .pin_current_activation("bounded-lkg", &ids, None)
+            .await
+            .expect("new activation uses live LKG after failed reload");
+        assert_eq!(
+            store
+                .read_pinned_skill_resource(
+                    "bounded-lkg",
+                    "bounded-bytes",
+                    Path::new("references/value.txt"),
+                )
+                .await
+                .expect("LKG resource"),
+            vec![b'a'; 32]
+        );
+        store.release_activation("bounded-lkg").await;
+        fs::write(skill_dir.join("references/value.txt"), vec![b'c'; 32])
+            .await
+            .expect("bounded resource");
+        store.reload().await.expect("recovered publication");
+        store
+            .pin_current_activation("bounded-reused", &ids, None)
+            .await
+            .expect("released retained budget is reusable");
+    }
+
+    #[tokio::test]
+    async fn retained_distinct_generation_budget_rejects_new_pin_without_evicting_old() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = write_skill(&skills_dir, "generation-budget", "budget", "prompt N")
+            .await
+            .expect("skill N");
+        fs::create_dir_all(skill_dir.join("references"))
+            .await
+            .expect("references");
+        fs::write(skill_dir.join("references/value.txt"), vec![b'n'; 32])
+            .await
+            .expect("resource N");
+        let definition_n = serde_json::to_vec(&crate::SkillDefinition::new(
+            "generation-budget",
+            "generation-budget",
+            "budget",
+            "prompt N",
+        ))
+        .expect("definition N")
+        .len();
+        let definition_n1 = serde_json::to_vec(&crate::SkillDefinition::new(
+            "generation-budget",
+            "generation-budget",
+            "budget",
+            "prompt N+1",
+        ))
+        .expect("definition N+1")
+        .len();
+        let store = SkillStore::new_with_snapshot_limits(
+            SkillStoreConfig {
+                skills_dir,
+                ..Default::default()
+            },
+            super::SkillSnapshotLimits {
+                max_file_bytes: 256,
+                max_skill_bytes: 1024,
+                max_publication_bytes: 2048,
+                max_retained_bytes: definition_n + definition_n1 + 65,
+            },
+        );
+        store.reload().await.expect("publish N");
+        let ids = vec!["generation-budget".to_string()];
+        store
+            .pin_current_activation("active-n", &ids, None)
+            .await
+            .expect("pin N");
+        write_skill(
+            skill_dir.parent().expect("skills root"),
+            "generation-budget",
+            "budget",
+            "prompt N+1",
+        )
+        .await
+        .expect("skill N+1");
+        fs::write(skill_dir.join("references/value.txt"), vec![b'1'; 32])
+            .await
+            .expect("resource N+1");
+        store.reload().await.expect("publish N+1");
+        let catalog_n1 = store.workflow_catalog_snapshot().await;
+        let error = store
+            .pin_current_activation("new-n1", &ids, None)
+            .await
+            .expect_err("N and current N+1 fit, but pinning retained N+1 must exceed budget");
+        assert!(error.to_string().contains("budget"));
+        assert_eq!(store.workflow_catalog_snapshot().await, catalog_n1);
+        assert_eq!(
+            store
+                .read_pinned_skill_resource(
+                    "active-n",
+                    "generation-budget",
+                    Path::new("references/value.txt"),
+                )
+                .await
+                .expect("active N retained"),
+            vec![b'n'; 32]
+        );
+        store.release_activation("active-n").await;
+        store
+            .pin_current_activation("new-n1", &ids, None)
+            .await
+            .expect("release frees N generation budget");
+        assert_eq!(
+            store
+                .get_pinned_skill_with_root("new-n1", "generation-budget")
+                .await
+                .expect("N+1 pin")
+                .0
+                .prompt,
+            "prompt N+1"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_publications_share_one_global_retained_budget() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace_a = directory.path().join("workspace-a");
+        let workspace_b = directory.path().join("workspace-b");
+        for workspace in [&workspace_a, &workspace_b] {
+            let root = write_skill(
+                &workspace.join(".bamboo/skills"),
+                "publication-demo",
+                "publication",
+                "publication",
+            )
+            .await
+            .expect("workspace skill");
+            fs::create_dir_all(root.join("references"))
+                .await
+                .expect("references");
+            fs::write(root.join("references/value.bin"), vec![b'x'; 128])
+                .await
+                .expect("resource");
+        }
+        let store = SkillStore::new_with_snapshot_limits(
+            SkillStoreConfig {
+                skills_dir: directory.path().join("data/skills"),
+                ..Default::default()
+            },
+            super::SkillSnapshotLimits {
+                max_file_bytes: 256,
+                max_skill_bytes: 1024,
+                max_publication_bytes: 1024,
+                max_retained_bytes: 400,
+            },
+        );
+        store.reload().await.expect("empty root publication");
+        store
+            .skill_store_for_workspace(&workspace_a)
+            .await
+            .expect("first workspace publication fits");
+        let error = store
+            .skill_store_for_workspace(&workspace_b)
+            .await
+            .err()
+            .expect("second workspace publication must share the same budget");
+        assert!(error
+            .to_string()
+            .contains("global workflow snapshot budget"));
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_store_cache_is_globally_bounded() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        for index in 0..super::MAX_CACHED_WORKSPACE_STORES {
+            let workspace = directory.path().join(format!("workspace-{index}"));
+            fs::create_dir_all(&workspace).await.expect("workspace");
+            store
+                .skill_store_for_workspace(&workspace)
+                .await
+                .expect("bounded workspace store slot");
+        }
+        let overflow = directory.path().join("workspace-overflow");
+        fs::create_dir_all(&overflow)
+            .await
+            .expect("overflow workspace");
+        let error = store
+            .skill_store_for_workspace(&overflow)
+            .await
+            .err()
+            .expect("empty workspace stores must be capped");
+        assert!(error.to_string().contains("workspace store capacity"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_alias_cache_is_bounded_for_one_canonical_store() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("target");
+        fs::create_dir_all(&target).await.expect("target");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        store
+            .skill_store_for_workspace(&target)
+            .await
+            .expect("canonical target");
+        let initial_aliases = store.workspace_stores.read().await.len();
+        for index in 0..(super::MAX_CACHED_WORKSPACE_ALIASES - initial_aliases) {
+            let alias = directory.path().join(format!("alias-{index}"));
+            symlink(&target, &alias).expect("alias");
+            store
+                .skill_store_for_workspace(&alias)
+                .await
+                .expect("bounded alias slot");
+        }
+        let overflow = directory.path().join("alias-overflow");
+        symlink(&target, &overflow).expect("overflow alias");
+        let error = store
+            .skill_store_for_workspace(&overflow)
+            .await
+            .err()
+            .expect("aliases must be capped");
+        assert!(error.to_string().contains("workspace alias capacity"));
     }
 }
