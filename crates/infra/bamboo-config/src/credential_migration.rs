@@ -164,14 +164,19 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
     Ok(())
 }
 
-/// Serialize public credential mutations with provider/MCP exact
-/// transactions. Keeping `ensure -> load -> CAS` under this lock closes the
-/// window where a writer could pass the pending-manifest guard and commit a
-/// same-ref clear after the transaction's durable commit point.
+/// Serialize public credential access with provider/MCP exact transactions.
+/// Keeping `ensure -> load/decrypt` (and mutation CAS) under this lock closes
+/// windows where a reader could observe a transaction member with stale
+/// metadata or a writer could commit after the durable transaction point.
 pub(crate) fn with_provider_mcp_migration_lock<T>(
     data_dir: &Path,
     operation: impl FnOnce() -> ConfigStoreResult<T>,
 ) -> ConfigStoreResult<T> {
+    let data_dir = if data_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        data_dir
+    };
     std::fs::create_dir_all(data_dir)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -232,10 +237,10 @@ fn persist_provider_credential_transaction_inner(
     let (config_bytes, provider_bytes) = config
         .prepare_provider_transaction_documents(&providers_original)
         .map_err(|error| ConfigStoreError::Validation(error.to_string()))?;
-    if store.revision()? != prepared.expected_revision {
+    if store.revision_unchecked()? != prepared.expected_revision {
         return Err(ConfigStoreError::Conflict {
             expected: prepared.expected_revision,
-            actual: store.revision()?,
+            actual: store.revision_unchecked()?,
         });
     }
 
@@ -335,7 +340,7 @@ fn persist_provider_credential_transaction_inner(
             if file.name == CREDENTIALS_FILE {
                 return Err(ConfigStoreError::Conflict {
                     expected: file.expected_revision.unwrap_or(0),
-                    actual: store.revision()?,
+                    actual: store.revision_unchecked()?,
                 });
             }
             return Err(ConfigStoreError::Validation(format!(

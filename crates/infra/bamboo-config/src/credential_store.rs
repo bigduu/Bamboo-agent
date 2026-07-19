@@ -165,8 +165,7 @@ impl CredentialStore {
     }
 
     pub fn revision(&self) -> ConfigStoreResult<u64> {
-        self.ensure_transaction_ready()?;
-        self.revision_unchecked()
+        self.with_transaction_lock(|| self.revision_unchecked())
     }
 
     pub(crate) fn revision_unchecked(&self) -> ConfigStoreResult<u64> {
@@ -190,8 +189,7 @@ impl CredentialStore {
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<(CredentialStatus, CredentialStoreHealth)> {
-        self.ensure_transaction_ready()?;
-        self.status_with_health_unchecked(credential_ref)
+        self.with_transaction_lock(|| self.status_with_health_unchecked(credential_ref))
     }
 
     pub(crate) fn status_unchecked(
@@ -236,19 +234,20 @@ impl CredentialStore {
     pub fn statuses_with_health(
         &self,
     ) -> ConfigStoreResult<(Vec<CredentialStatus>, CredentialStoreHealth)> {
-        self.ensure_transaction_ready()?;
-        let (document, health) = self.load_document_with_health()?;
-        let statuses = document
-            .entries
-            .into_iter()
-            .map(|(credential_ref, entry)| CredentialStatus {
-                credential_ref,
-                configured: true,
-                source: entry.source,
-                updated_at: Some(entry.updated_at),
-            })
-            .collect();
-        Ok((statuses, health))
+        self.with_transaction_lock(|| {
+            let (document, health) = self.load_document_with_health()?;
+            let statuses = document
+                .entries
+                .into_iter()
+                .map(|(credential_ref, entry)| CredentialStatus {
+                    credential_ref,
+                    configured: true,
+                    source: entry.source,
+                    updated_at: Some(entry.updated_at),
+                })
+                .collect();
+            Ok((statuses, health))
+        })
     }
 
     pub fn replace(
@@ -258,9 +257,7 @@ impl CredentialStore {
         source: CredentialSource,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        let data_dir = self.path().parent().unwrap_or_else(|| Path::new("."));
-        crate::with_provider_mcp_migration_lock(data_dir, || {
-            self.ensure_transaction_ready()?;
+        self.with_transaction_lock(|| {
             self.replace_unchecked(credential_ref, secret, source, expected_revision)
         })
     }
@@ -311,11 +308,7 @@ impl CredentialStore {
         credential_ref: &CredentialRef,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        let data_dir = self.path().parent().unwrap_or_else(|| Path::new("."));
-        crate::with_provider_mcp_migration_lock(data_dir, || {
-            self.ensure_transaction_ready()?;
-            self.clear_unchecked(credential_ref, expected_revision)
-        })
+        self.with_transaction_lock(|| self.clear_unchecked(credential_ref, expected_revision))
     }
 
     pub(crate) fn clear_unchecked(
@@ -473,8 +466,7 @@ impl CredentialStore {
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<Option<SecretValue>> {
-        self.ensure_transaction_ready()?;
-        self.resolve_unchecked(credential_ref)
+        self.with_transaction_lock(|| self.resolve_unchecked(credential_ref))
     }
 
     pub(crate) fn resolve_unchecked(
@@ -742,8 +734,24 @@ impl CredentialStore {
     }
 
     fn ensure_transaction_ready(&self) -> ConfigStoreResult<()> {
-        let data_dir = self.path().parent().unwrap_or_else(|| Path::new("."));
-        crate::ensure_provider_mcp_migration_ready(data_dir)
+        crate::ensure_provider_mcp_migration_ready(self.data_dir())
+    }
+
+    fn data_dir(&self) -> &Path {
+        self.path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    fn with_transaction_lock<T>(
+        &self,
+        operation: impl FnOnce() -> ConfigStoreResult<T>,
+    ) -> ConfigStoreResult<T> {
+        crate::with_provider_mcp_migration_lock(self.data_dir(), || {
+            self.ensure_transaction_ready()?;
+            operation()
+        })
     }
 
     fn load_document_with_health(
@@ -854,6 +862,10 @@ pub fn credentials_path(data_dir: impl AsRef<Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -885,6 +897,111 @@ mod tests {
         assert_eq!(revision, 2);
         assert!(!status.configured);
         assert!(store.resolve(&reference).unwrap().is_none());
+    }
+
+    #[test]
+    fn public_resolve_and_status_wait_out_the_manifest_commit_window() {
+        let _key = crate::encryption::set_test_encryption_key([0x33; 32]);
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+        store
+            .replace(
+                reference.clone(),
+                "old-consistent-secret",
+                CredentialSource::User,
+                0,
+            )
+            .unwrap();
+
+        let migration_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join(".config-credential-migration.lock"))
+            .unwrap();
+        migration_lock.lock_exclusive().unwrap();
+        std::fs::write(
+            dir.path().join("config-credential-migration.json"),
+            b"manifest-commit-window",
+        )
+        .unwrap();
+        store
+            .replace_unchecked(
+                reference.clone(),
+                "new-transaction-secret",
+                CredentialSource::User,
+                1,
+            )
+            .unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resolve_result_tx, resolve_result_rx) = mpsc::channel();
+        let (status_result_tx, status_result_rx) = mpsc::channel();
+        let resolve_store = store.clone();
+        let resolve_ref = reference.clone();
+        let resolve_started = started_tx.clone();
+        let resolve_thread = std::thread::spawn(move || {
+            let _key = crate::encryption::set_test_encryption_key([0x33; 32]);
+            resolve_started.send(()).unwrap();
+            let result = resolve_store
+                .resolve(&resolve_ref)
+                .map(|value| value.map(|secret| secret.expose().to_string()));
+            resolve_result_tx.send(result).unwrap();
+        });
+        let status_store = store.clone();
+        let status_ref = reference.clone();
+        let status_thread = std::thread::spawn(move || {
+            let _key = crate::encryption::set_test_encryption_key([0x33; 32]);
+            started_tx.send(()).unwrap();
+            let result = status_store
+                .status_with_revision(&status_ref)
+                .map(|(revision, status)| (revision, status.configured));
+            status_result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        started_rx.recv().unwrap();
+        assert!(
+            resolve_result_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "resolve must not observe a transaction member while the manifest lock is held"
+        );
+        assert!(
+            status_result_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "status must not observe a transaction member while the manifest lock is held"
+        );
+
+        std::fs::remove_file(dir.path().join("config-credential-migration.json")).unwrap();
+        migration_lock.unlock().unwrap();
+        assert_eq!(
+            resolve_result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "new-transaction-secret",
+            "resolve must read only after the commit window closes"
+        );
+        assert_eq!(
+            status_result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            (2, true),
+            "status must pair the post-transaction revision and state"
+        );
+        resolve_thread.join().unwrap();
+        status_thread.join().unwrap();
+    }
+
+    #[test]
+    fn empty_credential_parent_normalizes_to_current_directory() {
+        let store = CredentialStore::open(Path::new(""));
+        assert_eq!(store.data_dir(), Path::new("."));
     }
 
     #[test]
