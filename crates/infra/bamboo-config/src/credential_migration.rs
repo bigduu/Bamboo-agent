@@ -2743,6 +2743,83 @@ mod tests {
     }
 
     #[test]
+    fn migration_rejects_shared_ref_with_different_legacy_secrets_without_writes() {
+        let _key = crate::encryption::set_test_encryption_key([0x89; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared_ref = "provider_instance.shared.api_key";
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "provider_instances": {
+                "first": {
+                    "provider_type": "openai",
+                    "api_key": "sk-first",
+                    "credential_ref": shared_ref
+                },
+                "second": {
+                    "provider_type": "anthropic",
+                    "api_key": "sk-second",
+                    "credential_ref": shared_ref
+                }
+            }
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
+
+        assert!(migrate_with_fault(dir.path(), MigrationFault::None).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn migration_deduplicates_shared_ref_with_the_same_legacy_secret() {
+        let _key = crate::encryption::set_test_encryption_key([0x8a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared_ref = CredentialRef::parse("provider_instance.shared.api_key").unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "provider_instances": {
+                    "first": {
+                        "provider_type": "openai",
+                        "api_key": "sk-same",
+                        "credential_ref": shared_ref.as_str()
+                    },
+                    "second": {
+                        "provider_type": "anthropic",
+                        "api_key": "sk-same",
+                        "credential_ref": shared_ref.as_str()
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(outcome.migrated_credentials, 1);
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&shared_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-same"
+        );
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        for id in ["first", "second"] {
+            assert!(root["provider_instances"][id].get("api_key").is_none());
+            assert_eq!(
+                root["provider_instances"][id]["credential_ref"],
+                shared_ref.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn backup_only_provider_instance_is_stored_before_backup_is_scrubbed() {
         let _key = crate::encryption::set_test_encryption_key([0x85; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -2970,6 +3047,88 @@ mod tests {
         let root: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
         assert!(root["provider_instances"].get("work").is_none());
+    }
+
+    #[test]
+    fn provider_instance_delete_preserves_a_ref_used_by_other_instances_and_mcp() {
+        let _key = crate::encryption::set_test_encryption_key([0x88; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared_ref = CredentialRef::parse("shared.provider.and.mcp.secret").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                shared_ref.clone(),
+                "sk-shared-survivor",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut current = crate::Config::default();
+        for id in ["delete-me", "keep-me"] {
+            let mut instance: crate::ProviderInstanceConfig = serde_json::from_value(
+                serde_json::json!({"provider_type": "openai", "model": "gpt-test"}),
+            )
+            .unwrap();
+            instance.credential_ref = Some(shared_ref.clone());
+            current.provider_instances.insert(id.to_string(), instance);
+        }
+        current
+            .mcp
+            .servers
+            .push(bamboo_domain::mcp_config::McpServerConfig {
+                id: "shared-stdio".to_string(),
+                name: None,
+                enabled: false,
+                transport: bamboo_domain::mcp_config::TransportConfig::Stdio(
+                    bamboo_domain::mcp_config::StdioConfig {
+                        command: "unused".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: Default::default(),
+                        env_encrypted: Default::default(),
+                        env_credential_refs: std::collections::HashMap::from([(
+                            "TOKEN".to_string(),
+                            shared_ref.as_str().to_string(),
+                        )]),
+                        startup_timeout_ms: 100,
+                    },
+                ),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: Default::default(),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
+            });
+        current.save_to_dir(dir.path().to_path_buf()).unwrap();
+
+        let mut candidate = current.clone();
+        candidate.provider_instances.remove("delete-me");
+        persist_provider_instance_credential_transaction(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            &BTreeSet::from(["delete-me".to_string()]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&shared_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-shared-survivor"
+        );
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert!(root["provider_instances"].get("delete-me").is_none());
+        assert_eq!(
+            root["provider_instances"]["keep-me"]["credential_ref"],
+            shared_ref.as_str()
+        );
+        assert_eq!(
+            root["mcpServers"]["shared-stdio"]["env_credential_refs"]["TOKEN"],
+            shared_ref.as_str()
+        );
     }
 
     #[test]

@@ -350,6 +350,7 @@ impl CredentialStore {
             target: PlannedProviderTarget,
             reference: CredentialRef,
             secret: Option<String>,
+            removes_candidate_consumer: bool,
         }
 
         enum PlannedProviderTarget {
@@ -368,6 +369,8 @@ impl CredentialStore {
                         .then(|| provider.api_key.trim().to_string());
                         updates.push(PlannedUpdate {
                             target: PlannedProviderTarget::BuiltIn($name),
+                            removes_candidate_consumer: provider.credential_ref.as_ref()
+                                == Some(&reference),
                             reference,
                             secret,
                         });
@@ -380,9 +383,12 @@ impl CredentialStore {
         plan_env!("gemini", gemini);
         if provider_intents.contains("bodhi") {
             if let Some(provider) = config.providers.bodhi.as_ref() {
+                let reference = credential_ref("provider", "bodhi", "api_key")?;
                 updates.push(PlannedUpdate {
                     target: PlannedProviderTarget::BuiltIn("bodhi"),
-                    reference: credential_ref("provider", "bodhi", "api_key")?,
+                    removes_candidate_consumer: provider.credential_ref.as_ref()
+                        == Some(&reference),
+                    reference,
                     secret: (!provider.api_key.trim().is_empty())
                         .then(|| provider.api_key.trim().to_string()),
                 });
@@ -400,6 +406,9 @@ impl CredentialStore {
                 .map(|instance| instance.api_key.trim().to_string());
             updates.push(PlannedUpdate {
                 target: PlannedProviderTarget::Instance(instance_id.clone()),
+                removes_candidate_consumer: instance
+                    .and_then(|instance| instance.credential_ref.as_ref())
+                    == Some(&reference),
                 reference,
                 secret,
             });
@@ -409,14 +418,43 @@ impl CredentialStore {
             return Ok(None);
         }
 
+        let candidate_ref_counts = config_credential_ref_counts(config)?;
+        let mut removed_consumer_counts = BTreeMap::<CredentialRef, usize>::new();
+        let mut secrets_by_ref = BTreeMap::<CredentialRef, String>::new();
+        for update in &updates {
+            if let Some(secret) = update.secret.as_ref() {
+                match secrets_by_ref.get(&update.reference) {
+                    Some(existing) if existing != secret => {
+                        return Err(ConfigStoreError::Validation(
+                            "provider updates assign conflicting values to one credential reference"
+                                .to_string(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        secrets_by_ref.insert(update.reference.clone(), secret.clone());
+                    }
+                }
+            } else if update.removes_candidate_consumer {
+                *removed_consumer_counts
+                    .entry(update.reference.clone())
+                    .or_default() += 1;
+            }
+        }
         let touched_refs = updates
             .iter()
             .map(|update| update.reference.clone())
-            .collect::<Vec<_>>();
-        let required_refs = updates
+            .collect::<BTreeSet<_>>();
+        let retained_after_update = |reference: &CredentialRef| {
+            candidate_ref_counts.get(reference).copied().unwrap_or(0)
+                > removed_consumer_counts.get(reference).copied().unwrap_or(0)
+        };
+        let required_refs = touched_refs
             .iter()
-            .filter(|update| update.secret.is_some())
-            .map(|update| update.reference.clone())
+            .filter(|reference| {
+                secrets_by_ref.contains_key(*reference) || retained_after_update(reference)
+            })
+            .cloned()
             .collect::<Vec<_>>();
 
         let (mut document, health) = self.load_document_with_health()?;
@@ -426,14 +464,14 @@ impl CredentialStore {
             ));
         }
         let mut changed = false;
-        for update in &updates {
-            match update.secret.as_deref() {
+        for reference in &touched_refs {
+            match secrets_by_ref.get(reference).map(String::as_str) {
                 Some(secret) => {
                     let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
                         ConfigStoreError::Validation("credential encryption failed".to_string())
                     })?;
                     document.entries.insert(
-                        update.reference.clone(),
+                        reference.clone(),
                         CredentialEntry {
                             ciphertext,
                             source: CredentialSource::User,
@@ -444,9 +482,10 @@ impl CredentialStore {
                     );
                     changed = true;
                 }
-                None => {
-                    changed |= document.entries.remove(&update.reference).is_some();
+                None if !retained_after_update(reference) => {
+                    changed |= document.entries.remove(reference).is_some();
                 }
+                None => {}
             }
         }
         macro_rules! publish_ref {
@@ -476,6 +515,7 @@ impl CredentialStore {
             }
         }
         validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(&document, &required_refs)?;
         let revision = if changed {
             health.revision.checked_add(1).ok_or_else(|| {
                 ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
@@ -491,7 +531,7 @@ impl CredentialStore {
         Ok(Some(PreparedProviderCredentialUpdate {
             bytes,
             expected_revision: health.revision,
-            touched_refs,
+            touched_refs: touched_refs.into_iter().collect(),
             required_refs,
         }))
     }
@@ -528,6 +568,27 @@ impl CredentialStore {
         &self,
         secrets: Vec<(CredentialRef, String, u64)>,
     ) -> ConfigStoreResult<PreparedCredentialMigration> {
+        let mut unique_secrets = BTreeMap::<CredentialRef, (String, u64)>::new();
+        for (credential_ref, secret, input_generation) in secrets {
+            if secret.trim().is_empty() || crate::patch::is_masked_api_key(&secret) {
+                return Err(ConfigStoreError::Validation(
+                    "legacy credential value is invalid".to_string(),
+                ));
+            }
+            match unique_secrets.get_mut(&credential_ref) {
+                Some((existing, generation)) if existing == &secret => {
+                    *generation = (*generation).max(input_generation);
+                }
+                Some(_) => {
+                    return Err(ConfigStoreError::Validation(
+                        "conflicting legacy credentials share a credential reference".to_string(),
+                    ));
+                }
+                None => {
+                    unique_secrets.insert(credential_ref, (secret, input_generation));
+                }
+            }
+        }
         let (mut document, health) = self.load_document_with_health()?;
         if health.status == SectionStatus::Degraded {
             return Err(ConfigStoreError::Validation(
@@ -536,12 +597,7 @@ impl CredentialStore {
         }
         let mut added = 0;
         let mut changed = false;
-        for (credential_ref, secret, input_generation) in secrets {
-            if secret.trim().is_empty() || crate::patch::is_masked_api_key(&secret) {
-                return Err(ConfigStoreError::Validation(
-                    "legacy credential value is invalid".to_string(),
-                ));
-            }
+        for (credential_ref, (secret, input_generation)) in unique_secrets {
             // An old binary can rewrite an already-migrated sidecar in the
             // unversioned shape. Its nominal generation is one again, so the
             // secret value itself decides whether this is a no-op or a newer
@@ -819,6 +875,64 @@ impl CredentialStore {
             ),
         })
     }
+}
+
+fn config_credential_ref_counts(
+    config: &crate::Config,
+) -> ConfigStoreResult<BTreeMap<CredentialRef, usize>> {
+    let mut counts = BTreeMap::<CredentialRef, usize>::new();
+    let mut add = |reference: &CredentialRef| {
+        *counts.entry(reference.clone()).or_default() += 1;
+    };
+    macro_rules! add_provider {
+        ($field:ident) => {
+            if let Some(reference) = config
+                .providers
+                .$field
+                .as_ref()
+                .and_then(|provider| provider.credential_ref.as_ref())
+            {
+                add(reference);
+            }
+        };
+    }
+    add_provider!(openai);
+    add_provider!(anthropic);
+    add_provider!(gemini);
+    add_provider!(bodhi);
+    for instance in config.provider_instances.values() {
+        if let Some(reference) = instance.credential_ref.as_ref() {
+            add(reference);
+        }
+    }
+    for server in &config.mcp.servers {
+        match &server.transport {
+            bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
+                for raw_reference in stdio.env_credential_refs.values() {
+                    add(&CredentialRef::parse(raw_reference.clone())?);
+                }
+            }
+            bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
+                for raw_reference in config
+                    .headers
+                    .iter()
+                    .filter_map(|header| header.credential_ref.as_ref())
+                {
+                    add(&CredentialRef::parse(raw_reference.clone())?);
+                }
+            }
+            bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {
+                for raw_reference in config
+                    .headers
+                    .iter()
+                    .filter_map(|header| header.credential_ref.as_ref())
+                {
+                    add(&CredentialRef::parse(raw_reference.clone())?);
+                }
+            }
+        }
+    }
+    Ok(counts)
 }
 
 fn parse_credential_ref_list(values: &[String]) -> ConfigStoreResult<Vec<CredentialRef>> {
