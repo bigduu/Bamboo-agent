@@ -3696,7 +3696,10 @@ impl Config {
                 if schema_version != 1 || !envelope.contains_key("data") {
                     anyhow::bail!("provider revision envelope is unsupported");
                 }
-                envelope.insert("revision".into(), Value::from(revision.saturating_add(1)));
+                let revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("provider revision counter exhausted"))?;
+                envelope.insert("revision".into(), Value::from(revision));
                 envelope.insert("data".into(), serde_json::to_value(providers)?);
                 Value::Object(envelope)
             }

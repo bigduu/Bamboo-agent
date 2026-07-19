@@ -44,6 +44,11 @@ struct MigrationManifest {
     stage_dir: String,
     state: MigrationState,
     files: Vec<StagedFile>,
+    /// A credential write that linearized after an exact provider transaction
+    /// commit remains authoritative. Recovery then owns only the two metadata
+    /// documents and must never replay its older staged credential bytes.
+    #[serde(default)]
+    credential_superseded: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +117,7 @@ enum MigrationFault {
     AfterRebaseStageWrite,
     AfterRebaseManifest,
     BeforeExactCommitCredentialRace,
+    AfterExactCommitCredentialRace,
 }
 
 /// Extract provider/MCP sidecar secrets into the isolated credential store.
@@ -262,6 +268,7 @@ fn persist_provider_credential_transaction_inner(
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
         files: staged,
+        credential_superseded: false,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
 
@@ -295,6 +302,16 @@ fn persist_provider_credential_transaction_inner(
         }
     }
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterExactCommitCredentialRace) {
+        let reference = credential_ref("provider", "openai", "api_key")?;
+        store.replace_unchecked(
+            reference,
+            "concurrent-post-commit-winner",
+            crate::CredentialSource::User,
+            prepared.expected_revision,
+        )?;
+    }
     #[cfg(test)]
     if fault == Some(MigrationFault::AfterManifest) {
         return Err(injected_fault());
@@ -408,6 +425,7 @@ fn migrate_inner(
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
         files: staged,
+        credential_superseded: false,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
     #[cfg(test)]
@@ -470,15 +488,14 @@ fn plan_provider_section(
     minimum_generation: u64,
 ) -> ConfigStoreResult<Option<PlannedSection>> {
     let path = data_dir.join(PROVIDERS_FILE);
-    let Ok(original) = std::fs::read(&path) else {
-        return Ok(None);
+    let original = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
     let mut root: Value = serde_json::from_slice(&original)?;
     let (data, revision) = section_data_mut(&mut root)?;
-    let migration_generation = revision
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(minimum_generation);
+    let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
     let object = data.as_object_mut().ok_or_else(|| {
         ConfigStoreError::Validation("provider section must be an object".to_string())
     })?;
@@ -531,15 +548,14 @@ fn plan_mcp_section(
     minimum_generation: u64,
 ) -> ConfigStoreResult<Option<PlannedSection>> {
     let path = data_dir.join(MCP_FILE);
-    let Ok(original) = std::fs::read(&path) else {
-        return Ok(None);
+    let original = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
     let mut root: Value = serde_json::from_slice(&original)?;
     let (data, revision) = section_data_mut(&mut root)?;
-    let migration_generation = revision
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(minimum_generation);
+    let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
     let mut changed = false;
     if let Some(servers) = data.get_mut("servers").and_then(Value::as_array_mut) {
         for server in servers {
@@ -944,10 +960,15 @@ fn install_pending(
                     .write_bytes_if_hash_with_backup(expected, &staged)?
                 {
                     if file.name == CREDENTIALS_FILE {
-                        return Err(ConfigStoreError::Conflict {
-                            expected: file.expected_revision.unwrap_or(0),
-                            actual: CredentialStore::open(data_dir).revision_unchecked()?,
-                        });
+                        let actual = CredentialStore::validate_document_bytes(&current)?;
+                        let expected = file.expected_revision.unwrap_or(0);
+                        if actual > expected {
+                            manifest.files.remove(file_index);
+                            manifest.credential_superseded = true;
+                            write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
+                            continue;
+                        }
+                        return Err(ConfigStoreError::Conflict { expected, actual });
                     }
                     return Err(ConfigStoreError::Validation(format!(
                         "{} changed during committed transaction",
@@ -1017,10 +1038,8 @@ fn rebase_changed_section(
 ) -> ConfigStoreResult<bool> {
     let name = manifest.files[file_index].name.clone();
     let mut extracted = Vec::new();
-    let minimum_generation = manifest.files[file_index]
-        .migration_generation
-        .unwrap_or(0)
-        .saturating_add(1);
+    let minimum_generation =
+        next_revision(manifest.files[file_index].migration_generation.unwrap_or(0))?;
     let section = match name.as_str() {
         PROVIDERS_FILE => plan_provider_section(data_dir, &mut extracted, minimum_generation)?,
         MCP_FILE => plan_mcp_section(data_dir, &mut extracted, minimum_generation)?,
@@ -1077,13 +1096,9 @@ fn cleanup_transaction_dirs(
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<()> {
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
-    if stage_dir.exists() {
-        std::fs::remove_dir_all(stage_dir)?;
-    }
+    remove_managed_directory_if_exists(&stage_dir)?;
     let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{}", manifest.transaction_id));
-    if backup_dir.exists() {
-        std::fs::remove_dir_all(backup_dir)?;
-    }
+    remove_managed_directory_if_exists(&backup_dir)?;
     sync_dir(data_dir)?;
     Ok(())
 }
@@ -1096,13 +1111,9 @@ fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
     let journal: MigrationManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&journal)?;
     let stage_dir = validated_stage_dir(data_dir, &journal.stage_dir)?;
-    if stage_dir.exists() {
-        std::fs::remove_dir_all(stage_dir)?;
-    }
+    remove_managed_directory_if_exists(&stage_dir)?;
     let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{}", journal.transaction_id));
-    if backup_dir.exists() {
-        std::fs::remove_dir_all(backup_dir)?;
-    }
+    remove_managed_directory_if_exists(&backup_dir)?;
     remove_file_if_exists(&journal_path)?;
     sync_dir(data_dir)
 }
@@ -1184,13 +1195,18 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         .files
         .iter()
         .any(|file| file.install_mode == InstallMode::Exact);
+    let exact_members_valid = (manifest.files.len() == 3
+        && !manifest.credential_superseded
+        && unique.contains(CREDENTIALS_FILE))
+        || (manifest.files.len() == 2
+            && manifest.credential_superseded
+            && !unique.contains(CREDENTIALS_FILE));
     let exact_shape_valid = !exact_transaction
-        || (manifest.files.len() == 3
+        || (exact_members_valid
             && manifest
                 .files
                 .iter()
                 .all(|file| file.install_mode == InstallMode::Exact)
-            && unique.contains(CREDENTIALS_FILE)
             && unique.contains(PROVIDERS_FILE)
             && unique.contains(CONFIG_FILE)
             && manifest.files.iter().all(|file| {
@@ -1203,7 +1219,8 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         || manifest.stage_dir != expected_stage
         || manifest.files.is_empty()
         || unique.len() != manifest.files.len()
-        || credential_count != 1
+        || credential_count != usize::from(!manifest.credential_superseded)
+        || (manifest.credential_superseded && !exact_transaction)
         || !exact_shape_valid
         || manifest.files.iter().any(|file| {
             !matches!(
@@ -1257,7 +1274,37 @@ fn validated_stage_dir(data_dir: &Path, name: &str) -> ConfigStoreResult<PathBuf
             "credential migration stage path is invalid".to_string(),
         ));
     }
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
+            return Err(ConfigStoreError::Validation(
+                "credential migration stage path is invalid".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(path)
+}
+
+fn remove_managed_directory_if_exists(path: &Path) -> ConfigStoreResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(ConfigStoreError::Validation(
+            "credential migration directory is invalid".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn next_revision(revision: u64) -> ConfigStoreResult<u64> {
+    revision.checked_add(1).ok_or_else(|| {
+        ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+    })
 }
 
 fn remove_file_if_exists(path: &Path) -> ConfigStoreResult<()> {
@@ -1614,6 +1661,131 @@ mod tests {
     }
 
     #[test]
+    fn non_not_found_provider_and_mcp_read_errors_fail_closed() {
+        let _key = crate::encryption::set_test_encryption_key([0x74; 32]);
+        for target in [PROVIDERS_FILE, MCP_FILE] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(target)).unwrap();
+
+            let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+            assert!(matches!(error, ConfigStoreError::Io(_)));
+            assert!(!dir.path().join(MANIFEST_FILE).exists());
+            assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn migration_rejects_exhausted_section_and_credential_revisions() {
+        let _key = crate::encryption::set_test_encryption_key([0x75; 32]);
+
+        let section_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            section_dir.path().join(PROVIDERS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": u64::MAX,
+                "data": {"openai": {"api_key": "sk-overflow"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = migrate_with_fault(section_dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("revision counter exhausted"));
+        assert!(!section_dir.path().join(MANIFEST_FILE).exists());
+        assert!(
+            std::fs::read_to_string(section_dir.path().join(PROVIDERS_FILE))
+                .unwrap()
+                .contains("sk-overflow")
+        );
+
+        let credential_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            credential_dir.path().join(PROVIDERS_FILE),
+            br#"{"openai":{"api_key":"sk-credential-overflow"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            credential_dir.path().join(CREDENTIALS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": u64::MAX,
+                "data": {"entries": {}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = migrate_with_fault(credential_dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("revision counter exhausted"));
+        assert!(!credential_dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn exhausted_credential_revision_allows_secret_free_cleanup_when_user_value_wins() {
+        let _key = crate::encryption::set_test_encryption_key([0x78; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+        store
+            .replace(
+                reference.clone(),
+                "user-authoritative",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut credentials: Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        credentials["revision"] = Value::from(u64::MAX);
+        std::fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&credentials).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            br#"{"openai":{"api_key":"stale-legacy","model":"kept"}}"#,
+        )
+        .unwrap();
+
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+
+        assert_eq!(store.revision().unwrap(), u64::MAX);
+        assert_eq!(
+            store.resolve(&reference).unwrap().unwrap().expose(),
+            "user-authoritative"
+        );
+        let providers = std::fs::read_to_string(dir.path().join(PROVIDERS_FILE)).unwrap();
+        assert!(!providers.contains("stale-legacy"));
+        assert!(providers.contains("credential_ref"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_manifest_rejects_a_symlinked_stage_directory() {
+        use std::os::unix::fs::symlink;
+
+        let _key = crate::encryption::set_test_encryption_key([0x76; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        install_fixture(dir.path());
+        assert!(migrate_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        let stage = dir.path().join(&manifest.stage_dir);
+        std::fs::remove_dir_all(&stage).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("must-survive"), b"sentinel").unwrap();
+        symlink(external.path(), &stage).unwrap();
+
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("stage path is invalid"));
+        assert_eq!(
+            std::fs::read(external.path().join("must-survive")).unwrap(),
+            b"sentinel"
+        );
+    }
+
+    #[test]
     fn crashes_at_every_post_manifest_durable_boundary_resume_before_reads() {
         for fault in [
             MigrationFault::AfterManifest,
@@ -1813,6 +1985,7 @@ mod tests {
             stage_dir: format!("{STAGE_PREFIX}{transaction_id}/../../outside"),
             state: MigrationState::Pending,
             files: vec![file.clone()],
+            credential_superseded: false,
         };
         assert!(validate_manifest(&traversal).is_err());
 
@@ -1822,6 +1995,7 @@ mod tests {
             stage_dir: format!("{STAGE_PREFIX}{transaction_id}"),
             state: MigrationState::Pending,
             files: vec![file.clone(), file],
+            credential_superseded: false,
         };
         assert!(validate_manifest(&duplicate).is_err());
     }
@@ -1953,6 +2127,79 @@ mod tests {
             "concurrent-winner"
         );
         migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+    }
+
+    #[test]
+    fn provider_transaction_keeps_a_post_commit_credential_winner_and_finishes_metadata() {
+        let _key = crate::encryption::set_test_encryption_key([0x79; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let (mut candidate, intents) = provider_transaction_candidate("sk-transaction-loser");
+
+        persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterExactCommitCredentialRace),
+        )
+        .unwrap();
+
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-post-commit-winner"
+        );
+        let loaded = crate::Config::from_data_dir(Some(dir.path().to_path_buf()));
+        let provider = loaded.providers.openai.as_ref().unwrap();
+        assert_eq!(provider.model.as_deref(), Some("transaction-model"));
+        assert_eq!(provider.credential_ref.as_ref(), Some(&reference));
+    }
+
+    #[test]
+    fn provider_transaction_rejects_exhausted_provider_revision_before_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0x77; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let provider_path = dir.path().join(PROVIDERS_FILE);
+        let provider_data: Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        std::fs::write(
+            &provider_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": u64::MAX,
+                "data": provider_data
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let providers_before = std::fs::read(&provider_path).unwrap();
+        let config_before = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+        let (mut candidate, intents) = provider_transaction_candidate("sk-overflow");
+
+        let error = persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::None),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("revision counter exhausted"));
+        assert_eq!(std::fs::read(&provider_path).unwrap(), providers_before);
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            config_before
+        );
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
     }
 
     fn assert_migrated_except_provider_value(dir: &Path) {

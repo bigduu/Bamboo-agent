@@ -138,6 +138,7 @@ pub(crate) struct PreparedProviderCredentialUpdate {
 #[derive(Debug, Deserialize)]
 struct PreparedCredentialEnvelope {
     schema_version: u32,
+    revision: u64,
     data: CredentialDocument,
 }
 
@@ -422,7 +423,13 @@ impl CredentialStore {
         publish_ref!("gemini", gemini);
         publish_ref!("bodhi", bodhi);
         validate_document(&document).map_err(ConfigStoreError::Validation)?;
-        let revision = health.revision.saturating_add(u64::from(changed));
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": CREDENTIAL_SCHEMA_VERSION,
             "revision": revision,
@@ -474,6 +481,7 @@ impl CredentialStore {
             ));
         }
         let mut added = 0;
+        let mut changed = false;
         for (credential_ref, secret, input_generation) in secrets {
             if secret.trim().is_empty() || crate::patch::is_masked_api_key(&secret) {
                 return Err(ConfigStoreError::Validation(
@@ -495,7 +503,16 @@ impl CredentialStore {
                     if existing == secret {
                         continue;
                     }
-                    input_generation.max(entry.migration_generation.unwrap_or(0).saturating_add(1))
+                    let next_generation = entry
+                        .migration_generation
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            ConfigStoreError::Validation(
+                                "credential migration generation counter exhausted".to_string(),
+                            )
+                        })?;
+                    input_generation.max(next_generation)
                 }
                 None => input_generation,
             };
@@ -516,11 +533,19 @@ impl CredentialStore {
                 )
                 .is_none();
             added += usize::from(was_new);
+            changed = true;
         }
         validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": CREDENTIAL_SCHEMA_VERSION,
-            "revision": health.revision.saturating_add(1),
+            "revision": revision,
             "data": document,
         }))?;
         Ok(PreparedCredentialMigration { bytes, added })
@@ -583,6 +608,17 @@ impl CredentialStore {
         Err(ConfigStoreError::Validation(
             "credential migration could not obtain a stable revision".to_string(),
         ))
+    }
+
+    pub(crate) fn validate_document_bytes(bytes: &[u8]) -> ConfigStoreResult<u64> {
+        let document: PreparedCredentialEnvelope = serde_json::from_slice(bytes)?;
+        if document.schema_version != CREDENTIAL_SCHEMA_VERSION {
+            return Err(ConfigStoreError::Validation(
+                "credential document has an unsupported schema".to_string(),
+            ));
+        }
+        validate_document(&document.data).map_err(ConfigStoreError::Validation)?;
+        Ok(document.revision)
     }
 
     fn load_document(&self) -> ConfigStoreResult<CredentialDocument> {
