@@ -742,13 +742,14 @@ impl AppState {
             })
         };
 
-        let (config_watcher, config_live_health) =
+        let (config_watcher, config_live_health, mcp_config_live_health) =
             super::config_runtime::ConfigWatcherRuntime::start(
                 bamboo_home_dir.clone(),
                 config.clone(),
                 config_io_lock.clone(),
                 provider_registry.clone(),
                 provider_lock.clone(),
+                mcp_manager.clone(),
                 account_sink.clone(),
             );
         let credential_store = Arc::new(bamboo_config::CredentialStore::open(&bamboo_home_dir));
@@ -758,6 +759,7 @@ impl AppState {
             config,
             config_io_lock,
             config_live_health,
+            mcp_config_live_health,
             config_watcher,
             credential_store,
             fabric_deployer,

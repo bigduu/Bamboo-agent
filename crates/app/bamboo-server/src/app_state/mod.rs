@@ -176,6 +176,9 @@ pub struct AppState {
     /// Server-owned live configuration watcher and its health envelope.
     /// The runtime handle keeps the directory watcher tasks alive.
     pub config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
+    /// MCP section health is independent from provider health so an invalid or
+    /// degraded MCP candidate cannot make unrelated sections appear unhealthy.
+    pub mcp_config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
     #[allow(dead_code)]
     config_watcher: config_runtime::ConfigWatcherRuntime,
 

@@ -165,6 +165,16 @@ Watching legacy `config.json` is intentionally deferred because applying its ful
 projection without provider/MCP/notification/cluster side effects would create a
 split runtime.
 
+The same server-owned watcher now applies the shared `AtomicJsonStore` revisioned
+`mcp.json` envelope, including a sidecar already present at process start. It
+parses and validates the complete candidate, stages every added or changed MCP
+client through connect, initialize and tool discovery, and only then replaces
+runtime-map/tool-index entries and the effective MCP snapshot. A failure discards
+all staged clients, leaves working runtimes and tool aliases intact, keeps the
+last-known-good revision, marks MCP health degraded and publishes
+`config.invalid`; repair publishes `config.recovered`. Directory debouncing and
+missing-file retries cover editor temp-write/rename bursts.
+
 Credential metadata/status/replace/clear HTTP adapters now use the encrypted store
 with expected-revision CAS. Responses contain only status metadata and health;
 conflicts return HTTP 409. Successful mutations publish `config.changed` through

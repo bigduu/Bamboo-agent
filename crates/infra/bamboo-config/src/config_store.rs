@@ -338,7 +338,10 @@ where
         }
     }
 
-    fn load_validated_for_reload<F>(
+    /// Load a candidate for an already-live section. External edits that reuse
+    /// or move backwards from the current revision are durably normalized to a
+    /// fresh monotonic revision before the candidate is returned.
+    pub fn load_validated_for_reload<F>(
         &self,
         current_revision: u64,
         current_data: &T,

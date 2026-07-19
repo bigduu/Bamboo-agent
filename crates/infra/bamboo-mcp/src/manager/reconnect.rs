@@ -164,7 +164,7 @@ impl McpServerManager {
         // an immediate `tools/list_changed` refreshes against the NEW connection
         // (not the old, disconnected one). (#420)
         if let Some(rx) = notification_rx {
-            self.spawn_notification_drain(server_id.clone(), rx);
+            self.spawn_notification_drain(server_id.clone(), runtime.clone(), rx);
         }
 
         // Update tools

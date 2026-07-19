@@ -533,6 +533,60 @@ fn insert_mock_runtime(
 }
 
 #[tokio::test]
+async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_index() {
+    let manager = McpServerManager::new();
+    let transport = NotifyingMockTransport::new(&[], &[]);
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect old mock runtime");
+    let old = insert_mock_runtime(&manager, "stable", client);
+    let old_tool = McpTool {
+        name: "still_available".to_string(),
+        description: "old runtime marker".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    };
+    manager
+        .index
+        .register_server_tools("stable", &[old_tool], &[], &[]);
+    let alias = manager.index.generate_alias("stable", "still_available");
+
+    let mut replacement = create_test_server_config("stable");
+    replacement.transport = TransportConfig::Stdio(StdioConfig {
+        command: "definitely-not-a-real-mcp-command-597".to_string(),
+        args: vec![],
+        cwd: None,
+        env: std::collections::HashMap::new(),
+        env_encrypted: std::collections::HashMap::new(),
+        startup_timeout_ms: 100,
+    });
+    let candidate = McpConfig {
+        version: 1,
+        servers: vec![replacement],
+    };
+
+    let error = manager
+        .reconcile_from_config_transactional(&candidate)
+        .await
+        .expect_err("replacement bootstrap must fail");
+    assert!(!error.to_string().is_empty());
+    let live = manager
+        .runtimes
+        .get("stable")
+        .expect("old runtime remains published")
+        .clone();
+    assert!(Arc::ptr_eq(&live, &old));
+    assert!(manager.index.contains(&alias));
+    assert_eq!(
+        manager.index.lookup(&alias).unwrap().original_name,
+        "still_available"
+    );
+    assert_eq!(
+        old.info.read().await.status,
+        ServerStatus::Ready,
+        "failed candidate must not stop or degrade the old runtime"
+    );
+}
+
+#[tokio::test]
 async fn tools_list_changed_notification_triggers_refresh() {
     // #366 headline capability: a server-initiated `tools/list_changed` reaches the
     // drain consumer and triggers a real tool-list refresh (re-registering the
@@ -560,7 +614,7 @@ async fn tools_list_changed_notification_triggers_refresh() {
         .take_notification_receiver()
         .await
         .expect("notification receiver available exactly once");
-    manager.spawn_notification_drain("srv".to_string(), rx);
+    manager.spawn_notification_drain("srv".to_string(), runtime.clone(), rx);
 
     // The drain observes the notification -> refresh_tools -> ToolsChanged.
     let evt = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
@@ -605,7 +659,7 @@ async fn unhandled_notification_is_drained_without_refresh() {
         .take_notification_receiver()
         .await
         .expect("notification receiver available");
-    manager.spawn_notification_drain("srv".to_string(), rx);
+    manager.spawn_notification_drain("srv".to_string(), runtime.clone(), rx);
 
     // No dispatcher for `notifications/message` -> no ToolsChanged emitted.
     let got = tokio::time::timeout(Duration::from_millis(300), event_rx.recv()).await;

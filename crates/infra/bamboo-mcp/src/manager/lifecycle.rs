@@ -13,6 +13,11 @@ const TOOLS_LIST_CHANGED_METHODS: [&str; 2] =
 impl McpServerManager {
     /// Start a new MCP server connection.
     pub async fn start_server(&self, config: McpServerConfig) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().await;
+        self.start_server_unlocked(config).await
+    }
+
+    pub(super) async fn start_server_unlocked(&self, config: McpServerConfig) -> Result<()> {
         let server_id = config.id.clone();
 
         if self.runtimes.contains_key(&server_id) {
@@ -21,14 +26,26 @@ impl McpServerManager {
 
         info!("Starting MCP server '{}'", server_id);
 
+        let prepared = self.prepare_server_runtime(config, "start").await?;
+        debug_assert_eq!(prepared.runtime.config.id, server_id);
+        let replaced = self.install_prepared_runtime(prepared).await;
+        debug_assert!(replaced.is_none());
+
+        Ok(())
+    }
+
+    pub(super) async fn prepare_server_runtime(
+        &self,
+        config: McpServerConfig,
+        phase: &'static str,
+    ) -> Result<PreparedServerRuntime> {
+        let server_id = config.id.clone();
         let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
         let (client, tools, instructions, notification_rx) = self
-            .bootstrap_server_client(&server_id, &config, "start")
+            .bootstrap_server_client(&server_id, &config, phase)
             .await?;
-
-        // Create runtime
         let runtime = Arc::new(ServerRuntime {
-            config: config.clone(),
+            config,
             client: RwLock::new(client),
             info: RwLock::new(RuntimeInfo {
                 status: ServerStatus::Ready,
@@ -46,8 +63,29 @@ impl McpServerManager {
             qos: McpServerQos::new(McpQosConfig::default()),
             proxy_fingerprint: runtime_proxy_fingerprint,
         });
+        Ok(PreparedServerRuntime {
+            runtime,
+            tools,
+            notification_rx,
+        })
+    }
 
-        // Register tools in index
+    /// Publish a fully initialized runtime. No fallible initialization remains
+    /// in this method, so callers can stage all candidates before committing.
+    pub(super) async fn install_prepared_runtime(
+        &self,
+        prepared: PreparedServerRuntime,
+    ) -> Option<Arc<ServerRuntime>> {
+        let PreparedServerRuntime {
+            runtime,
+            tools,
+            notification_rx,
+        } = prepared;
+        let config = &runtime.config;
+        let server_id = config.id.clone();
+        let healthcheck_interval_ms = config.healthcheck_interval_ms;
+
+        self.index.remove_server_tools(&server_id);
         let aliases = self.index.register_server_tools(
             &server_id,
             &tools,
@@ -61,14 +99,14 @@ impl McpServerManager {
             server_id
         );
 
-        // Store runtime
-        self.runtimes.insert(server_id.clone(), runtime.clone());
+        // Store runtime only after its client initialized and tools were read.
+        let replaced = self.runtimes.insert(server_id.clone(), runtime.clone());
 
         // Spawn the notification drain only AFTER the runtime is registered, so an
         // immediate `tools/list_changed` resolves via `refresh_tools` instead of
         // racing `ServerNotFound`. (#420)
         if let Some(rx) = notification_rx {
-            self.spawn_notification_drain(server_id.clone(), rx);
+            self.spawn_notification_drain(server_id.clone(), runtime.clone(), rx);
         }
 
         // Emit event
@@ -91,13 +129,17 @@ impl McpServerManager {
         }
 
         // Start health check task
-        self.start_health_check(runtime, config.healthcheck_interval_ms);
-
-        Ok(())
+        self.start_health_check(runtime, healthcheck_interval_ms);
+        replaced
     }
 
     /// Stop an MCP server connection.
     pub async fn stop_server(&self, server_id: &str) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().await;
+        self.stop_server_unlocked(server_id).await
+    }
+
+    pub(super) async fn stop_server_unlocked(&self, server_id: &str) -> Result<()> {
         let (_, runtime) = self
             .runtimes
             .remove(server_id)
@@ -134,6 +176,27 @@ impl McpServerManager {
 
         info!("MCP server '{}' stopped", server_id);
         Ok(())
+    }
+
+    /// Stop a runtime that has already been detached/replaced. This deliberately
+    /// does not touch the runtime map or tool index, which now belong to its
+    /// successfully committed replacement.
+    pub(super) async fn shutdown_detached_runtime(
+        &self,
+        server_id: &str,
+        runtime: Arc<ServerRuntime>,
+    ) {
+        runtime.shutdown.store(true, Ordering::SeqCst);
+        let mut client = runtime.client.write().await;
+        if let Err(error) = client.disconnect().await {
+            warn!(
+                "Error disconnecting replaced MCP server '{}': {}",
+                server_id, error
+            );
+        }
+        let mut info = runtime.info.write().await;
+        info.status = ServerStatus::Stopped;
+        info.disconnected_at = Some(Utc::now());
     }
 
     /// Call a tool on a specific server.
@@ -381,11 +444,19 @@ impl McpServerManager {
     pub(super) fn spawn_notification_drain(
         &self,
         server_id: String,
+        expected_runtime: Arc<ServerRuntime>,
         mut receiver: tokio::sync::mpsc::Receiver<JsonRpcNotification>,
     ) {
         let manager = self.clone();
         tokio::spawn(async move {
             while let Some(notification) = receiver.recv().await {
+                let still_current = manager
+                    .runtimes
+                    .get(&server_id)
+                    .is_some_and(|runtime| Arc::ptr_eq(runtime.value(), &expected_runtime));
+                if !still_current {
+                    break;
+                }
                 manager
                     .dispatch_server_notification(&server_id, notification)
                     .await;

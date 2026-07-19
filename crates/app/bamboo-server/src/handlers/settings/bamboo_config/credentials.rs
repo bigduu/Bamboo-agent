@@ -85,12 +85,20 @@ pub async fn clear_credential(
 pub async fn get_live_config_health(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let health = app_state
+    let providers = app_state
         .config_live_health
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    Ok(HttpResponse::Ok().json(health))
+    let mcp = app_state
+        .mcp_config_live_health
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "providers": providers,
+        "mcp": mcp,
+    })))
 }
 
 fn envelope<T>(data: T, health: CredentialStoreHealth) -> CredentialEnvelope<T> {

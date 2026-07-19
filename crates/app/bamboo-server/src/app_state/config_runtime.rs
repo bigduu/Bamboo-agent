@@ -3,7 +3,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bamboo_config::{ConfigDirectoryWatcher, ProviderConfigs, SectionSourceKind, SectionStatus};
+use bamboo_config::{
+    AtomicJsonStore, ConfigDirectoryWatcher, ProviderConfigs, SectionSourceKind, SectionStatus,
+};
+use bamboo_mcp::{McpConfig, McpServerManager, TransportConfig};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -33,16 +36,30 @@ impl ConfigWatcherRuntime {
         config_io_lock: Arc<tokio::sync::Mutex<()>>,
         provider_registry: Arc<bamboo_llm::ProviderRegistry>,
         provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
+        mcp_manager: Arc<McpServerManager>,
         account_sink: Arc<bamboo_engine::events::AccountEventSink>,
-    ) -> (Self, Arc<std::sync::RwLock<ConfigLiveHealth>>) {
-        let health = Arc::new(std::sync::RwLock::new(initial_provider_health(&data_dir)));
+    ) -> (
+        Self,
+        Arc<std::sync::RwLock<ConfigLiveHealth>>,
+        Arc<std::sync::RwLock<ConfigLiveHealth>>,
+    ) {
+        let provider_health = Arc::new(std::sync::RwLock::new(initial_provider_health(&data_dir)));
+        let mcp_store = AtomicJsonStore::new(data_dir.join("mcp.json"), 1);
+        let mcp_health = Arc::new(std::sync::RwLock::new(initial_mcp_health(&mcp_store)));
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = match ConfigDirectoryWatcher::watch(&data_dir, Duration::from_millis(120)) {
             Ok(watcher) => watcher,
             Err(error) => {
                 tracing::warn!(error = %error, "live configuration watcher could not start");
                 {
-                    let mut value = health
+                    let mut value = provider_health
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    value.status = SectionStatus::Degraded;
+                    value.last_error = Some("configuration watcher unavailable".to_string());
+                }
+                {
+                    let mut value = mcp_health
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     value.status = SectionStatus::Degraded;
@@ -54,7 +71,8 @@ impl ConfigWatcherRuntime {
                         watcher_task: None,
                         apply_task: None,
                     },
-                    health,
+                    provider_health,
+                    mcp_health,
                 );
             }
         };
@@ -63,6 +81,7 @@ impl ConfigWatcherRuntime {
         // thread after aborting the async consumer, so a bounded blocking_send
         // could deadlock shutdown if its queue were full.
         let (changes_tx, mut changes_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        let initial_changes = changes_tx.clone();
         let worker_stop = stop.clone();
         let watcher_task = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
@@ -78,17 +97,26 @@ impl ConfigWatcherRuntime {
             }
         });
 
-        let apply_health = health.clone();
+        // A sidecar may already exist before the server starts. Queue it through
+        // the exact same candidate/runtime transaction as later filesystem
+        // events; parse-only initial health must never be mistaken for a
+        // published runtime snapshot.
+        let initial_mcp_path = data_dir.join("mcp.json");
+        if initial_mcp_path.exists() {
+            let _ = initial_changes.send(vec![initial_mcp_path]);
+        }
+
+        let apply_provider_health = provider_health.clone();
+        let apply_mcp_health = mcp_health.clone();
         let apply_task = tokio::spawn(async move {
             while let Some(paths) = changes_rx.recv().await {
-                // This integration stage deliberately owns only the already
-                // extracted provider sidecar. Watching config.json here would
-                // publish unrelated MCP/notification/etc. changes without
-                // applying their side effects, creating a split runtime.
-                let watched = paths.iter().any(|path| {
+                let provider_watched = paths.iter().any(|path| {
                     path.file_name().and_then(|name| name.to_str()) == Some("providers.json")
                 });
-                if !watched {
+                let mcp_watched = paths.iter().any(|path| {
+                    path.file_name().and_then(|name| name.to_str()) == Some("mcp.json")
+                });
+                if !provider_watched && !mcp_watched {
                     continue;
                 }
 
@@ -96,64 +124,88 @@ impl ConfigWatcherRuntime {
                 // writers. Otherwise a slow provider build could later publish
                 // a clone taken before an unrelated API update and clobber it.
                 let _io = config_io_lock.lock().await;
-                let current_config = config.read().await.clone();
-                let result = load_and_prepare_provider_candidate(&data_dir, current_config).await;
-                match result {
-                    Ok((candidate_config, candidate_registry, candidate_provider)) => {
-                        let mut live_config = config.write().await;
-                        let mut live_provider = provider.write().await;
-                        let recovered = apply_health
-                            .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .status
-                            != SectionStatus::Healthy;
-                        candidate_config.publish_env_vars();
-                        *live_config = candidate_config;
-                        provider_registry.replace_with(candidate_registry);
-                        *live_provider = candidate_provider;
-                        drop(live_provider);
-                        drop(live_config);
+                if provider_watched {
+                    let current_config = config.read().await.clone();
+                    let result =
+                        load_and_prepare_provider_candidate(&data_dir, current_config).await;
+                    match result {
+                        Ok((candidate_config, candidate_registry, candidate_provider)) => {
+                            let mut live_config = config.write().await;
+                            let mut live_provider = provider.write().await;
+                            let recovered = section_is_unhealthy(&apply_provider_health);
+                            candidate_config.publish_env_vars();
+                            *live_config = candidate_config;
+                            provider_registry.replace_with(candidate_registry);
+                            *live_provider = candidate_provider;
+                            drop(live_provider);
+                            drop(live_config);
 
-                        let revision = update_live_health(
-                            &apply_health,
-                            SectionStatus::Healthy,
-                            None,
-                            true,
-                            Some((data_dir.join("providers.json"), SectionSourceKind::File)),
-                        );
-                        let event = if recovered {
-                            AgentEvent::ConfigRecovered {
-                                section: "providers".to_string(),
-                                revision,
-                            }
-                        } else {
-                            AgentEvent::ConfigChanged {
-                                section: "providers".to_string(),
-                                revision,
-                            }
-                        };
-                        account_sink.record(None, &event);
+                            publish_section_success(
+                                &apply_provider_health,
+                                &account_sink,
+                                "providers",
+                                data_dir.join("providers.json"),
+                                recovered,
+                                None,
+                            );
+                        }
+                        Err(error) => publish_section_failure(
+                            &apply_provider_health,
+                            &account_sink,
+                            "providers",
+                            candidate_error_status(&error.kind),
+                            error.message,
+                        ),
                     }
-                    Err(error) => {
-                        let status = match error.kind {
-                            ProviderCandidateErrorKind::Missing => SectionStatus::Missing,
-                            ProviderCandidateErrorKind::InvalidDocument => SectionStatus::Invalid,
-                            ProviderCandidateErrorKind::Runtime => SectionStatus::Degraded,
-                        };
-                        let revision = update_live_health(
-                            &apply_health,
-                            status,
-                            Some(error.message),
-                            false,
-                            None,
-                        );
-                        account_sink.record(
-                            None,
-                            &AgentEvent::ConfigInvalid {
-                                section: "providers".to_string(),
-                                revision,
-                            },
-                        );
+                }
+
+                if mcp_watched {
+                    let current_config = config.read().await.clone();
+                    let current_revision = apply_mcp_health
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .revision;
+                    let result = load_and_validate_mcp_candidate(
+                        &mcp_store,
+                        current_revision,
+                        current_config,
+                    )
+                    .await;
+                    match result {
+                        Ok((candidate_config, candidate_revision)) => {
+                            match mcp_manager
+                                .reconcile_from_config_transactional(&candidate_config.mcp)
+                                .await
+                            {
+                                Ok(()) => {
+                                    let recovered = section_is_unhealthy(&apply_mcp_health);
+                                    config.write().await.mcp = candidate_config.mcp.clone();
+                                    publish_section_success(
+                                        &apply_mcp_health,
+                                        &account_sink,
+                                        "mcp",
+                                        data_dir.join("mcp.json"),
+                                        recovered,
+                                        Some(candidate_revision),
+                                    );
+                                }
+                                Err(_) => publish_section_failure(
+                                    &apply_mcp_health,
+                                    &account_sink,
+                                    "mcp",
+                                    SectionStatus::Degraded,
+                                    "MCP runtime initialization failed; retaining last-known-good runtime"
+                                        .to_string(),
+                                ),
+                            }
+                        }
+                        Err(error) => publish_section_failure(
+                            &apply_mcp_health,
+                            &account_sink,
+                            "mcp",
+                            candidate_error_status(&error.kind),
+                            error.message,
+                        ),
                     }
                 }
             }
@@ -165,9 +217,71 @@ impl ConfigWatcherRuntime {
                 watcher_task: Some(watcher_task),
                 apply_task: Some(apply_task),
             },
-            health,
+            provider_health,
+            mcp_health,
         )
     }
+}
+
+fn section_is_unhealthy(health: &std::sync::RwLock<ConfigLiveHealth>) -> bool {
+    health
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .status
+        != SectionStatus::Healthy
+}
+
+fn publish_section_success(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    section: &str,
+    source_path: PathBuf,
+    recovered: bool,
+    revision: Option<u64>,
+) {
+    let revision = match revision {
+        Some(revision) => set_live_health_revision(
+            health,
+            revision,
+            Some((source_path, SectionSourceKind::File)),
+        ),
+        None => update_live_health(
+            health,
+            SectionStatus::Healthy,
+            None,
+            true,
+            Some((source_path, SectionSourceKind::File)),
+        ),
+    };
+    let event = if recovered {
+        AgentEvent::ConfigRecovered {
+            section: section.to_string(),
+            revision,
+        }
+    } else {
+        AgentEvent::ConfigChanged {
+            section: section.to_string(),
+            revision,
+        }
+    };
+    account_sink.record(None, &event);
+}
+
+fn publish_section_failure(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    section: &str,
+    status: SectionStatus,
+    message: String,
+) {
+    let revision = update_live_health(health, status, Some(message), false, None);
+    account_sink.record(
+        None,
+        &AgentEvent::ConfigInvalid {
+            section: section.to_string(),
+            revision,
+        },
+    );
 }
 
 fn initial_provider_health(data_dir: &std::path::Path) -> ConfigLiveHealth {
@@ -225,6 +339,46 @@ fn initial_provider_health(data_dir: &std::path::Path) -> ConfigLiveHealth {
     }
 }
 
+fn initial_mcp_health(store: &AtomicJsonStore<McpConfig>) -> ConfigLiveHealth {
+    match store.load_validated(validate_mcp_config) {
+        Ok(Some(stored)) => ConfigLiveHealth {
+            // The document is only a parsed candidate until runtime staging
+            // succeeds; the published LKG revision remains zero meanwhile.
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: store.path().to_path_buf(),
+            source_kind: if stored.recovered_from_backup {
+                SectionSourceKind::Backup
+            } else {
+                SectionSourceKind::File
+            },
+            status: SectionStatus::Degraded,
+            last_error: Some(if stored.recovered_from_backup {
+                "primary MCP section invalid; runtime initialization pending from backup"
+                    .to_string()
+            } else {
+                "MCP runtime initialization pending".to_string()
+            }),
+        },
+        Ok(None) => ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: store.path().to_path_buf(),
+            source_kind: SectionSourceKind::Default,
+            status: SectionStatus::Missing,
+            last_error: None,
+        },
+        Err(_) => ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: store.path().to_path_buf(),
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Invalid,
+            last_error: Some("MCP section could not be parsed or validated".to_string()),
+        },
+    }
+}
+
 impl Drop for ConfigWatcherRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -271,6 +425,76 @@ async fn load_and_prepare_provider_candidate(
     Ok((candidate_config, candidate_registry, candidate_provider))
 }
 
+async fn load_and_validate_mcp_candidate(
+    store: &AtomicJsonStore<McpConfig>,
+    current_revision: u64,
+    mut candidate_config: Config,
+) -> Result<(Config, u64), ProviderCandidateError> {
+    for _ in 0..3 {
+        if store.path().exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !store.path().exists() {
+        return Err(ProviderCandidateError::missing_section(
+            "MCP section is missing",
+        ));
+    }
+    let stored = store
+        .load_validated_for_reload(current_revision, &candidate_config.mcp, validate_mcp_config)
+        .map_err(|_| ProviderCandidateError::invalid("MCP section is invalid"))?
+        .ok_or_else(|| ProviderCandidateError::missing_section("MCP section is missing"))?;
+    if stored.recovered_from_backup {
+        return Err(ProviderCandidateError::invalid(
+            "primary MCP section is invalid; retaining last-known-good runtime",
+        ));
+    }
+    candidate_config.mcp = stored.data;
+    candidate_config.hydrate_mcp_secrets_from_encrypted();
+    Ok((candidate_config, stored.revision))
+}
+
+fn validate_mcp_config(config: &McpConfig) -> Result<(), String> {
+    let mut ids = std::collections::HashSet::new();
+    for server in &config.servers {
+        if server.id.trim().is_empty() {
+            return Err("MCP server id cannot be empty".to_string());
+        }
+        if !ids.insert(server.id.as_str()) {
+            return Err(format!("duplicate MCP server id '{}'", server.id));
+        }
+        if server.request_timeout_ms == 0 || server.healthcheck_interval_ms == 0 {
+            return Err(format!(
+                "MCP server '{}' timeouts must be non-zero",
+                server.id
+            ));
+        }
+        match &server.transport {
+            TransportConfig::Stdio(stdio) if stdio.command.trim().is_empty() => {
+                return Err(format!(
+                    "MCP stdio server '{}' command cannot be empty",
+                    server.id
+                ));
+            }
+            TransportConfig::Sse(sse) if sse.url.trim().is_empty() => {
+                return Err(format!(
+                    "MCP SSE server '{}' URL cannot be empty",
+                    server.id
+                ));
+            }
+            TransportConfig::StreamableHttp(http) if http.url.trim().is_empty() => {
+                return Err(format!(
+                    "MCP HTTP server '{}' URL cannot be empty",
+                    server.id
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 enum ProviderCandidateErrorKind {
     Missing,
     InvalidDocument,
@@ -297,11 +521,26 @@ impl ProviderCandidateError {
         }
     }
 
+    fn missing_section(message: &str) -> Self {
+        Self {
+            kind: ProviderCandidateErrorKind::Missing,
+            message: message.to_string(),
+        }
+    }
+
     fn runtime() -> Self {
         Self {
             kind: ProviderCandidateErrorKind::Runtime,
             message: "provider runtime initialization failed".to_string(),
         }
+    }
+}
+
+fn candidate_error_status(kind: &ProviderCandidateErrorKind) -> SectionStatus {
+    match kind {
+        ProviderCandidateErrorKind::Missing => SectionStatus::Missing,
+        ProviderCandidateErrorKind::InvalidDocument => SectionStatus::Invalid,
+        ProviderCandidateErrorKind::Runtime => SectionStatus::Degraded,
     }
 }
 
@@ -326,6 +565,25 @@ fn update_live_health(
         health.source_kind = source_kind;
     }
     health.revision
+}
+
+fn set_live_health_revision(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    revision: u64,
+    source: Option<(PathBuf, SectionSourceKind)>,
+) -> u64 {
+    let mut health = health
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    health.revision = revision;
+    health.loaded_at = Utc::now();
+    health.status = SectionStatus::Healthy;
+    health.last_error = None;
+    if let Some((source_path, source_kind)) = source {
+        health.source_path = source_path;
+        health.source_kind = source_kind;
+    }
+    revision
 }
 
 impl AppState {
@@ -706,8 +964,86 @@ mod live_reload_tests {
     use super::*;
     use bamboo_agent_core::{Message, ToolSchema};
     use bamboo_llm::{LLMError, LLMStream};
+    use bamboo_mcp::{McpServerConfig, ReconnectConfig, StdioConfig};
 
     struct WorkingProvider;
+
+    fn disabled_mcp_config(id: &str) -> McpConfig {
+        McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: id.to_string(),
+                name: None,
+                enabled: false,
+                transport: TransportConfig::Stdio(StdioConfig {
+                    command: "unused-disabled-command".to_string(),
+                    args: vec![],
+                    cwd: None,
+                    env: std::collections::HashMap::new(),
+                    env_encrypted: std::collections::HashMap::new(),
+                    startup_timeout_ms: 100,
+                }),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        }
+    }
+
+    fn mcp_document_bytes(revision: u64, config: &McpConfig) -> Vec<u8> {
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "revision": revision,
+            "data": config,
+        }))
+        .unwrap()
+    }
+
+    async fn wait_for_mcp_health(
+        state: &AppState,
+        status: SectionStatus,
+        minimum_revision: u64,
+    ) -> ConfigLiveHealth {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let health = state
+                    .mcp_config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if health.status == status && health.revision >= minimum_revision {
+                    break health;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("MCP health transition timed out")
+    }
+
+    async fn next_mcp_config_event(
+        feed: &mut tokio::sync::broadcast::Receiver<Arc<bamboo_engine::events::ChangeEvent>>,
+    ) -> AgentEvent {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let envelope = feed.recv().await.expect("account feed remains open");
+                match &envelope.event {
+                    AgentEvent::ConfigChanged { section, .. }
+                    | AgentEvent::ConfigInvalid { section, .. }
+                    | AgentEvent::ConfigRecovered { section, .. }
+                        if section == "mcp" =>
+                    {
+                        break envelope.event.clone();
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("MCP config event timed out")
+    }
 
     #[test]
     fn initial_provider_health_validates_primary_and_backup() {
@@ -873,5 +1209,117 @@ mod live_reload_tests {
             AgentEvent::ConfigRecovered { revision: 1, .. }
         ));
         assert_eq!(state.provider_registry.default_provider_name(), "openai");
+    }
+
+    #[tokio::test]
+    async fn mcp_watcher_updates_lkg_rejects_invalid_and_recovers_after_atomic_replace() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x45; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let mut feed = state.account_sink.subscribe();
+        let path = dir.path().join("mcp.json");
+
+        std::fs::write(&path, mcp_document_bytes(1, &disabled_mcp_config("first"))).unwrap();
+        let first = wait_for_mcp_health(&state, SectionStatus::Healthy, 1).await;
+        assert_eq!(first.revision, 1);
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "first");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigRecovered { revision: 1, .. }
+        ));
+
+        std::fs::write(&path, b"{broken").unwrap();
+        let invalid = wait_for_mcp_health(&state, SectionStatus::Invalid, 1).await;
+        assert_eq!(invalid.revision, 1, "invalid candidates cannot advance LKG");
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "first");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigInvalid { revision: 1, .. }
+        ));
+
+        // Model an editor's temp-write + atomic rename, with an immediate
+        // follow-up write in the same debounce burst. The watcher must settle
+        // on the final complete document rather than treating the rename gap as
+        // a reset.
+        let swap = dir.path().join("mcp.json.swap");
+        std::fs::write(
+            &swap,
+            mcp_document_bytes(2, &disabled_mcp_config("intermediate")),
+        )
+        .unwrap();
+        std::fs::rename(&swap, &path).unwrap();
+        std::fs::write(
+            &path,
+            mcp_document_bytes(2, &disabled_mcp_config("recovered")),
+        )
+        .unwrap();
+        let recovered = wait_for_mcp_health(&state, SectionStatus::Healthy, 2).await;
+        assert_eq!(recovered.revision, 2, "rename burst should coalesce once");
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "recovered");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigRecovered { revision: 2, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_sidecar_present_at_startup_is_applied_through_runtime_transaction() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x47; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            mcp_document_bytes(1, &disabled_mcp_config("startup-sidecar")),
+        )
+        .unwrap();
+
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let health = wait_for_mcp_health(&state, SectionStatus::Healthy, 1).await;
+        assert_eq!(health.revision, 1);
+        assert_eq!(health.source_kind, SectionSourceKind::File);
+        assert_eq!(
+            state.config.read().await.mcp.servers[0].id,
+            "startup-sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_init_failure_marks_degraded_and_retains_lkg_config() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x46; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let mut feed = state.account_sink.subscribe();
+        let path = dir.path().join("mcp.json");
+
+        std::fs::write(
+            &path,
+            mcp_document_bytes(1, &disabled_mcp_config("last-known-good")),
+        )
+        .unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 1).await;
+        let _ = next_mcp_config_event(&mut feed).await;
+
+        let mut failing = disabled_mcp_config("candidate");
+        failing.servers[0].enabled = true;
+        if let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport {
+            stdio.command = "definitely-not-a-real-mcp-command-597".to_string();
+        }
+        std::fs::write(&path, mcp_document_bytes(2, &failing)).unwrap();
+
+        let degraded = wait_for_mcp_health(&state, SectionStatus::Degraded, 1).await;
+        assert_eq!(degraded.revision, 1);
+        assert!(degraded
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("last-known-good runtime"));
+        assert_eq!(
+            state.config.read().await.mcp.servers[0].id,
+            "last-known-good"
+        );
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigInvalid { revision: 1, .. }
+        ));
     }
 }
