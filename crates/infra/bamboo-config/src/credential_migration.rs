@@ -119,6 +119,7 @@ enum MigrationFault {
     AfterCredentials,
     AfterProviders,
     AfterMcp,
+    AfterConfig,
     AfterRebaseCredentialCommit,
     AfterRebaseStageWrite,
     AfterRebaseManifest,
@@ -197,16 +198,57 @@ pub fn persist_provider_credential_transaction(
     config: &mut crate::Config,
     intents: &BTreeSet<String>,
 ) -> ConfigStoreResult<()> {
-    #[cfg(test)]
-    return persist_provider_credential_transaction_inner(data_dir.as_ref(), config, intents, None);
-    #[cfg(not(test))]
-    persist_provider_credential_transaction_inner(data_dir.as_ref(), config, intents)
+    persist_provider_instance_credential_transaction(data_dir, config, intents, &BTreeSet::new())
 }
 
+/// Persist built-in and provider-instance API-key updates as one recoverable
+/// credential/config transaction. Instance deletes are represented by an
+/// intent whose id is absent from `config`; the prior durable credential ref
+/// is recovered from `config.json` so custom legacy refs are cleared too.
+pub fn persist_provider_instance_credential_transaction(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+) -> ConfigStoreResult<()> {
+    #[cfg(test)]
+    return persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+    );
+    #[cfg(not(test))]
+    persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+    )
+}
+
+#[cfg(test)]
 fn persist_provider_credential_transaction_inner(
     data_dir: &Path,
     config: &mut crate::Config,
-    intents: &BTreeSet<String>,
+    provider_intents: &BTreeSet<String>,
+    fault: Option<MigrationFault>,
+) -> ConfigStoreResult<()> {
+    persist_provider_credential_transaction_with_instances_inner(
+        data_dir,
+        config,
+        provider_intents,
+        &BTreeSet::new(),
+        fault,
+    )
+}
+
+fn persist_provider_credential_transaction_with_instances_inner(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
     std::fs::create_dir_all(data_dir)?;
@@ -227,13 +269,20 @@ fn persist_provider_credential_transaction_inner(
     )?;
     discard_uncommitted(data_dir)?;
 
-    let store = CredentialStore::open(data_dir);
-    let Some(prepared) = store.prepare_provider_api_key_intents(config, intents)? else {
-        return Ok(());
-    };
     let credentials_original = read_target_or_empty(&data_dir.join(CREDENTIALS_FILE))?;
     let providers_original = read_target_or_empty(&data_dir.join(PROVIDERS_FILE))?;
     let config_original = read_target_or_empty(&data_dir.join(CONFIG_FILE))?;
+    let persisted_instance_refs = provider_instance_refs_from_document(&config_original)?;
+    let store = CredentialStore::open(data_dir);
+    let Some(prepared) = store.prepare_provider_api_key_intents(
+        config,
+        provider_intents,
+        provider_instance_intents,
+        &persisted_instance_refs,
+    )?
+    else {
+        return Ok(());
+    };
     let (config_bytes, provider_bytes) = config
         .prepare_provider_transaction_documents(&providers_original)
         .map_err(|error| ConfigStoreError::Validation(error.to_string()))?;
@@ -322,7 +371,9 @@ fn persist_provider_credential_transaction_inner(
 
     #[cfg(test)]
     if fault == Some(MigrationFault::BeforeExactCommitCredentialRace) {
-        let reference = credential_ref("provider", "openai", "api_key")?;
+        let reference = prepared.touched_refs.first().cloned().ok_or_else(|| {
+            ConfigStoreError::Validation("credential intent is empty".to_string())
+        })?;
         store.replace_unchecked(
             reference,
             "concurrent-winner",
@@ -364,11 +415,13 @@ fn persist_provider_credential_transaction_inner(
         let clear_same_ref = fault == Some(MigrationFault::AfterExactCommitCredentialClearRace);
         let same_ref =
             clear_same_ref || fault == Some(MigrationFault::AfterExactCommitCredentialRace);
-        let reference = credential_ref(
-            "provider",
-            if same_ref { "openai" } else { "anthropic" },
-            "api_key",
-        )?;
+        let reference = if same_ref {
+            prepared.touched_refs.first().cloned().ok_or_else(|| {
+                ConfigStoreError::Validation("credential intent is empty".to_string())
+            })?
+        } else {
+            credential_ref("provider", "anthropic", "api_key")?
+        };
         if clear_same_ref {
             store.clear_unchecked(&reference, prepared.expected_revision)?;
         } else {
@@ -434,7 +487,9 @@ fn migrate_inner(
     let mut extracted = Vec::new();
     let providers = plan_provider_section(data_dir, &mut extracted, 1)?;
     let mcp = plan_mcp_section(data_dir, &mut extracted, 1)?;
-    if providers.is_none() && mcp.is_none() {
+    let provider_instances = plan_provider_instance_section(data_dir, &mut extracted, 1, true)?;
+    if providers.is_none() && mcp.is_none() && provider_instances.is_none() {
+        scrub_provider_instance_credentials_from_backups(data_dir)?;
         return Ok(CredentialMigrationOutcome {
             migrated_credentials: 0,
             resumed: false,
@@ -468,7 +523,7 @@ fn migrate_inner(
         None,
         &mut staged,
     )?;
-    for section in providers.into_iter().chain(mcp) {
+    for section in providers.into_iter().chain(mcp).chain(provider_instances) {
         stage_file(
             &stage_dir,
             &backup_dir,
@@ -607,6 +662,134 @@ fn plan_provider_section(
     advance_or_wrap(&mut root, revision.is_some(), migration_generation);
     Ok(Some(PlannedSection {
         name: PROVIDERS_FILE,
+        bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation,
+    }))
+}
+
+fn provider_instance_refs_from_document(
+    bytes: &[u8],
+) -> ConfigStoreResult<BTreeMap<String, CredentialRef>> {
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let root: Value = serde_json::from_slice(bytes)?;
+    let Some(instances) = root.get("provider_instances") else {
+        return Ok(BTreeMap::new());
+    };
+    let instances = instances.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation("provider_instances must be an object".to_string())
+    })?;
+    instances
+        .iter()
+        .filter_map(|(instance_id, value)| {
+            value
+                .get("credential_ref")
+                .map(|value| (instance_id, value))
+        })
+        .map(|(instance_id, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "provider instance credential reference must be a string".to_string(),
+                )
+            })?;
+            Ok((
+                instance_id.clone(),
+                CredentialRef::parse(value.to_string())?,
+            ))
+        })
+        .collect()
+}
+
+fn plan_provider_instance_section(
+    data_dir: &Path,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+    tolerate_corrupt_root: bool,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let path = data_dir.join(CONFIG_FILE);
+    let original = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A non-file at the optional root-config location cannot contain a
+        // provider-instance migration source. Leave it for Config's normal
+        // root write/recovery handling while still propagating real read and
+        // permission failures.
+        Err(error) if tolerate_corrupt_root && error.kind() == std::io::ErrorKind::IsADirectory => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut root_extracted = Vec::new();
+    let planned =
+        plan_provider_instance_document(original, &mut root_extracted, minimum_generation);
+    match planned {
+        Ok(planned) => {
+            extracted.extend(root_extracted);
+            Ok(planned)
+        }
+        // Root-config corruption recovery runs after migration readiness. Do
+        // not block provider/MCP/store hydration because this optional member
+        // has invalid JSON or validation errors. Crucially, extraction is
+        // isolated above so an error cannot publish a partial credential set.
+        Err(_) if tolerate_corrupt_root => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn plan_provider_instance_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let mut root: Value = serde_json::from_slice(&original)?;
+    let object = root.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("root configuration must be an object".to_string())
+    })?;
+    let Some(instances) = object
+        .get_mut("provider_instances")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+    let migration_generation = minimum_generation;
+    let mut changed = false;
+    for (instance_id, value) in instances {
+        let instance = value.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("provider instance must be an object".to_string())
+        })?;
+        let plaintext = take_nonempty_string(instance, "api_key")?;
+        let ciphertext = take_nonempty_string(instance, "api_key_encrypted")?;
+        if plaintext.is_none() && ciphertext.is_none() {
+            continue;
+        }
+        let reference = existing_or_generated_ref(
+            instance.get("credential_ref"),
+            "provider_instance",
+            instance_id,
+            "api_key",
+        )?;
+        instance.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        extracted.push(ExtractedSecret {
+            credential_ref: reference,
+            value: plaintext
+                .map(LegacySecret::Plaintext)
+                .or_else(|| ciphertext.map(LegacySecret::Ciphertext))
+                .expect("one provider-instance credential exists"),
+            migration_generation,
+        });
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    serde_json::from_value::<crate::Config>(root.clone()).map_err(ConfigStoreError::Json)?;
+    Ok(Some(PlannedSection {
+        name: CONFIG_FILE,
         bytes: serde_json::to_vec_pretty(&root)?,
         original,
         migration_generation,
@@ -1101,6 +1284,7 @@ fn install_pending(
             (Some(MigrationFault::AfterCredentials), CREDENTIALS_FILE)
                 | (Some(MigrationFault::AfterProviders), PROVIDERS_FILE)
                 | (Some(MigrationFault::AfterMcp), MCP_FILE)
+                | (Some(MigrationFault::AfterConfig), CONFIG_FILE)
         ) {
             return Err(injected_fault());
         }
@@ -1254,6 +1438,9 @@ fn rebase_changed_section(
     let section = match name.as_str() {
         PROVIDERS_FILE => plan_provider_section(data_dir, &mut extracted, minimum_generation)?,
         MCP_FILE => plan_mcp_section(data_dir, &mut extracted, minimum_generation)?,
+        CONFIG_FILE => {
+            plan_provider_instance_section(data_dir, &mut extracted, minimum_generation, false)?
+        }
         _ => {
             return Err(ConfigStoreError::Validation(
                 "migration section target is invalid".to_string(),
@@ -1296,10 +1483,111 @@ fn rebase_changed_section(
 }
 
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
+    scrub_provider_instance_credentials_from_backups(data_dir)?;
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
     cleanup_transaction_dirs(data_dir, &manifest)
+}
+
+fn scrub_provider_instance_credentials_from_backups(data_dir: &Path) -> ConfigStoreResult<()> {
+    let store = CredentialStore::open(data_dir);
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let path = data_dir.join(format!("{CONFIG_FILE}.{suffix}"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut root: Value = match serde_json::from_slice(&bytes) {
+            Ok(root) => root,
+            Err(_) => continue,
+        };
+        if !scrub_provider_instance_credentials(&store, &mut root)? {
+            continue;
+        }
+        AtomicFileStore::new(path)
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&root)?)?;
+    }
+    Ok(())
+}
+
+fn scrub_provider_instance_credentials(
+    store: &CredentialStore,
+    root: &mut Value,
+) -> ConfigStoreResult<bool> {
+    let Some(instances) = root
+        .get_mut("provider_instances")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for (instance_id, value) in instances {
+        let Some(instance) = value.as_object_mut() else {
+            continue;
+        };
+        let plaintext = instance
+            .get("api_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let ciphertext = instance
+            .get("api_key_encrypted")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let had_secret =
+            instance.contains_key("api_key") || instance.contains_key("api_key_encrypted");
+        if !had_secret {
+            continue;
+        }
+        let reference = if let Some(existing) = instance.get("credential_ref") {
+            let existing = existing.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "provider instance credential reference must be a string".to_string(),
+                )
+            })?;
+            CredentialRef::parse(existing.to_string())?
+        } else {
+            credential_ref("provider_instance", instance_id, "api_key")?
+        };
+        let status = store.status_unchecked(&reference)?;
+        if !status.configured {
+            let secret = match plaintext {
+                Some(secret) => secret,
+                None => match ciphertext {
+                    Some(ciphertext) => crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                        ConfigStoreError::Validation(
+                            "legacy provider instance credential could not be decrypted"
+                                .to_string(),
+                        )
+                    })?,
+                    None => {
+                        instance.remove("api_key");
+                        instance.remove("api_key_encrypted");
+                        changed = true;
+                        continue;
+                    }
+                },
+            };
+            let revision = store.revision_unchecked()?;
+            store.replace_unchecked(
+                reference.clone(),
+                &secret,
+                crate::CredentialSource::Migrated,
+                revision,
+            )?;
+        }
+        instance.remove("api_key");
+        instance.remove("api_key_encrypted");
+        instance.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        changed = true;
+    }
+    Ok(changed)
 }
 
 fn cleanup_transaction_dirs(
@@ -1442,7 +1730,6 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                         .original_sha256
                         .as_ref()
                         .is_none_or(|hash| hash.len() != 64))
-                || (file.install_mode == InstallMode::Migration && file.name == CONFIG_FILE)
                 || (file.name == CREDENTIALS_FILE && !file.sensitive)
                 || (file.name != CREDENTIALS_FILE && file.sensitive)
                 || (file.expected_revision.is_some() && file.name != CREDENTIALS_FILE)
@@ -2207,6 +2494,86 @@ mod tests {
     }
 
     #[test]
+    fn committed_provider_instance_migration_rejects_a_corrupt_root_rebase() {
+        let _key = crate::encryption::set_test_encryption_key([0x86; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "provider_instances": {
+                    "work": {"provider_type": "openai", "api_key": "sk-staged"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(migrate_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{concurrent-broken").unwrap();
+
+        assert!(migrate_with_fault(dir.path(), MigrationFault::None).is_err());
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            b"{concurrent-broken"
+        );
+    }
+
+    #[test]
+    fn invalid_root_validation_is_ignored_without_partial_secret_extraction() {
+        let _key = crate::encryption::set_test_encryption_key([0x87; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let provider_ref = credential_ref("provider", "openai", "api_key").unwrap();
+        store
+            .replace(
+                provider_ref.clone(),
+                "sk-sidecar-survives-invalid-root",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "openai": {
+                    "credential_ref": provider_ref.as_str(),
+                    "model": "gpt-sidecar"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let invalid_root = serde_json::to_vec_pretty(&serde_json::json!({
+            "provider_instances": {
+                "first": {
+                    "provider_type": "openai",
+                    "api_key": "must-not-be-partially-extracted"
+                },
+                "invalid": {
+                    "provider_type": "anthropic",
+                    "api_key": {"not": "a string"}
+                }
+            }
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &invalid_root).unwrap();
+
+        let loaded = crate::Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            loaded.providers.openai.as_ref().unwrap().api_key,
+            "sk-sidecar-survives-invalid-root"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            invalid_root
+        );
+        assert!(store
+            .resolve(&credential_ref("provider_instance", "first", "api_key").unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn rebase_crashes_keep_manifest_stage_pair_valid_and_never_replay_older_secret() {
         for fault in [
             MigrationFault::AfterRebaseCredentialCommit,
@@ -2295,6 +2662,341 @@ mod tests {
             ..Default::default()
         });
         (config, BTreeSet::from(["openai".to_string()]))
+    }
+
+    fn provider_instance_transaction_candidate(
+        instance_id: &str,
+        secret: &str,
+    ) -> (crate::Config, BTreeSet<String>) {
+        let mut config = crate::Config::default();
+        let instance: crate::ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "label": "Work",
+            "api_key": secret,
+            "model": "gpt-test",
+            "unknown_instance_field": "must-survive"
+        }))
+        .unwrap();
+        config
+            .provider_instances
+            .insert(instance_id.to_string(), instance);
+        (config, BTreeSet::from([instance_id.to_string()]))
+    }
+
+    #[test]
+    fn legacy_provider_instances_migrate_recoverably_and_scrub_backups() {
+        let _key = crate::encryption::set_test_encryption_key([0x81; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ciphertext = crate::encryption::encrypt("sk-cipher-instance").unwrap();
+        let root = serde_json::json!({
+            "provider_instances": {
+                "work unsafe/id": {
+                    "provider_type": "openai",
+                    "api_key": "sk-plain-instance",
+                    "api_key_encrypted": crate::encryption::encrypt("stale-shadow").unwrap(),
+                    "unknown_instance_field": "must-survive"
+                },
+                "personal": {
+                    "provider_type": "anthropic",
+                    "api_key_encrypted": ciphertext
+                }
+            },
+            "unknown_root_field": "must-survive"
+        });
+        let bytes = serde_json::to_vec_pretty(&root).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &bytes).unwrap();
+        std::fs::write(dir.path().join("config.json.bak"), &bytes).unwrap();
+
+        assert!(migrate_with_fault(dir.path(), MigrationFault::AfterConfig).is_err());
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+
+        for path in [
+            dir.path().join(CONFIG_FILE),
+            dir.path().join("config.json.bak"),
+        ] {
+            let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(value["unknown_root_field"], "must-survive");
+            assert_eq!(
+                value["provider_instances"]["work unsafe/id"]["unknown_instance_field"],
+                "must-survive"
+            );
+            for id in ["work unsafe/id", "personal"] {
+                let instance = &value["provider_instances"][id];
+                assert!(instance.get("api_key").is_none());
+                assert!(instance.get("api_key_encrypted").is_none());
+                assert!(instance.get("credential_ref").is_some());
+            }
+        }
+        let loaded = crate::Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            loaded.provider_instances["work unsafe/id"].api_key,
+            "sk-plain-instance"
+        );
+        assert_eq!(
+            loaded.provider_instances["personal"].api_key,
+            "sk-cipher-instance"
+        );
+        let credentials = std::fs::read_to_string(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        assert!(!credentials.contains("sk-plain-instance"));
+        assert!(!credentials.contains("sk-cipher-instance"));
+    }
+
+    #[test]
+    fn backup_only_provider_instance_is_stored_before_backup_is_scrubbed() {
+        let _key = crate::encryption::set_test_encryption_key([0x85; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let store = CredentialStore::open(dir.path());
+        let existing_ref = credential_ref("provider_instance", "shared", "api_key").unwrap();
+        store
+            .replace(
+                existing_ref.clone(),
+                "sk-current-winner",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let provider_ref = credential_ref("provider", "openai", "api_key").unwrap();
+        store
+            .replace(
+                provider_ref.clone(),
+                "sk-built-in-survives-corrupt-root",
+                crate::CredentialSource::User,
+                store.revision().unwrap(),
+            )
+            .unwrap();
+        let mcp_ref = credential_ref("mcp", "backup-stdio", "env_TOKEN").unwrap();
+        store
+            .replace(
+                mcp_ref.clone(),
+                "mcp-survives-corrupt-root",
+                crate::CredentialSource::User,
+                store.revision().unwrap(),
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "openai": {
+                    "credential_ref": provider_ref.as_str(),
+                    "model": "gpt-sidecar"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.json.bak"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "provider_instances": {
+                    "personal": {
+                        "provider_type": "anthropic",
+                        "api_key": "sk-backup-only",
+                        "model": "backup-model"
+                    },
+                    "shared": {
+                        "provider_type": "openai",
+                        "api_key": "sk-stale-backup"
+                    }
+                },
+                "mcpServers": {
+                    "backup-stdio": {
+                        "command": "unused-disabled-command",
+                        "enabled": false,
+                        "env_credential_refs": {"TOKEN": mcp_ref.as_str()},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        let reference = credential_ref("provider_instance", "personal", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-backup-only"
+        );
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&existing_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-current-winner"
+        );
+        let backup: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json.bak")).unwrap())
+                .unwrap();
+        assert!(backup["provider_instances"]["personal"]
+            .get("api_key")
+            .is_none());
+        assert_eq!(
+            backup["provider_instances"]["personal"]["credential_ref"],
+            reference.as_str()
+        );
+        assert!(backup["provider_instances"]["shared"]
+            .get("api_key")
+            .is_none());
+        assert_eq!(
+            backup["provider_instances"]["shared"]["credential_ref"],
+            existing_ref.as_str()
+        );
+
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{broken").unwrap();
+        let recovered = crate::Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            recovered.provider_instances["personal"].api_key,
+            "sk-backup-only"
+        );
+        assert_eq!(
+            recovered.provider_instances["personal"].model.as_deref(),
+            Some("backup-model")
+        );
+        assert_eq!(
+            recovered.providers.openai.as_ref().unwrap().api_key,
+            "sk-built-in-survives-corrupt-root"
+        );
+        let stdio = match &recovered.mcp.servers[0].transport {
+            bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => stdio,
+            other => panic!("expected stdio transport, got {other:?}"),
+        };
+        assert_eq!(
+            stdio.env.get("TOKEN").map(String::as_str),
+            Some("mcp-survives-corrupt-root")
+        );
+    }
+
+    #[test]
+    fn provider_instance_transaction_keeps_only_refs_through_generic_saves() {
+        let _key = crate::encryption::set_test_encryption_key([0x82; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let (mut candidate, instance_intents) =
+            provider_instance_transaction_candidate("work", "sk-instance-transaction");
+        persist_provider_credential_transaction_with_instances_inner(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            &instance_intents,
+            None,
+        )
+        .unwrap();
+
+        let reference = credential_ref("provider_instance", "work", "api_key").unwrap();
+        assert_eq!(
+            candidate.provider_instances["work"].credential_ref.as_ref(),
+            Some(&reference)
+        );
+        candidate.provider_instances.get_mut("work").unwrap().label = Some("Renamed".to_string());
+        candidate.save_to_dir(dir.path().to_path_buf()).unwrap();
+
+        for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+            let path = dir.path().join(format!("config.json{suffix}"));
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let Some(instance) = value
+                .get("provider_instances")
+                .and_then(|instances| instances.get("work"))
+            else {
+                continue;
+            };
+            assert!(instance.get("api_key").is_none());
+            assert!(instance.get("api_key_encrypted").is_none());
+            assert_eq!(instance["credential_ref"], reference.as_str());
+        }
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-instance-transaction"
+        );
+    }
+
+    #[test]
+    fn provider_instance_delete_clears_custom_ref_and_survives_concurrent_clear() {
+        let _key = crate::encryption::set_test_encryption_key([0x83; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let custom_ref = CredentialRef::parse("provider_instance.custom.secret").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                custom_ref.clone(),
+                "sk-delete-me",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut current = crate::Config::default();
+        let mut instance: crate::ProviderInstanceConfig = serde_json::from_value(
+            serde_json::json!({"provider_type": "openai", "model": "gpt-test"}),
+        )
+        .unwrap();
+        instance.credential_ref = Some(custom_ref.clone());
+        current
+            .provider_instances
+            .insert("work".to_string(), instance);
+        current.save_to_dir(dir.path().to_path_buf()).unwrap();
+
+        let mut candidate = current.clone();
+        candidate.provider_instances.remove("work");
+        persist_provider_credential_transaction_with_instances_inner(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::new(),
+            &BTreeSet::from(["work".to_string()]),
+            Some(MigrationFault::AfterExactCommitCredentialClearRace),
+        )
+        .unwrap();
+
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&custom_ref)
+            .unwrap()
+            .is_none());
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert!(root["provider_instances"].get("work").is_none());
+    }
+
+    #[test]
+    fn dangling_provider_instance_ref_fails_closed_without_rewriting_metadata() {
+        let _key = crate::encryption::set_test_encryption_key([0x84; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = credential_ref("provider_instance", "work", "api_key").unwrap();
+        let mut config = crate::Config::default();
+        let mut instance: crate::ProviderInstanceConfig = serde_json::from_value(
+            serde_json::json!({"provider_type": "openai", "model": "gpt-test"}),
+        )
+        .unwrap();
+        instance.credential_ref = Some(reference.clone());
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+        config.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let before = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+
+        let loaded = crate::Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert!(loaded.provider_instances["work"].api_key.is_empty());
+        assert_eq!(
+            loaded.provider_instances["work"].credential_ref.as_ref(),
+            Some(&reference)
+        );
+        assert_eq!(std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(), before);
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
     }
 
     #[test]

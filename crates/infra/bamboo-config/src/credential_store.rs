@@ -342,25 +342,32 @@ impl CredentialStore {
     pub(crate) fn prepare_provider_api_key_intents(
         &self,
         config: &mut crate::Config,
-        intents: &BTreeSet<String>,
+        provider_intents: &BTreeSet<String>,
+        provider_instance_intents: &BTreeSet<String>,
+        persisted_instance_refs: &BTreeMap<String, CredentialRef>,
     ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
         struct PlannedUpdate {
-            provider: &'static str,
+            target: PlannedProviderTarget,
             reference: CredentialRef,
             secret: Option<String>,
+        }
+
+        enum PlannedProviderTarget {
+            BuiltIn(&'static str),
+            Instance(String),
         }
 
         let mut updates = Vec::new();
         macro_rules! plan_env {
             ($name:literal, $field:ident) => {
-                if intents.contains($name) {
+                if provider_intents.contains($name) {
                     if let Some(provider) = config.providers.$field.as_ref() {
                         let reference = credential_ref("provider", $name, "api_key")?;
                         let secret = (!provider.api_key_from_env
                             && !provider.api_key.trim().is_empty())
                         .then(|| provider.api_key.trim().to_string());
                         updates.push(PlannedUpdate {
-                            provider: $name,
+                            target: PlannedProviderTarget::BuiltIn($name),
                             reference,
                             secret,
                         });
@@ -371,15 +378,31 @@ impl CredentialStore {
         plan_env!("openai", openai);
         plan_env!("anthropic", anthropic);
         plan_env!("gemini", gemini);
-        if intents.contains("bodhi") {
+        if provider_intents.contains("bodhi") {
             if let Some(provider) = config.providers.bodhi.as_ref() {
                 updates.push(PlannedUpdate {
-                    provider: "bodhi",
+                    target: PlannedProviderTarget::BuiltIn("bodhi"),
                     reference: credential_ref("provider", "bodhi", "api_key")?,
                     secret: (!provider.api_key.trim().is_empty())
                         .then(|| provider.api_key.trim().to_string()),
                 });
             }
+        }
+
+        for instance_id in provider_instance_intents {
+            let instance = config.provider_instances.get(instance_id);
+            let reference = instance
+                .and_then(|instance| instance.credential_ref.clone())
+                .or_else(|| persisted_instance_refs.get(instance_id).cloned())
+                .unwrap_or(credential_ref("provider_instance", instance_id, "api_key")?);
+            let secret = instance
+                .filter(|instance| !instance.api_key.trim().is_empty())
+                .map(|instance| instance.api_key.trim().to_string());
+            updates.push(PlannedUpdate {
+                target: PlannedProviderTarget::Instance(instance_id.clone()),
+                reference,
+                secret,
+            });
         }
 
         if updates.is_empty() {
@@ -428,7 +451,9 @@ impl CredentialStore {
         }
         macro_rules! publish_ref {
             ($name:literal, $field:ident) => {
-                if let Some(update) = updates.iter().find(|update| update.provider == $name) {
+                if let Some(update) = updates.iter().find(|update| {
+                    matches!(&update.target, PlannedProviderTarget::BuiltIn(name) if *name == $name)
+                }) {
                     if let Some(provider) = config.providers.$field.as_mut() {
                         provider.credential_ref =
                             update.secret.as_ref().map(|_| update.reference.clone());
@@ -441,6 +466,15 @@ impl CredentialStore {
         publish_ref!("anthropic", anthropic);
         publish_ref!("gemini", gemini);
         publish_ref!("bodhi", bodhi);
+        for update in &updates {
+            let PlannedProviderTarget::Instance(instance_id) = &update.target else {
+                continue;
+            };
+            if let Some(instance) = config.provider_instances.get_mut(instance_id) {
+                instance.credential_ref = update.secret.as_ref().map(|_| update.reference.clone());
+                instance.api_key_encrypted = None;
+            }
+        }
         validate_document(&document).map_err(ConfigStoreError::Validation)?;
         let revision = if changed {
             health.revision.checked_add(1).ok_or_else(|| {

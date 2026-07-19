@@ -82,6 +82,10 @@ pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> ProviderApiKe
         .and_then(|v| v.as_object())
     {
         for (instance_id, instance_patch) in root.iter() {
+            if instance_patch.is_null() {
+                intents.provider_instances.insert(instance_id.clone());
+                continue;
+            }
             let Some(obj) = instance_patch.as_object() else {
                 continue;
             };
@@ -219,6 +223,7 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
                 continue;
             };
             obj.remove("api_key_encrypted");
+            obj.remove("credential_ref");
         }
     }
 
@@ -1385,6 +1390,27 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_root_patch_strips_provider_instance_storage_metadata() {
+        let mut patch = json!({
+            "provider_instances": {
+                "work": {
+                    "provider_type": "openai",
+                    "api_key": "sk-user-value",
+                    "api_key_encrypted": "client-ciphertext",
+                    "credential_ref": "attacker.chosen.ref"
+                }
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        let instance = obj["provider_instances"]["work"].as_object().unwrap();
+        assert_eq!(instance["api_key"], "sk-user-value");
+        assert!(!instance.contains_key("api_key_encrypted"));
+        assert!(!instance.contains_key("credential_ref"));
+    }
+
+    #[test]
     fn preserve_masked_notification_secrets_keeps_existing_plaintext() {
         let mut current = Config::default();
         current.notifications.ntfy.token = Some("existing-ntfy-token".to_string());
@@ -2248,6 +2274,13 @@ mod tests {
              same as an empty string — otherwise preserve_unpatched_provider_secrets \
              would resurrect the deleted key"
         );
+        assert!(intents.provider_instances.contains("uuid-1"));
+    }
+
+    #[test]
+    fn provider_api_key_intents_treats_whole_instance_null_as_delete_intent() {
+        let patch = json!({ "provider_instances": { "uuid-1": null } });
+        let intents = provider_api_key_intents(patch.as_object().unwrap());
         assert!(intents.provider_instances.contains("uuid-1"));
     }
 

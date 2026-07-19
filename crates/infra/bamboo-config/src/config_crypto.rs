@@ -308,6 +308,10 @@ impl Config {
     /// `api_key_encrypted`. Used before persisting to disk.
     pub fn refresh_provider_instance_api_keys_encrypted(&mut self) -> Result<()> {
         for (id, instance) in self.provider_instances.iter_mut() {
+            if instance.credential_ref.is_some() {
+                instance.api_key_encrypted = None;
+                continue;
+            }
             let api_key = instance.api_key.trim();
             // Empty plaintext → preserve existing ciphertext (see
             // refresh_provider_api_keys_encrypted). #268.
@@ -315,6 +319,24 @@ impl Config {
                 instance.api_key_encrypted = Some(crate::encryption::encrypt(api_key).context(
                     format!("Failed to encrypt api_key for provider instance '{}'", id),
                 )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ref-backed provider instances are the only representation permitted in
+    /// ordinary config documents. Callers that introduce or clear an instance
+    /// key must use the recoverable credential transaction first.
+    pub fn ensure_provider_instance_credentials_isolated(&mut self) -> Result<()> {
+        for (id, instance) in &mut self.provider_instances {
+            if instance.credential_ref.is_some() {
+                instance.api_key_encrypted = None;
+                continue;
+            }
+            if !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some() {
+                anyhow::bail!(
+                    "provider instance '{id}' secret requires credential transaction before persistence"
+                );
             }
         }
         Ok(())

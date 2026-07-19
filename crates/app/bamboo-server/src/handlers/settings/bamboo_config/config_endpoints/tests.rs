@@ -381,6 +381,123 @@ async fn provider_credential_patch_rejects_changed_sidecars_and_model_limits_wit
 }
 
 #[actix_web::test]
+async fn provider_instance_credential_patch_rejects_model_limits_without_partial_commit() {
+    use crate::app_state::AppState;
+    use actix_web::{http::StatusCode, test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+    let baseline_files = transaction_file_snapshot(&data_dir);
+    let baseline_live = app_state
+        .config
+        .read()
+        .await
+        .to_compatibility_value()
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "provider_instances": {
+                    "work": {"provider_type": "openai", "api_key": "sk-instance-mixed"}
+                },
+                "model_limits": [{
+                    "model_pattern": "gpt-*", "max_context_tokens": 1000,
+                    "max_output_tokens": 100
+                }]
+            }))
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(transaction_file_snapshot(&data_dir), baseline_files);
+    assert_eq!(
+        app_state
+            .config
+            .read()
+            .await
+            .to_compatibility_value()
+            .unwrap(),
+        baseline_live
+    );
+}
+
+#[actix_web::test]
+async fn whole_provider_instance_null_clears_credential_and_metadata_transactionally() {
+    use crate::app_state::AppState;
+    use actix_web::{http::StatusCode, test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let mut config = Config::default();
+    let instance: bamboo_config::ProviderInstanceConfig = serde_json::from_value(
+        serde_json::json!({"provider_type": "openai", "api_key": "sk-delete-root"}),
+    )
+    .unwrap();
+    config
+        .provider_instances
+        .insert("work".to_string(), instance);
+    bamboo_config::persist_provider_instance_credential_transaction(
+        temp_dir.path(),
+        &mut config,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::from(["work".to_string()]),
+    )
+    .unwrap();
+    let reference = config.provider_instances["work"]
+        .credential_ref
+        .clone()
+        .unwrap();
+
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app_state = web::Data::new(state);
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({"provider_instances": {"work": null}}))
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!app_state
+        .config
+        .read()
+        .await
+        .provider_instances
+        .contains_key("work"));
+    assert!(bamboo_config::CredentialStore::open(temp_dir.path())
+        .resolve(&reference)
+        .unwrap()
+        .is_none());
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp_dir.path().join("config.json")).unwrap())
+            .unwrap();
+    assert!(root["provider_instances"].get("work").is_none());
+}
+
+#[actix_web::test]
 async fn provider_credential_full_payload_allows_unchanged_sidecars() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};

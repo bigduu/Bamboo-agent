@@ -249,6 +249,7 @@ pub fn run_config_set(
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
     let mut provider_credential_intents = BTreeSet::new();
+    let mut provider_instance_credential_intents = BTreeSet::new();
 
     let parts: Vec<&str> = key.split('.').collect();
     // `Some(outcome)` = generic dot-path set (validated new config inside);
@@ -302,6 +303,7 @@ pub fn run_config_set(
                 );
             };
             instance.api_key = v.to_string();
+            provider_instance_credential_intents.insert((*id).to_string());
             None
         }
         ["notifications", "ntfy", "token"] => {
@@ -354,11 +356,12 @@ pub fn run_config_set(
         Some(out) => out.config,
         None => config,
     };
-    if !provider_credential_intents.is_empty() {
-        bamboo_config::persist_provider_credential_transaction(
+    if !provider_credential_intents.is_empty() || !provider_instance_credential_intents.is_empty() {
+        bamboo_config::persist_provider_instance_credential_transaction(
             &data_dir,
             &mut to_save,
             &provider_credential_intents,
+            &provider_instance_credential_intents,
         )?;
     } else {
         to_save

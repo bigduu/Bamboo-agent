@@ -148,15 +148,20 @@ Migration must be idempotent and manifest-gated:
 6. on restart, discard an uncommitted stage or resume from the manifest; never
    infer completion from the presence of one section file.
 
-Provider and MCP sidecars now use the first manifest-gated migration slice. It
-stages and fsyncs `credentials.json`, `providers.json`, and `mcp.json`, installs a
-pending manifest as the commit point, and finishes or resumes every member before
-`Config` reads any of them. Provider API keys, MCP stdio env values, and MCP HTTP
-headers become stable credential refs; plaintext and legacy ciphertext are removed
-from the ordinary sidecars. Unknown section/envelope fields remain attached to the
-raw JSON candidate. A concurrent editor/API write is compared under the section
-file lock and rebased with a higher migration generation instead of overwritten.
-User-written credentials always outrank migration replay.
+Provider, provider-instance and MCP credentials now use the first manifest-gated
+migration slice. It stages and fsyncs `credentials.json` plus each affected member
+of `providers.json`, `mcp.json`, and `config.json`, installs a pending manifest as
+the commit point, and finishes or resumes every member before `Config` reads any
+of them. Built-in/instance API keys, MCP stdio env values, and MCP HTTP headers
+become stable credential refs; plaintext and legacy ciphertext are removed from
+ordinary documents and parseable root backup generations. Unknown fields remain
+attached to the raw JSON candidate. A concurrent editor/API write is compared
+under the section file lock and rebased with a higher migration generation instead
+of overwritten. User-written credentials always outrank migration replay.
+Backup generations are processed newest first: a backup-only instance is committed
+to the credential store before that backup is rewritten, while an already configured
+same ref remains authoritative over an older backup value. Unparseable root backups
+are left untouched for manual recovery rather than destructively guessed at.
 
 An older binary may later rewrite an unversioned sidecar. Migration compares the
 resolved legacy value with an existing migrated credential: equal values are a
@@ -173,10 +178,16 @@ directories only when their name is the exact managed prefix plus a canonical
 UUID and no valid manifest or journal references them. Symlinks, non-UUID names
 and referenced transactions are never traversed or removed.
 
-This is intentionally not the full legacy-root migration. Provider instances in
-`config.json`, broker/env/notification/cluster secrets, and the remaining section
-split still require the broader inventory transaction. Compatibility PATCH and
-dot-path operations must not claim that all secrets have moved.
+Provider-instance create/update/delete, compatibility PATCH, and CLI dot-path
+writes share the same exact credentials/providers/root transaction. Client-owned
+`credential_ref` and legacy ciphertext fields are stripped, credential commit
+precedes live publication, and generic saves fail closed if an unreferenced
+instance secret would re-enter `config.json`.
+
+This is intentionally not the full legacy-root migration. Proxy, broker,
+env/notification/cluster secrets and the remaining section split still require the
+broader inventory transaction. Compatibility PATCH and dot-path operations must
+not claim that all secrets have moved.
 
 ## Server integration status
 

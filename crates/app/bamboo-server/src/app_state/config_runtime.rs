@@ -1416,12 +1416,13 @@ impl AppState {
         &self,
         update: F,
         provider_intents: std::collections::BTreeSet<String>,
+        provider_instance_intents: std::collections::BTreeSet<String>,
         effects: ConfigUpdateEffects,
     ) -> Result<Config, AppError>
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
-        if provider_intents.is_empty() {
+        if provider_intents.is_empty() && provider_instance_intents.is_empty() {
             return self.update_config(update, effects).await;
         }
         let (snapshot, enforcement_newly_off) = {
@@ -1476,10 +1477,11 @@ impl AppState {
             };
             let data_dir = self.app_data_dir.clone();
             let candidate = tokio::task::spawn_blocking(move || {
-                bamboo_config::persist_provider_credential_transaction(
+                bamboo_config::persist_provider_instance_credential_transaction(
                     &data_dir,
                     &mut candidate,
                     &provider_intents,
+                    &provider_instance_intents,
                 )?;
                 Ok::<_, ConfigStoreError>(candidate)
             })

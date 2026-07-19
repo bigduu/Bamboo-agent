@@ -20,7 +20,10 @@ pub async fn set_bamboo_config(
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
     let effects = config_manager::effects_for_root_patch(&patch_obj);
     let provider_credential_intents = api_key_intents.providers.clone();
-    if !provider_credential_intents.is_empty() && model_limits_patch.is_some() {
+    let provider_instance_credential_intents = api_key_intents.provider_instances.clone();
+    if (!provider_credential_intents.is_empty() || !provider_instance_credential_intents.is_empty())
+        && model_limits_patch.is_some()
+    {
         return Err(AppError::BadRequest(
             "provider credential updates cannot be combined with model_limits changes; split the request"
                 .to_string(),
@@ -46,6 +49,7 @@ pub async fn set_bamboo_config(
                 Ok(())
             },
             provider_credential_intents,
+            provider_instance_credential_intents,
             ConfigUpdateEffects {
                 // Best-effort: setup/UX flows must be able to persist partial config even when
                 // provider init isn't possible yet.

@@ -3631,6 +3631,7 @@ impl Config {
         to_save.extra.remove("data_dir");
         to_save.extra.remove("model");
         to_save.refresh_encrypted_secrets()?;
+        to_save.ensure_provider_instance_credentials_isolated()?;
         to_save.sanitize_mcp_credential_refs_for_disk();
         to_save.sanitize_env_vars_for_disk();
         to_save.sanitize_cluster_fabric_for_disk();
@@ -3803,6 +3804,7 @@ impl Config {
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.refresh_encrypted_secrets()?;
+        to_save.ensure_provider_instance_credentials_isolated()?;
         to_save.sanitize_mcp_credential_refs_for_disk();
         to_save.sanitize_env_vars_for_disk();
         to_save.sanitize_cluster_fabric_for_disk();

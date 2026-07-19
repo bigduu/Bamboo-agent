@@ -30,6 +30,7 @@ pub(super) async fn handle_update_provider_config(
                 Ok(())
             },
             provider_credential_intents,
+            std::collections::BTreeSet::new(),
             // Persist first; reload below so we can return a clear provider-reload error.
             ConfigUpdateEffects {
                 reload_provider: false,
