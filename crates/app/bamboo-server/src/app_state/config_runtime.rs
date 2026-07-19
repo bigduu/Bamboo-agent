@@ -238,7 +238,7 @@ impl Drop for ConfigWatcherRuntime {
 }
 
 async fn load_and_prepare_provider_candidate(
-    data_dir: &PathBuf,
+    data_dir: &std::path::Path,
     mut candidate_config: Config,
 ) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), ProviderCandidateError> {
     // Editors commonly implement save as delete/rename/create. Retry a missing
@@ -262,7 +262,7 @@ async fn load_and_prepare_provider_candidate(
     *candidate_config.providers_mut() = providers;
     candidate_config.hydrate_provider_api_keys_from_encrypted();
     let candidate_registry =
-        bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.clone())
+        bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.to_path_buf())
             .await
             .map_err(|_| ProviderCandidateError::runtime())?;
     let candidate_provider = candidate_registry
@@ -685,6 +685,22 @@ fn reject_if_recovery_pending(cfg: &Config) -> Result<(), AppError> {
     Ok(())
 }
 
+/// The prominent warning emitted whenever `plugin_trust.enforcement` is (or
+/// becomes) `Off` — that setting silently downgrades EVERY subsequent `url`
+/// plugin install/update to skip the host allowlist, signature, and
+/// checksum-required-by-default layers, with no per-install flag needed (see
+/// `crate::plugin_source`'s module docs). Factored into one function so the
+/// boot-time signal (`AppState::new`) and the live-apply signal
+/// (`update_config`/`replace_config`, covering the HTTP `config set` / PATCH
+/// paths) emit the EXACT same message — no drift, and no trigger can flip
+/// enforcement off silently.
+pub(crate) fn warn_plugin_trust_enforcement_off() {
+    tracing::warn!(
+        "plugin_trust.enforcement is OFF — plugin installs from ANY URL are accepted \
+         without host/signature/checksum verification (config.json plugin_trust.enforcement)"
+    );
+}
+
 #[cfg(test)]
 mod live_reload_tests {
     use super::*;
@@ -858,20 +874,4 @@ mod live_reload_tests {
         ));
         assert_eq!(state.provider_registry.default_provider_name(), "openai");
     }
-}
-
-/// The prominent warning emitted whenever `plugin_trust.enforcement` is (or
-/// becomes) `Off` — that setting silently downgrades EVERY subsequent `url`
-/// plugin install/update to skip the host allowlist, signature, and
-/// checksum-required-by-default layers, with no per-install flag needed (see
-/// `crate::plugin_source`'s module docs). Factored into one function so the
-/// boot-time signal (`AppState::new`) and the live-apply signal
-/// (`update_config`/`replace_config`, covering the HTTP `config set` / PATCH
-/// paths) emit the EXACT same message — no drift, and no trigger can flip
-/// enforcement off silently.
-pub(crate) fn warn_plugin_trust_enforcement_off() {
-    tracing::warn!(
-        "plugin_trust.enforcement is OFF — plugin installs from ANY URL are accepted \
-         without host/signature/checksum verification (config.json plugin_trust.enforcement)"
-    );
 }
