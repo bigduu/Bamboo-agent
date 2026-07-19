@@ -8,6 +8,31 @@ use anyhow::{Context, Result};
 
 use super::{Config, ProxyAuth};
 
+fn hydrate_header_credentials(
+    store: &crate::CredentialStore,
+    headers: &mut [bamboo_domain::mcp_config::HeaderConfig],
+) -> crate::ConfigStoreResult<()> {
+    for header in headers {
+        if !header.value.is_empty() {
+            continue;
+        }
+        let Some(raw_reference) = header.credential_ref.as_ref() else {
+            continue;
+        };
+        let reference = crate::CredentialRef::parse(raw_reference.clone())?;
+        header.value = store
+            .resolve(&reference)?
+            .ok_or_else(|| {
+                crate::ConfigStoreError::Validation(
+                    "referenced MCP credential is unavailable".to_string(),
+                )
+            })?
+            .expose()
+            .to_string();
+    }
+    Ok(())
+}
+
 impl Config {
     // ── Proxy auth ─────────────────────────────────────────────────────
 
@@ -138,13 +163,64 @@ impl Config {
         }
     }
 
+    /// Resolve built-in provider and provider-instance credential references
+    /// after legacy ciphertext hydration. Existing in-memory values (notably
+    /// environment overrides) retain precedence.
+    pub fn hydrate_provider_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        macro_rules! hydrate {
+            ($provider:expr) => {
+                if let Some(provider) = $provider {
+                    if provider.api_key.trim().is_empty() {
+                        if let Some(reference) = provider.credential_ref.as_ref() {
+                            provider.api_key = store
+                                .resolve(reference)?
+                                .ok_or_else(|| {
+                                    crate::ConfigStoreError::Validation(
+                                        "referenced provider credential is unavailable".to_string(),
+                                    )
+                                })?
+                                .expose()
+                                .to_string();
+                        }
+                    }
+                }
+            };
+        }
+        hydrate!(self.providers.openai.as_mut());
+        hydrate!(self.providers.anthropic.as_mut());
+        hydrate!(self.providers.gemini.as_mut());
+        hydrate!(self.providers.bodhi.as_mut());
+        for instance in self.provider_instances.values_mut() {
+            if instance.api_key.trim().is_empty() {
+                if let Some(reference) = instance.credential_ref.as_ref() {
+                    instance.api_key = store
+                        .resolve(reference)?
+                        .ok_or_else(|| {
+                            crate::ConfigStoreError::Validation(
+                                "referenced provider credential is unavailable".to_string(),
+                            )
+                        })?
+                        .expose()
+                        .to_string();
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn refresh_provider_api_keys_encrypted(&mut self) -> Result<()> {
         // Env-injected keys (`api_key_from_env`) are runtime-only: leave
         // `api_key_encrypted` untouched so they're never baked into config.json
         // on save (which would otherwise persist the secret even after the env
         // var is removed). (#253)
         if let Some(openai) = self.providers.openai.as_mut() {
-            if !openai.api_key_from_env {
+            if openai.credential_ref.is_some() {
+                openai.api_key_encrypted = None;
+            } else if !openai.api_key_from_env {
                 let api_key = openai.api_key.trim();
                 // Only (re)encrypt when we actually hold a plaintext key. When the
                 // plaintext is empty because the stored ciphertext failed to
@@ -162,7 +238,9 @@ impl Config {
         }
 
         if let Some(anthropic) = self.providers.anthropic.as_mut() {
-            if !anthropic.api_key_from_env {
+            if anthropic.credential_ref.is_some() {
+                anthropic.api_key_encrypted = None;
+            } else if !anthropic.api_key_from_env {
                 let api_key = anthropic.api_key.trim();
                 // Empty plaintext → preserve existing ciphertext (see OpenAI above). #268.
                 if !api_key.is_empty() {
@@ -175,7 +253,9 @@ impl Config {
         }
 
         if let Some(gemini) = self.providers.gemini.as_mut() {
-            if !gemini.api_key_from_env {
+            if gemini.credential_ref.is_some() {
+                gemini.api_key_encrypted = None;
+            } else if !gemini.api_key_from_env {
                 let api_key = gemini.api_key.trim();
                 // Empty plaintext → preserve existing ciphertext (see OpenAI above). #268.
                 if !api_key.is_empty() {
@@ -188,6 +268,10 @@ impl Config {
         }
 
         if let Some(bodhi) = self.providers.bodhi.as_mut() {
+            if bodhi.credential_ref.is_some() {
+                bodhi.api_key_encrypted = None;
+                return Ok(());
+            }
             let api_key = bodhi.api_key.trim();
             // Empty plaintext → preserve existing ciphertext (see OpenAI above). #268.
             if !api_key.is_empty() {
@@ -302,6 +386,40 @@ impl Config {
                 }
             }
         }
+    }
+
+    /// Resolve MCP env/header references without exposing credential values to
+    /// serialization or debug output.
+    pub fn hydrate_mcp_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        for server in &mut self.mcp.servers {
+            match &mut server.transport {
+                bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
+                    for (name, raw_reference) in &stdio.env_credential_refs {
+                        if stdio.env.get(name).is_some_and(|value| !value.is_empty()) {
+                            continue;
+                        }
+                        let reference = crate::CredentialRef::parse(raw_reference.clone())?;
+                        let secret = store.resolve(&reference)?.ok_or_else(|| {
+                            crate::ConfigStoreError::Validation(
+                                "referenced MCP credential is unavailable".to_string(),
+                            )
+                        })?;
+                        stdio.env.insert(name.clone(), secret.expose().to_string());
+                    }
+                }
+                bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
+                    hydrate_header_credentials(&store, &mut config.headers)?;
+                }
+                bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {
+                    hydrate_header_credentials(&store, &mut config.headers)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn refresh_mcp_secrets_encrypted(&mut self) -> Result<()> {

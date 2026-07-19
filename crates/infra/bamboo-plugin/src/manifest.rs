@@ -213,6 +213,7 @@ impl McpServerManifestEntry {
                         })
                         .collect(),
                     env_encrypted: HashMap::new(),
+                    env_credential_refs: std::collections::HashMap::new(),
                     startup_timeout_ms: default_startup_timeout(),
                 })
             }

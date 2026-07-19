@@ -147,11 +147,20 @@ Migration must be idempotent and manifest-gated:
 6. on restart, discard an uncommitted stage or resume from the manifest; never
    infer completion from the presence of one section file.
 
-Until that manifest migration is wired, compatibility PATCH/dot-path operations
-must continue using the full effective projection and must not claim that all
-secrets have moved. The server integration must add typed section and credential
-status/replace/clear endpoints, event-feed adapters, watcher lifecycle ownership,
-and migration fixtures before #597 can be considered complete.
+Provider and MCP sidecars now use the first manifest-gated migration slice. It
+stages and fsyncs `credentials.json`, `providers.json`, and `mcp.json`, installs a
+pending manifest as the commit point, and finishes or resumes every member before
+`Config` reads any of them. Provider API keys, MCP stdio env values, and MCP HTTP
+headers become stable credential refs; plaintext and legacy ciphertext are removed
+from the ordinary sidecars. Unknown section/envelope fields remain attached to the
+raw JSON candidate. A concurrent editor/API write is compared under the section
+file lock and rebased with a higher migration generation instead of overwritten.
+User-written credentials always outrank migration replay.
+
+This is intentionally not the full legacy-root migration. Provider instances in
+`config.json`, broker/env/notification/cluster secrets, and the remaining section
+split still require the broader inventory transaction. Compatibility PATCH and
+dot-path operations must not claim that all secrets have moved.
 
 ## Server integration status
 
@@ -185,6 +194,9 @@ revision/health/source envelopes used by the watcher. Their DTOs are intentional
 diagnostic projections: provider keys, ciphertext, request overrides and unknown
 provider fields are omitted, while MCP transport environment/header names are
 reported without values. URL diagnostics drop user info, query strings and
-fragments; MCP argument values are omitted. Typed section mutation/CAS endpoints
-remain deferred until credential references and the provider manifest migration
-are authoritative.
+fragments; MCP argument values are omitted. Typed provider/MCP mutation endpoints
+preserve credential references, reject new inline secret material, and persist
+metadata-only sidecars. Runtime construction hydrates references from
+`CredentialStore`; a missing or corrupt referenced credential rejects the
+candidate with a redacted degraded/invalid transition and retains the
+last-known-good runtime.

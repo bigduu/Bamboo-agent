@@ -9,6 +9,7 @@ fn openai_config_with(model: &str, reasoning_effort: Option<ReasoningEffort>) ->
         api_key: "sk-test".to_string(),
         api_key_from_env: false,
         api_key_encrypted: None,
+        credential_ref: None,
         base_url: None,
         model: Some(model.to_string()),
         fast_model: Some("gpt-fast-global".to_string()),

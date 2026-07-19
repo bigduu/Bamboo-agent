@@ -483,7 +483,7 @@ async fn load_and_prepare_provider_candidate(
         .load_validated_for_reload_allowing_unversioned(
             current_revision,
             candidate_config.providers(),
-            |_| Ok(()),
+            validate_provider_config,
         )
         .map_err(|_| {
             if store.path().exists() {
@@ -526,6 +526,9 @@ async fn prepare_provider_candidate(
     data_dir: &std::path::Path,
 ) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), ProviderCandidateError> {
     candidate_config.hydrate_provider_api_keys_from_encrypted();
+    candidate_config
+        .hydrate_provider_credentials_from_store(data_dir)
+        .map_err(|_| ProviderCandidateError::invalid("provider credential is unavailable"))?;
     let candidate_registry =
         bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.to_path_buf())
             .await
@@ -577,6 +580,14 @@ async fn load_and_validate_mcp_candidate(
         && serde_json::to_value(&stored.data).ok() == serde_json::to_value(&current_document).ok();
     candidate_config.mcp = stored.data;
     candidate_config.hydrate_mcp_secrets_from_encrypted();
+    candidate_config
+        .hydrate_mcp_credentials_from_store(
+            store
+                .path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .map_err(|_| ProviderCandidateError::invalid("MCP credential is unavailable"))?;
     Ok(McpCandidate {
         config: candidate_config,
         revision: stored.revision,
@@ -608,9 +619,10 @@ fn mcp_durable_comparison_document(config: &McpConfig) -> McpConfig {
     for server in &mut document.servers {
         match &mut server.transport {
             TransportConfig::Stdio(config) => {
-                config
-                    .env
-                    .retain(|name, _| !config.env_encrypted.contains_key(name));
+                config.env.retain(|name, _| {
+                    !config.env_encrypted.contains_key(name)
+                        && !config.env_credential_refs.contains_key(name)
+                });
             }
             TransportConfig::Sse(config) => clear_paired_header_plaintext(&mut config.headers),
             TransportConfig::StreamableHttp(config) => {
@@ -623,7 +635,7 @@ fn mcp_durable_comparison_document(config: &McpConfig) -> McpConfig {
 
 fn clear_paired_header_plaintext(headers: &mut [bamboo_mcp::HeaderConfig]) {
     for header in headers {
-        if header.value_encrypted.is_some() {
+        if header.value_encrypted.is_some() || header.credential_ref.is_some() {
             header.value.clear();
         }
     }
@@ -664,6 +676,75 @@ fn validate_mcp_config(config: &McpConfig) -> Result<(), String> {
                 ));
             }
             _ => {}
+        }
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                if !stdio.env_encrypted.is_empty()
+                    || stdio.env.iter().any(|(name, value)| {
+                        !value.is_empty() && !stdio.env_credential_refs.contains_key(name)
+                    })
+                {
+                    return Err(format!(
+                        "MCP server '{}' contains a secret outside the credential store",
+                        server.id
+                    ));
+                }
+                for raw in stdio.env_credential_refs.values() {
+                    bamboo_config::CredentialRef::parse(raw.clone())
+                        .map_err(|_| "MCP credential reference is invalid".to_string())?;
+                }
+            }
+            TransportConfig::Sse(config) => validate_header_refs(&server.id, &config.headers)?,
+            TransportConfig::StreamableHttp(config) => {
+                validate_header_refs(&server.id, &config.headers)?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_config(providers: &ProviderConfigs) -> Result<(), String> {
+    macro_rules! validate {
+        ($field:ident) => {
+            if let Some(provider) = &providers.$field {
+                if provider.api_key_encrypted.is_some()
+                    || (!provider.api_key.trim().is_empty()
+                        && !provider.api_key_from_env
+                        && provider.credential_ref.is_none())
+                {
+                    return Err("provider secret is outside the credential store".to_string());
+                }
+            }
+        };
+    }
+    validate!(openai);
+    validate!(anthropic);
+    validate!(gemini);
+    if let Some(provider) = &providers.bodhi {
+        if provider.api_key_encrypted.is_some()
+            || (!provider.api_key.trim().is_empty() && provider.credential_ref.is_none())
+        {
+            return Err("provider secret is outside the credential store".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_header_refs(
+    server_id: &str,
+    headers: &[bamboo_mcp::HeaderConfig],
+) -> Result<(), String> {
+    for header in headers {
+        if header.value_encrypted.is_some()
+            || (!header.value.is_empty() && header.credential_ref.is_none())
+        {
+            return Err(format!(
+                "MCP server '{server_id}' contains a secret outside the credential store"
+            ));
+        }
+        if let Some(raw) = &header.credential_ref {
+            bamboo_config::CredentialRef::parse(raw.clone())
+                .map_err(|_| "MCP credential reference is invalid".to_string())?;
         }
     }
     Ok(())
@@ -799,13 +880,18 @@ impl AppState {
             };
 
         let store = AtomicJsonStore::new(self.app_data_dir.join("providers.json"), 1);
+        let durable_providers = provider_durable_document(&providers)?;
         // Acquire every async publication guard before crossing the durable
         // boundary. Once commit succeeds, cancellation cannot strand the file
         // ahead of the live config/provider snapshots.
         let mut live_config = self.config.write().await;
         let mut live_provider = self.provider.write().await;
         let revision = store
-            .commit_allowing_unversioned(expected_revision, providers, |_| Ok(()))
+            .commit_allowing_unversioned(
+                expected_revision,
+                durable_providers,
+                validate_provider_config,
+            )
             .map_err(ConfigSectionMutationError::Store)?;
 
         candidate.publish_env_vars();
@@ -837,9 +923,9 @@ impl AppState {
         validate_mcp_config(&candidate).map_err(ConfigSectionMutationError::Invalid)?;
         let mut revision = None;
         let mut store_error = None;
-        let durable_candidate = encrypted_mcp_document(&candidate)?;
+        let durable_candidate = credential_ref_mcp_document(&candidate)?;
         let mut next_config = candidate.clone();
-        retain_mcp_ciphertext(&durable_candidate, &mut next_config);
+        retain_mcp_credential_refs(&durable_candidate, &mut next_config);
         let result = self
             .mcp_manager
             .reconcile_from_config_transactional_after(&candidate, || async {
@@ -890,6 +976,27 @@ impl AppState {
     }
 }
 
+fn provider_durable_document(
+    providers: &ProviderConfigs,
+) -> Result<ProviderConfigs, ConfigSectionMutationError> {
+    let mut document = providers.clone();
+    macro_rules! sanitize {
+        ($field:ident) => {
+            if let Some(provider) = document.$field.as_mut() {
+                provider.api_key_encrypted = None;
+            }
+        };
+    }
+    sanitize!(openai);
+    sanitize!(anthropic);
+    sanitize!(gemini);
+    if let Some(provider) = document.bodhi.as_mut() {
+        provider.api_key_encrypted = None;
+    }
+    validate_provider_config(&document).map_err(ConfigSectionMutationError::Invalid)?;
+    Ok(document)
+}
+
 fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut ProviderConfigs) {
     candidate.extra = current.extra.clone();
     macro_rules! retain {
@@ -897,6 +1004,7 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
             if let (Some(current), Some(candidate)) = (&current.$field, &mut candidate.$field) {
                 candidate.api_key = current.api_key.clone();
                 candidate.api_key_encrypted = current.api_key_encrypted.clone();
+                candidate.credential_ref = current.credential_ref.clone();
                 candidate.api_key_from_env = current.api_key_from_env;
                 candidate.request_overrides = current.request_overrides.clone();
                 candidate.extra = current.extra.clone();
@@ -909,6 +1017,7 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
     if let (Some(current), Some(candidate)) = (&current.bodhi, &mut candidate.bodhi) {
         candidate.api_key = current.api_key.clone();
         candidate.api_key_encrypted = current.api_key_encrypted.clone();
+        candidate.credential_ref = current.credential_ref.clone();
         candidate.extra = current.extra.clone();
     }
     if let (Some(current), Some(candidate)) = (&current.copilot, &mut candidate.copilot) {
@@ -931,6 +1040,7 @@ fn retain_mcp_credentials(current: &McpConfig, candidate: &mut McpConfig) {
                 if candidate.env.is_empty() && candidate.env_encrypted.is_empty() {
                     candidate.env = current.env.clone();
                     candidate.env_encrypted = current.env_encrypted.clone();
+                    candidate.env_credential_refs = current.env_credential_refs.clone();
                 }
             }
             (TransportConfig::Sse(current), TransportConfig::Sse(candidate))
@@ -949,31 +1059,31 @@ fn retain_mcp_credentials(current: &McpConfig, candidate: &mut McpConfig) {
     }
 }
 
-fn encrypted_mcp_document(runtime: &McpConfig) -> Result<McpConfig, ConfigSectionMutationError> {
+fn credential_ref_mcp_document(
+    runtime: &McpConfig,
+) -> Result<McpConfig, ConfigSectionMutationError> {
     let mut document = runtime.clone();
     for server in &mut document.servers {
         match &mut server.transport {
             TransportConfig::Stdio(config) => {
-                for (name, value) in std::mem::take(&mut config.env) {
-                    if value.is_empty() || config.env_encrypted.contains_key(&name) {
-                        continue;
-                    }
-                    let encrypted = bamboo_config::encryption::encrypt(&value).map_err(|_| {
-                        ConfigSectionMutationError::Invalid(
-                            "MCP credential could not be prepared for durable storage".to_string(),
-                        )
-                    })?;
-                    config.env_encrypted.insert(name, encrypted);
+                config.env_encrypted.clear();
+                config.env.retain(|name, value| {
+                    !(value.is_empty() || config.env_credential_refs.contains_key(name))
+                });
+                if !config.env.is_empty() {
+                    return Err(ConfigSectionMutationError::Invalid(
+                        "MCP secret requires a credential reference".to_string(),
+                    ));
                 }
             }
-            TransportConfig::Sse(config) => encrypt_headers(&mut config.headers)?,
-            TransportConfig::StreamableHttp(config) => encrypt_headers(&mut config.headers)?,
+            TransportConfig::Sse(config) => reference_headers(&mut config.headers)?,
+            TransportConfig::StreamableHttp(config) => reference_headers(&mut config.headers)?,
         }
     }
     Ok(document)
 }
 
-fn retain_mcp_ciphertext(document: &McpConfig, runtime: &mut McpConfig) {
+fn retain_mcp_credential_refs(document: &McpConfig, runtime: &mut McpConfig) {
     for runtime_server in &mut runtime.servers {
         let Some(document_server) = document
             .servers
@@ -984,7 +1094,8 @@ fn retain_mcp_ciphertext(document: &McpConfig, runtime: &mut McpConfig) {
         };
         match (&document_server.transport, &mut runtime_server.transport) {
             (TransportConfig::Stdio(document), TransportConfig::Stdio(runtime)) => {
-                runtime.env_encrypted = document.env_encrypted.clone();
+                runtime.env_encrypted.clear();
+                runtime.env_credential_refs = document.env_credential_refs.clone();
             }
             (TransportConfig::Sse(document), TransportConfig::Sse(runtime)) => {
                 copy_header_ciphertext(&document.headers, &mut runtime.headers);
@@ -1007,25 +1118,23 @@ fn copy_header_ciphertext(
             .iter()
             .find(|header| header.name == runtime_header.name)
         {
-            runtime_header.value_encrypted = document_header.value_encrypted.clone();
+            runtime_header.value_encrypted = None;
+            runtime_header.credential_ref = document_header.credential_ref.clone();
         }
     }
 }
 
-fn encrypt_headers(
+fn reference_headers(
     headers: &mut [bamboo_mcp::HeaderConfig],
 ) -> Result<(), ConfigSectionMutationError> {
     for header in headers {
-        if header.value_encrypted.is_none() && !header.value.is_empty() {
-            header.value_encrypted = Some(
-                bamboo_config::encryption::encrypt(&header.value).map_err(|_| {
-                    ConfigSectionMutationError::Invalid(
-                        "MCP credential could not be prepared for durable storage".to_string(),
-                    )
-                })?,
-            );
+        if !header.value.is_empty() && header.credential_ref.is_none() {
+            return Err(ConfigSectionMutationError::Invalid(
+                "MCP secret requires a credential reference".to_string(),
+            ));
         }
         header.value.clear();
+        header.value_encrypted = None;
     }
     Ok(())
 }
@@ -1425,6 +1534,7 @@ mod live_reload_tests {
                     cwd: None,
                     env: std::collections::HashMap::new(),
                     env_encrypted: std::collections::HashMap::new(),
+                    env_credential_refs: std::collections::HashMap::new(),
                     startup_timeout_ms: 100,
                 }),
                 request_timeout_ms: 100,
@@ -1537,13 +1647,22 @@ mod live_reload_tests {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
         let secret = "provider-cancel-secret";
+        let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+        bamboo_config::CredentialStore::open(dir.path())
+            .replace(
+                reference.clone(),
+                secret,
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         {
             let mut config = state.config.write().await;
             config.provider = "openai".to_string();
             *config.providers_mut() = ProviderConfigs {
                 openai: Some(bamboo_config::OpenAIConfig {
                     api_key: secret.to_string(),
-                    api_key_encrypted: Some(bamboo_config::encryption::encrypt(secret).unwrap()),
+                    credential_ref: Some(reference),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1573,6 +1692,71 @@ mod live_reload_tests {
             "cancellation while waiting for publication guards must precede durable commit"
         );
         drop(held_provider);
+    }
+
+    #[tokio::test]
+    async fn missing_or_corrupt_referenced_credentials_reject_candidates_redacted() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x68; 32]);
+        for corrupt_credentials in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+            let providers = ProviderConfigs {
+                openai: Some(bamboo_config::OpenAIConfig {
+                    credential_ref: Some(reference),
+                    model: Some("candidate".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let provider_store = AtomicJsonStore::new(dir.path().join("providers.json"), 1);
+            provider_store
+                .commit(0, providers, validate_provider_config)
+                .unwrap();
+            if corrupt_credentials {
+                std::fs::write(dir.path().join("credentials.json"), b"{corrupt-secret").unwrap();
+            }
+            let error =
+                match load_and_prepare_provider_candidate(&provider_store, 0, Config::default())
+                    .await
+                {
+                    Ok(_) => panic!("unavailable credential must reject provider candidate"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.message, "provider credential is unavailable");
+            assert!(!error
+                .message
+                .contains(dir.path().to_string_lossy().as_ref()));
+
+            let mut mcp = disabled_mcp_config("credential-lkg");
+            let TransportConfig::Stdio(stdio) = &mut mcp.servers[0].transport else {
+                unreachable!()
+            };
+            stdio.env_credential_refs.insert(
+                "TOKEN".to_string(),
+                bamboo_config::credential_ref("mcp", "credential-lkg", "env_TOKEN")
+                    .unwrap()
+                    .as_str()
+                    .to_string(),
+            );
+            let mcp_store = AtomicJsonStore::new(dir.path().join("mcp.json"), 1);
+            mcp_store.commit(0, mcp, validate_mcp_config).unwrap();
+            let error = match load_and_validate_mcp_candidate(
+                &mcp_store,
+                0,
+                Config::default(),
+                false,
+            )
+            .await
+            {
+                Ok(_) => panic!("unavailable credential must reject MCP candidate"),
+                Err(error) => error,
+            };
+            assert_eq!(error.message, "MCP credential is unavailable");
+            assert!(!error.message.contains("TOKEN"));
+            assert!(!error
+                .message
+                .contains(dir.path().to_string_lossy().as_ref()));
+        }
     }
 
     #[tokio::test]
@@ -1660,11 +1844,18 @@ mod live_reload_tests {
             AgentEvent::ConfigInvalid { revision: 0, .. }
         ));
 
+        let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+        bamboo_config::CredentialStore::open(dir.path())
+            .replace(
+                reference.clone(),
+                "watcher-test-key",
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         let providers = ProviderConfigs {
             openai: Some(bamboo_config::OpenAIConfig {
-                api_key_encrypted: Some(
-                    bamboo_config::encryption::encrypt("watcher-test-key").unwrap(),
-                ),
+                credential_ref: Some(reference),
                 ..Default::default()
             }),
             ..Default::default()

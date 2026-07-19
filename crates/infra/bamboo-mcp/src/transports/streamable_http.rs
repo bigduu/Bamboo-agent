@@ -539,6 +539,7 @@ mod tests {
                 name: "Authorization".to_string(),
                 value: "Bearer token123".to_string(),
                 value_encrypted: None,
+                credential_ref: None,
             }],
             connect_timeout_ms: 5000,
         };
@@ -556,6 +557,7 @@ mod tests {
                 name: "Invalid\nName".to_string(),
                 value: "test".to_string(),
                 value_encrypted: None,
+                credential_ref: None,
             }],
             connect_timeout_ms: 5000,
         };

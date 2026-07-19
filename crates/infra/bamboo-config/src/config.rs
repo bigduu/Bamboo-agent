@@ -2062,6 +2062,9 @@ pub struct OpenAIConfig {
     /// Encrypted OpenAI API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
     /// Such keys are runtime-only and MUST NOT be re-encrypted into
     /// `api_key_encrypted` on save (that would bake the secret into
@@ -2124,6 +2127,9 @@ pub struct AnthropicConfig {
     /// Encrypted Anthropic API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
     /// Such keys are runtime-only and MUST NOT be re-encrypted into
     /// `api_key_encrypted` on save (that would bake the secret into
@@ -2198,6 +2204,9 @@ pub struct GeminiConfig {
     /// Encrypted Google AI API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
     /// Such keys are runtime-only and MUST NOT be re-encrypted into
     /// `api_key_encrypted` on save (that would bake the secret into
@@ -2295,6 +2304,9 @@ pub struct BodhiConfig {
     /// Encrypted form of the API key stored on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// Bodhi server base URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -2366,6 +2378,10 @@ pub struct ProviderInstanceConfig {
     /// `api_key` on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
 
     /// Custom base URL override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2655,6 +2671,13 @@ impl Config {
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(default_data_dir);
 
+        // Finish any manifest-committed provider/MCP credential extraction
+        // before reading even one member of the transaction. An uncommitted
+        // stage is discarded and safely replanned.
+        if let Err(error) = crate::migrate_provider_mcp_credentials(&data_dir) {
+            tracing::warn!(error = %error, "provider/MCP credential migration unavailable");
+        }
+
         let config_path = data_dir.join("config.json");
 
         let mut config = if config_path.exists() {
@@ -2739,6 +2762,12 @@ impl Config {
         config.hydrate_provider_instance_api_keys_from_encrypted();
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
+        if let Err(error) = config.hydrate_provider_credentials_from_store(&data_dir) {
+            tracing::warn!(error = %error, "provider credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_mcp_credentials_from_store(&data_dir) {
+            tracing::warn!(error = %error, "MCP credential hydration unavailable");
+        }
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
         // Decrypt encrypted cluster-fabric SSH secrets into in-memory plaintext.
@@ -6185,6 +6214,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-main".to_string()),
             fast_model: Some("gpt-fast".to_string()),
@@ -6215,6 +6245,7 @@ mod tests {
         let openai = |api_key: &str, from_env: bool| OpenAIConfig {
             api_key: api_key.to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,
@@ -6266,6 +6297,7 @@ mod tests {
         let openai = |api_key: &str, enc: Option<&str>| OpenAIConfig {
             api_key: api_key.to_string(),
             api_key_encrypted: enc.map(str::to_string),
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,
@@ -6379,6 +6411,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-main".to_string()),
             fast_model: Some("gpt-fast".to_string()),
@@ -6404,6 +6437,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-main".to_string()),
             fast_model: None,
@@ -6964,7 +6998,7 @@ mod tests {
     }
 
     #[test]
-    fn config_save_encrypts_provider_api_keys_and_does_not_persist_plaintext() {
+    fn config_save_persists_provider_reference_and_isolates_plaintext() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
@@ -6975,11 +7009,21 @@ mod tests {
             0x1c, 0x1d, 0x1e, 0x1f,
         ]);
 
+        let reference = crate::credential_ref("provider", "openai", "api_key").unwrap();
+        crate::CredentialStore::open(&temp_home.path)
+            .replace(
+                reference.clone(),
+                "sk-test-provider-key",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "sk-test-provider-key".to_string(),
             api_key_encrypted: None,
+            credential_ref: Some(reference),
             base_url: None,
             model: None,
             fast_model: None,
@@ -6993,13 +7037,13 @@ mod tests {
 
         config
             .save_to_dir(temp_home.path.clone())
-            .expect("save should encrypt provider api keys");
+            .expect("save should persist provider reference");
 
         let content = std::fs::read_to_string(temp_home.path.join("providers.json"))
             .expect("read providers.json");
         assert!(
-            content.contains("\"api_key_encrypted\""),
-            "providers.json should store encrypted provider keys"
+            !content.contains("api_key_encrypted"),
+            "providers.json must not store provider ciphertext"
         );
         assert!(
             !content.contains("\"api_key\""),
@@ -7039,6 +7083,7 @@ mod tests {
                         cwd: None,
                         env,
                         env_encrypted: std::collections::HashMap::new(),
+                        env_credential_refs: std::collections::HashMap::new(),
                         startup_timeout_ms: 5000,
                     },
                 ),
@@ -7059,6 +7104,7 @@ mod tests {
                             name: "Authorization".to_string(),
                             value: "Bearer token123".to_string(),
                             value_encrypted: None,
+                            credential_ref: None,
                         }],
                         connect_timeout_ms: 5000,
                     },
@@ -7528,6 +7574,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("legacy-gpt-4o".to_string()),
             fast_model: None,
@@ -7564,6 +7611,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("legacy-gpt-4o".to_string()),
             fast_model: None,
@@ -7600,6 +7648,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("legacy-gpt-4o-mini".to_string()),
@@ -7642,6 +7691,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("legacy-gpt-4o-mini".to_string()),
@@ -7710,6 +7760,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("gpt-4o-mini".to_string()),
@@ -7784,6 +7835,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("legacy-gpt-4o-mini".to_string()),

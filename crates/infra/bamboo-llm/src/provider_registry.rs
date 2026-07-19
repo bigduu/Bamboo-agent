@@ -375,6 +375,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
                 // override, so it may be persisted normally. #253.
                 api_key_from_env: false,
                 api_key_encrypted: instance.api_key_encrypted.clone(),
+                credential_ref: None,
                 base_url: instance.base_url.clone(),
                 model: instance.model.clone(),
                 fast_model: instance.fast_model.clone(),
@@ -392,6 +393,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
                 // override, so it may be persisted normally. #253.
                 api_key_from_env: false,
                 api_key_encrypted: instance.api_key_encrypted.clone(),
+                credential_ref: None,
                 base_url: instance.base_url.clone(),
                 model: instance.model.clone(),
                 fast_model: instance.fast_model.clone(),
@@ -417,6 +419,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
                 // override, so it may be persisted normally. #253.
                 api_key_from_env: false,
                 api_key_encrypted: instance.api_key_encrypted.clone(),
+                credential_ref: None,
                 base_url: instance.base_url.clone(),
                 model: instance.model.clone(),
                 fast_model: instance.fast_model.clone(),
@@ -445,6 +448,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
             providers.bodhi = Some(bamboo_config::BodhiConfig {
                 api_key: instance.api_key.clone(),
                 api_key_encrypted: instance.api_key_encrypted.clone(),
+                credential_ref: None,
                 base_url: instance.base_url.clone(),
                 target_provider: instance
                     .extra
@@ -514,6 +518,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             api_key_from_env: false,
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,
@@ -606,6 +611,7 @@ mod tests {
             label: Some("Test OpenAI".to_string()),
             api_key: "sk-instance-key".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: Some("https://custom.api.com/v1".to_string()),
             model: Some("gpt-4o".to_string()),
             fast_model: Some("gpt-4o-mini".to_string()),
@@ -649,6 +655,7 @@ mod tests {
             label: Some("GLM compat".to_string()),
             api_key: "glm-key".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: Some("https://glm.example.com/anthropic".to_string()),
             model: Some("glm-4.6".to_string()),
             fast_model: None,
@@ -681,6 +688,7 @@ mod tests {
             label: None,
             api_key: "sk-ant-key".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,

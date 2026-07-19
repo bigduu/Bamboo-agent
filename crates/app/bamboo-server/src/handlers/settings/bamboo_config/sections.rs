@@ -276,7 +276,7 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
         result.insert(
             "openai".to_string(),
             json!({
-                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted),
+                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted, provider.credential_ref.is_some()),
                 "base_url": safe_url_diagnostic(provider.base_url.as_deref()),
                 "model": provider.model,
                 "fast_model": provider.fast_model,
@@ -290,7 +290,7 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
         result.insert(
             "anthropic".to_string(),
             json!({
-                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted),
+                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted, provider.credential_ref.is_some()),
                 "base_url": safe_url_diagnostic(provider.base_url.as_deref()),
                 "model": provider.model,
                 "fast_model": provider.fast_model,
@@ -305,7 +305,7 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
         result.insert(
             "gemini".to_string(),
             json!({
-                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted),
+                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted, provider.credential_ref.is_some()),
                 "base_url": safe_url_diagnostic(provider.base_url.as_deref()),
                 "model": provider.model,
                 "fast_model": provider.fast_model,
@@ -332,7 +332,7 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
         result.insert(
             "bodhi".to_string(),
             json!({
-                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted),
+                "api_key_configured": provider_key_configured(&provider.api_key, &provider.api_key_encrypted, provider.credential_ref.is_some()),
                 "base_url": safe_url_diagnostic(provider.base_url.as_deref()),
                 "target_provider": provider.target_provider,
                 "reasoning_effort": provider.reasoning_effort,
@@ -343,8 +343,8 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
     Value::Object(result)
 }
 
-fn provider_key_configured(plaintext: &str, ciphertext: &Option<String>) -> bool {
-    !plaintext.trim().is_empty() || ciphertext.is_some()
+fn provider_key_configured(plaintext: &str, ciphertext: &Option<String>, referenced: bool) -> bool {
+    !plaintext.trim().is_empty() || ciphertext.is_some() || referenced
 }
 
 fn safe_url_diagnostic(raw: Option<&str>) -> Option<String> {
@@ -362,6 +362,7 @@ fn mcp_server_diagnostics(server: &bamboo_mcp::McpServerConfig) -> Value {
         bamboo_mcp::TransportConfig::Stdio(stdio) => {
             let mut env_keys = stdio.env.keys().cloned().collect::<Vec<_>>();
             env_keys.extend(stdio.env_encrypted.keys().cloned());
+            env_keys.extend(stdio.env_credential_refs.keys().cloned());
             env_keys.sort();
             env_keys.dedup();
             json!({
@@ -456,6 +457,7 @@ mod tests {
                 openai: Some(OpenAIConfig {
                     api_key: "provider-plaintext-secret".to_string(),
                     api_key_encrypted: Some("provider-ciphertext-secret".to_string()),
+                    credential_ref: None,
                     base_url: Some(
                         "https://provider-url-secret@provider.example/v1?token=query-secret"
                             .to_string(),
@@ -492,6 +494,7 @@ mod tests {
                                 "LEGACY_TOKEN".to_string(),
                                 "mcp-env-ciphertext-secret".to_string(),
                             )]),
+                            env_credential_refs: HashMap::new(),
                             startup_timeout_ms: 4_000,
                         }),
                     ),
@@ -504,6 +507,7 @@ mod tests {
                                 name: "Authorization".to_string(),
                                 value: "mcp-header-plaintext-secret".to_string(),
                                 value_encrypted: Some("mcp-header-ciphertext-secret".to_string()),
+                                credential_ref: None,
                             }],
                             connect_timeout_ms: 5_000,
                         }),
@@ -670,13 +674,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let secret = "provider-put-secret-597";
+        let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+        state
+            .credential_store
+            .replace(
+                reference.clone(),
+                secret,
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         {
             let mut config = state.config.write().await;
             config.provider = "openai".to_string();
             *config.providers_mut() = ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: secret.to_string(),
-                    api_key_encrypted: Some(bamboo_config::encryption::encrypt(secret).unwrap()),
+                    credential_ref: Some(reference),
                     model: Some("old-model".to_string()),
                     ..Default::default()
                 }),
@@ -704,8 +718,9 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert!(response.status().is_success());
+        let status = response.status();
         let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
         assert!(!body.contains(secret));
         assert!(!body.contains("api_key_encrypted"));
         let body: Value = serde_json::from_str(&body).unwrap();
@@ -728,7 +743,8 @@ mod tests {
         assert!(!disk.contains(secret));
         let disk: Value = serde_json::from_str(&disk).unwrap();
         assert_eq!(disk["revision"], 1);
-        assert!(disk["data"]["openai"]["api_key_encrypted"].is_string());
+        assert!(disk["data"]["openai"]["credential_ref"].is_string());
+        assert!(disk["data"]["openai"].get("api_key_encrypted").is_none());
         let first = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = feed.recv().await.unwrap();
@@ -826,6 +842,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let secret = "mcp-put-secret-597";
+        let env_reference = bamboo_config::credential_ref("mcp", "preserved", "env_TOKEN").unwrap();
+        let header_reference =
+            bamboo_config::credential_ref("mcp", "preserved-http", "header_Authorization").unwrap();
+        state
+            .credential_store
+            .replace(
+                env_reference.clone(),
+                secret,
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        state
+            .credential_store
+            .replace(
+                header_reference.clone(),
+                secret,
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
         let current = McpConfig {
             version: 1,
             servers: vec![
@@ -837,6 +874,10 @@ mod tests {
                         cwd: None,
                         env: HashMap::from([("TOKEN".to_string(), secret.to_string())]),
                         env_encrypted: HashMap::new(),
+                        env_credential_refs: HashMap::from([(
+                            "TOKEN".to_string(),
+                            env_reference.as_str().to_string(),
+                        )]),
                         startup_timeout_ms: 500,
                     }),
                 ),
@@ -848,6 +889,7 @@ mod tests {
                             name: "Authorization".to_string(),
                             value: secret.to_string(),
                             value_encrypted: None,
+                            credential_ref: Some(header_reference.as_str().to_string()),
                         }],
                         connect_timeout_ms: 500,
                     }),
@@ -874,6 +916,7 @@ mod tests {
                         cwd: None,
                         env: HashMap::new(),
                         env_encrypted: HashMap::new(),
+                        env_credential_refs: std::collections::HashMap::new(),
                         startup_timeout_ms: 500,
                     }),
                 ),
@@ -895,8 +938,9 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert!(response.status().is_success());
+        let status = response.status();
         let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
         assert!(!body.contains(secret));
         let config = state.config.read().await;
         let TransportConfig::Stdio(stdio) = &config.mcp.servers[0].transport else {
@@ -910,8 +954,10 @@ mod tests {
         drop(config);
         let disk = std::fs::read_to_string(dir.path().join("mcp.json")).unwrap();
         assert!(!disk.contains(secret));
-        assert!(disk.contains("env_encrypted"));
-        assert!(disk.contains("headers_encrypted"));
+        assert!(!disk.contains("env_encrypted"));
+        assert!(!disk.contains("headers_encrypted"));
+        assert!(disk.contains("env_credential_refs"));
+        assert!(disk.contains("header_credential_refs"));
         let first = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = feed.recv().await.unwrap();

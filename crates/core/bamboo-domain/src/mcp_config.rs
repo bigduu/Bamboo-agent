@@ -71,6 +71,8 @@ struct McpServerConfigFlatDisk {
     #[serde(default)]
     env_encrypted: HashMap<String, String>,
     #[serde(default)]
+    env_credential_refs: HashMap<String, String>,
+    #[serde(default)]
     startup_timeout_ms: Option<u64>,
 
     // sse shape
@@ -80,6 +82,8 @@ struct McpServerConfigFlatDisk {
     headers: Vec<HeaderConfig>,
     #[serde(default)]
     headers_encrypted: HashMap<String, String>,
+    #[serde(default)]
+    header_credential_refs: HashMap<String, String>,
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -117,6 +121,7 @@ where
                 name: name.clone(),
                 value,
                 value_encrypted: None,
+                credential_ref: None,
             });
         }
         return Ok(headers);
@@ -151,12 +156,17 @@ impl McpServerConfigFlatDisk {
                 cwd: self.cwd,
                 env: self.env,
                 env_encrypted: self.env_encrypted,
+                env_credential_refs: self.env_credential_refs,
                 startup_timeout_ms: self
                     .startup_timeout_ms
                     .unwrap_or_else(default_startup_timeout),
             }),
             (None, Some(url)) => {
-                let headers = merge_encrypted_headers(self.headers, self.headers_encrypted);
+                let headers = merge_header_secrets(
+                    self.headers,
+                    self.headers_encrypted,
+                    self.header_credential_refs,
+                );
                 let connect_timeout_ms = self
                     .connect_timeout_ms
                     .unwrap_or_else(default_connect_timeout);
@@ -199,9 +209,10 @@ impl McpServerConfigFlatDisk {
     }
 }
 
-fn merge_encrypted_headers(
+fn merge_header_secrets(
     mut headers: Vec<HeaderConfig>,
     encrypted: HashMap<String, String>,
+    credential_refs: HashMap<String, String>,
 ) -> Vec<HeaderConfig> {
     for (name, value_encrypted) in encrypted {
         if let Some(header) = headers.iter_mut().find(|header| header.name == name) {
@@ -211,6 +222,19 @@ fn merge_encrypted_headers(
                 name,
                 value: String::new(),
                 value_encrypted: Some(value_encrypted),
+                credential_ref: None,
+            });
+        }
+    }
+    for (name, credential_ref) in credential_refs {
+        if let Some(header) = headers.iter_mut().find(|header| header.name == name) {
+            header.credential_ref = Some(credential_ref);
+        } else {
+            headers.push(HeaderConfig {
+                name,
+                value: String::new(),
+                value_encrypted: None,
+                credential_ref: Some(credential_ref),
             });
         }
     }
@@ -238,6 +262,8 @@ struct McpServerDiskOut {
     env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     env_encrypted: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    env_credential_refs: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_timeout_ms: Option<u64>,
 
@@ -248,6 +274,8 @@ struct McpServerDiskOut {
     headers: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     headers_encrypted: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    header_credential_refs: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,10 +309,12 @@ impl From<&McpServerConfig> for McpServerDiskOut {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: HashMap::new(),
             startup_timeout_ms: None,
             url: None,
             headers: HashMap::new(),
             headers_encrypted: HashMap::new(),
+            header_credential_refs: HashMap::new(),
             transport_kind: None,
             connect_timeout_ms: None,
             request_timeout_ms: server.request_timeout_ms,
@@ -309,6 +339,7 @@ impl From<&McpServerConfig> for McpServerDiskOut {
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect();
                 out.env_encrypted = stdio.env_encrypted.clone();
+                out.env_credential_refs = stdio.env_credential_refs.clone();
                 out.startup_timeout_ms = Some(stdio.startup_timeout_ms);
             }
             TransportConfig::Sse(sse) => {
@@ -332,6 +363,16 @@ impl From<&McpServerConfig> for McpServerDiskOut {
                             .map(|value| (header.name.clone(), value.clone()))
                     })
                     .collect();
+                out.header_credential_refs = sse
+                    .headers
+                    .iter()
+                    .filter_map(|header| {
+                        header
+                            .credential_ref
+                            .as_ref()
+                            .map(|value| (header.name.clone(), value.clone()))
+                    })
+                    .collect();
                 out.connect_timeout_ms = Some(sse.connect_timeout_ms);
             }
             TransportConfig::StreamableHttp(config) => {
@@ -351,6 +392,16 @@ impl From<&McpServerConfig> for McpServerDiskOut {
                     .filter_map(|header| {
                         header
                             .value_encrypted
+                            .as_ref()
+                            .map(|value| (header.name.clone(), value.clone()))
+                    })
+                    .collect();
+                out.header_credential_refs = config
+                    .headers
+                    .iter()
+                    .filter_map(|header| {
+                        header
+                            .credential_ref
                             .as_ref()
                             .map(|value| (header.name.clone(), value.clone()))
                     })
@@ -503,6 +554,10 @@ pub struct StdioConfig {
     /// the paired plaintext); a later migration moves it to the credential store.
     #[serde(default, skip_serializing)]
     pub env_encrypted: HashMap<String, String>,
+    /// Stable references for secret environment values stored in the isolated
+    /// credential store. The map key remains visible configuration metadata.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env_credential_refs: HashMap<String, String>,
     /// Startup timeout in milliseconds
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_ms: u64,
@@ -559,6 +614,9 @@ pub struct HeaderConfig {
     /// the paired plaintext); a later migration moves it to the credential store.
     #[serde(default, skip_serializing)]
     pub value_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 /// Reconnection configuration
@@ -815,6 +873,7 @@ mod tests {
                         name: "Authorization".to_string(),
                         value: "Bearer token".to_string(),
                         value_encrypted: None,
+                        credential_ref: None,
                     }],
                     connect_timeout_ms: 5000,
                 }),
@@ -874,6 +933,7 @@ mod tests {
             name: "Content-Type".to_string(),
             value: "application/json".to_string(),
             value_encrypted: None,
+            credential_ref: None,
         };
         assert_eq!(header.name, "Content-Type");
         assert_eq!(header.value, "application/json");
@@ -948,6 +1008,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     env_encrypted,
+                    env_credential_refs: HashMap::new(),
                     startup_timeout_ms: default_startup_timeout(),
                 }),
                 request_timeout_ms: default_request_timeout(),
@@ -990,6 +1051,7 @@ mod tests {
                             "TOKEN".to_string(),
                             "stdio-ciphertext".to_string(),
                         )]),
+                        env_credential_refs: HashMap::new(),
                         startup_timeout_ms: default_startup_timeout(),
                     }),
                 ),
@@ -1001,6 +1063,7 @@ mod tests {
                             name: "Authorization".to_string(),
                             value: "sse-secret".to_string(),
                             value_encrypted: Some("sse-ciphertext".to_string()),
+                            credential_ref: None,
                         }],
                         connect_timeout_ms: default_connect_timeout(),
                     }),
@@ -1013,6 +1076,7 @@ mod tests {
                             name: "Authorization".to_string(),
                             value: "http-secret".to_string(),
                             value_encrypted: Some("http-ciphertext".to_string()),
+                            credential_ref: None,
                         }],
                         connect_timeout_ms: default_connect_timeout(),
                     }),

@@ -637,16 +637,27 @@ mod tests {
     }
 
     #[test]
-    fn generic_set_preserves_api_key_encrypted_at_rest() {
+    fn generic_set_preserves_provider_credential_reference_at_rest() {
         let _guard = crate::test_support::env_cache_lock_acquire();
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_path_buf();
 
-        // Seed a config with an encrypted-at-rest anthropic key (the dedicated
-        // CLI writer path: plaintext in memory, save encrypts).
+        let reference = crate::credential_ref("provider", "anthropic", "api_key").unwrap();
+        crate::CredentialStore::open(&data_dir)
+            .replace(
+                reference.clone(),
+                "sk-ant-super-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        // Seed a config with a credential-store-backed anthropic key.
         let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
-        config.providers.anthropic =
-            Some(serde_json::from_value(json!({"api_key": "sk-ant-super-secret"})).unwrap());
+        config.providers.anthropic = Some(crate::AnthropicConfig {
+            api_key: "sk-ant-super-secret".to_string(),
+            credential_ref: Some(reference.clone()),
+            ..Default::default()
+        });
         config.save_to_dir(data_dir.clone()).expect("seed save");
 
         let on_disk = std::fs::read_to_string(data_dir.join("providers.json")).unwrap();
@@ -654,10 +665,11 @@ mod tests {
             !on_disk.contains("sk-ant-super-secret"),
             "plaintext key must never be written to disk"
         );
-        let cipher_before = serde_json::from_str::<Value>(&on_disk).unwrap()["anthropic"]
-            ["api_key_encrypted"]
+        let before: Value = serde_json::from_str(&on_disk).unwrap();
+        let before_data = before.get("data").unwrap_or(&before);
+        let reference_before = before_data["anthropic"]["credential_ref"]
             .as_str()
-            .expect("encrypted key present")
+            .expect("credential reference present")
             .to_string();
 
         // Now perform an UNRELATED generic set and save again.
@@ -674,14 +686,16 @@ mod tests {
         let on_disk = std::fs::read_to_string(data_dir.join("providers.json")).unwrap();
         assert!(!on_disk.contains("sk-ant-super-secret"));
         let root: Value = serde_json::from_str(&on_disk).unwrap();
-        assert_eq!(root["anthropic"]["model"], json!("claude-x"));
+        let data = root.get("data").unwrap_or(&root);
+        assert_eq!(data["anthropic"]["model"], json!("claude-x"));
         assert_eq!(
-            root["anthropic"]["api_key_encrypted"]
+            data["anthropic"]["credential_ref"]
                 .as_str()
-                .expect("encrypted key still present"),
-            cipher_before,
-            "an unrelated generic set must not churn or drop the stored ciphertext"
+                .expect("credential reference still present"),
+            reference_before,
+            "an unrelated generic set must not churn or drop the credential reference"
         );
+        assert!(!on_disk.contains("api_key_encrypted"));
 
         let config_json: Value = serde_json::from_slice(
             &std::fs::read(data_dir.join("config.json")).expect("root config exists"),

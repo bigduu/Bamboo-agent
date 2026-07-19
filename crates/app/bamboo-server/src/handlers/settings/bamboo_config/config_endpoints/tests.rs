@@ -51,6 +51,7 @@ async fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_a
         api_key: "sk-secret".to_string(),
         api_key_from_env: false,
         api_key_encrypted: None,
+        credential_ref: None,
         base_url: None,
         model: None,
         fast_model: None,

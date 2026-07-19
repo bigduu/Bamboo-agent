@@ -28,6 +28,7 @@ impl std::ops::DerefMut for ProviderConfigsModule {
 
 impl ProviderConfigsModule {
     pub(crate) fn load_sync(&mut self, data_dir: &Path) -> Result<bool> {
+        crate::migrate_provider_mcp_credentials(data_dir)?;
         let store = AtomicJsonStore::new(data_dir.join(FILE_NAME), 1);
         if let Some(stored) = store.load_validated_allowing_unversioned(|_| Ok(()))? {
             // A provider module loaded through ConfigRegistry must be just as
@@ -37,18 +38,43 @@ impl ProviderConfigsModule {
             let mut config = Config::default();
             config.providers.0 = stored.data;
             config.hydrate_provider_api_keys_from_encrypted();
+            config.hydrate_provider_credentials_from_store(data_dir)?;
             self.0 = config.providers.0.clone();
             return Ok(true);
         }
         Ok(false)
     }
     pub(crate) fn save_sync(&self, data_dir: &Path) -> Result<()> {
-        // Provider fields keep plaintext only in memory. Make the module safe
-        // to persist through ConfigRegistry directly, not only through
-        // Config::save_to_dir's broader secret-refresh pass.
-        let mut config = Config::default();
-        config.providers.0 = self.0.clone();
-        config.refresh_provider_api_keys_encrypted()?;
+        crate::migrate_provider_mcp_credentials(data_dir)?;
+        // The sidecar is metadata-only after credential-ref migration. Runtime
+        // plaintext is skipped by serde and legacy ciphertext is explicitly
+        // cleared. A new non-environment secret must be written through the
+        // credential API so the credential + section transaction is explicit.
+        let mut providers = self.0.clone();
+        macro_rules! sanitize {
+            ($field:ident) => {
+                if let Some(provider) = providers.$field.as_mut() {
+                    if !provider.api_key.trim().is_empty()
+                        && !provider.api_key_from_env
+                        && provider.credential_ref.is_none()
+                    {
+                        anyhow::bail!(
+                            "provider secret requires credential API before section persistence"
+                        );
+                    }
+                    provider.api_key_encrypted = None;
+                }
+            };
+        }
+        sanitize!(openai);
+        sanitize!(anthropic);
+        sanitize!(gemini);
+        if let Some(provider) = providers.bodhi.as_mut() {
+            if !provider.api_key.trim().is_empty() && provider.credential_ref.is_none() {
+                anyhow::bail!("provider secret requires credential API before section persistence");
+            }
+            provider.api_key_encrypted = None;
+        }
         let path = data_dir.join(FILE_NAME);
         let has_envelope_marker = std::fs::read(&path)
             .ok()
@@ -64,9 +90,9 @@ impl ProviderConfigsModule {
             let revision = store
                 .load_validated_allowing_unversioned(|_| Ok(()))?
                 .map_or(0, |stored| stored.revision);
-            store.commit_allowing_unversioned(revision, config.providers.0, |_| Ok(()))?;
+            store.commit_allowing_unversioned(revision, providers, |_| Ok(()))?;
         } else {
-            save_sidecar_with_sanitized_backup(&path, &config.providers.0)?;
+            save_sidecar_with_sanitized_backup(&path, &providers)?;
         }
         Ok(())
     }

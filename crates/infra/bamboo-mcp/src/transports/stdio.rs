@@ -244,6 +244,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         }
     }
@@ -325,6 +326,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -350,6 +352,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -366,6 +369,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -387,6 +391,7 @@ mod tests {
             cwd: None,
             env,
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -407,6 +412,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         };
         let mut transport = StdioTransport::new(config);
@@ -446,6 +452,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         };
         let mut transport = StdioTransport::new(config);

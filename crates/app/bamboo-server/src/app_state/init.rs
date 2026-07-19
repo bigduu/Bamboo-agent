@@ -227,6 +227,7 @@ mod mcp_startup_tests {
                 cwd: None,
                 env: std::collections::HashMap::new(),
                 env_encrypted: std::collections::HashMap::new(),
+                env_credential_refs: std::collections::HashMap::new(),
                 startup_timeout_ms: 100,
             }),
             request_timeout_ms: 100,

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config_store::{
     AtomicJsonStore, ConfigStoreError, ConfigStoreResult, SectionSourceKind, SectionStatus,
@@ -100,12 +101,28 @@ struct CredentialEntry {
     source: CredentialSource,
     updated_at: DateTime<Utc>,
     key_version: u32,
+    /// Monotonic source-section revision for migrated records. User-written
+    /// entries keep this absent and always outrank migration replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CredentialDocument {
     #[serde(default)]
     entries: BTreeMap<CredentialRef, CredentialEntry>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedCredentialMigration {
+    pub bytes: Vec<u8>,
+    pub added: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreparedCredentialEnvelope {
+    schema_version: u32,
+    data: CredentialDocument,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +234,7 @@ impl CredentialStore {
                 source,
                 updated_at,
                 key_version: ENCRYPTION_KEY_VERSION,
+                migration_generation: None,
             },
         );
         let revision = self
@@ -272,6 +290,118 @@ impl CredentialStore {
             .transpose()
     }
 
+    /// Build, but do not install, a credential document for a cross-file
+    /// migration. Installation must go through [`Self::commit_migration`] so a
+    /// user update racing a staged transaction cannot be overwritten.
+    pub(crate) fn prepare_migration(
+        &self,
+        secrets: Vec<(CredentialRef, String, u64)>,
+    ) -> ConfigStoreResult<PreparedCredentialMigration> {
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for migration".to_string(),
+            ));
+        }
+        let mut added = 0;
+        for (credential_ref, secret, migration_generation) in secrets {
+            if document.entries.get(&credential_ref).is_some_and(|entry| {
+                entry.source != CredentialSource::Migrated
+                    || entry.migration_generation.unwrap_or(0) >= migration_generation
+            }) {
+                continue;
+            }
+            if secret.trim().is_empty() || crate::patch::is_masked_api_key(&secret) {
+                return Err(ConfigStoreError::Validation(
+                    "legacy credential value is invalid".to_string(),
+                ));
+            }
+            let ciphertext = crate::encryption::encrypt(&secret).map_err(|_| {
+                ConfigStoreError::Validation("credential encryption failed".to_string())
+            })?;
+            let was_new = document
+                .entries
+                .insert(
+                    credential_ref,
+                    CredentialEntry {
+                        ciphertext,
+                        source: CredentialSource::Migrated,
+                        updated_at: Utc::now(),
+                        key_version: ENCRYPTION_KEY_VERSION,
+                        migration_generation: Some(migration_generation),
+                    },
+                )
+                .is_none();
+            added += usize::from(was_new);
+        }
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": health.revision.saturating_add(1),
+            "data": document,
+        }))?;
+        Ok(PreparedCredentialMigration { bytes, added })
+    }
+
+    /// Merge a durable staged migration candidate under the credential store's
+    /// revision CAS. User records always win; a migrated record may be rebased
+    /// by a newer legacy section write. Replaying the same committed candidate
+    /// is a no-op.
+    pub(crate) fn commit_migration(&self, staged: &[u8]) -> ConfigStoreResult<()> {
+        let prepared: PreparedCredentialEnvelope = serde_json::from_slice(staged)?;
+        if prepared.schema_version != CREDENTIAL_SCHEMA_VERSION {
+            return Err(ConfigStoreError::Validation(
+                "staged credential document has an unsupported schema".to_string(),
+            ));
+        }
+        validate_document(&prepared.data).map_err(ConfigStoreError::Validation)?;
+        for _ in 0..16 {
+            let (mut current, health) = self.load_document_with_health()?;
+            if health.status == SectionStatus::Degraded {
+                return Err(ConfigStoreError::Validation(
+                    "credential document is unavailable for migration".to_string(),
+                ));
+            }
+            let mut changed = false;
+            for (credential_ref, entry) in &prepared.data.entries {
+                match current.entries.get(credential_ref) {
+                    None => {
+                        current
+                            .entries
+                            .insert(credential_ref.clone(), entry.clone());
+                        changed = true;
+                    }
+                    Some(existing)
+                        if existing.source == CredentialSource::Migrated
+                            && entry.source == CredentialSource::Migrated
+                            && existing.migration_generation.unwrap_or(0)
+                                < entry.migration_generation.unwrap_or(0) =>
+                    {
+                        current
+                            .entries
+                            .insert(credential_ref.clone(), entry.clone());
+                        changed = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            match self
+                .store
+                .commit(health.revision, current, validate_document)
+            {
+                Ok(_) => return Ok(()),
+                Err(ConfigStoreError::Conflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ConfigStoreError::Validation(
+            "credential migration could not obtain a stable revision".to_string(),
+        ))
+    }
+
     fn load_document(&self) -> ConfigStoreResult<CredentialDocument> {
         self.load_document_with_health()
             .map(|(document, _)| document)
@@ -323,7 +453,33 @@ fn validate_document(document: &CredentialDocument) -> Result<(), String> {
 
 /// Stable credential reference convention used by migrations and section DTOs.
 pub fn credential_ref(domain: &str, owner: &str, field: &str) -> ConfigStoreResult<CredentialRef> {
-    CredentialRef::parse(format!("{domain}.{owner}.{field}"))
+    CredentialRef::parse(format!(
+        "{}.{}.{}",
+        credential_ref_component(domain),
+        credential_ref_component(owner),
+        credential_ref_component(field)
+    ))
+}
+
+/// Encode an arbitrary external identifier into one reference component.
+/// Common ASCII identifiers retain the documented readable convention. The
+/// reserved `x_` prefix plus hex encoding makes unsafe names injective (for
+/// example `a.b`, `a/b`, and the literal `x_612e62` cannot collide).
+fn credential_ref_component(value: &str) -> String {
+    let readable = !value.is_empty()
+        && value.len() <= 43
+        && !value.starts_with("x_")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if readable {
+        return value.to_string();
+    }
+    if value.len() <= 20 {
+        return format!("x_{}", hex::encode(value.as_bytes()));
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    format!("x_h{}", hex::encode(&digest[..20]))
 }
 
 pub fn credentials_path(data_dir: impl AsRef<Path>) -> PathBuf {
@@ -393,6 +549,33 @@ mod tests {
         assert!(CredentialRef::parse("provider.openai.api_key").is_ok());
         assert!(CredentialRef::parse("../credentials").is_err());
         assert!(CredentialRef::parse("x".repeat(161)).is_err());
+    }
+
+    #[test]
+    fn external_names_map_to_valid_non_colliding_references() {
+        let values = ["a.b", "a/b", "x_612e62", "a b", "你好"];
+        let references = values
+            .iter()
+            .map(|name| credential_ref("mcp", name, "header_Authorization").unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(references.len(), values.len());
+        assert!(references
+            .iter()
+            .all(|reference| CredentialRef::parse(reference.as_str()).is_ok()));
+        assert_eq!(
+            credential_ref("provider", "openai", "api_key")
+                .unwrap()
+                .as_str(),
+            "provider.openai.api_key"
+        );
+        let long = credential_ref(
+            "mcp",
+            &format!("server/{}", "界".repeat(40)),
+            &format!("header/{}", "x".repeat(100)),
+        )
+        .unwrap();
+        assert!(long.as_str().len() <= 160);
+        assert!(CredentialRef::parse(long.as_str()).is_ok());
     }
 
     #[test]

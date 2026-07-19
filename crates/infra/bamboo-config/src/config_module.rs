@@ -281,15 +281,26 @@ mod tests {
     fn providers_sidecar_never_contains_plaintext_api_key() {
         let _key = crate::encryption::set_test_encryption_key([23; 32]);
         let dir = TempDir::new().unwrap();
+        let reference = crate::credential_ref("provider", "openai", "api_key").unwrap();
+        crate::CredentialStore::open(dir.path())
+            .replace(
+                reference.clone(),
+                "sk-plaintext-must-not-leak",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         let mut config = Config::default();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "sk-plaintext-must-not-leak".into(),
+            credential_ref: Some(reference),
             ..OpenAIConfig::default()
         });
         config.save_providers_to_dir(dir.path()).unwrap();
         let raw = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
         assert!(!raw.contains("sk-plaintext-must-not-leak"));
-        assert!(raw.contains("api_key_encrypted"));
+        assert!(!raw.contains("api_key_encrypted"));
+        assert!(raw.contains("credential_ref"));
     }
 
     #[test]
@@ -347,10 +358,22 @@ mod tests {
             &dir.path().join("providers.json"),
             json!({"openai": {"api_key": "sk-old-plaintext", "model": "old"}}),
         );
+        crate::migrate_provider_mcp_credentials(dir.path()).unwrap();
+        let reference = crate::credential_ref("provider", "openai", "api_key").unwrap();
+        let store = crate::CredentialStore::open(dir.path());
+        store
+            .replace(
+                reference.clone(),
+                "sk-new-plaintext",
+                crate::CredentialSource::User,
+                store.revision().unwrap(),
+            )
+            .unwrap();
 
         let providers = ProviderConfigs {
             openai: Some(OpenAIConfig {
                 api_key: "sk-new-plaintext".into(),
+                credential_ref: Some(reference),
                 model: Some("new".into()),
                 ..OpenAIConfig::default()
             }),
@@ -362,7 +385,8 @@ mod tests {
 
         let current = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
         assert!(!current.contains("sk-new-plaintext"));
-        assert!(current.contains("api_key_encrypted"));
+        assert!(!current.contains("api_key_encrypted"));
+        assert!(current.contains("credential_ref"));
         let backup = std::fs::read_to_string(dir.path().join("providers.json.bak")).unwrap();
         assert!(!backup.contains("sk-old-plaintext"));
 

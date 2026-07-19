@@ -16,6 +16,7 @@ fn create_test_server_config(id: &str) -> McpServerConfig {
             cwd: None,
             env: std::collections::HashMap::new(),
             env_encrypted: std::collections::HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         }),
         request_timeout_ms: 5000,
@@ -571,6 +572,7 @@ async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_in
         cwd: None,
         env: std::collections::HashMap::new(),
         env_encrypted: std::collections::HashMap::new(),
+        env_credential_refs: std::collections::HashMap::new(),
         startup_timeout_ms: 100,
     });
     let candidate = McpConfig {

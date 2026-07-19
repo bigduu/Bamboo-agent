@@ -16,6 +16,7 @@ use fs2::FileExt;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -84,6 +85,27 @@ impl AtomicFileStore {
     pub fn write_bytes_without_backup(&self, bytes: &[u8]) -> ConfigStoreResult<()> {
         let _lock = self.lock()?;
         self.install_bytes(bytes)
+    }
+
+    /// Install bytes only when the current file still matches the caller's
+    /// staged base. The comparison and atomic replacement share the file's
+    /// advisory lock, closing the editor/API lost-update window.
+    pub fn write_bytes_if_hash(
+        &self,
+        expected_sha256: &str,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<bool> {
+        let _lock = self.lock()?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if hex::encode(Sha256::digest(&current)) != expected_sha256 {
+            return Ok(false);
+        }
+        self.install_bytes(bytes)?;
+        Ok(true)
     }
 
     fn lock(&self) -> ConfigStoreResult<FileLock> {

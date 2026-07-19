@@ -271,6 +271,7 @@ mod comprehensive_config_tests {
             api_key: String::new(),
             api_key_from_env: false,
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("claude-3".to_string()),
             fast_model: None,

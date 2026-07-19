@@ -39,6 +39,7 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
                 api_key: "sk-test".to_string(),
                 api_key_from_env: false,
                 api_key_encrypted: None,
+                credential_ref: None,
                 base_url: None,
                 model: None,
                 fast_model: None,
