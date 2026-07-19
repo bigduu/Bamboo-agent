@@ -98,7 +98,8 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
         .unwrap_or("")
         .contains("Invalid configuration"));
 
-    // 4) Strict provider endpoint: valid provider config => 200 and persists encrypted key.
+    // 4) Strict provider endpoint: valid provider config => 200 and routes the
+    // secret to credentials.json while providers.json stores only a stable ref.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/settings/provider")
         .set_json(json!({
@@ -111,15 +112,32 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
 
     let providers_document = read_config_json(&providers_path);
     let providers = config_document_data(&providers_document);
-    let openai_encrypted_before = providers
+    let openai_ref_before = providers
         .get("openai")
-        .and_then(|o| o.get("api_key_encrypted"))
+        .and_then(|o| o.get("credential_ref"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    assert!(
-        !openai_encrypted_before.is_empty(),
-        "expected providers.openai.api_key_encrypted to be persisted"
+    assert_eq!(openai_ref_before, "provider.openai.api_key");
+    assert!(providers["openai"].get("api_key_encrypted").is_none());
+    let providers_raw = std::fs::read_to_string(&providers_path).unwrap();
+    let credentials_raw = std::fs::read_to_string(data_dir.join("credentials.json")).unwrap();
+    assert!(!providers_raw.contains("sk-test-key"));
+    assert!(!credentials_raw.contains("sk-test-key"));
+    let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+    assert_eq!(
+        state
+            .credential_store
+            .resolve(&reference)
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "sk-test-key"
+    );
+    let reloaded = bamboo_config::Config::from_data_dir_without_env(Some(data_dir.clone()));
+    assert_eq!(
+        reloaded.providers().openai.as_ref().unwrap().api_key,
+        "sk-test-key"
     );
 
     // Attempt to inject api_key_encrypted via permissive endpoint - must be ignored.
@@ -143,21 +161,14 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
         );
     }
     let providers = config_document_data(&providers_document);
-    let openai_encrypted_after = providers
+    let openai_ref_after = providers
         .get("openai")
-        .and_then(|o| o.get("api_key_encrypted"))
+        .and_then(|o| o.get("credential_ref"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    assert!(
-        !openai_encrypted_after.is_empty(),
-        "expected providers.openai.api_key_encrypted to remain persisted"
-    );
-    assert!(
-        openai_encrypted_after.contains(':'),
-        "expected nonce:ciphertext format"
-    );
-    assert_ne!(openai_encrypted_after, "deadbeef");
+    assert_eq!(openai_ref_after, openai_ref_before);
+    assert!(providers["openai"].get("api_key_encrypted").is_none());
 
     // Ensure the permissive endpoint merges without clobbering prior provider/setup state.
     let req = test::TestRequest::post()
@@ -175,6 +186,13 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     assert_eq!(cfg["http_proxy"], "http://proxy:8080");
     assert_eq!(cfg["https_proxy"], "http://proxy:8080");
     assert!(cfg.get("setup").is_some(), "expected setup to still exist");
+    let providers_document = read_config_json(&providers_path);
+    let providers = config_document_data(&providers_document);
+    assert_eq!(
+        providers["openai"]["credential_ref"], "provider.openai.api_key",
+        "metadata-only updates must preserve the existing credential ref"
+    );
+    assert!(providers["openai"].get("api_key_encrypted").is_none());
 }
 
 #[actix_web::test]

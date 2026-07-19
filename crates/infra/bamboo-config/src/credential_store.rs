@@ -4,7 +4,7 @@
 //! through [`CredentialStore::resolve`] for runtime construction and is wrapped
 //! in a type whose `Debug` implementation is always redacted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -282,6 +282,113 @@ impl CredentialStore {
         ))
     }
 
+    /// Atomically route explicitly updated built-in provider API keys into the
+    /// credential document and replace their legacy ciphertext with stable
+    /// references in the runtime config.
+    ///
+    /// Providers absent from `intents` are never inspected or rewritten. This
+    /// is important for compatibility PATCH endpoints: an ordinary metadata
+    /// update must preserve the existing credential reference exactly.
+    pub fn persist_provider_api_key_intents(
+        &self,
+        config: &mut crate::Config,
+        intents: &BTreeSet<String>,
+    ) -> ConfigStoreResult<()> {
+        struct PlannedUpdate {
+            provider: &'static str,
+            reference: CredentialRef,
+            secret: Option<String>,
+        }
+
+        let mut updates = Vec::new();
+        macro_rules! plan_env {
+            ($name:literal, $field:ident) => {
+                if intents.contains($name) {
+                    if let Some(provider) = config.providers.$field.as_ref() {
+                        let reference = credential_ref("provider", $name, "api_key")?;
+                        let secret = (!provider.api_key_from_env
+                            && !provider.api_key.trim().is_empty())
+                        .then(|| provider.api_key.trim().to_string());
+                        updates.push(PlannedUpdate {
+                            provider: $name,
+                            reference,
+                            secret,
+                        });
+                    }
+                }
+            };
+        }
+        plan_env!("openai", openai);
+        plan_env!("anthropic", anthropic);
+        plan_env!("gemini", gemini);
+        if intents.contains("bodhi") {
+            if let Some(provider) = config.providers.bodhi.as_ref() {
+                updates.push(PlannedUpdate {
+                    provider: "bodhi",
+                    reference: credential_ref("provider", "bodhi", "api_key")?,
+                    secret: (!provider.api_key.trim().is_empty())
+                        .then(|| provider.api_key.trim().to_string()),
+                });
+            }
+        }
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for provider update".to_string(),
+            ));
+        }
+        let mut changed = false;
+        for update in &updates {
+            match update.secret.as_deref() {
+                Some(secret) => {
+                    let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
+                        ConfigStoreError::Validation("credential encryption failed".to_string())
+                    })?;
+                    document.entries.insert(
+                        update.reference.clone(),
+                        CredentialEntry {
+                            ciphertext,
+                            source: CredentialSource::User,
+                            updated_at: Utc::now(),
+                            key_version: ENCRYPTION_KEY_VERSION,
+                            migration_generation: None,
+                        },
+                    );
+                    changed = true;
+                }
+                None => {
+                    changed |= document.entries.remove(&update.reference).is_some();
+                }
+            }
+        }
+        if changed {
+            self.store
+                .commit(health.revision, document, validate_document)?;
+        }
+
+        macro_rules! publish_ref {
+            ($name:literal, $field:ident) => {
+                if let Some(update) = updates.iter().find(|update| update.provider == $name) {
+                    if let Some(provider) = config.providers.$field.as_mut() {
+                        provider.credential_ref =
+                            update.secret.as_ref().map(|_| update.reference.clone());
+                        provider.api_key_encrypted = None;
+                    }
+                }
+            };
+        }
+        publish_ref!("openai", openai);
+        publish_ref!("anthropic", anthropic);
+        publish_ref!("gemini", gemini);
+        publish_ref!("bodhi", bodhi);
+        Ok(())
+    }
+
     pub fn resolve(
         &self,
         credential_ref: &CredentialRef,
@@ -543,6 +650,80 @@ mod tests {
         assert_eq!(revision, 2);
         assert!(!status.configured);
         assert!(store.resolve(&reference).unwrap().is_none());
+    }
+
+    #[test]
+    fn provider_intents_commit_once_and_publish_only_stable_refs() {
+        let _key = crate::encryption::set_test_encryption_key([0x32; 32]);
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let mut config = crate::Config::default();
+        config.providers.openai = Some(crate::OpenAIConfig {
+            api_key: "sk-openai-secret".to_string(),
+            ..Default::default()
+        });
+        config.providers.anthropic = Some(crate::AnthropicConfig {
+            api_key: "sk-anthropic-secret".to_string(),
+            ..Default::default()
+        });
+        let intents = BTreeSet::from(["anthropic".to_string(), "openai".to_string()]);
+
+        store
+            .persist_provider_api_key_intents(&mut config, &intents)
+            .unwrap();
+        let revision = store.revision().unwrap();
+        assert_eq!(revision, 1, "both secrets must use one CAS commit");
+
+        let openai = config.providers.openai.as_ref().unwrap();
+        assert_eq!(
+            openai.credential_ref.as_ref().map(CredentialRef::as_str),
+            Some("provider.openai.api_key")
+        );
+        assert!(openai.api_key_encrypted.is_none());
+        let anthropic = config.providers.anthropic.as_ref().unwrap();
+        assert_eq!(
+            anthropic.credential_ref.as_ref().map(CredentialRef::as_str),
+            Some("provider.anthropic.api_key")
+        );
+        assert!(anthropic.api_key_encrypted.is_none());
+
+        assert_eq!(
+            store
+                .resolve(openai.credential_ref.as_ref().unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-openai-secret"
+        );
+        assert_eq!(
+            store
+                .resolve(anthropic.credential_ref.as_ref().unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-anthropic-secret"
+        );
+        let raw = std::fs::read_to_string(store.path()).unwrap();
+        assert!(!raw.contains("sk-openai-secret"));
+        assert!(!raw.contains("sk-anthropic-secret"));
+
+        let no_intents = BTreeSet::new();
+        store
+            .persist_provider_api_key_intents(&mut config, &no_intents)
+            .unwrap();
+        assert_eq!(store.revision().unwrap(), revision);
+        assert_eq!(
+            config
+                .providers
+                .openai
+                .as_ref()
+                .unwrap()
+                .credential_ref
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "provider.openai.api_key"
+        );
     }
 
     #[test]

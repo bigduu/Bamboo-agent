@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
             cwd: None,
             env: HashMap::new(),
             env_encrypted: HashMap::new(),
+            env_credential_refs: HashMap::new(),
             startup_timeout_ms: 20_000,
         }),
         request_timeout_ms: 60_000,

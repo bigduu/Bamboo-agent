@@ -1,8 +1,8 @@
 use bamboo_config::encryption::set_test_encryption_key;
-use bamboo_config::{OpenAIConfig, ProviderConfigs};
+use bamboo_config::{CredentialStore, OpenAIConfig, ProviderConfigs};
 use bamboo_llm::Config;
 use bamboo_mcp::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 fn deep_merge_json(dst: &mut serde_json::Value, src: serde_json::Value) {
     match (dst, src) {
@@ -80,7 +80,11 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
         },
     ];
 
-    // Ensure encrypted-at-rest blobs exist on disk (what the settings endpoints round-trip).
+    // Route provider plaintext to the isolated store before persisting its
+    // metadata-only sidecar. MCP remains on its transitional ciphertext path.
+    CredentialStore::open(temp_dir)
+        .persist_provider_api_key_intents(&mut cfg, &BTreeSet::from(["openai".to_string()]))
+        .unwrap();
     cfg.refresh_provider_api_keys_encrypted().unwrap();
     cfg.refresh_mcp_secrets_encrypted().unwrap();
 

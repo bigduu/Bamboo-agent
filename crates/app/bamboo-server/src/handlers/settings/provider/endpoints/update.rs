@@ -18,13 +18,19 @@ pub(super) async fn handle_update_provider_config(
     let mut patch_obj = build_provider_patch(&payload);
     config_manager::sanitize_root_patch(&mut patch_obj);
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
+    let credential_store = app_state.credential_store.clone();
 
     let new_config = match app_state
         .update_config(
             move |config| {
                 let current = config.clone();
-                let new_config = apply_provider_patch(&current, patch_obj, &api_key_intents)?;
+                let mut new_config = apply_provider_patch(&current, patch_obj, &api_key_intents)?;
                 validate_provider_config(&new_config)?;
+                config_manager::persist_provider_credentials_for_patch(
+                    &mut new_config,
+                    &api_key_intents,
+                    &credential_store,
+                )?;
 
                 *config = new_config;
                 Ok(())

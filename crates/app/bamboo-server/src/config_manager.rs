@@ -20,7 +20,7 @@
 use serde_json::{Map, Value};
 
 use crate::error::AppError;
-use bamboo_config::patch::ProviderApiKeyIntents;
+use bamboo_config::{patch::ProviderApiKeyIntents, ConfigStoreError, CredentialStore};
 use bamboo_llm::Config;
 
 // Re-export pure domain logic from the config crate so server consumers
@@ -133,6 +133,31 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
     }
 
     Ok(())
+}
+
+/// Compatibility bridge for legacy settings endpoints. Explicit built-in
+/// provider key updates are committed to the isolated credential store in one
+/// CAS write, then represented in config only by stable credential refs.
+pub fn persist_provider_credentials_for_patch(
+    config: &mut Config,
+    intents: &ProviderApiKeyIntents,
+    store: &CredentialStore,
+) -> Result<(), AppError> {
+    store
+        .persist_provider_api_key_intents(config, &intents.providers)
+        .map_err(|error| match error {
+            ConfigStoreError::Conflict { expected, actual } => {
+                AppError::ConfigConflict { expected, actual }
+            }
+            ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+            ConfigStoreError::Io(error) => AppError::StorageError(error),
+            ConfigStoreError::Json(_) => {
+                AppError::BadRequest("credential document is invalid".to_string())
+            }
+            ConfigStoreError::Watch(error) => {
+                AppError::InternalError(anyhow::anyhow!("credential store watch failed: {error}"))
+            }
+        })
 }
 
 pub fn assert_json_object(value: Value) -> Result<Map<String, Value>, AppError> {

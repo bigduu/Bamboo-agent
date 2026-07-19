@@ -3,15 +3,16 @@
 //! These are local, server-less commands: they read and write `config.json`
 //! under the data dir directly (via [`bamboo_config::Config`]), so a fresh
 //! install can configure a provider + API key and self-diagnose **without** the
-//! web UI or hand-editing JSON. Writes go through `Config::save_to_dir`, which
-//! encrypts provider keys at rest and writes atomically (with a rotating `.bak`).
+//! web UI or hand-editing JSON. Provider keys go through the isolated
+//! credential store; configuration metadata is written via `Config::save_to_dir`.
 
+use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use bamboo_config::Config;
+use bamboo_config::{Config, CredentialStore};
 
 /// Providers that `init` / `config set` can configure with a static API key.
 ///
@@ -104,12 +105,16 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         .model
         .or_else(|| default_model_for(&provider).map(String::from));
 
-    // 5. Apply + persist (encrypts the key, atomic write, rotates .bak).
+    // 5. Apply + persist. Credential storage is committed before the metadata
+    // sidecar so no ordinary config document ever contains the plaintext.
     config.provider = provider.clone();
-    set_provider_api_key(&mut config, &provider, &api_key)?;
+    configure_provider_credential(&mut config, &provider, &api_key)?;
     if let Some(m) = &model {
         set_provider_model(&mut config, &provider, m)?;
     }
+    let provider_intents = BTreeSet::from([provider.clone()]);
+    CredentialStore::open(&data_dir)
+        .persist_provider_api_key_intents(&mut config, &provider_intents)?;
     config
         .save_to_dir(data_dir.clone())
         .context("failed to write config.json")?;
@@ -217,8 +222,8 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
 ///
 /// Two classes of keys:
 ///
-/// **Secret-aware keys** (encrypted at rest; the value is set on the typed
-/// config and `Config::save_to_dir` writes the `*_encrypted` form):
+/// **Secret-aware keys** (provider keys use the isolated credential store;
+/// remaining legacy domains are encrypted by `Config::save_to_dir`):
 ///   - `provider` (default provider selection; not a secret, kept for
 ///     backward compatibility)
 ///   - `providers.<anthropic|openai|gemini>.api_key` (unchanged legacy path)
@@ -243,6 +248,7 @@ pub fn run_config_set(
 ) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
+    let mut provider_credential_intents = BTreeSet::new();
 
     let parts: Vec<&str> = key.split('.').collect();
     // `Some(outcome)` = generic dot-path set (validated new config inside);
@@ -261,11 +267,8 @@ pub fn run_config_set(
             if v.is_empty() {
                 bail!("api_key must not be empty");
             }
-            config
-                .providers_mut()
-                .bodhi
-                .get_or_insert_with(empty_provider)
-                .api_key = v.to_string();
+            configure_provider_credential(&mut config, "bodhi", v)?;
+            provider_credential_intents.insert("bodhi".to_string());
             None
         }
         ["providers", p, "api_key"] => {
@@ -274,7 +277,8 @@ pub fn run_config_set(
             if v.is_empty() {
                 bail!("api_key must not be empty");
             }
-            set_provider_api_key(&mut config, &p, v)?;
+            configure_provider_credential(&mut config, &p, v)?;
+            provider_credential_intents.insert(p);
             None
         }
         ["providers", p, "model"] => {
@@ -346,10 +350,14 @@ pub fn run_config_set(
         return Ok(());
     }
 
-    let to_save = match outcome {
+    let mut to_save = match outcome {
         Some(out) => out.config,
         None => config,
     };
+    if !provider_credential_intents.is_empty() {
+        CredentialStore::open(&data_dir)
+            .persist_provider_api_key_intents(&mut to_save, &provider_credential_intents)?;
+    }
     to_save
         .save_to_dir(data_dir.clone())
         .context("failed to write config.json")?;
@@ -456,6 +464,19 @@ fn set_provider_api_key(config: &mut Config, provider: &str, key: &str) -> Resul
                 .api_key = key.to_string()
         }
         _ => bail!("unsupported provider '{provider}'"),
+    }
+    Ok(())
+}
+
+fn configure_provider_credential(config: &mut Config, provider: &str, key: &str) -> Result<()> {
+    if provider == "bodhi" {
+        config
+            .providers_mut()
+            .bodhi
+            .get_or_insert_with(empty_provider)
+            .api_key = key.to_string();
+    } else {
+        set_provider_api_key(config, provider, key)?;
     }
     Ok(())
 }
@@ -752,7 +773,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_path_buf();
 
-        // Legacy secret-aware arm (unchanged behavior).
+        // Secret-aware arm writes through the isolated credential store.
         run_config_set(
             "providers.anthropic.api_key",
             "sk-ant-setupcli-secret",
@@ -767,9 +788,13 @@ mod tests {
             "plaintext api_key must never reach disk"
         );
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(root["anthropic"]["api_key_encrypted"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            root["anthropic"]["credential_ref"],
+            "provider.anthropic.api_key"
+        );
+        assert!(root["anthropic"].get("api_key_encrypted").is_none());
+        let credentials = std::fs::read_to_string(data_dir.join("credentials.json")).unwrap();
+        assert!(!credentials.contains("sk-ant-setupcli-secret"));
 
         // A follow-up generic set must keep the stored ciphertext intact.
         run_config_set(
@@ -783,9 +808,11 @@ mod tests {
         assert!(!raw.contains("sk-ant-setupcli-secret"));
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(root["anthropic"]["model"], "claude-x");
-        assert!(root["anthropic"]["api_key_encrypted"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            root["anthropic"]["credential_ref"],
+            "provider.anthropic.api_key"
+        );
+        assert!(root["anthropic"].get("api_key_encrypted").is_none());
 
         let reloaded = Config::from_data_dir_without_env(Some(data_dir));
         assert_eq!(
