@@ -285,14 +285,21 @@ impl AppState {
         let ledger_schedule_bridge =
             Arc::new(crate::schedule_app::LateBoundLedgerBridge::default());
 
+        // The runtime and skill tools must share one cache-aware coordinator.
+        // Session setup publishes this run's resolved skill allowlist through it
+        // before the model can call load_skill.
+        let session_repo = bamboo_engine::SessionRepository::new(
+            sessions.clone(),
+            storage.clone(),
+            persistence.clone(),
+        );
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
             skill_manager.clone(),
-            storage.clone(),
-            persistence.clone(),
-            sessions.clone(),
+            session_repo.clone(),
             bamboo_home_dir.clone(),
             notification_service.clone(),
             session_event_senders.clone(),
@@ -379,7 +386,7 @@ impl AppState {
         let agent = Arc::new(
             bamboo_engine::Agent::builder()
                 .storage(storage.clone())
-                .persistence(persistence.clone())
+                .persistence(Arc::new(session_repo.clone()))
                 .attachment_reader(session_store.clone())
                 .skill_manager(skill_manager.clone())
                 .metrics_collector(metrics_service.collector())

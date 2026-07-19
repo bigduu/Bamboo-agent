@@ -1,0 +1,7 @@
+[
+  {"kind":"success","prompt":"Simplify a covered module while preserving its API.","expectations":["Establishes a behavior baseline","Reduces concrete complexity","Runs equivalence validation"]},
+  {"kind":"missing_input","prompt":"Simplify this, with no scope identified.","expectations":["Inspects available context","Clarifies only the behavior boundary that matters"]},
+  {"kind":"tool_failure","prompt":"The focused equivalence test cannot run.","expectations":["Does not claim behavior preservation","Explains alternate evidence and residual risk"]},
+  {"kind":"permission_denied","prompt":"A required generated fixture cannot be accessed.","expectations":["Does not bypass the denial","Keeps changes within verified scope"]},
+  {"kind":"context_compaction","prompt":"Continue a broad simplification after compaction.","expectations":["Preserves the behavior baseline and scoped decisions","Avoids unrelated cleanup"]}
+]

@@ -1,0 +1,12 @@
+[
+  {"query":"Review the changes on this branch for correctness and security regressions before I open a PR.","should_trigger":true},
+  {"query":"Can you do a thorough review of PR #482 and only report actionable findings with line references?","should_trigger":true},
+  {"query":"Audit crates/storage/src/journal.rs for data-loss and concurrency risks; do not edit anything.","should_trigger":true},
+  {"query":"Look over this patch and tell me whether the new retry logic can duplicate side effects.","should_trigger":true},
+  {"query":"Please inspect the staged diff, tests, and compatibility impact. If it is clean, say that explicitly.","should_trigger":true},
+  {"query":"The login test is failing on Windows; reproduce it, find the root cause, and fix it.","should_trigger":false},
+  {"query":"Proofread the wording in README.md and make the tone friendlier.","should_trigger":false},
+  {"query":"Implement pagination for the users endpoint and add tests.","should_trigger":false},
+  {"query":"Explain how the approval state machine works to a new contributor.","should_trigger":false},
+  {"query":"Research the latest OWASP guidance for WebSocket authentication and cite primary sources.","should_trigger":false}
+]

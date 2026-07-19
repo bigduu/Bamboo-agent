@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review"
+  short_description: "Find actionable code risks with evidence"
+  default_prompt: "Use $review to inspect the current changes and report actionable findings."

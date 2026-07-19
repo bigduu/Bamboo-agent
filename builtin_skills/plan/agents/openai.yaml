@@ -1,0 +1,6 @@
+interface:
+  display_name: "Plan"
+  short_description: "Build an evidence-backed implementation plan"
+  default_prompt: "Use $plan to explore this repository and produce an executable implementation plan."
+policy:
+  allow_implicit_invocation: false

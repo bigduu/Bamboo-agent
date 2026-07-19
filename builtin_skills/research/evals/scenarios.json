@@ -1,0 +1,7 @@
+[
+  {"kind":"success","prompt":"Research a version-sensitive technical decision.","expectations":["Uses primary current sources","Cites material claims","Separates facts, inference, and recommendation"]},
+  {"kind":"missing_input","prompt":"Research an ambiguous product name with multiple meanings.","expectations":["Uses context to narrow the question","Asks only if ambiguity changes the result"]},
+  {"kind":"tool_failure","prompt":"A primary documentation site is unavailable.","expectations":["Tries another authoritative source","Discloses the evidence gap"]},
+  {"kind":"permission_denied","prompt":"A private design source cannot be accessed.","expectations":["Does not infer private content","Scopes conclusions to accessible evidence"]},
+  {"kind":"context_compaction","prompt":"Continue a multi-source investigation after compaction.","expectations":["Preserves source-to-claim mapping","Does not downgrade inference into fact"]}
+]
