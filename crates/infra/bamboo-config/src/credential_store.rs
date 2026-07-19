@@ -346,6 +346,14 @@ impl CredentialStore {
         provider_instance_intents: &BTreeSet<String>,
         persisted_instance_refs: &BTreeMap<String, CredentialRef>,
     ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        if provider_intents.contains("__proxy_auth") {
+            if provider_intents.len() != 1 || !provider_instance_intents.is_empty() {
+                return Err(ConfigStoreError::Validation(
+                    "proxy auth must be updated in its own credential transaction".to_string(),
+                ));
+            }
+            return self.prepare_proxy_auth_intent(config).map(Some);
+        }
         struct PlannedUpdate {
             target: PlannedProviderTarget,
             reference: CredentialRef,
@@ -534,6 +542,78 @@ impl CredentialStore {
             touched_refs: touched_refs.into_iter().collect(),
             required_refs,
         }))
+    }
+
+    /// Prepare the fixed proxy-auth credential update without publishing it.
+    /// The caller commits these bytes together with root metadata through the
+    /// recoverable exact transaction manifest.
+    pub(crate) fn prepare_proxy_auth_intent(
+        &self,
+        config: &mut crate::Config,
+    ) -> ConfigStoreResult<PreparedProviderCredentialUpdate> {
+        let reference = config
+            .proxy_auth_credential_ref
+            .clone()
+            .unwrap_or(credential_ref("proxy", "default", "auth")?);
+        let secret = config
+            .proxy_auth
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let counts = config_credential_ref_counts(config)?;
+        let shared = counts.get(&reference).copied().unwrap_or(0) > 1;
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for proxy auth update".to_string(),
+            ));
+        }
+        let mut changed = false;
+        if let Some(secret) = secret.as_deref() {
+            let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
+                ConfigStoreError::Validation("credential encryption failed".to_string())
+            })?;
+            document.entries.insert(
+                reference.clone(),
+                CredentialEntry {
+                    ciphertext,
+                    source: CredentialSource::User,
+                    updated_at: Utc::now(),
+                    key_version: ENCRYPTION_KEY_VERSION,
+                    migration_generation: None,
+                },
+            );
+            changed = true;
+        } else if !shared {
+            changed = document.entries.remove(&reference).is_some();
+        }
+        config.proxy_auth_credential_ref = Some(reference.clone());
+        config.proxy_auth_encrypted = None;
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        let required_refs = if secret.is_some() || shared {
+            vec![reference.clone()]
+        } else {
+            Vec::new()
+        };
+        ensure_required_entries(&document, &required_refs)?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        Ok(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            touched_refs: vec![reference],
+            required_refs,
+        })
     }
 
     pub fn resolve(
@@ -900,6 +980,9 @@ fn config_credential_ref_counts(
     add_provider!(anthropic);
     add_provider!(gemini);
     add_provider!(bodhi);
+    if let Some(reference) = config.proxy_auth_credential_ref.as_ref() {
+        add(reference);
+    }
     for instance in config.provider_instances.values() {
         if let Some(reference) = instance.credential_ref.as_ref() {
             add(reference);

@@ -230,10 +230,10 @@ fn guard_reserved_paths(segments: &[&str], key: &str) -> Result<(), DotPathError
     }
 
     match segments {
-        ["proxy_auth", ..] => Err(DotPathError::Unsupported {
+        ["proxy_auth", ..] | ["proxy_auth_credential_ref"] => Err(DotPathError::Unsupported {
             key: key.to_string(),
-            reason: "proxy credentials are managed via the web UI settings (stored \
-                     encrypted as `proxy_auth_encrypted`)"
+            reason: "proxy credentials are managed via the dedicated proxy-auth API and \
+                     isolated credential store"
                 .to_string(),
         }),
         ["providers", p, "api_key"] => Err(DotPathError::SecretPath {
@@ -565,6 +565,7 @@ mod tests {
         }
         for key in [
             "proxy_auth.username",
+            "proxy_auth_credential_ref",
             "providers.anthropic.api_key_encrypted",
             "proxy_auth_encrypted",
             "subagents.broker.token",

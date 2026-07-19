@@ -234,3 +234,13 @@ resolve before runtime staging or durable commit. Root `config.json` uses a
 disk-only MCP projection that removes both hydrated plaintext and legacy
 ciphertext for ref-backed env/header fields. Public compatibility serialization
 continues to round-trip the hydrated MCP shape.
+
+Proxy authentication now follows the same isolated-store boundary. Legacy
+`proxy_auth_encrypted`, per-scheme encrypted fields, and any legacy inline
+`proxy_auth` object migrate to `proxy.default.auth` through the recoverable
+credential/config manifest. Ordinary root config and rotated backups retain
+only `proxy_auth_credential_ref`; runtime construction resolves and parses the
+credential after migration readiness. The dedicated set/clear endpoint uses an
+exact transaction, and its status endpoint returns credential/section metadata
+without username, password, ciphertext, or mask values. Generic root saves
+refuse an unisolated proxy secret rather than recreating legacy ciphertext.

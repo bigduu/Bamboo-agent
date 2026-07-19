@@ -201,6 +201,20 @@ pub fn persist_provider_credential_transaction(
     persist_provider_instance_credential_transaction(data_dir, config, intents, &BTreeSet::new())
 }
 
+/// Persist proxy authentication and its stable root metadata as one
+/// recoverable credential/config transaction.
+pub fn persist_proxy_auth_credential_transaction(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+) -> ConfigStoreResult<()> {
+    persist_provider_instance_credential_transaction(
+        data_dir,
+        config,
+        &BTreeSet::from(["__proxy_auth".to_string()]),
+        &BTreeSet::new(),
+    )
+}
+
 /// Persist built-in and provider-instance API-key updates as one recoverable
 /// credential/config transaction. Instance deletes are represented by an
 /// intent whose id is absent from `config`; the prior durable credential ref
@@ -729,6 +743,9 @@ fn plan_provider_instance_section(
             extracted.extend(root_extracted);
             Ok(planned)
         }
+        Err(ConfigStoreError::Validation(message)) if message.starts_with("legacy proxy auth") => {
+            Err(ConfigStoreError::Validation(message))
+        }
         // Root-config corruption recovery runs after migration readiness. Do
         // not block provider/MCP/store hydration because this optional member
         // has invalid JSON or validation errors. Crucially, extraction is
@@ -747,42 +764,41 @@ fn plan_provider_instance_document(
     let object = root.as_object_mut().ok_or_else(|| {
         ConfigStoreError::Validation("root configuration must be an object".to_string())
     })?;
-    let Some(instances) = object
-        .get_mut("provider_instances")
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(None);
-    };
     let migration_generation = minimum_generation;
-    let mut changed = false;
-    for (instance_id, value) in instances {
-        let instance = value.as_object_mut().ok_or_else(|| {
-            ConfigStoreError::Validation("provider instance must be an object".to_string())
+    let mut changed = migrate_proxy_auth(object, extracted, migration_generation)?;
+    if let Some(instances) = object.get_mut("provider_instances") {
+        let instances = instances.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("provider_instances must be an object".to_string())
         })?;
-        let plaintext = take_nonempty_string(instance, "api_key")?;
-        let ciphertext = take_nonempty_string(instance, "api_key_encrypted")?;
-        if plaintext.is_none() && ciphertext.is_none() {
-            continue;
+        for (instance_id, value) in instances {
+            let instance = value.as_object_mut().ok_or_else(|| {
+                ConfigStoreError::Validation("provider instance must be an object".to_string())
+            })?;
+            let plaintext = take_nonempty_string(instance, "api_key")?;
+            let ciphertext = take_nonempty_string(instance, "api_key_encrypted")?;
+            if plaintext.is_none() && ciphertext.is_none() {
+                continue;
+            }
+            let reference = existing_or_generated_ref(
+                instance.get("credential_ref"),
+                "provider_instance",
+                instance_id,
+                "api_key",
+            )?;
+            instance.insert(
+                "credential_ref".to_string(),
+                Value::String(reference.as_str().to_string()),
+            );
+            extracted.push(ExtractedSecret {
+                credential_ref: reference,
+                value: plaintext
+                    .map(LegacySecret::Plaintext)
+                    .or_else(|| ciphertext.map(LegacySecret::Ciphertext))
+                    .expect("one provider-instance credential exists"),
+                migration_generation,
+            });
+            changed = true;
         }
-        let reference = existing_or_generated_ref(
-            instance.get("credential_ref"),
-            "provider_instance",
-            instance_id,
-            "api_key",
-        )?;
-        instance.insert(
-            "credential_ref".to_string(),
-            Value::String(reference.as_str().to_string()),
-        );
-        extracted.push(ExtractedSecret {
-            credential_ref: reference,
-            value: plaintext
-                .map(LegacySecret::Plaintext)
-                .or_else(|| ciphertext.map(LegacySecret::Ciphertext))
-                .expect("one provider-instance credential exists"),
-            migration_generation,
-        });
-        changed = true;
     }
     if !changed {
         return Ok(None);
@@ -794,6 +810,81 @@ fn plan_provider_instance_document(
         original,
         migration_generation,
     }))
+}
+
+fn migrate_proxy_auth(
+    object: &mut Map<String, Value>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    let had_legacy = [
+        "proxy_auth",
+        "proxy_auth_encrypted",
+        "http_proxy_auth_encrypted",
+        "https_proxy_auth_encrypted",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    let plaintext = match object.remove("proxy_auth") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(normalize_proxy_auth_secret(&serde_json::to_string(
+            &value,
+        )?)?),
+    };
+    let mut secrets = plaintext.into_iter().collect::<BTreeSet<_>>();
+    for key in [
+        "proxy_auth_encrypted",
+        "https_proxy_auth_encrypted",
+        "http_proxy_auth_encrypted",
+    ] {
+        if let Some(ciphertext) = take_nonempty_string(object, key)? {
+            let decrypted = crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                ConfigStoreError::Validation(
+                    "legacy proxy auth credential could not be decrypted".to_string(),
+                )
+            })?;
+            secrets.insert(normalize_proxy_auth_secret(&decrypted)?);
+        }
+    }
+    if secrets.len() > 1 {
+        return Err(ConfigStoreError::Validation(
+            "legacy proxy auth fields contain conflicting credentials".to_string(),
+        ));
+    }
+    let existing = object
+        .get("proxy_auth_credential_ref")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    ConfigStoreError::Validation(
+                        "proxy auth credential reference must be a string".to_string(),
+                    )
+                })
+                .and_then(|value| CredentialRef::parse(value.to_string()))
+        })
+        .transpose()?;
+    let Some(secret) = secrets.into_iter().next() else {
+        return Ok(had_legacy);
+    };
+    let reference = existing.unwrap_or(credential_ref("proxy", "default", "auth")?);
+    object.insert(
+        "proxy_auth_credential_ref".to_string(),
+        Value::String(reference.as_str().to_string()),
+    );
+    extracted.push(ExtractedSecret {
+        credential_ref: reference,
+        value: LegacySecret::Plaintext(secret),
+        migration_generation,
+    });
+    Ok(true)
+}
+
+fn normalize_proxy_auth_secret(value: &str) -> ConfigStoreResult<String> {
+    let auth: crate::ProxyAuth = serde_json::from_str(value).map_err(|_| {
+        ConfigStoreError::Validation("legacy proxy auth credential is invalid".to_string())
+    })?;
+    serde_json::to_string(&auth).map_err(ConfigStoreError::Json)
 }
 
 fn plan_mcp_section(
@@ -1516,76 +1607,86 @@ fn scrub_provider_instance_credentials(
     store: &CredentialStore,
     root: &mut Value,
 ) -> ConfigStoreResult<bool> {
-    let Some(instances) = root
-        .get_mut("provider_instances")
-        .and_then(Value::as_object_mut)
-    else {
+    let Some(object) = root.as_object_mut() else {
         return Ok(false);
     };
-    let mut changed = false;
-    for (instance_id, value) in instances {
-        let Some(instance) = value.as_object_mut() else {
-            continue;
-        };
-        let plaintext = instance
-            .get("api_key")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
-        let ciphertext = instance
-            .get("api_key_encrypted")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
-        let had_secret =
-            instance.contains_key("api_key") || instance.contains_key("api_key_encrypted");
-        if !had_secret {
-            continue;
-        }
-        let reference = if let Some(existing) = instance.get("credential_ref") {
-            let existing = existing.as_str().ok_or_else(|| {
-                ConfigStoreError::Validation(
-                    "provider instance credential reference must be a string".to_string(),
-                )
-            })?;
-            CredentialRef::parse(existing.to_string())?
-        } else {
-            credential_ref("provider_instance", instance_id, "api_key")?
-        };
-        let status = store.status_unchecked(&reference)?;
-        if !status.configured {
-            let secret = match plaintext {
-                Some(secret) => secret,
-                None => match ciphertext {
-                    Some(ciphertext) => crate::encryption::decrypt(&ciphertext).map_err(|_| {
-                        ConfigStoreError::Validation(
-                            "legacy provider instance credential could not be decrypted"
-                                .to_string(),
-                        )
-                    })?,
-                    None => {
-                        instance.remove("api_key");
-                        instance.remove("api_key_encrypted");
-                        changed = true;
-                        continue;
-                    }
-                },
+    let mut extracted = Vec::new();
+    let mut changed = migrate_proxy_auth(object, &mut extracted, 1)?;
+    if !extracted.is_empty() {
+        let resolved = resolve_extracted_secrets(store, extracted)?;
+        let prepared = store.prepare_migration(resolved)?;
+        store.commit_migration(&prepared.bytes)?;
+    }
+    if let Some(instances) = object
+        .get_mut("provider_instances")
+        .and_then(Value::as_object_mut)
+    {
+        for (instance_id, value) in instances {
+            let Some(instance) = value.as_object_mut() else {
+                continue;
             };
-            let revision = store.revision_unchecked()?;
-            store.replace_unchecked(
-                reference.clone(),
-                &secret,
-                crate::CredentialSource::Migrated,
-                revision,
-            )?;
+            let plaintext = instance
+                .get("api_key")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+            let ciphertext = instance
+                .get("api_key_encrypted")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+            let had_secret =
+                instance.contains_key("api_key") || instance.contains_key("api_key_encrypted");
+            if !had_secret {
+                continue;
+            }
+            let reference = if let Some(existing) = instance.get("credential_ref") {
+                let existing = existing.as_str().ok_or_else(|| {
+                    ConfigStoreError::Validation(
+                        "provider instance credential reference must be a string".to_string(),
+                    )
+                })?;
+                CredentialRef::parse(existing.to_string())?
+            } else {
+                credential_ref("provider_instance", instance_id, "api_key")?
+            };
+            let status = store.status_unchecked(&reference)?;
+            if !status.configured {
+                let secret = match plaintext {
+                    Some(secret) => secret,
+                    None => match ciphertext {
+                        Some(ciphertext) => {
+                            crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                                ConfigStoreError::Validation(
+                                    "legacy provider instance credential could not be decrypted"
+                                        .to_string(),
+                                )
+                            })?
+                        }
+                        None => {
+                            instance.remove("api_key");
+                            instance.remove("api_key_encrypted");
+                            changed = true;
+                            continue;
+                        }
+                    },
+                };
+                let revision = store.revision_unchecked()?;
+                store.replace_unchecked(
+                    reference.clone(),
+                    &secret,
+                    crate::CredentialSource::Migrated,
+                    revision,
+                )?;
+            }
+            instance.remove("api_key");
+            instance.remove("api_key_encrypted");
+            instance.insert(
+                "credential_ref".to_string(),
+                Value::String(reference.as_str().to_string()),
+            );
+            changed = true;
         }
-        instance.remove("api_key");
-        instance.remove("api_key_encrypted");
-        instance.insert(
-            "credential_ref".to_string(),
-            Value::String(reference.as_str().to_string()),
-        );
-        changed = true;
     }
     Ok(changed)
 }
@@ -1915,6 +2016,190 @@ impl Drop for MigrationLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_proxy_auth_migrates_idempotently_and_hydrates_runtime() {
+        let _key = crate::encryption::set_test_encryption_key([0x91; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let auth = serde_json::json!({"username": "alice", "password": "proxy-secret"});
+        let ciphertext = crate::encryption::encrypt(&auth.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "http_proxy": "http://proxy.example:8080",
+                "proxy_auth_encrypted": ciphertext,
+                "unknown_proxy_peer": {"kept": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+        let first_root = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+        let first_credentials = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let root: Value = serde_json::from_slice(&first_root).unwrap();
+        assert_eq!(root["proxy_auth_credential_ref"], "proxy.default.auth");
+        assert!(root.get("proxy_auth").is_none());
+        assert!(root.get("proxy_auth_encrypted").is_none());
+        assert!(root.get("http_proxy_auth_encrypted").is_none());
+        assert!(root.get("https_proxy_auth_encrypted").is_none());
+        assert_eq!(root["unknown_proxy_peer"]["kept"], true);
+        assert!(!String::from_utf8_lossy(&first_credentials).contains("proxy-secret"));
+
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let loaded_auth = loaded.proxy_auth.as_ref().expect("proxy auth hydrated");
+        assert_eq!(loaded_auth.username, "alice");
+        assert_eq!(loaded_auth.password, "proxy-secret");
+
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            first_root
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            first_credentials
+        );
+    }
+
+    #[test]
+    fn conflicting_legacy_proxy_auth_rolls_back_before_any_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0x92; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let first = crate::encryption::encrypt(
+            &serde_json::json!({"username": "alice", "password": "one"}).to_string(),
+        )
+        .unwrap();
+        let second = crate::encryption::encrypt(
+            &serde_json::json!({"username": "alice", "password": "two"}).to_string(),
+        )
+        .unwrap();
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "proxy_auth_encrypted": first,
+            "https_proxy_auth_encrypted": second
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
+
+        let error = migrate_provider_mcp_credentials(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("conflicting"));
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn proxy_auth_exact_transaction_preserves_shared_refs_on_clear() {
+        let _key = crate::encryption::set_test_encryption_key([0x93; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = credential_ref("provider", "openai", "api_key").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                shared.clone(),
+                "shared-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut config = crate::Config::default();
+        config.proxy_auth_credential_ref = Some(shared.clone());
+        config.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(shared.clone()),
+            ..crate::OpenAIConfig::default()
+        });
+        config.save_to_dir(dir.path().to_path_buf()).unwrap();
+        config.proxy_auth = None;
+
+        persist_proxy_auth_credential_transaction(dir.path(), &mut config).unwrap();
+        assert_eq!(
+            store.resolve(&shared).unwrap().unwrap().expose(),
+            "shared-secret"
+        );
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["proxy_auth_credential_ref"], shared.as_str());
+        assert!(root.get("proxy_auth_encrypted").is_none());
+    }
+
+    #[test]
+    fn committed_proxy_auth_transaction_recovers_without_partial_publication() {
+        let _key = crate::encryption::set_test_encryption_key([0x94; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "recover-user".to_string(),
+            password: "recover-secret".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterManifest),
+        )
+        .is_err());
+        let before_recovery: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert!(before_recovery.get("proxy_auth_credential_ref").is_none());
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let auth = loaded
+            .proxy_auth
+            .as_ref()
+            .expect("committed proxy auth recovered");
+        assert_eq!(auth.username, "recover-user");
+        assert_eq!(auth.password, "recover-secret");
+        let root = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        let credentials = std::fs::read_to_string(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        for secret in ["recover-user", "recover-secret"] {
+            assert!(!root.contains(secret));
+            assert!(!credentials.contains(secret));
+        }
+    }
+
+    #[test]
+    fn backup_only_proxy_auth_is_stored_before_backup_is_scrubbed() {
+        let _key = crate::encryption::set_test_encryption_key([0x95; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").unwrap();
+        let ciphertext = crate::encryption::encrypt(
+            &serde_json::json!({"username": "backup-user", "password": "backup-secret"})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.json.bak"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "proxy_auth_encrypted": ciphertext
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+        let reference = credential_ref("proxy", "default", "auth").unwrap();
+        let stored = CredentialStore::open(dir.path())
+            .resolve(&reference)
+            .unwrap()
+            .unwrap();
+        let auth: crate::ProxyAuth = serde_json::from_str(stored.expose()).unwrap();
+        assert_eq!(auth.password, "backup-secret");
+        let backup = std::fs::read_to_string(dir.path().join("config.json.bak")).unwrap();
+        assert!(!backup.contains("proxy_auth_encrypted"));
+        assert!(!backup.contains("backup-secret"));
+        assert!(backup.contains("proxy_auth_credential_ref"));
+    }
 
     fn install_fixture(dir: &Path) {
         let provider = include_bytes!("../tests/fixtures/config_migration/providers-legacy.json");

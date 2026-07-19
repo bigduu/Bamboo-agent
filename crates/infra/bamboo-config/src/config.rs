@@ -1153,15 +1153,15 @@ pub struct ConfigValues {
     pub https_proxy: String,
     /// Proxy authentication credentials
     ///
-    /// Note: this is kept in-memory only. On disk we store `proxy_auth_encrypted`.
+    /// Kept in memory only; ordinary config stores `proxy_auth_credential_ref`.
     #[serde(skip_serializing)]
     pub proxy_auth: Option<ProxyAuth>,
-    /// Encrypted proxy authentication credentials (nonce:ciphertext)
-    ///
-    /// This is the at-rest storage representation. When present, Bamboo will
-    /// decrypt it into `proxy_auth` at load time.
+    /// Legacy encrypted proxy authentication accepted only for migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_auth_encrypted: Option<String>,
+    /// Stable credential-store reference for proxy authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_credential_ref: Option<crate::CredentialRef>,
     /// Deprecated: Use `providers.copilot.headless_auth` instead
     #[serde(default)]
     pub headless_auth: bool,
@@ -1309,6 +1309,7 @@ impl Default for ConfigValues {
             https_proxy: String::new(),
             proxy_auth: None,
             proxy_auth_encrypted: None,
+            proxy_auth_credential_ref: None,
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
@@ -1348,6 +1349,8 @@ struct NetworkConfigSection {
     proxy_auth: Option<ProxyAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy_auth_encrypted: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_auth_credential_ref: Option<crate::CredentialRef>,
     #[serde(default)]
     headless_auth: bool,
     #[serde(default)]
@@ -1507,6 +1510,7 @@ impl From<ConfigValues> for ConfigRoot {
             https_proxy,
             proxy_auth,
             proxy_auth_encrypted,
+            proxy_auth_credential_ref,
             headless_auth,
             provider,
             defaults,
@@ -1538,6 +1542,7 @@ impl From<ConfigValues> for ConfigRoot {
                 https_proxy,
                 proxy_auth,
                 proxy_auth_encrypted,
+                proxy_auth_credential_ref,
                 headless_auth,
                 server,
             },
@@ -1594,6 +1599,7 @@ impl From<ConfigRoot> for ConfigValues {
             https_proxy,
             proxy_auth,
             proxy_auth_encrypted,
+            proxy_auth_credential_ref,
             headless_auth,
             server,
         } = network;
@@ -1631,6 +1637,7 @@ impl From<ConfigRoot> for ConfigValues {
             https_proxy,
             proxy_auth,
             proxy_auth_encrypted,
+            proxy_auth_credential_ref,
             headless_auth,
             provider,
             defaults,
@@ -2762,6 +2769,12 @@ impl Config {
 
         // Decrypt encrypted proxy auth into in-memory plaintext form.
         config.hydrate_proxy_auth_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_proxy_auth_from_store(&data_dir) {
+                tracing::warn!(error = %error, "proxy auth credential hydration unavailable");
+                config.proxy_auth = None;
+            }
+        }
         // Decrypt encrypted provider API keys into in-memory plaintext form.
         config.hydrate_provider_api_keys_from_encrypted();
         // Decrypt encrypted provider-instance API keys into in-memory plaintext form.
@@ -3555,6 +3568,7 @@ impl Config {
                 https_proxy: String::new(),
                 proxy_auth: None,
                 proxy_auth_encrypted: None,
+                proxy_auth_credential_ref: None,
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
                 cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
@@ -3786,6 +3800,13 @@ impl Config {
                  Config::confirm_recovery (or the recovery-confirm API) first. (#153)",
                 status.source,
                 status.quarantine_path,
+            );
+        }
+        if self.proxy_auth_credential_ref.is_none()
+            && (self.proxy_auth.is_some() || self.proxy_auth_encrypted.is_some())
+        {
+            anyhow::bail!(
+                "proxy auth requires the isolated credential transaction before persistence"
             );
         }
 
@@ -7187,7 +7208,7 @@ mod tests {
     }
 
     #[test]
-    fn config_save_encrypts_proxy_auth_and_load_hydrates_plaintext() {
+    fn config_save_refuses_unisolated_proxy_auth_without_writing_ciphertext() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
@@ -7203,28 +7224,15 @@ mod tests {
             username: "user".to_string(),
             password: "pass".to_string(),
         });
-        config
-            .save_to_dir(temp_home.path.clone())
-            .expect("save should encrypt proxy auth");
-
-        let content =
-            std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
+        let error = config.save_to_dir(temp_home.path.clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("isolated credential transaction"));
+        let path = temp_home.path.join("config.json");
         assert!(
-            content.contains("proxy_auth_encrypted"),
-            "config.json should store encrypted proxy auth"
+            !path.exists(),
+            "a rejected unisolated secret must not create config.json"
         );
-        assert!(
-            !content.contains("\"proxy_auth\""),
-            "config.json should not store plaintext proxy_auth"
-        );
-
-        let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
-        let loaded_auth = loaded
-            .proxy_auth
-            .as_ref()
-            .expect("proxy auth should be hydrated");
-        assert_eq!(loaded_auth.username, "user");
-        assert_eq!(loaded_auth.password, "pass");
         drop(key_guard);
     }
 

@@ -42,6 +42,10 @@ impl Config {
     /// we can re-encrypt deterministically on save without ever persisting
     /// plaintext credentials.
     pub fn hydrate_proxy_auth_from_encrypted(&mut self) {
+        if self.proxy_auth_credential_ref.is_some() {
+            self.proxy_auth_encrypted = None;
+            return;
+        }
         if self.proxy_auth.is_some() {
             return;
         }
@@ -100,6 +104,10 @@ impl Config {
     /// This is used both when persisting the config to disk and when generating
     /// API responses that should never include plaintext proxy credentials.
     pub fn refresh_proxy_auth_encrypted(&mut self) -> Result<()> {
+        if self.proxy_auth_credential_ref.is_some() {
+            self.proxy_auth_encrypted = None;
+            return Ok(());
+        }
         // Keep on-disk representation fully derived from the in-memory plaintext:
         // - Some(auth)  => always (re-)encrypt and store `proxy_auth_encrypted`
         // - None        => remove `proxy_auth_encrypted`
@@ -112,6 +120,27 @@ impl Config {
         let encrypted =
             crate::encryption::encrypt(&auth_str).context("Failed to encrypt proxy auth")?;
         self.proxy_auth_encrypted = Some(encrypted);
+        Ok(())
+    }
+
+    /// Hydrate proxy authentication from its isolated credential-store entry.
+    /// The stored secret is the JSON representation of [`crate::ProxyAuth`].
+    pub fn hydrate_proxy_auth_from_store(&mut self, data_dir: &std::path::Path) -> Result<()> {
+        let Some(reference) = self.proxy_auth_credential_ref.as_ref() else {
+            return Ok(());
+        };
+        let value = crate::CredentialStore::open(data_dir)
+            .resolve(reference)
+            .map_err(anyhow::Error::from)?;
+        let Some(value) = value else {
+            self.proxy_auth = None;
+            return Ok(());
+        };
+        self.proxy_auth = Some(
+            serde_json::from_str(value.expose())
+                .context("Failed to parse proxy auth credential")?,
+        );
+        self.proxy_auth_encrypted = None;
         Ok(())
     }
 

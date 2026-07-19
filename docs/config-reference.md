@@ -58,7 +58,7 @@ default. The full field list of `Config`:
 | Field | Type | Notes |
 |---|---|---|
 | `http_proxy` / `https_proxy` | `String` | Outbound proxy URLs for provider HTTP calls. |
-| `proxy_auth_encrypted` | `Option<String>` | Encrypted proxy credentials; hydrated in memory as `proxy_auth`. |
+| `proxy_auth_credential_ref` | `Option<String>` | Stable reference to isolated proxy credentials (normally `proxy.default.auth`); no proxy plaintext, ciphertext, or mask is stored in ordinary config. |
 | `provider` | `String` | Default provider name. Default `"anthropic"`. |
 | `defaults` | `Option<DefaultsConfig>` | Per-role model routing (`chat`/`fast`/`vision`/`planning`/...); only consulted when `features.provider_model_ref` is on. |
 | `providers` | `ProviderConfigs` | Legacy single-instance-per-type provider configs. See [Providers](#providers). |

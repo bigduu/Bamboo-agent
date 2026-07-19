@@ -196,6 +196,7 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     // Never allow clients to modify proxy auth fields or data_dir via this endpoint.
     patch_obj.remove("proxy_auth");
     patch_obj.remove("proxy_auth_encrypted");
+    patch_obj.remove("proxy_auth_credential_ref");
     // Legacy/compat proxy auth keys (written by older Bodhi/Tauri builds).
     patch_obj.remove("http_proxy_auth_encrypted");
     patch_obj.remove("https_proxy_auth_encrypted");
@@ -1408,6 +1409,22 @@ mod tests {
         assert_eq!(instance["api_key"], "sk-user-value");
         assert!(!instance.contains_key("api_key_encrypted"));
         assert!(!instance.contains_key("credential_ref"));
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_proxy_credential_metadata() {
+        let mut patch = json!({
+            "http_proxy": "http://proxy.example:8080",
+            "proxy_auth": {"username": "attacker", "password": "secret"},
+            "proxy_auth_encrypted": "client-ciphertext",
+            "proxy_auth_credential_ref": "attacker.chosen.ref"
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+        assert_eq!(obj["http_proxy"], "http://proxy.example:8080");
+        assert!(!obj.contains_key("proxy_auth"));
+        assert!(!obj.contains_key("proxy_auth_encrypted"));
+        assert!(!obj.contains_key("proxy_auth_credential_ref"));
     }
 
     #[test]

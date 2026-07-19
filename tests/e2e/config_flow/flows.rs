@@ -30,8 +30,8 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
         .set_json(json!({
-            "username": "user",
-            "password": "pass"
+            "username": "proxy-user-name",
+            "password": "proxy-pass-value"
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -47,7 +47,16 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let body = test::read_body(resp).await;
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["configured"], true);
-    assert_eq!(status["username"], "user");
+    assert_eq!(status["credential_ref"], "proxy.default.auth");
+    assert!(status.get("username").is_none());
+    let root = std::fs::read_to_string(&config_path).unwrap();
+    assert!(root.contains("proxy_auth_credential_ref"));
+    assert!(!root.contains("proxy_auth_encrypted"));
+    assert!(!root.contains("\"username\""));
+    assert!(!root.contains("\"password\""));
+    let credentials = std::fs::read_to_string(data_dir.join("credentials.json")).unwrap();
+    assert!(!credentials.contains("proxy-user-name"));
+    assert!(!credentials.contains("proxy-pass-value"));
 
     // Attempt to inject proxy_auth_encrypted via permissive endpoint - must be ignored.
     let req = test::TestRequest::post()
@@ -68,7 +77,8 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let body = test::read_body(resp).await;
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["configured"], true);
-    assert_eq!(status["username"], "user");
+    assert_eq!(status["credential_ref"], "proxy.default.auth");
+    assert!(status.get("username").is_none());
 
     // Mark setup complete (writes into Config.extra["setup"]).
     let req = test::TestRequest::post()

@@ -1518,6 +1518,26 @@ impl AppState {
         Ok(snapshot)
     }
 
+    /// Persist proxy authentication through the isolated credential store and
+    /// publish the detached runtime candidate only after the exact transaction
+    /// has durably committed.
+    pub async fn update_proxy_auth_credential(
+        &self,
+        auth: Option<bamboo_config::ProxyAuth>,
+        effects: ConfigUpdateEffects,
+    ) -> Result<Config, AppError> {
+        self.update_config_with_provider_credentials(
+            move |config| {
+                config.proxy_auth = auth;
+                Ok(())
+            },
+            std::collections::BTreeSet::from(["__proxy_auth".to_string()]),
+            std::collections::BTreeSet::new(),
+            effects,
+        )
+        .await
+    }
+
     /// Replace the full config (used for JSON merge endpoints).
     pub async fn replace_config(
         &self,

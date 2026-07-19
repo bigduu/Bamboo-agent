@@ -16,12 +16,22 @@ pub(super) struct ValidateConfigResponse {
 }
 
 /// Request body for setting proxy authentication.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ProxyAuthPayload {
     /// Proxy username.
     username: Option<String>,
     /// Proxy password.
     password: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyAuthPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyAuthPayload")
+            .field("username", &self.username.as_ref().map(|_| "[REDACTED]"))
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl ProxyAuthPayload {
@@ -182,5 +192,8 @@ mod tests {
 
         let debug_str = format!("{:?}", payload);
         assert!(debug_str.contains("ProxyAuthPayload"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("Some(\"user\")"));
+        assert!(!debug_str.contains("Some(\"pass\")"));
     }
 }

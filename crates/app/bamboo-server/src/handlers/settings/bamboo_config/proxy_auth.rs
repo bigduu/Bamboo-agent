@@ -31,7 +31,8 @@ use super::types::ProxyAuthPayload;
 /// - `500 Internal Server Error`: Failed to save or reload
 ///
 /// # Security
-/// Credentials are encrypted before storage in config.json.
+/// Credentials are encrypted in the isolated credential store. `config.json`
+/// retains only the stable `proxy.default.auth` reference.
 ///
 /// # Example
 /// ```bash
@@ -46,16 +47,8 @@ pub async fn set_proxy_auth(
     let auth = payload.into_inner().into_proxy_auth();
 
     app_state
-        .update_config(
-            move |config| {
-                config.proxy_auth = auth;
-                config.refresh_proxy_auth_encrypted().map_err(|e| {
-                    AppError::InternalError(anyhow::anyhow!(
-                        "Failed to encrypt proxy auth before save: {e}"
-                    ))
-                })?;
-                Ok(())
-            },
+        .update_proxy_auth_credential(
+            auth,
             ConfigUpdateEffects {
                 // Best-effort: setup flows often set proxy auth before provider config is complete.
                 // Persisting should not fail just because provider init can't happen yet.
@@ -81,8 +74,10 @@ pub async fn set_proxy_auth(
 /// # Response Format
 /// ```json
 /// {
+///   "credential_ref": "proxy.default.auth",
 ///   "configured": true,
-///   "username": "myuser"
+///   "revision": 1,
+///   "status": "healthy"
 /// }
 /// ```
 ///
@@ -90,7 +85,7 @@ pub async fn set_proxy_auth(
 /// - `200 OK`: Status retrieved successfully
 ///
 /// # Note
-/// Password is never returned, only whether auth is configured and the username.
+/// Neither username nor password is returned; only credential and section metadata.
 ///
 /// # Example
 /// ```bash
@@ -99,20 +94,31 @@ pub async fn set_proxy_auth(
 pub async fn get_proxy_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    // Defensive: ensure in-memory proxy_auth is hydrated from encrypted fields.
-    // Some call paths update config via JSON patching and may only carry encrypted values.
-    let mut config = app_state.config.write().await;
-    config.hydrate_proxy_auth_from_encrypted();
-
-    if let Some(auth) = config.proxy_auth.as_ref() {
-        return Ok(HttpResponse::Ok().json(serde_json::json!({
-            "configured": true,
-            "username": auth.username,
-        })));
-    }
-
+    let reference = app_state
+        .config
+        .read()
+        .await
+        .proxy_auth_credential_ref
+        .clone()
+        .unwrap_or(
+            bamboo_config::credential_ref("proxy", "default", "auth").map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "invalid proxy credential reference: {error}"
+                ))
+            })?,
+        );
+    let (status, health) = app_state
+        .credential_store
+        .status_with_health(&reference)
+        .map_err(super::credentials::map_store_read_error)?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
-        "configured": false,
-        "username": serde_json::Value::Null
+        "credential_ref": status.credential_ref,
+        "configured": status.configured,
+        "source": status.source,
+        "updated_at": status.updated_at,
+        "revision": health.revision,
+        "status": health.status,
+        "source_kind": health.source,
+        "last_error": health.last_error,
     })))
 }

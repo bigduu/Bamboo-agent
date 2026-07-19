@@ -138,7 +138,7 @@ fn map_store_mutation_error(error: ConfigStoreError) -> AppError {
     }
 }
 
-fn map_store_read_error(error: ConfigStoreError) -> AppError {
+pub(super) fn map_store_read_error(error: ConfigStoreError) -> AppError {
     match error {
         ConfigStoreError::Conflict { expected, actual } => {
             AppError::ConfigConflict { expected, actual }

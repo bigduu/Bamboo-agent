@@ -2067,7 +2067,6 @@ fn serialize_config_for_cli(
     mut config: Config,
     show_secrets: bool,
 ) -> bamboo_agent::Result<serde_json::Value> {
-    config.refresh_proxy_auth_encrypted()?;
     config.refresh_provider_api_keys_encrypted()?;
     config.refresh_mcp_secrets_encrypted()?;
     config.normalize_tool_settings();
@@ -2214,7 +2213,8 @@ mod tests {
         assert!(value["providers"]["openai"]["api_key_encrypted"]
             .as_str()
             .is_some());
-        assert!(value.get("proxy_auth_encrypted").is_some());
+        assert!(value.get("proxy_auth_encrypted").is_none());
+        assert!(value.get("proxy_auth").is_none());
         assert_eq!(
             value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
             "super-secret"
