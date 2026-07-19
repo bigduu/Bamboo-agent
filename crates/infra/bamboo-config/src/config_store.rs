@@ -108,6 +108,30 @@ impl AtomicFileStore {
         Ok(true)
     }
 
+    /// Hash-CAS install that also preserves the ordinary last-known-good
+    /// backup generations. Transaction replay remains idempotent because the
+    /// caller skips this method once the target already matches its candidate.
+    pub fn write_bytes_if_hash_with_backup(
+        &self,
+        expected_sha256: &str,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<bool> {
+        let _lock = self.lock()?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if hex::encode(Sha256::digest(&current)) != expected_sha256 {
+            return Ok(false);
+        }
+        self.commit_bytes_locked(bytes, |previous| {
+            let value: serde_json::Value = serde_json::from_slice(previous)?;
+            Ok(serde_json::to_vec_pretty(&value)?)
+        })?;
+        Ok(true)
+    }
+
     fn lock(&self) -> ConfigStoreResult<FileLock> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         create_dir(parent, self.sensitive)?;

@@ -129,6 +129,12 @@ pub(crate) struct PreparedCredentialMigration {
     pub added: usize,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedProviderCredentialUpdate {
+    pub bytes: Vec<u8>,
+    pub expected_revision: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct PreparedCredentialEnvelope {
     schema_version: u32,
@@ -156,6 +162,11 @@ impl CredentialStore {
     }
 
     pub fn revision(&self) -> ConfigStoreResult<u64> {
+        self.ensure_transaction_ready()?;
+        self.revision_unchecked()
+    }
+
+    pub(crate) fn revision_unchecked(&self) -> ConfigStoreResult<u64> {
         Ok(self.store.load()?.map_or(0, |stored| stored.revision))
     }
 
@@ -173,6 +184,22 @@ impl CredentialStore {
     }
 
     pub fn status_with_health(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<(CredentialStatus, CredentialStoreHealth)> {
+        self.ensure_transaction_ready()?;
+        self.status_with_health_unchecked(credential_ref)
+    }
+
+    pub(crate) fn status_unchecked(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<CredentialStatus> {
+        self.status_with_health_unchecked(credential_ref)
+            .map(|(status, _)| status)
+    }
+
+    fn status_with_health_unchecked(
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<(CredentialStatus, CredentialStoreHealth)> {
@@ -206,6 +233,7 @@ impl CredentialStore {
     pub fn statuses_with_health(
         &self,
     ) -> ConfigStoreResult<(Vec<CredentialStatus>, CredentialStoreHealth)> {
+        self.ensure_transaction_ready()?;
         let (document, health) = self.load_document_with_health()?;
         let statuses = document
             .entries
@@ -221,6 +249,17 @@ impl CredentialStore {
     }
 
     pub fn replace(
+        &self,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.ensure_transaction_ready()?;
+        self.replace_unchecked(credential_ref, secret, source, expected_revision)
+    }
+
+    pub(crate) fn replace_unchecked(
         &self,
         credential_ref: CredentialRef,
         secret: &str,
@@ -266,6 +305,7 @@ impl CredentialStore {
         credential_ref: &CredentialRef,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.ensure_transaction_ready()?;
         let mut document = self.load_document()?;
         document.entries.remove(credential_ref);
         let revision = self
@@ -289,11 +329,11 @@ impl CredentialStore {
     /// Providers absent from `intents` are never inspected or rewritten. This
     /// is important for compatibility PATCH endpoints: an ordinary metadata
     /// update must preserve the existing credential reference exactly.
-    pub fn persist_provider_api_key_intents(
+    pub(crate) fn prepare_provider_api_key_intents(
         &self,
         config: &mut crate::Config,
         intents: &BTreeSet<String>,
-    ) -> ConfigStoreResult<()> {
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
         struct PlannedUpdate {
             provider: &'static str,
             reference: CredentialRef,
@@ -333,7 +373,7 @@ impl CredentialStore {
         }
 
         if updates.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let (mut document, health) = self.load_document_with_health()?;
@@ -366,11 +406,6 @@ impl CredentialStore {
                 }
             }
         }
-        if changed {
-            self.store
-                .commit(health.revision, document, validate_document)?;
-        }
-
         macro_rules! publish_ref {
             ($name:literal, $field:ident) => {
                 if let Some(update) = updates.iter().find(|update| update.provider == $name) {
@@ -386,10 +421,28 @@ impl CredentialStore {
         publish_ref!("anthropic", anthropic);
         publish_ref!("gemini", gemini);
         publish_ref!("bodhi", bodhi);
-        Ok(())
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        let revision = health.revision.saturating_add(u64::from(changed));
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+        }))
     }
 
     pub fn resolve(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<Option<SecretValue>> {
+        self.ensure_transaction_ready()?;
+        self.resolve_unchecked(credential_ref)
+    }
+
+    pub(crate) fn resolve_unchecked(
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<Option<SecretValue>> {
@@ -537,6 +590,11 @@ impl CredentialStore {
             .map(|(document, _)| document)
     }
 
+    fn ensure_transaction_ready(&self) -> ConfigStoreResult<()> {
+        let data_dir = self.path().parent().unwrap_or_else(|| Path::new("."));
+        crate::ensure_provider_mcp_migration_ready(data_dir)
+    }
+
     fn load_document_with_health(
         &self,
     ) -> ConfigStoreResult<(CredentialDocument, CredentialStoreHealth)> {
@@ -668,9 +726,7 @@ mod tests {
         });
         let intents = BTreeSet::from(["anthropic".to_string(), "openai".to_string()]);
 
-        store
-            .persist_provider_api_key_intents(&mut config, &intents)
-            .unwrap();
+        crate::persist_provider_credential_transaction(dir.path(), &mut config, &intents).unwrap();
         let revision = store.revision().unwrap();
         assert_eq!(revision, 1, "both secrets must use one CAS commit");
 
@@ -708,8 +764,7 @@ mod tests {
         assert!(!raw.contains("sk-anthropic-secret"));
 
         let no_intents = BTreeSet::new();
-        store
-            .persist_provider_api_key_intents(&mut config, &no_intents)
+        crate::persist_provider_credential_transaction(dir.path(), &mut config, &no_intents)
             .unwrap();
         assert_eq!(store.revision().unwrap(), revision);
         assert_eq!(

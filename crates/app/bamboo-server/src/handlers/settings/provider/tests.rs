@@ -1,5 +1,5 @@
 use bamboo_config::encryption::set_test_encryption_key;
-use bamboo_config::{CredentialStore, OpenAIConfig, ProviderConfigs};
+use bamboo_config::{OpenAIConfig, ProviderConfigs};
 use bamboo_llm::Config;
 use bamboo_mcp::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
 use std::collections::{BTreeSet, HashMap};
@@ -82,9 +82,12 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
 
     // Route provider plaintext to the isolated store before persisting its
     // metadata-only sidecar. MCP remains on its transitional ciphertext path.
-    CredentialStore::open(temp_dir)
-        .persist_provider_api_key_intents(&mut cfg, &BTreeSet::from(["openai".to_string()]))
-        .unwrap();
+    bamboo_config::persist_provider_credential_transaction(
+        temp_dir,
+        &mut cfg,
+        &BTreeSet::from(["openai".to_string()]),
+    )
+    .unwrap();
     cfg.refresh_provider_api_keys_encrypted().unwrap();
     cfg.refresh_mcp_secrets_encrypted().unwrap();
 

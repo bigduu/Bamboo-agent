@@ -3613,6 +3613,98 @@ impl Config {
         config.providers.save_sync(data_dir)
     }
 
+    /// Build the metadata-only documents used by a provider credential
+    /// transaction. Nothing is written here: the migration journal owns the
+    /// durable commit and publishes both documents together with credentials.
+    pub(crate) fn prepare_provider_transaction_documents(
+        &self,
+        provider_document: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
+            anyhow::bail!(
+                "refusing to overwrite config.json: recovery from {:?} is unconfirmed",
+                status.source
+            );
+        }
+
+        let mut to_save = self.clone();
+        to_save.extra.remove("data_dir");
+        to_save.extra.remove("model");
+        to_save.refresh_encrypted_secrets()?;
+        to_save.sanitize_mcp_credential_refs_for_disk();
+        to_save.sanitize_env_vars_for_disk();
+        to_save.sanitize_cluster_fabric_for_disk();
+        to_save.assign_connect_platform_ids();
+        to_save.normalize_tool_settings();
+        to_save.normalize_skill_settings();
+
+        let mut root = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+            .context("Failed to serialize root config DTO to JSON")?;
+        if let Some(object) = root.as_object_mut() {
+            object.remove("connect");
+        }
+        let root = serde_json::to_vec_pretty(&root)?;
+
+        let mut providers = to_save.providers.0.clone();
+        macro_rules! sanitize_provider {
+            ($field:ident) => {
+                if let Some(provider) = providers.$field.as_mut() {
+                    if !provider.api_key.trim().is_empty()
+                        && !provider.api_key_from_env
+                        && provider.credential_ref.is_none()
+                    {
+                        anyhow::bail!(
+                            "provider secret requires credential transaction before persistence"
+                        );
+                    }
+                    provider.api_key_encrypted = None;
+                }
+            };
+        }
+        sanitize_provider!(openai);
+        sanitize_provider!(anthropic);
+        sanitize_provider!(gemini);
+        if let Some(provider) = providers.bodhi.as_mut() {
+            if !provider.api_key.trim().is_empty() && provider.credential_ref.is_none() {
+                anyhow::bail!("provider secret requires credential transaction before persistence");
+            }
+            provider.api_key_encrypted = None;
+        }
+
+        let existing_provider_value = if provider_document.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice::<Value>(provider_document)
+                    .context("provider metadata document is invalid")?,
+            )
+        };
+        let provider_value = match existing_provider_value {
+            Some(Value::Object(mut envelope))
+                if envelope.contains_key("schema_version")
+                    || envelope.contains_key("revision")
+                    || envelope.contains_key("data") =>
+            {
+                let revision = envelope
+                    .get("revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("provider revision envelope is invalid"))?;
+                let schema_version = envelope
+                    .get("schema_version")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("provider revision envelope is invalid"))?;
+                if schema_version != 1 || !envelope.contains_key("data") {
+                    anyhow::bail!("provider revision envelope is unsupported");
+                }
+                envelope.insert("revision".into(), Value::from(revision.saturating_add(1)));
+                envelope.insert("data".into(), serde_json::to_value(providers)?);
+                Value::Object(envelope)
+            }
+            Some(_) | None => serde_json::to_value(providers)?,
+        };
+        Ok((root, serde_json::to_vec_pretty(&provider_value)?))
+    }
+
     /// The pending config-corruption recovery, if `config.json` failed to
     /// parse on load and the recovery hasn't been confirmed yet. `None` on
     /// every clean load. #153.

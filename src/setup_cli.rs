@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use bamboo_config::{Config, CredentialStore};
+use bamboo_config::Config;
 
 /// Providers that `init` / `config set` can configure with a static API key.
 ///
@@ -113,11 +113,11 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         set_provider_model(&mut config, &provider, m)?;
     }
     let provider_intents = BTreeSet::from([provider.clone()]);
-    CredentialStore::open(&data_dir)
-        .persist_provider_api_key_intents(&mut config, &provider_intents)?;
-    config
-        .save_to_dir(data_dir.clone())
-        .context("failed to write config.json")?;
+    bamboo_config::persist_provider_credential_transaction(
+        &data_dir,
+        &mut config,
+        &provider_intents,
+    )?;
 
     // 6. Report + next steps.
     let path = data_dir.join("config.json");
@@ -355,12 +355,16 @@ pub fn run_config_set(
         None => config,
     };
     if !provider_credential_intents.is_empty() {
-        CredentialStore::open(&data_dir)
-            .persist_provider_api_key_intents(&mut to_save, &provider_credential_intents)?;
+        bamboo_config::persist_provider_credential_transaction(
+            &data_dir,
+            &mut to_save,
+            &provider_credential_intents,
+        )?;
+    } else {
+        to_save
+            .save_to_dir(data_dir.clone())
+            .context("failed to write config.json")?;
     }
-    to_save
-        .save_to_dir(data_dir.clone())
-        .context("failed to write config.json")?;
     println!("✓ set {key} = {shown}");
     Ok(())
 }

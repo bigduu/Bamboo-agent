@@ -1333,8 +1333,8 @@ impl AppState {
     /// Unified config update entrypoint.
     ///
     /// Invariants:
-    /// - Update in-memory first
-    /// - Persist to disk
+    /// - Build and validate a detached candidate
+    /// - Persist to disk before publishing it in memory
     /// - Apply runtime side-effects last (provider reload, MCP reconcile)
     pub async fn update_config<F>(
         &self,
@@ -1352,7 +1352,7 @@ impl AppState {
         let snapshot = {
             let _io = self.config_io_lock.lock().await;
             let (snapshot, enforcement_newly_off) = {
-                let mut cfg = self.config.write().await;
+                let cfg = self.config.read().await;
                 // Refuse the whole operation (no in-memory mutation, no disk
                 // write) while a config-corruption recovery is pending
                 // confirmation (#153) — `save_to_dir` would reject the persist
@@ -1361,13 +1361,14 @@ impl AppState {
                 // instead of silently drifting further from what's on disk.
                 reject_if_recovery_pending(&cfg)?;
                 let was_off = cfg.plugin_trust.enforcement_is_off();
-                update(&mut cfg)?;
+                let mut candidate = cfg.clone();
+                update(&mut candidate)?;
                 // Backfill any missing connect.platforms id (#496) on the live
                 // in-memory config itself — not just inside `save_to_dir`'s
                 // internal save-copy — so the response this update returns
                 // (and any GET immediately after) already reflects the id a
                 // client can round-trip on its next PATCH.
-                cfg.assign_connect_platform_ids();
+                candidate.assign_connect_platform_ids();
                 // Same live-vs-save-copy treatment for ciphertext (#516):
                 // `save_to_dir` refreshes `*_encrypted` only on its save-time
                 // clone, so a secret set through this entrypoint (e.g. a
@@ -1375,14 +1376,13 @@ impl AppState {
                 // plaintext-only in memory — and the next settings-PATCH merge
                 // (`build_merged_config`'s serde round-trip drops plaintext)
                 // would lose the key entirely.
-                cfg.refresh_encrypted_secrets().map_err(|e| {
+                candidate.refresh_encrypted_secrets().map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!(
                         "Failed to refresh encrypted secrets: {e}"
                     ))
                 })?;
-                cfg.publish_env_vars();
-                let newly_off = !was_off && cfg.plugin_trust.enforcement_is_off();
-                (cfg.clone(), newly_off)
+                let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
+                (candidate, newly_off)
             };
             // Loud signal at the MOMENT plugin_trust.enforcement is flipped off
             // live (e.g. via `bamboo config set plugin_trust.enforcement off`
@@ -1398,9 +1398,87 @@ impl AppState {
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
                 })?;
+            {
+                let mut cfg = self.config.write().await;
+                snapshot.publish_env_vars();
+                *cfg = snapshot.clone();
+            }
             snapshot
         };
 
+        self.apply_config_effects(snapshot.clone(), effects).await?;
+        Ok(snapshot)
+    }
+
+    /// Compatibility provider update whose credential and metadata documents
+    /// share the recoverable config transaction manifest.
+    pub async fn update_config_with_provider_credentials<F>(
+        &self,
+        update: F,
+        provider_intents: std::collections::BTreeSet<String>,
+        effects: ConfigUpdateEffects,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError>,
+    {
+        if provider_intents.is_empty() {
+            return self.update_config(update, effects).await;
+        }
+        let (snapshot, enforcement_newly_off) = {
+            let _io = self.config_io_lock.lock().await;
+            let (mut candidate, enforcement_newly_off) = {
+                let cfg = self.config.read().await;
+                reject_if_recovery_pending(&cfg)?;
+                let was_off = cfg.plugin_trust.enforcement_is_off();
+                let mut candidate = cfg.clone();
+                update(&mut candidate)?;
+                candidate.assign_connect_platform_ids();
+                candidate.refresh_encrypted_secrets().map_err(|error| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "Failed to refresh encrypted secrets: {error}"
+                    ))
+                })?;
+                let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
+                (candidate, newly_off)
+            };
+            let data_dir = self.app_data_dir.clone();
+            let candidate = tokio::task::spawn_blocking(move || {
+                bamboo_config::persist_provider_credential_transaction(
+                    &data_dir,
+                    &mut candidate,
+                    &provider_intents,
+                )?;
+                Ok::<_, ConfigStoreError>(candidate)
+            })
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "provider credential transaction task failed: {error}"
+                ))
+            })?
+            .map_err(|error| match error {
+                ConfigStoreError::Conflict { expected, actual } => {
+                    AppError::ConfigConflict { expected, actual }
+                }
+                ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::Io(error) => AppError::StorageError(error),
+                ConfigStoreError::Json(_) => {
+                    AppError::BadRequest("configuration document is invalid".to_string())
+                }
+                ConfigStoreError::Watch(error) => {
+                    AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
+                }
+            })?;
+            {
+                let mut cfg = self.config.write().await;
+                candidate.publish_env_vars();
+                *cfg = candidate.clone();
+            }
+            (candidate, enforcement_newly_off)
+        };
+        if enforcement_newly_off {
+            warn_plugin_trust_enforcement_off();
+        }
         self.apply_config_effects(snapshot.clone(), effects).await?;
         Ok(snapshot)
     }

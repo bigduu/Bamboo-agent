@@ -19,11 +19,11 @@ pub async fn set_bamboo_config(
     config_manager::sanitize_root_patch(&mut patch_obj);
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
     let effects = config_manager::effects_for_root_patch(&patch_obj);
-    let credential_store = app_state.credential_store.clone();
+    let provider_credential_intents = api_key_intents.providers.clone();
 
     // Apply the patch under the config write lock to avoid clobbering concurrent updates.
     let new_config = app_state
-        .update_config(
+        .update_config_with_provider_credentials(
             move |config| {
                 let current = config.clone();
                 let mut patch_obj = patch_obj;
@@ -36,14 +36,10 @@ pub async fn set_bamboo_config(
                     &mut new_config,
                     &api_key_intents,
                 )?;
-                config_manager::persist_provider_credentials_for_patch(
-                    &mut new_config,
-                    &api_key_intents,
-                    &credential_store,
-                )?;
                 *config = new_config;
                 Ok(())
             },
+            provider_credential_intents,
             ConfigUpdateEffects {
                 // Best-effort: setup/UX flows must be able to persist partial config even when
                 // provider init isn't possible yet.
