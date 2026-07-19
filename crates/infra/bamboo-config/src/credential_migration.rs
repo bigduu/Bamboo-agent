@@ -265,6 +265,9 @@ fn persist_provider_credential_transaction_with_instances_inner(
     provider_instance_intents: &BTreeSet<String>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
+    let proxy_only = provider_intents.len() == 1
+        && provider_intents.contains("__proxy_auth")
+        && provider_instance_intents.is_empty();
     std::fs::create_dir_all(data_dir)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -341,18 +344,20 @@ fn persist_provider_credential_transaction_with_instances_inner(
         .map(|reference| reference.as_str().to_string())
         .collect();
     credential_file.transaction_base_sha256 = credential_file.original_sha256.clone();
-    stage_file(
-        &stage_dir,
-        &backup_dir,
-        PROVIDERS_FILE,
-        &provider_bytes,
-        Some(&providers_original),
-        false,
-        None,
-        InstallMode::Exact,
-        None,
-        &mut staged,
-    )?;
+    if !proxy_only {
+        stage_file(
+            &stage_dir,
+            &backup_dir,
+            PROVIDERS_FILE,
+            &provider_bytes,
+            Some(&providers_original),
+            false,
+            None,
+            InstallMode::Exact,
+            None,
+            &mut staged,
+        )?;
+    }
     stage_file(
         &stage_dir,
         &backup_dir,
@@ -1322,6 +1327,11 @@ fn install_pending(
                     .sensitive(file.sensitive)
                     .write_bytes_if_hash_with_backup(expected, &staged)?
                 {
+                    if file.name == CONFIG_FILE
+                        && install_rebased_proxy_config_member(data_dir, manifest, file_index)?
+                    {
+                        continue;
+                    }
                     return Err(ConfigStoreError::Validation(format!(
                         "{} changed during committed transaction",
                         file.name
@@ -1379,6 +1389,124 @@ fn install_pending(
         ) {
             return Err(injected_fault());
         }
+    }
+    Ok(())
+}
+
+fn install_rebased_proxy_config_member(
+    data_dir: &Path,
+    manifest: &mut MigrationManifest,
+    file_index: usize,
+) -> ConfigStoreResult<bool> {
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed credential transaction is incomplete".to_string(),
+            )
+        })?;
+    if credential_file.touched_credential_refs.len() != 1 {
+        return Ok(false);
+    }
+    let touched_ref = credential_file.touched_credential_refs[0].clone();
+    let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let file = manifest.files[file_index].clone();
+    let mut staged: Value =
+        serde_json::from_slice(&std::fs::read(stage_dir.join(&file.staged_name))?)?;
+    let staged_ref = staged
+        .get("proxy_auth_credential_ref")
+        .and_then(Value::as_str);
+    if staged_ref != Some(touched_ref.as_str()) {
+        return Ok(false);
+    }
+    let mut original: Value = serde_json::from_slice(&read_encrypted_migration_backup(
+        &backup_dir.join(CONFIG_FILE),
+    )?)?;
+    strip_proxy_auth_fields(&mut staged)?;
+    strip_proxy_auth_fields(&mut original)?;
+    if staged != original {
+        return Ok(false);
+    }
+    for other in manifest.files.iter().filter(|other| {
+        other.install_mode == InstallMode::Exact
+            && other.name != CREDENTIALS_FILE
+            && other.name != CONFIG_FILE
+    }) {
+        let staged: Value =
+            serde_json::from_slice(&std::fs::read(stage_dir.join(&other.staged_name))?)?;
+        let original: Value = serde_json::from_slice(&read_encrypted_migration_backup(
+            &backup_dir.join(&other.name),
+        )?)?;
+        if staged != original {
+            return Ok(false);
+        }
+    }
+
+    let target = data_dir.join(CONFIG_FILE);
+    let current = read_target_or_empty(&target)?;
+    let current_hash = sha256(&current);
+    let mut rebased: Value = serde_json::from_slice(&current).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed proxy transaction"
+                .to_string(),
+        )
+    })?;
+    let object = rebased.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed proxy transaction"
+                .to_string(),
+        )
+    })?;
+    for key in [
+        "proxy_auth",
+        "proxy_auth_encrypted",
+        "http_proxy_auth_encrypted",
+        "https_proxy_auth_encrypted",
+    ] {
+        object.remove(key);
+    }
+    object.insert(
+        "proxy_auth_credential_ref".to_string(),
+        Value::String(touched_ref),
+    );
+    serde_json::from_value::<crate::Config>(rebased.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed proxy transaction"
+                .to_string(),
+        )
+    })?;
+    let rebased = serde_json::to_vec_pretty(&rebased)?;
+    let staged_name = format!("{CONFIG_FILE}.rebase.{}", Uuid::new_v4());
+    AtomicFileStore::new(stage_dir.join(&staged_name)).write_bytes_without_backup(&rebased)?;
+    sync_dir(&stage_dir)?;
+    let file = &mut manifest.files[file_index];
+    file.staged_name = staged_name;
+    file.sha256 = sha256(&rebased);
+    file.original_sha256 = Some(current_hash.clone());
+    write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
+    if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
+        return Err(ConfigStoreError::Validation(
+            "config.json changed repeatedly during committed proxy transaction".to_string(),
+        ));
+    }
+    Ok(true)
+}
+
+fn strip_proxy_auth_fields(value: &mut Value) -> ConfigStoreResult<()> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("proxy transaction root must be an object".to_string())
+    })?;
+    for key in [
+        "proxy_auth",
+        "proxy_auth_encrypted",
+        "proxy_auth_credential_ref",
+        "http_proxy_auth_encrypted",
+        "https_proxy_auth_encrypted",
+    ] {
+        object.remove(key);
     }
     Ok(())
 }
@@ -1796,12 +1924,12 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         .iter()
         .any(|file| file.install_mode == InstallMode::Exact);
     let exact_shape_valid = !exact_transaction
-        || (manifest.files.len() == 3
+        || ((manifest.files.len() == 2 || manifest.files.len() == 3)
             && manifest
                 .files
                 .iter()
                 .all(|file| file.install_mode == InstallMode::Exact)
-            && unique.contains(PROVIDERS_FILE)
+            && (manifest.files.len() == 2 || unique.contains(PROVIDERS_FILE))
             && unique.contains(CONFIG_FILE)
             && manifest.files.iter().all(|file| {
                 file.migration_generation.is_none()
@@ -2121,8 +2249,107 @@ mod tests {
         );
         let root: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
-        assert_eq!(root["proxy_auth_credential_ref"], shared.as_str());
+        assert_eq!(root["proxy_auth_credential_ref"], "proxy.default.auth");
         assert!(root.get("proxy_auth_encrypted").is_none());
+        assert!(store
+            .resolve(&credential_ref("proxy", "default", "auth").unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn proxy_auth_replace_detaches_from_shared_provider_ref_without_overwrite() {
+        let _key = crate::encryption::set_test_encryption_key([0x96; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = credential_ref("provider", "openai", "api_key").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                shared.clone(),
+                "provider-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let mut config = crate::Config::default();
+        config.proxy_auth_credential_ref = Some(shared.clone());
+        config.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(shared.clone()),
+            ..crate::OpenAIConfig::default()
+        });
+        config.save_to_dir(dir.path().to_path_buf()).unwrap();
+        config.proxy_auth = Some(crate::ProxyAuth {
+            username: "proxy-user".to_string(),
+            password: "proxy-password".to_string(),
+        });
+
+        persist_proxy_auth_credential_transaction(dir.path(), &mut config).unwrap();
+        assert_eq!(
+            store.resolve(&shared).unwrap().unwrap().expose(),
+            "provider-secret"
+        );
+        let canonical = credential_ref("proxy", "default", "auth").unwrap();
+        let proxy: crate::ProxyAuth =
+            serde_json::from_str(store.resolve(&canonical).unwrap().unwrap().expose()).unwrap();
+        assert_eq!(proxy.username, "proxy-user");
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["proxy_auth_credential_ref"], canonical.as_str());
+    }
+
+    #[test]
+    fn occupied_canonical_proxy_ref_fails_closed_without_any_write() {
+        let _key = crate::encryption::set_test_encryption_key([0x97; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = credential_ref("provider", "openai", "api_key").unwrap();
+        let canonical = credential_ref("proxy", "default", "auth").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                shared.clone(),
+                "openai-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        store
+            .replace(
+                canonical.clone(),
+                "anthropic-secret",
+                crate::CredentialSource::User,
+                store.revision().unwrap(),
+            )
+            .unwrap();
+        let mut config = crate::Config::default();
+        config.proxy_auth_credential_ref = Some(shared.clone());
+        config.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(shared),
+            ..crate::OpenAIConfig::default()
+        });
+        config.providers.anthropic = Some(crate::AnthropicConfig {
+            credential_ref: Some(canonical),
+            ..crate::AnthropicConfig::default()
+        });
+        config.save_to_dir(dir.path().to_path_buf()).unwrap();
+        config.proxy_auth = Some(crate::ProxyAuth {
+            username: "proxy-user".to_string(),
+            password: "proxy-password".to_string(),
+        });
+        let root_before = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+
+        let error = persist_proxy_auth_credential_transaction(dir.path(), &mut config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("canonical reference is occupied"));
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            root_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
     }
 
     #[test]
@@ -2166,6 +2393,49 @@ mod tests {
             assert!(!root.contains(secret));
             assert!(!credentials.contains(secret));
         }
+    }
+
+    #[test]
+    fn committed_proxy_transaction_rebases_valid_external_root_edit() {
+        let _key = crate::encryption::set_test_encryption_key([0x98; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = crate::Config::default();
+        initial.http_proxy = "http://before.example:8080".to_string();
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let mut candidate = initial.clone();
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "race-user".to_string(),
+            password: "race-password".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterManifest),
+        )
+        .is_err());
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["http_proxy"] = Value::String("http://external.example:9090".to_string());
+        external["external_edit"] = serde_json::json!({"preserved": true});
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["http_proxy"], "http://external.example:9090");
+        assert_eq!(root["external_edit"]["preserved"], true);
+        assert_eq!(root["proxy_auth_credential_ref"], "proxy.default.auth");
+        assert!(root.get("proxy_auth_encrypted").is_none());
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let auth = loaded.proxy_auth.as_ref().expect("proxy auth hydrated");
+        assert_eq!(auth.username, "race-user");
+        assert_eq!(auth.password, "race-password");
     }
 
     #[test]

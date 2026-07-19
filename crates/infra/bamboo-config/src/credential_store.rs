@@ -551,25 +551,39 @@ impl CredentialStore {
         &self,
         config: &mut crate::Config,
     ) -> ConfigStoreResult<PreparedProviderCredentialUpdate> {
-        let reference = config
+        let canonical = credential_ref("proxy", "default", "auth")?;
+        let current_reference = config
             .proxy_auth_credential_ref
             .clone()
-            .unwrap_or(credential_ref("proxy", "default", "auth")?);
+            .unwrap_or_else(|| canonical.clone());
         let secret = config
             .proxy_auth
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
         let counts = config_credential_ref_counts(config)?;
-        let shared = counts.get(&reference).copied().unwrap_or(0) > 1;
+        let non_proxy_consumers = |reference: &CredentialRef| {
+            counts.get(reference).copied().unwrap_or(0)
+                - usize::from(config.proxy_auth_credential_ref.as_ref() == Some(reference))
+        };
+        let reference = if non_proxy_consumers(&current_reference) > 0 {
+            if non_proxy_consumers(&canonical) > 0 {
+                return Err(ConfigStoreError::Validation(
+                    "proxy auth credential reference is shared and the canonical reference is occupied"
+                        .to_string(),
+                ));
+            }
+            canonical
+        } else {
+            current_reference
+        };
         let (mut document, health) = self.load_document_with_health()?;
         if health.status == SectionStatus::Degraded {
             return Err(ConfigStoreError::Validation(
                 "credential document is unavailable for proxy auth update".to_string(),
             ));
         }
-        let mut changed = false;
-        if let Some(secret) = secret.as_deref() {
+        let changed = if let Some(secret) = secret.as_deref() {
             let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
                 ConfigStoreError::Validation("credential encryption failed".to_string())
             })?;
@@ -583,14 +597,14 @@ impl CredentialStore {
                     migration_generation: None,
                 },
             );
-            changed = true;
-        } else if !shared {
-            changed = document.entries.remove(&reference).is_some();
-        }
+            true
+        } else {
+            document.entries.remove(&reference).is_some()
+        };
         config.proxy_auth_credential_ref = Some(reference.clone());
         config.proxy_auth_encrypted = None;
         validate_document(&document).map_err(ConfigStoreError::Validation)?;
-        let required_refs = if secret.is_some() || shared {
+        let required_refs = if secret.is_some() {
             vec![reference.clone()]
         } else {
             Vec::new()
