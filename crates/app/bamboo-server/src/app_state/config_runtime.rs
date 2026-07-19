@@ -1524,18 +1524,95 @@ impl AppState {
     pub async fn update_proxy_auth_credential(
         &self,
         auth: Option<bamboo_config::ProxyAuth>,
+        expected_revision: u64,
         effects: ConfigUpdateEffects,
-    ) -> Result<Config, AppError> {
-        self.update_config_with_provider_credentials(
-            move |config| {
-                config.proxy_auth = auth;
-                Ok(())
-            },
-            std::collections::BTreeSet::from(["__proxy_auth".to_string()]),
-            std::collections::BTreeSet::new(),
-            effects,
-        )
-        .await
+    ) -> Result<
+        (
+            Config,
+            bamboo_config::CredentialStatus,
+            bamboo_config::CredentialStoreHealth,
+        ),
+        AppError,
+    > {
+        let snapshot_and_status = {
+            let _io = self.config_io_lock.lock().await;
+            let mut candidate = {
+                let cfg = self.config.read().await;
+                reject_if_recovery_pending(&cfg)?;
+                let mut candidate = cfg.clone();
+                candidate.proxy_auth = auth;
+                candidate.assign_connect_platform_ids();
+                candidate.refresh_encrypted_secrets().map_err(|error| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "Failed to refresh encrypted secrets: {error}"
+                    ))
+                })?;
+                candidate
+            };
+            let data_dir = self.app_data_dir.clone();
+            let (candidate, _revision) = tokio::task::spawn_blocking(move || {
+                let revision =
+                    bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+                        &data_dir,
+                        &mut candidate,
+                        expected_revision,
+                    )?;
+                Ok::<_, ConfigStoreError>((candidate, revision))
+            })
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "proxy credential transaction task failed: {error}"
+                ))
+            })?
+            .map_err(|error| match error {
+                ConfigStoreError::Conflict { expected, actual } => {
+                    AppError::ConfigConflict { expected, actual }
+                }
+                ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::Io(error) => AppError::StorageError(error),
+                ConfigStoreError::Json(_) => {
+                    AppError::BadRequest("configuration document is invalid".to_string())
+                }
+                ConfigStoreError::Watch(error) => {
+                    AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
+                }
+            })?;
+            let reference = candidate
+                .proxy_auth_credential_ref
+                .as_ref()
+                .ok_or_else(|| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "proxy credential transaction did not publish its reference"
+                    ))
+                })?;
+            {
+                let mut cfg = self.config.write().await;
+                candidate.publish_env_vars();
+                *cfg = candidate.clone();
+            }
+            let (status, health) = self
+                .credential_store
+                .status_with_health(reference)
+                .map_err(|error| match error {
+                    ConfigStoreError::Conflict { expected, actual } => {
+                        AppError::ConfigConflict { expected, actual }
+                    }
+                    ConfigStoreError::Validation(_) | ConfigStoreError::Json(_) => {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "credential store validation failed"
+                        ))
+                    }
+                    ConfigStoreError::Io(error) => AppError::StorageError(error),
+                    ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
+                        "configuration watch failed: {error}"
+                    )),
+                })?;
+            (candidate, status, health)
+        };
+        self.apply_config_effects(snapshot_and_status.0.clone(), effects)
+            .await?;
+        Ok(snapshot_and_status)
     }
 
     /// Replace the full config (used for JSON merge endpoints).

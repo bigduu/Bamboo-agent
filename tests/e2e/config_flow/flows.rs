@@ -30,6 +30,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
         .set_json(json!({
+            "expected_revision": 0,
             "username": "proxy-user-name",
             "password": "proxy-pass-value"
         }))

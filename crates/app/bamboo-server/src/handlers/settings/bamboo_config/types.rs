@@ -17,7 +17,10 @@ pub(super) struct ValidateConfigResponse {
 
 /// Request body for setting proxy authentication.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyAuthPayload {
+    /// Credential-store revision required for replace or clear.
+    expected_revision: u64,
     /// Proxy username.
     username: Option<String>,
     /// Proxy password.
@@ -28,6 +31,7 @@ impl std::fmt::Debug for ProxyAuthPayload {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ProxyAuthPayload")
+            .field("expected_revision", &self.expected_revision)
             .field("username", &self.username.as_ref().map(|_| "[REDACTED]"))
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .finish()
@@ -35,6 +39,10 @@ impl std::fmt::Debug for ProxyAuthPayload {
 }
 
 impl ProxyAuthPayload {
+    pub(super) fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+
     pub(super) fn into_proxy_auth(self) -> Option<ProxyAuth> {
         let username = self.username.unwrap_or_default();
         if username.trim().is_empty() {
@@ -98,16 +106,17 @@ mod tests {
 
     #[test]
     fn test_proxy_auth_payload_deserialization() {
-        let json = r#"{"username":"user","password":"pass"}"#;
+        let json = r#"{"expected_revision":4,"username":"user","password":"pass"}"#;
         let payload: ProxyAuthPayload = serde_json::from_str(json).unwrap();
 
         assert_eq!(payload.username, Some("user".to_string()));
         assert_eq!(payload.password, Some("pass".to_string()));
+        assert_eq!(payload.expected_revision(), 4);
     }
 
     #[test]
     fn test_proxy_auth_payload_only_username() {
-        let json = r#"{"username":"user"}"#;
+        let json = r#"{"expected_revision":0,"username":"user"}"#;
         let payload: ProxyAuthPayload = serde_json::from_str(json).unwrap();
 
         assert_eq!(payload.username, Some("user".to_string()));
@@ -116,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_proxy_auth_payload_empty() {
-        let json = r#"{}"#;
+        let json = r#"{"expected_revision":0}"#;
         let payload: ProxyAuthPayload = serde_json::from_str(json).unwrap();
 
         assert_eq!(payload.username, None);
@@ -124,8 +133,17 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_auth_payload_requires_revision_precondition() {
+        let error =
+            serde_json::from_str::<ProxyAuthPayload>(r#"{"username":"user","password":"pass"}"#)
+                .unwrap_err();
+        assert!(error.to_string().contains("expected_revision"));
+    }
+
+    #[test]
     fn test_proxy_auth_payload_into_proxy_auth_valid() {
         let payload = ProxyAuthPayload {
+            expected_revision: 0,
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
         };
@@ -141,6 +159,7 @@ mod tests {
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_empty_username() {
         let payload = ProxyAuthPayload {
+            expected_revision: 0,
             username: Some("".to_string()),
             password: Some("pass".to_string()),
         };
@@ -152,6 +171,7 @@ mod tests {
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_whitespace_username() {
         let payload = ProxyAuthPayload {
+            expected_revision: 0,
             username: Some("   ".to_string()),
             password: Some("pass".to_string()),
         };
@@ -163,6 +183,7 @@ mod tests {
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_none_username() {
         let payload = ProxyAuthPayload {
+            expected_revision: 0,
             username: None,
             password: Some("pass".to_string()),
         };
@@ -174,6 +195,7 @@ mod tests {
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_no_password() {
         let payload = ProxyAuthPayload {
+            expected_revision: 0,
             username: Some("user".to_string()),
             password: None,
         };
@@ -186,6 +208,7 @@ mod tests {
     #[test]
     fn test_proxy_auth_payload_debug() {
         let payload = ProxyAuthPayload {
+            expected_revision: 0,
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
         };

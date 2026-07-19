@@ -55,6 +55,8 @@ pub async fn replace_credential(
     payload: web::Json<ReplaceCredentialRequest>,
 ) -> Result<HttpResponse, AppError> {
     let credential_ref = parse_credential_ref(path.into_inner())?;
+    let _io = app_state.config_io_lock.lock().await;
+    reject_active_proxy_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
         .replace(
@@ -74,6 +76,8 @@ pub async fn clear_credential(
     payload: web::Json<ClearCredentialRequest>,
 ) -> Result<HttpResponse, AppError> {
     let credential_ref = parse_credential_ref(path.into_inner())?;
+    let _io = app_state.config_io_lock.lock().await;
+    reject_active_proxy_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
         .clear(&credential_ref, payload.expected_revision)
@@ -124,6 +128,26 @@ fn publish_credential_event(app_state: &AppState, revision: u64) {
 fn parse_credential_ref(value: String) -> Result<CredentialRef, AppError> {
     CredentialRef::parse(value)
         .map_err(|_| AppError::BadRequest("invalid credential reference".to_string()))
+}
+
+async fn reject_active_proxy_ref(
+    app_state: &AppState,
+    credential_ref: &CredentialRef,
+) -> Result<(), AppError> {
+    if app_state
+        .config
+        .read()
+        .await
+        .proxy_auth_credential_ref
+        .as_ref()
+        == Some(credential_ref)
+    {
+        return Err(AppError::BadRequest(
+            "active proxy credentials must be changed through the revisioned proxy-auth API"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_store_mutation_error(error: ConfigStoreError) -> AppError {
@@ -329,5 +353,79 @@ mod tests {
         let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
         assert!(!body.contains("private-corrupt-bytes"));
         assert!(!body.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[actix_web::test]
+    async fn generic_mutations_reject_the_active_proxy_credential_reference() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x43; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let reference = CredentialRef::parse("proxy.default.auth").unwrap();
+        state
+            .credential_store
+            .replace(
+                reference.clone(),
+                r#"{"username":"active","password":"secret"}"#,
+                CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.proxy_auth_credential_ref = Some(reference.clone());
+            config.proxy_auth = Some(bamboo_config::ProxyAuth {
+                username: "active".to_string(),
+                password: "secret".to_string(),
+            });
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::put().to(replace_credential),
+                )
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::delete().to(clear_credential),
+                ),
+        )
+        .await;
+
+        let replace = test::TestRequest::put()
+            .uri("/credentials/proxy.default.auth")
+            .set_json(serde_json::json!({
+                "expected_revision": 1,
+                "value": "replacement"
+            }))
+            .to_request();
+        let replace = test::call_service(&app, replace).await;
+        assert_eq!(replace.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        let clear = test::TestRequest::delete()
+            .uri("/credentials/proxy.default.auth")
+            .set_json(serde_json::json!({"expected_revision": 1}))
+            .to_request();
+        let clear = test::call_service(&app, clear).await;
+        assert_eq!(clear.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            r#"{"username":"active","password":"secret"}"#
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .proxy_auth
+                .as_ref()
+                .map(|auth| auth.username.as_str()),
+            Some("active")
+        );
     }
 }

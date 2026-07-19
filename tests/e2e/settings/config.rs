@@ -169,6 +169,7 @@ async fn test_set_proxy_auth_does_not_fail_when_provider_unconfigured() {
     let auth_req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
         .set_json(json!({
+            "expected_revision": 0,
             "username": "user",
             "password": "pass"
         }))

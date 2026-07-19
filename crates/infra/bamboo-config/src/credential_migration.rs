@@ -219,15 +219,40 @@ pub fn persist_provider_credential_transaction(
 
 /// Persist proxy authentication and its stable root metadata as one
 /// recoverable credential/config transaction.
-pub fn persist_proxy_auth_credential_transaction(
+#[cfg(test)]
+fn persist_proxy_auth_credential_transaction(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
-) -> ConfigStoreResult<()> {
-    persist_provider_instance_credential_transaction(
-        data_dir,
+) -> ConfigStoreResult<u64> {
+    let data_dir = data_dir.as_ref();
+    let expected_revision = CredentialStore::open(data_dir).revision()?;
+    persist_proxy_auth_credential_transaction_at_revision(data_dir, config, expected_revision)
+}
+
+/// Persist proxy authentication with an explicit credential-store revision
+/// precondition. The returned revision is the durable credential revision
+/// committed by the exact transaction.
+pub fn persist_proxy_auth_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    #[cfg(test)]
+    return persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
         config,
         &BTreeSet::from(["__proxy_auth".to_string()]),
         &BTreeSet::new(),
+        Some(expected_revision),
+        None,
+    );
+    #[cfg(not(test))]
+    persist_provider_credential_transaction_with_instances_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::from(["__proxy_auth".to_string()]),
+        &BTreeSet::new(),
+        Some(expected_revision),
     )
 }
 
@@ -241,6 +266,11 @@ pub fn persist_provider_instance_credential_transaction(
     provider_intents: &BTreeSet<String>,
     provider_instance_intents: &BTreeSet<String>,
 ) -> ConfigStoreResult<()> {
+    if provider_intents.contains("__proxy_auth") {
+        return Err(ConfigStoreError::Validation(
+            "proxy auth requires the dedicated revisioned credential transaction".to_string(),
+        ));
+    }
     #[cfg(test)]
     return persist_provider_credential_transaction_with_instances_inner(
         data_dir.as_ref(),
@@ -248,14 +278,18 @@ pub fn persist_provider_instance_credential_transaction(
         provider_intents,
         provider_instance_intents,
         None,
-    );
+        None,
+    )
+    .map(|_| ());
     #[cfg(not(test))]
     persist_provider_credential_transaction_with_instances_inner(
         data_dir.as_ref(),
         config,
         provider_intents,
         provider_instance_intents,
+        None,
     )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -270,8 +304,13 @@ fn persist_provider_credential_transaction_inner(
         config,
         provider_intents,
         &BTreeSet::new(),
+        provider_intents
+            .contains("__proxy_auth")
+            .then(|| CredentialStore::open(data_dir).revision_unchecked())
+            .transpose()?,
         fault,
     )
+    .map(|_| ())
 }
 
 fn persist_provider_credential_transaction_with_instances_inner(
@@ -279,8 +318,9 @@ fn persist_provider_credential_transaction_with_instances_inner(
     config: &mut crate::Config,
     provider_intents: &BTreeSet<String>,
     provider_instance_intents: &BTreeSet<String>,
+    proxy_expected_revision: Option<u64>,
     #[cfg(test)] fault: Option<MigrationFault>,
-) -> ConfigStoreResult<()> {
+) -> ConfigStoreResult<u64> {
     let proxy_only = provider_intents.len() == 1
         && provider_intents.contains("__proxy_auth")
         && provider_instance_intents.is_empty();
@@ -314,8 +354,21 @@ fn persist_provider_credential_transaction_with_instances_inner(
         &persisted_instance_refs,
     )?
     else {
-        return Ok(());
+        return store.revision_unchecked();
     };
+    if proxy_only {
+        let expected = proxy_expected_revision.ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "proxy auth credential revision precondition is required".to_string(),
+            )
+        })?;
+        if prepared.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: prepared.expected_revision,
+            });
+        }
+    }
     let (config_bytes, provider_bytes) = config
         .prepare_provider_transaction_documents(&providers_original)
         .map_err(|error| ConfigStoreError::Validation(error.to_string()))?;
@@ -484,7 +537,8 @@ fn persist_provider_credential_transaction_with_instances_inner(
         #[cfg(test)]
         fault,
     )?;
-    finish_transaction(data_dir, manifest)
+    finish_transaction(data_dir, manifest)?;
+    store.revision_unchecked()
 }
 
 #[cfg(test)]
@@ -4237,6 +4291,7 @@ mod tests {
             &BTreeSet::new(),
             &instance_intents,
             None,
+            None,
         )
         .unwrap();
 
@@ -4305,6 +4360,7 @@ mod tests {
             &mut candidate,
             &BTreeSet::new(),
             &BTreeSet::from(["work".to_string()]),
+            None,
             Some(MigrationFault::AfterExactCommitCredentialClearRace),
         )
         .unwrap();

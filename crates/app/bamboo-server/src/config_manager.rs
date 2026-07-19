@@ -175,6 +175,13 @@ pub fn build_merged_config(
     clear_notification_ciphertext_for_explicit_clears(&mut new_config, &notification_intents);
     clear_connect_ciphertext_for_explicit_clears(&mut new_config, &connect_intents);
     new_config.hydrate_proxy_auth_from_encrypted();
+    // Proxy auth is credential-store backed and intentionally omitted from the
+    // compatibility JSON round-trip. Root PATCH sanitization forbids changing
+    // both the secret and its reference, so preserve the already-hydrated live
+    // value just like the CLI dot-path setter does.
+    if new_config.proxy_auth_credential_ref == current.proxy_auth_credential_ref {
+        new_config.proxy_auth = current.proxy_auth.clone();
+    }
     new_config.hydrate_provider_api_keys_from_encrypted();
     new_config.hydrate_provider_instance_api_keys_from_encrypted();
     new_config.hydrate_mcp_secrets_from_encrypted();
@@ -202,7 +209,33 @@ pub fn build_merged_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_config::OpenAIConfig;
+    use bamboo_config::{credential_ref, OpenAIConfig, ProxyAuth};
+
+    #[test]
+    fn unrelated_root_patch_preserves_store_hydrated_proxy_auth() {
+        let mut current = Config::default();
+        current.proxy_auth_credential_ref =
+            Some(credential_ref("proxy", "default", "auth").unwrap());
+        current.proxy_auth = Some(ProxyAuth {
+            username: "proxy-user".to_string(),
+            password: "proxy-password".to_string(),
+        });
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"http_proxy":"http://proxy.example:8080"}"#).unwrap();
+
+        let merged = build_merged_config(&current, patch).expect("merge");
+
+        assert_eq!(
+            merged.proxy_auth_credential_ref,
+            current.proxy_auth_credential_ref
+        );
+        let auth = merged
+            .proxy_auth
+            .as_ref()
+            .expect("live proxy auth must survive");
+        assert_eq!(auth.username, "proxy-user");
+        assert_eq!(auth.password, "proxy-password");
+    }
 
     fn env_sourced_openai_config() -> Config {
         let mut config = Config::default();
