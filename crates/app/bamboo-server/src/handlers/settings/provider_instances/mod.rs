@@ -407,9 +407,11 @@ pub async fn update_provider_instance(
             Value::String(value) => !config_manager::is_masked_api_key(value),
             _ => false,
         });
-    let provider_instance_intents = has_api_key_intent
-        .then(|| std::collections::BTreeSet::from([instance_id.clone()]))
-        .unwrap_or_default();
+    let provider_instance_intents = if has_api_key_intent {
+        std::collections::BTreeSet::from([instance_id.clone()])
+    } else {
+        std::collections::BTreeSet::new()
+    };
 
     let new_config = app_state
         .update_config_with_provider_credentials(
