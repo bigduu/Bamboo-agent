@@ -1,8 +1,8 @@
 //! Independently persisted legacy provider configuration (`providers.json`).
 
 use crate::{
-    config_module::{load_sidecar, save_sidecar_with_sanitized_backup},
-    Config, ConfigModule, ProviderConfigs,
+    config_module::save_sidecar_with_sanitized_backup, AtomicJsonStore, Config, ConfigModule,
+    ProviderConfigs,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,13 +28,14 @@ impl std::ops::DerefMut for ProviderConfigsModule {
 
 impl ProviderConfigsModule {
     pub(crate) fn load_sync(&mut self, data_dir: &Path) -> Result<bool> {
-        if let Some(value) = load_sidecar(&data_dir.join(FILE_NAME))? {
+        let store = AtomicJsonStore::new(data_dir.join(FILE_NAME), 1);
+        if let Some(stored) = store.load_validated_allowing_unversioned(|_| Ok(()))? {
             // A provider module loaded through ConfigRegistry must be just as
             // usable as one loaded through Config::from_data_dir. Hydrate its
             // at-rest ciphertext here; the later Config-wide hydration pass is
             // intentionally idempotent for the compatibility path.
             let mut config = Config::default();
-            config.providers.0 = value;
+            config.providers.0 = stored.data;
             config.hydrate_provider_api_keys_from_encrypted();
             self.0 = config.providers.0.clone();
             return Ok(true);
@@ -48,7 +49,26 @@ impl ProviderConfigsModule {
         let mut config = Config::default();
         config.providers.0 = self.0.clone();
         config.refresh_provider_api_keys_encrypted()?;
-        save_sidecar_with_sanitized_backup(&data_dir.join(FILE_NAME), &config.providers.0)
+        let path = data_dir.join(FILE_NAME);
+        let has_envelope_marker = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.contains_key("schema_version")
+                    || object.contains_key("revision")
+                    || object.contains_key("data")
+            });
+        if has_envelope_marker {
+            let store = AtomicJsonStore::new(path, 1);
+            let revision = store
+                .load_validated_allowing_unversioned(|_| Ok(()))?
+                .map_or(0, |stored| stored.revision);
+            store.commit_allowing_unversioned(revision, config.providers.0, |_| Ok(()))?;
+        } else {
+            save_sidecar_with_sanitized_backup(&path, &config.providers.0)?;
+        }
+        Ok(())
     }
 }
 
@@ -73,5 +93,25 @@ impl ConfigModule for ProviderConfigsModule {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_never_overwrites_partial_or_future_revision_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let module = ProviderConfigsModule::default();
+        for original in [
+            br#"{"schema_version":1,"data":{}}"#.as_slice(),
+            br#"{"schema_version":99,"revision":7,"data":{}}"#.as_slice(),
+        ] {
+            std::fs::write(&path, original).unwrap();
+            assert!(module.save_sync(dir.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
     }
 }

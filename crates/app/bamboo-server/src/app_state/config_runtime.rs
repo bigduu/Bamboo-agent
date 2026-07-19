@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bamboo_config::{
-    AtomicJsonStore, ConfigDirectoryWatcher, ProviderConfigs, SectionSourceKind, SectionStatus,
+    AtomicJsonStore, ConfigDirectoryWatcher, ConfigStoreError, ProviderConfigs, SectionSourceKind,
+    SectionStatus,
 };
 use bamboo_mcp::{McpConfig, McpServerManager, TransportConfig};
 use chrono::{DateTime, Utc};
@@ -48,7 +49,10 @@ impl ConfigWatcherRuntime {
         Arc<std::sync::RwLock<ConfigLiveHealth>>,
         Arc<std::sync::RwLock<ConfigLiveHealth>>,
     ) {
-        let provider_health = Arc::new(std::sync::RwLock::new(initial_provider_health(&data_dir)));
+        let provider_store = AtomicJsonStore::new(data_dir.join("providers.json"), 1);
+        let provider_health = Arc::new(std::sync::RwLock::new(initial_provider_health(
+            &provider_store,
+        )));
         let mcp_store = AtomicJsonStore::new(data_dir.join("mcp.json"), 1);
         let mcp_health = Arc::new(std::sync::RwLock::new(initial_mcp_health(&mcp_store)));
         let stop = Arc::new(AtomicBool::new(false));
@@ -142,17 +146,29 @@ impl ConfigWatcherRuntime {
                 let _io = config_io_lock.lock().await;
                 if provider_watched {
                     let current_config = config.read().await.clone();
-                    let result =
-                        load_and_prepare_provider_candidate(&data_dir, current_config).await;
+                    let current_revision = apply_provider_health
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .revision;
+                    let result = load_and_prepare_provider_candidate(
+                        &provider_store,
+                        current_revision,
+                        current_config,
+                    )
+                    .await;
                     match result {
-                        Ok((candidate_config, candidate_registry, candidate_provider)) => {
+                        Ok(candidate) if candidate.unchanged => {}
+                        Ok(candidate) => {
+                            if candidate.normalized_external_revision {
+                                self_write_marker.mark_self_write(provider_store.path());
+                            }
                             let mut live_config = config.write().await;
                             let mut live_provider = provider.write().await;
                             let recovered = section_is_unhealthy(&apply_provider_health);
-                            candidate_config.publish_env_vars();
-                            *live_config = candidate_config;
-                            provider_registry.replace_with(candidate_registry);
-                            *live_provider = candidate_provider;
+                            candidate.config.publish_env_vars();
+                            *live_config = candidate.config;
+                            provider_registry.replace_with(candidate.registry);
+                            *live_provider = candidate.provider;
                             drop(live_provider);
                             drop(live_config);
 
@@ -162,7 +178,7 @@ impl ConfigWatcherRuntime {
                                 "providers",
                                 data_dir.join("providers.json"),
                                 recovered,
-                                None,
+                                Some(candidate.revision),
                             );
                         }
                         Err(error) => publish_section_failure(
@@ -189,6 +205,7 @@ impl ConfigWatcherRuntime {
                     )
                     .await;
                     match result {
+                        Ok(candidate) if candidate.unchanged => {}
                         Ok(candidate) => {
                             if candidate.normalized_external_revision
                                 || candidate.source_kind == SectionSourceKind::Backup
@@ -199,13 +216,20 @@ impl ConfigWatcherRuntime {
                                 // a different fingerprint and remains visible.
                                 self_write_marker.mark_self_write(mcp_store.path());
                             }
+                            let next_mcp = candidate.config.mcp.clone();
+                            let publish_config = config.clone();
                             match mcp_manager
-                                .reconcile_from_config_transactional(&candidate.config.mcp)
+                                .reconcile_from_config_transactional_after(
+                                    &candidate.config.mcp,
+                                    || async move {
+                                        publish_config.write().await.mcp = next_mcp;
+                                        Ok(())
+                                    },
+                                )
                                 .await
                             {
                                 Ok(()) => {
                                     let recovered = section_is_unhealthy(&apply_mcp_health);
-                                    config.write().await.mcp = candidate.config.mcp.clone();
                                     if candidate.source_kind == SectionSourceKind::Backup {
                                         publish_mcp_backup_lkg(
                                             &apply_mcp_health,
@@ -224,14 +248,16 @@ impl ConfigWatcherRuntime {
                                         );
                                     }
                                 }
-                                Err(_) => publish_section_failure(
-                                    &apply_mcp_health,
-                                    &account_sink,
-                                    "mcp",
-                                    SectionStatus::Degraded,
-                                    "MCP runtime initialization failed; retaining last-known-good runtime"
-                                        .to_string(),
-                                ),
+                                Err(_) => {
+                                    publish_section_failure(
+                                        &apply_mcp_health,
+                                        &account_sink,
+                                        "mcp",
+                                        SectionStatus::Degraded,
+                                        "MCP runtime initialization failed; retaining last-known-good runtime"
+                                            .to_string(),
+                                    )
+                                }
                             }
                         }
                         Err(error) => publish_section_failure(
@@ -346,58 +372,42 @@ fn publish_mcp_backup_lkg(
     );
 }
 
-fn initial_provider_health(data_dir: &std::path::Path) -> ConfigLiveHealth {
-    let primary = data_dir.join("providers.json");
-    if !primary.exists() {
-        return ConfigLiveHealth {
+fn initial_provider_health(store: &AtomicJsonStore<ProviderConfigs>) -> ConfigLiveHealth {
+    match store.load_validated_allowing_unversioned(|_| Ok(())) {
+        Ok(Some(stored)) => ConfigLiveHealth {
+            revision: stored.revision,
+            loaded_at: Utc::now(),
+            source_path: stored.source_path,
+            source_kind: if stored.recovered_from_backup {
+                SectionSourceKind::Backup
+            } else {
+                SectionSourceKind::File
+            },
+            status: if stored.recovered_from_backup {
+                SectionStatus::Degraded
+            } else {
+                SectionStatus::Healthy
+            },
+            last_error: stored.recovered_from_backup.then(|| {
+                "primary provider section invalid; using last-known-good backup".to_string()
+            }),
+        },
+        Ok(None) => ConfigLiveHealth {
             revision: 0,
             loaded_at: Utc::now(),
-            source_path: primary,
+            source_path: store.path().to_path_buf(),
             source_kind: SectionSourceKind::Default,
             status: SectionStatus::Missing,
             last_error: None,
-        };
-    }
-    if std::fs::read(&primary)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ProviderConfigs>(&bytes).ok())
-        .is_some()
-    {
-        return ConfigLiveHealth {
+        },
+        Err(_) => ConfigLiveHealth {
             revision: 0,
             loaded_at: Utc::now(),
-            source_path: primary,
-            source_kind: SectionSourceKind::File,
-            status: SectionStatus::Healthy,
-            last_error: None,
-        };
-    }
-
-    let backup = data_dir.join("providers.json.bak");
-    if std::fs::read(&backup)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ProviderConfigs>(&bytes).ok())
-        .is_some()
-    {
-        ConfigLiveHealth {
-            revision: 0,
-            loaded_at: Utc::now(),
-            source_path: backup,
-            source_kind: SectionSourceKind::Backup,
-            status: SectionStatus::Degraded,
-            last_error: Some(
-                "primary provider section invalid; using last-known-good backup".to_string(),
-            ),
-        }
-    } else {
-        ConfigLiveHealth {
-            revision: 0,
-            loaded_at: Utc::now(),
-            source_path: primary,
+            source_path: store.path().to_path_buf(),
             source_kind: SectionSourceKind::File,
             status: SectionStatus::Invalid,
             last_error: Some("provider section could not be parsed or read".to_string()),
-        }
+        },
     }
 }
 
@@ -454,28 +464,67 @@ impl Drop for ConfigWatcherRuntime {
 }
 
 async fn load_and_prepare_provider_candidate(
-    data_dir: &std::path::Path,
-    mut candidate_config: Config,
-) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), ProviderCandidateError> {
+    store: &AtomicJsonStore<ProviderConfigs>,
+    current_revision: u64,
+    candidate_config: Config,
+) -> Result<ProviderCandidate, ProviderCandidateError> {
     // Editors commonly implement save as delete/rename/create. Retry a missing
     // watched file briefly instead of treating the transient gap as a reset.
     for _ in 0..3 {
-        if data_dir.join("providers.json").exists() {
+        if store.path().exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let providers_path = data_dir.join("providers.json");
-    let bytes = std::fs::read(&providers_path).map_err(|_| {
-        if providers_path.exists() {
-            ProviderCandidateError::invalid("provider section is unreadable")
-        } else {
-            ProviderCandidateError::missing()
-        }
-    })?;
-    let providers = serde_json::from_slice::<ProviderConfigs>(&bytes)
-        .map_err(|_| ProviderCandidateError::invalid("provider section is invalid"))?;
-    *candidate_config.providers_mut() = providers;
+    if !store.path().exists() {
+        return Err(ProviderCandidateError::missing());
+    }
+    let stored = store
+        .load_validated_for_reload_allowing_unversioned(
+            current_revision,
+            candidate_config.providers(),
+            |_| Ok(()),
+        )
+        .map_err(|_| {
+            if store.path().exists() {
+                ProviderCandidateError::invalid("provider section is invalid")
+            } else {
+                ProviderCandidateError::missing()
+            }
+        })?
+        .ok_or_else(ProviderCandidateError::missing)?;
+    if stored.recovered_from_backup {
+        return Err(ProviderCandidateError::invalid(
+            "primary provider section is invalid; retaining last-known-good runtime",
+        ));
+    }
+    let unchanged = stored.revision == current_revision
+        && serde_json::to_value(&stored.data).ok()
+            == serde_json::to_value(candidate_config.providers()).ok();
+    let mut candidate_config = candidate_config;
+    *candidate_config.providers_mut() = stored.data;
+    let (candidate_config, registry, provider) = prepare_provider_candidate(
+        candidate_config,
+        store
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    )
+    .await?;
+    Ok(ProviderCandidate {
+        config: candidate_config,
+        registry,
+        provider,
+        revision: stored.revision,
+        normalized_external_revision: stored.normalized_external_revision,
+        unchanged,
+    })
+}
+
+async fn prepare_provider_candidate(
+    mut candidate_config: Config,
+    data_dir: &std::path::Path,
+) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), ProviderCandidateError> {
     candidate_config.hydrate_provider_api_keys_from_encrypted();
     let candidate_registry =
         bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.to_path_buf())
@@ -485,6 +534,15 @@ async fn load_and_prepare_provider_candidate(
         .get_default()
         .ok_or_else(ProviderCandidateError::runtime)?;
     Ok((candidate_config, candidate_registry, candidate_provider))
+}
+
+struct ProviderCandidate {
+    config: Config,
+    registry: bamboo_llm::ProviderRegistry,
+    provider: Arc<dyn LLMProvider>,
+    revision: u64,
+    normalized_external_revision: bool,
+    unchanged: bool,
 }
 
 async fn load_and_validate_mcp_candidate(
@@ -504,8 +562,9 @@ async fn load_and_validate_mcp_candidate(
             "MCP section is missing",
         ));
     }
+    let current_document = mcp_durable_comparison_document(&candidate_config.mcp);
     let stored = store
-        .load_validated_for_reload(current_revision, &candidate_config.mcp, validate_mcp_config)
+        .load_validated_for_reload(current_revision, &current_document, validate_mcp_config)
         .map_err(|_| ProviderCandidateError::invalid("MCP section is invalid"))?
         .ok_or_else(|| ProviderCandidateError::missing_section("MCP section is missing"))?;
     if stored.recovered_from_backup && !allow_startup_backup {
@@ -513,6 +572,9 @@ async fn load_and_validate_mcp_candidate(
             "primary MCP section is invalid; retaining last-known-good runtime",
         ));
     }
+    let unchanged = !allow_startup_backup
+        && stored.revision == current_revision
+        && serde_json::to_value(&stored.data).ok() == serde_json::to_value(&current_document).ok();
     candidate_config.mcp = stored.data;
     candidate_config.hydrate_mcp_secrets_from_encrypted();
     Ok(McpCandidate {
@@ -525,6 +587,7 @@ async fn load_and_validate_mcp_candidate(
         },
         source_path: stored.source_path,
         normalized_external_revision: stored.normalized_external_revision,
+        unchanged,
     })
 }
 
@@ -534,6 +597,36 @@ struct McpCandidate {
     source_kind: SectionSourceKind,
     source_path: PathBuf,
     normalized_external_revision: bool,
+    unchanged: bool,
+}
+
+/// Project a hydrated runtime section back to its durable comparison shape.
+/// Public compatibility serialization intentionally retains plaintext beside
+/// ciphertext, while the sidecar stores only ciphertext for paired secrets.
+fn mcp_durable_comparison_document(config: &McpConfig) -> McpConfig {
+    let mut document = config.clone();
+    for server in &mut document.servers {
+        match &mut server.transport {
+            TransportConfig::Stdio(config) => {
+                config
+                    .env
+                    .retain(|name, _| !config.env_encrypted.contains_key(name));
+            }
+            TransportConfig::Sse(config) => clear_paired_header_plaintext(&mut config.headers),
+            TransportConfig::StreamableHttp(config) => {
+                clear_paired_header_plaintext(&mut config.headers)
+            }
+        }
+    }
+    document
+}
+
+fn clear_paired_header_plaintext(headers: &mut [bamboo_mcp::HeaderConfig]) {
+    for header in headers {
+        if header.value_encrypted.is_some() {
+            header.value.clear();
+        }
+    }
 }
 
 fn validate_mcp_config(config: &McpConfig) -> Result<(), String> {
@@ -665,6 +758,276 @@ fn set_live_health_revision(
         health.source_kind = source_kind;
     }
     revision
+}
+
+#[derive(Debug)]
+pub(crate) enum ConfigSectionMutationError {
+    Store(ConfigStoreError),
+    Invalid(String),
+    Runtime(String),
+}
+
+impl AppState {
+    /// Validate and stage a provider runtime before the first durable CAS
+    /// write, then publish config/runtime/health/event under `config_io_lock`.
+    pub(crate) async fn put_provider_section(
+        &self,
+        expected_revision: u64,
+        mut providers: ProviderConfigs,
+    ) -> Result<u64, ConfigSectionMutationError> {
+        let _io = self.config_io_lock.lock().await;
+        let current = self.config.read().await.clone();
+        retain_provider_credentials(current.providers(), &mut providers);
+        let mut candidate = current;
+        *candidate.providers_mut() = providers.clone();
+        let (candidate, registry, provider) =
+            match prepare_provider_candidate(candidate, &self.app_data_dir).await {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    let message =
+                        "provider runtime initialization failed; retaining last-known-good runtime"
+                            .to_string();
+                    publish_section_failure(
+                        &self.config_live_health,
+                        &self.account_sink,
+                        "providers",
+                        SectionStatus::Degraded,
+                        message.clone(),
+                    );
+                    return Err(ConfigSectionMutationError::Runtime(message));
+                }
+            };
+
+        let store = AtomicJsonStore::new(self.app_data_dir.join("providers.json"), 1);
+        // Acquire every async publication guard before crossing the durable
+        // boundary. Once commit succeeds, cancellation cannot strand the file
+        // ahead of the live config/provider snapshots.
+        let mut live_config = self.config.write().await;
+        let mut live_provider = self.provider.write().await;
+        let revision = store
+            .commit_allowing_unversioned(expected_revision, providers, |_| Ok(()))
+            .map_err(ConfigSectionMutationError::Store)?;
+
+        candidate.publish_env_vars();
+        *live_config = candidate;
+        self.provider_registry.replace_with(registry);
+        *live_provider = provider;
+        publish_section_success(
+            &self.config_live_health,
+            &self.account_sink,
+            "providers",
+            store.path().to_path_buf(),
+            section_is_unhealthy(&self.config_live_health),
+            Some(revision),
+        );
+        Ok(revision)
+    }
+
+    /// Stage MCP connection/initialization/tool discovery, perform the CAS at
+    /// the manager's pre-publication boundary, then publish the config snapshot
+    /// before the prepared runtimes and finally emit one section event.
+    pub(crate) async fn put_mcp_section(
+        &self,
+        expected_revision: u64,
+        mut candidate: McpConfig,
+    ) -> Result<u64, ConfigSectionMutationError> {
+        let _io = self.config_io_lock.lock().await;
+        let store = AtomicJsonStore::new(self.app_data_dir.join("mcp.json"), 1);
+        retain_mcp_credentials(&self.config.read().await.mcp, &mut candidate);
+        validate_mcp_config(&candidate).map_err(ConfigSectionMutationError::Invalid)?;
+        let mut revision = None;
+        let mut store_error = None;
+        let durable_candidate = encrypted_mcp_document(&candidate)?;
+        let mut next_config = candidate.clone();
+        retain_mcp_ciphertext(&durable_candidate, &mut next_config);
+        let result = self
+            .mcp_manager
+            .reconcile_from_config_transactional_after(&candidate, || async {
+                // Stage may await freely, but acquire the snapshot guard before
+                // the durable boundary. Commit + snapshot publication below is
+                // then one cancellation-free synchronous critical section.
+                let mut live_config = self.config.write().await;
+                match store.commit(expected_revision, durable_candidate, validate_mcp_config) {
+                    Ok(committed) => {
+                        live_config.mcp = next_config;
+                        revision = Some(committed);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        store_error = Some(error);
+                        Err(bamboo_mcp::McpError::InvalidConfig(
+                            "MCP section durable commit failed".to_string(),
+                        ))
+                    }
+                }
+            })
+            .await;
+        if let Some(error) = store_error {
+            return Err(ConfigSectionMutationError::Store(error));
+        }
+        if result.is_err() {
+            let message =
+                "MCP runtime initialization failed; retaining last-known-good runtime".to_string();
+            publish_section_failure(
+                &self.mcp_config_live_health,
+                &self.account_sink,
+                "mcp",
+                SectionStatus::Degraded,
+                message.clone(),
+            );
+            return Err(ConfigSectionMutationError::Runtime(message));
+        }
+        let revision = revision.expect("successful MCP reconcile commits a revision");
+        publish_section_success(
+            &self.mcp_config_live_health,
+            &self.account_sink,
+            "mcp",
+            store.path().to_path_buf(),
+            section_is_unhealthy(&self.mcp_config_live_health),
+            Some(revision),
+        );
+        Ok(revision)
+    }
+}
+
+fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut ProviderConfigs) {
+    candidate.extra = current.extra.clone();
+    macro_rules! retain {
+        ($field:ident) => {
+            if let (Some(current), Some(candidate)) = (&current.$field, &mut candidate.$field) {
+                candidate.api_key = current.api_key.clone();
+                candidate.api_key_encrypted = current.api_key_encrypted.clone();
+                candidate.api_key_from_env = current.api_key_from_env;
+                candidate.request_overrides = current.request_overrides.clone();
+                candidate.extra = current.extra.clone();
+            }
+        };
+    }
+    retain!(openai);
+    retain!(anthropic);
+    retain!(gemini);
+    if let (Some(current), Some(candidate)) = (&current.bodhi, &mut candidate.bodhi) {
+        candidate.api_key = current.api_key.clone();
+        candidate.api_key_encrypted = current.api_key_encrypted.clone();
+        candidate.extra = current.extra.clone();
+    }
+    if let (Some(current), Some(candidate)) = (&current.copilot, &mut candidate.copilot) {
+        candidate.request_overrides = current.request_overrides.clone();
+        candidate.extra = current.extra.clone();
+    }
+}
+
+fn retain_mcp_credentials(current: &McpConfig, candidate: &mut McpConfig) {
+    for candidate_server in &mut candidate.servers {
+        let Some(current_server) = current
+            .servers
+            .iter()
+            .find(|server| server.id == candidate_server.id)
+        else {
+            continue;
+        };
+        match (&current_server.transport, &mut candidate_server.transport) {
+            (TransportConfig::Stdio(current), TransportConfig::Stdio(candidate)) => {
+                if candidate.env.is_empty() && candidate.env_encrypted.is_empty() {
+                    candidate.env = current.env.clone();
+                    candidate.env_encrypted = current.env_encrypted.clone();
+                }
+            }
+            (TransportConfig::Sse(current), TransportConfig::Sse(candidate))
+                if candidate.headers.is_empty() =>
+            {
+                candidate.headers = current.headers.clone();
+            }
+            (
+                TransportConfig::StreamableHttp(current),
+                TransportConfig::StreamableHttp(candidate),
+            ) if candidate.headers.is_empty() => {
+                candidate.headers = current.headers.clone();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn encrypted_mcp_document(runtime: &McpConfig) -> Result<McpConfig, ConfigSectionMutationError> {
+    let mut document = runtime.clone();
+    for server in &mut document.servers {
+        match &mut server.transport {
+            TransportConfig::Stdio(config) => {
+                for (name, value) in std::mem::take(&mut config.env) {
+                    if value.is_empty() || config.env_encrypted.contains_key(&name) {
+                        continue;
+                    }
+                    let encrypted = bamboo_config::encryption::encrypt(&value).map_err(|_| {
+                        ConfigSectionMutationError::Invalid(
+                            "MCP credential could not be prepared for durable storage".to_string(),
+                        )
+                    })?;
+                    config.env_encrypted.insert(name, encrypted);
+                }
+            }
+            TransportConfig::Sse(config) => encrypt_headers(&mut config.headers)?,
+            TransportConfig::StreamableHttp(config) => encrypt_headers(&mut config.headers)?,
+        }
+    }
+    Ok(document)
+}
+
+fn retain_mcp_ciphertext(document: &McpConfig, runtime: &mut McpConfig) {
+    for runtime_server in &mut runtime.servers {
+        let Some(document_server) = document
+            .servers
+            .iter()
+            .find(|server| server.id == runtime_server.id)
+        else {
+            continue;
+        };
+        match (&document_server.transport, &mut runtime_server.transport) {
+            (TransportConfig::Stdio(document), TransportConfig::Stdio(runtime)) => {
+                runtime.env_encrypted = document.env_encrypted.clone();
+            }
+            (TransportConfig::Sse(document), TransportConfig::Sse(runtime)) => {
+                copy_header_ciphertext(&document.headers, &mut runtime.headers);
+            }
+            (
+                TransportConfig::StreamableHttp(document),
+                TransportConfig::StreamableHttp(runtime),
+            ) => copy_header_ciphertext(&document.headers, &mut runtime.headers),
+            _ => {}
+        }
+    }
+}
+
+fn copy_header_ciphertext(
+    document: &[bamboo_mcp::HeaderConfig],
+    runtime: &mut [bamboo_mcp::HeaderConfig],
+) {
+    for runtime_header in runtime {
+        if let Some(document_header) = document
+            .iter()
+            .find(|header| header.name == runtime_header.name)
+        {
+            runtime_header.value_encrypted = document_header.value_encrypted.clone();
+        }
+    }
+}
+
+fn encrypt_headers(
+    headers: &mut [bamboo_mcp::HeaderConfig],
+) -> Result<(), ConfigSectionMutationError> {
+    for header in headers {
+        if header.value_encrypted.is_none() && !header.value.is_empty() {
+            header.value_encrypted = Some(
+                bamboo_config::encryption::encrypt(&header.value).map_err(|_| {
+                    ConfigSectionMutationError::Invalid(
+                        "MCP credential could not be prepared for durable storage".to_string(),
+                    )
+                })?,
+            );
+        }
+        header.value.clear();
+    }
+    Ok(())
 }
 
 impl AppState {
@@ -1129,17 +1492,18 @@ mod live_reload_tests {
     #[test]
     fn initial_provider_health_validates_primary_and_backup() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = initial_provider_health(dir.path());
+        let store = AtomicJsonStore::new(dir.path().join("providers.json"), 1);
+        let missing = initial_provider_health(&store);
         assert_eq!(missing.status, SectionStatus::Missing);
         assert_eq!(missing.source_kind, SectionSourceKind::Default);
 
         std::fs::write(dir.path().join("providers.json"), b"{broken").unwrap();
-        let invalid = initial_provider_health(dir.path());
+        let invalid = initial_provider_health(&store);
         assert_eq!(invalid.status, SectionStatus::Invalid);
         assert_eq!(invalid.source_kind, SectionSourceKind::File);
 
         std::fs::write(dir.path().join("providers.json.bak"), b"{}").unwrap();
-        let recovered = initial_provider_health(dir.path());
+        let recovered = initial_provider_health(&store);
         assert_eq!(recovered.status, SectionStatus::Degraded);
         assert_eq!(recovered.source_kind, SectionSourceKind::Backup);
         assert!(recovered
@@ -1149,7 +1513,7 @@ mod live_reload_tests {
             .contains("last-known-good backup"));
 
         std::fs::write(dir.path().join("providers.json"), b"{}").unwrap();
-        let healthy = initial_provider_health(dir.path());
+        let healthy = initial_provider_health(&store);
         assert_eq!(healthy.status, SectionStatus::Healthy);
         assert_eq!(healthy.source_kind, SectionSourceKind::File);
     }
@@ -1165,6 +1529,50 @@ mod live_reload_tests {
         ) -> Result<LLMStream, LLMError> {
             Err(LLMError::Api("working-provider-marker".to_string()))
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_put_cannot_commit_before_publication_guards() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x53; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let secret = "provider-cancel-secret";
+        {
+            let mut config = state.config.write().await;
+            config.provider = "openai".to_string();
+            *config.providers_mut() = ProviderConfigs {
+                openai: Some(bamboo_config::OpenAIConfig {
+                    api_key: secret.to_string(),
+                    api_key_encrypted: Some(bamboo_config::encryption::encrypt(secret).unwrap()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+        }
+        let provider_lock = state.provider.clone();
+        let held_provider = provider_lock.write().await;
+        let mut operation = Box::pin(state.put_provider_section(
+            0,
+            ProviderConfigs {
+                openai: Some(bamboo_config::OpenAIConfig {
+                    model: Some("candidate-model".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut operation)
+                .await
+                .is_err()
+        );
+        drop(operation);
+        assert!(
+            !dir.path().join("providers.json").exists(),
+            "cancellation while waiting for publication guards must precede durable commit"
+        );
+        drop(held_provider);
     }
 
     #[tokio::test]

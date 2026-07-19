@@ -109,7 +109,8 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    let providers = read_config_json(&providers_path);
+    let providers_document = read_config_json(&providers_path);
+    let providers = config_document_data(&providers_document);
     let openai_encrypted_before = providers
         .get("openai")
         .and_then(|o| o.get("api_key_encrypted"))
@@ -131,7 +132,17 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    let providers = read_config_json(&providers_path);
+    let providers_document = read_config_json(&providers_path);
+    if providers_document.get("data").is_some() {
+        assert_eq!(providers_document["schema_version"], 1);
+        assert!(
+            providers_document["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision >= 1),
+            "revisioned providers envelope must have a positive revision"
+        );
+    }
+    let providers = config_document_data(&providers_document);
     let openai_encrypted_after = providers
         .get("openai")
         .and_then(|o| o.get("api_key_encrypted"))

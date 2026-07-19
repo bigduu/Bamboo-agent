@@ -22,6 +22,23 @@ impl McpServerManager {
     /// new and changed servers have completed transport connection, protocol
     /// initialization, and tool discovery.
     pub async fn reconcile_from_config_transactional(&self, config: &McpConfig) -> Result<()> {
+        self.reconcile_from_config_transactional_after(config, || async { Ok(()) })
+            .await
+    }
+
+    /// Stage every new/changed runtime, then run `before_publish`, and only
+    /// publish the prepared runtimes when that durable boundary succeeds.
+    /// This lets a section store place its CAS commit exactly between runtime
+    /// validation and runtime/tool-index publication.
+    pub async fn reconcile_from_config_transactional_after<F, Fut>(
+        &self,
+        config: &McpConfig,
+        before_publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let _reconcile = self.reconcile_lock.lock().await;
         let mut seen = HashSet::new();
         for server in &config.servers {
@@ -83,23 +100,61 @@ impl McpServerManager {
             .filter(|id| !desired_enabled.contains(id.as_str()))
             .collect();
 
+        if let Err(error) = before_publish().await {
+            for prepared in replacements {
+                let id = prepared.runtime.config.id.clone();
+                self.shutdown_detached_runtime(&id, prepared.runtime).await;
+            }
+            return Err(error);
+        }
+
+        // From the durable boundary through the end of these loops there must
+        // be no suspension point: cancellation must observe either the old
+        // section or every committed runtime/tool-index publication.
+        let mut published = Vec::new();
         let mut replaced = Vec::new();
         for prepared in replacements {
-            let id = prepared.runtime.config.id.clone();
-            if let Some(old) = self.install_prepared_runtime(prepared).await {
-                replaced.push((id, old));
+            let (id, tool_names, old) = self.publish_prepared_runtime(prepared);
+            if let Some(old) = old {
+                // publish_prepared_runtime sets shutdown synchronously before
+                // returning, but keep the old generation for deferred cleanup.
+                replaced.push((id.clone(), old));
+            }
+            published.push((id, tool_names));
+        }
+        let mut removed = Vec::new();
+        for id in removals {
+            match self.detach_runtime(&id) {
+                Ok(runtime) => removed.push((id, runtime)),
+                Err(error) => {
+                    // The reconcile lock makes this unreachable for ordinary
+                    // manager callers, but a commit must remain best-effort and
+                    // infallible once replacements are published.
+                    warn!("Failed to detach removed MCP server '{}': {}", id, error);
+                }
             }
         }
-        for id in removals {
-            if let Err(error) = self.stop_server_unlocked(&id).await {
-                // The reconcile lock makes this unreachable for ordinary
-                // manager callers, but a commit must remain best-effort and
-                // infallible once replacements are published.
-                warn!("Failed to stop removed MCP server '{}': {}", id, error);
-            }
+
+        // Event channel backpressure and transport shutdown are post-commit
+        // cleanup. They must never delay section health publication by the
+        // caller or make a committed reconcile cancellable halfway through.
+        for (id, tool_names) in published {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.emit_runtime_ready_events(id, tool_names).await;
+            });
+        }
+        for (id, runtime) in removed {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.finish_detached_stop(id, runtime, true).await;
+            });
         }
         for (id, old) in replaced {
-            self.shutdown_detached_runtime(&id, old).await;
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.finish_detached_stop(id, old, false).await;
+            });
         }
         Ok(())
     }

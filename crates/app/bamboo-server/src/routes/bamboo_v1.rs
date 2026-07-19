@@ -106,8 +106,16 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::get().to(settings::get_provider_section),
         )
         .route(
+            "/bamboo/config/sections/providers",
+            web::put().to(settings::put_provider_section),
+        )
+        .route(
             "/bamboo/config/sections/mcp",
             web::get().to(settings::get_mcp_section),
+        )
+        .route(
+            "/bamboo/config/sections/mcp",
+            web::put().to(settings::put_mcp_section),
         )
         .route(
             "/bamboo/config/credentials",

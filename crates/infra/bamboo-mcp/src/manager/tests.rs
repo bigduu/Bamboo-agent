@@ -602,6 +602,60 @@ async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_in
 }
 
 #[tokio::test]
+async fn committed_reconcile_publishes_all_removals_before_blocked_cleanup() {
+    use std::sync::atomic::AtomicBool;
+
+    let (event_tx, _event_rx) = mpsc::channel(1);
+    event_tx
+        .send(McpEvent::ToolsChanged {
+            server_id: "blocker".to_string(),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("fill event channel");
+    let manager = McpServerManager::new().with_event_channel(event_tx);
+
+    let first = insert_mock_runtime(&manager, "first", connected_mock_client().await);
+    let second = insert_mock_runtime(&manager, "second", connected_mock_client().await);
+    for id in ["first", "second"] {
+        manager
+            .index
+            .register_server_tools(id, &[marker_tool("old")], &[], &[]);
+    }
+
+    let durable = Arc::new(AtomicBool::new(false));
+    let healthy = Arc::new(AtomicBool::new(false));
+    let durable_at_commit = durable.clone();
+    let healthy_after_reconcile = healthy.clone();
+    tokio::time::timeout(Duration::from_millis(100), async {
+        manager
+            .reconcile_from_config_transactional_after(
+                &McpConfig {
+                    version: 1,
+                    servers: Vec::new(),
+                },
+                || async move {
+                    durable_at_commit.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("committed reconcile is infallible");
+        // Models the section endpoint's post-reconcile health publication.
+        healthy_after_reconcile.store(true, Ordering::SeqCst);
+    })
+    .await
+    .expect("blocked cleanup must not suspend committed publication");
+
+    assert!(durable.load(Ordering::SeqCst));
+    assert!(healthy.load(Ordering::SeqCst));
+    assert!(manager.list_servers().is_empty());
+    assert!(manager.index.all_aliases().is_empty());
+    assert!(first.shutdown.load(Ordering::SeqCst));
+    assert!(second.shutdown.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn detached_refresh_cannot_overwrite_replacement_tool_index() {
     let manager = McpServerManager::new();
     let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);

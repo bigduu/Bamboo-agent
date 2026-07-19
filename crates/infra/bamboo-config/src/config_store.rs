@@ -302,6 +302,74 @@ where
         self.load_validated_locked(&validate)
     }
 
+    /// Load a revisioned document while accepting the pre-section-store raw
+    /// `T` shape as revision zero. This is intentionally opt-in: callers use
+    /// it only while migrating a legacy sidecar in place.
+    pub fn load_validated_allowing_unversioned<F>(
+        &self,
+        validate: F,
+    ) -> ConfigStoreResult<Option<StoredValue<T>>>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        let _lock = self.file.lock()?;
+        self.load_validated_compatible_locked(&validate)
+    }
+
+    fn load_validated_compatible_locked<F>(
+        &self,
+        validate: &F,
+    ) -> ConfigStoreResult<Option<StoredValue<T>>>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        if !self.path().exists() {
+            return Ok(None);
+        }
+        let primary = std::fs::read(self.path())?;
+        match self
+            .read_compatible_document_bytes(&primary)
+            .and_then(|document| {
+                validate(&document.data)
+                    .map_err(ConfigStoreError::Validation)
+                    .map(|_| document)
+            }) {
+            Ok(document) => Ok(Some(StoredValue {
+                data: document.data,
+                revision: document.revision,
+                source_path: self.path().to_path_buf(),
+                recovered_from_backup: false,
+                quarantine_path: None,
+                normalized_external_revision: false,
+            })),
+            Err(primary_error) => {
+                let quarantine_path = Some(self.file.quarantine_primary_locked(&primary)?);
+                for generation in 0..self.file.backup_generations {
+                    let backup = self.file.backup_path(generation);
+                    if let Ok(document) = std::fs::read(&backup)
+                        .map_err(ConfigStoreError::Io)
+                        .and_then(|bytes| self.read_compatible_document_bytes(&bytes))
+                        .and_then(|document| {
+                            validate(&document.data)
+                                .map_err(ConfigStoreError::Validation)
+                                .map(|_| document)
+                        })
+                    {
+                        return Ok(Some(StoredValue {
+                            data: document.data,
+                            revision: document.revision,
+                            source_path: backup,
+                            recovered_from_backup: true,
+                            quarantine_path,
+                            normalized_external_revision: false,
+                        }));
+                    }
+                }
+                Err(primary_error)
+            }
+        }
+    }
+
     fn load_validated_locked<F>(&self, validate: &F) -> ConfigStoreResult<Option<StoredValue<T>>>
     where
         F: Fn(&T) -> Result<(), String>,
@@ -391,6 +459,41 @@ where
         Ok(Some(stored))
     }
 
+    /// Legacy-compatible counterpart of [`Self::load_validated_for_reload`].
+    /// A changed raw sidecar is upgraded durably to the revisioned envelope
+    /// before it can become the next live snapshot.
+    pub fn load_validated_for_reload_allowing_unversioned<F>(
+        &self,
+        current_revision: u64,
+        current_data: &T,
+        validate: F,
+    ) -> ConfigStoreResult<Option<StoredValue<T>>>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        let _lock = self.file.lock()?;
+        let Some(mut stored) = self.load_validated_compatible_locked(&validate)? else {
+            return Ok(None);
+        };
+        if stored.recovered_from_backup {
+            return Ok(Some(stored));
+        }
+
+        let content_changed =
+            serde_json::to_value(&stored.data)? != serde_json::to_value(current_data)?;
+        if stored.revision < current_revision
+            || (stored.revision == current_revision && content_changed)
+        {
+            let revision = current_revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("revision counter exhausted".to_string())
+            })?;
+            self.commit_document_locked(revision, stored.data.clone(), true)?;
+            stored.revision = revision;
+            stored.normalized_external_revision = true;
+        }
+        Ok(Some(stored))
+    }
+
     pub fn commit<F>(
         &self,
         expected_revision: u64,
@@ -429,6 +532,61 @@ where
         Ok(revision)
     }
 
+    /// CAS commit that treats an existing pre-envelope raw `T` document as
+    /// revision zero and upgrades it atomically on the first successful write.
+    pub fn commit_allowing_unversioned<F>(
+        &self,
+        expected_revision: u64,
+        candidate: T,
+        validate: F,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: FnOnce(&T) -> Result<(), String>,
+    {
+        validate(&candidate).map_err(ConfigStoreError::Validation)?;
+        let _lock = self.file.lock()?;
+        let actual = if self.path().exists() {
+            let bytes = std::fs::read(self.path())?;
+            self.read_compatible_document_bytes(&bytes)?.revision
+        } else {
+            0
+        };
+        if actual != expected_revision {
+            return Err(ConfigStoreError::Conflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let revision = actual.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("revision counter exhausted".to_string())
+        })?;
+        self.commit_document_locked(revision, candidate, true)?;
+        Ok(revision)
+    }
+
+    fn commit_document_locked(
+        &self,
+        revision: u64,
+        candidate: T,
+        allow_unversioned_backup: bool,
+    ) -> ConfigStoreResult<()> {
+        let document = RevisionedDocument {
+            schema_version: self.schema_version,
+            revision,
+            data: candidate,
+        };
+        let bytes = serde_json::to_vec_pretty(&document)?;
+        self.file.commit_bytes_locked(&bytes, |previous| {
+            let parsed = if allow_unversioned_backup {
+                self.read_compatible_document_bytes(previous)?
+            } else {
+                self.read_document_bytes(previous)?
+            };
+            Ok(serde_json::to_vec_pretty(&parsed)?)
+        })?;
+        Ok(())
+    }
+
     fn read_document(&self, path: &Path) -> ConfigStoreResult<RevisionedDocument<T>> {
         let bytes = std::fs::read(path)?;
         self.read_document_bytes(&bytes)
@@ -442,6 +600,27 @@ where
             ));
         }
         Ok(document)
+    }
+
+    fn read_compatible_document_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<RevisionedDocument<T>> {
+        let shape: serde_json::Value = serde_json::from_slice(bytes)?;
+        let has_envelope_marker = shape.as_object().is_some_and(|object| {
+            object.contains_key("schema_version")
+                || object.contains_key("revision")
+                || object.contains_key("data")
+        });
+        if has_envelope_marker {
+            self.read_document_bytes(bytes)
+        } else {
+            Ok(RevisionedDocument {
+                schema_version: self.schema_version,
+                revision: 0,
+                data: serde_json::from_slice(bytes)?,
+            })
+        }
     }
 }
 
@@ -979,6 +1158,76 @@ mod tests {
             }
         ));
         assert_eq!(store.load().unwrap().unwrap().data.value, "one");
+    }
+
+    #[test]
+    fn legacy_revision_zero_has_exactly_one_concurrent_cas_winner() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        std::fs::write(&path, br#"{"value":"legacy"}"#).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for value in ["one", "two"] {
+            let store = AtomicJsonStore::new(&path, 1);
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.commit_allowing_unversioned(
+                    0,
+                    Example {
+                        value: value.to_string(),
+                    },
+                    |_| Ok(()),
+                )
+            }));
+        }
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(ConfigStoreError::Conflict {
+                        expected: 0,
+                        actual: 1
+                    })
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn compatible_load_never_downgrades_envelope_errors_to_legacy() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let store: AtomicJsonStore<Example> = AtomicJsonStore::new(&path, 1);
+
+        std::fs::write(
+            &path,
+            br#"{"schema_version":99,"revision":7,"data":{"value":"future"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_validated_allowing_unversioned(|_| Ok(())),
+            Err(ConfigStoreError::Validation(message))
+                if message == "document schema is newer than this runtime"
+        ));
+
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"data":{"value":"missing-revision"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_validated_allowing_unversioned(|_| Ok(())),
+            Err(ConfigStoreError::Json(_))
+        ));
     }
 
     #[test]

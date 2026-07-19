@@ -76,6 +76,19 @@ impl McpServerManager {
         &self,
         prepared: PreparedServerRuntime,
     ) -> Option<Arc<ServerRuntime>> {
+        let (server_id, tool_names, replaced) = self.publish_prepared_runtime(prepared);
+
+        self.emit_runtime_ready_events(server_id, tool_names).await;
+        replaced
+    }
+
+    /// Publish a fully initialized runtime without suspending. Configuration
+    /// reconciliation uses this after its durable CAS boundary so cancellation
+    /// cannot leave only part of a committed runtime set visible.
+    pub(super) fn publish_prepared_runtime(
+        &self,
+        prepared: PreparedServerRuntime,
+    ) -> (String, Vec<String>, Option<Arc<ServerRuntime>>) {
         let PreparedServerRuntime {
             runtime,
             tools,
@@ -109,7 +122,23 @@ impl McpServerManager {
             self.spawn_notification_drain(server_id.clone(), runtime.clone(), rx);
         }
 
-        // Emit event
+        // The new generation's health task and the old generation's shutdown
+        // flag are part of the synchronous publication boundary. Event delivery
+        // and client disconnection may suspend and happen afterward.
+        self.start_health_check(runtime, healthcheck_interval_ms);
+        if let Some(ref old) = replaced {
+            old.shutdown.store(true, Ordering::SeqCst);
+        }
+
+        let tool_names = aliases.into_iter().map(|alias| alias.alias).collect();
+        (server_id, tool_names, replaced)
+    }
+
+    pub(super) async fn emit_runtime_ready_events(
+        &self,
+        server_id: String,
+        tool_names: Vec<String>,
+    ) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx
                 .send(McpEvent::ServerStatusChanged {
@@ -119,7 +148,6 @@ impl McpServerManager {
                 })
                 .await;
 
-            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
                 .send(McpEvent::ToolsChanged {
                     server_id,
@@ -127,10 +155,6 @@ impl McpServerManager {
                 })
                 .await;
         }
-
-        // Start health check task
-        self.start_health_check(runtime, healthcheck_interval_ms);
-        replaced
     }
 
     /// Stop an MCP server connection.
@@ -140,42 +164,44 @@ impl McpServerManager {
     }
 
     pub(super) async fn stop_server_unlocked(&self, server_id: &str) -> Result<()> {
+        info!("Stopping MCP server '{}'", server_id);
+        let runtime = self.detach_runtime(server_id)?;
+        self.finish_detached_stop(server_id.to_string(), runtime, true)
+            .await;
+        info!("MCP server '{}' stopped", server_id);
+        Ok(())
+    }
+
+    /// Remove a runtime and all of its externally visible tools without
+    /// suspending. The returned client can be disconnected afterward.
+    pub(super) fn detach_runtime(&self, server_id: &str) -> Result<Arc<ServerRuntime>> {
         let (_, runtime) = self
             .runtimes
             .remove(server_id)
             .ok_or_else(|| McpError::NotRunning(server_id.to_string()))?;
-
-        info!("Stopping MCP server '{}'", server_id);
-
         runtime.shutdown.store(true, Ordering::SeqCst);
-
-        // Disconnect client
-        let mut client = runtime.client.write().await;
-        if let Err(e) = client.disconnect().await {
-            warn!("Error disconnecting MCP server '{}': {}", server_id, e);
-        }
-
-        // Update info
-        let mut info = runtime.info.write().await;
-        info.status = ServerStatus::Stopped;
-        info.disconnected_at = Some(Utc::now());
-
-        // Remove tools from index
         self.index.remove_server_tools(server_id);
+        Ok(runtime)
+    }
 
-        // Emit event
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx
-                .send(McpEvent::ServerStatusChanged {
-                    server_id: server_id.to_string(),
-                    status: ServerStatus::Stopped,
-                    error: None,
-                })
-                .await;
+    pub(super) async fn finish_detached_stop(
+        &self,
+        server_id: String,
+        runtime: Arc<ServerRuntime>,
+        emit_stopped: bool,
+    ) {
+        self.shutdown_detached_runtime(&server_id, runtime).await;
+        if emit_stopped {
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx
+                    .send(McpEvent::ServerStatusChanged {
+                        server_id,
+                        status: ServerStatus::Stopped,
+                        error: None,
+                    })
+                    .await;
+            }
         }
-
-        info!("MCP server '{}' stopped", server_id);
-        Ok(())
     }
 
     /// Stop a runtime that has already been detached/replaced. This deliberately

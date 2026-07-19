@@ -1,8 +1,29 @@
 use actix_web::{web, HttpResponse};
-use bamboo_config::SectionEnvelope;
+use bamboo_config::{patch::is_masked_api_key, ConfigStoreError, ProviderConfigs, SectionEnvelope};
+use bamboo_mcp::McpConfig;
+use serde::{de::Error as _, Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 
-use crate::{app_state::AppState, error::AppError};
+use crate::{
+    app_state::{AppState, ConfigSectionMutationError},
+    error::AppError,
+};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutProviderSectionRequest {
+    pub expected_revision: u64,
+    #[serde(deserialize_with = "deserialize_provider_candidate")]
+    pub data: ProviderConfigs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutMcpSectionRequest {
+    pub expected_revision: u64,
+    #[serde(deserialize_with = "deserialize_mcp_candidate")]
+    pub data: McpConfig,
+}
 
 /// Read-only, secret-free provider section projection. Credential values,
 /// ciphertext, UI masks, request override headers, and forward-compatible
@@ -48,6 +69,188 @@ pub async fn get_mcp_section(app_state: web::Data<AppState>) -> Result<HttpRespo
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     Ok(HttpResponse::Ok().json(section_envelope(data, health)))
+}
+
+pub async fn put_provider_section(
+    app_state: web::Data<AppState>,
+    payload: web::Json<PutProviderSectionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let payload = payload.into_inner();
+    app_state
+        .put_provider_section(payload.expected_revision, payload.data)
+        .await
+        .map_err(map_mutation_error)?;
+    get_provider_section(app_state).await
+}
+
+pub async fn put_mcp_section(
+    app_state: web::Data<AppState>,
+    payload: web::Json<PutMcpSectionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let payload = payload.into_inner();
+    app_state
+        .put_mcp_section(payload.expected_revision, payload.data)
+        .await
+        .map_err(map_mutation_error)?;
+    get_mcp_section(app_state).await
+}
+
+fn map_mutation_error(error: ConfigSectionMutationError) -> AppError {
+    match error {
+        ConfigSectionMutationError::Store(ConfigStoreError::Conflict { expected, actual }) => {
+            AppError::ConfigConflict { expected, actual }
+        }
+        ConfigSectionMutationError::Store(ConfigStoreError::Validation(message))
+        | ConfigSectionMutationError::Invalid(message)
+        | ConfigSectionMutationError::Runtime(message) => AppError::BadRequest(message),
+        ConfigSectionMutationError::Store(ConfigStoreError::Io(error)) => {
+            AppError::StorageError(error)
+        }
+        ConfigSectionMutationError::Store(ConfigStoreError::Json(_)) => {
+            AppError::BadRequest("section document is invalid".to_string())
+        }
+        ConfigSectionMutationError::Store(ConfigStoreError::Watch(error)) => {
+            AppError::InternalError(anyhow::anyhow!("section store watch failed: {error}"))
+        }
+    }
+}
+
+fn deserialize_provider_candidate<'de, D>(deserializer: D) -> Result<ProviderConfigs, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    reject_secret_fields(&value, SecretPolicy::Provider).map_err(D::Error::custom)?;
+    let candidate: ProviderConfigs = serde_json::from_value(value).map_err(D::Error::custom)?;
+    validate_provider_shape(&candidate).map_err(D::Error::custom)?;
+    Ok(candidate)
+}
+
+fn deserialize_mcp_candidate<'de, D>(deserializer: D) -> Result<McpConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    reject_secret_fields(&value, SecretPolicy::Mcp).map_err(D::Error::custom)?;
+    let candidate: McpConfig = serde_json::from_value(value).map_err(D::Error::custom)?;
+    validate_mcp_public_shape(&candidate).map_err(D::Error::custom)?;
+    Ok(candidate)
+}
+
+#[derive(Clone, Copy)]
+enum SecretPolicy {
+    Provider,
+    Mcp,
+}
+
+fn reject_secret_fields(value: &Value, policy: SecretPolicy) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                let normalized = key.to_ascii_lowercase();
+                let forbidden = match policy {
+                    SecretPolicy::Provider => matches!(
+                        normalized.as_str(),
+                        "api_key" | "api_key_encrypted" | "request_overrides"
+                    ),
+                    SecretPolicy::Mcp => {
+                        matches!(normalized.as_str(), "env_encrypted" | "value_encrypted")
+                            || (matches!(normalized.as_str(), "env" | "headers")
+                                && !value.as_object().is_some_and(Map::is_empty)
+                                && !value.as_array().is_some_and(Vec::is_empty))
+                    }
+                };
+                if forbidden {
+                    return Err(format!(
+                        "secret-bearing field '{key}' is not accepted; use the credential API"
+                    ));
+                }
+                reject_secret_fields(value, policy)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => {
+            for value in values {
+                reject_secret_fields(value, policy)?;
+            }
+            Ok(())
+        }
+        Value::String(value) if is_masked_api_key(value) => {
+            Err("masked secret placeholders are not accepted".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_provider_shape(candidate: &ProviderConfigs) -> Result<(), String> {
+    if !candidate.extra.is_empty() {
+        return Err("unknown provider fields are not accepted by the typed endpoint".to_string());
+    }
+    macro_rules! validate {
+        ($field:ident) => {
+            if let Some(provider) = &candidate.$field {
+                if !provider.extra.is_empty() || provider.request_overrides.is_some() {
+                    return Err(
+                        "unknown provider fields and request overrides are not accepted by the typed endpoint"
+                            .to_string(),
+                    );
+                }
+                if let Some(url) = provider.base_url.as_deref() {
+                    validate_public_url(url)?;
+                }
+            }
+        };
+    }
+    validate!(openai);
+    validate!(anthropic);
+    validate!(gemini);
+    if let Some(provider) = &candidate.copilot {
+        if !provider.extra.is_empty() || provider.request_overrides.is_some() {
+            return Err(
+                "unknown provider fields and request overrides are not accepted by the typed endpoint"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(provider) = &candidate.bodhi {
+        if !provider.extra.is_empty() {
+            return Err(
+                "unknown provider fields are not accepted by the typed endpoint".to_string(),
+            );
+        }
+        if let Some(url) = provider.base_url.as_deref() {
+            validate_public_url(url)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_public_shape(candidate: &McpConfig) -> Result<(), String> {
+    for server in &candidate.servers {
+        match &server.transport {
+            bamboo_mcp::TransportConfig::Stdio(_) => {}
+            bamboo_mcp::TransportConfig::Sse(config) => validate_public_url(&config.url)?,
+            bamboo_mcp::TransportConfig::StreamableHttp(config) => {
+                validate_public_url(&config.url)?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_url(raw: &str) -> Result<(), String> {
+    let url = url::Url::parse(raw).map_err(|_| "section URL is invalid".to_string())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "credentials, query strings, and fragments are not accepted in section URLs"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn section_envelope(
@@ -459,5 +662,341 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["revision"], 99);
         assert_eq!(body["data"]["active_provider"], "coherent-provider");
+    }
+
+    #[actix_web::test]
+    async fn provider_put_upgrades_legacy_cas_preserves_secret_and_redacts_response() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x51; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let secret = "provider-put-secret-597";
+        {
+            let mut config = state.config.write().await;
+            config.provider = "openai".to_string();
+            *config.providers_mut() = ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: secret.to_string(),
+                    api_key_encrypted: Some(bamboo_config::encryption::encrypt(secret).unwrap()),
+                    model: Some("old-model".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+        }
+        let raw = serde_json::to_vec_pretty(state.config.read().await.providers()).unwrap();
+        std::fs::write(dir.path().join("providers.json"), raw).unwrap();
+        let mut feed = state.account_sink.subscribe();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/providers", web::put().to(put_provider_section)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/providers")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {"openai": {"model": "new-model"}}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(!body.contains(secret));
+        assert!(!body.contains("api_key_encrypted"));
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["revision"], 1);
+        assert_eq!(body["data"]["providers"]["openai"]["model"], "new-model");
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key,
+            secret
+        );
+
+        let disk = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
+        assert!(!disk.contains(secret));
+        let disk: Value = serde_json::from_str(&disk).unwrap();
+        assert_eq!(disk["revision"], 1);
+        assert!(disk["data"]["openai"]["api_key_encrypted"].is_string());
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
+                        if section == "providers" && *revision == 1
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(first.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), feed.recv())
+                .await
+                .is_err(),
+            "the watcher echo must not publish a duplicate event"
+        );
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/providers")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {"openai": {"model": "stale-model"}}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("new-model")
+        );
+
+        let mut external = state.config.read().await.providers().clone();
+        external.openai.as_mut().unwrap().model = Some("external-model".to_string());
+        std::fs::write(
+            dir.path().join("providers.json"),
+            serde_json::to_vec_pretty(&external).unwrap(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let health = state
+                    .config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if health.status == SectionStatus::Healthy && health.revision == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("external raw provider edit is normalized");
+        let normalized: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert_eq!(normalized["revision"], 2);
+        let stale_after_external = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/providers")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": {"openai": {"model": "lost-update"}}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            stale_after_external.status(),
+            actix_web::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[actix_web::test]
+    async fn mcp_put_preserves_secret_stages_runtime_and_retains_lkg_on_failure() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x52; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let secret = "mcp-put-secret-597";
+        let current = McpConfig {
+            version: 1,
+            servers: vec![
+                server(
+                    "preserved",
+                    TransportConfig::Stdio(StdioConfig {
+                        command: "unused-disabled-command".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: HashMap::from([("TOKEN".to_string(), secret.to_string())]),
+                        env_encrypted: HashMap::new(),
+                        startup_timeout_ms: 500,
+                    }),
+                ),
+                server(
+                    "preserved-http",
+                    TransportConfig::StreamableHttp(StreamableHttpConfig {
+                        url: "https://mcp.example/rpc".to_string(),
+                        headers: vec![HeaderConfig {
+                            name: "Authorization".to_string(),
+                            value: secret.to_string(),
+                            value_encrypted: None,
+                        }],
+                        connect_timeout_ms: 500,
+                    }),
+                ),
+            ],
+        };
+        state.config.write().await.mcp = current;
+        let mut feed = state.account_sink.subscribe();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/mcp", web::put().to(put_mcp_section)),
+        )
+        .await;
+        let candidate = McpConfig {
+            version: 1,
+            servers: vec![
+                server(
+                    "preserved",
+                    TransportConfig::Stdio(StdioConfig {
+                        command: "updated-disabled-command".to_string(),
+                        args: vec!["--safe".to_string()],
+                        cwd: None,
+                        env: HashMap::new(),
+                        env_encrypted: HashMap::new(),
+                        startup_timeout_ms: 500,
+                    }),
+                ),
+                server(
+                    "preserved-http",
+                    TransportConfig::StreamableHttp(StreamableHttpConfig {
+                        url: "https://mcp.example/rpc".to_string(),
+                        headers: Vec::new(),
+                        connect_timeout_ms: 500,
+                    }),
+                ),
+            ],
+        };
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({"expected_revision": 0, "data": candidate.clone()}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(!body.contains(secret));
+        let config = state.config.read().await;
+        let TransportConfig::Stdio(stdio) = &config.mcp.servers[0].transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(stdio.env["TOKEN"], secret);
+        let TransportConfig::StreamableHttp(http) = &config.mcp.servers[1].transport else {
+            panic!("expected streamable HTTP transport");
+        };
+        assert_eq!(http.headers[0].value, secret);
+        drop(config);
+        let disk = std::fs::read_to_string(dir.path().join("mcp.json")).unwrap();
+        assert!(!disk.contains(secret));
+        assert!(disk.contains("env_encrypted"));
+        assert!(disk.contains("headers_encrypted"));
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
+                        if section == "mcp" && *revision == 1
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(first.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), feed.recv())
+                .await
+                .is_err(),
+            "the MCP watcher echo must not publish a duplicate event"
+        );
+        assert_eq!(
+            state
+                .mcp_config_live_health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .revision,
+            1
+        );
+
+        let mut failing = candidate;
+        failing.servers[0].enabled = true;
+        if let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport {
+            stdio.command = "definitely-not-a-real-mcp-command-597".to_string();
+        }
+        let failure = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({"expected_revision": 1, "data": failing}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failure.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(persisted["revision"], 1);
+        assert!(
+            !state.config.read().await.mcp.servers[0].enabled,
+            "runtime failure must retain the last-known-good config"
+        );
+        let health = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(health.revision, 1);
+        assert_eq!(health.status, SectionStatus::Degraded);
+    }
+
+    #[::core::prelude::v1::test]
+    fn typed_writes_reject_secret_fields_masks_and_credential_urls() {
+        for payload in [
+            json!({"expected_revision": 0, "data": {"openai": {"api_key": "secret"}}}),
+            json!({"expected_revision": 0, "data": {"openai": {"model": "****...****"}}}),
+            json!({"expected_revision": 0, "data": {"openai": {"base_url": "https://user:pass@example.test/v1"}}}),
+        ] {
+            assert!(serde_json::from_value::<PutProviderSectionRequest>(payload).is_err());
+        }
+        for payload in [
+            json!({"expected_revision": 0, "data": {"server": {"command": "cmd", "env": {"TOKEN": "secret"}}}}),
+            json!({"expected_revision": 0, "data": {"server": {"url": "https://example.test/mcp?token=secret"}}}),
+        ] {
+            assert!(serde_json::from_value::<PutMcpSectionRequest>(payload).is_err());
+        }
+
+        assert!(serde_json::from_value::<PutProviderSectionRequest>(json!({
+            "expected_revision": 0,
+            "data": {"openai": {"model": "foo****bar"}}
+        }))
+        .is_ok());
+        assert!(serde_json::from_value::<PutMcpSectionRequest>(json!({
+            "expected_revision": 0,
+            "data": {"server": {"command": "cmd****name"}}
+        }))
+        .is_ok());
     }
 }
