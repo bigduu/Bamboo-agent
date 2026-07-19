@@ -41,7 +41,7 @@ pub(crate) async fn prepare_session_for_loop(
 ) -> Option<TaskLoopContext> {
     let skill_result =
         skill_context::load_skill_context(config, session, session_id, initial_message).await;
-    let skill_context = skill_result.context.clone();
+    let mut skill_context = skill_result.context.clone();
 
     if let Some(source) = skill_result.selection_source.as_deref() {
         debug_logger.log_event(
@@ -83,6 +83,8 @@ pub(crate) async fn prepare_session_for_loop(
             );
         }
 
+        skill_context::reset_explicit_activation_state(session, &skill_result);
+
         // Runtime tools authorize skill loads through the shared session repository.
         // Publish this run's resolved IDs before the first model/tool call so they
         // never observe a missing or previous-run allowlist from the cache.
@@ -93,6 +95,21 @@ pub(crate) async fn prepare_session_for_loop(
                     session_id,
                     error
                 );
+            }
+        }
+
+        if let Some(activated_context) =
+            skill_context::activate_explicit_skill(tools, session, session_id, &skill_result).await
+        {
+            skill_context = activated_context;
+            if let Some(persistence) = config.persistence.as_ref() {
+                if let Err(error) = persistence.save_runtime_session(session).await {
+                    tracing::warn!(
+                        "[{}] Failed to publish explicit skill activation before execution: {}",
+                        session_id,
+                        error
+                    );
+                }
             }
         }
     }

@@ -1664,7 +1664,8 @@ Use this skill for testing.
             assert_eq!(entry.kind, crate::WorkflowKind::Instruction);
             assert_eq!(entry.status, WorkflowStatus::Valid);
             assert!(entry.revision > 0);
-            assert_eq!(entry.version, "1");
+            let expected_version = if id == "review" { "3" } else { "1" };
+            assert_eq!(entry.version, expected_version);
             assert_eq!(entry.invocation_policy["explicit"], true);
             assert_eq!(entry.invocation_policy["automatic"], automatic);
             assert_eq!(entry.argument_schema["type"], "object");
