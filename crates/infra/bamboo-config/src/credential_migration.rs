@@ -43,6 +43,8 @@ struct MigrationManifest {
     transaction_id: String,
     stage_dir: String,
     state: MigrationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exact_scope: Option<ExactTransactionScope>,
     files: Vec<StagedFile>,
 }
 
@@ -51,6 +53,12 @@ struct MigrationManifest {
 enum MigrationState {
     Pending,
     Complete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExactTransactionScope {
+    ProxyAuth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +137,7 @@ enum MigrationFault {
     AfterExactCommitCredentialClearRace,
     AfterExactCredentialRebaseStage,
     AfterExactCredentialRebaseManifest,
+    AfterExactProxyConfigRebaseManifestExternalWrite,
 }
 
 /// Extract provider/MCP sidecar secrets into the isolated credential store.
@@ -384,6 +393,7 @@ fn persist_provider_credential_transaction_with_instances_inner(
         transaction_id,
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
+        exact_scope: proxy_only.then_some(ExactTransactionScope::ProxyAuth),
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -570,6 +580,7 @@ fn migrate_inner(
         transaction_id,
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
+        exact_scope: None,
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -1282,6 +1293,7 @@ fn install_pending(
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
     validate_manifest(manifest)?;
+    ensure_proxy_ref_has_no_durable_non_proxy_consumers(data_dir, manifest)?;
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let names = manifest
         .files
@@ -1328,7 +1340,13 @@ fn install_pending(
                     .write_bytes_if_hash_with_backup(expected, &staged)?
                 {
                     if file.name == CONFIG_FILE
-                        && install_rebased_proxy_config_member(data_dir, manifest, file_index)?
+                        && install_rebased_proxy_config_member(
+                            data_dir,
+                            manifest,
+                            file_index,
+                            #[cfg(test)]
+                            fault,
+                        )?
                     {
                         continue;
                     }
@@ -1397,7 +1415,11 @@ fn install_rebased_proxy_config_member(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
     file_index: usize,
+    #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<bool> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ProxyAuth) {
+        return Ok(false);
+    }
     let credential_file = manifest
         .files
         .iter()
@@ -1412,39 +1434,16 @@ fn install_rebased_proxy_config_member(
     }
     let touched_ref = credential_file.touched_credential_refs[0].clone();
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
-    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
     let file = manifest.files[file_index].clone();
-    let mut staged: Value =
-        serde_json::from_slice(&std::fs::read(stage_dir.join(&file.staged_name))?)?;
+    let staged: Value = serde_json::from_slice(&std::fs::read(stage_dir.join(&file.staged_name))?)?;
     let staged_ref = staged
         .get("proxy_auth_credential_ref")
         .and_then(Value::as_str);
     if staged_ref != Some(touched_ref.as_str()) {
         return Ok(false);
     }
-    let mut original: Value = serde_json::from_slice(&read_encrypted_migration_backup(
-        &backup_dir.join(CONFIG_FILE),
-    )?)?;
-    strip_proxy_auth_fields(&mut staged)?;
-    strip_proxy_auth_fields(&mut original)?;
-    if staged != original {
-        return Ok(false);
-    }
-    for other in manifest.files.iter().filter(|other| {
-        other.install_mode == InstallMode::Exact
-            && other.name != CREDENTIALS_FILE
-            && other.name != CONFIG_FILE
-    }) {
-        let staged: Value =
-            serde_json::from_slice(&std::fs::read(stage_dir.join(&other.staged_name))?)?;
-        let original: Value = serde_json::from_slice(&read_encrypted_migration_backup(
-            &backup_dir.join(&other.name),
-        )?)?;
-        if staged != original {
-            return Ok(false);
-        }
-    }
 
+    ensure_proxy_ref_has_no_durable_non_proxy_consumers(data_dir, manifest)?;
     let target = data_dir.join(CONFIG_FILE);
     let current = read_target_or_empty(&target)?;
     let current_hash = sha256(&current);
@@ -1487,6 +1486,11 @@ fn install_rebased_proxy_config_member(
     file.sha256 = sha256(&rebased);
     file.original_sha256 = Some(current_hash.clone());
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterExactProxyConfigRebaseManifestExternalWrite) {
+        inject_external_proxy_root_write(&target)?;
+        return Err(injected_fault());
+    }
     if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
         return Err(ConfigStoreError::Validation(
             "config.json changed repeatedly during committed proxy transaction".to_string(),
@@ -1495,20 +1499,96 @@ fn install_rebased_proxy_config_member(
     Ok(true)
 }
 
-fn strip_proxy_auth_fields(value: &mut Value) -> ConfigStoreResult<()> {
-    let object = value.as_object_mut().ok_or_else(|| {
-        ConfigStoreError::Validation("proxy transaction root must be an object".to_string())
-    })?;
-    for key in [
-        "proxy_auth",
-        "proxy_auth_encrypted",
-        "proxy_auth_credential_ref",
-        "http_proxy_auth_encrypted",
-        "https_proxy_auth_encrypted",
-    ] {
-        object.remove(key);
+fn ensure_proxy_ref_has_no_durable_non_proxy_consumers(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ProxyAuth) {
+        return Ok(());
+    }
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let [touched_ref] = credential_file.touched_credential_refs.as_slice() else {
+        return Err(ConfigStoreError::Validation(
+            "committed proxy credential transaction is invalid".to_string(),
+        ));
+    };
+
+    for name in [CONFIG_FILE, PROVIDERS_FILE, MCP_FILE] {
+        let bytes = read_target_or_empty(&data_dir.join(name))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let document: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            ConfigStoreError::Validation(format!(
+                "{name} changed to an invalid document during committed proxy transaction"
+            ))
+        })?;
+        if contains_non_proxy_credential_reference(&document, touched_ref, name == CONFIG_FILE) {
+            return Err(ConfigStoreError::Validation(
+                "proxy auth credential reference gained a non-proxy consumer during committed transaction"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn contains_non_proxy_credential_reference(
+    value: &Value,
+    touched_ref: &str,
+    config_root: bool,
+) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, child)| {
+            if config_root && key == "proxy_auth_credential_ref" {
+                return false;
+            }
+            (key == "credential_ref" && child.as_str() == Some(touched_ref))
+                || (key.ends_with("_credential_refs") && contains_string_value(child, touched_ref))
+                || contains_non_proxy_credential_reference(child, touched_ref, false)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|child| contains_non_proxy_credential_reference(child, touched_ref, false)),
+        _ => false,
+    }
+}
+
+fn contains_string_value(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_string_value(value, expected)),
+        Value::Object(object) => object
+            .values()
+            .any(|value| contains_string_value(value, expected)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn inject_external_proxy_root_write(target: &Path) -> ConfigStoreResult<()> {
+    let mut current: Value = serde_json::from_slice(&std::fs::read(target)?)?;
+    let object = current.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed proxy transaction"
+                .to_string(),
+        )
+    })?;
+    object.insert(
+        "external_rebase_generation".to_string(),
+        Value::Number(2_u64.into()),
+    );
+    AtomicFileStore::new(target).write_bytes_without_backup(&serde_json::to_vec_pretty(&current)?)
 }
 
 fn install_exact_credential_member(
@@ -1923,14 +2003,30 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         .files
         .iter()
         .any(|file| file.install_mode == InstallMode::Exact);
+    let exact_scope_valid = match (exact_transaction, manifest.exact_scope) {
+        (false, None) => true,
+        (true, Some(ExactTransactionScope::ProxyAuth)) => {
+            manifest.files.len() == 2
+                && unique.contains(CONFIG_FILE)
+                && manifest
+                    .files
+                    .iter()
+                    .find(|file| file.name == CREDENTIALS_FILE)
+                    .is_some_and(|file| {
+                        file.touched_credential_refs == ["proxy.default.auth".to_string()]
+                    })
+        }
+        (true, None) => manifest.files.len() == 3 && unique.contains(PROVIDERS_FILE),
+        (false, Some(_)) => false,
+    };
     let exact_shape_valid = !exact_transaction
         || ((manifest.files.len() == 2 || manifest.files.len() == 3)
             && manifest
                 .files
                 .iter()
                 .all(|file| file.install_mode == InstallMode::Exact)
-            && (manifest.files.len() == 2 || unique.contains(PROVIDERS_FILE))
             && unique.contains(CONFIG_FILE)
+            && exact_scope_valid
             && manifest.files.iter().all(|file| {
                 file.migration_generation.is_none()
                     && ((file.name == CREDENTIALS_FILE && file.expected_revision.is_some())
@@ -1942,6 +2038,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         || manifest.files.is_empty()
         || unique.len() != manifest.files.len()
         || credential_count != 1
+        || !exact_scope_valid
         || !exact_shape_valid
         || manifest.files.iter().any(|file| {
             !matches!(
@@ -2436,6 +2533,109 @@ mod tests {
         let auth = loaded.proxy_auth.as_ref().expect("proxy auth hydrated");
         assert_eq!(auth.username, "race-user");
         assert_eq!(auth.password, "race-password");
+    }
+
+    #[test]
+    fn committed_proxy_transaction_rebases_again_after_manifested_rebase_loses_cas() {
+        let _key = crate::encryption::set_test_encryption_key([0x99; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "repeat-user".to_string(),
+            password: "repeat-password".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterManifest),
+        )
+        .is_err());
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["external_rebase_generation"] = Value::Number(1_u64.into());
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        assert!(migrate_with_fault(
+            dir.path(),
+            MigrationFault::AfterExactProxyConfigRebaseManifestExternalWrite,
+        )
+        .is_err());
+        let after_lost_cas: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(after_lost_cas["external_rebase_generation"], 2);
+        assert!(after_lost_cas.get("proxy_auth_credential_ref").is_none());
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["external_rebase_generation"], 2);
+        assert_eq!(root["proxy_auth_credential_ref"], "proxy.default.auth");
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let auth = loaded.proxy_auth.as_ref().expect("proxy auth hydrated");
+        assert_eq!(auth.username, "repeat-user");
+        assert_eq!(auth.password, "repeat-password");
+    }
+
+    #[test]
+    fn committed_proxy_transaction_rejects_new_provider_instance_consumer_before_credential_write()
+    {
+        let _key = crate::encryption::set_test_encryption_key([0x9a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "must-not-install".to_string(),
+            password: "must-not-install-secret".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterManifest),
+        )
+        .is_err());
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["provider_instances"] = serde_json::json!({
+            "racer": {
+                "provider_type": "openai",
+                "model": "gpt-test",
+                "credential_ref": "proxy.default.auth"
+            }
+        });
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+        let root_before = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+        let credentials_before = read_target_or_empty(&dir.path().join(CREDENTIALS_FILE)).unwrap();
+
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("non-proxy consumer"));
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            root_before
+        );
+        assert_eq!(
+            read_target_or_empty(&dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
     }
 
     #[test]
@@ -3194,6 +3394,7 @@ mod tests {
             transaction_id: transaction_id.clone(),
             stage_dir: format!("{STAGE_PREFIX}{transaction_id}/../../outside"),
             state: MigrationState::Pending,
+            exact_scope: None,
             files: vec![file.clone()],
         };
         assert!(validate_manifest(&traversal).is_err());
@@ -3203,6 +3404,7 @@ mod tests {
             transaction_id: transaction_id.clone(),
             stage_dir: format!("{STAGE_PREFIX}{transaction_id}"),
             state: MigrationState::Pending,
+            exact_scope: None,
             files: vec![file.clone(), file],
         };
         assert!(validate_manifest(&duplicate).is_err());
