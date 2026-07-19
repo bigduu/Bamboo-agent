@@ -179,3 +179,12 @@ Credential metadata/status/replace/clear HTTP adapters now use the encrypted sto
 with expected-revision CAS. Responses contain only status metadata and health;
 conflicts return HTTP 409. Successful mutations publish `config.changed` through
 the durable account feed, which also supplies the v2 WebSocket `feed` channel.
+
+Read-only typed provider and MCP section endpoints expose the same independent
+revision/health/source envelopes used by the watcher. Their DTOs are intentionally
+diagnostic projections: provider keys, ciphertext, request overrides and unknown
+provider fields are omitted, while MCP transport environment/header names are
+reported without values. URL diagnostics drop user info, query strings and
+fragments; MCP argument values are omitted. Typed section mutation/CAS endpoints
+remain deferred until credential references and the provider manifest migration
+are authoritative.

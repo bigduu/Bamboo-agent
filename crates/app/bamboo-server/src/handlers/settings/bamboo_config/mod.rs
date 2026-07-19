@@ -1,6 +1,7 @@
 mod config_endpoints;
 mod credentials;
 mod proxy_auth;
+mod sections;
 mod tools;
 mod types;
 mod validation;
@@ -17,6 +18,7 @@ pub use credentials::{
     replace_credential,
 };
 pub use proxy_auth::{get_proxy_auth_status, set_proxy_auth};
+pub use sections::{get_mcp_section, get_provider_section};
 pub use tools::get_bamboo_tools;
 pub use types::ProxyAuthPayload;
 pub use validation::validate_bamboo_config_patch;

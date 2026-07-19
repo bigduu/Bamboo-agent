@@ -452,6 +452,7 @@ impl AppState {
 mod agent_session_context;
 mod builder;
 mod config_runtime;
+pub(crate) use config_runtime::ConfigLiveHealth;
 pub mod init;
 mod persistence;
 mod provider_api;

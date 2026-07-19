@@ -106,7 +106,7 @@ fn redact_legacy_mcp(mcp: &mut Map<String, Value>, config: &Config) {
 
             match transport_type {
                 "stdio" => redact_legacy_stdio_transport(transport, &server_id, config),
-                "sse" => redact_legacy_sse_transport(transport),
+                "sse" | "streamable_http" => redact_legacy_sse_transport(transport),
                 _ => {}
             }
         }

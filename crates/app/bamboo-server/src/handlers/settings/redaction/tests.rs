@@ -186,6 +186,20 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
                             }
                         ]
                     }
+                },
+                {
+                    "id": "legacy-http",
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example/rpc",
+                        "headers": [
+                            {
+                                "name": "Authorization",
+                                "value": "Bearer legacy-http-secret",
+                                "value_encrypted": "legacy-http-ciphertext"
+                            }
+                        ]
+                    }
                 }
             ]
         }
@@ -207,6 +221,12 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
         .expect("header should be object");
     assert_eq!(sse_header["value"], "****...****");
     assert!(!sse_header.contains_key("value_encrypted"));
+
+    let http_header = servers[2]["transport"]["headers"][0]
+        .as_object()
+        .expect("streamable HTTP header should be object");
+    assert_eq!(http_header["value"], "****...****");
+    assert!(!http_header.contains_key("value_encrypted"));
 }
 
 // ── Env vars redaction tests ──────────────────────────────

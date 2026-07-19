@@ -25,10 +25,10 @@ pub use access_control::{
 pub(crate) use access_control::{request_is_authorized, verify_device_token};
 pub use bamboo_config::{
     clear_credential, confirm_config_recovery, get_bamboo_config, get_bamboo_tools,
-    get_config_recovery_status, get_credential_status, get_live_config_health,
-    get_model_limit_defaults, get_proxy_auth_status, list_credentials, replace_credential,
-    reset_bamboo_config, set_bamboo_config, set_proxy_auth, validate_bamboo_config_patch,
-    ProxyAuthPayload,
+    get_config_recovery_status, get_credential_status, get_live_config_health, get_mcp_section,
+    get_model_limit_defaults, get_provider_section, get_proxy_auth_status, list_credentials,
+    replace_credential, reset_bamboo_config, set_bamboo_config, set_proxy_auth,
+    validate_bamboo_config_patch, ProxyAuthPayload,
 };
 pub use cluster_fabric::{
     create_cluster, create_node, delete_cluster, delete_node, get_node, list_nodes, node_deploy,
