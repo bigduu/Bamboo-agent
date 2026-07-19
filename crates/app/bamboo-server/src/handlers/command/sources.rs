@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
-use bamboo_skills::types::SkillDefinition;
+use bamboo_skills::WorkflowCatalogEntry;
 use serde::Deserialize;
 
 use super::types::CommandItem;
@@ -217,79 +217,27 @@ pub(super) async fn list_prompt_presets_as_commands(data_dir: &Path) -> Vec<Comm
     }
 }
 
-pub(super) async fn list_workflows_as_commands(
-    data_dir: &Path,
-) -> Result<Vec<CommandItem>, AppError> {
-    let dir = data_dir.join("workflows");
-    tokio::fs::create_dir_all(&dir).await.map_err(|error| {
-        AppError::InternalError(anyhow::anyhow!("Failed to create workflows dir: {error}"))
-    })?;
-
-    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|error| {
-        AppError::InternalError(anyhow::anyhow!("Failed to read workflows dir: {error}"))
-    })?;
-
-    let mut commands = Vec::new();
-    while let Some(entry) = entries.next_entry().await.map_err(|error| {
-        AppError::InternalError(anyhow::anyhow!("Failed to read entry: {error}"))
-    })? {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("md") {
-            continue;
-        }
-
-        let name = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-
-        let metadata = entry.metadata().await.map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!("Failed to read metadata: {error}"))
-        })?;
-        let filename = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_string();
-
-        commands.push(CommandItem {
-            id: format!("workflow-{name}"),
-            name: name.clone(),
-            display_name: name.clone(),
-            description: format!("Workflow: {name}"),
-            command_type: "workflow".to_string(),
-            category: None,
-            tags: None,
-            metadata: serde_json::json!({
-                "filename": filename,
-                "size": metadata.len(),
-                "source": "global"
-            }),
-        });
-    }
-
-    Ok(commands)
-}
-
-pub(super) fn skill_to_command(skill: &SkillDefinition) -> CommandItem {
+pub(super) fn catalog_entry_to_command(entry: &WorkflowCatalogEntry) -> CommandItem {
+    let (id_prefix, command_type) = match entry.kind {
+        bamboo_skills::WorkflowKind::Instruction => ("skill", "skill"),
+        bamboo_skills::WorkflowKind::Orchestration => ("workflow", "workflow"),
+    };
     CommandItem {
-        id: format!("skill-{}", skill.id),
-        name: skill.id.clone(),
-        display_name: skill.name.clone(),
-        description: skill.description.clone(),
-        command_type: "skill".to_string(),
+        id: format!("{id_prefix}-{}", entry.id),
+        name: entry.id.clone(),
+        display_name: entry.name.clone(),
+        description: entry.description.clone(),
+        command_type: command_type.to_string(),
         category: None,
         tags: None,
         metadata: serde_json::json!({
-            "prompt": skill.prompt,
-            "toolRefs": skill.tool_refs,
-            "license": skill.license,
-            "compatibility": skill.compatibility,
-            "metadata": skill.metadata,
+            "kind": entry.kind,
+            "source": entry.source,
+            "revision": entry.revision,
+            "version": entry.version,
+            "invocationPolicy": entry.invocation_policy,
+            "argumentSchema": entry.argument_schema,
+            "status": entry.status,
         }),
     }
 }

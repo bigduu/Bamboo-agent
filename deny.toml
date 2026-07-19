@@ -111,11 +111,12 @@ confidence-threshold = 0.8
 # Allow 1 or more licenses on a per-crate basis, so that particular licenses
 # aren't accepted for every possible crate as with the normal allow list.
 #
-# No exceptions currently needed: `actix-governor` (GPL-3.0-or-later) was
-# replaced by an in-repo actix middleware over the MIT/Apache-2.0 `governor`
-# crate it used to wrap (bamboo-server's `src/rate_limit.rs`, #504), which
-# removed the GPL dependency entirely rather than requiring one.
-exceptions = []
+# Keep exceptions pinned to an exact package version instead of widening the
+# workspace-wide allow list. `notify` uses CC0-1.0 for a small portion of its
+# cross-platform filesystem-watcher implementation.
+exceptions = [
+    { crate = "notify@8.2.0", allow = ["CC0-1.0"] },
+]
 
 # Some crates don't have (easily) machine readable licensing information,
 # adding a clarification entry for it allows you to manually specify the

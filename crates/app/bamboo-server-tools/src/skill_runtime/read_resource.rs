@@ -113,7 +113,7 @@ impl Tool for ReadSkillResourceTool {
 
         let skill_root = self
             .access
-            .skill_root(skill_id, skill_mode.as_deref())
+            .skill_root(skill_id, skill_mode.as_deref(), ctx.session_id())
             .await?;
         let canonical_root = tokio::fs::canonicalize(&skill_root).await.map_err(|_| {
             ToolError::Execution(format!(

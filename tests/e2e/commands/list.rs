@@ -66,21 +66,32 @@ async fn test_list_commands_includes_workflows_and_skills() {
     )
     .await;
 
-    let req = test::TestRequest::get().uri("/v1/commands").to_request();
+    let command = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let req = test::TestRequest::get().uri("/v1/commands").to_request();
+            let resp = test::call_service(&app, req).await;
+            let body = test::read_body(resp).await;
+            let result: Value =
+                serde_json::from_slice(&body).expect("Response should be valid JSON");
+            if let Some(command) = result["commands"]
+                .as_array()
+                .expect("commands should be an array")
+                .iter()
+                .find(|command| command["name"] == "example")
+                .cloned()
+            {
+                break command;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("watcher should publish the imported workflow command");
 
-    let resp = test::call_service(&app, req).await;
-    let body = test::read_body(resp).await;
-    let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
-
-    // Should have at least one command (the workflow we created)
-    let commands = result["commands"]
-        .as_array()
-        .expect("commands should be an array");
-    assert!(!commands.is_empty());
-
-    // Should include our workflow
-    let has_workflow = commands
-        .iter()
-        .any(|cmd| cmd["type"] == "workflow" && cmd["name"] == "example");
-    assert!(has_workflow, "Should include the example workflow");
+    assert_eq!(command["id"], "skill-example");
+    assert_eq!(command["type"], "skill");
+    assert_eq!(
+        command["description"],
+        "Imported legacy workflow 'example'."
+    );
 }

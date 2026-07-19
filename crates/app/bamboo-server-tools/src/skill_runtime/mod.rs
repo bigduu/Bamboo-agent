@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use bamboo_llm::Config;
 use bamboo_skills::access_control::{SkillAccessError, SkillSessionPort};
-use bamboo_skills::SkillManager;
+use bamboo_skills::{SkillManager, SkillStore};
 
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
@@ -51,12 +51,39 @@ impl SkillToolAccess {
         &self,
         skill_id: &str,
         skill_mode: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<PathBuf, ToolError> {
-        self.skill_manager
-            .store()
+        self.skill_store(session_id)
+            .await?
             .get_skill_root_for_mode(skill_id, skill_mode)
             .await
             .map_err(|err| ToolError::Execution(format!("Failed to resolve skill root: {err}")))
+    }
+
+    pub(super) async fn skill_store(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Arc<SkillStore>, ToolError> {
+        let session_id = session_id.ok_or_else(|| {
+            ToolError::Execution(
+                "Skill runtime tools require a session_id in tool context".to_string(),
+            )
+        })?;
+        let session = self
+            .session_for_context(Some(session_id))
+            .await
+            .ok_or_else(|| {
+                ToolError::Execution(format!(
+                    "Session '{session_id}' not found while resolving skill workspace"
+                ))
+            })?;
+        let workspace = session.workspace_path_meta().map(PathBuf::from);
+        self.skill_manager
+            .store_for_workspace(workspace.as_deref())
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("Failed to resolve session skill store: {error}"))
+            })
     }
 }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub type SkillId = String;
 
 /// Complete definition of a skill
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillDefinition {
     /// Unique identifier (kebab-case)
     pub id: SkillId,

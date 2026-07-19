@@ -7,8 +7,8 @@ use crate::error::AppError;
 use crate::handlers::settings::is_safe_workflow_name;
 
 use super::sources::{
-    list_markdown_commands, list_mcp_tools_as_commands, list_prompt_presets_as_commands,
-    list_workflows_as_commands, safe_project_commands_dir, skill_to_command,
+    catalog_entry_to_command, list_markdown_commands, list_mcp_tools_as_commands,
+    list_prompt_presets_as_commands, safe_project_commands_dir,
 };
 use super::types::{CommandItem, CommandListResponse, GetCommandQuery, ListCommandsQuery};
 
@@ -28,6 +28,38 @@ pub(super) fn expand_arguments(template: &str, arguments: &str) -> String {
     template.replace("$ARGUMENTS", arguments)
 }
 
+async fn session_workspace(
+    app_state: &AppState,
+    session_id: Option<&str>,
+    legacy_workspace_path: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    if legacy_workspace_path.is_some_and(|value| !value.trim().is_empty()) {
+        return Err(AppError::BadRequest(
+            "workspace_path is deprecated; provide session_id so workspace access is session-bound"
+                .to_string(),
+        ));
+    }
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let session = app_state
+        .load_session(session_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
+    let Some(workspace) = session.workspace_path_meta() else {
+        return Ok(None);
+    };
+    let workspace = tokio::fs::canonicalize(workspace)
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Invalid session workspace: {error}")))?;
+    if !workspace.is_dir() {
+        return Err(AppError::BadRequest(
+            "Session workspace must be a directory".to_string(),
+        ));
+    }
+    Ok(Some(workspace))
+}
+
 /// Lists all available commands from workflows, skills, and MCP tools.
 pub async fn list_commands(
     app_state: web::Data<AppState>,
@@ -35,16 +67,17 @@ pub async fn list_commands(
 ) -> Result<HttpResponse, AppError> {
     let mut commands = Vec::new();
     let mut seen = HashSet::new();
+    let workspace = session_workspace(
+        app_state.get_ref(),
+        query.session_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )
+    .await?;
 
     // Conflict precedence is deliberately source-based and stable:
     // project markdown > global markdown > global preset > workflow > skill > MCP.
-    if let Some(workspace_path) = query
-        .workspace_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Some(dir) = safe_project_commands_dir(workspace_path) {
+    if let Some(workspace_path) = workspace.as_ref() {
+        if let Some(dir) = safe_project_commands_dir(workspace_path.to_string_lossy().as_ref()) {
             let project = list_markdown_commands(&dir, "project")
                 .await
                 .into_iter()
@@ -68,21 +101,24 @@ pub async fn list_commands(
         list_prompt_presets_as_commands(&app_state.app_data_dir).await,
     );
 
-    match list_workflows_as_commands(&app_state.app_data_dir).await {
-        Ok(workflows) => append_unique(&mut commands, &mut seen, workflows),
-        Err(error) => {
-            tracing::warn!("Failed to load workflows: {error}");
-        }
-    }
-
-    let skills = app_state
-        .skill_manager
-        .store()
-        .list_skills(None, false)
-        .await;
-    let skill_commands = skills
+    let catalog = if let Some(workspace) = workspace.as_ref() {
+        app_state
+            .skill_manager
+            .store()
+            .workflow_catalog_for_workspace(workspace)
+            .await
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
+    } else {
+        app_state
+            .skill_manager
+            .store()
+            .workflow_catalog_snapshot()
+            .await
+    };
+    let skill_commands = catalog
+        .entries
         .into_iter()
-        .map(|skill| skill_to_command(&skill))
+        .map(|entry| catalog_entry_to_command(&entry))
         .collect();
     append_unique(&mut commands, &mut seen, skill_commands);
 
@@ -107,17 +143,20 @@ pub async fn get_command(
     query: web::Query<GetCommandQuery>,
 ) -> Result<HttpResponse, AppError> {
     let (command_type, id) = path.into_inner();
+    let workspace = session_workspace(
+        app_state.get_ref(),
+        query.session_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )
+    .await?;
 
     match command_type.as_str() {
         "prompt" => {
             let mut sources = Vec::new();
-            if let Some(workspace_path) = query
-                .workspace_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                if let Some(dir) = safe_project_commands_dir(workspace_path) {
+            if let Some(workspace_path) = workspace.as_ref() {
+                if let Some(dir) =
+                    safe_project_commands_dir(workspace_path.to_string_lossy().as_ref())
+                {
                     sources.push((dir, "project"));
                 }
             }
@@ -186,10 +225,19 @@ pub async fn get_command(
                 "type": "workflow"
             })))
         }
-        "skill" => match app_state.skill_manager.store().get_skill(&id).await {
-            Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
-            Err(error) => Err(AppError::NotFound(format!("Skill {id} not found: {error}"))),
-        },
+        "skill" => {
+            let store = app_state
+                .skill_manager
+                .store_for_workspace(workspace.as_deref())
+                .await
+                .map_err(|error| {
+                    AppError::BadRequest(format!("Invalid session workspace: {error}"))
+                })?;
+            match store.get_skill(&id).await {
+                Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
+                Err(error) => Err(AppError::NotFound(format!("Skill {id} not found: {error}"))),
+            }
+        }
         "mcp" => Err(AppError::NotFound(
             "MCP tools do not support content retrieval".to_string(),
         )),

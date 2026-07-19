@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
+use bamboo_agent_core::tools::{Tool, ToolExecutionContext, ToolOutcome};
 use bamboo_agent_core::Session;
 use bamboo_llm::Config;
 use bamboo_skills::{SkillManager, SkillStoreConfig};
@@ -316,4 +316,254 @@ Use this demo skill."#,
     assert!(summary.contains("demo-skill"));
     assert!(summary.contains("references/policy.md"));
     assert!(summary.contains("\"offset\":1"));
+}
+
+#[tokio::test]
+async fn session_workspace_catalog_selection_and_runtime_roots_are_isolated() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let global_skills = temp_dir.path().join("data/skills");
+    let workspace_one = temp_dir.path().join("workspace-one");
+    let workspace_two = temp_dir.path().join("workspace-two");
+
+    for (workspace, description, instructions, resource, exclusive) in [
+        (
+            &workspace_one,
+            "alpha needle workflow",
+            "Alpha workspace instructions.",
+            "alpha resource",
+            "only-alpha",
+        ),
+        (
+            &workspace_two,
+            "beta needle workflow",
+            "Beta workspace instructions.",
+            "beta resource",
+            "only-beta",
+        ),
+    ] {
+        let shared = workspace.join(".bamboo/skills/shared-workflow");
+        std::fs::create_dir_all(shared.join("references")).expect("shared resource dir");
+        std::fs::write(
+            shared.join("SKILL.md"),
+            format!(
+                "---\nname: shared-workflow\ndescription: {description}\nallowed-tools:\n  - read_file\n---\n{instructions}\n"
+            ),
+        )
+        .expect("shared skill");
+        std::fs::write(shared.join("references/scope.txt"), resource).expect("shared resource");
+        let exclusive_root = workspace.join(".bamboo/skills").join(exclusive);
+        std::fs::create_dir_all(&exclusive_root).expect("exclusive skill dir");
+        std::fs::write(
+            exclusive_root.join("SKILL.md"),
+            format!(
+                "---\nname: {exclusive}\ndescription: {exclusive} project skill\n---\n{exclusive} instructions\n"
+            ),
+        )
+        .expect("exclusive skill");
+    }
+
+    let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: global_skills,
+        project_dir: None,
+        active_mode: None,
+    }));
+    skill_manager
+        .initialize()
+        .await
+        .expect("initialize manager");
+
+    let catalog_one = skill_manager
+        .store()
+        .workflow_catalog_for_workspace(&workspace_one)
+        .await
+        .expect("workspace one catalog");
+    let catalog_two = skill_manager
+        .store()
+        .workflow_catalog_for_workspace(&workspace_two)
+        .await
+        .expect("workspace two catalog");
+    assert_eq!(
+        catalog_one
+            .entries
+            .iter()
+            .find(|entry| entry.id == "shared-workflow")
+            .expect("shared one")
+            .description,
+        "alpha needle workflow"
+    );
+    assert_eq!(
+        catalog_two
+            .entries
+            .iter()
+            .find(|entry| entry.id == "shared-workflow")
+            .expect("shared two")
+            .description,
+        "beta needle workflow"
+    );
+    assert!(catalog_one
+        .entries
+        .iter()
+        .any(|entry| entry.id == "only-alpha"));
+    assert!(!catalog_one
+        .entries
+        .iter()
+        .any(|entry| entry.id == "only-beta"));
+    assert!(catalog_two
+        .entries
+        .iter()
+        .any(|entry| entry.id == "only-beta"));
+    assert!(!catalog_two
+        .entries
+        .iter()
+        .any(|entry| entry.id == "only-alpha"));
+
+    let disabled = std::collections::BTreeSet::new();
+    let explicitly_selected = vec!["shared-workflow".to_string()];
+    let selected_one = skill_manager
+        .resolve_skills_for_request_in_workspace_with_mode(
+            &workspace_one,
+            &disabled,
+            Some(&explicitly_selected),
+            None,
+            None,
+        )
+        .await
+        .expect("explicit selection one");
+    let selected_two = skill_manager
+        .resolve_skills_for_request_in_workspace_with_mode(
+            &workspace_two,
+            &disabled,
+            Some(&explicitly_selected),
+            None,
+            None,
+        )
+        .await
+        .expect("explicit selection two");
+    assert_eq!(selected_one[0].prompt, "Alpha workspace instructions.");
+    assert_eq!(selected_two[0].prompt, "Beta workspace instructions.");
+
+    let auto_one = skill_manager
+        .resolve_skills_for_request_in_workspace_with_mode(
+            &workspace_one,
+            &disabled,
+            None,
+            None,
+            Some("alpha needle"),
+        )
+        .await
+        .expect("auto selection one");
+    let auto_two = skill_manager
+        .resolve_skills_for_request_in_workspace_with_mode(
+            &workspace_two,
+            &disabled,
+            None,
+            None,
+            Some("beta needle"),
+        )
+        .await
+        .expect("auto selection two");
+    assert!(auto_one.iter().any(|skill| skill.id == "only-alpha"));
+    assert!(!auto_one.iter().any(|skill| skill.id == "only-beta"));
+    assert!(auto_two.iter().any(|skill| skill.id == "only-beta"));
+    assert!(!auto_two.iter().any(|skill| skill.id == "only-alpha"));
+    assert_eq!(
+        auto_one
+            .iter()
+            .find(|skill| skill.id == "shared-workflow")
+            .expect("auto shared one")
+            .description,
+        "alpha needle workflow"
+    );
+    assert_eq!(
+        auto_two
+            .iter()
+            .find(|skill| skill.id == "shared-workflow")
+            .expect("auto shared two")
+            .description,
+        "beta needle workflow"
+    );
+
+    let mut session_one = Session::new("workspace-session-one", "model");
+    session_one.set_workspace_path_meta(workspace_one.to_string_lossy());
+    let mut session_two = Session::new("workspace-session-two", "model");
+    session_two.set_workspace_path_meta(workspace_two.to_string_lossy());
+    let sessions = Arc::new(dashmap::DashMap::new());
+    for session in [&session_one, &session_two] {
+        sessions.insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+    }
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage.save_session(&session_one).await.expect("save one");
+    storage.save_session(&session_two).await.expect("save two");
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
+    let config = Arc::new(RwLock::new(Config::default()));
+    let load_tool = LoadSkillTool::new(skill_manager.clone(), config.clone(), repo.clone());
+    let read_tool = ReadSkillResourceTool::new(skill_manager, config, repo);
+
+    for (session_id, expected_instructions, expected_resource, expected_workspace) in [
+        (
+            "workspace-session-one",
+            "Alpha workspace instructions.",
+            "alpha resource",
+            &workspace_one,
+        ),
+        (
+            "workspace-session-two",
+            "Beta workspace instructions.",
+            "beta resource",
+            &workspace_two,
+        ),
+    ] {
+        let context = ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: "workspace-skill-call",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let ToolOutcome::Completed(loaded) = load_tool
+            .invoke(
+                serde_json::json!({ "skill_id": "shared-workflow" }),
+                context.to_tool_ctx(),
+            )
+            .await
+            .expect("load workspace skill")
+        else {
+            panic!("load_skill should complete")
+        };
+        let loaded: serde_json::Value =
+            serde_json::from_str(&loaded.result).expect("load result json");
+        assert_eq!(loaded["instructions"], expected_instructions);
+        let expected_workspace =
+            std::fs::canonicalize(expected_workspace).expect("canonical workspace");
+        let skill_root = loaded["skill_base_dir"].as_str().expect("skill root");
+        assert!(
+            skill_root.starts_with(expected_workspace.to_string_lossy().as_ref()),
+            "runtime root {skill_root} must stay under {}",
+            expected_workspace.display()
+        );
+
+        let ToolOutcome::Completed(resource) = read_tool
+            .invoke(
+                serde_json::json!({
+                    "skill_id": "shared-workflow",
+                    "resource_path": "references/scope.txt"
+                }),
+                context.to_tool_ctx(),
+            )
+            .await
+            .expect("read workspace resource")
+        else {
+            panic!("read_skill_resource should complete")
+        };
+        let resource: serde_json::Value =
+            serde_json::from_str(&resource.result).expect("resource result json");
+        assert_eq!(resource["content"], expected_resource);
+    }
 }

@@ -6,8 +6,10 @@ use tracing::{debug, info, warn};
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillDefinition, SkillResult};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkillDirectorySource {
+    /// Compile-time embedded bundle materialized under the global skills dir.
+    Builtin,
     /// Cross-agent user skills discovered from `~/.agents/skills`.
     Agents,
     Global,
@@ -31,6 +33,23 @@ pub struct LoadedSkillRecord {
     pub skill_root: PathBuf,
     pub source: SkillDirectorySource,
     pub mode: Option<String>,
+    pub skill_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedSkillRecord {
+    pub skill_id: Option<String>,
+    pub skill_root: PathBuf,
+    pub skill_file: PathBuf,
+    pub source: SkillDirectorySource,
+    pub mode: Option<String>,
+    pub error: String,
+}
+
+#[derive(Debug, Default)]
+pub struct SkillLoadReport {
+    pub loaded: Vec<LoadedSkillRecord>,
+    pub failed: Vec<FailedSkillRecord>,
 }
 
 pub async fn ensure_skills_dir(skills_dir: &Path) -> SkillResult<()> {
@@ -105,7 +124,16 @@ async fn find_skill_files(dir: &Path) -> Vec<PathBuf> {
 pub async fn load_skills_from_discovery_dirs(
     discovery_dirs: &[SkillDiscoveryDir],
 ) -> SkillResult<Vec<LoadedSkillRecord>> {
-    let mut loaded = Vec::new();
+    Ok(load_skills_from_discovery_dirs_detailed(discovery_dirs)
+        .await?
+        .loaded)
+}
+
+/// Discover every candidate and preserve per-bundle failures for catalog LKG handling.
+pub async fn load_skills_from_discovery_dirs_detailed(
+    discovery_dirs: &[SkillDiscoveryDir],
+) -> SkillResult<SkillLoadReport> {
+    let mut report = SkillLoadReport::default();
 
     for discovery in discovery_dirs {
         match fs::try_exists(&discovery.dir).await {
@@ -133,7 +161,8 @@ pub async fn load_skills_from_discovery_dirs(
             discovery.mode.as_deref().unwrap_or("generic")
         );
 
-        let skill_files = find_skill_files(&discovery.dir).await;
+        let mut skill_files = find_skill_files(&discovery.dir).await;
+        skill_files.sort();
         for skill_file in skill_files {
             match fs::read_to_string(&skill_file).await {
                 Ok(content) => match parse_markdown_skill(&skill_file, &content) {
@@ -142,26 +171,61 @@ pub async fn load_skills_from_discovery_dirs(
                             .parent()
                             .map(Path::to_path_buf)
                             .unwrap_or_else(|| discovery.dir.clone());
-                        loaded.push(LoadedSkillRecord {
+                        report.loaded.push(LoadedSkillRecord {
                             skill,
                             skill_root,
                             source: discovery.source,
                             mode: discovery.mode.clone(),
+                            skill_file,
                         });
                     }
                     Err(error) => {
                         warn!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        let skill_root = skill_file
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| discovery.dir.clone());
+                        report.failed.push(FailedSkillRecord {
+                            skill_id: skill_root
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_string),
+                            skill_root,
+                            skill_file,
+                            source: discovery.source,
+                            mode: discovery.mode.clone(),
+                            error: error.to_string(),
+                        });
                     }
                 },
                 Err(error) => {
                     warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                    let skill_root = skill_file
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| discovery.dir.clone());
+                    report.failed.push(FailedSkillRecord {
+                        skill_id: skill_root
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string),
+                        skill_root,
+                        skill_file,
+                        source: discovery.source,
+                        mode: discovery.mode.clone(),
+                        error: error.to_string(),
+                    });
                 }
             }
         }
     }
 
-    info!("Loaded {} skill records from discovery dirs", loaded.len());
-    Ok(loaded)
+    info!(
+        "Loaded {} skill records from discovery dirs ({} invalid)",
+        report.loaded.len(),
+        report.failed.len()
+    );
+    Ok(report)
 }
 
 /// Discover additional skill-discovery dirs contributed by installed

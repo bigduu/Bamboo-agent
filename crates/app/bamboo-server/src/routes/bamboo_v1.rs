@@ -34,6 +34,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::get().to(command::get_command),
         )
         // Settings routes
+        .route(
+            "/bamboo/workflow-catalog",
+            web::get().to(settings::list_workflow_catalog),
+        )
         .route("/bamboo/workflows", web::get().to(settings::list_workflows))
         .route(
             "/bamboo/workflows/{name}",

@@ -39,7 +39,8 @@ pub(crate) async fn prepare_session_for_loop(
     session_id: &str,
     debug_logger: &DebugLogger,
 ) -> Option<TaskLoopContext> {
-    let skill_result = skill_context::load_skill_context(config, session_id, initial_message).await;
+    let skill_result =
+        skill_context::load_skill_context(config, session, session_id, initial_message).await;
     let skill_context = skill_result.context.clone();
 
     if let Some(source) = skill_result.selection_source.as_deref() {

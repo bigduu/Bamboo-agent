@@ -34,12 +34,16 @@ pub struct CommandItem {
 pub struct ListCommandsQuery {
     #[serde(default)]
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct GetCommandQuery {
     #[serde(default)]
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub arguments: Option<String>,
 }

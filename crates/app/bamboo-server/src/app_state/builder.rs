@@ -313,6 +313,48 @@ impl AppState {
                     "failed to initialize account change-feed journal: {e}"
                 ))
             })?;
+        // Bridge global workflow catalog transitions onto the same durable account feed used by
+        // SSE and v2 WebSocket clients. Catalog events are account-scoped (no session id).
+        {
+            let mut workflow_events = skill_manager.store().subscribe_workflow_catalog();
+            let account_sink = account_sink.clone();
+            tokio::spawn(async move {
+                loop {
+                    let event = match workflow_events.recv().await {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!("Workflow catalog event bridge lagged by {skipped}");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    let event = match event.kind {
+                        bamboo_skills::WorkflowCatalogEventKind::Changed => {
+                            AgentEvent::WorkflowChanged {
+                                workflow_id: event.workflow_id,
+                                revision: event.revision,
+                                scope: event.scope,
+                            }
+                        }
+                        bamboo_skills::WorkflowCatalogEventKind::Invalid => {
+                            AgentEvent::WorkflowInvalid {
+                                workflow_id: event.workflow_id,
+                                revision: event.revision,
+                                scope: event.scope,
+                            }
+                        }
+                        bamboo_skills::WorkflowCatalogEventKind::Recovered => {
+                            AgentEvent::WorkflowRecovered {
+                                workflow_id: event.workflow_id,
+                                revision: event.revision,
+                                scope: event.scope,
+                            }
+                        }
+                    };
+                    account_sink.record(None, &event);
+                }
+            });
+        }
         let (approval_registry, restart_approval_events) =
             bamboo_engine::external_agents::live::initialize_durable_approvals(
                 data_dir.join("approvals/child-approvals-v1.json"),
