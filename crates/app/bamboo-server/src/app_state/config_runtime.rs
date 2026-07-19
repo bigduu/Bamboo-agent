@@ -35,23 +35,7 @@ impl ConfigWatcherRuntime {
         provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
         account_sink: Arc<bamboo_engine::events::AccountEventSink>,
     ) -> (Self, Arc<std::sync::RwLock<ConfigLiveHealth>>) {
-        let providers_exists = data_dir.join("providers.json").exists();
-        let health = Arc::new(std::sync::RwLock::new(ConfigLiveHealth {
-            revision: 0,
-            loaded_at: Utc::now(),
-            source_path: data_dir.join("providers.json"),
-            source_kind: if providers_exists {
-                SectionSourceKind::File
-            } else {
-                SectionSourceKind::Default
-            },
-            status: if providers_exists {
-                SectionStatus::Healthy
-            } else {
-                SectionStatus::Missing
-            },
-            last_error: None,
-        }));
+        let health = Arc::new(std::sync::RwLock::new(initial_provider_health(&data_dir)));
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = match ConfigDirectoryWatcher::watch(&data_dir, Duration::from_millis(120)) {
             Ok(watcher) => watcher,
@@ -75,13 +59,16 @@ impl ConfigWatcherRuntime {
             }
         };
 
-        let (changes_tx, mut changes_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(32);
+        // The filesystem side must never block in send: Drop joins this OS
+        // thread after aborting the async consumer, so a bounded blocking_send
+        // could deadlock shutdown if its queue were full.
+        let (changes_tx, mut changes_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
         let worker_stop = stop.clone();
         let watcher_task = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match watcher.recv_timeout(Duration::from_millis(250)) {
                     Ok(paths) => {
-                        if changes_tx.blocking_send(paths).is_err() {
+                        if changes_tx.send(paths).is_err() {
                             break;
                         }
                     }
@@ -127,8 +114,13 @@ impl ConfigWatcherRuntime {
                         drop(live_provider);
                         drop(live_config);
 
-                        let revision =
-                            update_live_health(&apply_health, SectionStatus::Healthy, None, true);
+                        let revision = update_live_health(
+                            &apply_health,
+                            SectionStatus::Healthy,
+                            None,
+                            true,
+                            Some((data_dir.join("providers.json"), SectionSourceKind::File)),
+                        );
                         let event = if recovered {
                             AgentEvent::ConfigRecovered {
                                 section: "providers".to_string(),
@@ -143,11 +135,17 @@ impl ConfigWatcherRuntime {
                         account_sink.record(None, &event);
                     }
                     Err(error) => {
+                        let status = match error.kind {
+                            ProviderCandidateErrorKind::Missing => SectionStatus::Missing,
+                            ProviderCandidateErrorKind::InvalidDocument => SectionStatus::Invalid,
+                            ProviderCandidateErrorKind::Runtime => SectionStatus::Degraded,
+                        };
                         let revision = update_live_health(
                             &apply_health,
-                            SectionStatus::Degraded,
-                            Some(error),
+                            status,
+                            Some(error.message),
                             false,
+                            None,
                         );
                         account_sink.record(
                             None,
@@ -172,6 +170,61 @@ impl ConfigWatcherRuntime {
     }
 }
 
+fn initial_provider_health(data_dir: &std::path::Path) -> ConfigLiveHealth {
+    let primary = data_dir.join("providers.json");
+    if !primary.exists() {
+        return ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: primary,
+            source_kind: SectionSourceKind::Default,
+            status: SectionStatus::Missing,
+            last_error: None,
+        };
+    }
+    if std::fs::read(&primary)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ProviderConfigs>(&bytes).ok())
+        .is_some()
+    {
+        return ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: primary,
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Healthy,
+            last_error: None,
+        };
+    }
+
+    let backup = data_dir.join("providers.json.bak");
+    if std::fs::read(&backup)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ProviderConfigs>(&bytes).ok())
+        .is_some()
+    {
+        ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: backup,
+            source_kind: SectionSourceKind::Backup,
+            status: SectionStatus::Degraded,
+            last_error: Some(
+                "primary provider section invalid; using last-known-good backup".to_string(),
+            ),
+        }
+    } else {
+        ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: primary,
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Invalid,
+            last_error: Some("provider section could not be parsed or read".to_string()),
+        }
+    }
+}
+
 impl Drop for ConfigWatcherRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -187,7 +240,7 @@ impl Drop for ConfigWatcherRuntime {
 async fn load_and_prepare_provider_candidate(
     data_dir: &PathBuf,
     mut candidate_config: Config,
-) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), String> {
+) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), ProviderCandidateError> {
     // Editors commonly implement save as delete/rename/create. Retry a missing
     // watched file briefly instead of treating the transient gap as a reset.
     for _ in 0..3 {
@@ -197,20 +250,59 @@ async fn load_and_prepare_provider_candidate(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let providers_path = data_dir.join("providers.json");
-    let bytes = std::fs::read(&providers_path)
-        .map_err(|_| "provider section is missing or unreadable".to_string())?;
+    let bytes = std::fs::read(&providers_path).map_err(|_| {
+        if providers_path.exists() {
+            ProviderCandidateError::invalid("provider section is unreadable")
+        } else {
+            ProviderCandidateError::missing()
+        }
+    })?;
     let providers = serde_json::from_slice::<ProviderConfigs>(&bytes)
-        .map_err(|_| "provider section is invalid".to_string())?;
+        .map_err(|_| ProviderCandidateError::invalid("provider section is invalid"))?;
     *candidate_config.providers_mut() = providers;
     candidate_config.hydrate_provider_api_keys_from_encrypted();
     let candidate_registry =
         bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.clone())
             .await
-            .map_err(|_| "provider runtime initialization failed".to_string())?;
+            .map_err(|_| ProviderCandidateError::runtime())?;
     let candidate_provider = candidate_registry
         .get_default()
-        .ok_or_else(|| "default provider runtime initialization failed".to_string())?;
+        .ok_or_else(ProviderCandidateError::runtime)?;
     Ok((candidate_config, candidate_registry, candidate_provider))
+}
+
+enum ProviderCandidateErrorKind {
+    Missing,
+    InvalidDocument,
+    Runtime,
+}
+
+struct ProviderCandidateError {
+    kind: ProviderCandidateErrorKind,
+    message: String,
+}
+
+impl ProviderCandidateError {
+    fn missing() -> Self {
+        Self {
+            kind: ProviderCandidateErrorKind::Missing,
+            message: "provider section is missing".to_string(),
+        }
+    }
+
+    fn invalid(message: &str) -> Self {
+        Self {
+            kind: ProviderCandidateErrorKind::InvalidDocument,
+            message: message.to_string(),
+        }
+    }
+
+    fn runtime() -> Self {
+        Self {
+            kind: ProviderCandidateErrorKind::Runtime,
+            message: "provider runtime initialization failed".to_string(),
+        }
+    }
 }
 
 fn update_live_health(
@@ -218,6 +310,7 @@ fn update_live_health(
     status: SectionStatus,
     last_error: Option<String>,
     advance_revision: bool,
+    source: Option<(PathBuf, SectionSourceKind)>,
 ) -> u64 {
     let mut health = health
         .write()
@@ -228,6 +321,10 @@ fn update_live_health(
     health.loaded_at = Utc::now();
     health.status = status;
     health.last_error = last_error;
+    if let Some((source_path, source_kind)) = source {
+        health.source_path = source_path;
+        health.source_kind = source_kind;
+    }
     health.revision
 }
 
@@ -596,6 +693,34 @@ mod live_reload_tests {
 
     struct WorkingProvider;
 
+    #[test]
+    fn initial_provider_health_validates_primary_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = initial_provider_health(dir.path());
+        assert_eq!(missing.status, SectionStatus::Missing);
+        assert_eq!(missing.source_kind, SectionSourceKind::Default);
+
+        std::fs::write(dir.path().join("providers.json"), b"{broken").unwrap();
+        let invalid = initial_provider_health(dir.path());
+        assert_eq!(invalid.status, SectionStatus::Invalid);
+        assert_eq!(invalid.source_kind, SectionSourceKind::File);
+
+        std::fs::write(dir.path().join("providers.json.bak"), b"{}").unwrap();
+        let recovered = initial_provider_health(dir.path());
+        assert_eq!(recovered.status, SectionStatus::Degraded);
+        assert_eq!(recovered.source_kind, SectionSourceKind::Backup);
+        assert!(recovered
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("last-known-good backup"));
+
+        std::fs::write(dir.path().join("providers.json"), b"{}").unwrap();
+        let healthy = initial_provider_health(dir.path());
+        assert_eq!(healthy.status, SectionStatus::Healthy);
+        assert_eq!(healthy.source_kind, SectionSourceKind::File);
+    }
+
     #[async_trait::async_trait]
     impl LLMProvider for WorkingProvider {
         async fn chat_stream(
@@ -633,6 +758,7 @@ mod live_reload_tests {
 
     #[tokio::test]
     async fn provider_watcher_retains_lkg_on_invalid_and_recovers_after_repair() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x43; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
         let working: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
@@ -653,7 +779,7 @@ mod live_reload_tests {
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .status
-                    == SectionStatus::Degraded
+                    == SectionStatus::Invalid
                 {
                     break;
                 }
@@ -671,6 +797,15 @@ mod live_reload_tests {
             0,
             "invalid edits must not advance the LKG revision"
         );
+        {
+            let health = state
+                .config_live_health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(health.status, SectionStatus::Invalid);
+            assert_eq!(health.source_kind, SectionSourceKind::Default);
+            assert_eq!(health.source_path, providers_path);
+        }
         assert!(Arc::ptr_eq(
             &state.provider_registry.get_default().unwrap(),
             &working

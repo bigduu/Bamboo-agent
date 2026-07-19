@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config_store::{AtomicJsonStore, ConfigStoreError, ConfigStoreResult};
+use crate::config_store::{
+    AtomicJsonStore, ConfigStoreError, ConfigStoreResult, SectionSourceKind, SectionStatus,
+};
 
 const CREDENTIAL_SCHEMA_VERSION: u32 = 1;
 const ENCRYPTION_KEY_VERSION: u32 = 1;
@@ -56,6 +58,26 @@ pub struct CredentialStatus {
     pub configured: bool,
     pub source: CredentialSource,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Truthful health metadata for a credential document read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CredentialStoreHealth {
+    pub revision: u64,
+    pub status: SectionStatus,
+    pub source: SectionSourceKind,
+    pub last_error: Option<String>,
+}
+
+impl CredentialStoreHealth {
+    pub fn committed(revision: u64) -> Self {
+        Self {
+            revision,
+            status: SectionStatus::Healthy,
+            source: SectionSourceKind::File,
+            last_error: None,
+        }
+    }
 }
 
 pub struct SecretValue(String);
@@ -119,7 +141,15 @@ impl CredentialStore {
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        let (document, revision) = self.load_document_with_revision()?;
+        let (status, health) = self.status_with_health(credential_ref)?;
+        Ok((health.revision, status))
+    }
+
+    pub fn status_with_health(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<(CredentialStatus, CredentialStoreHealth)> {
+        let (document, health) = self.load_document_with_health()?;
         let status = match document.entries.get(credential_ref) {
             Some(entry) => CredentialStatus {
                 credential_ref: credential_ref.clone(),
@@ -134,7 +164,7 @@ impl CredentialStore {
                 updated_at: None,
             },
         };
-        Ok((revision, status))
+        Ok((status, health))
     }
 
     pub fn statuses(&self) -> ConfigStoreResult<Vec<CredentialStatus>> {
@@ -142,7 +172,14 @@ impl CredentialStore {
     }
 
     pub fn statuses_with_revision(&self) -> ConfigStoreResult<(u64, Vec<CredentialStatus>)> {
-        let (document, revision) = self.load_document_with_revision()?;
+        let (statuses, health) = self.statuses_with_health()?;
+        Ok((health.revision, statuses))
+    }
+
+    pub fn statuses_with_health(
+        &self,
+    ) -> ConfigStoreResult<(Vec<CredentialStatus>, CredentialStoreHealth)> {
+        let (document, health) = self.load_document_with_health()?;
         let statuses = document
             .entries
             .into_iter()
@@ -153,7 +190,7 @@ impl CredentialStore {
                 updated_at: Some(entry.updated_at),
             })
             .collect();
-        Ok((revision, statuses))
+        Ok((statuses, health))
     }
 
     pub fn replace(
@@ -163,9 +200,9 @@ impl CredentialStore {
         source: CredentialSource,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        if secret.is_empty() {
+        if secret.trim().is_empty() || crate::patch::is_masked_api_key(secret) {
             return Err(ConfigStoreError::Validation(
-                "credential value must not be empty; use clear instead".to_string(),
+                "credential value must not be empty or a mask; use clear instead".to_string(),
             ));
         }
         let mut document = self.load_document()?;
@@ -236,14 +273,39 @@ impl CredentialStore {
     }
 
     fn load_document(&self) -> ConfigStoreResult<CredentialDocument> {
-        self.load_document_with_revision()
+        self.load_document_with_health()
             .map(|(document, _)| document)
     }
 
-    fn load_document_with_revision(&self) -> ConfigStoreResult<(CredentialDocument, u64)> {
+    fn load_document_with_health(
+        &self,
+    ) -> ConfigStoreResult<(CredentialDocument, CredentialStoreHealth)> {
         Ok(match self.store.load_validated(validate_document)? {
-            Some(stored) => (stored.data, stored.revision),
-            None => (CredentialDocument::default(), 0),
+            Some(stored) if stored.recovered_from_backup => (
+                stored.data,
+                CredentialStoreHealth {
+                    revision: stored.revision,
+                    status: SectionStatus::Degraded,
+                    source: SectionSourceKind::Backup,
+                    last_error: Some(
+                        "primary credential document invalid; using last-known-good backup"
+                            .to_string(),
+                    ),
+                },
+            ),
+            Some(stored) => (
+                stored.data,
+                CredentialStoreHealth::committed(stored.revision),
+            ),
+            None => (
+                CredentialDocument::default(),
+                CredentialStoreHealth {
+                    revision: 0,
+                    status: SectionStatus::Missing,
+                    source: SectionSourceKind::Default,
+                    last_error: None,
+                },
+            ),
         })
     }
 }
@@ -275,9 +337,7 @@ mod tests {
 
     #[test]
     fn replace_resolve_status_and_clear_never_expose_secret_metadata() {
-        let _guard = crate::test_support::env_cache_lock_acquire();
-        let previous_key = std::env::var_os("BAMBOO_ENCRYPTION_KEY");
-        std::env::set_var("BAMBOO_ENCRYPTION_KEY", "credential-store-test-key");
+        let _key = crate::encryption::set_test_encryption_key([0x31; 32]);
         let dir = TempDir::new().unwrap();
         let store = CredentialStore::open(dir.path());
         let reference = credential_ref("provider", "openai", "api_key").unwrap();
@@ -304,18 +364,11 @@ mod tests {
         assert_eq!(revision, 2);
         assert!(!status.configured);
         assert!(store.resolve(&reference).unwrap().is_none());
-
-        match previous_key {
-            Some(value) => std::env::set_var("BAMBOO_ENCRYPTION_KEY", value),
-            None => std::env::remove_var("BAMBOO_ENCRYPTION_KEY"),
-        }
     }
 
     #[test]
     fn stale_replace_is_rejected_without_overwriting_newer_secret() {
-        let _guard = crate::test_support::env_cache_lock_acquire();
-        let previous_key = std::env::var_os("BAMBOO_ENCRYPTION_KEY");
-        std::env::set_var("BAMBOO_ENCRYPTION_KEY", "credential-store-cas-key");
+        let _key = crate::encryption::set_test_encryption_key([0x32; 32]);
         let dir = TempDir::new().unwrap();
         let store = CredentialStore::open(dir.path());
         let reference = credential_ref("mcp", "github", "token").unwrap();
@@ -333,10 +386,6 @@ mod tests {
             store.resolve(&reference).unwrap().unwrap().expose(),
             "newest"
         );
-        match previous_key {
-            Some(value) => std::env::set_var("BAMBOO_ENCRYPTION_KEY", value),
-            None => std::env::remove_var("BAMBOO_ENCRYPTION_KEY"),
-        }
     }
 
     #[test]
@@ -344,5 +393,49 @@ mod tests {
         assert!(CredentialRef::parse("provider.openai.api_key").is_ok());
         assert!(CredentialRef::parse("../credentials").is_err());
         assert!(CredentialRef::parse("x".repeat(161)).is_err());
+    }
+
+    #[test]
+    fn replace_rejects_whitespace_and_ui_masks_without_writing() {
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+        for invalid in ["   ", "********", "****...****", "  ****...****  "] {
+            assert!(matches!(
+                store.replace(reference.clone(), invalid, CredentialSource::User, 0),
+                Err(ConfigStoreError::Validation(_))
+            ));
+        }
+        assert!(!store.path().exists());
+        assert_eq!(store.revision().unwrap(), 0);
+    }
+
+    #[test]
+    fn read_health_distinguishes_missing_file_and_backup_recovery() {
+        let _key = crate::encryption::set_test_encryption_key([0x33; 32]);
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+        let (_, missing) = store.status_with_health(&reference).unwrap();
+        assert_eq!(missing.revision, 0);
+        assert_eq!(missing.status, SectionStatus::Missing);
+        assert_eq!(missing.source, SectionSourceKind::Default);
+
+        store
+            .replace(reference.clone(), "first", CredentialSource::User, 0)
+            .unwrap();
+        store
+            .replace(reference.clone(), "second", CredentialSource::User, 1)
+            .unwrap();
+        std::fs::write(store.path(), b"{corrupt").unwrap();
+        let (status, recovered) = store.status_with_health(&reference).unwrap();
+        assert!(status.configured);
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(recovered.status, SectionStatus::Degraded);
+        assert_eq!(recovered.source, SectionSourceKind::Backup);
+        assert_eq!(
+            recovered.last_error.as_deref(),
+            Some("primary credential document invalid; using last-known-good backup")
+        );
     }
 }

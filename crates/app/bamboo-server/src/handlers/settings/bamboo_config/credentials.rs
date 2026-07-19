@@ -1,6 +1,7 @@
 use actix_web::{web, HttpResponse};
 use bamboo_config::{
-    ConfigStoreError, CredentialRef, CredentialSource, SectionSourceKind, SectionStatus,
+    ConfigStoreError, CredentialRef, CredentialSource, CredentialStoreHealth, SectionSourceKind,
+    SectionStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,12 +17,11 @@ struct CredentialEnvelope<T> {
     last_error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceCredentialRequest {
     pub expected_revision: u64,
     pub value: String,
-    #[serde(default = "user_source")]
-    pub source: CredentialSource,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,28 +29,24 @@ pub struct ClearCredentialRequest {
     pub expected_revision: u64,
 }
 
-fn user_source() -> CredentialSource {
-    CredentialSource::User
-}
-
 pub async fn list_credentials(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let (revision, statuses) = app_state
+    let (statuses, health) = app_state
         .credential_store
-        .statuses_with_revision()
-        .map_err(map_store_error)?;
-    Ok(HttpResponse::Ok().json(envelope(statuses, revision)))
+        .statuses_with_health()
+        .map_err(map_store_read_error)?;
+    Ok(HttpResponse::Ok().json(envelope(statuses, health)))
 }
 
 pub async fn get_credential_status(
     app_state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
-    let credential_ref = CredentialRef::parse(path.into_inner()).map_err(map_store_error)?;
-    let (revision, status) = app_state
+    let credential_ref = parse_credential_ref(path.into_inner())?;
+    let (status, health) = app_state
         .credential_store
-        .status_with_revision(&credential_ref)
-        .map_err(map_store_error)?;
-    Ok(HttpResponse::Ok().json(envelope(status, revision)))
+        .status_with_health(&credential_ref)
+        .map_err(map_store_read_error)?;
+    Ok(HttpResponse::Ok().json(envelope(status, health)))
 }
 
 pub async fn replace_credential(
@@ -58,18 +54,18 @@ pub async fn replace_credential(
     path: web::Path<String>,
     payload: web::Json<ReplaceCredentialRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let credential_ref = CredentialRef::parse(path.into_inner()).map_err(map_store_error)?;
+    let credential_ref = parse_credential_ref(path.into_inner())?;
     let (revision, status) = app_state
         .credential_store
         .replace(
             credential_ref,
             &payload.value,
-            payload.source,
+            CredentialSource::User,
             payload.expected_revision,
         )
-        .map_err(map_store_error)?;
+        .map_err(map_store_mutation_error)?;
     publish_credential_event(&app_state, revision);
-    Ok(HttpResponse::Ok().json(envelope(status, revision)))
+    Ok(HttpResponse::Ok().json(envelope(status, CredentialStoreHealth::committed(revision))))
 }
 
 pub async fn clear_credential(
@@ -77,13 +73,13 @@ pub async fn clear_credential(
     path: web::Path<String>,
     payload: web::Json<ClearCredentialRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let credential_ref = CredentialRef::parse(path.into_inner()).map_err(map_store_error)?;
+    let credential_ref = parse_credential_ref(path.into_inner())?;
     let (revision, status) = app_state
         .credential_store
         .clear(&credential_ref, payload.expected_revision)
-        .map_err(map_store_error)?;
+        .map_err(map_store_mutation_error)?;
     publish_credential_event(&app_state, revision);
-    Ok(HttpResponse::Ok().json(envelope(status, revision)))
+    Ok(HttpResponse::Ok().json(envelope(status, CredentialStoreHealth::committed(revision))))
 }
 
 pub async fn get_live_config_health(
@@ -97,13 +93,13 @@ pub async fn get_live_config_health(
     Ok(HttpResponse::Ok().json(health))
 }
 
-fn envelope<T>(data: T, revision: u64) -> CredentialEnvelope<T> {
+fn envelope<T>(data: T, health: CredentialStoreHealth) -> CredentialEnvelope<T> {
     CredentialEnvelope {
         data,
-        revision,
-        status: SectionStatus::Healthy,
-        source: SectionSourceKind::File,
-        last_error: None,
+        revision: health.revision,
+        status: health.status,
+        source: health.source,
+        last_error: health.last_error,
     }
 }
 
@@ -117,14 +113,33 @@ fn publish_credential_event(app_state: &AppState, revision: u64) {
     );
 }
 
-fn map_store_error(error: ConfigStoreError) -> AppError {
+fn parse_credential_ref(value: String) -> Result<CredentialRef, AppError> {
+    CredentialRef::parse(value)
+        .map_err(|_| AppError::BadRequest("invalid credential reference".to_string()))
+}
+
+fn map_store_mutation_error(error: ConfigStoreError) -> AppError {
     match error {
         ConfigStoreError::Conflict { expected, actual } => {
             AppError::ConfigConflict { expected, actual }
         }
-        ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+        ConfigStoreError::Validation(message) if message.starts_with("credential value ") => {
+            AppError::BadRequest(message)
+        }
+        other => map_store_read_error(other),
+    }
+}
+
+fn map_store_read_error(error: ConfigStoreError) -> AppError {
+    match error {
+        ConfigStoreError::Conflict { expected, actual } => {
+            AppError::ConfigConflict { expected, actual }
+        }
+        ConfigStoreError::Validation(_) => {
+            AppError::InternalError(anyhow::anyhow!("credential store validation failed"))
+        }
         ConfigStoreError::Json(_) => {
-            AppError::BadRequest("invalid credential document".to_string())
+            AppError::InternalError(anyhow::anyhow!("credential store document is invalid"))
         }
         ConfigStoreError::Io(error) => AppError::StorageError(error),
         ConfigStoreError::Watch(error) => {
@@ -148,7 +163,8 @@ mod tests {
             source: CredentialSource::User,
             updated_at: None,
         };
-        let value = serde_json::to_value(envelope(status, 4)).unwrap();
+        let value =
+            serde_json::to_value(envelope(status, CredentialStoreHealth::committed(4))).unwrap();
         assert_eq!(value["revision"], 4);
         assert_eq!(value["status"], "healthy");
         assert!(value["data"].get("value").is_none());
@@ -157,6 +173,7 @@ mod tests {
 
     #[actix_web::test]
     async fn replace_is_redacted_stale_cas_is_409_and_feed_receives_change() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x41; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let mut feed = state.account_sink.subscribe();
@@ -213,6 +230,20 @@ mod tests {
         let stale_body: serde_json::Value = test::read_body_json(stale_response).await;
         assert_eq!(stale_body["error"]["code"], "config_revision_conflict");
 
+        let forged_source = test::TestRequest::put()
+            .uri("/credentials/provider.openai.api_key")
+            .set_json(serde_json::json!({
+                "expected_revision": 1,
+                "value": "replacement",
+                "source": "migrated"
+            }))
+            .to_request();
+        let forged_response = test::call_service(&app, forged_source).await;
+        assert_eq!(
+            forged_response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+
         let get = test::TestRequest::get()
             .uri("/credentials/provider.openai.api_key")
             .to_request();
@@ -221,5 +252,74 @@ mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!body.contains("sk-never-return-this"));
         assert!(body.contains("\"configured\":true"));
+    }
+
+    #[actix_web::test]
+    async fn status_api_reports_missing_and_backup_recovery_truthfully() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x42; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/credentials/{credential_ref}",
+            web::get().to(get_credential_status),
+        ))
+        .await;
+
+        let missing = test::TestRequest::get()
+            .uri("/credentials/provider.openai.api_key")
+            .to_request();
+        let missing: serde_json::Value = test::call_and_read_body_json(&app, missing).await;
+        assert_eq!(missing["revision"], 0);
+        assert_eq!(missing["status"], "missing");
+        assert_eq!(missing["source"], "default");
+
+        let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
+        state
+            .credential_store
+            .replace(reference.clone(), "first", CredentialSource::User, 0)
+            .unwrap();
+        state
+            .credential_store
+            .replace(reference, "second", CredentialSource::User, 1)
+            .unwrap();
+        std::fs::write(state.credential_store.path(), b"{corrupt").unwrap();
+
+        let recovered = test::TestRequest::get()
+            .uri("/credentials/provider.openai.api_key")
+            .to_request();
+        let recovered: serde_json::Value = test::call_and_read_body_json(&app, recovered).await;
+        assert_eq!(recovered["revision"], 1);
+        assert_eq!(recovered["status"], "degraded");
+        assert_eq!(recovered["source"], "backup");
+        assert_eq!(
+            recovered["last_error"],
+            "primary credential document invalid; using last-known-good backup"
+        );
+        let serialized = recovered.to_string();
+        assert!(!serialized.contains("first"));
+        assert!(!serialized.contains("second"));
+    }
+
+    #[actix_web::test]
+    async fn corrupt_store_without_backup_is_redacted_server_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        std::fs::write(state.credential_store.path(), b"{private-corrupt-bytes").unwrap();
+        let app = test::init_service(App::new().app_data(state).route(
+            "/credentials/{credential_ref}",
+            web::get().to(get_credential_status),
+        ))
+        .await;
+        let request = test::TestRequest::get()
+            .uri("/credentials/provider.openai.api_key")
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(!body.contains("private-corrupt-bytes"));
+        assert!(!body.contains(dir.path().to_string_lossy().as_ref()));
     }
 }
