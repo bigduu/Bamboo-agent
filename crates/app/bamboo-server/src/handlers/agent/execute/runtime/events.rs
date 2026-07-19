@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
@@ -25,6 +26,8 @@ fn is_critical_event(event: &AgentEvent) -> bool {
             | AgentEvent::PlanModeEntered { .. }
             | AgentEvent::PlanModeExited { .. }
             | AgentEvent::BudgetExceeded { .. }
+            | AgentEvent::WorkflowActivated { .. }
+            | AgentEvent::WorkflowDeactivated { .. }
     )
 }
 
@@ -53,7 +56,22 @@ pub(crate) fn spawn_event_forwarder(
 
     tokio::spawn(
         async move {
+            let mut forwarded_lifecycle_ids = HashSet::new();
             while let Some(event) = mpsc_rx.recv().await {
+                let lifecycle_id = match &event {
+                    AgentEvent::WorkflowActivated { event_id, .. }
+                    | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
+                    _ => None,
+                };
+                if lifecycle_id
+                    .is_some_and(|event_id| !forwarded_lifecycle_ids.insert(event_id.clone()))
+                {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "duplicate workflow lifecycle event suppressed before forwarding"
+                    );
+                    continue;
+                }
                 // Cache critical events for late-subscriber replay.
                 if is_critical_event(&event) {
                     let mut runners = state.agent_runners.write().await;
@@ -666,6 +684,80 @@ mod tests {
         assert_eq!(journaled[0].seq, 1);
         assert_eq!(journaled[1].seq, 2);
         assert_eq!(journaled[2].seq, 3);
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_suppresses_duplicate_lifecycle_before_all_observers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state");
+        let state = actix_web::web::Data::new(state);
+        let session_id = "lifecycle-forwarder-dedupe";
+        {
+            let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
+            runner.status = bamboo_engine::runtime::execution::runner_state::AgentStatus::Running;
+            state
+                .agent_runners
+                .write()
+                .await
+                .insert(session_id.to_string(), runner);
+        }
+        let (mpsc_tx, mpsc_rx) = mpsc::channel(8);
+        let (session_tx, mut session_rx) = tokio::sync::broadcast::channel(8);
+        let mut account_rx = state.account_sink.subscribe();
+        spawn_event_forwarder(
+            state.clone(),
+            session_id.to_string(),
+            mpsc_rx,
+            session_tx,
+            None,
+        );
+        let event = AgentEvent::WorkflowActivated {
+            event_id: "stable-forwarder-id".to_string(),
+            session_id: session_id.to_string(),
+            workflow_id: "review".to_string(),
+            revision: 7,
+            invoked_by: "model".to_string(),
+        };
+        mpsc_tx.send(event.clone()).await.unwrap();
+        mpsc_tx.send(event).await.unwrap();
+        drop(mpsc_tx);
+
+        let session_event = timeout(Duration::from_secs(1), session_rx.recv())
+            .await
+            .expect("session event")
+            .expect("broadcast");
+        assert!(matches!(
+            session_event,
+            AgentEvent::WorkflowActivated { .. }
+        ));
+        let mut session_lifecycle_count = 1;
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(30), session_rx.recv()).await {
+            if matches!(event, AgentEvent::WorkflowActivated { ref event_id, .. } if event_id == "stable-forwarder-id")
+            {
+                session_lifecycle_count += 1;
+            }
+        }
+        assert_eq!(session_lifecycle_count, 1);
+        let account_event = timeout(Duration::from_secs(1), account_rx.recv())
+            .await
+            .expect("account event")
+            .expect("account broadcast");
+        assert!(matches!(
+            account_event.event,
+            AgentEvent::WorkflowActivated { .. }
+        ));
+        let mut account_lifecycle_count = 1;
+        while let Ok(Ok(change)) = timeout(Duration::from_millis(30), account_rx.recv()).await {
+            if matches!(change.event, AgentEvent::WorkflowActivated { ref event_id, .. } if event_id == "stable-forwarder-id")
+            {
+                account_lifecycle_count += 1;
+            }
+        }
+        assert_eq!(account_lifecycle_count, 1);
+        let runner = state.agent_runners.read().await;
+        assert_eq!(runner[session_id].last_critical_events.len(), 1);
     }
 
     #[tokio::test]

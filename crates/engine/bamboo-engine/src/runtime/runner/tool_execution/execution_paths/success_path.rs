@@ -4,7 +4,60 @@ use bamboo_agent_core::AgentEvent;
 use super::super::{clarification, events, task, tool_error_collector};
 use super::{goal, workspace, SuccessPathContext};
 
-pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
+const WORKFLOW_TOOL_METADATA_KEYS: &[&str] = &[
+    bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+    bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+    bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
+    bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
+    bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+    bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY,
+    bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+    bamboo_skills::runtime_metadata::LOADED_SKILL_IDS_METADATA_KEY,
+    bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_ID_METADATA_KEY,
+    bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
+];
+
+async fn refresh_workflow_tool_side_effects(ctx: &mut SuccessPathContext<'_>) {
+    if !ctx.result.success {
+        return;
+    }
+    let keys: &[&str] = match ctx.tool_call.function.name.as_str() {
+        "load_skill" => WORKFLOW_TOOL_METADATA_KEYS,
+        "workflow_run" => &[bamboo_skills::WORKFLOW_RUN_IDS_METADATA_KEY],
+        _ => return,
+    };
+    let Some(persistence) = ctx.config.persistence.as_ref() else {
+        return;
+    };
+    match persistence.load_runtime_session(ctx.session_id).await {
+        Ok(Some(latest)) => {
+            for key in keys {
+                if let Some(value) = latest.metadata.get(*key) {
+                    ctx.session
+                        .metadata
+                        .insert((*key).to_string(), value.clone());
+                } else {
+                    ctx.session.metadata.remove(*key);
+                }
+            }
+        }
+        Ok(None) => tracing::warn!(
+            "[{}] load_skill completed but no repository session was available for activation refresh",
+            ctx.session_id
+        ),
+        Err(error) => tracing::warn!(
+            "[{}] load_skill activation refresh failed: {}",
+            ctx.session_id,
+            error
+        ),
+    }
+}
+
+pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_>) -> bool {
+    // Server tools mutate a repository-owned Session clone. Pull only the
+    // workflow activation namespace into the runner's live Session before the
+    // next round and before any later runtime save can overwrite those changes.
+    refresh_workflow_tool_side_effects(&mut ctx).await;
     task::track_task_progress(
         ctx.task_context,
         ctx.event_tx,

@@ -204,6 +204,11 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
         },
         ..Default::default()
     };
+    if result.kind == WorkflowKind::Orchestration {
+        // Starting an orchestration can spend budget and invoke multiple tools;
+        // model activation is opt-in at the bundle as well as the session.
+        result.invocation_policy = serde_json::json!({"explicit": true, "automatic": false});
+    }
     if is_workflow_definition && metadata.workflow_schema.is_some() {
         let definition: bamboo_domain::WorkflowRunDefinition =
             serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;

@@ -333,9 +333,30 @@ pub struct SkillActivationDescriptor {
     pub selected_skill_mode: Option<String>,
 }
 
+/// Serializable immutable activation payload. This is intentionally separate
+/// from the in-memory Arc graph so a session can restore the exact workflow
+/// revision after a server restart without consulting a newer catalog.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SkillActivationSnapshot {
+    pub catalog_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_skill_mode: Option<String>,
+    pub skills: BTreeMap<SkillId, SkillActivationSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SkillActivationSnapshotEntry {
+    pub definition: SkillDefinition,
+    pub catalog_entry: WorkflowCatalogEntry,
+    pub revision: u64,
+    #[serde(default)]
+    pub resources: BTreeMap<String, Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 struct PinnedSkillDefinition {
     definition: Arc<SkillDefinition>,
+    catalog_entry: WorkflowCatalogEntry,
     root: PathBuf,
     revision: u64,
     resources: SkillResourceSnapshot,
@@ -345,6 +366,7 @@ struct PinnedSkillDefinition {
 struct PinnedSkillActivation {
     catalog_revision: u64,
     selected_skill_mode: Option<String>,
+    restored_from_durable_snapshot: bool,
     skills: HashMap<SkillId, PinnedSkillDefinition>,
 }
 
@@ -1198,6 +1220,12 @@ impl SkillStore {
         if !definitions.contains_key(&root_key) {
             return Err(SkillError::NotFound(format!("{root_id}@{root_revision}")));
         }
+        let root_invocation_policy = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.winner && entry.id == root_id && entry.revision == root_revision)
+            .map(|entry| entry.invocation_policy.clone())
+            .ok_or_else(|| SkillError::NotFound(format!("{root_id}@{root_revision}")))?;
 
         // Persist only the transitive closure reachable from the selected root.
         // Keeping every orchestration definition in the publication would copy
@@ -1231,6 +1259,7 @@ impl SkillStore {
             publication_revision: catalog.revision,
             root_id: root_id.to_string(),
             root_revision,
+            root_invocation_policy,
             definitions: reachable,
         })
     }
@@ -1311,6 +1340,10 @@ impl SkillStore {
                 .get(skill.id.as_str())
                 .map(|entry| entry.revision)
                 .ok_or_else(|| SkillError::NotFound(skill.id.clone()))?;
+            let catalog_entry = (*catalog_entries
+                .get(skill.id.as_str())
+                .ok_or_else(|| SkillError::NotFound(skill.id.clone()))?)
+            .clone();
             skill_revisions.insert(skill.id.clone(), revision);
             definition_bytes = definition_bytes.saturating_add(
                 serde_json::to_vec(skill)
@@ -1326,6 +1359,7 @@ impl SkillStore {
                 skill.id.clone(),
                 PinnedSkillDefinition {
                     definition: Arc::new(skill.clone()),
+                    catalog_entry,
                     root,
                     revision,
                     resources: resource_snapshot,
@@ -1352,6 +1386,7 @@ impl SkillStore {
             PinnedSkillActivation {
                 catalog_revision: catalog.revision,
                 selected_skill_mode: self.effective_mode(mode_override),
+                restored_from_durable_snapshot: false,
                 skills: pinned_skills,
             },
         )?;
@@ -1457,6 +1492,188 @@ impl SkillStore {
             selected_skill_mode: activation.selected_skill_mode.clone(),
         };
         Some((skills, descriptor))
+    }
+
+    pub async fn pinned_activation_catalog_entries(
+        &self,
+        activation_id: &str,
+    ) -> Option<Vec<WorkflowCatalogEntry>> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations.by_id.get(activation_id)?;
+        let mut entries = activation
+            .skills
+            .values()
+            .map(|skill| skill.catalog_entry.clone())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        Some(entries)
+    }
+
+    pub async fn activation_was_restored(&self, activation_id: &str) -> bool {
+        self.pinned_activations
+            .read()
+            .await
+            .by_id
+            .get(activation_id)
+            .is_some_and(|activation| activation.restored_from_durable_snapshot)
+    }
+
+    pub async fn export_activation_snapshot(
+        &self,
+        activation_id: &str,
+    ) -> Option<SkillActivationSnapshot> {
+        let activations = self.pinned_activations.read().await;
+        let activation = activations.by_id.get(activation_id)?;
+        Some(SkillActivationSnapshot {
+            catalog_revision: activation.catalog_revision,
+            selected_skill_mode: activation.selected_skill_mode.clone(),
+            skills: activation
+                .skills
+                .iter()
+                .map(|(id, skill)| {
+                    (
+                        id.clone(),
+                        SkillActivationSnapshotEntry {
+                            definition: skill.definition.as_ref().clone(),
+                            catalog_entry: skill.catalog_entry.clone(),
+                            revision: skill.revision,
+                            resources: skill
+                                .resources
+                                .iter()
+                                .map(|(path, bytes)| (path.clone(), bytes.as_ref().clone()))
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    /// Restore an activation from session-persisted LKG bytes. The snapshot is
+    /// recharged against the same global retained budget as live catalog pins.
+    pub async fn restore_activation_snapshot(
+        &self,
+        activation_id: &str,
+        snapshot: SkillActivationSnapshot,
+    ) -> SkillResult<SkillActivationDescriptor> {
+        const MAX_DURABLE_ACTIVATION_BYTES: usize = 512 * 1024;
+        const MAX_DURABLE_ACTIVATION_SKILLS: usize = 32;
+        const MAX_DURABLE_ACTIVATION_RESOURCES: usize = 1_024;
+        if snapshot.skills.is_empty() {
+            return Err(SkillError::Validation(
+                "persisted workflow activation is empty".to_string(),
+            ));
+        }
+        if snapshot.skills.len() > MAX_DURABLE_ACTIVATION_SKILLS {
+            return Err(SkillError::Validation(
+                "persisted workflow activation contains too many skills".to_string(),
+            ));
+        }
+        let serialized_bytes = serde_json::to_vec(&snapshot).map_err(|_| {
+            SkillError::Validation("persisted workflow activation is invalid".to_string())
+        })?;
+        if serialized_bytes.len() > MAX_DURABLE_ACTIVATION_BYTES {
+            return Err(SkillError::Validation(
+                "persisted workflow activation exceeds the durable size limit".to_string(),
+            ));
+        }
+        let resource_count = snapshot
+            .skills
+            .values()
+            .map(|entry| entry.resources.len())
+            .sum::<usize>();
+        if resource_count > MAX_DURABLE_ACTIVATION_RESOURCES {
+            return Err(SkillError::Validation(
+                "persisted workflow activation contains too many resources".to_string(),
+            ));
+        }
+        for (id, entry) in &snapshot.skills {
+            if id != &entry.definition.id
+                || id != &entry.catalog_entry.id
+                || entry.revision == 0
+                || entry.revision != entry.catalog_entry.revision
+                || !entry.catalog_entry.winner
+                || entry.catalog_entry.status != WorkflowStatus::Valid
+            {
+                return Err(SkillError::Validation(
+                    "persisted workflow activation identity mismatch".to_string(),
+                ));
+            }
+            for path in entry.resources.keys() {
+                crate::resource_helpers::normalize_relative_resource_path(path)
+                    .map_err(SkillError::Validation)?;
+            }
+        }
+        let mut definition_bytes = 0usize;
+        let mut retained_resources = HashMap::<usize, usize>::new();
+        let mut pinned_skills = HashMap::with_capacity(snapshot.skills.len());
+        let mut skill_revisions = BTreeMap::new();
+        for (id, entry) in snapshot.skills {
+            if id != entry.definition.id {
+                return Err(SkillError::Validation(
+                    "persisted workflow activation identity mismatch".to_string(),
+                ));
+            }
+            definition_bytes = definition_bytes.saturating_add(
+                serde_json::to_vec(&entry.definition)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0),
+            );
+            let resources: SkillResourceSnapshot = Arc::new(
+                entry
+                    .resources
+                    .into_iter()
+                    .map(|(path, bytes)| (path, Arc::new(bytes)))
+                    .collect(),
+            );
+            for bytes in resources.values() {
+                retained_resources
+                    .entry(Arc::as_ptr(bytes) as usize)
+                    .or_insert(bytes.len());
+            }
+            skill_revisions.insert(id.clone(), entry.revision);
+            pinned_skills.insert(
+                id,
+                PinnedSkillDefinition {
+                    definition: Arc::new(entry.definition),
+                    catalog_entry: entry.catalog_entry,
+                    // Durable snapshots never persist an absolute filesystem path.
+                    // Resource reads use the immutable embedded byte map.
+                    root: PathBuf::new(),
+                    revision: entry.revision,
+                    resources,
+                },
+            );
+        }
+
+        let mut activations = self.pinned_activations.write().await;
+        if !activations.by_id.contains_key(activation_id)
+            && activations.by_id.len() >= MAX_PINNED_SKILL_ACTIVATIONS
+        {
+            return Err(SkillError::Storage(format!(
+                "active workflow snapshot capacity ({MAX_PINNED_SKILL_ACTIVATIONS}) reached"
+            )));
+        }
+        self.retained_budget.replace(
+            activation_id,
+            definition_bytes,
+            retained_resources.into_iter().collect(),
+            self.snapshot_limits.max_retained_bytes,
+        )?;
+        activations.insert(
+            activation_id.to_string(),
+            PinnedSkillActivation {
+                catalog_revision: snapshot.catalog_revision,
+                selected_skill_mode: snapshot.selected_skill_mode.clone(),
+                restored_from_durable_snapshot: true,
+                skills: pinned_skills,
+            },
+        )?;
+        Ok(SkillActivationDescriptor {
+            catalog_revision: snapshot.catalog_revision,
+            skill_revisions,
+            selected_skill_mode: snapshot.selected_skill_mode,
+        })
     }
 
     pub async fn get_pinned_skill_with_root(
@@ -4071,6 +4288,41 @@ Use this skill for testing.
             .pin_current_activation("after-release", &ids, None)
             .await
             .expect("released slot is reusable");
+    }
+
+    #[tokio::test]
+    async fn durable_restore_capacity_failure_preserves_existing_activations() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        write_skill(&skills_dir, "bounded", "bounded", "bounded")
+            .await
+            .expect("skill");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+        let ids = vec!["bounded".to_string()];
+        for index in 0..super::MAX_PINNED_SKILL_ACTIVATIONS {
+            store
+                .pin_current_activation(&format!("active-{index}"), &ids, None)
+                .await
+                .expect("capacity slot");
+        }
+        let snapshot = store
+            .export_activation_snapshot("active-0")
+            .await
+            .expect("durable snapshot");
+        let error = store
+            .restore_activation_snapshot("restore-over-capacity", snapshot)
+            .await
+            .expect_err("restore must fail atomically at capacity");
+        assert!(error.to_string().contains("capacity"));
+        assert!(store.activation_descriptor("active-0").await.is_some());
+        assert!(store
+            .activation_descriptor("restore-over-capacity")
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -414,19 +414,30 @@ async fn cancelled_pipeline_releases_activation_without_false_completion() {
 }
 
 #[tokio::test]
-async fn suspended_restart_without_retained_snapshot_fails_before_provider_call() {
-    struct NeverCalledProvider;
+async fn suspended_restart_without_retained_snapshot_continues_degraded() {
+    struct CalledProvider {
+        called: std::sync::atomic::AtomicBool,
+        messages: std::sync::Mutex<Vec<Message>>,
+    }
 
     #[async_trait]
-    impl LLMProvider for NeverCalledProvider {
+    impl LLMProvider for CalledProvider {
         async fn chat_stream(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[bamboo_agent_core::tools::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> bamboo_llm::provider::Result<LLMStream> {
-            panic!("missing suspended snapshot must fail before the provider is called")
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.messages
+                .lock()
+                .expect("provider messages lock")
+                .extend_from_slice(messages);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("continued without workflow".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
 
@@ -458,6 +469,10 @@ async fn suspended_restart_without_retained_snapshot_fails_before_provider_call(
         "7".to_string(),
     );
     session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
         bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
         r#"{"restart-demo":3}"#.to_string(),
     );
@@ -467,33 +482,58 @@ async fn suspended_restart_without_retained_snapshot_fails_before_provider_call(
         model_name: Some("model".to_string()),
         ..Default::default()
     };
-    let (event_tx, _event_rx) = mpsc::channel(4);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let provider = Arc::new(CalledProvider {
+        called: std::sync::atomic::AtomicBool::new(false),
+        messages: std::sync::Mutex::new(Vec::new()),
+    });
     let result = super::run_agent_loop_with_config(
         &mut session,
         "continue".to_string(),
         event_tx,
-        Arc::new(NeverCalledProvider),
+        provider.clone(),
         Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
         CancellationToken::new(),
         config,
     )
     .await;
 
-    let bamboo_agent_core::AgentError::Tool(message) = result.expect_err("restart must fail")
-    else {
-        panic!("expected workflow setup error")
+    result.expect("missing LKG degrades workflow without killing the main session");
+    assert!(provider.called.load(std::sync::atomic::Ordering::SeqCst));
+    let (has_degraded_diagnostic, has_workflow_runtime) = {
+        let provider_messages = provider.messages.lock().expect("provider messages lock");
+        (
+            provider_messages
+                .iter()
+                .any(|message| message.content.contains("Workflow Activation Degraded")),
+            provider_messages
+                .iter()
+                .any(|message| message.content.contains("context_type: workflow_runtime")),
+        )
     };
-    assert!(message.contains("before model execution"));
-    assert!(message.contains("retry as a new activation"));
+    assert!(has_degraded_diagnostic);
+    assert!(!has_workflow_runtime);
     assert!(session
         .metadata
         .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
-        .is_some_and(|message| message.contains("Suspended workflow snapshot is unavailable")));
+        .is_some_and(|message| message.contains("snapshot")));
     assert!(manager
         .store()
         .activation_descriptor("restart-missing-pin")
         .await
         .is_none());
+    assert!(!session
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+    assert!(!session
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY));
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(!matches!(
+            event,
+            bamboo_agent_core::AgentEvent::WorkflowActivated { .. }
+        ));
+    }
 }
 
 #[tokio::test]
@@ -621,7 +661,7 @@ async fn activation_metadata_persistence_failure_releases_pin_before_provider_ca
 
 #[tokio::test]
 async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin() {
-    struct FailSecondSave(std::sync::atomic::AtomicUsize);
+    struct FailSecondSave(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
     impl bamboo_domain::RuntimeSessionPersistence for FailSecondSave {
         async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
@@ -642,7 +682,14 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
         ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                result: "pinned instructions".to_string(),
+                result: serde_json::json!({
+                    "skill_id": "review",
+                    "revision": 1,
+                    "instructions": "pinned instructions",
+                    "dynamic_context": [],
+                    "activation_status": "active"
+                })
+                .to_string(),
                 display_preference: None,
                 images: Vec::new(),
             })
@@ -680,6 +727,7 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
     ));
     manager.initialize().await.expect("initialize");
     let mut session = Session::new("post-preload-save-failure", "model");
+    let save_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (event_tx, _event_rx) = mpsc::channel(4);
     let result = super::run_agent_loop_with_config(
         &mut session,
@@ -691,9 +739,7 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
         AgentLoopConfig {
             skill_manager: Some(manager.clone()),
             selected_skill_ids: Some(vec!["review".to_string()]),
-            persistence: Some(Arc::new(FailSecondSave(
-                std::sync::atomic::AtomicUsize::new(0),
-            ))),
+            persistence: Some(Arc::new(FailSecondSave(save_count.clone()))),
             model_name: Some("model".to_string()),
             ..Default::default()
         },
@@ -703,11 +749,18 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
         .expect_err("post preload save must fail")
         .to_string()
         .contains("loaded-state could not be published"));
+    assert_eq!(save_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(manager
         .store()
         .activation_descriptor("post-preload-save-failure")
         .await
         .is_none());
+    assert!(!session
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+    assert!(!session
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY));
 }
 
 #[tokio::test]

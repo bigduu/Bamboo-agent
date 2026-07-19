@@ -45,6 +45,8 @@ pub struct ChatTurnInput {
     pub enhance_prompt: Option<String>,
     pub workspace_path: Option<String>,
     pub selected_skill_ids: Option<Vec<String>>,
+    pub workflow_selection: Option<bamboo_skills::WorkflowSelection>,
+    pub orchestration_opt_in: Option<bool>,
     pub copilot_conclusion_with_options_enhancement_enabled: Option<bool>,
     /// Optional data directory for workspace path fallback when neither request
     /// nor metadata provides one.

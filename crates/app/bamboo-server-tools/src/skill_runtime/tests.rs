@@ -3,18 +3,381 @@ use bamboo_skills::access_control::{parse_loaded_skill_ids, serialize_loaded_ski
 use bamboo_skills::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
     SKILL_RUNTIME_ACTIVATION_GENERATION_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
-    SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolExecutionContext, ToolOutcome};
+use bamboo_agent_core::tools::{
+    FunctionSchema, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolOutcome,
+    ToolResult, ToolSchema,
+};
 use bamboo_agent_core::Session;
 use bamboo_llm::Config;
 use bamboo_skills::{SkillManager, SkillStoreConfig};
+
+#[tokio::test]
+async fn real_runner_auto_load_skill_survives_final_save_and_restart() {
+    use bamboo_agent_core::storage::AttachmentReader;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+    use bamboo_engine::{Agent, ExecuteRequestBuilder};
+    use bamboo_llm::{LLMChunk, LLMProvider, LLMStream};
+    use futures::stream;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoAttachments;
+    #[async_trait::async_trait]
+    impl AttachmentReader for NoAttachments {
+        async fn read_attachment(
+            &self,
+            _session_id: &str,
+            _attachment_id: &str,
+        ) -> std::io::Result<Option<(Vec<u8>, String)>> {
+            Ok(None)
+        }
+    }
+
+    struct RecordingProvider {
+        queue: AsyncMutex<Vec<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
+        requests: AsyncMutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for RecordingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.requests.lock().await.push(messages.to_vec());
+            let items = self.queue.lock().await.remove(0);
+            Ok(Box::pin(stream::iter(items)))
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let skill_dir = directory.path().join("skills/runner-review");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: runner-review
+description: RUNNER_AUTO_REVIEW_NEEDLE
+metadata:
+  invocation_policy:
+    explicit: true
+    automatic: true
+---
+RUNNER_RUNTIME_INSTRUCTIONS"#,
+    )
+    .expect("skill");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("manager");
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let cache = Arc::new(dashmap::DashMap::new());
+    let repo = bamboo_engine::SessionRepository::new(cache, storage.clone(), locked.clone());
+    let config = Arc::new(RwLock::new(Config::default()));
+    let load_skill = LoadSkillTool::new(manager.clone(), config.clone(), repo.clone());
+    let tools = Arc::new(
+        bamboo_tools::BuiltinToolExecutorBuilder::new()
+            .with_tool(load_skill)
+            .expect("register load_skill")
+            .build(),
+    );
+    let call = ToolCall {
+        id: "call-load-runner-review".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "load_skill".to_string(),
+            arguments: serde_json::json!({"skill_id":"runner-review"}).to_string(),
+        },
+    };
+    let provider = Arc::new(RecordingProvider {
+        queue: AsyncMutex::new(vec![
+            vec![Ok(LLMChunk::ToolCalls(vec![call])), Ok(LLMChunk::Done)],
+            vec![
+                Ok(LLMChunk::Token("first done".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+            vec![
+                Ok(LLMChunk::Token("restart done".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+        ]),
+        requests: AsyncMutex::new(Vec::new()),
+    });
+    let metrics = bamboo_metrics::MetricsCollector::spawn(
+        Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            directory.path().join("metrics.db"),
+        )),
+        7,
+    );
+    let agent = Agent::builder()
+        .storage(storage.clone())
+        .persistence(Arc::new(repo.clone()))
+        .attachment_reader(Arc::new(NoAttachments))
+        .skill_manager(manager)
+        .metrics_collector(metrics)
+        .config(config)
+        .provider(provider.clone())
+        .default_tools(tools)
+        .build()
+        .expect("agent");
+
+    let session_id = "real-runner-auto-load";
+    let mut session = Session::new(session_id, "test-model");
+    session.title = "PRESERVE_TITLE".to_string();
+    session
+        .metadata
+        .insert("external.metadata".to_string(), "preserve".to_string());
+    session.add_message(bamboo_agent_core::Message::system("system"));
+    session.add_message(bamboo_agent_core::Message::user(
+        "Please use RUNNER_AUTO_REVIEW_NEEDLE",
+    ));
+    repo.save(&mut session).await.expect("seed session");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+    agent
+        .execute(
+            &mut session,
+            ExecuteRequestBuilder::new(
+                "Please use RUNNER_AUTO_REVIEW_NEEDLE",
+                event_tx,
+                CancellationToken::new(),
+            )
+            .model("test-model")
+            .build(),
+        )
+        .await
+        .expect("real runner executes");
+    assert!(session
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+    let saved = storage
+        .load_session(session_id)
+        .await
+        .expect("load")
+        .expect("saved");
+    assert!(saved
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY));
+    assert!(saved
+        .metadata
+        .contains_key(SKILL_RUNTIME_SELECTION_SOURCE_KEY));
+    assert!(saved
+        .metadata
+        .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY));
+    assert_eq!(saved.title, "PRESERVE_TITLE");
+    assert_eq!(
+        saved.metadata.get("external.metadata").map(String::as_str),
+        Some("preserve")
+    );
+    assert!(saved.messages.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|call| call.function.name == "load_skill"))
+    }));
+
+    let requests = provider.requests.lock().await;
+    let second = serde_json::to_string(&requests[1]).expect("second request");
+    assert_eq!(
+        requests[1]
+            .iter()
+            .filter(|message| serde_json::to_string(message)
+                .expect("message")
+                .contains("workflow_runtime"))
+            .count(),
+        1,
+        "{second}"
+    );
+    assert!(second.contains("RUNNER_RUNTIME_INSTRUCTIONS"));
+    drop(requests);
+
+    let mut restarted = saved;
+    restarted.add_message(bamboo_agent_core::Message::user("continue"));
+    let (restart_tx, _restart_rx) = tokio::sync::mpsc::channel(128);
+    agent
+        .execute(
+            &mut restarted,
+            ExecuteRequestBuilder::new("continue", restart_tx, CancellationToken::new())
+                .model("test-model")
+                .build(),
+        )
+        .await
+        .expect("restart active runner");
+    let requests = provider.requests.lock().await;
+    let restart = serde_json::to_string(&requests[2]).expect("restart request");
+    assert_eq!(
+        requests[2]
+            .iter()
+            .filter(|message| serde_json::to_string(message)
+                .expect("message")
+                .contains("workflow_runtime"))
+            .count(),
+        1,
+        "{restart}"
+    );
+    assert!(restart.contains("RUNNER_RUNTIME_INSTRUCTIONS"));
+}
+
+#[tokio::test]
+async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_alive() {
+    use bamboo_agent_core::storage::AttachmentReader;
+    use bamboo_engine::{Agent, ExecuteRequestBuilder};
+    use bamboo_llm::{LLMChunk, LLMProvider, LLMStream};
+    use futures::stream;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoAttachments;
+    #[async_trait::async_trait]
+    impl AttachmentReader for NoAttachments {
+        async fn read_attachment(
+            &self,
+            _session_id: &str,
+            _attachment_id: &str,
+        ) -> std::io::Result<Option<(Vec<u8>, String)>> {
+            Ok(None)
+        }
+    }
+    struct CapturingProvider {
+        requests: AsyncMutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for CapturingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.requests.lock().await.push(messages.to_vec());
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("main model continued".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    for (id, stop) in [("dynamic-continue", false), ("dynamic-stop", true)] {
+        let root = directory.path().join("skills").join(id);
+        std::fs::create_dir_all(&root).expect("skill root");
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\nname: {id}\ndescription: {id}\nmetadata:\n  dynamic_context:\n    - id: read\n      tool: Read\n      input: {{path: README.md}}\n      stop_on_failure: {stop}\n---\n{id} instructions"
+            ),
+        )
+        .expect("skill");
+    }
+    std::fs::write(directory.path().join("README.md"), "workspace").expect("readme");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("manager");
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(
+        Arc::new(dashmap::DashMap::new()),
+        storage.clone(),
+        locked,
+    );
+    let dynamic_provider = Arc::new(DynamicProviderExecutor {
+        mode: DynamicProviderMode::Complete("MUST_NOT_EXECUTE".to_string()),
+        calls: AtomicUsize::new(0),
+        saw_bypass: AtomicBool::new(false),
+    });
+    let config = Arc::new(RwLock::new(Config::default()));
+    let tools = Arc::new(
+        bamboo_tools::BuiltinToolExecutorBuilder::new()
+            .with_tool(
+                LoadSkillTool::new(manager.clone(), config.clone(), repo.clone())
+                    .with_fail_closed_context_registry(dynamic_provider.clone()),
+            )
+            .expect("load tool")
+            .build(),
+    );
+    let llm = Arc::new(CapturingProvider {
+        requests: AsyncMutex::new(Vec::new()),
+    });
+    let metrics = bamboo_metrics::MetricsCollector::spawn(
+        Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            directory.path().join("matrix-metrics.db"),
+        )),
+        7,
+    );
+    let agent = Agent::builder()
+        .storage(storage.clone())
+        .persistence(Arc::new(repo.clone()))
+        .attachment_reader(Arc::new(NoAttachments))
+        .skill_manager(manager)
+        .metrics_collector(metrics)
+        .config(config)
+        .provider(llm.clone())
+        .default_tools(tools)
+        .build()
+        .expect("agent");
+
+    for (index, (id, stop)) in [("dynamic-continue", false), ("dynamic-stop", true)]
+        .into_iter()
+        .enumerate()
+    {
+        let session_id = format!("explicit-matrix-{index}");
+        let mut session = Session::new(&session_id, "test-model");
+        session.set_workspace_path_meta(directory.path().to_string_lossy().into_owned());
+        session.add_message(bamboo_agent_core::Message::system("system"));
+        session.add_message(bamboo_agent_core::Message::user("run selected workflow"));
+        repo.save(&mut session).await.expect("seed");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        agent
+            .execute(
+                &mut session,
+                ExecuteRequestBuilder::new(
+                    "run selected workflow",
+                    event_tx,
+                    CancellationToken::new(),
+                )
+                .model("test-model")
+                .selected_skill_ids(vec![id.to_string()])
+                .build(),
+            )
+            .await
+            .expect("main model always continues");
+        assert_eq!(
+            session
+                .metadata
+                .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY),
+            !stop
+        );
+        assert_eq!(
+            session
+                .metadata
+                .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY),
+            !stop
+        );
+        let request = serde_json::to_string(&llm.requests.lock().await[index]).expect("request");
+        if stop {
+            assert!(!request.contains("context_type: workflow_runtime"));
+        } else {
+            assert!(request.contains("context_type: workflow_runtime"));
+            assert!(request.contains("typed_authority_unavailable"));
+        }
+    }
+    assert_eq!(dynamic_provider.calls.load(Ordering::SeqCst), 0);
+}
 
 #[test]
 fn parse_loaded_skill_ids_supports_json_and_csv() {
@@ -38,6 +401,265 @@ fn serialize_loaded_skill_ids_is_stable_and_sorted() {
     assert_eq!(serialize_loaded_skill_ids(&ids), r#"["skill-a","skill-b"]"#);
 }
 
+#[tokio::test]
+async fn dynamic_context_is_permission_scoped_redacted_cached_and_event_deduped() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp_dir.path().join("skills/dynamic-demo");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: dynamic-demo
+description: Dynamic demo
+metadata:
+  dynamic_context:
+    - id: workspace-read
+      tool: Read
+      input:
+        path: input.txt
+      max_chars: 128
+      timeout_ms: 1000
+      cache_ttl_secs: 60
+---
+Use the dynamic context."#,
+    )
+    .expect("skill file");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: temp_dir.path().join("skills"),
+        project_dir: None,
+        active_mode: None,
+    }));
+    manager.initialize().await.expect("manager");
+    let session_id = "dynamic-context-session";
+    let mut session = Session::new(session_id, "model");
+    session.set_workspace_path_meta(temp_dir.path().to_string_lossy().into_owned());
+    std::fs::write(temp_dir.path().join("input.txt"), "workspace input").expect("workspace input");
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["dynamic-demo"]"#.to_string(),
+    );
+    let sessions = test_session_cache(session_id, &session);
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage.save_session(&session).await.expect("save session");
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
+    let provider = Arc::new(DynamicProviderExecutor {
+        mode: DynamicProviderMode::Complete(
+            serde_json::json!({
+                "api_key": "super-secret-output",
+                "data": "x".repeat(512),
+            })
+            .to_string(),
+        ),
+        calls: AtomicUsize::new(0),
+        saw_bypass: AtomicBool::new(false),
+    });
+    let tool = LoadSkillTool::new(
+        manager.clone(),
+        Arc::new(RwLock::new(Config::default())),
+        repo.clone(),
+    )
+    .with_test_context_tools(provider.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+    let context = ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id: "dynamic-load",
+        event_tx: Some(&event_tx),
+        available_tool_schemas: None,
+        bypass_permissions: true,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+    for _ in 0..2 {
+        let ToolOutcome::Completed(result) = tool
+            .invoke(
+                serde_json::json!({"skill_id":"dynamic-demo"}),
+                context.to_tool_ctx(),
+            )
+            .await
+            .expect("load dynamic workflow")
+        else {
+            panic!("load must complete")
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("payload json");
+        assert_eq!(payload["activation_status"], "active");
+        assert!(payload["dynamic_context"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("[REDACTED]")
+                && !content.contains("super-secret-output")));
+        assert!(payload["dynamic_context"][0]["diagnostic"].is_object());
+    }
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "each load rechecks the current provider permission policy"
+    );
+    assert!(!provider.saw_bypass.load(Ordering::SeqCst));
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(bamboo_agent_core::AgentEvent::WorkflowActivated { ref workflow_id, .. })
+            if workflow_id == "dynamic-demo"
+    ));
+    assert!(
+        event_rx.try_recv().is_err(),
+        "activation event is deduplicated"
+    );
+    let saved = storage
+        .load_session(session_id)
+        .await
+        .expect("load session")
+        .expect("saved session");
+    let cache = saved
+        .metadata
+        .get(bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY)
+        .expect("bounded cache metadata");
+    assert!(!cache.contains("input.txt"));
+    assert!(!cache.contains("super-secret-output"));
+
+    let production_session_id = "dynamic-context-production-authority";
+    let mut production_session = Session::new(production_session_id, "model");
+    production_session.set_workspace_path_meta(temp_dir.path().to_string_lossy().into_owned());
+    production_session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["dynamic-demo"]"#.to_string(),
+    );
+    repo.save(&mut production_session)
+        .await
+        .expect("save production session");
+    let production_tool = LoadSkillTool::new(
+        manager,
+        Arc::new(RwLock::new(Config::default())),
+        repo.clone(),
+    )
+    .with_fail_closed_context_registry(provider.clone());
+    let calls_before = provider.calls.load(Ordering::SeqCst);
+    let production_context = ToolExecutionContext {
+        session_id: Some(production_session_id),
+        tool_call_id: "production-authority-load",
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+    let ToolOutcome::Completed(production) = production_tool
+        .invoke(
+            serde_json::json!({"skill_id":"dynamic-demo"}),
+            production_context.to_tool_ctx(),
+        )
+        .await
+        .expect("production authority degrades without aborting")
+    else {
+        panic!("production load completes")
+    };
+    let production: serde_json::Value =
+        serde_json::from_str(&production.result).expect("production payload");
+    assert_eq!(production["activation_status"], "active");
+    assert_eq!(
+        production["dynamic_context"][0]["provenance"],
+        "typed_authority_unavailable"
+    );
+    assert_eq!(production["dynamic_context"][0]["content"], "");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), calls_before);
+    let production_saved = repo
+        .storage()
+        .load_session(production_session_id)
+        .await
+        .expect("load")
+        .expect("production saved");
+    assert!(production_saved
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+    assert!(!production_saved
+        .metadata
+        .contains_key(bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY));
+}
+
+#[tokio::test]
+async fn dynamic_context_needs_human_degrades_without_activation() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp_dir.path().join("skills/dynamic-approval");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: dynamic-approval
+description: Dynamic approval demo
+metadata:
+  dynamic_context:
+    - id: approval-read
+      tool: Read
+      input: {path: README.md}
+      stop_on_failure: true
+---
+Never activate after an approval pause."#,
+    )
+    .expect("skill file");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: temp_dir.path().join("skills"),
+        project_dir: None,
+        active_mode: None,
+    }));
+    manager.initialize().await.expect("manager");
+    let session_id = "dynamic-approval-session";
+    let mut session = Session::new(session_id, "model");
+    session.set_workspace_path_meta(temp_dir.path().to_string_lossy().into_owned());
+    std::fs::write(temp_dir.path().join("README.md"), "workspace readme").expect("readme");
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["dynamic-approval"]"#.to_string(),
+    );
+    let sessions = test_session_cache(session_id, &session);
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage.save_session(&session).await.expect("save session");
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
+    let provider = Arc::new(DynamicProviderExecutor {
+        mode: DynamicProviderMode::NeedsHuman,
+        calls: AtomicUsize::new(0),
+        saw_bypass: AtomicBool::new(false),
+    });
+    let tool = LoadSkillTool::new(manager, Arc::new(RwLock::new(Config::default())), repo)
+        .with_test_context_tools(provider.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+    let context = ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id: "dynamic-approval-load",
+        event_tx: Some(&event_tx),
+        available_tool_schemas: None,
+        bypass_permissions: true,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+    let ToolOutcome::Completed(result) = tool
+        .invoke(
+            serde_json::json!({"skill_id":"dynamic-approval"}),
+            context.to_tool_ctx(),
+        )
+        .await
+        .expect("degraded result continues main session")
+    else {
+        panic!("load must return degraded completed payload")
+    };
+    let payload: serde_json::Value = serde_json::from_str(&result.result).expect("payload json");
+    assert_eq!(payload["activation_status"], "degraded");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(!provider.saw_bypass.load(Ordering::SeqCst));
+    assert!(event_rx.try_recv().is_err());
+    let saved = storage
+        .load_session(session_id)
+        .await
+        .expect("load session")
+        .expect("saved session");
+    assert!(!saved
+        .metadata
+        .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+}
+
 /// Build a per-session-locked session cache pre-populated with one session.
 fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::SessionCache {
     let cache = Arc::new(dashmap::DashMap::new());
@@ -46,6 +668,61 @@ fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::Ses
         Arc::new(parking_lot::RwLock::new(session.clone())),
     );
     cache
+}
+
+enum DynamicProviderMode {
+    Complete(String),
+    NeedsHuman,
+}
+
+struct DynamicProviderExecutor {
+    mode: DynamicProviderMode,
+    calls: AtomicUsize,
+    saw_bypass: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for DynamicProviderExecutor {
+    async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+        unreachable!("dynamic provider must use outcome-aware dispatch")
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_bypass
+            .store(ctx.bypass_permissions, Ordering::SeqCst);
+        Ok(match &self.mode {
+            DynamicProviderMode::Complete(output) => {
+                ToolOutcome::Completed(ToolResult::text(true, output.clone()))
+            }
+            DynamicProviderMode::NeedsHuman => ToolOutcome::NeedsHuman {
+                question: bamboo_agent_core::PendingQuestion {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.function.name.clone(),
+                    question: "Approve?".to_string(),
+                    options: vec!["yes".to_string(), "no".to_string()],
+                    allow_custom: false,
+                    source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+                },
+                result: ToolResult::text(false, "approval required"),
+            },
+        })
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "Read".to_string(),
+                description: "read-only dynamic provider".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }]
+    }
 }
 
 #[derive(Default)]
@@ -208,6 +885,10 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
     explicit_run.metadata.insert(
         SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
         r#"["plan"]"#.to_string(),
+    );
+    explicit_run.metadata.insert(
+        SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
     );
     repo.save(&mut explicit_run)
         .await

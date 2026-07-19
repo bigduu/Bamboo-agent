@@ -25,6 +25,8 @@ pub enum ChatError {
     SaveFailed(#[from] SessionSaveError),
     #[error("invalid model: {0}")]
     InvalidModel(String),
+    #[error("invalid workflow selection: {0}")]
+    InvalidWorkflowSelection(String),
 }
 
 /// Errors from the execute preparation use case.

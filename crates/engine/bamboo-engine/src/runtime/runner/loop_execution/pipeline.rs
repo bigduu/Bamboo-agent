@@ -1162,6 +1162,22 @@ async fn handle_tool_calls_path(
         .with_reasoning_signature(reasoning_signature),
     );
 
+    // Tool calls are a durable conversation boundary. In particular,
+    // repository-backed tools such as load_skill update metadata through a
+    // separate locked session transaction; persist the assistant/tool-call
+    // message first so a crash during the tool cannot lose or be overwritten
+    // by that transaction.
+    if let Some(persistence) = frame.config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "assistant tool-call checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+
     let compression_model = Some(model_name.to_string())
         .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
     if compression_model.is_none() {

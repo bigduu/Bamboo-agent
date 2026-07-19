@@ -592,6 +592,16 @@ impl WorkflowRunEngine {
         self.repository.list_run_ids().await.map_err(storage)
     }
 
+    /// Whether the in-process worker for `run_id` is still executing.
+    ///
+    /// A terminal durable snapshot can become visible just before the worker's
+    /// final registration guard is released. Shutdown/restart coordination can
+    /// use this boundary to avoid opening a second repository owner while the
+    /// old worker is still finishing its journal commit.
+    pub fn is_run_active(&self, run_id: &str) -> bool {
+        self.active.contains_key(run_id)
+    }
+
     pub async fn cancel(&self, run_id: &str) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         let mut snapshot = self
             .repository
@@ -1638,6 +1648,7 @@ impl RunContext {
                 }
                 let mut last_error = None;
                 for _ in 0..*structured_output_attempts {
+                    self.ensure_agent_usage_budget_available().await?;
                     self.reserve_agent().await?;
                     self.checkpoint_usage("agent_reserved").await?;
                     match self
@@ -1853,6 +1864,26 @@ impl RunContext {
             ));
         }
         None
+    }
+
+    async fn ensure_agent_usage_budget_available(&self) -> Result<(), WorkflowFailure> {
+        let usage = self.ledger.lock().await;
+        if self
+            .root_limits
+            .max_tokens
+            .is_some_and(|limit| usage.tokens >= limit)
+            || self
+                .root_limits
+                .max_cost_micros
+                .is_some_and(|limit| usage.cost_micros >= limit)
+        {
+            return Err(failure(
+                WorkflowFailureCode::BudgetExceeded,
+                "workflow token/cost budget exhausted before agent dispatch",
+                false,
+            ));
+        }
+        Ok(())
     }
 
     async fn checkpoint_usage(&self, name: &str) -> Result<(), WorkflowFailure> {

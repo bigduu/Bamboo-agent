@@ -6,6 +6,11 @@ use bamboo_agent_core::{Role, Session};
 use bamboo_config::paths::path_to_display_string;
 use bamboo_domain::Message;
 use bamboo_skills::selection::normalize_selected_skill_ids;
+use bamboo_skills::{
+    ActiveWorkflow, WorkflowActivationStatus, WorkflowSelection, ACTIVE_WORKFLOW_METADATA_KEY,
+    ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY, WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
+    WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY, WORKFLOW_SELECTION_METADATA_KEY,
+};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -66,16 +71,19 @@ pub async fn prepare_chat_turn(
         input.data_dir.as_deref(),
     );
 
-    // ---- Resolve selected skill IDs ----
-    resolve_selected_skill_ids(
+    // ---- Resolve typed workflow selection / legacy skill IDs ----
+    resolve_workflow_selection(
         &mut session,
+        input.workflow_selection.as_ref(),
         input.selected_skill_ids.as_deref(),
         &input.message,
-    );
-
-    // ---- Clear skill runtime state ----
-    session.metadata.remove(SKILL_RUNTIME_LOADED_KEY);
-    session.metadata.remove(SKILL_RUNTIME_LAST_KEY);
+    )?;
+    if let Some(opted_in) = input.orchestration_opt_in {
+        session.metadata.insert(
+            WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY.to_string(),
+            opted_in.to_string(),
+        );
+    }
 
     // ---- Build enhanced system prompt with profile ----
     let (system_prompt, prompt_profile) = build_enhanced_system_prompt_with_profile(
@@ -251,6 +259,89 @@ pub fn resolve_selected_skill_ids(
     }
 
     session.clear_selected_skill_ids();
+}
+
+pub fn resolve_workflow_selection(
+    session: &mut Session,
+    workflow_selection: Option<&WorkflowSelection>,
+    selected_skill_ids_from_request: Option<&[String]>,
+    message: &str,
+) -> Result<(), ChatError> {
+    if let Some(selection) = workflow_selection {
+        let id = selection.id.trim();
+        if id.is_empty() || selection.revision == 0 || !selection.args.is_object() {
+            return Err(ChatError::InvalidWorkflowSelection(
+                "id must be non-empty, revision must be positive, and args must be an object"
+                    .to_string(),
+            ));
+        }
+        let previous = session
+            .metadata
+            .get(WORKFLOW_SELECTION_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok());
+        let selection_changed = previous.as_ref() != Some(selection);
+        session.metadata.insert(
+            WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(selection).map_err(|_| {
+                ChatError::InvalidWorkflowSelection("selection cannot be serialized".to_string())
+            })?,
+        );
+        persist_selected_skill_ids_metadata(session, Some(&[id.to_string()]));
+        if selection_changed {
+            deactivate_active_workflow(session);
+            clear_skill_runtime_state(session);
+        }
+        return Ok(());
+    }
+
+    if selected_skill_ids_from_request.is_some() {
+        // Legacy explicit selection remains compatible, but can never override
+        // an authoritative typed selection in the same request.
+        session.metadata.remove(WORKFLOW_SELECTION_METADATA_KEY);
+        deactivate_active_workflow(session);
+        resolve_selected_skill_ids(session, selected_skill_ids_from_request, message);
+        clear_skill_runtime_state(session);
+        return Ok(());
+    }
+
+    if let Some(active) = session
+        .metadata
+        .get(ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<ActiveWorkflow>(raw).ok())
+        .filter(|active| active.status == WorkflowActivationStatus::Active)
+    {
+        persist_selected_skill_ids_metadata(session, Some(&[active.id]));
+        return Ok(());
+    }
+
+    // Legacy natural-language hints are parsed only when there is no typed or
+    // durable active workflow. They remain compatibility input, never authority.
+    resolve_selected_skill_ids(session, None, message);
+    Ok(())
+}
+
+fn deactivate_active_workflow(session: &mut Session) {
+    if let Some(active) = session
+        .metadata
+        .get(ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<ActiveWorkflow>(raw).ok())
+        .filter(|active| active.status == WorkflowActivationStatus::Active)
+    {
+        session.metadata.insert(
+            WORKFLOW_ACTIVATION_EVENT_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "type": "workflow.deactivated",
+                "workflow_id": active.id,
+                "revision": active.revision,
+                "deactivated_at": chrono::Utc::now(),
+            })
+            .to_string(),
+        );
+    }
+    session.metadata.remove(ACTIVE_WORKFLOW_METADATA_KEY);
+    session
+        .metadata
+        .remove(ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY);
 }
 
 /// Clear skill runtime state markers from session metadata.
@@ -508,6 +599,8 @@ mod tests {
             enhance_prompt: enhance_prompt.map(ToString::to_string),
             workspace_path: None,
             selected_skill_ids: None,
+            workflow_selection: None,
+            orchestration_opt_in: None,
             copilot_conclusion_with_options_enhancement_enabled: None,
             data_dir: None,
         }
@@ -520,6 +613,84 @@ mod tests {
             .find(|message| matches!(message.role, Role::System))
             .map(|message| message.content.clone())
             .expect("session should have a system message")
+    }
+
+    fn active_workflow(id: &str, revision: u64) -> ActiveWorkflow {
+        ActiveWorkflow {
+            id: id.to_string(),
+            source: bamboo_skills::WorkflowSource::User,
+            revision,
+            kind: bamboo_skills::WorkflowKind::Instruction,
+            args: serde_json::json!({}),
+            invoked_by: bamboo_skills::WorkflowInvokedBy::User,
+            activated_at: chrono::Utc::now(),
+            status: WorkflowActivationStatus::Active,
+            diagnostic: None,
+            context_fingerprint: Some("fingerprint".to_string()),
+            dynamic_context: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn typed_workflow_selection_is_authoritative_over_legacy_ids_and_hint() {
+        let mut session = Session::new("typed-selection", "model");
+        let selection = WorkflowSelection {
+            id: "review".to_string(),
+            source: bamboo_skills::WorkflowSource::User,
+            revision: 7,
+            args: serde_json::json!({"depth": "full"}),
+        };
+        resolve_workflow_selection(
+            &mut session,
+            Some(&selection),
+            Some(&["plan".to_string()]),
+            "use skill plan",
+        )
+        .expect("typed selection");
+        assert_eq!(
+            session.selected_skill_ids(),
+            Some(vec!["review".to_string()])
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(WORKFLOW_SELECTION_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok()),
+            Some(selection)
+        );
+    }
+
+    #[test]
+    fn active_workflow_survives_turn_without_new_selection() {
+        let mut session = Session::new("active-selection", "model");
+        session.metadata.insert(
+            ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            serde_json::to_string(&active_workflow("review", 7)).expect("active json"),
+        );
+        resolve_workflow_selection(&mut session, None, None, "use skill plan")
+            .expect("preserve active");
+        assert_eq!(
+            session.selected_skill_ids(),
+            Some(vec!["review".to_string()])
+        );
+        assert!(session.metadata.contains_key(ACTIVE_WORKFLOW_METADATA_KEY));
+    }
+
+    #[test]
+    fn explicit_empty_legacy_selection_deactivates_active_workflow() {
+        let mut session = Session::new("deactivate-selection", "model");
+        session.metadata.insert(
+            ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            serde_json::to_string(&active_workflow("review", 7)).expect("active json"),
+        );
+        resolve_workflow_selection(&mut session, None, Some(&[]), "plain message")
+            .expect("deactivate");
+        assert!(session.selected_skill_ids().is_none());
+        assert!(!session.metadata.contains_key(ACTIVE_WORKFLOW_METADATA_KEY));
+        assert!(session
+            .metadata
+            .get(WORKFLOW_ACTIVATION_EVENT_METADATA_KEY)
+            .is_some_and(|event| event.contains("workflow.deactivated")));
     }
 
     // Regression: the request's enhance_prompt must land in the upserted system

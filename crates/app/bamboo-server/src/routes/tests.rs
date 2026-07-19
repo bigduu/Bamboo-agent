@@ -93,6 +93,7 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
     let relative_paths = [
         "/commands",
         "/bamboo/workflows",
+        "/sessions/session/workflow-runs",
         "/sessions/session/workflow-runs/example",
         "/bamboo/setup/status",
         "/bamboo/config",
@@ -228,6 +229,7 @@ async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
     let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
     for (method, uri) in [
         ("POST", "/api/v1/sessions/session/workflow-runs"),
+        ("GET", "/api/v1/sessions/session/workflow-runs"),
         ("GET", "/api/v1/sessions/session/workflow-runs/example"),
         ("POST", "/v1/sessions/session/workflow-runs/example/cancel"),
     ] {

@@ -77,6 +77,69 @@ pub(crate) fn build_task_list_context_block(session: &Session) -> Option<Context
     ))
 }
 
+/// Rebuild the exact active instruction workflow from its durable LKG snapshot.
+/// This is a dedicated host context block, never a synthetic user message in
+/// session history and never a catalog/live-filesystem re-resolution.
+pub(crate) fn build_active_workflow_context_block(session: &Session) -> Option<ContextBlock> {
+    let durable = session
+        .metadata
+        .get(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<bamboo_skills::DurableWorkflowActivation>(raw).ok())
+        .filter(|durable| {
+            durable.active.status == bamboo_skills::WorkflowActivationStatus::Active
+        })?;
+    let entry = durable.snapshot.skills.get(&durable.active.id)?;
+    if durable.snapshot.skills.len() != 1
+        || entry.revision != durable.active.revision
+        || entry.catalog_entry.source != durable.active.source
+        || entry.catalog_entry.kind != bamboo_skills::WorkflowKind::Instruction
+    {
+        return None;
+    }
+    let dynamic = durable
+        .active
+        .dynamic_context
+        .iter()
+        .map(|block| {
+            serde_json::json!({
+                "provider_id": block.provider_id,
+                "provenance": block.provenance,
+                "status": block.status,
+                "content": block.content,
+                "diagnostic": block.diagnostic,
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(
+        ContextBlock::new(
+            ContextBlockType::WorkflowRuntime,
+            ContextBlockPriority::Critical,
+            ContextBlockStability::SessionStable,
+            format!("Active Workflow: {}@{}", durable.active.id, durable.active.revision),
+            format!(
+                "workflow_id: {}\nsource: {:?}\nrevision: {}\nargs: {}\ncontext_fingerprint: {}\n\n### Instructions\n{}\n\n### Dynamic Context\n{}",
+                durable.active.id,
+                durable.active.source,
+                durable.active.revision,
+                durable.active.args,
+                durable
+                    .active
+                    .context_fingerprint
+                    .as_deref()
+                    .unwrap_or("unavailable"),
+                entry.definition.prompt,
+                serde_json::to_string(&dynamic).unwrap_or_else(|_| "[]".to_string()),
+            ),
+        )
+        .with_metadata(Some(serde_json::json!({
+            "workflow_id": durable.active.id,
+            "source": durable.active.source,
+            "revision": durable.active.revision,
+            "context_fingerprint": durable.active.context_fingerprint,
+        }))),
+    )
+}
+
 /// Build the per-round session-goal block directly from the active goal.
 ///
 /// Placed by the caller in the volatile tail (alongside task/memory/plan) so the

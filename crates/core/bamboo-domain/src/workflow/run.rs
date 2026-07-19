@@ -31,6 +31,10 @@ pub struct WorkflowDefinitionBundle {
     pub publication_revision: u64,
     pub root_id: String,
     pub root_revision: u64,
+    /// Invocation authority captured from the catalog publication that was
+    /// pinned for this run. Restarts must never consult a newer live policy.
+    #[serde(default = "default_invocation_policy")]
+    pub root_invocation_policy: Value,
     pub definitions: BTreeMap<String, WorkflowRunDefinition>,
 }
 
@@ -50,6 +54,10 @@ impl WorkflowDefinitionBundle {
 
 fn default_object_schema() -> Value {
     serde_json::json!({"type": "object", "additionalProperties": true})
+}
+
+fn default_invocation_policy() -> Value {
+    serde_json::json!({"explicit": true, "automatic": false})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -350,12 +358,17 @@ pub enum WorkflowRunEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StartWorkflowRun {
     pub definition: WorkflowRunDefinition,
+    #[serde(default = "default_empty_object")]
     pub args: Value,
     pub session_id: String,
     #[serde(default)]
     pub workspace_trusted: bool,
     #[serde(default)]
     pub allowed_capabilities: Vec<String>,
+}
+
+fn default_empty_object() -> Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

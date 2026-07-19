@@ -39,7 +39,7 @@ use bamboo_domain::RuntimeSessionPersistence;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config"];
+const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
 
 // ── LockedSessionStore ────────────────────────────────────────────────
 
@@ -300,6 +300,10 @@ impl RuntimeSessionPersistence for LockedSessionStore {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
     }
+
+    async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        self.storage.load_session(session_id).await
+    }
 }
 
 // ── Internal merge helper ─────────────────────────────────────────────
@@ -559,6 +563,46 @@ mod tests {
         // And the in-memory copy was corrected by the merge too.
         assert_eq!(stale_snapshot.title, "User Renamed");
         assert_eq!(stale_snapshot.metadata_version, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_save_runtime_preserves_durable_workflow_run_index_from_stale_runner() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-workflow-run-index";
+
+        let baseline = fresh(session_id);
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale_runner = storage.load_session(session_id).await.unwrap().unwrap();
+
+        store
+            .update_runtime_config(session_id, |session| {
+                session.metadata.insert(
+                    "workflow.run_ids.v1".to_string(),
+                    r#"["http-started-run"]"#.to_string(),
+                );
+            })
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        store.merge_save_runtime(&mut stale_runner).await.unwrap();
+
+        assert_eq!(
+            stale_runner
+                .metadata
+                .get("workflow.run_ids.v1")
+                .map(String::as_str),
+            Some(r#"["http-started-run"]"#)
+        );
+        let durable = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            durable
+                .metadata
+                .get("workflow.run_ids.v1")
+                .map(String::as_str),
+            Some(r#"["http-started-run"]"#)
+        );
     }
 
     // #540: a running loop's `merge_save_runtime` (carrying the run-start bypass

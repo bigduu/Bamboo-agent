@@ -46,9 +46,14 @@ pub(crate) async fn run_agent_loop_with_config(
 ) -> super::Result<()> {
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
     async {
-        let mut state: LoopRunState =
-            initialize_loop_state(session, initial_message.as_str(), &config, tools.as_ref())
-                .await?;
+        let mut state: LoopRunState = initialize_loop_state(
+            session,
+            initial_message.as_str(),
+            &config,
+            tools.as_ref(),
+            &event_tx,
+        )
+        .await?;
 
         let pipeline_result = run_pipeline(
             session,
