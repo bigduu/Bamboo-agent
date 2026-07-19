@@ -1,6 +1,10 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
+use bamboo_skills::runtime_metadata::{
+    LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+};
 use bamboo_tools::exposure::{
     activated_discoverable_tools, canonical_tool_name, discoverable_tool_short_description,
     is_core_tool,
@@ -61,6 +65,30 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
         tool_schemas.retain(|schema| {
             schema.function.name != bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME
         });
+    }
+
+    // One activation chooses one workflow. Once its detailed instructions have
+    // been loaded, stop offering load_skill so the model cannot redundantly
+    // reload the same workflow (or switch to another advertised candidate) on a
+    // later round. Resource reads remain available for the active workflow.
+    let loaded_skill_ids = session
+        .metadata
+        .get(LOADED_SKILL_IDS_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    let selected_skill_ids = session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    let explicit_activation_is_current = session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+        .is_some_and(|source| source == "explicit")
+        && !loaded_skill_ids.is_empty()
+        && loaded_skill_ids == selected_skill_ids;
+    if explicit_activation_is_current {
+        tool_schemas.retain(|schema| schema.function.name != "load_skill");
     }
 
     let activated = activated_discoverable_tools(session);

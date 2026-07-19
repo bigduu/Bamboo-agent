@@ -217,7 +217,16 @@ fn should_prefer_storage(memory_session: &Session, storage_session: &Session) ->
 #[async_trait::async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
-        self.save(session).await
+        // Runtime authorization reads through this same cache. Refresh it even
+        // when durable storage fails so a current activation can never observe
+        // a previous run's skill allowlist. The error is still returned to the
+        // caller and durable state remains unchanged.
+        let result = self.persistence.merge_save_runtime(session).await;
+        self.cache.insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+        result
     }
 
     async fn append_token_usage_record(
@@ -244,6 +253,10 @@ mod tests {
         sessions: Mutex<HashMap<String, Session>>,
     }
 
+    struct FailingSaveStorage {
+        persisted: Mutex<Option<Session>>,
+    }
+
     #[async_trait::async_trait]
     impl Storage for MapStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
@@ -258,6 +271,21 @@ mod tests {
         }
         async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
             Ok(self.sessions.lock().unwrap().remove(session_id).is_some())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FailingSaveStorage {
+        async fn save_session(&self, _session: &Session) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected save failure"))
+        }
+
+        async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.persisted.lock().unwrap().clone())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+            Ok(false)
         }
     }
 
@@ -341,6 +369,58 @@ mod tests {
         assert!(
             merged.pending_question.is_some(),
             "same-age storage carrying a pending question must still be recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_publish_refreshes_cache_even_when_storage_fails() {
+        let id = "runtime-selection";
+        let mut previous = Session::new(id.to_string(), "m");
+        previous.metadata.insert(
+            "skill_runtime_selected_skill_ids".to_string(),
+            "[\"plan\"]".to_string(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(FailingSaveStorage {
+            persisted: Mutex::new(Some(previous.clone())),
+        });
+        let repo = test_repo(storage.clone());
+        cache_put(&repo, &previous);
+
+        let mut current = previous.clone();
+        current.metadata.insert(
+            "skill_runtime_selected_skill_ids".to_string(),
+            "[\"review\"]".to_string(),
+        );
+        current.updated_at = Utc::now();
+
+        let result =
+            bamboo_domain::RuntimeSessionPersistence::save_runtime_session(&repo, &mut current)
+                .await;
+        assert!(result.is_err(), "durable failure must still be surfaced");
+
+        let cached = repo.load(id).await.expect("cached current session");
+        assert_eq!(
+            cached
+                .metadata
+                .get("skill_runtime_selected_skill_ids")
+                .map(String::as_str),
+            Some("[\"review\"]")
+        );
+        let allowlist = bamboo_skills::access_control::extract_skill_allowlist(&cached.metadata)
+            .expect("runtime authorization allowlist");
+        assert!(allowlist.contains("review"));
+        assert!(!allowlist.contains("plan"));
+        let durable = storage
+            .load_session(id)
+            .await
+            .expect("load durable state")
+            .expect("previous durable session");
+        assert_eq!(
+            durable
+                .metadata
+                .get("skill_runtime_selected_skill_ids")
+                .map(String::as_str),
+            Some("[\"plan\"]")
         );
     }
 }

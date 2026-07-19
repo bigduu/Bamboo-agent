@@ -22,6 +22,12 @@ struct StaticToolExecutor {
 }
 
 #[derive(Default)]
+struct RecordingToolExecutor {
+    calls: Mutex<Vec<ToolCall>>,
+    schemas: Vec<ToolSchema>,
+}
+
+#[derive(Default)]
 struct RecordingPersistence {
     sessions: Mutex<Vec<Session>>,
 }
@@ -47,6 +53,33 @@ impl ToolExecutor for StaticToolExecutor {
             success: true,
             result: "ok".to_string(),
             display_preference: None,
+            images: Vec::new(),
+        })
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        self.schemas.clone()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for RecordingToolExecutor {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+    ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+        self.calls
+            .lock()
+            .expect("recording tool lock")
+            .push(call.clone());
+        Ok(ToolResult {
+            success: true,
+            result: serde_json::json!({
+                "skill_id": "review",
+                "instructions": "REPORT_ONLY_ACTIONABLE_FINDINGS"
+            })
+            .to_string(),
+            display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
         })
     }
@@ -113,6 +146,76 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
     assert!(!ids.contains("plan"));
 }
 
+#[tokio::test]
+async fn session_setup_preloads_one_explicit_skill_before_model_execution() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize skills");
+    let persistence = Arc::new(RecordingPersistence::default());
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager),
+        selected_skill_ids: Some(vec!["review".to_string()]),
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
+    let tools = RecordingToolExecutor {
+        calls: Mutex::new(Vec::new()),
+        schemas: vec![schema("load_skill")],
+    };
+    let mut session = Session::new("explicit-review", "model");
+
+    super::prepare_session_for_loop(
+        &mut session,
+        "Review this change",
+        &config,
+        &tools,
+        None,
+        "explicit-review",
+        &crate::runtime::runner::logging::DebugLogger::new(false),
+    )
+    .await;
+
+    let calls = tools.calls.lock().expect("recording tool lock");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "load_skill");
+    assert!(calls[0].function.arguments.contains("review"));
+    assert_eq!(
+        session
+            .metadata
+            .get("skill_runtime_loaded_skill_ids")
+            .map(String::as_str),
+        Some("[\"review\"]")
+    );
+    assert_eq!(
+        session
+            .metadata
+            .get("skill_runtime_last_loaded_skill_id")
+            .map(String::as_str),
+        Some("review")
+    );
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+        .expect("system prompt")
+        .content
+        .as_str();
+    assert!(system_prompt.contains("## Explicit Workflow Activated"));
+    assert!(system_prompt.contains("REPORT_ONLY_ACTIONABLE_FINDINGS"));
+    assert!(!system_prompt.contains("Select EXACTLY ONE skill"));
+
+    let saved = persistence.sessions.lock().expect("recording lock");
+    assert!(saved.iter().any(|saved_session| {
+        saved_session
+            .metadata
+            .get("skill_runtime_loaded_skill_ids")
+            .is_some_and(|ids| ids == "[\"review\"]")
+    }));
+}
+
 #[test]
 fn resolve_available_tool_schemas_uses_executor_when_registry_empty() {
     let config = crate::runtime::config::AgentLoopConfig::default();
@@ -171,6 +274,66 @@ fn resolve_available_tool_schemas_excludes_disabled_tools() {
         .collect();
 
     assert_eq!(names, vec!["z_tool"]);
+}
+
+#[test]
+fn resolve_available_tool_schemas_hides_load_skill_after_activation() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("load_skill"), schema("read_skill_resource")],
+    };
+    let mut session = Session::new("session-loaded-skill", "model");
+    session.metadata.insert(
+        "skill_runtime_loaded_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selected_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selection_source".to_string(),
+        "explicit".to_string(),
+    );
+
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+    let names = resolved
+        .iter()
+        .map(|schema| schema.function.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(!names.contains(&"load_skill"));
+    assert!(names.contains(&"read_skill_resource"));
+}
+
+#[test]
+fn resolve_available_tool_schemas_keeps_load_skill_for_new_automatic_selection() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("load_skill"), schema("read_skill_resource")],
+    };
+    let mut session = Session::new("session-auto-after-loaded-skill", "model");
+    session.metadata.insert(
+        "skill_runtime_loaded_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selected_skill_ids".to_string(),
+        "[\"debug\",\"review\"]".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selection_source".to_string(),
+        "auto".to_string(),
+    );
+
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+    let names = resolved
+        .iter()
+        .map(|schema| schema.function.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"load_skill"));
+    assert!(names.contains(&"read_skill_resource"));
 }
 
 #[test]
