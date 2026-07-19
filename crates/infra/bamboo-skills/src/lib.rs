@@ -149,6 +149,18 @@ fn filter_disabled_skills(
         .collect()
 }
 
+fn invocation_allowed_skill_ids<'a>(
+    catalog: &'a WorkflowCatalogSnapshot,
+    policy: &str,
+) -> HashSet<&'a str> {
+    catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.winner && entry.invocation_policy[policy].as_bool() == Some(true))
+        .map(|entry| entry.id.as_str())
+        .collect()
+}
+
 /// Skill manager instance (convenience wrapper around SkillStore).
 #[derive(Clone)]
 pub struct SkillManager {
@@ -201,14 +213,24 @@ impl SkillManager {
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
     ) -> Vec<SkillDefinition> {
-        let skills = if selected_skill_mode.is_some() {
-            store.list_skills_for_mode(None, selected_skill_mode).await
-        } else {
-            store.list_skills(None, true).await
+        let (skills, catalog) = match store.skills_and_catalog_for_mode(selected_skill_mode).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to resolve skills and workflow policy for mode {:?}: {}",
+                    selected_skill_mode,
+                    error
+                );
+                return Vec::new();
+            }
         };
         let skills = filter_disabled_skills(skills, disabled_skill_ids);
         let Some(selected_skill_ids) = selected_skill_ids else {
-            return skills;
+            let automatic_ids = invocation_allowed_skill_ids(&catalog, "automatic");
+            return skills
+                .into_iter()
+                .filter(|skill| automatic_ids.contains(skill.id.as_str()))
+                .collect();
         };
 
         let selected_set: HashSet<&str> = selected_skill_ids
@@ -217,26 +239,44 @@ impl SkillManager {
             .filter(|id| !id.is_empty())
             .collect();
         if selected_set.is_empty() {
-            return skills;
+            let automatic_ids = invocation_allowed_skill_ids(&catalog, "automatic");
+            return skills
+                .into_iter()
+                .filter(|skill| automatic_ids.contains(skill.id.as_str()))
+                .collect();
+        }
+
+        let explicit_ids = invocation_allowed_skill_ids(&catalog, "explicit");
+        let denied: Vec<&str> = selected_set
+            .iter()
+            .copied()
+            .filter(|selected| !explicit_ids.contains(selected))
+            .collect();
+        if !denied.is_empty() {
+            tracing::warn!(
+                "Some selected skills do not allow explicit invocation and will be ignored: {:?}",
+                denied
+            );
         }
 
         let filtered: Vec<SkillDefinition> = skills
             .into_iter()
-            .filter(|skill| selected_set.contains(skill.id.as_str()))
+            .filter(|skill| {
+                selected_set.contains(skill.id.as_str()) && explicit_ids.contains(skill.id.as_str())
+            })
             .collect();
 
-        if filtered.len() != selected_set.len() {
-            let missing: Vec<&str> = selected_set
-                .iter()
-                .copied()
-                .filter(|selected| !filtered.iter().any(|skill| skill.id == *selected))
-                .collect();
-            if !missing.is_empty() {
-                tracing::warn!(
-                    "Some selected skills were not found on disk and will be ignored: {:?}",
-                    missing
-                );
-            }
+        let missing: Vec<&str> = selected_set
+            .iter()
+            .copied()
+            .filter(|selected| explicit_ids.contains(selected))
+            .filter(|selected| !filtered.iter().any(|skill| skill.id == *selected))
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                "Some selected skills were not found on disk and will be ignored: {:?}",
+                missing
+            );
         }
 
         filtered
@@ -459,11 +499,13 @@ impl Default for SkillManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
+
+    use tokio::fs;
 
     use super::{
         filter_disabled_skills, shortlist_skills_for_context, tokenize_request_hint,
-        SkillDefinition,
+        SkillDefinition, SkillManager, SkillStoreConfig, WorkflowStatus,
     };
 
     fn demo_skill(id: &str, description: &str) -> SkillDefinition {
@@ -512,5 +554,143 @@ mod tests {
         let ids: Vec<&str> = filtered.iter().map(|skill| skill.id.as_str()).collect();
 
         assert_eq!(ids, vec!["pptx"]);
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_honors_builtin_invocation_policy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+
+        let selected = manager
+            .resolve_skills_for_request_with_mode(
+                &BTreeSet::new(),
+                None,
+                None,
+                Some("plan the implementation and review the changes"),
+            )
+            .await;
+        let ids = selected
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(!ids.contains("plan"));
+        assert!(ids.contains("review"));
+
+        let empty_selection = Vec::new();
+        let selected = manager
+            .resolve_skills_for_request_with_mode(
+                &BTreeSet::new(),
+                Some(&empty_selection),
+                None,
+                Some("plan the implementation"),
+            )
+            .await;
+        assert!(!selected.iter().any(|skill| skill.id == "plan"));
+    }
+
+    #[tokio::test]
+    async fn explicit_selection_can_load_manual_only_builtin() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+        let selected_ids = vec!["plan".to_string()];
+
+        let selected = manager
+            .resolve_skills_for_request_with_mode(
+                &BTreeSet::new(),
+                Some(&selected_ids),
+                None,
+                Some("plan the implementation"),
+            )
+            .await;
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|skill| skill.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plan"]
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_keeps_lkg_policy_until_recovery() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = skills_dir.join("steady");
+        fs::create_dir_all(skill_dir.join("agents"))
+            .await
+            .expect("skill directory");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: steady\ndescription: Use for steady tasks.\n---\nRetained instructions.\n",
+        )
+        .await
+        .expect("skill definition");
+        fs::write(
+            skill_dir.join("agents/bamboo.yaml"),
+            "version: '1'\ninvocation_policy:\n  explicit: true\n  automatic: true\n",
+        )
+        .await
+        .expect("skill metadata");
+
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+        let resolve = || async {
+            manager
+                .resolve_skills_for_request_with_mode(
+                    &BTreeSet::new(),
+                    None,
+                    None,
+                    Some("steady task"),
+                )
+                .await
+        };
+        assert!(resolve().await.iter().any(|skill| skill.id == "steady"));
+
+        fs::write(
+            skill_dir.join("agents/bamboo.yaml"),
+            "version: '2'\ninvocation_policy: [\n",
+        )
+        .await
+        .expect("break metadata");
+        assert!(resolve().await.iter().any(|skill| skill.id == "steady"));
+        let invalid = manager
+            .store()
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "steady")
+            .expect("retained catalog entry");
+        assert_eq!(invalid.status, WorkflowStatus::Invalid);
+
+        fs::write(
+            skill_dir.join("agents/bamboo.yaml"),
+            "version: '2'\ninvocation_policy:\n  explicit: true\n  automatic: false\n",
+        )
+        .await
+        .expect("recover metadata");
+        assert!(!resolve().await.iter().any(|skill| skill.id == "steady"));
+        let recovered = manager
+            .store()
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "steady")
+            .expect("recovered catalog entry");
+        assert_eq!(recovered.status, WorkflowStatus::Valid);
     }
 }

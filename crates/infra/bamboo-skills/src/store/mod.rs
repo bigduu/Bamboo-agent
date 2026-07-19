@@ -639,6 +639,33 @@ impl SkillStore {
         self.catalog.read().await.clone()
     }
 
+    /// Return prompt-visible skills and their catalog metadata from one validated snapshot.
+    pub(crate) async fn skills_and_catalog_for_mode(
+        &self,
+        mode_override: Option<&str>,
+    ) -> SkillResult<(Vec<SkillDefinition>, WorkflowCatalogSnapshot)> {
+        let mode_store = self.skill_store_for_mode(mode_override).await?;
+        let store = mode_store.as_deref().unwrap_or(self);
+        if let Err(error) = store.reload().await {
+            tracing::warn!(
+                "Failed to reload skills before policy-aware selection; using the last validated snapshot: {}",
+                error
+            );
+        }
+
+        let _snapshot_guard = store.snapshot_publish_lock.read().await;
+        let mut skills = store
+            .skills
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        skills.sort_by_key(|skill| skill.name.clone());
+        let catalog = store.catalog.read().await.clone();
+        Ok((skills, catalog))
+    }
+
     pub fn subscribe_workflow_catalog(
         &self,
     ) -> tokio::sync::broadcast::Receiver<WorkflowCatalogEvent> {
@@ -1517,7 +1544,9 @@ mod tests {
     use tokio::fs;
 
     use super::SkillStore;
-    use crate::store::builtin::{load_builtin_skill_bundles, BuiltinSkillBundle};
+    use crate::store::builtin::{
+        load_builtin_skill_bundles, BuiltinSkillBundle, WORKFLOW_BUILTINS,
+    };
     use crate::store::storage::write_skill_file;
     use crate::store::storage::SkillDirectorySource;
     use crate::types::SkillStoreConfig;
@@ -1613,6 +1642,33 @@ Use this skill for testing.
 
         let skills = store.list_skills(None, false).await;
         assert!(skills.iter().any(|skill| skill.id == "skill-creator"));
+    }
+
+    #[tokio::test]
+    async fn workflow_builtins_are_versioned_instruction_catalog_entries() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("skills"),
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+
+        let catalog = store.workflow_catalog_snapshot().await;
+        for (id, automatic) in WORKFLOW_BUILTINS {
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("missing {id} catalog entry"));
+            assert_eq!(entry.source, WorkflowSource::Builtin);
+            assert_eq!(entry.kind, crate::WorkflowKind::Instruction);
+            assert_eq!(entry.status, WorkflowStatus::Valid);
+            assert!(entry.revision > 0);
+            assert_eq!(entry.version, "1");
+            assert_eq!(entry.invocation_policy["explicit"], true);
+            assert_eq!(entry.invocation_policy["automatic"], automatic);
+            assert_eq!(entry.argument_schema["type"], "object");
+        }
     }
 
     #[tokio::test]

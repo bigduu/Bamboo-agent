@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simplify"
+  short_description: "Reduce code complexity without behavior drift"
+  default_prompt: "Use $simplify to find and safely remove unnecessary complexity in this code."

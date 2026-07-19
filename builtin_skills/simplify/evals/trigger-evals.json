@@ -1,0 +1,12 @@
+[
+  {"query":"Simplify this request router without changing endpoints, error envelopes, or tests. Prefer deleting indirection over adding helpers.","should_trigger":true},
+  {"query":"Refactor the duplicated retry branches into one clear path and prove behavior is unchanged.","should_trigger":true},
+  {"query":"This module has four wrappers around a HashMap. Reduce the abstraction while preserving the public API.","should_trigger":true},
+  {"query":"Clean up the state machine so the transition rules are easier to follow, with regression tests for equivalence.","should_trigger":true},
+  {"query":"Can we remove unnecessary generic parameters and make this code more direct without a feature change?","should_trigger":true},
+  {"query":"Add batching support to the storage layer.","should_trigger":false},
+  {"query":"The parser panics on empty input; diagnose and fix the root cause.","should_trigger":false},
+  {"query":"Review this PR for security and correctness issues.","should_trigger":false},
+  {"query":"Reformat every Rust file and rename variables to shorter names.","should_trigger":false},
+  {"query":"Plan a future rewrite of the service in Go.","should_trigger":false}
+]

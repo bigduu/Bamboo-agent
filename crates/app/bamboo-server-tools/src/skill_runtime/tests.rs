@@ -2,6 +2,7 @@ use super::{LoadSkillTool, ReadSkillResourceTool};
 use bamboo_skills::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
 use bamboo_skills::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
+    SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -143,6 +144,82 @@ Use this demo skill."#,
 }
 
 #[tokio::test]
+async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
+    let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+    let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: temp_dir.path().join("skills"),
+        project_dir: None,
+        active_mode: None,
+    }));
+    skill_manager
+        .initialize()
+        .await
+        .expect("skill manager should initialize");
+
+    let config = Arc::new(RwLock::new(Config::default()));
+    let session_id = "session-runtime-allowlist";
+    let session = Session::new(session_id, "model");
+    let sessions = test_session_cache(session_id, &session);
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage
+        .save_session(&session)
+        .await
+        .expect("session should be saved");
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
+    let mut automatic_run = session.clone();
+    automatic_run.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["review"]"#.to_string(),
+    );
+    repo.save(&mut automatic_run)
+        .await
+        .expect("publish automatic runtime selection");
+    let tool = LoadSkillTool::new(skill_manager, config, repo.clone());
+    let context = ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id: "tool-call-runtime-allowlist",
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+
+    tool.invoke(
+        serde_json::json!({ "skill_id": "review" }),
+        context.to_tool_ctx(),
+    )
+    .await
+    .expect("advertised review skill should load");
+
+    let error = tool
+        .invoke(
+            serde_json::json!({ "skill_id": "plan" }),
+            context.to_tool_ctx(),
+        )
+        .await
+        .expect_err("manual-only plan must not load in an automatic review session");
+    assert!(error.to_string().contains("not selected for this request"));
+
+    let mut explicit_run = repo.load(session_id).await.expect("cached session");
+    explicit_run.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["plan"]"#.to_string(),
+    );
+    repo.save(&mut explicit_run)
+        .await
+        .expect("publish explicit runtime selection");
+    tool.invoke(
+        serde_json::json!({ "skill_id": "plan" }),
+        context.to_tool_ctx(),
+    )
+    .await
+    .expect("explicitly advertised plan skill should load on the next run");
+}
+
+#[tokio::test]
 async fn load_skill_persists_last_loaded_skill_summary() {
     let temp_dir = tempfile::tempdir().expect("tempdir should be created");
     let skill_dir = temp_dir.path().join("skills").join("demo-skill");
@@ -169,7 +246,11 @@ Use this demo skill."#,
 
     let config = Arc::new(RwLock::new(Config::default()));
     let session_id = "session-2";
-    let session = Session::new(session_id, "model");
+    let mut session = Session::new(session_id, "model");
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["demo-skill"]"#.to_string(),
+    );
     let sessions = test_session_cache(session_id, &session);
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     storage
@@ -248,7 +329,11 @@ Use this demo skill."#,
 
     let config = Arc::new(RwLock::new(Config::default()));
     let session_id = "session-3";
-    let session = Session::new(session_id, "model");
+    let mut session = Session::new(session_id, "model");
+    session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["demo-skill"]"#.to_string(),
+    );
     let sessions = test_session_cache(session_id, &session);
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     storage
@@ -485,8 +570,16 @@ async fn session_workspace_catalog_selection_and_runtime_roots_are_isolated() {
 
     let mut session_one = Session::new("workspace-session-one", "model");
     session_one.set_workspace_path_meta(workspace_one.to_string_lossy());
+    session_one.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["shared-workflow"]"#.to_string(),
+    );
     let mut session_two = Session::new("workspace-session-two", "model");
     session_two.set_workspace_path_meta(workspace_two.to_string_lossy());
+    session_two.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["shared-workflow"]"#.to_string(),
+    );
     let sessions = Arc::new(dashmap::DashMap::new());
     for session in [&session_one, &session_two] {
         sessions.insert(

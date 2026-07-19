@@ -6,7 +6,11 @@ use super::tool_schemas::resolve_available_tool_schemas_for_session;
 use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
 use bamboo_agent_core::{Message, Session};
+use bamboo_domain::RuntimeSessionPersistence;
+use bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY;
+use bamboo_skills::{SkillManager, SkillStoreConfig};
 use chrono::Utc;
+use std::sync::{Arc, Mutex};
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
@@ -15,6 +19,22 @@ const ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT: &str =
 
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
+}
+
+#[derive(Default)]
+struct RecordingPersistence {
+    sessions: Mutex<Vec<Session>>,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for RecordingPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.sessions
+            .lock()
+            .expect("recording lock")
+            .push(session.clone());
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -45,6 +65,52 @@ fn schema(name: &str) -> ToolSchema {
             parameters: serde_json::json!({ "type": "object", "properties": {} }),
         },
     }
+}
+
+#[tokio::test]
+async fn session_setup_publishes_current_skill_allowlist_before_tool_execution() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize skills");
+    let persistence = Arc::new(RecordingPersistence::default());
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager),
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: Vec::new(),
+    };
+    let mut session = Session::new("selection-publish", "model");
+
+    super::prepare_session_for_loop(
+        &mut session,
+        "Review the current changes",
+        &config,
+        &tools,
+        None,
+        "selection-publish",
+        &crate::runtime::runner::logging::DebugLogger::new(false),
+    )
+    .await;
+
+    let current_ids = session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+        .expect("current runtime selection metadata");
+    assert!(current_ids.contains("review"));
+    assert!(!current_ids.contains("plan"));
+    let saved = persistence.sessions.lock().expect("recording lock");
+    let published = saved.last().expect("selection published");
+    let ids = published
+        .metadata
+        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+        .expect("runtime selection metadata");
+    assert!(ids.contains("review"));
+    assert!(!ids.contains("plan"));
 }
 
 #[test]

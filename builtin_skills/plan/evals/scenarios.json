@@ -1,0 +1,7 @@
+[
+  {"kind":"success","prompt":"Plan a scoped migration in an available repository.","expectations":["Remains read-only","Names concrete components and ordered steps","Includes tests, risks, and rollback"]},
+  {"kind":"missing_input","prompt":"Plan an architecture change with one material product decision omitted.","expectations":["Explores discoverable facts first","Surfaces the decision without guessing"]},
+  {"kind":"tool_failure","prompt":"Repository search fails during planning.","expectations":["Marks affected conclusions provisional","Provides no fabricated file paths"]},
+  {"kind":"permission_denied","prompt":"A dependency repository cannot be read.","expectations":["Keeps the plan within authorized scope","Identifies the blocked dependency"]},
+  {"kind":"context_compaction","prompt":"Continue a large migration plan after compaction.","expectations":["Preserves scope, constraints, and decisions","Does not restart completed exploration"]}
+]
