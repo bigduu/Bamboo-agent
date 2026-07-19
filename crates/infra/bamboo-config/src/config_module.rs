@@ -197,6 +197,34 @@ mod tests {
     }
 
     #[test]
+    fn invalid_provider_credential_refs_from_external_edits_are_rejected() {
+        for invalid_ref in ["../credentials".to_string(), "x".repeat(161)] {
+            let dir = TempDir::new().unwrap();
+            write_json(
+                &dir.path().join("config.json"),
+                json!({
+                    "providers": {"openai": {"model": "root-lkg"}}
+                }),
+            );
+            write_json(
+                &dir.path().join("providers.json"),
+                json!({
+                    "openai": {
+                        "model": "must-not-load",
+                        "credential_ref": invalid_ref
+                    }
+                }),
+            );
+
+            let config = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+            assert_eq!(
+                config.providers.openai.as_ref().unwrap().model.as_deref(),
+                Some("root-lkg")
+            );
+        }
+    }
+
+    #[test]
     fn sidecars_override_legacy_inline_sections() {
         let dir = TempDir::new().unwrap();
         write_json(

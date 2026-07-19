@@ -111,6 +111,28 @@ pub fn migrate_provider_mcp_credentials(
     migrate_inner(data_dir.as_ref(), None)
 }
 
+/// Fail-closed guard for every production reader of provider/MCP transaction
+/// members. A malformed manifest is treated like a pending one: callers must
+/// retain their existing runtime rather than guessing which files committed.
+pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> ConfigStoreResult<()> {
+    let path = data_dir.as_ref().join(MANIFEST_FILE);
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(());
+    };
+    let manifest: MigrationManifest = serde_json::from_slice(&bytes).map_err(|_| {
+        ConfigStoreError::Validation("provider/MCP credential migration is pending".to_string())
+    })?;
+    validate_manifest(&manifest).map_err(|_| {
+        ConfigStoreError::Validation("provider/MCP credential migration is pending".to_string())
+    })?;
+    if manifest.state == MigrationState::Pending {
+        return Err(ConfigStoreError::Validation(
+            "provider/MCP credential migration is pending".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn migrate_with_fault(
     data_dir: &Path,
@@ -161,8 +183,8 @@ fn migrate_inner(
     let stage_dir_name = format!("{STAGE_PREFIX}{transaction_id}");
     let stage_dir = data_dir.join(&stage_dir_name);
     let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{transaction_id}"));
-    std::fs::create_dir(&stage_dir)?;
-    std::fs::create_dir(&backup_dir)?;
+    create_private_dir(&stage_dir)?;
+    create_private_dir(&backup_dir)?;
     sync_dir(data_dir)?;
 
     let mut staged = Vec::new();
@@ -190,6 +212,8 @@ fn migrate_inner(
             &mut staged,
         )?;
     }
+    restrict_directory_files_to_owner(&stage_dir)?;
+    restrict_directory_files_to_owner(&backup_dir)?;
     sync_dir(&stage_dir)?;
     sync_dir(&backup_dir)?;
 
@@ -634,9 +658,22 @@ fn stage_file(
         .sensitive(sensitive)
         .write_bytes_without_backup(candidate)?;
     if let Some(original) = original {
+        if let Some(data_dir) = backup_dir.parent() {
+            restrict_file_to_owner(&data_dir.join(name))?;
+        }
+        let plaintext = std::str::from_utf8(original).map_err(|_| {
+            ConfigStoreError::Validation("migration backup source is not valid UTF-8".to_string())
+        })?;
+        let encrypted = crate::encryption::encrypt(plaintext).map_err(|_| {
+            ConfigStoreError::Validation("migration backup encryption failed".to_string())
+        })?;
+        let protected_backup = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "ciphertext": encrypted,
+        }))?;
         AtomicFileStore::new(backup_dir.join(name))
-            .sensitive(sensitive)
-            .write_bytes_without_backup(original)?;
+            .sensitive(true)
+            .write_bytes_without_backup(&protected_backup)?;
     }
     staged.push(StagedFile {
         name: name.to_string(),
@@ -664,6 +701,8 @@ fn recover_committed(
     let mut manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
     if manifest.state == MigrationState::Complete {
+        cleanup_transaction_dirs(data_dir, &manifest)?;
+        remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
         return Ok(None);
     }
     install_pending(
@@ -817,11 +856,22 @@ fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> Confi
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &manifest)
+}
+
+fn cleanup_transaction_dirs(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     if stage_dir.exists() {
         std::fs::remove_dir_all(stage_dir)?;
-        sync_dir(data_dir)?;
     }
+    let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{}", manifest.transaction_id));
+    if backup_dir.exists() {
+        std::fs::remove_dir_all(backup_dir)?;
+    }
+    sync_dir(data_dir)?;
     Ok(())
 }
 
@@ -835,6 +885,10 @@ fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
     let stage_dir = validated_stage_dir(data_dir, &journal.stage_dir)?;
     if stage_dir.exists() {
         std::fs::remove_dir_all(stage_dir)?;
+    }
+    let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{}", journal.transaction_id));
+    if backup_dir.exists() {
+        std::fs::remove_dir_all(backup_dir)?;
     }
     remove_file_if_exists(&journal_path)?;
     sync_dir(data_dir)
@@ -914,6 +968,43 @@ fn remove_file_if_exists(path: &Path) -> ConfigStoreResult<()> {
     }
 }
 
+fn create_private_dir(path: &Path) -> ConfigStoreResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(path)?;
+    Ok(())
+}
+
+fn restrict_file_to_owner(path: &Path) -> ConfigStoreResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+fn restrict_directory_files_to_owner(path: &Path) -> ConfigStoreResult<()> {
+    #[cfg(unix)]
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            restrict_file_to_owner(&entry.path())?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -964,6 +1055,7 @@ mod tests {
         for secret in [
             "sk-provider-plain",
             "Bearer mcp-header-secret",
+            "stdio-plain-secret",
             "stdio-cipher-secret",
         ] {
             assert!(!providers.contains(secret));
@@ -996,6 +1088,42 @@ mod tests {
                 .expose(),
             "stdio-cipher-secret"
         );
+        assert_no_legacy_plaintext(dir);
+        assert!(!std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(BACKUP_PREFIX)));
+    }
+
+    fn assert_no_legacy_plaintext(dir: &Path) {
+        fn visit(path: &Path, needles: &[&str]) {
+            for entry in std::fs::read_dir(path).unwrap().filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, needles);
+                } else if let Ok(content) = std::fs::read_to_string(&path) {
+                    for needle in needles {
+                        assert!(
+                            !content.contains(needle),
+                            "legacy plaintext remained in {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        visit(
+            dir,
+            &[
+                "sk-provider-plain",
+                "Bearer mcp-header-secret",
+                "stdio-plain-secret",
+                "stdio-cipher-secret",
+            ],
+        );
     }
 
     #[test]
@@ -1006,13 +1134,70 @@ mod tests {
         let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
         assert!(outcome.migrated_credentials >= 3);
         assert_migrated(dir.path());
-        assert!(std::fs::read_dir(dir.path())
+        assert!(!std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| entry
                 .file_name()
                 .to_string_lossy()
                 .starts_with(BACKUP_PREFIX)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_transaction_backups_are_encrypted_owner_only_and_cleaned_on_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _key = crate::encryption::set_test_encryption_key([0x69; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        install_fixture(dir.path());
+        assert!(migrate_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(BACKUP_PREFIX)
+            })
+            .expect("pending transaction has a backup directory")
+            .path();
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for entry in std::fs::read_dir(&backup).unwrap().filter_map(Result::ok) {
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let content = std::fs::read_to_string(entry.path()).unwrap();
+            if !content.is_empty() {
+                assert!(content.contains("ciphertext"));
+            }
+            for plaintext in [
+                "sk-provider-plain",
+                "Bearer mcp-header-secret",
+                "stdio-plain-secret",
+            ] {
+                assert!(!content.contains(plaintext));
+            }
+        }
+        for source in [PROVIDERS_FILE, MCP_FILE] {
+            assert_eq!(
+                std::fs::metadata(dir.path().join(source))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_migrated(dir.path());
     }
 
     #[test]
@@ -1076,6 +1261,53 @@ mod tests {
             "user-newer"
         );
         assert_migrated_except_provider_value(dir.path());
+    }
+
+    #[test]
+    fn unversioned_provider_and_mcp_rewrites_advance_migrated_secret_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x6a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        install_fixture(dir.path());
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            br#"{"openai":{"api_key":"sk-provider-from-old-binary","model":"old-binary"}}"#,
+        )
+        .unwrap();
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        let provider_ref = credential_ref("provider", "openai", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&provider_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-provider-from-old-binary"
+        );
+
+        let mut old_mcp: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/config_migration/mcp-legacy.json"
+        ))
+        .unwrap();
+        old_mcp["data"]["stdio unsafe/name"]["env"]["PUBLIC TOKEN"] =
+            Value::String("mcp-from-old-binary".to_string());
+        old_mcp["data"]["stdio unsafe/name"]["env_encrypted"] = serde_json::json!({});
+        std::fs::write(
+            dir.path().join(MCP_FILE),
+            serde_json::to_vec_pretty(&old_mcp).unwrap(),
+        )
+        .unwrap();
+        migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        let mcp_ref = credential_ref("mcp", "stdio unsafe/name", "env_PUBLIC TOKEN").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&mcp_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "mcp-from-old-binary"
+        );
     }
 
     #[test]

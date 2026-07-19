@@ -29,6 +29,7 @@ impl std::ops::DerefMut for ProviderConfigsModule {
 impl ProviderConfigsModule {
     pub(crate) fn load_sync(&mut self, data_dir: &Path) -> Result<bool> {
         crate::migrate_provider_mcp_credentials(data_dir)?;
+        crate::ensure_provider_mcp_migration_ready(data_dir)?;
         let store = AtomicJsonStore::new(data_dir.join(FILE_NAME), 1);
         if let Some(stored) = store.load_validated_allowing_unversioned(|_| Ok(()))? {
             // A provider module loaded through ConfigRegistry must be just as
@@ -46,6 +47,7 @@ impl ProviderConfigsModule {
     }
     pub(crate) fn save_sync(&self, data_dir: &Path) -> Result<()> {
         crate::migrate_provider_mcp_credentials(data_dir)?;
+        crate::ensure_provider_mcp_migration_ready(data_dir)?;
         // The sidecar is metadata-only after credential-ref migration. Runtime
         // plaintext is skipped by serde and legacy ciphertext is explicitly
         // cleared. A new non-environment secret must be written through the

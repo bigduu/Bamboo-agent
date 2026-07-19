@@ -2674,9 +2674,13 @@ impl Config {
         // Finish any manifest-committed provider/MCP credential extraction
         // before reading even one member of the transaction. An uncommitted
         // stage is discarded and safely replanned.
-        if let Err(error) = crate::migrate_provider_mcp_credentials(&data_dir) {
-            tracing::warn!(error = %error, "provider/MCP credential migration unavailable");
-        }
+        let provider_mcp_ready = crate::migrate_provider_mcp_credentials(&data_dir)
+            .and_then(|_| crate::ensure_provider_mcp_migration_ready(&data_dir))
+            .map_err(|error| {
+                tracing::warn!(error = %error, "provider/MCP credential migration unavailable");
+                error
+            })
+            .is_ok();
 
         let config_path = data_dir.join("config.json");
 
@@ -2745,13 +2749,15 @@ impl Config {
                 "Failed to load subagents.json; using legacy config.json subagents: {error}"
             ),
         }
-        let mut providers_module = config.providers.clone();
-        match providers_module.load_sync(&data_dir) {
-            Ok(true) => config.providers = providers_module,
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                "Failed to load providers.json; using legacy config.json providers: {error}"
-            ),
+        if provider_mcp_ready {
+            let mut providers_module = config.providers.clone();
+            match providers_module.load_sync(&data_dir) {
+                Ok(true) => config.providers = providers_module,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    "Failed to load providers.json; using legacy config.json providers: {error}"
+                ),
+            }
         }
 
         // Decrypt encrypted proxy auth into in-memory plaintext form.
@@ -2762,11 +2768,13 @@ impl Config {
         config.hydrate_provider_instance_api_keys_from_encrypted();
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
-        if let Err(error) = config.hydrate_provider_credentials_from_store(&data_dir) {
-            tracing::warn!(error = %error, "provider credential hydration unavailable");
-        }
-        if let Err(error) = config.hydrate_mcp_credentials_from_store(&data_dir) {
-            tracing::warn!(error = %error, "MCP credential hydration unavailable");
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_provider_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "provider credential hydration unavailable");
+            }
+            if let Err(error) = config.hydrate_mcp_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "MCP credential hydration unavailable");
+            }
         }
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
@@ -3700,6 +3708,7 @@ impl Config {
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.refresh_encrypted_secrets()?;
+        to_save.sanitize_mcp_credential_refs_for_disk();
         to_save.sanitize_env_vars_for_disk();
         to_save.sanitize_cluster_fabric_for_disk();
         to_save.assign_connect_platform_ids();
@@ -3749,9 +3758,22 @@ impl Config {
             // (parseable) config.json as the freshest .bak. #135.
             rotate_backups(&path, BAK_GENERATIONS);
             let backup = backup_path_for(&path, 0);
-            if let Err(e) = std::fs::copy(&path, &backup) {
+            let backup_result = std::fs::read(&path).and_then(|bytes| {
+                let mut value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                if sanitize_ref_backed_mcp_json(&mut value) {
+                    let sanitized = serde_json::to_vec_pretty(&value).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    write_atomic(&backup, &sanitized)
+                } else {
+                    std::fs::copy(&path, &backup).map(|_| ())
+                }
+            });
+            if let Err(e) = backup_result {
                 tracing::warn!("Failed to back up config.json before save: {}", e);
             }
+            scrub_ref_backed_mcp_from_config_backups(&path);
         }
 
         write_atomic(&path, content.as_bytes())
@@ -3760,6 +3782,118 @@ impl Config {
         save_connect_config(&to_save.connect, &data_dir)?;
 
         Ok(())
+    }
+}
+
+/// Remove credential-ref-backed MCP values from a raw root document without
+/// otherwise normalizing its compatibility shape. This is used for rotated
+/// root backups as well as the typed disk DTO so a pre-fix root cannot keep a
+/// duplicate secret alive for several more saves.
+fn sanitize_ref_backed_mcp_json(root: &mut Value) -> bool {
+    let Some(object) = root.as_object_mut() else {
+        return false;
+    };
+    let Some(mcp) = (if object.contains_key("mcpServers") {
+        object.get_mut("mcpServers")
+    } else {
+        object.get_mut("mcp")
+    }) else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(servers) = mcp.get_mut("servers").and_then(Value::as_array_mut) {
+        for server in servers {
+            if let Some(object) = server.as_object_mut() {
+                if let Some(transport) = object.get_mut("transport").and_then(Value::as_object_mut)
+                {
+                    changed |= sanitize_ref_backed_mcp_transport(transport);
+                }
+            }
+        }
+    } else if let Some(servers) = mcp.as_object_mut() {
+        for server in servers.values_mut() {
+            if let Some(object) = server.as_object_mut() {
+                changed |= sanitize_ref_backed_mcp_transport(object);
+                if let Some(transport) = object.get_mut("transport").and_then(Value::as_object_mut)
+                {
+                    changed |= sanitize_ref_backed_mcp_transport(transport);
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn sanitize_ref_backed_mcp_transport(object: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    let env_names = object
+        .get("env_credential_refs")
+        .and_then(Value::as_object)
+        .map(|refs| refs.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for name in env_names {
+        for field in ["env", "env_encrypted"] {
+            if object
+                .get_mut(field)
+                .and_then(Value::as_object_mut)
+                .and_then(|values| values.remove(&name))
+                .is_some()
+            {
+                changed = true;
+            }
+        }
+    }
+    let header_names = object
+        .get("header_credential_refs")
+        .and_then(Value::as_object)
+        .map(|refs| refs.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for name in header_names {
+        for field in ["headers", "headers_encrypted"] {
+            if object
+                .get_mut(field)
+                .and_then(Value::as_object_mut)
+                .and_then(|values| values.remove(&name))
+                .is_some()
+            {
+                changed = true;
+            }
+        }
+    }
+    if let Some(headers) = object.get_mut("headers").and_then(Value::as_array_mut) {
+        for header in headers {
+            let Some(header) = header.as_object_mut() else {
+                continue;
+            };
+            if header.get("credential_ref").is_some_and(Value::is_string) {
+                changed |= header.remove("value").is_some();
+                changed |= header.remove("value_encrypted").is_some();
+            }
+        }
+    }
+    changed
+}
+
+fn scrub_ref_backed_mcp_from_config_backups(path: &std::path::Path) {
+    for generation in 0..BAK_GENERATIONS {
+        let backup = backup_path_for(path, generation);
+        let Ok(bytes) = std::fs::read(&backup) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if sanitize_ref_backed_mcp_json(&mut value) {
+            if let Ok(sanitized) = serde_json::to_vec_pretty(&value) {
+                if let Err(error) = write_atomic(&backup, &sanitized) {
+                    tracing::warn!(
+                        "Failed to scrub MCP credentials from {:?}: {}",
+                        backup,
+                        error
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -7172,6 +7306,122 @@ mod tests {
                 assert_eq!(sse.headers[0].value, "Bearer token123");
             }
             _ => panic!("Expected SSE transport"),
+        }
+    }
+
+    #[test]
+    fn migrated_hydrated_mcp_save_never_duplicates_referenced_secrets_to_root_or_backups() {
+        let _lock = env_lock_acquire();
+        let _key = crate::encryption::set_test_encryption_key([0x6b; 32]);
+        let temp_home = TempHome::new();
+        let env_plaintext = "mcp-root-env-plaintext-597";
+        let header_plaintext = "Bearer mcp-root-header-plaintext-597";
+        let legacy_ciphertext = crate::encryption::encrypt(env_plaintext).unwrap();
+        std::fs::write(
+            temp_home.path.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "features": {"provider_model_ref": true},
+                "mcpServers": {
+                    "stdio-root": {
+                        "command": "unused-disabled-command",
+                        "env": {"TOKEN": env_plaintext},
+                        "env_encrypted": {"TOKEN": legacy_ciphertext.clone()},
+                        "env_credential_refs": {
+                            "TOKEN": "mcp.stdio-root.env_TOKEN"
+                        }
+                    },
+                    "http-root": {
+                        "url": "https://example.test/mcp",
+                        "transport_kind": "streamable_http",
+                        "headers": {"Authorization": header_plaintext},
+                        "header_credential_refs": {
+                            "Authorization": "mcp.http-root.header_Authorization"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_home.path.join("mcp.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 7,
+                "data": {
+                    "stdio-root": {
+                        "command": "unused-disabled-command",
+                        "enabled": false,
+                        "env_encrypted": {"TOKEN": legacy_ciphertext},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    },
+                    "http-root": {
+                        "url": "https://example.test/mcp",
+                        "transport_kind": "streamable_http",
+                        "enabled": false,
+                        "headers": {"Authorization": header_plaintext},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        crate::migrate_provider_mcp_credentials(&temp_home.path).unwrap();
+        let stored = crate::AtomicJsonStore::<bamboo_domain::mcp_config::McpConfig>::new(
+            temp_home.path.join("mcp.json"),
+            1,
+        )
+        .load()
+        .unwrap()
+        .unwrap();
+        let mut config = Config::from_data_dir_without_env(Some(temp_home.path.clone()));
+        config.mcp = stored.data;
+        config
+            .hydrate_mcp_credentials_from_store(&temp_home.path)
+            .unwrap();
+
+        let public = serde_json::to_value(&config.mcp).unwrap();
+        let rendered_public = public.to_string();
+        assert!(rendered_public.contains(env_plaintext));
+        assert!(rendered_public.contains(header_plaintext));
+        let compatible: bamboo_domain::mcp_config::McpConfig =
+            serde_json::from_value(public).unwrap();
+        assert_eq!(compatible.servers.len(), 2);
+
+        config.features.provider_model_ref = !config.features.provider_model_ref;
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+        config.features.provider_model_ref = !config.features.provider_model_ref;
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+
+        for entry in std::fs::read_dir(&temp_home.path)
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "credentials.json" || entry.path().is_dir() {
+                continue;
+            }
+            if name == "config.json"
+                || name == "mcp.json"
+                || name.contains(".bak")
+                || name.starts_with("config-credential-migration")
+            {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                let content = String::from_utf8_lossy(&bytes);
+                assert!(!content.contains(env_plaintext), "secret leaked to {name}");
+                assert!(
+                    !content.contains(header_plaintext),
+                    "secret leaked to {name}"
+                );
+                assert!(
+                    !content.contains(&legacy_ciphertext),
+                    "legacy ciphertext leaked to {name}"
+                );
+            }
         }
     }
 

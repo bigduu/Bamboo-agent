@@ -1,11 +1,12 @@
 use super::*;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bamboo_config::{
-    AtomicJsonStore, ConfigDirectoryWatcher, ConfigStoreError, ProviderConfigs, SectionSourceKind,
-    SectionStatus,
+    ensure_provider_mcp_migration_ready, AtomicJsonStore, ConfigDirectoryWatcher, ConfigStoreError,
+    ProviderConfigs, SectionSourceKind, SectionStatus,
 };
 use bamboo_mcp::{McpConfig, McpServerManager, TransportConfig};
 use chrono::{DateTime, Utc};
@@ -373,6 +374,18 @@ fn publish_mcp_backup_lkg(
 }
 
 fn initial_provider_health(store: &AtomicJsonStore<ProviderConfigs>) -> ConfigLiveHealth {
+    if ensure_provider_mcp_migration_ready(store.path().parent().unwrap_or_else(|| Path::new(".")))
+        .is_err()
+    {
+        return ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: store.path().to_path_buf(),
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Degraded,
+            last_error: Some("provider/MCP credential migration is pending".to_string()),
+        };
+    }
     match store.load_validated_allowing_unversioned(|_| Ok(())) {
         Ok(Some(stored)) => ConfigLiveHealth {
             revision: stored.revision,
@@ -412,6 +425,18 @@ fn initial_provider_health(store: &AtomicJsonStore<ProviderConfigs>) -> ConfigLi
 }
 
 fn initial_mcp_health(store: &AtomicJsonStore<McpConfig>) -> ConfigLiveHealth {
+    if ensure_provider_mcp_migration_ready(store.path().parent().unwrap_or_else(|| Path::new(".")))
+        .is_err()
+    {
+        return ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: store.path().to_path_buf(),
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Degraded,
+            last_error: Some("provider/MCP credential migration is pending".to_string()),
+        };
+    }
     match store.load_validated(validate_mcp_config) {
         Ok(Some(stored)) => ConfigLiveHealth {
             // The document is only a parsed candidate until runtime staging
@@ -468,6 +493,12 @@ async fn load_and_prepare_provider_candidate(
     current_revision: u64,
     candidate_config: Config,
 ) -> Result<ProviderCandidate, ProviderCandidateError> {
+    ensure_provider_mcp_migration_ready(store.path().parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|_| {
+            ProviderCandidateError::invalid(
+                "provider/MCP credential migration is pending; retaining last-known-good runtime",
+            )
+        })?;
     // Editors commonly implement save as delete/rename/create. Retry a missing
     // watched file briefly instead of treating the transient gap as a reset.
     for _ in 0..3 {
@@ -554,6 +585,12 @@ async fn load_and_validate_mcp_candidate(
     mut candidate_config: Config,
     allow_startup_backup: bool,
 ) -> Result<McpCandidate, ProviderCandidateError> {
+    ensure_provider_mcp_migration_ready(store.path().parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|_| {
+            ProviderCandidateError::invalid(
+                "provider/MCP credential migration is pending; retaining last-known-good runtime",
+            )
+        })?;
     for _ in 0..3 {
         if store.path().exists() {
             break;
@@ -857,6 +894,8 @@ impl AppState {
         mut providers: ProviderConfigs,
     ) -> Result<u64, ConfigSectionMutationError> {
         let _io = self.config_io_lock.lock().await;
+        ensure_provider_mcp_migration_ready(&self.app_data_dir)
+            .map_err(ConfigSectionMutationError::Store)?;
         let current = self.config.read().await.clone();
         retain_provider_credentials(current.providers(), &mut providers);
         let mut candidate = current;
@@ -918,9 +957,21 @@ impl AppState {
         mut candidate: McpConfig,
     ) -> Result<u64, ConfigSectionMutationError> {
         let _io = self.config_io_lock.lock().await;
+        ensure_provider_mcp_migration_ready(&self.app_data_dir)
+            .map_err(ConfigSectionMutationError::Store)?;
         let store = AtomicJsonStore::new(self.app_data_dir.join("mcp.json"), 1);
         retain_mcp_credentials(&self.config.read().await.mcp, &mut candidate);
         validate_mcp_config(&candidate).map_err(ConfigSectionMutationError::Invalid)?;
+        let mut hydration_config = Config::default();
+        hydration_config.mcp = candidate;
+        hydration_config
+            .hydrate_mcp_credentials_from_store(&self.app_data_dir)
+            .map_err(|_| {
+                ConfigSectionMutationError::Invalid(
+                    "referenced MCP credential is unavailable".to_string(),
+                )
+            })?;
+        let candidate = hydration_config.mcp.clone();
         let mut revision = None;
         let mut store_error = None;
         let durable_candidate = credential_ref_mcp_document(&candidate)?;
@@ -1004,7 +1055,13 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
             if let (Some(current), Some(candidate)) = (&current.$field, &mut candidate.$field) {
                 candidate.api_key = current.api_key.clone();
                 candidate.api_key_encrypted = current.api_key_encrypted.clone();
-                candidate.credential_ref = current.credential_ref.clone();
+                if candidate.credential_ref.is_none() {
+                    candidate.credential_ref = current.credential_ref.clone();
+                }
+                if candidate.credential_ref != current.credential_ref {
+                    candidate.api_key.clear();
+                    candidate.api_key_encrypted = None;
+                }
                 candidate.api_key_from_env = current.api_key_from_env;
                 candidate.request_overrides = current.request_overrides.clone();
                 candidate.extra = current.extra.clone();
@@ -1017,7 +1074,13 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
     if let (Some(current), Some(candidate)) = (&current.bodhi, &mut candidate.bodhi) {
         candidate.api_key = current.api_key.clone();
         candidate.api_key_encrypted = current.api_key_encrypted.clone();
-        candidate.credential_ref = current.credential_ref.clone();
+        if candidate.credential_ref.is_none() {
+            candidate.credential_ref = current.credential_ref.clone();
+        }
+        if candidate.credential_ref != current.credential_ref {
+            candidate.api_key.clear();
+            candidate.api_key_encrypted = None;
+        }
         candidate.extra = current.extra.clone();
     }
     if let (Some(current), Some(candidate)) = (&current.copilot, &mut candidate.copilot) {
@@ -1037,7 +1100,10 @@ fn retain_mcp_credentials(current: &McpConfig, candidate: &mut McpConfig) {
         };
         match (&current_server.transport, &mut candidate_server.transport) {
             (TransportConfig::Stdio(current), TransportConfig::Stdio(candidate)) => {
-                if candidate.env.is_empty() && candidate.env_encrypted.is_empty() {
+                if candidate.env.is_empty()
+                    && candidate.env_encrypted.is_empty()
+                    && candidate.env_credential_refs.is_empty()
+                {
                     candidate.env = current.env.clone();
                     candidate.env_encrypted = current.env_encrypted.clone();
                     candidate.env_credential_refs = current.env_credential_refs.clone();
@@ -1555,6 +1621,47 @@ mod live_reload_tests {
         .unwrap()
     }
 
+    fn install_unrecoverable_pending_provider_migration(dir: &Path) {
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            dir.join("config.json"),
+            br#"{"providers":{"openai":{"model":"root-lkg"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("providers.json"),
+            br#"{"schema_version":1,"revision":2,"data":{"openai":{"model":"partial-must-not-load","credential_ref":"provider.openai.api_key"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config-credential-migration.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "transaction_id": transaction_id.clone(),
+                "stage_dir": format!(".config-credential-stage-v1-{transaction_id}"),
+                "state": "pending",
+                "files": [
+                    {
+                        "name": "credentials.json",
+                        "staged_name": "credentials.json",
+                        "sha256": "0".repeat(64),
+                        "sensitive": true
+                    },
+                    {
+                        "name": "providers.json",
+                        "staged_name": "providers.json",
+                        "sha256": "1".repeat(64),
+                        "original_sha256": "2".repeat(64),
+                        "migration_generation": 2,
+                        "sensitive": false
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     async fn wait_for_mcp_health(
         state: &AppState,
         status: SectionStatus,
@@ -1626,6 +1733,56 @@ mod live_reload_tests {
         let healthy = initial_provider_health(&store);
         assert_eq!(healthy.status, SectionStatus::Healthy);
         assert_eq!(healthy.source_kind, SectionSourceKind::File);
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_pending_manifest_never_publishes_partial_provider_state() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6c; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        install_unrecoverable_pending_provider_migration(dir.path());
+
+        let loaded = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            loaded.providers().openai.as_ref().unwrap().model.as_deref(),
+            Some("root-lkg")
+        );
+        let store = AtomicJsonStore::new(dir.path().join("providers.json"), 1);
+        let health = initial_provider_health(&store);
+        assert_eq!(health.status, SectionStatus::Degraded);
+        assert!(health
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("migration is pending"));
+        let error = match load_and_prepare_provider_candidate(&store, 0, loaded).await {
+            Ok(_) => panic!("pending migration must reject provider candidate"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("retaining last-known-good runtime"));
+        assert!(!error.message.contains("partial-must-not-load"));
+
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("root-lkg")
+        );
+        assert_eq!(
+            state
+                .config_live_health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .status,
+            SectionStatus::Degraded
+        );
     }
 
     #[async_trait::async_trait]
@@ -1757,6 +1914,212 @@ mod live_reload_tests {
                 .message
                 .contains(dir.path().to_string_lossy().as_ref()));
         }
+    }
+
+    #[tokio::test]
+    async fn typed_provider_put_switches_refs_and_rejects_missing_ref_without_mutation() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6d; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let ref_a = bamboo_config::credential_ref("provider", "openai-a", "api_key").unwrap();
+        let ref_b = bamboo_config::credential_ref("provider", "openai-b", "api_key").unwrap();
+        let missing = bamboo_config::credential_ref("provider", "missing", "api_key").unwrap();
+        state
+            .credential_store
+            .replace(
+                ref_a.clone(),
+                "provider-secret-a",
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        state
+            .credential_store
+            .replace(
+                ref_b.clone(),
+                "provider-secret-b",
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.provider = "openai".to_string();
+            *config.providers_mut() = ProviderConfigs {
+                openai: Some(bamboo_config::OpenAIConfig {
+                    api_key: "provider-secret-a".to_string(),
+                    credential_ref: Some(ref_a),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+        }
+
+        let revision = state
+            .put_provider_section(
+                0,
+                ProviderConfigs {
+                    openai: Some(bamboo_config::OpenAIConfig {
+                        credential_ref: Some(ref_b.clone()),
+                        model: Some("switched".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision, 1);
+        let runtime = state.config.read().await;
+        let openai = runtime.providers().openai.as_ref().unwrap();
+        assert_eq!(openai.credential_ref.as_ref(), Some(&ref_b));
+        assert_eq!(openai.api_key, "provider-secret-b");
+        drop(runtime);
+        let disk_before = std::fs::read(dir.path().join("providers.json")).unwrap();
+
+        assert!(state
+            .put_provider_section(
+                1,
+                ProviderConfigs {
+                    openai: Some(bamboo_config::OpenAIConfig {
+                        credential_ref: Some(missing),
+                        model: Some("must-not-publish".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("providers.json")).unwrap(),
+            disk_before
+        );
+        let runtime = state.config.read().await;
+        let openai = runtime.providers().openai.as_ref().unwrap();
+        assert_eq!(openai.credential_ref.as_ref(), Some(&ref_b));
+        assert_eq!(openai.api_key, "provider-secret-b");
+    }
+
+    #[tokio::test]
+    async fn typed_mcp_put_switches_stdio_and_header_refs_atomically() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6e; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let refs = [
+            bamboo_config::credential_ref("mcp", "stdio-a", "env_TOKEN").unwrap(),
+            bamboo_config::credential_ref("mcp", "header-a", "header_Authorization").unwrap(),
+            bamboo_config::credential_ref("mcp", "stdio-b", "env_TOKEN").unwrap(),
+            bamboo_config::credential_ref("mcp", "header-b", "header_Authorization").unwrap(),
+        ];
+        for (revision, (reference, value)) in refs
+            .iter()
+            .zip(["env-a", "header-a", "env-b", "header-b"])
+            .enumerate()
+        {
+            state
+                .credential_store
+                .replace(
+                    reference.clone(),
+                    value,
+                    bamboo_config::CredentialSource::User,
+                    revision as u64,
+                )
+                .unwrap();
+        }
+        let make_config = |env_ref: &bamboo_config::CredentialRef,
+                           header_ref: &bamboo_config::CredentialRef| {
+            McpConfig {
+                version: 1,
+                servers: vec![
+                    McpServerConfig {
+                        id: "switch-stdio".to_string(),
+                        name: None,
+                        enabled: false,
+                        transport: TransportConfig::Stdio(StdioConfig {
+                            command: "unused-disabled-command".to_string(),
+                            args: vec![],
+                            cwd: None,
+                            env: std::collections::HashMap::new(),
+                            env_encrypted: std::collections::HashMap::new(),
+                            env_credential_refs: std::collections::HashMap::from([(
+                                "TOKEN".to_string(),
+                                env_ref.as_str().to_string(),
+                            )]),
+                            startup_timeout_ms: 100,
+                        }),
+                        request_timeout_ms: 100,
+                        healthcheck_interval_ms: 100,
+                        reconnect: ReconnectConfig::default(),
+                        allowed_tools: vec![],
+                        denied_tools: vec![],
+                    },
+                    McpServerConfig {
+                        id: "switch-header".to_string(),
+                        name: None,
+                        enabled: false,
+                        transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
+                            url: "https://example.test/sse".to_string(),
+                            headers: vec![bamboo_mcp::HeaderConfig {
+                                name: "Authorization".to_string(),
+                                value: String::new(),
+                                value_encrypted: None,
+                                credential_ref: Some(header_ref.as_str().to_string()),
+                            }],
+                            connect_timeout_ms: 100,
+                        }),
+                        request_timeout_ms: 100,
+                        healthcheck_interval_ms: 100,
+                        reconnect: ReconnectConfig::default(),
+                        allowed_tools: vec![],
+                        denied_tools: vec![],
+                    },
+                ],
+            }
+        };
+        let mut current = make_config(&refs[0], &refs[1]);
+        if let TransportConfig::Stdio(stdio) = &mut current.servers[0].transport {
+            stdio.env.insert("TOKEN".to_string(), "env-a".to_string());
+        }
+        if let TransportConfig::Sse(sse) = &mut current.servers[1].transport {
+            sse.headers[0].value = "header-a".to_string();
+        }
+        state.config.write().await.mcp = current;
+
+        assert_eq!(
+            state
+                .put_mcp_section(0, make_config(&refs[2], &refs[3]))
+                .await
+                .unwrap(),
+            1
+        );
+        let runtime = state.config.read().await;
+        let TransportConfig::Stdio(stdio) = &runtime.mcp.servers[0].transport else {
+            panic!("stdio transport")
+        };
+        assert_eq!(stdio.env["TOKEN"], "env-b");
+        let TransportConfig::Sse(sse) = &runtime.mcp.servers[1].transport else {
+            panic!("sse transport")
+        };
+        assert_eq!(sse.headers[0].value, "header-b");
+        drop(runtime);
+        let disk_before = std::fs::read(dir.path().join("mcp.json")).unwrap();
+        let missing_env = bamboo_config::credential_ref("mcp", "missing", "env_TOKEN").unwrap();
+        let missing_header =
+            bamboo_config::credential_ref("mcp", "missing", "header_Authorization").unwrap();
+        assert!(state
+            .put_mcp_section(1, make_config(&missing_env, &missing_header))
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("mcp.json")).unwrap(),
+            disk_before
+        );
+        let runtime = state.config.read().await;
+        let TransportConfig::Stdio(stdio) = &runtime.mcp.servers[0].transport else {
+            panic!("stdio transport")
+        };
+        assert_eq!(stdio.env["TOKEN"], "env-b");
     }
 
     #[tokio::test]

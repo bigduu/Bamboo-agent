@@ -467,6 +467,44 @@ impl Config {
         Ok(())
     }
 
+    /// Project credential-ref-backed MCP runtime values to the root disk DTO.
+    /// Public serialization remains compatibility-oriented, but config.json
+    /// must never duplicate either hydrated plaintext or legacy ciphertext
+    /// once the isolated credential store is authoritative.
+    pub fn sanitize_mcp_credential_refs_for_disk(&mut self) {
+        for server in &mut self.mcp.servers {
+            match &mut server.transport {
+                bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
+                    for name in stdio
+                        .env_credential_refs
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                    {
+                        stdio.env.remove(&name);
+                        stdio.env_encrypted.remove(&name);
+                    }
+                }
+                bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
+                    for header in &mut config.headers {
+                        if header.credential_ref.is_some() {
+                            header.value.clear();
+                            header.value_encrypted = None;
+                        }
+                    }
+                }
+                bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {
+                    for header in &mut config.headers {
+                        if header.credential_ref.is_some() {
+                            header.value.clear();
+                            header.value_encrypted = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Env vars encryption ────────────────────────────────────────────
 
     /// Decrypt secret env vars into in-memory plaintext after loading config.

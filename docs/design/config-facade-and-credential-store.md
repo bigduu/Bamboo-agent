@@ -134,8 +134,9 @@ non-serializable, redacted-debug wrapper.
 
 Migration must be idempotent and manifest-gated:
 
-1. acquire the migration/advisory lock and copy parseable legacy inputs to a
-   timestamped migration backup;
+1. acquire the migration/advisory lock and encrypt parseable legacy inputs into
+   an owner-only, transaction-scoped backup (directory `0700`, files `0600` on
+   Unix); delete both stage and backup after completion;
 2. parse legacy root, broker and current sidecars as raw JSON so flattened and
    unknown fields remain attached to their owning section (unclassified fields go
    to the core section's `extra` map);
@@ -156,6 +157,15 @@ from the ordinary sidecars. Unknown section/envelope fields remain attached to t
 raw JSON candidate. A concurrent editor/API write is compared under the section
 file lock and rebased with a higher migration generation instead of overwritten.
 User-written credentials always outrank migration replay.
+
+An older binary may later rewrite an unversioned sidecar. Migration compares the
+resolved legacy value with an existing migrated credential: equal values are a
+no-op, while a different value advances the stored migration generation. This
+keeps old committed-stage replay from rolling the credential back while still
+accepting genuinely newer legacy input. Pending or malformed manifests are a
+fail-closed state: provider/MCP loaders, startup health, watchers and typed writes
+retain their current snapshot until recovery finishes; they never read a partial
+transaction member.
 
 This is intentionally not the full legacy-root migration. Provider instances in
 `config.json`, broker/env/notification/cluster secrets, and the remaining section
@@ -200,3 +210,10 @@ metadata-only sidecars. Runtime construction hydrates references from
 `CredentialStore`; a missing or corrupt referenced credential rejects the
 candidate with a redacted degraded/invalid transition and retains the
 last-known-good runtime.
+
+Omitted or empty reference metadata preserves an existing binding (clearing is a
+separate credential operation); an explicit replacement reference must parse and
+resolve before runtime staging or durable commit. Root `config.json` uses a
+disk-only MCP projection that removes both hydrated plaintext and legacy
+ciphertext for ref-backed env/header fields. Public compatibility serialization
+continues to round-trip the hydrated MCP shape.

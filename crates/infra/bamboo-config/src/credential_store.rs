@@ -19,9 +19,19 @@ use crate::config_store::{
 const CREDENTIAL_SCHEMA_VERSION: u32 = 1;
 const ENCRYPTION_KEY_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct CredentialRef(String);
+
+impl<'de> Deserialize<'de> for CredentialRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl CredentialRef {
     pub fn parse(value: impl Into<String>) -> ConfigStoreResult<Self> {
@@ -304,18 +314,31 @@ impl CredentialStore {
             ));
         }
         let mut added = 0;
-        for (credential_ref, secret, migration_generation) in secrets {
-            if document.entries.get(&credential_ref).is_some_and(|entry| {
-                entry.source != CredentialSource::Migrated
-                    || entry.migration_generation.unwrap_or(0) >= migration_generation
-            }) {
-                continue;
-            }
+        for (credential_ref, secret, input_generation) in secrets {
             if secret.trim().is_empty() || crate::patch::is_masked_api_key(&secret) {
                 return Err(ConfigStoreError::Validation(
                     "legacy credential value is invalid".to_string(),
                 ));
             }
+            // An old binary can rewrite an already-migrated sidecar in the
+            // unversioned shape. Its nominal generation is one again, so the
+            // secret value itself decides whether this is a no-op or a newer
+            // migration. User-managed records remain authoritative.
+            let migration_generation = match document.entries.get(&credential_ref) {
+                Some(entry) if entry.source != CredentialSource::Migrated => continue,
+                Some(entry) => {
+                    let existing = crate::encryption::decrypt(&entry.ciphertext).map_err(|_| {
+                        ConfigStoreError::Validation(
+                            "existing migrated credential is unavailable".to_string(),
+                        )
+                    })?;
+                    if existing == secret {
+                        continue;
+                    }
+                    input_generation.max(entry.migration_generation.unwrap_or(0).saturating_add(1))
+                }
+                None => input_generation,
+            };
             let ciphertext = crate::encryption::encrypt(&secret).map_err(|_| {
                 ConfigStoreError::Validation("credential encryption failed".to_string())
             })?;
@@ -549,6 +572,23 @@ mod tests {
         assert!(CredentialRef::parse("provider.openai.api_key").is_ok());
         assert!(CredentialRef::parse("../credentials").is_err());
         assert!(CredentialRef::parse("x".repeat(161)).is_err());
+        assert!(serde_json::from_str::<CredentialRef>(r#""../credentials""#).is_err());
+        assert!(
+            serde_json::from_value::<CredentialRef>(serde_json::json!("x".repeat(161))).is_err()
+        );
+        assert!(
+            serde_json::from_value::<crate::OpenAIConfig>(serde_json::json!({
+                "credential_ref": "../credentials"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<crate::ProviderInstanceConfig>(serde_json::json!({
+                "provider_type": "openai",
+                "credential_ref": "x".repeat(161)
+            }))
+            .is_err()
+        );
     }
 
     #[test]

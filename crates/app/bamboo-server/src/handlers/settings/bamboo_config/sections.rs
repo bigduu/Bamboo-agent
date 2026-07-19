@@ -837,6 +837,54 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn provider_put_rejects_invalid_credential_refs_without_mutating_lkg() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state.config.write().await.providers_mut().openai = Some(OpenAIConfig {
+            model: Some("lkg-model".to_string()),
+            ..Default::default()
+        });
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/providers", web::put().to(put_provider_section)),
+        )
+        .await;
+
+        for invalid_ref in ["../credentials".to_string(), "x".repeat(161)] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri("/providers")
+                    .set_json(json!({
+                        "expected_revision": 0,
+                        "data": {"openai": {
+                            "model": "must-not-publish",
+                            "credential_ref": invalid_ref
+                        }}
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        }
+        assert!(!dir.path().join("providers.json").exists());
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("lkg-model")
+        );
+    }
+
+    #[actix_web::test]
     async fn mcp_put_preserves_secret_stages_runtime_and_retains_lkg_on_failure() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x52; 32]);
         let dir = tempfile::tempdir().unwrap();
