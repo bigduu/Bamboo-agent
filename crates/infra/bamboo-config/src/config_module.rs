@@ -108,21 +108,9 @@ pub(crate) fn load_sidecar<T: DeserializeOwned>(path: &Path) -> Result<Option<T>
 }
 
 pub(crate) fn save_sidecar<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value)?;
-    // Retain one last-known-good generation. Validate the current document
-    // against the module's schema rather than merely checking that it is JSON:
-    // a syntactically valid but type-invalid document must not replace a usable
-    // backup.
-    if path.exists() {
-        let current = std::fs::read(path)?;
-        if serde_json::from_slice::<T>(&current).is_ok() {
-            crate::config::write_atomic(&path.with_extension("json.bak"), &current)?;
-        }
-    }
-    crate::config::write_atomic(path, &bytes)?;
+    crate::config_store::AtomicFileStore::new(path)
+        .backup_generations(1)
+        .write_json(value)?;
     Ok(())
 }
 
@@ -134,18 +122,9 @@ pub(crate) fn save_sidecar_with_sanitized_backup<T: Serialize + DeserializeOwned
     path: &Path,
     value: &T,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value)?;
-    if path.exists() {
-        let current = std::fs::read(path)?;
-        if let Ok(previous) = serde_json::from_slice::<T>(&current) {
-            let sanitized = serde_json::to_vec_pretty(&previous)?;
-            crate::config::write_atomic(&path.with_extension("json.bak"), &sanitized)?;
-        }
-    }
-    crate::config::write_atomic(path, &bytes)?;
+    crate::config_store::AtomicFileStore::new(path)
+        .backup_generations(1)
+        .write_json(value)?;
     Ok(())
 }
 

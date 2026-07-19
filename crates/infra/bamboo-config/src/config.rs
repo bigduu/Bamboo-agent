@@ -61,7 +61,6 @@ use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
@@ -4074,47 +4073,12 @@ fn rotate_backups(config_path: &std::path::Path, generations: usize) {
 }
 
 pub(crate) fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return std::fs::write(path, content);
-    };
-
-    std::fs::create_dir_all(parent)?;
-
-    // Write to a temp file in the same directory then rename to ensure atomic replace.
-    // (Rename is atomic on Unix when source/dest are on the same filesystem.)
-    //
-    // The temp name must be unique PER CALL, not just per-process (issue
-    // #486): it used to be derived from `process_id()` alone, which is
-    // IDENTICAL across every thread of the same process. Two `write_atomic`
-    // calls racing on the same directory (observed: two `#[test]` fns in
-    // this file's suite, run concurrently by the default multi-threaded
-    // test harness) therefore computed the exact same `tmp_path`. Whichever
-    // caller's `File::create` ran second truncated the first caller's
-    // in-flight temp file out from under it; whichever caller's `rename`
-    // then lost the race failed with ENOENT (its temp file had already been
-    // renamed away by the other caller) — reproducing
-    // `save_rotates_backup_generations`'s exact CI failure: "Failed to
-    // write config file ... No such file or directory (os error 2)". A
-    // monotonic per-process counter alongside the PID makes every call's
-    // temp file distinct, regardless of how many callers target the same
-    // directory concurrently.
-    static NEXT_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config.json");
-    let tmp_name = format!(".{}.tmp.{}.{}", file_name, std::process::id(), unique);
-    let tmp_path = parent.join(tmp_name);
-
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    crate::config_store::AtomicFileStore::new(path)
+        .write_bytes_without_backup(content)
+        .map_err(|error| match error {
+            crate::config_store::ConfigStoreError::Io(error) => error,
+            other => std::io::Error::other(other),
+        })
 }
 
 #[cfg(test)]
