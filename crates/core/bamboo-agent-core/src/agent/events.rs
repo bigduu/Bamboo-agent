@@ -648,6 +648,18 @@ pub enum AgentEvent {
         scope: String,
     },
 
+    /// A configuration section published a new last-known-good snapshot.
+    #[serde(rename = "config.changed")]
+    ConfigChanged { section: String, revision: u64 },
+
+    /// A configuration edit was rejected while the prior runtime stayed live.
+    #[serde(rename = "config.invalid")]
+    ConfigInvalid { section: String, revision: u64 },
+
+    /// A previously invalid configuration section became healthy again.
+    #[serde(rename = "config.recovered")]
+    ConfigRecovered { section: String, revision: u64 },
+
     /// A user-facing notification derived from agent activity by the backend
     /// notification policy. Clients render this (e.g. an OS desktop notification)
     /// after applying their own presence checks (window focus). The decision of
@@ -768,6 +780,9 @@ impl AgentEvent {
                 | AgentEvent::Error { .. }
                 | AgentEvent::WorkflowChanged { .. }
                 | AgentEvent::WorkflowInvalid { .. }
+                | AgentEvent::ConfigChanged { .. }
+                | AgentEvent::ConfigInvalid { .. }
+                | AgentEvent::ConfigRecovered { .. }
                 | AgentEvent::WorkflowRecovered { .. }
         )
     }

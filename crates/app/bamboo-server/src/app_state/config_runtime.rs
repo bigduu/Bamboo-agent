@@ -1,5 +1,236 @@
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use bamboo_config::{ConfigDirectoryWatcher, ProviderConfigs, SectionSourceKind, SectionStatus};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+
+/// Health metadata for the server-owned effective/provider configuration view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigLiveHealth {
+    pub revision: u64,
+    pub loaded_at: DateTime<Utc>,
+    pub source_path: PathBuf,
+    pub source_kind: SectionSourceKind,
+    pub status: SectionStatus,
+    pub last_error: Option<String>,
+}
+
+/// Owns the blocking filesystem watcher and async runtime-apply task.
+pub struct ConfigWatcherRuntime {
+    stop: Arc<AtomicBool>,
+    watcher_task: Option<std::thread::JoinHandle<()>>,
+    apply_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ConfigWatcherRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn start(
+        data_dir: PathBuf,
+        config: Arc<RwLock<Config>>,
+        config_io_lock: Arc<tokio::sync::Mutex<()>>,
+        provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+        provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
+        account_sink: Arc<bamboo_engine::events::AccountEventSink>,
+    ) -> (Self, Arc<std::sync::RwLock<ConfigLiveHealth>>) {
+        let providers_exists = data_dir.join("providers.json").exists();
+        let health = Arc::new(std::sync::RwLock::new(ConfigLiveHealth {
+            revision: 0,
+            loaded_at: Utc::now(),
+            source_path: data_dir.join("providers.json"),
+            source_kind: if providers_exists {
+                SectionSourceKind::File
+            } else {
+                SectionSourceKind::Default
+            },
+            status: if providers_exists {
+                SectionStatus::Healthy
+            } else {
+                SectionStatus::Missing
+            },
+            last_error: None,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = match ConfigDirectoryWatcher::watch(&data_dir, Duration::from_millis(120)) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!(error = %error, "live configuration watcher could not start");
+                {
+                    let mut value = health
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    value.status = SectionStatus::Degraded;
+                    value.last_error = Some("configuration watcher unavailable".to_string());
+                }
+                return (
+                    Self {
+                        stop,
+                        watcher_task: None,
+                        apply_task: None,
+                    },
+                    health,
+                );
+            }
+        };
+
+        let (changes_tx, mut changes_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(32);
+        let worker_stop = stop.clone();
+        let watcher_task = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match watcher.recv_timeout(Duration::from_millis(250)) {
+                    Ok(paths) => {
+                        if changes_tx.blocking_send(paths).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        let apply_health = health.clone();
+        let apply_task = tokio::spawn(async move {
+            while let Some(paths) = changes_rx.recv().await {
+                // This integration stage deliberately owns only the already
+                // extracted provider sidecar. Watching config.json here would
+                // publish unrelated MCP/notification/etc. changes without
+                // applying their side effects, creating a split runtime.
+                let watched = paths.iter().any(|path| {
+                    path.file_name().and_then(|name| name.to_str()) == Some("providers.json")
+                });
+                if !watched {
+                    continue;
+                }
+
+                // Serialize candidate construction and publication with config
+                // writers. Otherwise a slow provider build could later publish
+                // a clone taken before an unrelated API update and clobber it.
+                let _io = config_io_lock.lock().await;
+                let current_config = config.read().await.clone();
+                let result = load_and_prepare_provider_candidate(&data_dir, current_config).await;
+                match result {
+                    Ok((candidate_config, candidate_registry, candidate_provider)) => {
+                        let mut live_config = config.write().await;
+                        let mut live_provider = provider.write().await;
+                        let recovered = apply_health
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .status
+                            != SectionStatus::Healthy;
+                        candidate_config.publish_env_vars();
+                        *live_config = candidate_config;
+                        provider_registry.replace_with(candidate_registry);
+                        *live_provider = candidate_provider;
+                        drop(live_provider);
+                        drop(live_config);
+
+                        let revision =
+                            update_live_health(&apply_health, SectionStatus::Healthy, None, true);
+                        let event = if recovered {
+                            AgentEvent::ConfigRecovered {
+                                section: "providers".to_string(),
+                                revision,
+                            }
+                        } else {
+                            AgentEvent::ConfigChanged {
+                                section: "providers".to_string(),
+                                revision,
+                            }
+                        };
+                        account_sink.record(None, &event);
+                    }
+                    Err(error) => {
+                        let revision = update_live_health(
+                            &apply_health,
+                            SectionStatus::Degraded,
+                            Some(error),
+                            false,
+                        );
+                        account_sink.record(
+                            None,
+                            &AgentEvent::ConfigInvalid {
+                                section: "providers".to_string(),
+                                revision,
+                            },
+                        );
+                    }
+                }
+            }
+        });
+
+        (
+            Self {
+                stop,
+                watcher_task: Some(watcher_task),
+                apply_task: Some(apply_task),
+            },
+            health,
+        )
+    }
+}
+
+impl Drop for ConfigWatcherRuntime {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(task) = self.apply_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.watcher_task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+async fn load_and_prepare_provider_candidate(
+    data_dir: &PathBuf,
+    mut candidate_config: Config,
+) -> Result<(Config, bamboo_llm::ProviderRegistry, Arc<dyn LLMProvider>), String> {
+    // Editors commonly implement save as delete/rename/create. Retry a missing
+    // watched file briefly instead of treating the transient gap as a reset.
+    for _ in 0..3 {
+        if data_dir.join("providers.json").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let providers_path = data_dir.join("providers.json");
+    let bytes = std::fs::read(&providers_path)
+        .map_err(|_| "provider section is missing or unreadable".to_string())?;
+    let providers = serde_json::from_slice::<ProviderConfigs>(&bytes)
+        .map_err(|_| "provider section is invalid".to_string())?;
+    *candidate_config.providers_mut() = providers;
+    candidate_config.hydrate_provider_api_keys_from_encrypted();
+    let candidate_registry =
+        bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.clone())
+            .await
+            .map_err(|_| "provider runtime initialization failed".to_string())?;
+    let candidate_provider = candidate_registry
+        .get_default()
+        .ok_or_else(|| "default provider runtime initialization failed".to_string())?;
+    Ok((candidate_config, candidate_registry, candidate_provider))
+}
+
+fn update_live_health(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    status: SectionStatus,
+    last_error: Option<String>,
+    advance_revision: bool,
+) -> u64 {
+    let mut health = health
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if advance_revision {
+        health.revision = health.revision.saturating_add(1);
+    }
+    health.loaded_at = Utc::now();
+    health.status = status;
+    health.last_error = last_error;
+    health.revision
+}
+
 impl AppState {
     /// Reload the provider based on current configuration
     ///
@@ -34,12 +265,9 @@ impl AppState {
     /// ```
     pub async fn reload_provider(&self) -> Result<(), bamboo_llm::LLMError> {
         let config = self.config.read().await.clone();
-
-        self.provider_registry
-            .reload_from_config(&config, self.app_data_dir.clone())
-            .await?;
-
-        let default_provider_name = self.provider_registry.default_provider_name();
+        let candidate_registry =
+            bamboo_llm::ProviderRegistry::from_config(&config, self.app_data_dir.clone()).await?;
+        let default_provider_name = candidate_registry.default_provider_name();
         tracing::info!(
             default_provider = %default_provider_name,
             legacy_provider = %config.provider,
@@ -47,7 +275,7 @@ impl AppState {
             "Reloading provider runtime from current config"
         );
 
-        let new_provider = self.provider_registry.get_default().unwrap_or_else(|| {
+        let new_provider = candidate_registry.get_default().ok_or_else(|| {
             let message = if config.has_provider_instances() {
                 format!(
                     "Default provider instance '{}' is not available or failed to initialize",
@@ -59,10 +287,11 @@ impl AppState {
                     config.provider
                 )
             };
-            Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
-        });
+            bamboo_llm::LLMError::Auth(message)
+        })?;
 
         let mut provider = self.provider.write().await;
+        self.provider_registry.replace_with(candidate_registry);
         *provider = new_provider;
 
         tracing::info!(
@@ -357,6 +586,143 @@ fn reject_if_recovery_pending(cfg: &Config) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod live_reload_tests {
+    use super::*;
+    use bamboo_agent_core::{Message, ToolSchema};
+    use bamboo_llm::{LLMError, LLMStream};
+
+    struct WorkingProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for WorkingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api("working-provider-marker".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_keeps_existing_provider_registry_and_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let working: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        state
+            .provider_registry
+            .insert("working".to_string(), working.clone());
+        state.provider_registry.set_default("working".to_string());
+        *state.provider.write().await = working.clone();
+        state.config.write().await.provider = "openai".to_string();
+
+        assert!(state.reload_provider().await.is_err());
+        assert_eq!(state.provider_registry.default_provider_name(), "working");
+        assert!(Arc::ptr_eq(
+            &state.provider_registry.get_default().unwrap(),
+            &working
+        ));
+        let live = state.provider.read().await;
+        assert!(Arc::ptr_eq(&*live, &working));
+    }
+
+    #[tokio::test]
+    async fn provider_watcher_retains_lkg_on_invalid_and_recovers_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let working: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        state
+            .provider_registry
+            .insert("working".to_string(), working.clone());
+        state.provider_registry.set_default("working".to_string());
+        *state.provider.write().await = working.clone();
+        state.config.write().await.provider = "openai".to_string();
+        let mut feed = state.account_sink.subscribe();
+        let providers_path = dir.path().join("providers.json");
+
+        std::fs::write(&providers_path, b"{broken").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state
+                    .config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .status
+                    == SectionStatus::Degraded
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .config_live_health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .revision,
+            0,
+            "invalid edits must not advance the LKG revision"
+        );
+        assert!(Arc::ptr_eq(
+            &state.provider_registry.get_default().unwrap(),
+            &working
+        ));
+        let invalid = tokio::time::timeout(Duration::from_secs(2), feed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            invalid.event,
+            AgentEvent::ConfigInvalid { revision: 0, .. }
+        ));
+
+        let providers = ProviderConfigs {
+            openai: Some(bamboo_config::OpenAIConfig {
+                api_key_encrypted: Some(
+                    bamboo_config::encryption::encrypt("watcher-test-key").unwrap(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            &providers_path,
+            serde_json::to_vec_pretty(&providers).unwrap(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let health = state
+                    .config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if health.status == SectionStatus::Healthy && health.revision == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(2), feed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            recovered.event,
+            AgentEvent::ConfigRecovered { revision: 1, .. }
+        ));
+        assert_eq!(state.provider_registry.default_provider_name(), "openai");
+    }
 }
 
 /// The prominent warning emitted whenever `plugin_trust.enforcement` is (or

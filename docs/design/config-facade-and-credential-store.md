@@ -1,6 +1,6 @@
 # ADR: Modular live configuration and credential isolation
 
-- Status: accepted; persistence/snapshot foundation implemented, server adapters pending
+- Status: accepted; foundation and first server integration implemented
 - Issue: #597
 - Date: 2026-07-19
 
@@ -152,3 +152,20 @@ must continue using the full effective projection and must not claim that all
 secrets have moved. The server integration must add typed section and credential
 status/replace/clear endpoints, event-feed adapters, watcher lifecycle ownership,
 and migration fixtures before #597 can be considered complete.
+
+## Server integration status
+
+The first server-owned integration watches the already extracted
+`providers.json` sidecar for external edits. It validates the file, constructs a
+complete candidate provider registry, and requires the candidate default provider
+to initialize before atomically publishing the config/registry/provider handles.
+Failures retain the prior runtime, mark the provider health envelope degraded,
+and publish `config.invalid`; a valid follow-up publishes `config.recovered`.
+Watching legacy `config.json` is intentionally deferred because applying its full
+projection without provider/MCP/notification/cluster side effects would create a
+split runtime.
+
+Credential metadata/status/replace/clear HTTP adapters now use the encrypted store
+with expected-revision CAS. Responses contain only status metadata and health;
+conflicts return HTTP 409. Successful mutations publish `config.changed` through
+the durable account feed, which also supplies the v2 WebSocket `feed` channel.

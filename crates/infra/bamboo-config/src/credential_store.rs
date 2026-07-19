@@ -111,8 +111,16 @@ impl CredentialStore {
     }
 
     pub fn status(&self, credential_ref: &CredentialRef) -> ConfigStoreResult<CredentialStatus> {
-        let document = self.load_document()?;
-        Ok(match document.entries.get(credential_ref) {
+        self.status_with_revision(credential_ref)
+            .map(|(_, status)| status)
+    }
+
+    pub fn status_with_revision(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        let (document, revision) = self.load_document_with_revision()?;
+        let status = match document.entries.get(credential_ref) {
             Some(entry) => CredentialStatus {
                 credential_ref: credential_ref.clone(),
                 configured: true,
@@ -125,12 +133,17 @@ impl CredentialStore {
                 source: CredentialSource::User,
                 updated_at: None,
             },
-        })
+        };
+        Ok((revision, status))
     }
 
     pub fn statuses(&self) -> ConfigStoreResult<Vec<CredentialStatus>> {
-        let document = self.load_document()?;
-        Ok(document
+        self.statuses_with_revision().map(|(_, statuses)| statuses)
+    }
+
+    pub fn statuses_with_revision(&self) -> ConfigStoreResult<(u64, Vec<CredentialStatus>)> {
+        let (document, revision) = self.load_document_with_revision()?;
+        let statuses = document
             .entries
             .into_iter()
             .map(|(credential_ref, entry)| CredentialStatus {
@@ -139,7 +152,8 @@ impl CredentialStore {
                 source: entry.source,
                 updated_at: Some(entry.updated_at),
             })
-            .collect())
+            .collect();
+        Ok((revision, statuses))
     }
 
     pub fn replace(
@@ -222,10 +236,15 @@ impl CredentialStore {
     }
 
     fn load_document(&self) -> ConfigStoreResult<CredentialDocument> {
-        Ok(self
-            .store
-            .load_validated(validate_document)?
-            .map_or_else(CredentialDocument::default, |stored| stored.data))
+        self.load_document_with_revision()
+            .map(|(document, _)| document)
+    }
+
+    fn load_document_with_revision(&self) -> ConfigStoreResult<(CredentialDocument, u64)> {
+        Ok(match self.store.load_validated(validate_document)? {
+            Some(stored) => (stored.data, stored.revision),
+            None => (CredentialDocument::default(), 0),
+        })
     }
 }
 

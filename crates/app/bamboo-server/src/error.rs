@@ -55,6 +55,9 @@ pub enum AppError {
     #[error("Config recovery pending confirmation: {0}")]
     ConfigRecoveryPending(String),
 
+    #[error("Configuration revision conflict: expected {expected}, actual {actual}")]
+    ConfigConflict { expected: u64, actual: u64 },
+
     #[error("Internal server error: {0}")]
     InternalError(#[from] anyhow::Error),
 
@@ -114,6 +117,7 @@ impl ResponseError for AppError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::ProxyAuthRequired => StatusCode::PRECONDITION_REQUIRED,
             AppError::ConfigRecoveryPending(_) => StatusCode::CONFLICT,
+            AppError::ConfigConflict { .. } => StatusCode::CONFLICT,
             AppError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::SerializationError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -131,6 +135,7 @@ impl ResponseError for AppError {
                     AppError::ConfigRecoveryPending(_) => {
                         Some("config_recovery_pending".to_string())
                     }
+                    AppError::ConfigConflict { .. } => Some("config_revision_conflict".to_string()),
                     _ => None,
                 },
             },

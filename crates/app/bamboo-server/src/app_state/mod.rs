@@ -173,6 +173,15 @@ pub struct AppState {
     /// unblocked during a write's disk I/O. #126.
     pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Server-owned live configuration watcher and its health envelope.
+    /// The runtime handle keeps the directory watcher tasks alive.
+    pub config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
+    #[allow(dead_code)]
+    config_watcher: config_runtime::ConfigWatcherRuntime,
+
+    /// Encrypted credential authority exposed only through metadata/replace/clear APIs.
+    pub credential_store: Arc<bamboo_config::CredentialStore>,
+
     /// Shared Remote Cluster Fabric deploy engine (one worker registry across the
     /// HTTP operator handlers and the `cluster` agent tool).
     pub fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,

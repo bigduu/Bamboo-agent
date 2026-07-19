@@ -101,6 +101,19 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    /// Replace this registry with an already constructed candidate.
+    ///
+    /// Live reload callers use this only after verifying that the candidate's
+    /// default provider initialized successfully. Keeping construction separate
+    /// from publication means a bad edit cannot tear down the working registry.
+    pub fn replace_with(&self, candidate: Self) {
+        *self.providers.write().recover_poison() =
+            candidate.providers.into_inner().recover_poison();
+        *self.metadata.write().recover_poison() = candidate.metadata.into_inner().recover_poison();
+        *self.default_provider.write().recover_poison() =
+            candidate.default_provider.into_inner().recover_poison();
+    }
+
     async fn build_registry_state(
         config: &Config,
         app_data_dir: PathBuf,

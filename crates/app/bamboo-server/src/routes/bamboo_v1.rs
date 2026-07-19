@@ -98,6 +98,26 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::confirm_config_recovery),
         )
         .route(
+            "/bamboo/config/live-health",
+            web::get().to(settings::get_live_config_health),
+        )
+        .route(
+            "/bamboo/config/credentials",
+            web::get().to(settings::list_credentials),
+        )
+        .route(
+            "/bamboo/config/credentials/{credential_ref}",
+            web::get().to(settings::get_credential_status),
+        )
+        .route(
+            "/bamboo/config/credentials/{credential_ref}",
+            web::put().to(settings::replace_credential),
+        )
+        .route(
+            "/bamboo/config/credentials/{credential_ref}/clear",
+            web::post().to(settings::clear_credential),
+        )
+        .route(
             "/bamboo/proxy-auth",
             web::post().to(settings::set_proxy_auth),
         )
