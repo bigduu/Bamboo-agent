@@ -54,18 +54,14 @@ pub async fn set_proxy_auth(
             auth,
             expected_revision,
             ConfigUpdateEffects {
-                // Best-effort: setup flows often set proxy auth before provider config is complete.
-                // Persisting should not fail just because provider init can't happen yet.
-                reload_provider: false,
+                // Best-effort inside the detached post-commit convergence task:
+                // setup flows often set proxy auth before provider config is complete.
+                reload_provider: true,
                 // Proxy auth can affect SSE-based MCP servers too.
                 reconcile_mcp: true,
             },
         )
         .await?;
-
-    if let Err(e) = app_state.reload_provider().await {
-        tracing::warn!("Proxy auth updated but provider reload failed: {}", e);
-    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -185,7 +181,6 @@ mod tests {
 
     #[actix_web::test]
     async fn proxy_auth_update_requires_revision_and_stale_write_is_conflict() {
-        let _key = bamboo_config::encryption::set_test_encryption_key([0xa5; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let app = test::init_service(
@@ -210,6 +205,14 @@ mod tests {
         assert_eq!(body["configured"], true);
         assert_eq!(body["credential_ref"], "proxy.default.auth");
         assert!(!body.to_string().contains("proxy-secret"));
+        let (committed_ref, committed_auth) = {
+            let config = state.config.read().await;
+            (
+                config.proxy_auth_credential_ref.clone(),
+                config.proxy_auth.clone(),
+            )
+        };
+        let committed_credentials = std::fs::read(dir.path().join("credentials.json")).unwrap();
 
         let stale = test::TestRequest::post()
             .uri("/proxy-auth")
@@ -223,6 +226,30 @@ mod tests {
         assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
         let stale_body = String::from_utf8(test::read_body(stale).await.to_vec()).unwrap();
         assert!(!stale_body.contains("stale-secret"));
+        {
+            let config = state.config.read().await;
+            assert_eq!(config.proxy_auth_credential_ref, committed_ref);
+            assert_eq!(
+                config
+                    .proxy_auth
+                    .as_ref()
+                    .map(|auth| auth.username.as_str()),
+                committed_auth.as_ref().map(|auth| auth.username.as_str())
+            );
+            assert!(
+                config
+                    .proxy_auth
+                    .as_ref()
+                    .zip(committed_auth.as_ref())
+                    .is_some_and(|(current, committed)| current.password == committed.password),
+                "stale conflict changed the committed proxy password"
+            );
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.json")).unwrap(),
+            committed_credentials,
+            "stale conflict changed the committed credential document"
+        );
 
         let clear = test::TestRequest::post()
             .uri("/proxy-auth")

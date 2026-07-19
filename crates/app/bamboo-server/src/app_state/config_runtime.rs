@@ -1534,10 +1534,22 @@ impl AppState {
         ),
         AppError,
     > {
-        let snapshot_and_status = {
-            let _io = self.config_io_lock.lock().await;
+        let config_io_lock = self.config_io_lock.clone();
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let credential_store = self.credential_store.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+
+        // This task owns the mutation after dispatch. Dropping the request's
+        // JoinHandle does not cancel it, so the blocking durable transaction,
+        // live publication, and runtime convergence complete as one serialized
+        // operation even when the caller disconnects.
+        let transaction = tokio::spawn(async move {
+            let _io = config_io_lock.lock().await;
             let mut candidate = {
-                let cfg = self.config.read().await;
+                let cfg = config.read().await;
                 reject_if_recovery_pending(&cfg)?;
                 let mut candidate = cfg.clone();
                 candidate.proxy_auth = auth;
@@ -1549,19 +1561,16 @@ impl AppState {
                 })?;
                 candidate
             };
-            let data_dir = self.app_data_dir.clone();
-            let (candidate, _revision) = tokio::task::spawn_blocking(move || {
-                let revision =
-                    bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
-                        &data_dir,
-                        &mut candidate,
-                        expected_revision,
-                    )?;
-                // The exact transaction patches the current raw root document.
-                // Reload it before publication so an external edit already
-                // present when staging began is retained in live memory too.
-                let candidate = Config::from_data_dir_without_publish(Some(data_dir));
-                Ok::<_, ConfigStoreError>((candidate, revision))
+            let transaction_dir = app_data_dir.clone();
+            let candidate = tokio::task::spawn_blocking(move || {
+                bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+                    &transaction_dir,
+                    &mut candidate,
+                    expected_revision,
+                )?;
+                Ok::<_, ConfigStoreError>(Config::from_data_dir_without_publish(Some(
+                    transaction_dir,
+                )))
             })
             .await
             .map_err(|error| {
@@ -1582,41 +1591,71 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            let reference = candidate
-                .proxy_auth_credential_ref
-                .as_ref()
-                .ok_or_else(|| {
-                    AppError::InternalError(anyhow::anyhow!(
-                        "proxy credential transaction did not publish its reference"
-                    ))
-                })?;
-            {
-                let mut cfg = self.config.write().await;
-                candidate.publish_env_vars();
-                *cfg = candidate.clone();
+
+            // No fallible metadata read occurs before publication. Once the
+            // transaction commits, a response error can no longer leave live
+            // config behind its durable credential/config pair.
+            let reference = candidate.proxy_auth_credential_ref.clone();
+            candidate.publish_env_vars();
+            *config.write().await = candidate.clone();
+
+            if effects.reload_provider {
+                match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir.clone())
+                    .await
+                {
+                    Ok(candidate_registry) => {
+                        if let Some(candidate_provider) = candidate_registry.get_default() {
+                            let mut live_provider = provider.write().await;
+                            provider_registry.replace_with(candidate_registry);
+                            *live_provider = candidate_provider;
+                        } else {
+                            tracing::warn!(
+                                "proxy auth committed but provider reload had no default provider"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "proxy auth committed but provider reload failed"
+                        );
+                    }
+                }
             }
-            let (status, health) = self
-                .credential_store
-                .status_with_health(reference)
-                .map_err(|error| match error {
-                    ConfigStoreError::Conflict { expected, actual } => {
-                        AppError::ConfigConflict { expected, actual }
-                    }
-                    ConfigStoreError::Validation(_) | ConfigStoreError::Json(_) => {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "credential store validation failed"
-                        ))
-                    }
-                    ConfigStoreError::Io(error) => AppError::StorageError(error),
-                    ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
-                        "configuration watch failed: {error}"
-                    )),
-                })?;
-            (candidate, status, health)
-        };
-        self.apply_config_effects(snapshot_and_status.0.clone(), effects)
-            .await?;
-        Ok(snapshot_and_status)
+
+            if effects.reconcile_mcp {
+                mcp_manager.reconcile_from_config(&candidate.mcp).await;
+            }
+
+            let reference = reference.ok_or_else(|| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "proxy credential transaction did not publish its reference"
+                ))
+            })?;
+            let (status, health) =
+                credential_store
+                    .status_with_health(&reference)
+                    .map_err(|error| match error {
+                        ConfigStoreError::Conflict { expected, actual } => {
+                            AppError::ConfigConflict { expected, actual }
+                        }
+                        ConfigStoreError::Validation(_) | ConfigStoreError::Json(_) => {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "credential store validation failed"
+                            ))
+                        }
+                        ConfigStoreError::Io(error) => AppError::StorageError(error),
+                        ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
+                            "configuration watch failed: {error}"
+                        )),
+                    })?;
+            Ok::<_, AppError>((candidate, status, health))
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "proxy credential mutation task failed: {error}"
+            ))
+        })?
     }
 
     /// Replace the full config (used for JSON merge endpoints).
@@ -2063,6 +2102,124 @@ mod live_reload_tests {
             "cancellation while waiting for publication guards must precede durable commit"
         );
         drop(held_provider);
+    }
+
+    #[test]
+    fn cancelled_proxy_update_cannot_leave_durable_state_ahead_of_live_snapshot() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+
+            // Occupy Tokio's only blocking worker. The pre-fix implementation
+            // queued the durable transaction with `spawn_blocking`, so aborting
+            // the request detached that queued commit from live publication.
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+
+            let operation_state = state.clone();
+            let operation = tokio::spawn(async move {
+                operation_state
+                    .update_proxy_auth_credential(
+                        Some(bamboo_config::ProxyAuth {
+                            username: "cancel-user".to_string(),
+                            password: "cancel-secret".to_string(),
+                        }),
+                        0,
+                        ConfigUpdateEffects {
+                            reload_provider: true,
+                            reconcile_mcp: true,
+                        },
+                    )
+                    .await
+            });
+
+            // Wait until the owned mutation has acquired config_io_lock and
+            // queued its blocking transaction. Aborting the caller from this
+            // exact point reproduced the old detached-commit/live-publication
+            // split deterministically.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if state.config_io_lock.try_lock().is_err() {
+                        break;
+                    }
+                    assert!(!operation.is_finished());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("proxy mutation acquires the config IO lock");
+            operation.abort();
+            let _ = operation.await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let credentials_ready = std::fs::read(dir.path().join("credentials.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|value| value.get("revision").and_then(|value| value.as_u64()))
+                        == Some(1);
+                    let config_ready = std::fs::read(dir.path().join("config.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|value| {
+                            value
+                                .get("proxy_auth_credential_ref")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        })
+                        .as_deref()
+                        == Some("proxy.default.auth");
+                    if credentials_ready && config_ready {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned durable transaction completes after caller cancellation");
+
+            // The owner retains config_io_lock through best-effort provider/MCP
+            // convergence. Acquiring it proves cancellation did not strand the
+            // post-commit runtime task either.
+            let converged =
+                tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+                    .await
+                    .expect("owned runtime convergence completes after cancellation");
+            drop(converged);
+
+            let live = state.config.read().await;
+            assert_eq!(
+                live.proxy_auth_credential_ref
+                    .as_ref()
+                    .map(|reference| reference.as_str()),
+                Some("proxy.default.auth")
+            );
+            let auth = live
+                .proxy_auth
+                .as_ref()
+                .expect("durable proxy auth must be published despite cancellation");
+            assert_eq!(auth.username, "cancel-user");
+            assert_eq!(auth.password, "cancel-secret");
+            drop(live);
+
+            let root = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+            let credentials = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+            assert!(!root.contains("cancel-secret"));
+            assert!(!credentials.contains("cancel-secret"));
+        });
     }
 
     #[tokio::test]
