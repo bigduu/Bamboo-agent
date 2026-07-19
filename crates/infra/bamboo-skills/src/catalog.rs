@@ -136,6 +136,23 @@ fn yaml_scalar_to_string(value: serde_yaml::Value) -> Option<String> {
     }
 }
 
+fn public_yaml_error(display_name: &str, error: serde_yaml::Error) -> String {
+    tracing::warn!("Invalid workflow bundle metadata in {display_name}: {error}");
+    match error.location() {
+        Some(location) => format!(
+            "{display_name}: invalid metadata at line {}, column {}",
+            location.line(),
+            location.column()
+        ),
+        None => format!("{display_name}: invalid metadata"),
+    }
+}
+
+fn public_validation_error(display_name: &str, error: impl std::fmt::Display) -> String {
+    tracing::warn!("Invalid workflow definition in {display_name}: {error}");
+    format!("{display_name}: invalid workflow definition")
+}
+
 pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, String> {
     let workflow_path = root.join("workflow.yaml");
     let bamboo_path = root.join("agents").join("bamboo.yaml");
@@ -159,14 +176,14 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
         .await
         .map_err(|error| format!("{display_name}: {error}"))?;
     let metadata: BambooWorkflowMetadata =
-        serde_yaml::from_str(&raw).map_err(|error| format!("{display_name}: {error}"))?;
+        serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
     let is_workflow_definition = path.ends_with("workflow.yaml");
     if is_workflow_definition {
         let definition: bamboo_domain::WorkflowDefinition =
-            serde_yaml::from_str(&raw).map_err(|error| format!("{display_name}: {error}"))?;
+            serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
         definition
             .validate()
-            .map_err(|error| format!("{display_name}: {error}"))?;
+            .map_err(|error| public_validation_error(display_name, error))?;
     }
     let mut result = BundleMetadata {
         kind: if metadata.composition.is_some() || is_workflow_definition {
@@ -229,5 +246,35 @@ mod tests {
         assert!(!json.contains("prompt"));
         assert!(!json.contains("SKILL.md"));
         assert!(!json.contains("references"));
+    }
+
+    #[tokio::test]
+    async fn invalid_bundle_error_does_not_echo_private_yaml_values() {
+        const PRIVATE_VALUE: &str = "private-catalog-metadata-value";
+        const PRIVATE_RESOURCE: &str = "/private/resources/catalog-reference.md";
+        let directory = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(
+            directory.path().join("workflow.yaml"),
+            format!(
+                "id: private\nname: Private\ndescription: {PRIVATE_VALUE}\nversion: '1'\ncomposition:\n  type: {PRIVATE_RESOURCE}\n"
+            ),
+        )
+        .await
+        .expect("workflow metadata");
+
+        let error = load_bundle_metadata(directory.path())
+            .await
+            .expect_err("invalid composition type");
+
+        assert!(
+            !error.contains(PRIVATE_VALUE),
+            "catalog error leaked: {error}"
+        );
+        assert!(
+            !error.contains(PRIVATE_RESOURCE),
+            "catalog error leaked: {error}"
+        );
+        assert!(error.starts_with("workflow.yaml:"));
+        assert!(!error.contains(directory.path().to_string_lossy().as_ref()));
     }
 }

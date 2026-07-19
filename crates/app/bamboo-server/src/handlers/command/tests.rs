@@ -33,6 +33,31 @@ fn catalog_entry_to_command_maps_metadata_without_prompt() {
     assert!(command.metadata.get("prompt").is_none());
 }
 
+#[test]
+fn orchestration_catalog_entry_stays_selectable_as_skill_until_workflow_run_exists() {
+    let entry = WorkflowCatalogEntry {
+        id: "review-run".into(),
+        name: "Review run".into(),
+        description: "Reviews changes through an orchestration".into(),
+        kind: WorkflowKind::Orchestration,
+        source: WorkflowSource::Project,
+        revision: 8,
+        version: "1".into(),
+        invocation_policy: serde_json::json!({"explicit": true}),
+        argument_schema: serde_json::json!({"type": "object"}),
+        status: WorkflowStatus::Valid,
+        last_error: None,
+        winner: true,
+        shadowed_candidates: vec![],
+    };
+
+    let command = catalog_entry_to_command(&entry);
+
+    assert_eq!(command.id, "skill-review-run");
+    assert_eq!(command.command_type, "skill");
+    assert_eq!(command.metadata["kind"], "orchestration");
+}
+
 #[tokio::test]
 async fn markdown_commands_support_namespace_frontmatter_and_arguments() {
     let project = tempfile::tempdir().expect("project");

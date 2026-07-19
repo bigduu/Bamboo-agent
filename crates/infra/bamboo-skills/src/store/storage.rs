@@ -4,7 +4,23 @@ use tokio::fs;
 use tracing::{debug, info, warn};
 
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
-use crate::types::{SkillDefinition, SkillResult};
+use crate::types::{SkillDefinition, SkillError, SkillResult};
+
+fn public_skill_error(error: &SkillError) -> String {
+    match error {
+        SkillError::Yaml(error) => match error.location() {
+            Some(location) => format!(
+                "SKILL.md: invalid metadata at line {}, column {}",
+                location.line(),
+                location.column()
+            ),
+            None => "SKILL.md: invalid metadata".to_string(),
+        },
+        SkillError::InvalidId(_) => "SKILL.md: invalid skill id".to_string(),
+        SkillError::Validation(_) => "SKILL.md: invalid frontmatter or content".to_string(),
+        _ => "SKILL.md: failed to load bundle".to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkillDirectorySource {
@@ -194,7 +210,7 @@ pub async fn load_skills_from_discovery_dirs_detailed(
                             skill_file,
                             source: discovery.source,
                             mode: discovery.mode.clone(),
-                            error: error.to_string(),
+                            error: public_skill_error(&error),
                         });
                     }
                 },
