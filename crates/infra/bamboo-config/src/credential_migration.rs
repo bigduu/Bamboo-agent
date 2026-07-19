@@ -30,6 +30,13 @@ const PROVIDERS_FILE: &str = "providers.json";
 const MCP_FILE: &str = "mcp.json";
 const CREDENTIALS_FILE: &str = "credentials.json";
 const CONFIG_FILE: &str = "config.json";
+const PROXY_AUTH_DOMAIN_KEYS: [&str; 5] = [
+    "proxy_auth",
+    "proxy_auth_encrypted",
+    "http_proxy_auth_encrypted",
+    "https_proxy_auth_encrypted",
+    "proxy_auth_credential_ref",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CredentialMigrationOutcome {
@@ -369,9 +376,16 @@ fn persist_provider_credential_transaction_with_instances_inner(
             });
         }
     }
-    let (config_bytes, provider_bytes) = config
-        .prepare_provider_transaction_documents(&providers_original)
-        .map_err(|error| ConfigStoreError::Validation(error.to_string()))?;
+    let (config_bytes, provider_bytes) = if proxy_only {
+        (
+            prepare_proxy_auth_config_document(&config_original, config)?,
+            providers_original.clone(),
+        )
+    } else {
+        config
+            .prepare_provider_transaction_documents(&providers_original)
+            .map_err(|error| ConfigStoreError::Validation(error.to_string()))?
+    };
     if store.revision_unchecked()? != prepared.expected_revision {
         return Err(ConfigStoreError::Conflict {
             expected: prepared.expected_revision,
@@ -1391,6 +1405,67 @@ fn stage_file(
     Ok(())
 }
 
+fn prepare_proxy_auth_config_document(
+    current: &[u8],
+    candidate: &crate::Config,
+) -> ConfigStoreResult<Vec<u8>> {
+    let mut root = parse_config_root_object(
+        current,
+        "config.json is invalid during proxy credential transaction",
+    )?;
+    for key in PROXY_AUTH_DOMAIN_KEYS {
+        root.remove(key);
+    }
+    if let Some(reference) = candidate.proxy_auth_credential_ref.as_ref() {
+        root.insert(
+            "proxy_auth_credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+    }
+    let document = Value::Object(root);
+    serde_json::from_value::<crate::Config>(document.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json is invalid during proxy credential transaction".to_string(),
+        )
+    })?;
+    Ok(serde_json::to_vec_pretty(&document)?)
+}
+
+fn parse_config_root_object(
+    bytes: &[u8],
+    invalid_message: &str,
+) -> ConfigStoreResult<Map<String, Value>> {
+    if bytes.is_empty() {
+        return Ok(Map::new());
+    }
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| ConfigStoreError::Validation(invalid_message.to_string()))?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ConfigStoreError::Validation(invalid_message.to_string()))
+}
+
+fn proxy_auth_domain(root: &Map<String, Value>) -> Map<String, Value> {
+    PROXY_AUTH_DOMAIN_KEYS
+        .iter()
+        .filter_map(|key| {
+            root.get(*key)
+                .cloned()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
+fn replace_proxy_auth_domain(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    for key in PROXY_AUTH_DOMAIN_KEYS {
+        target.remove(key);
+        if let Some(value) = source.get(key) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 fn write_manifest(path: PathBuf, manifest: &MigrationManifest) -> ConfigStoreResult<()> {
     AtomicFileStore::new(path).write_bytes_without_backup(&serde_json::to_vec_pretty(manifest)?)
 }
@@ -1423,13 +1498,190 @@ fn recover_committed(
     }))
 }
 
+fn initial_exact_transaction_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+    name: &str,
+) -> ConfigStoreResult<(StagedFile, Vec<u8>)> {
+    let journal_bytes =
+        read_optional_migration_file(&data_dir.join(JOURNAL_FILE))?.ok_or_else(|| {
+            ConfigStoreError::Validation("credential transaction journal is missing".to_string())
+        })?;
+    let journal: MigrationManifest = serde_json::from_slice(&journal_bytes)?;
+    validate_manifest(&journal)?;
+    if journal.transaction_id != manifest.transaction_id
+        || journal.stage_dir != manifest.stage_dir
+        || journal.exact_scope != manifest.exact_scope
+    {
+        return Err(ConfigStoreError::Validation(
+            "credential transaction journal does not match the committed manifest".to_string(),
+        ));
+    }
+    let file = journal
+        .files
+        .into_iter()
+        .find(|file| file.name == name)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation("credential transaction journal is incomplete".to_string())
+        })?;
+    let staged =
+        std::fs::read(validated_stage_dir(data_dir, &journal.stage_dir)?.join(&file.staged_name))?;
+    if sha256(&staged) != file.sha256 {
+        return Err(ConfigStoreError::Validation(
+            "initial transaction document failed integrity validation".to_string(),
+        ));
+    }
+    Ok((file, staged))
+}
+
+fn rollback_proxy_config_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let (initial_file, initial_staged) =
+        initial_exact_transaction_member(data_dir, manifest, CONFIG_FILE)?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    if initial_file.original_sha256.as_deref() != Some(sha256(&original).as_str()) {
+        return Err(ConfigStoreError::Validation(
+            "config transaction backup failed integrity validation".to_string(),
+        ));
+    }
+    let original_root = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    let staged_root = parse_config_root_object(
+        &initial_staged,
+        "initial proxy config transaction document is invalid",
+    )?;
+    let staged_domain = proxy_auth_domain(&staged_root);
+    let target = data_dir.join(CONFIG_FILE);
+
+    for _ in 0..16 {
+        let current = read_target_or_empty(&target)?;
+        let current_hash = sha256(&current);
+        if current_hash == sha256(&original) {
+            return Ok(());
+        }
+        let mut current_root = parse_config_root_object(
+            &current,
+            "config.json changed to an invalid document while aborting proxy transaction",
+        )?;
+        if proxy_auth_domain(&current_root) != staged_domain {
+            // The transaction never installed its auth-domain change, or a
+            // later same-domain writer won. Preserve that current value.
+            return Ok(());
+        }
+        replace_proxy_auth_domain(&mut current_root, &original_root);
+        let rolled_back = Value::Object(current_root);
+        serde_json::from_value::<crate::Config>(rolled_back.clone()).map_err(|_| {
+            ConfigStoreError::Validation(
+                "config.json is invalid after proxy transaction rollback".to_string(),
+            )
+        })?;
+        let rolled_back = serde_json::to_vec_pretty(&rolled_back)?;
+        if sha256(&rolled_back) == current_hash {
+            return Ok(());
+        }
+        if AtomicFileStore::new(&target)
+            .write_bytes_if_hash_with_backup(&current_hash, &rolled_back)?
+        {
+            return Ok(());
+        }
+    }
+    Err(ConfigStoreError::Validation(
+        "proxy config transaction rollback could not obtain a stable document".to_string(),
+    ))
+}
+
+fn rollback_proxy_credential_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let (initial_file, initial_staged) =
+        initial_exact_transaction_member(data_dir, manifest, CREDENTIALS_FILE)?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CREDENTIALS_FILE))?;
+    if initial_file.original_sha256.as_deref() != Some(sha256(&original).as_str()) {
+        return Err(ConfigStoreError::Validation(
+            "credential transaction backup failed integrity validation".to_string(),
+        ));
+    }
+    let target = data_dir.join(CREDENTIALS_FILE);
+    for _ in 0..16 {
+        let current = read_target_or_empty(&target)?;
+        let current_hash = sha256(&current);
+        if current_hash == sha256(&original) {
+            return Ok(());
+        }
+        let (rolled_back, _revision, changed) =
+            CredentialStore::rollback_exact_transaction_documents(
+                &original,
+                &initial_staged,
+                &current,
+                &credential_file.touched_credential_refs,
+            )?;
+        if !changed {
+            return Ok(());
+        }
+        if AtomicFileStore::new(&target)
+            .sensitive(true)
+            .write_bytes_if_hash_with_backup(&current_hash, &rolled_back)?
+        {
+            return Ok(());
+        }
+    }
+    Err(ConfigStoreError::Validation(
+        "proxy credential transaction rollback could not obtain a stable revision".to_string(),
+    ))
+}
+
+fn abort_proxy_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ProxyAuth) {
+        return Ok(());
+    }
+    rollback_proxy_config_member(data_dir, manifest)?;
+    rollback_proxy_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
+}
+
+fn ensure_proxy_consumers_or_abort(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if let Err(error) = ensure_proxy_ref_has_no_durable_non_proxy_consumers(data_dir, manifest) {
+        abort_proxy_exact_transaction(data_dir, manifest)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn install_pending(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
     validate_manifest(manifest)?;
-    ensure_proxy_ref_has_no_durable_non_proxy_consumers(data_dir, manifest)?;
+    ensure_proxy_consumers_or_abort(data_dir, manifest)?;
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let names = manifest
         .files
@@ -1579,34 +1831,35 @@ fn install_rebased_proxy_config_member(
         return Ok(false);
     }
 
-    ensure_proxy_ref_has_no_durable_non_proxy_consumers(data_dir, manifest)?;
+    ensure_proxy_consumers_or_abort(data_dir, manifest)?;
     let target = data_dir.join(CONFIG_FILE);
     let current = read_target_or_empty(&target)?;
     let current_hash = sha256(&current);
-    let mut rebased: Value = serde_json::from_slice(&current).map_err(|_| {
-        ConfigStoreError::Validation(
-            "config.json changed to an invalid document during committed proxy transaction"
-                .to_string(),
-        )
-    })?;
-    let object = rebased.as_object_mut().ok_or_else(|| {
-        ConfigStoreError::Validation(
-            "config.json changed to an invalid document during committed proxy transaction"
-                .to_string(),
-        )
-    })?;
-    for key in [
-        "proxy_auth",
-        "proxy_auth_encrypted",
-        "http_proxy_auth_encrypted",
-        "https_proxy_auth_encrypted",
-    ] {
-        object.remove(key);
+    let mut object = parse_config_root_object(
+        &current,
+        "config.json changed to an invalid document during committed proxy transaction",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original_object = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    let staged_object = parse_config_root_object(
+        &serde_json::to_vec(&staged)?,
+        "staged proxy config transaction document is invalid",
+    )?;
+    let current_domain = proxy_auth_domain(&object);
+    let original_domain = proxy_auth_domain(&original_object);
+    let staged_domain = proxy_auth_domain(&staged_object);
+    if current_domain != original_domain && current_domain != staged_domain {
+        abort_proxy_exact_transaction(data_dir, manifest)?;
+        return Err(ConfigStoreError::Validation(
+            "proxy authentication metadata changed during committed transaction".to_string(),
+        ));
     }
-    object.insert(
-        "proxy_auth_credential_ref".to_string(),
-        Value::String(touched_ref),
-    );
+    replace_proxy_auth_domain(&mut object, &staged_object);
+    let rebased = Value::Object(object);
     serde_json::from_value::<crate::Config>(rebased.clone()).map_err(|_| {
         ConfigStoreError::Validation(
             "config.json changed to an invalid document during committed proxy transaction"
@@ -3018,6 +3271,36 @@ mod tests {
     }
 
     #[test]
+    fn proxy_transaction_narrow_patch_preserves_root_edit_present_before_staging() {
+        let _key = crate::encryption::set_test_encryption_key([0xa2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "narrow-user".to_string(),
+            password: "narrow-password".to_string(),
+        });
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["http_proxy"] = Value::String("http://external-before-stage:9090".to_string());
+        external["external_before_stage"] = serde_json::json!({"preserved": true});
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        persist_proxy_auth_credential_transaction(dir.path(), &mut candidate).unwrap();
+
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["http_proxy"], "http://external-before-stage:9090");
+        assert_eq!(root["external_before_stage"]["preserved"], true);
+        assert_eq!(root["proxy_auth_credential_ref"], "proxy.default.auth");
+    }
+
+    #[test]
     fn committed_proxy_transaction_rebases_again_after_manifested_rebase_loses_cas() {
         let _key = crate::encryption::set_test_encryption_key([0x99; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -3117,7 +3400,229 @@ mod tests {
             read_target_or_empty(&dir.path().join(CREDENTIALS_FILE)).unwrap(),
             credentials_before
         );
-        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_ok());
+        assert_no_migration_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn committed_proxy_transaction_rolls_back_installed_credential_for_new_consumer() {
+        let _key = crate::encryption::set_test_encryption_key([0xa3; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "partial-user".to_string(),
+            password: "partial-password".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterCredentials),
+        )
+        .is_err());
+        let reference = credential_ref("proxy", "default", "auth").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve_unchecked(&reference)
+            .unwrap()
+            .is_some());
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["provider_instances"] = serde_json::json!({
+            "racer": {
+                "provider_type": "openai",
+                "model": "gpt-test",
+                "credential_ref": "proxy.default.auth"
+            }
+        });
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("non-proxy consumer"));
+        assert!(CredentialStore::open(dir.path())
+            .resolve_unchecked(&reference)
+            .unwrap()
+            .is_none());
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            root["provider_instances"]["racer"]["credential_ref"],
+            "proxy.default.auth"
+        );
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_ok());
+        assert_no_migration_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn proxy_abort_rolls_back_config_installed_before_new_consumer() {
+        let _key = crate::encryption::set_test_encryption_key([0xa6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "fully-installed-user".to_string(),
+            password: "fully-installed-password".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterConfig),
+        )
+        .is_err());
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(external["proxy_auth_credential_ref"], "proxy.default.auth");
+        external["provider_instances"] = serde_json::json!({
+            "racer": {
+                "provider_type": "openai",
+                "model": "gpt-test",
+                "credential_ref": "proxy.default.auth"
+            }
+        });
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("non-proxy consumer"));
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert!(root.get("proxy_auth_credential_ref").is_none());
+        assert_eq!(
+            root["provider_instances"]["racer"]["credential_ref"],
+            "proxy.default.auth"
+        );
+        let reference = credential_ref("proxy", "default", "auth").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve_unchecked(&reference)
+            .unwrap()
+            .is_none());
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_ok());
+        assert_no_migration_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn proxy_abort_preserves_a_later_same_ref_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xa5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "transaction-user".to_string(),
+            password: "transaction-password".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterCredentials),
+        )
+        .is_err());
+
+        let reference = credential_ref("proxy", "default", "auth").unwrap();
+        let winner = serde_json::to_string(&crate::ProxyAuth {
+            username: "winner-user".to_string(),
+            password: "winner-password".to_string(),
+        })
+        .unwrap();
+        let store = CredentialStore::open(dir.path());
+        let revision = store.revision_unchecked().unwrap();
+        store
+            .replace_unchecked(
+                reference.clone(),
+                &winner,
+                crate::CredentialSource::User,
+                revision,
+            )
+            .unwrap();
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["provider_instances"] = serde_json::json!({
+            "racer": {
+                "provider_type": "openai",
+                "model": "gpt-test",
+                "credential_ref": "proxy.default.auth"
+            }
+        });
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("non-proxy consumer"));
+        assert_eq!(
+            store
+                .resolve_unchecked(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            winner
+        );
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_ok());
+        assert_no_migration_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn committed_proxy_transaction_aborts_on_same_domain_root_change() {
+        let _key = crate::encryption::set_test_encryption_key([0xa4; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::Config::default()
+            .save_to_dir(dir.path().to_path_buf())
+            .unwrap();
+        let mut candidate =
+            crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        candidate.proxy_auth = Some(crate::ProxyAuth {
+            username: "losing-user".to_string(),
+            password: "losing-password".to_string(),
+        });
+        let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+        assert!(persist_provider_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            Some(MigrationFault::AfterManifest),
+        )
+        .is_err());
+        let mut external: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        external["proxy_auth_credential_ref"] = Value::String("proxy.external.auth".to_string());
+        external["same_domain_winner"] = Value::Bool(true);
+        AtomicFileStore::new(dir.path().join(CONFIG_FILE))
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&external).unwrap())
+            .unwrap();
+
+        let error = migrate_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("proxy authentication metadata changed"));
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["proxy_auth_credential_ref"], "proxy.external.auth");
+        assert_eq!(root["same_domain_winner"], true);
+        let losing_ref = credential_ref("proxy", "default", "auth").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve_unchecked(&losing_ref)
+            .unwrap()
+            .is_none());
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_ok());
+        assert_no_migration_transaction_artifacts(dir.path());
     }
 
     #[test]

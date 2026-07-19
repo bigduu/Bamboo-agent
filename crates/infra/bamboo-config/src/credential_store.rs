@@ -882,6 +882,57 @@ impl CredentialStore {
         Ok((bytes, expected_revision, remaining_required))
     }
 
+    /// Compensate an exact transaction without overwriting a later writer.
+    /// Only a touched entry that still equals the transaction's initial
+    /// staged value is restored to its immutable base value. Unrelated entries
+    /// and same-ref winners are retained.
+    pub(crate) fn rollback_exact_transaction_documents(
+        original: &[u8],
+        initial_staged: &[u8],
+        current: &[u8],
+        touched_refs: &[String],
+    ) -> ConfigStoreResult<(Vec<u8>, u64, bool)> {
+        let original = Self::parse_transaction_document(original, true)?;
+        let initial_staged = Self::parse_transaction_document(initial_staged, false)?;
+        let current_document = Self::parse_transaction_document(current, false)?;
+        let expected_revision = current_document.revision;
+        let touched_refs = parse_credential_ref_list(touched_refs)?;
+        let mut rolled_back = current_document.data.clone();
+        let mut changed = false;
+
+        for reference in touched_refs {
+            let staged_entry = initial_staged.data.entries.get(&reference);
+            let current_entry = current_document.data.entries.get(&reference);
+            if current_entry != staged_entry {
+                continue;
+            }
+            match original.data.entries.get(&reference) {
+                Some(entry) if current_entry != Some(entry) => {
+                    rolled_back.entries.insert(reference, entry.clone());
+                    changed = true;
+                }
+                None if current_entry.is_some() => {
+                    rolled_back.entries.remove(&reference);
+                    changed = true;
+                }
+                Some(_) | None => {}
+            }
+        }
+        validate_document(&rolled_back).map_err(ConfigStoreError::Validation)?;
+        if !changed {
+            return Ok((current.to_vec(), expected_revision, false));
+        }
+        let revision = current_document.revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+        })?;
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": rolled_back,
+        }))?;
+        Ok((bytes, expected_revision, true))
+    }
+
     pub(crate) fn ensure_required_refs_in_bytes(
         bytes: &[u8],
         required_refs: &[String],

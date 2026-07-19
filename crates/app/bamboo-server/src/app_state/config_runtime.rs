@@ -1557,6 +1557,10 @@ impl AppState {
                         &mut candidate,
                         expected_revision,
                     )?;
+                // The exact transaction patches the current raw root document.
+                // Reload it before publication so an external edit already
+                // present when staging began is retained in live memory too.
+                let candidate = Config::from_data_dir_without_publish(Some(data_dir));
                 Ok::<_, ConfigStoreError>((candidate, revision))
             })
             .await
