@@ -2012,9 +2012,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                     .files
                     .iter()
                     .find(|file| file.name == CREDENTIALS_FILE)
-                    .is_some_and(|file| {
-                        file.touched_credential_refs == ["proxy.default.auth".to_string()]
-                    })
+                    .is_some_and(|file| file.touched_credential_refs.len() == 1)
         }
         (true, None) => manifest.files.len() == 3 && unique.contains(PROVIDERS_FILE),
         (false, Some(_)) => false,
@@ -2447,6 +2445,81 @@ mod tests {
             std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
             credentials_before
         );
+    }
+
+    #[test]
+    fn custom_proxy_only_ref_replace_and_clear_resume_without_touching_other_credentials() {
+        let _key = crate::encryption::set_test_encryption_key([0x9b; 32]);
+        for replacement in [
+            Some(crate::ProxyAuth {
+                username: "replacement-user".to_string(),
+                password: "replacement-password".to_string(),
+            }),
+            None,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let custom = CredentialRef::parse("proxy.historical.custom").unwrap();
+            let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+            let store = CredentialStore::open(dir.path());
+            store
+                .replace(
+                    custom.clone(),
+                    &serde_json::to_string(&crate::ProxyAuth {
+                        username: "original-user".to_string(),
+                        password: "original-password".to_string(),
+                    })
+                    .unwrap(),
+                    crate::CredentialSource::User,
+                    0,
+                )
+                .unwrap();
+            store
+                .replace(
+                    unrelated.clone(),
+                    "unrelated-provider-secret",
+                    crate::CredentialSource::User,
+                    store.revision().unwrap(),
+                )
+                .unwrap();
+            let mut initial = crate::Config::default();
+            initial.proxy_auth_credential_ref = Some(custom.clone());
+            initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+            let mut candidate =
+                crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+            candidate.proxy_auth = replacement.clone();
+            let intents = BTreeSet::from(["__proxy_auth".to_string()]);
+
+            assert!(persist_provider_credential_transaction_inner(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                Some(MigrationFault::AfterManifest),
+            )
+            .is_err());
+            assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+
+            let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+            assert!(outcome.resumed);
+            ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+            let root: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(root["proxy_auth_credential_ref"], custom.as_str());
+            match replacement {
+                Some(expected) => {
+                    let resolved: crate::ProxyAuth =
+                        serde_json::from_str(store.resolve(&custom).unwrap().unwrap().expose())
+                            .unwrap();
+                    assert_eq!(resolved.username, expected.username);
+                    assert_eq!(resolved.password, expected.password);
+                }
+                None => assert!(store.resolve(&custom).unwrap().is_none()),
+            }
+            assert_eq!(
+                store.resolve(&unrelated).unwrap().unwrap().expose(),
+                "unrelated-provider-secret"
+            );
+        }
     }
 
     #[test]
