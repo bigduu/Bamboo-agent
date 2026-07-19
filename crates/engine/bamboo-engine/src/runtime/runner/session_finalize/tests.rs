@@ -5,7 +5,9 @@ use super::finalize_session;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::{AgentRuntimeState, TaskItem, TaskItemStatus, TaskList};
+use bamboo_domain::{AgentRuntimeState, AgentStatusState, TaskItem, TaskItemStatus, TaskList};
+use bamboo_skills::{SkillManager, SkillStoreConfig};
+use std::sync::Arc;
 
 fn completed_task_list(session_id: &str) -> TaskList {
     TaskList {
@@ -119,4 +121,74 @@ async fn finalize_session_syncs_task_context_and_emits_task_completed() {
         Some("0")
     );
     assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn finalize_releases_completed_activation_but_retains_suspended_activation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let skill_root = directory.path().join("skills/finalize-demo");
+    tokio::fs::create_dir_all(&skill_root)
+        .await
+        .expect("skill root");
+    tokio::fs::write(
+        skill_root.join("SKILL.md"),
+        "---\nname: finalize-demo\ndescription: finalize\n---\nfinalize\n",
+    )
+    .await
+    .expect("skill");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize");
+    let ids = vec!["finalize-demo".to_string()];
+    for session_id in ["completed-pin", "suspended-pin"] {
+        manager
+            .store()
+            .pin_current_activation(session_id, &ids, None)
+            .await
+            .expect("pin activation");
+    }
+    let config = AgentLoopConfig {
+        skill_manager: Some(manager.clone()),
+        ..Default::default()
+    };
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let mut completed_session = Session::new("completed-pin", "model");
+    finalize_session(
+        None,
+        &mut completed_session,
+        &event_tx,
+        "completed-pin",
+        &config,
+        None,
+        true,
+        &mut AgentRuntimeState::new("completed-pin"),
+    )
+    .await;
+    assert!(manager
+        .store()
+        .activation_descriptor("completed-pin")
+        .await
+        .is_none());
+
+    let mut suspended_session = Session::new("suspended-pin", "model");
+    let mut suspended_state = AgentRuntimeState::new("suspended-pin");
+    suspended_state.status = AgentStatusState::Suspended;
+    finalize_session(
+        None,
+        &mut suspended_session,
+        &event_tx,
+        "suspended-pin",
+        &config,
+        None,
+        true,
+        &mut suspended_state,
+    )
+    .await;
+    assert!(manager
+        .store()
+        .activation_descriptor("suspended-pin")
+        .await
+        .is_some());
 }

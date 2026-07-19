@@ -16,7 +16,7 @@ pub use catalog::{
     WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource,
     WorkflowStatus,
 };
-pub use store::{SkillStore, SkillUpdate};
+pub use store::{SkillActivationDescriptor, SkillStore, SkillUpdate};
 pub use types::*;
 
 use std::collections::{BTreeSet, HashSet};
@@ -165,6 +165,13 @@ fn invocation_allowed_skill_ids<'a>(
 #[derive(Clone)]
 pub struct SkillManager {
     store: Arc<SkillStore>,
+    activation_scope_coordinator: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillActivationSelection {
+    pub skills: Vec<SkillDefinition>,
+    pub descriptor: SkillActivationDescriptor,
 }
 
 impl SkillManager {
@@ -172,6 +179,7 @@ impl SkillManager {
     pub fn new() -> Self {
         Self {
             store: Arc::new(SkillStore::default()),
+            activation_scope_coordinator: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -179,6 +187,7 @@ impl SkillManager {
     pub fn with_config(config: SkillStoreConfig) -> Self {
         Self {
             store: Arc::new(SkillStore::new(config)),
+            activation_scope_coordinator: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -207,26 +216,15 @@ impl SkillManager {
         }
     }
 
-    async fn list_skills_for_selection_from_store(
-        store: &SkillStore,
+    fn filter_skills_for_selection(
+        skills: Vec<SkillDefinition>,
+        catalog: &WorkflowCatalogSnapshot,
         disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
-        selected_skill_mode: Option<&str>,
     ) -> Vec<SkillDefinition> {
-        let (skills, catalog) = match store.skills_and_catalog_for_mode(selected_skill_mode).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(
-                    "Failed to resolve skills and workflow policy for mode {:?}: {}",
-                    selected_skill_mode,
-                    error
-                );
-                return Vec::new();
-            }
-        };
         let skills = filter_disabled_skills(skills, disabled_skill_ids);
         let Some(selected_skill_ids) = selected_skill_ids else {
-            let automatic_ids = invocation_allowed_skill_ids(&catalog, "automatic");
+            let automatic_ids = invocation_allowed_skill_ids(catalog, "automatic");
             return skills
                 .into_iter()
                 .filter(|skill| automatic_ids.contains(skill.id.as_str()))
@@ -239,14 +237,14 @@ impl SkillManager {
             .filter(|id| !id.is_empty())
             .collect();
         if selected_set.is_empty() {
-            let automatic_ids = invocation_allowed_skill_ids(&catalog, "automatic");
+            let automatic_ids = invocation_allowed_skill_ids(catalog, "automatic");
             return skills
                 .into_iter()
                 .filter(|skill| automatic_ids.contains(skill.id.as_str()))
                 .collect();
         }
 
-        let explicit_ids = invocation_allowed_skill_ids(&catalog, "explicit");
+        let explicit_ids = invocation_allowed_skill_ids(catalog, "explicit");
         let denied: Vec<&str> = selected_set
             .iter()
             .copied()
@@ -280,6 +278,65 @@ impl SkillManager {
         }
 
         filtered
+    }
+
+    async fn list_skills_for_selection_from_store(
+        store: &SkillStore,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+    ) -> Vec<SkillDefinition> {
+        let (skills, catalog) = match store.skills_and_catalog_for_mode(selected_skill_mode).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to resolve skills and workflow policy for mode {:?}: {}",
+                    selected_skill_mode,
+                    error
+                );
+                return Vec::new();
+            }
+        };
+        Self::filter_skills_for_selection(skills, &catalog, disabled_skill_ids, selected_skill_ids)
+    }
+
+    async fn resolve_and_pin_activation_from_store(
+        store: &SkillStore,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+    ) -> SkillResult<SkillActivationSelection> {
+        // All four values are cloned under the store's publication read lock.
+        // A watcher may publish after this await, but this activation only consumes
+        // these correlated generation-N clones and can never mix them with N+1.
+        let (skills, roots, resources, catalog) = store
+            .activation_source_for_mode(selected_skill_mode)
+            .await?;
+        let mut selected = Self::filter_skills_for_selection(
+            skills,
+            &catalog,
+            disabled_skill_ids,
+            selected_skill_ids,
+        );
+        if selected_skill_ids.is_none() {
+            selected = shortlist_skills_for_context(selected, request_hint);
+        }
+        let descriptor = store
+            .pin_activation_from_source(
+                activation_id,
+                selected_skill_mode,
+                &selected,
+                &roots,
+                &resources,
+                &catalog,
+            )
+            .await?;
+        Ok(SkillActivationSelection {
+            skills: selected,
+            descriptor,
+        })
     }
 
     pub(crate) async fn list_skills_for_selection(
@@ -357,6 +414,30 @@ impl SkillManager {
         skills
     }
 
+    /// Resolve policy-aware prompt candidates and pin their exact published
+    /// definition/resource generation for one runtime activation.
+    pub async fn resolve_and_pin_activation_for_request_with_mode(
+        &self,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+    ) -> SkillResult<SkillActivationSelection> {
+        let _scope_guard = self.activation_scope_coordinator.lock().await;
+        self.prepare_activation_scope(activation_id, &self.store)
+            .await;
+        Self::resolve_and_pin_activation_from_store(
+            self.store.as_ref(),
+            activation_id,
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            request_hint,
+        )
+        .await
+    }
+
     /// Resolve prompt-visible skills against the same isolated store used by a
     /// session's workspace catalog.
     pub async fn resolve_skills_for_request_in_workspace_with_mode(
@@ -380,6 +461,102 @@ impl SkillManager {
             skills = shortlist_skills_for_context(skills, request_hint);
         }
         Ok(skills)
+    }
+
+    pub async fn resolve_and_pin_activation_in_workspace_with_mode(
+        &self,
+        workspace: &Path,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+    ) -> SkillResult<SkillActivationSelection> {
+        let store = self.store.skill_store_for_workspace(workspace).await?;
+        let _scope_guard = self.activation_scope_coordinator.lock().await;
+        self.prepare_activation_scope(activation_id, &store).await;
+        Self::resolve_and_pin_activation_from_store(
+            store.as_ref(),
+            activation_id,
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            request_hint,
+        )
+        .await
+    }
+
+    async fn prepare_activation_scope(&self, activation_id: &str, target: &Arc<SkillStore>) {
+        let mut has_non_target_owner = self
+            .store
+            .activation_descriptor(activation_id)
+            .await
+            .is_some()
+            && !Arc::ptr_eq(&self.store, target);
+        for store in self.store.cached_workspace_stores().await {
+            if store.activation_descriptor(activation_id).await.is_some()
+                && !Arc::ptr_eq(&store, target)
+            {
+                has_non_target_owner = true;
+                break;
+            }
+        }
+        if has_non_target_owner {
+            self.store
+                .release_activation_across_cached_scopes(activation_id)
+                .await;
+        }
+    }
+
+    pub async fn pin_current_activation_for_workspace(
+        &self,
+        activation_id: &str,
+        workspace: Option<&Path>,
+        selected_skill_ids: &[String],
+        selected_skill_mode: Option<&str>,
+    ) -> SkillResult<SkillActivationDescriptor> {
+        let store = self.store_for_workspace(workspace).await?;
+        let _scope_guard = self.activation_scope_coordinator.lock().await;
+        self.prepare_activation_scope(activation_id, &store).await;
+        store
+            .pin_current_activation(activation_id, selected_skill_ids, selected_skill_mode)
+            .await
+    }
+
+    pub async fn pinned_allowed_tools_for_workspace(
+        &self,
+        activation_id: &str,
+        workspace: Option<&Path>,
+        disabled_skill_ids: &BTreeSet<String>,
+    ) -> SkillResult<Option<Vec<String>>> {
+        let store = self.store_for_workspace(workspace).await?;
+        Ok(store
+            .pinned_allowed_tools(activation_id, disabled_skill_ids)
+            .await)
+    }
+
+    pub async fn pinned_activation_for_workspace(
+        &self,
+        activation_id: &str,
+        workspace: Option<&Path>,
+    ) -> SkillResult<Option<SkillActivationSelection>> {
+        let store = self.store_for_workspace(workspace).await?;
+        Ok(store
+            .pinned_activation_skills(activation_id)
+            .await
+            .map(|(skills, descriptor)| SkillActivationSelection { skills, descriptor }))
+    }
+
+    pub async fn release_activation_for_workspace(
+        &self,
+        activation_id: &str,
+        _workspace: Option<&Path>,
+    ) -> SkillResult<()> {
+        let _scope_guard = self.activation_scope_coordinator.lock().await;
+        self.store
+            .release_activation_across_cached_scopes(activation_id)
+            .await;
+        Ok(())
     }
 
     /// Build system prompt context from a selected subset of skills with mode and user request hint.
@@ -692,5 +869,92 @@ mod tests {
             .find(|entry| entry.id == "steady")
             .expect("recovered catalog entry");
         assert_eq!(recovered.status, WorkflowStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn activation_scope_moves_atomically_between_workspaces_without_stale_revival() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace_a = directory.path().join("a");
+        let workspace_b = directory.path().join("b");
+        for (workspace, prompt) in [(&workspace_a, "prompt A"), (&workspace_b, "prompt B")] {
+            let skill = workspace.join(".bamboo/skills/scope-demo");
+            fs::create_dir_all(&skill).await.expect("skill root");
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: scope-demo\ndescription: scope\n---\n{prompt}\n"),
+            )
+            .await
+            .expect("skill");
+        }
+        let manager = std::sync::Arc::new(SkillManager::with_config(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        }));
+        manager.initialize().await.expect("initialize");
+        let ids = vec!["scope-demo".to_string()];
+        for (workspace, expected) in [
+            (&workspace_a, "prompt A"),
+            (&workspace_b, "prompt B"),
+            (&workspace_a, "prompt A"),
+        ] {
+            let selection = manager
+                .resolve_and_pin_activation_in_workspace_with_mode(
+                    workspace,
+                    "moving-session",
+                    &BTreeSet::new(),
+                    Some(&ids),
+                    None,
+                    None,
+                )
+                .await
+                .expect("move activation");
+            assert_eq!(selection.skills[0].prompt, expected);
+            let mut owners = 0;
+            for store in manager.store.cached_workspace_stores().await {
+                owners += usize::from(
+                    store
+                        .activation_descriptor("moving-session")
+                        .await
+                        .is_some(),
+                );
+            }
+            assert_eq!(owners, 1);
+        }
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for workspace in [workspace_a.clone(), workspace_b.clone()] {
+            let manager = manager.clone();
+            let ids = ids.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                manager
+                    .resolve_and_pin_activation_in_workspace_with_mode(
+                        &workspace,
+                        "concurrent-session",
+                        &BTreeSet::new(),
+                        Some(&ids),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("concurrent pin");
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            task.await.expect("pin task");
+        }
+        let mut owners = 0;
+        for store in manager.store.cached_workspace_stores().await {
+            owners += usize::from(
+                store
+                    .activation_descriptor("concurrent-session")
+                    .await
+                    .is_some(),
+            );
+        }
+        assert_eq!(owners, 1, "coordinator must prevent duplicate scope owners");
     }
 }

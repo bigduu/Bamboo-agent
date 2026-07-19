@@ -19,6 +19,7 @@ thiserror = "2"
 async-trait = "0.1"
 walkdir = "2"
 notify = "8"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
