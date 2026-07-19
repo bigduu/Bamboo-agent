@@ -195,7 +195,8 @@ impl AppState {
             bamboo_home_dir.join("notification_preferences.json"),
         ));
         let session_watchers = super::watchers::SessionWatchers::new();
-        let mcp_manager = init_mcp_manager(config.clone());
+        let (mcp_manager, _legacy_mcp_bootstrap) =
+            init_mcp_manager(config.clone(), &bamboo_home_dir);
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
 

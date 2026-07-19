@@ -28,6 +28,11 @@ pub struct ConfigWatcherRuntime {
     apply_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+struct ConfigPathChanges {
+    paths: Vec<PathBuf>,
+    initial_mcp: bool,
+}
+
 impl ConfigWatcherRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
@@ -80,14 +85,22 @@ impl ConfigWatcherRuntime {
         // The filesystem side must never block in send: Drop joins this OS
         // thread after aborting the async consumer, so a bounded blocking_send
         // could deadlock shutdown if its queue were full.
-        let (changes_tx, mut changes_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        let self_write_marker = watcher.self_write_marker();
+        let (changes_tx, mut changes_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ConfigPathChanges>();
         let initial_changes = changes_tx.clone();
         let worker_stop = stop.clone();
         let watcher_task = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match watcher.recv_timeout(Duration::from_millis(250)) {
                     Ok(paths) => {
-                        if changes_tx.send(paths).is_err() {
+                        if changes_tx
+                            .send(ConfigPathChanges {
+                                paths,
+                                initial_mcp: false,
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -103,17 +116,20 @@ impl ConfigWatcherRuntime {
         // published runtime snapshot.
         let initial_mcp_path = data_dir.join("mcp.json");
         if initial_mcp_path.exists() {
-            let _ = initial_changes.send(vec![initial_mcp_path]);
+            let _ = initial_changes.send(ConfigPathChanges {
+                paths: vec![initial_mcp_path],
+                initial_mcp: true,
+            });
         }
 
         let apply_provider_health = provider_health.clone();
         let apply_mcp_health = mcp_health.clone();
         let apply_task = tokio::spawn(async move {
-            while let Some(paths) = changes_rx.recv().await {
-                let provider_watched = paths.iter().any(|path| {
+            while let Some(changes) = changes_rx.recv().await {
+                let provider_watched = changes.paths.iter().any(|path| {
                     path.file_name().and_then(|name| name.to_str()) == Some("providers.json")
                 });
-                let mcp_watched = paths.iter().any(|path| {
+                let mcp_watched = changes.paths.iter().any(|path| {
                     path.file_name().and_then(|name| name.to_str()) == Some("mcp.json")
                 });
                 if !provider_watched && !mcp_watched {
@@ -169,25 +185,44 @@ impl ConfigWatcherRuntime {
                         &mcp_store,
                         current_revision,
                         current_config,
+                        changes.initial_mcp,
                     )
                     .await;
                     match result {
-                        Ok((candidate_config, candidate_revision)) => {
+                        Ok(candidate) => {
+                            if candidate.normalized_external_revision
+                                || candidate.source_kind == SectionSourceKind::Backup
+                            {
+                                // Normalization writes the primary and backup
+                                // recovery quarantines it. Suppress only that
+                                // exact watcher echo; a later external write has
+                                // a different fingerprint and remains visible.
+                                self_write_marker.mark_self_write(mcp_store.path());
+                            }
                             match mcp_manager
-                                .reconcile_from_config_transactional(&candidate_config.mcp)
+                                .reconcile_from_config_transactional(&candidate.config.mcp)
                                 .await
                             {
                                 Ok(()) => {
                                     let recovered = section_is_unhealthy(&apply_mcp_health);
-                                    config.write().await.mcp = candidate_config.mcp.clone();
-                                    publish_section_success(
-                                        &apply_mcp_health,
-                                        &account_sink,
-                                        "mcp",
-                                        data_dir.join("mcp.json"),
-                                        recovered,
-                                        Some(candidate_revision),
-                                    );
+                                    config.write().await.mcp = candidate.config.mcp.clone();
+                                    if candidate.source_kind == SectionSourceKind::Backup {
+                                        publish_mcp_backup_lkg(
+                                            &apply_mcp_health,
+                                            &account_sink,
+                                            candidate.source_path,
+                                            candidate.revision,
+                                        );
+                                    } else {
+                                        publish_section_success(
+                                            &apply_mcp_health,
+                                            &account_sink,
+                                            "mcp",
+                                            data_dir.join("mcp.json"),
+                                            recovered,
+                                            Some(candidate.revision),
+                                        );
+                                    }
                                 }
                                 Err(_) => publish_section_failure(
                                     &apply_mcp_health,
@@ -279,6 +314,33 @@ fn publish_section_failure(
         None,
         &AgentEvent::ConfigInvalid {
             section: section.to_string(),
+            revision,
+        },
+    );
+}
+
+fn publish_mcp_backup_lkg(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    source_path: PathBuf,
+    revision: u64,
+) {
+    {
+        let mut health = health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        health.revision = revision;
+        health.loaded_at = Utc::now();
+        health.source_path = source_path;
+        health.source_kind = SectionSourceKind::Backup;
+        health.status = SectionStatus::Degraded;
+        health.last_error =
+            Some("primary MCP section invalid; running last-known-good backup runtime".to_string());
+    }
+    account_sink.record(
+        None,
+        &AgentEvent::ConfigInvalid {
+            section: "mcp".to_string(),
             revision,
         },
     );
@@ -429,7 +491,8 @@ async fn load_and_validate_mcp_candidate(
     store: &AtomicJsonStore<McpConfig>,
     current_revision: u64,
     mut candidate_config: Config,
-) -> Result<(Config, u64), ProviderCandidateError> {
+    allow_startup_backup: bool,
+) -> Result<McpCandidate, ProviderCandidateError> {
     for _ in 0..3 {
         if store.path().exists() {
             break;
@@ -445,14 +508,32 @@ async fn load_and_validate_mcp_candidate(
         .load_validated_for_reload(current_revision, &candidate_config.mcp, validate_mcp_config)
         .map_err(|_| ProviderCandidateError::invalid("MCP section is invalid"))?
         .ok_or_else(|| ProviderCandidateError::missing_section("MCP section is missing"))?;
-    if stored.recovered_from_backup {
+    if stored.recovered_from_backup && !allow_startup_backup {
         return Err(ProviderCandidateError::invalid(
             "primary MCP section is invalid; retaining last-known-good runtime",
         ));
     }
     candidate_config.mcp = stored.data;
     candidate_config.hydrate_mcp_secrets_from_encrypted();
-    Ok((candidate_config, stored.revision))
+    Ok(McpCandidate {
+        config: candidate_config,
+        revision: stored.revision,
+        source_kind: if stored.recovered_from_backup {
+            SectionSourceKind::Backup
+        } else {
+            SectionSourceKind::File
+        },
+        source_path: stored.source_path,
+        normalized_external_revision: stored.normalized_external_revision,
+    })
+}
+
+struct McpCandidate {
+    config: Config,
+    revision: u64,
+    source_kind: SectionSourceKind,
+    source_path: PathBuf,
+    normalized_external_revision: bool,
 }
 
 fn validate_mcp_config(config: &McpConfig) -> Result<(), String> {
@@ -1260,6 +1341,31 @@ mod live_reload_tests {
             next_mcp_config_event(&mut feed).await,
             AgentEvent::ConfigRecovered { revision: 2, .. }
         ));
+
+        // Reusing the live revision with different content forces the shared
+        // store to normalize it to revision 3. The normalization write itself
+        // must be suppressed exactly once rather than triggering a duplicate
+        // reconcile/event.
+        std::fs::write(
+            &path,
+            mcp_document_bytes(2, &disabled_mcp_config("normalized")),
+        )
+        .unwrap();
+        let normalized = wait_for_mcp_health(&state, SectionStatus::Healthy, 3).await;
+        assert_eq!(normalized.revision, 3);
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "normalized");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigChanged { revision: 3, .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), feed.recv())
+                .await
+                .is_err()
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["revision"], 3);
     }
 
     #[tokio::test]
@@ -1280,6 +1386,66 @@ mod live_reload_tests {
             state.config.read().await.mcp.servers[0].id,
             "startup-sidecar"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_startup_uses_valid_backup_and_reports_degraded_invalid_health() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x48; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let store = AtomicJsonStore::new(&path, 1);
+        store
+            .commit(0, disabled_mcp_config("backup-lkg"), validate_mcp_config)
+            .unwrap();
+        store
+            .commit(1, disabled_mcp_config("new-primary"), validate_mcp_config)
+            .unwrap();
+        std::fs::write(&path, b"{corrupt-primary").unwrap();
+
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let health = wait_for_mcp_health(&state, SectionStatus::Degraded, 1).await;
+        assert_eq!(health.revision, 1);
+        assert_eq!(health.source_kind, SectionSourceKind::Backup);
+        assert_eq!(health.source_path, path.with_extension("json.bak"));
+        assert!(health
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("last-known-good backup runtime"));
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "backup-lkg");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.account_sink.latest_seq() > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigInvalid { section, revision }
+                        if section == "mcp" && *revision == 1
+                ))
+                .count(),
+            1
+        );
+        let stable_health = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(stable_health.status, SectionStatus::Degraded);
+        assert_eq!(stable_health.source_kind, SectionSourceKind::Backup);
+        assert_eq!(stable_health.source_path, path.with_extension("json.bak"));
     }
 
     #[tokio::test]

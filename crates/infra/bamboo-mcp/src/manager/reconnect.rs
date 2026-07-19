@@ -38,9 +38,11 @@ impl McpServerManager {
 
         loop {
             // Check if shutdown was requested
-            if runtime.shutdown.load(Ordering::SeqCst) {
+            if runtime.shutdown.load(Ordering::SeqCst)
+                || !self.is_current_runtime(&server_id, &runtime)
+            {
                 info!(
-                    "Reconnection cancelled due to shutdown for MCP server '{}'",
+                    "Reconnection cancelled due to shutdown or replacement for MCP server '{}'",
                     server_id
                 );
                 runtime.reconnecting.store(false, Ordering::SeqCst);
@@ -49,6 +51,13 @@ impl McpServerManager {
 
             // Check max attempts
             if reconnect_config.max_attempts > 0 && attempt >= reconnect_config.max_attempts {
+                let reconcile = self.reconcile_lock.lock().await;
+                if runtime.shutdown.load(Ordering::SeqCst)
+                    || !self.is_current_runtime(&server_id, &runtime)
+                {
+                    runtime.reconnecting.store(false, Ordering::SeqCst);
+                    return Ok(());
+                }
                 error!(
                     "Max reconnection attempts ({}) reached for MCP server '{}'",
                     reconnect_config.max_attempts, server_id
@@ -59,6 +68,7 @@ impl McpServerManager {
                 info.status = ServerStatus::Error;
                 info.last_error = Some("Max reconnection attempts reached".to_string());
                 info.disconnected_at = Some(Utc::now());
+                drop(info);
 
                 // Emit error event
                 if let Some(ref tx) = self.event_tx {
@@ -70,6 +80,7 @@ impl McpServerManager {
                         })
                         .await;
                 }
+                drop(reconcile);
 
                 runtime.reconnecting.store(false, Ordering::SeqCst);
                 return Err(McpError::Connection(format!(
@@ -86,10 +97,27 @@ impl McpServerManager {
 
             // Wait for backoff period
             tokio::time::sleep(Duration::from_millis(current_backoff)).await;
+            if runtime.shutdown.load(Ordering::SeqCst)
+                || !self.is_current_runtime(&server_id, &runtime)
+            {
+                runtime.reconnecting.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
 
             // Attempt reconnection
             match self.reconnect_server(runtime.clone()).await {
-                Ok(_) => {
+                Ok(false) => {
+                    runtime.reconnecting.store(false, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Ok(true) => {
+                    let reconcile = self.reconcile_lock.lock().await;
+                    if runtime.shutdown.load(Ordering::SeqCst)
+                        || !self.is_current_runtime(&server_id, &runtime)
+                    {
+                        runtime.reconnecting.store(false, Ordering::SeqCst);
+                        return Ok(());
+                    }
                     info!(
                         "Successfully reconnected MCP server '{}' after {} attempt(s)",
                         server_id, attempt
@@ -101,6 +129,7 @@ impl McpServerManager {
                     info.last_error = None;
                     info.restart_count += 1;
                     info.disconnected_at = None;
+                    drop(info);
 
                     // Emit recovery event
                     if let Some(ref tx) = self.event_tx {
@@ -112,11 +141,19 @@ impl McpServerManager {
                             })
                             .await;
                     }
+                    drop(reconcile);
 
                     runtime.reconnecting.store(false, Ordering::SeqCst);
                     return Ok(());
                 }
                 Err(e) => {
+                    let reconcile = self.reconcile_lock.lock().await;
+                    if runtime.shutdown.load(Ordering::SeqCst)
+                        || !self.is_current_runtime(&server_id, &runtime)
+                    {
+                        runtime.reconnecting.store(false, Ordering::SeqCst);
+                        return Ok(());
+                    }
                     warn!(
                         "Reconnection attempt {} failed for MCP server '{}': {}",
                         attempt, server_id, e
@@ -125,6 +162,8 @@ impl McpServerManager {
                     // Update error info
                     let mut info = runtime.info.write().await;
                     info.last_error = Some(e.to_string());
+                    drop(info);
+                    drop(reconcile);
 
                     // Calculate next backoff with exponential increase
                     if reconnect_config.max_backoff_ms > current_backoff {
@@ -137,7 +176,7 @@ impl McpServerManager {
     }
 
     /// Internal method to reconnect a single server.
-    async fn reconnect_server(&self, runtime: Arc<ServerRuntime>) -> Result<()> {
+    async fn reconnect_server(&self, runtime: Arc<ServerRuntime>) -> Result<bool> {
         let server_id = runtime.config.id.clone();
 
         info!("Attempting to reconnect MCP server '{}'", server_id);
@@ -154,6 +193,37 @@ impl McpServerManager {
             .bootstrap_server_client(&server_id, &runtime.config, "reconnect")
             .await?;
 
+        Ok(self
+            .publish_reconnected_runtime_if_current(
+                &server_id,
+                &runtime,
+                client,
+                tools,
+                instructions,
+                notification_rx,
+            )
+            .await)
+    }
+
+    pub(super) async fn publish_reconnected_runtime_if_current(
+        &self,
+        server_id: &str,
+        runtime: &Arc<ServerRuntime>,
+        mut client: McpProtocolClient,
+        tools: Vec<McpTool>,
+        instructions: Option<String>,
+        notification_rx: Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
+    ) -> bool {
+        // Bootstrap may span a replacement. Serialize this final generation
+        // check with transactional commit before touching runtime state or the
+        // shared tool index.
+        let _reconcile = self.reconcile_lock.lock().await;
+        if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
+            drop(_reconcile);
+            let _ = client.disconnect().await;
+            return false;
+        }
+
         // Update client
         {
             let mut client_lock = runtime.client.write().await;
@@ -164,7 +234,7 @@ impl McpServerManager {
         // an immediate `tools/list_changed` refreshes against the NEW connection
         // (not the old, disconnected one). (#420)
         if let Some(rx) = notification_rx {
-            self.spawn_notification_drain(server_id.clone(), runtime.clone(), rx);
+            self.spawn_notification_drain(server_id.to_string(), runtime.clone(), rx);
         }
 
         // Update tools
@@ -180,9 +250,9 @@ impl McpServerManager {
         }
 
         // Re-register tools in index
-        self.index.remove_server_tools(&server_id);
+        self.index.remove_server_tools(server_id);
         let aliases = self.index.register_server_tools(
-            &server_id,
+            server_id,
             &tools,
             &runtime.config.allowed_tools,
             &runtime.config.denied_tools,
@@ -199,13 +269,13 @@ impl McpServerManager {
             let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
                 .send(McpEvent::ToolsChanged {
-                    server_id,
+                    server_id: server_id.to_string(),
                     tools: tool_names,
                 })
                 .await;
         }
 
-        Ok(())
+        true
     }
 
     pub(super) async fn bootstrap_server_client(

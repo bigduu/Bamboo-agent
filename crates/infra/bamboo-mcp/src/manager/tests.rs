@@ -532,6 +532,21 @@ fn insert_mock_runtime(
     runtime
 }
 
+async fn connected_mock_client() -> McpProtocolClient {
+    let transport = NotifyingMockTransport::new(&[], &[]);
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect mock runtime");
+    client
+}
+
+fn marker_tool(name: &str) -> McpTool {
+    McpTool {
+        name: name.to_string(),
+        description: format!("{name} marker"),
+        parameters: serde_json::json!({"type": "object"}),
+    }
+}
+
 #[tokio::test]
 async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_index() {
     let manager = McpServerManager::new();
@@ -584,6 +599,94 @@ async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_in
         ServerStatus::Ready,
         "failed candidate must not stop or degrade the old runtime"
     );
+}
+
+#[tokio::test]
+async fn detached_refresh_cannot_overwrite_replacement_tool_index() {
+    let manager = McpServerManager::new();
+    let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let replacement = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    manager.index.remove_server_tools("stable");
+    manager
+        .index
+        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[]);
+
+    assert!(
+        !manager
+            .publish_refreshed_tools_if_current("stable", &old, vec![marker_tool("stale_refresh")])
+            .await
+    );
+    assert!(manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "replacement")));
+    assert!(!manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "stale_refresh")));
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("stable").unwrap().value(),
+        &replacement
+    ));
+}
+
+#[tokio::test]
+async fn detached_reconnect_cannot_overwrite_replacement_tool_index() {
+    let manager = McpServerManager::new();
+    let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let replacement = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    manager.index.remove_server_tools("stable");
+    manager
+        .index
+        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[]);
+
+    assert!(
+        !manager
+            .publish_reconnected_runtime_if_current(
+                "stable",
+                &old,
+                connected_mock_client().await,
+                vec![marker_tool("stale_reconnect")],
+                Some("stale instructions".to_string()),
+                None,
+            )
+            .await
+    );
+    assert!(manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "replacement")));
+    assert!(!manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "stale_reconnect")));
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("stable").unwrap().value(),
+        &replacement
+    ));
+}
+
+#[tokio::test]
+async fn detached_generation_cannot_publish_health_or_reconnect_status() {
+    let (event_tx, mut event_rx) = mpsc::channel(4);
+    let manager = McpServerManager::new().with_event_channel(event_tx);
+    let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let _replacement = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let initial = old.info.read().await.clone();
+
+    assert_eq!(
+        manager
+            .publish_health_result_if_current(
+                "stable",
+                &old,
+                Err("stale ping failure".to_string()),
+            )
+            .await,
+        None
+    );
+    manager.attempt_reconnection(old.clone()).await.unwrap();
+
+    let after = old.info.read().await;
+    assert_eq!(after.status, initial.status);
+    assert_eq!(after.last_error, initial.last_error);
+    assert!(!old.reconnecting.load(Ordering::SeqCst));
+    assert!(event_rx.try_recv().is_err());
 }
 
 #[tokio::test]

@@ -252,8 +252,13 @@ struct RevisionedDocument<T> {
 pub struct StoredValue<T> {
     pub data: T,
     pub revision: u64,
+    /// The exact primary or backup file that supplied `data`.
+    pub source_path: PathBuf,
     pub recovered_from_backup: bool,
     pub quarantine_path: Option<PathBuf>,
+    /// True when an external edit reused/went behind the live revision and the
+    /// store durably rewrote it with a fresh monotonic revision.
+    pub normalized_external_revision: bool,
 }
 
 /// A versioned JSON store with compare-and-swap writes.
@@ -313,8 +318,10 @@ where
             Ok(document) => Ok(Some(StoredValue {
                 data: document.data,
                 revision: document.revision,
+                source_path: self.path().to_path_buf(),
                 recovered_from_backup: false,
                 quarantine_path: None,
+                normalized_external_revision: false,
             })),
             Err(primary_error) => {
                 let quarantine_path = Some(self.file.quarantine_primary_locked(&primary)?);
@@ -328,8 +335,10 @@ where
                         return Ok(Some(StoredValue {
                             data: document.data,
                             revision: document.revision,
+                            source_path: backup,
                             recovered_from_backup: true,
                             quarantine_path,
+                            normalized_external_revision: false,
                         }));
                     }
                 }
@@ -377,6 +386,7 @@ where
                 Ok(serde_json::to_vec_pretty(&parsed)?)
             })?;
             stored.revision = revision;
+            stored.normalized_external_revision = true;
         }
         Ok(Some(stored))
     }
@@ -719,6 +729,20 @@ pub struct ConfigDirectoryWatcher {
     self_writes: SelfWriteMarkers,
 }
 
+/// Cloneable marker used by async section applicators after an internal
+/// normalization write. Suppression remains content-exact, so a later external
+/// edit of the same path is never hidden.
+#[derive(Clone)]
+pub struct ConfigSelfWriteMarker {
+    self_writes: SelfWriteMarkers,
+}
+
+impl ConfigSelfWriteMarker {
+    pub fn mark_self_write(&self, path: impl Into<PathBuf>) {
+        mark_self_write(&self.self_writes, path.into());
+    }
+}
+
 type SelfWriteMarker = (Instant, Option<Vec<u8>>);
 type SelfWriteMarkers = Arc<Mutex<HashMap<PathBuf, SelfWriteMarker>>>;
 
@@ -776,17 +800,27 @@ impl ConfigDirectoryWatcher {
     }
 
     pub fn mark_self_write(&self, path: impl Into<PathBuf>) {
-        let path = normalize_path(path.into());
-        let fingerprint = std::fs::read(&path).ok();
-        self.self_writes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(path, (Instant::now(), fingerprint));
+        mark_self_write(&self.self_writes, path.into());
+    }
+
+    pub fn self_write_marker(&self) -> ConfigSelfWriteMarker {
+        ConfigSelfWriteMarker {
+            self_writes: Arc::clone(&self.self_writes),
+        }
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<PathBuf>, mpsc::RecvTimeoutError> {
         self.changes.recv_timeout(timeout)
     }
+}
+
+fn mark_self_write(markers: &SelfWriteMarkers, path: PathBuf) {
+    let path = normalize_path(path);
+    let fingerprint = std::fs::read(&path).ok();
+    markers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path, (Instant::now(), fingerprint));
 }
 
 fn collect_event_paths(event: notify::Result<Event>, paths: &mut BTreeSet<PathBuf>) {

@@ -258,6 +258,12 @@ impl McpServerManager {
         self.runtimes.contains_key(server_id)
     }
 
+    fn is_current_runtime(&self, server_id: &str, expected: &Arc<ServerRuntime>) -> bool {
+        self.runtimes
+            .get(server_id)
+            .is_some_and(|runtime| Arc::ptr_eq(runtime.value(), expected))
+    }
+
     /// Shutdown all servers.
     pub async fn shutdown_all(&self) {
         let server_ids: Vec<String> = self.list_servers();
