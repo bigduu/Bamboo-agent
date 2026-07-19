@@ -105,7 +105,7 @@ impl fmt::Debug for SecretValue {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CredentialEntry {
     ciphertext: String,
     source: CredentialSource,
@@ -117,7 +117,7 @@ struct CredentialEntry {
     migration_generation: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct CredentialDocument {
     #[serde(default)]
     entries: BTreeMap<CredentialRef, CredentialEntry>,
@@ -133,6 +133,8 @@ pub(crate) struct PreparedCredentialMigration {
 pub(crate) struct PreparedProviderCredentialUpdate {
     pub bytes: Vec<u8>,
     pub expected_revision: u64,
+    pub touched_refs: Vec<CredentialRef>,
+    pub required_refs: Vec<CredentialRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +379,16 @@ impl CredentialStore {
             return Ok(None);
         }
 
+        let touched_refs = updates
+            .iter()
+            .map(|update| update.reference.clone())
+            .collect::<Vec<_>>();
+        let required_refs = updates
+            .iter()
+            .filter(|update| update.secret.is_some())
+            .map(|update| update.reference.clone())
+            .collect::<Vec<_>>();
+
         let (mut document, health) = self.load_document_with_health()?;
         if health.status == SectionStatus::Degraded {
             return Err(ConfigStoreError::Validation(
@@ -438,6 +450,8 @@ impl CredentialStore {
         Ok(Some(PreparedProviderCredentialUpdate {
             bytes,
             expected_revision: health.revision,
+            touched_refs,
+            required_refs,
         }))
     }
 
@@ -610,7 +624,80 @@ impl CredentialStore {
         ))
     }
 
-    pub(crate) fn validate_document_bytes(bytes: &[u8]) -> ConfigStoreResult<u64> {
+    /// Three-way merge an exact provider transaction after another credential
+    /// writer won its CAS. Unrelated current entries are always retained. For
+    /// each touched ref, a current value different from the transaction base
+    /// wins; otherwise the staged set/clear is applied.
+    pub(crate) fn merge_exact_transaction_documents(
+        original: &[u8],
+        staged: &[u8],
+        current: &[u8],
+        touched_refs: &[String],
+        required_refs: &[String],
+    ) -> ConfigStoreResult<(Vec<u8>, u64)> {
+        let original = Self::parse_transaction_document(original, true)?;
+        let staged = Self::parse_transaction_document(staged, false)?;
+        let current_document = Self::parse_transaction_document(current, false)?;
+        let expected_revision = current_document.revision;
+        let touched_refs = parse_credential_ref_list(touched_refs)?;
+        let required_refs = parse_credential_ref_list(required_refs)?;
+        let mut merged = current_document.data.clone();
+        let mut changed = false;
+
+        for reference in touched_refs {
+            let original_entry = original.data.entries.get(&reference);
+            let current_entry = current_document.data.entries.get(&reference);
+            if current_entry != original_entry {
+                continue;
+            }
+            match staged.data.entries.get(&reference) {
+                Some(entry) if current_entry != Some(entry) => {
+                    merged.entries.insert(reference, entry.clone());
+                    changed = true;
+                }
+                None if current_entry.is_some() => {
+                    merged.entries.remove(&reference);
+                    changed = true;
+                }
+                Some(_) | None => {}
+            }
+        }
+        validate_document(&merged).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(&merged, &required_refs)?;
+        if !changed {
+            return Ok((current.to_vec(), expected_revision));
+        }
+        let revision = current_document.revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+        })?;
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": merged,
+        }))?;
+        Ok((bytes, expected_revision))
+    }
+
+    pub(crate) fn ensure_required_refs_in_bytes(
+        bytes: &[u8],
+        required_refs: &[String],
+    ) -> ConfigStoreResult<()> {
+        let document = Self::parse_transaction_document(bytes, false)?;
+        let required_refs = parse_credential_ref_list(required_refs)?;
+        ensure_required_entries(&document.data, &required_refs)
+    }
+
+    fn parse_transaction_document(
+        bytes: &[u8],
+        allow_empty: bool,
+    ) -> ConfigStoreResult<PreparedCredentialEnvelope> {
+        if bytes.is_empty() && allow_empty {
+            return Ok(PreparedCredentialEnvelope {
+                schema_version: CREDENTIAL_SCHEMA_VERSION,
+                revision: 0,
+                data: CredentialDocument::default(),
+            });
+        }
         let document: PreparedCredentialEnvelope = serde_json::from_slice(bytes)?;
         if document.schema_version != CREDENTIAL_SCHEMA_VERSION {
             return Err(ConfigStoreError::Validation(
@@ -618,7 +705,7 @@ impl CredentialStore {
             ));
         }
         validate_document(&document.data).map_err(ConfigStoreError::Validation)?;
-        Ok(document.revision)
+        Ok(document)
     }
 
     fn load_document(&self) -> ConfigStoreResult<CredentialDocument> {
@@ -662,6 +749,32 @@ impl CredentialStore {
             ),
         })
     }
+}
+
+fn parse_credential_ref_list(values: &[String]) -> ConfigStoreResult<Vec<CredentialRef>> {
+    values
+        .iter()
+        .map(|value| CredentialRef::parse(value.clone()))
+        .collect()
+}
+
+fn ensure_required_entries(
+    document: &CredentialDocument,
+    required_refs: &[CredentialRef],
+) -> ConfigStoreResult<()> {
+    for reference in required_refs {
+        let entry = document.entries.get(reference).ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "provider transaction credential is unavailable".to_string(),
+            )
+        })?;
+        crate::encryption::decrypt(&entry.ciphertext).map_err(|_| {
+            ConfigStoreError::Validation(
+                "provider transaction credential is unavailable".to_string(),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_document(document: &CredentialDocument) -> Result<(), String> {
