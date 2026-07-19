@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "issue": "bigduu/Bamboo-agent#620",
+  "recorded_at": "2026-07-19",
+  "environment": {
+    "client": "Lotus origin/main via Vite",
+    "server": "Bamboo feature branch built from source",
+    "provider": "Deepseek/deepseek-v4-flash",
+    "data": "isolated temporary Bamboo data directory"
+  },
+  "runs": [
+    {
+      "session": "22d36944-24a3-4a62-81bc-acd22542914e",
+      "implementation": "baseline",
+      "selection_source": "explicit",
+      "selected_skill_ids": ["review"],
+      "loaded_skill_ids": [],
+      "model_load_skill_calls": 0,
+      "result": "fail",
+      "failure_analysis": "Lotus submitted a structured explicit selection, but the model answered before loading the workflow body."
+    },
+    {
+      "session": "8f983dfb-262b-4e77-b0e6-60ca373e4100",
+      "implementation": "preload_without_schema_suppression",
+      "selection_source": "explicit",
+      "selected_skill_ids": ["review"],
+      "loaded_skill_ids": ["review"],
+      "model_load_skill_calls": 1,
+      "result": "partial",
+      "failure_analysis": "The runtime activated review before the first model round, but load_skill remained advertised and the model redundantly loaded it again."
+    },
+    {
+      "session": "0a4e2928-b8d0-41ab-820c-459005e28105",
+      "implementation": "final",
+      "selection_source": "explicit",
+      "selected_skill_ids": ["review"],
+      "loaded_skill_ids": ["review"],
+      "model_load_skill_calls": 0,
+      "review_builtin_version": "3",
+      "result": "activation_pass_output_quality_fail",
+      "failure_analysis": "The system prompt contained the complete preloaded review payload and load_skill was absent from the model-visible activation path. The provider still asserted an incorrect Rust release-mode division behavior despite the workflow's evidence hard gate; this is recorded as residual model compliance risk rather than an activation failure."
+    }
+  ],
+  "checks": {
+    "automatic_multi_candidate_selection_remains_lazy": true,
+    "explicit_selected_and_loaded_ids_match": true,
+    "redundant_model_load_suppressed": true,
+    "current_page_console_errors_after_clear": 0,
+    "workflow_workspace_writes": 0
+  },
+  "limitations": [
+    "The provider's final answer did not comply with the loaded review evidence rule, so activation success must not be reported as output-quality success.",
+    "Lotus fuzzy command ranking selected agent-browser first for the exact query /review; review required four ArrowDown presses before Enter.",
+    "Historical browser network errors came from intentional Bamboo restarts during local dogfood and were cleared before the final page check."
+  ]
+}

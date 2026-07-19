@@ -252,7 +252,8 @@ mod tests {
             .expect("utf8 Bamboo metadata");
             let bamboo_metadata: serde_yaml::Value =
                 serde_yaml::from_str(bamboo_metadata).expect("valid Bamboo metadata");
-            assert_eq!(bamboo_metadata["version"].as_str(), Some("1"));
+            let expected_version = if id == "review" { "3" } else { "1" };
+            assert_eq!(bamboo_metadata["version"].as_str(), Some(expected_version));
             assert_eq!(
                 bamboo_metadata["invocation_policy"]["explicit"].as_bool(),
                 Some(true)
