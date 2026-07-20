@@ -923,6 +923,11 @@ fn spawn_task_evaluation_if_needed(
         turn + 1,
         eval_model,
         config.reasoning_effort,
+        crate::runtime::stream::handler::StreamTimeoutContext::new(
+            config.stream_timeout,
+            config.provider_name.as_deref(),
+            eval_model,
+        ),
     )?;
     let Some(request) = request else {
         return Ok(());
@@ -3944,6 +3949,9 @@ mod tests {
         assert!(!should_retry_turn_error(&AgentError::Budget(
             "budget exceeded".to_string(),
         )));
+        assert!(!should_retry_turn_error(&AgentError::StreamTimeout(
+            "semantic_output_started=true, retry_safe=false".to_string(),
+        )));
     }
 
     #[test]
@@ -5445,6 +5453,7 @@ mod tests {
             model_name: "fast".to_string(),
             reasoning_effort: None,
             checkpoint: bamboo_agent_core::GoldCheckpoint::PostRound,
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
             session_snapshot: session.clone(),
             task_context_snapshot: None,
             gold_config: crate::runtime::config::GoldConfig::default(),

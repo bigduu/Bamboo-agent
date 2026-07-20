@@ -26,6 +26,7 @@ wins; please file an issue.
 - [Providers](#providers)
 - [Server](#server)
 - [Tools, skills, hooks](#tools-skills-hooks)
+- [LLM stream timeouts](#llm-stream-timeouts)
 - [Memory / auto-dream / gardener](#memory--auto-dream--gardener)
 - [Sub-agents + the `claude_code` executor](#sub-agents--the-claude_code-executor)
 - [MCP servers](#mcp-servers)
@@ -74,6 +75,7 @@ default. The full field list of `Config`:
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
 | `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
+| `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
 | `subagents` | `SubagentsConfig` | Sub-agent execution + the `claude_code` executor. See below. |
 | `cluster_fabric` | `ClusterFabricConfig` | Operator-managed remote nodes for deploying `broker-agent` workers over SSH; empty by default. SSH secrets encrypted at rest. |
@@ -153,6 +155,35 @@ TLS termination — no ACME/auto-cert). All overridable per-invocation with
 - `hooks.image_fallback` — how image parts are handled when the effective
   model/path is text-only (drop, OCR-replace, etc. — see
   `ImageFallbackHookConfig`).
+
+## LLM stream timeouts
+
+```json
+{
+  "stream_timeout": {
+    "transport_idle_timeout_secs": 120,
+    "first_semantic_timeout_secs": 600,
+    "semantic_idle_timeout_secs": 600
+  }
+}
+```
+
+The three watchdogs measure different signals and apply identically to the
+main response stream and auxiliary silent model calls:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `transport_idle_timeout_secs` | `120` | Maximum gap between valid provider transport frames. Parsed SSE ping/lifecycle frames count even when they contain no token. |
+| `first_semantic_timeout_secs` | `600` | Maximum time from request dispatch to the first text, reasoning, or tool-call delta. Transport keepalives do not extend it. |
+| `semantic_idle_timeout_secs` | `600` | Maximum semantic-progress gap after output starts. Transport keepalives do not extend it. |
+
+Every value must be between `1` and `86400` seconds. Invalid persisted values
+are rejected by config loading; invalid values constructed by an embedding are
+replaced with the safe defaults. Timeout errors report the expired phase,
+deadline, provider/model identifiers, and last transport/semantic activity,
+but never include prompts or raw provider payloads. A stream timeout is not
+automatically retried, because replay after partial output or tool-call deltas
+could duplicate externally visible state.
 
 ## Memory / auto-dream / gardener
 

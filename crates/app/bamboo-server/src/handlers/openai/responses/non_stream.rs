@@ -75,7 +75,8 @@ pub(super) async fn handle_non_streaming_response(
                 tool_calls.extend_indexed(calls)
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
-            Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
+            Ok(bamboo_llm::types::LLMChunk::TransportActivity)
+            | Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
             | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {

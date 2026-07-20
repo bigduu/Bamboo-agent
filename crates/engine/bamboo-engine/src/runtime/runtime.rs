@@ -727,6 +727,7 @@ impl AgentRuntime {
             // the HTTP layer) means every caller — HTTP, schedules, connect,
             // the in-proc SDK — gets the same clamped fallback for free.
             run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
+            stream_timeout: config.stream_timeout,
             ..Default::default()
         };
 

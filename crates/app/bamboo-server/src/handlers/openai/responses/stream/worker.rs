@@ -130,7 +130,8 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 tool_calls.extend_indexed(indexed)
             }
             Ok(LLMChunk::Done) => break,
-            Ok(LLMChunk::CacheUsage { .. })
+            Ok(LLMChunk::TransportActivity)
+            | Ok(LLMChunk::CacheUsage { .. })
             | Ok(LLMChunk::UsageSummary { .. })
             | Ok(LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
