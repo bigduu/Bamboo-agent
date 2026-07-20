@@ -190,7 +190,9 @@ impl AppState {
             }
         }));
 
-        let permission_checker = load_permission_checker(&bamboo_home_dir).await;
+        let (permission_checker, permission_section) =
+            load_permission_checker(&bamboo_home_dir).await?;
+        let permission_io_lock = Arc::new(tokio::sync::Mutex::new(()));
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
             bamboo_home_dir.join("notification_preferences.json"),
         ));
@@ -789,6 +791,8 @@ impl AppState {
             connect_manager,
             tool_factory,
             permission_checker,
+            permission_section,
+            permission_io_lock,
             approval_registry,
             notification_service,
             session_watchers,

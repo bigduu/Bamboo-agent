@@ -57,5 +57,7 @@ pub use policy::{
     PermissionReasonCode, PermissionRequest,
 };
 pub use rule_parser::ParsedRule;
-pub use storage::PermissionStorage;
+pub use storage::{
+    default_permission_document, PermissionSection, PermissionStorage, PermissionStorageError,
+};
 pub use tool_permissions::{check_permissions, check_tool_rules, is_delete_command};

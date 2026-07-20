@@ -1,17 +1,80 @@
-//! Permission storage for persisting whitelist configuration.
+//! Durable permission-policy persistence.
 //!
-//! This module provides functionality to save and load permission configurations
-//! from persistent storage (e.g., Tauri config directory).
+//! Permission policy owns `permissions.json`. The shared `config.json` is read
+//! only as a legacy migration source so permission writes cannot clobber
+//! unrelated configuration sections.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::config::{PermissionConfig, SerializablePermissionConfig};
-use bamboo_llm::Config;
+use bamboo_config::{
+    AtomicFileStore, AtomicJsonStore, ConfigSectionEvent, ConfigStoreError, LiveSection,
+    SectionSnapshot, SectionStatus,
+};
+use serde::Serialize;
 
-/// Storage for permission configuration
-///
-/// This struct handles loading and saving permission configurations
-/// to a persistent storage location.
+use crate::config::{PermissionConfig, RiskLevel, SerializablePermissionConfig};
+
+const PERMISSION_SCHEMA_VERSION: u32 = 1;
+const LEGACY_ROOT_KEY: &str = "permissions";
+
+/// The process-wide immutable snapshot and durable writer for permission policy.
+pub struct PermissionSection {
+    live: LiveSection<SerializablePermissionConfig>,
+}
+
+impl PermissionSection {
+    /// Open the canonical sidecar, migrating a legacy document when necessary.
+    pub fn open(config_dir: impl Into<PathBuf>) -> Result<Self, PermissionStorageError> {
+        Self::open_with_filename(config_dir, PermissionStorage::DEFAULT_FILENAME)
+    }
+
+    fn open_with_filename(
+        config_dir: impl Into<PathBuf>,
+        filename: impl AsRef<Path>,
+    ) -> Result<Self, PermissionStorageError> {
+        let config_dir = config_dir.into();
+        let path = config_dir.join(filename);
+        if let Err(error) = migrate_legacy_document(&config_dir, &path) {
+            // Migration failure must not make the server unavailable. The live
+            // section will either recover a valid backup or publish a safe,
+            // explicitly-invalid default snapshot.
+            tracing::warn!(path = %path.display(), %error, "permission migration skipped");
+        }
+
+        let store = AtomicJsonStore::new(&path, PERMISSION_SCHEMA_VERSION);
+        let live = LiveSection::open(
+            "permission",
+            store,
+            default_permission_document(),
+            validate_permission_document,
+        )
+        .map_err(|source| PermissionStorageError::StoreError {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { live })
+    }
+
+    pub fn snapshot(&self) -> Arc<SectionSnapshot<SerializablePermissionConfig>> {
+        self.live.snapshot()
+    }
+
+    /// Validate, durably commit with CAS, then publish the new immutable snapshot.
+    pub fn commit(
+        &self,
+        expected_revision: u64,
+        candidate: SerializablePermissionConfig,
+    ) -> Result<ConfigSectionEvent, ConfigStoreError> {
+        self.live.commit(expected_revision, candidate)
+    }
+
+    pub fn reload(&self) -> ConfigSectionEvent {
+        self.live.reload()
+    }
+}
+
+/// Compatibility facade used by existing callers.
 #[derive(Debug, Clone)]
 pub struct PermissionStorage {
     config_dir: PathBuf,
@@ -19,10 +82,8 @@ pub struct PermissionStorage {
 }
 
 impl PermissionStorage {
-    /// The default filename for permission configuration
     pub const DEFAULT_FILENAME: &str = "permissions.json";
 
-    /// Create a new permission storage with the given config directory
     pub fn new(config_dir: impl Into<PathBuf>) -> Self {
         Self {
             config_dir: config_dir.into(),
@@ -30,7 +91,6 @@ impl PermissionStorage {
         }
     }
 
-    /// Create a new permission storage with a custom filename
     pub fn with_filename(config_dir: impl Into<PathBuf>, filename: impl Into<String>) -> Self {
         Self {
             config_dir: config_dir.into(),
@@ -38,256 +98,276 @@ impl PermissionStorage {
         }
     }
 
-    /// Get the full path to the permission config file
     pub fn config_path(&self) -> PathBuf {
-        // Unified configuration: permissions are stored in `config.json`.
-        self.config_dir.join("config.json")
-    }
-
-    fn legacy_permissions_path(&self) -> PathBuf {
         self.config_dir.join(&self.filename)
     }
 
-    /// Load permission configuration from storage
-    ///
-    /// Returns `Ok(None)` if the file doesn't exist.
-    /// Returns an error if the file exists but cannot be read or parsed.
     pub async fn load(&self) -> Result<Option<PermissionConfig>, PermissionStorageError> {
-        const KEY: &str = "permissions";
-
-        // Load unified config.json first. Non-publishing: this is a read-only
-        // access to the `permissions` key and must not clobber the server's live
-        // env-var cache with stale disk data (#40).
-        let config = Config::from_data_dir_without_publish(Some(self.config_dir.clone()));
-        if let Some(value) = config.extra.get(KEY).cloned() {
-            let serializable: SerializablePermissionConfig = serde_json::from_value(value)
-                .map_err(|e| PermissionStorageError::ParseError {
-                    path: self.config_path(),
-                    source: e,
-                })?;
-            return Ok(Some(PermissionConfig::from_serializable(serializable)));
-        }
-
-        // Legacy migration: permissions.json -> config.json["permissions"]
-        let legacy = self.legacy_permissions_path();
-        if !legacy.exists() {
-            return Ok(None);
-        }
-
-        let content = tokio::fs::read_to_string(&legacy).await.map_err(|e| {
-            PermissionStorageError::ReadError {
-                path: legacy.clone(),
-                source: e,
-            }
-        })?;
-        if content.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let serializable: SerializablePermissionConfig =
-            serde_json::from_str(&content).map_err(|e| PermissionStorageError::ParseError {
-                path: legacy.clone(),
-                source: e,
-            })?;
-
-        let mut config = config;
-        config.extra.insert(
-            KEY.to_string(),
-            serde_json::to_value(&serializable).map_err(|e| {
-                PermissionStorageError::SerializationError {
-                    path: self.config_path(),
-                    source: e,
-                }
-            })?,
-        );
-
-        // Persist unified config.
-        let data_dir = self.config_dir.clone();
-        tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
-            .await
-            .map_err(|e| PermissionStorageError::WriteError {
+        let config_dir = self.config_dir.clone();
+        let filename = self.filename.clone();
+        let section = tokio::task::spawn_blocking(move || {
+            PermissionSection::open_with_filename(config_dir, filename)
+        })
+        .await
+        .map_err(|source| PermissionStorageError::TaskError {
+            path: self.config_path(),
+            source,
+        })??;
+        let snapshot = section.snapshot();
+        match snapshot.status {
+            SectionStatus::Missing => Ok(None),
+            SectionStatus::Invalid => Err(PermissionStorageError::InvalidDocument {
                 path: self.config_path(),
-                source: std::io::Error::other(e.to_string()),
-            })?
-            .map_err(|e| PermissionStorageError::WriteError {
-                path: self.config_path(),
-                source: std::io::Error::other(e.to_string()),
-            })?;
-
-        // Best-effort backup legacy file.
-        if let Some(name) = legacy.file_name().and_then(|s| s.to_str()) {
-            let backup = legacy.with_file_name(format!("{name}.migrated.bak"));
-            let _ = tokio::fs::rename(&legacy, backup).await;
+            }),
+            SectionStatus::Healthy | SectionStatus::Degraded => Ok(Some(
+                PermissionConfig::from_serializable(snapshot.data.as_ref().clone()),
+            )),
         }
-
-        Ok(Some(PermissionConfig::from_serializable(serializable)))
     }
 
-    /// Load permission configuration with fallback to default
-    ///
-    /// Returns the loaded config, or a default config if loading fails
-    /// or the file doesn't exist.
     pub async fn load_or_default(&self) -> Result<PermissionConfig, PermissionStorageError> {
-        match self.load().await {
-            Ok(Some(config)) => Ok(config),
-            Ok(None) => Ok(PermissionConfig::new()),
-            Err(e) => Err(e),
-        }
+        Ok(self.load().await?.unwrap_or_default())
     }
 
-    /// Save permission configuration to storage
     pub async fn save(&self, config: &PermissionConfig) -> Result<(), PermissionStorageError> {
-        const KEY: &str = "permissions";
-
-        // Ensure the config directory exists
-        if !self.config_dir.exists() {
-            tokio::fs::create_dir_all(&self.config_dir)
-                .await
-                .map_err(|e| PermissionStorageError::WriteError {
-                    path: self.config_path(),
-                    source: e,
-                })?;
-        }
-
-        let serializable = config.to_serializable();
-        // Read-modify-write of the unified config's `permissions` key. Non-
-        // publishing: persisting permissions must not republish (clobber) the
-        // server's live env-var cache from disk (#40).
-        let mut root = Config::from_data_dir_without_publish(Some(self.config_dir.clone()));
-        root.extra.insert(
-            KEY.to_string(),
-            serde_json::to_value(&serializable).map_err(|e| {
-                PermissionStorageError::SerializationError {
-                    path: self.config_path(),
-                    source: e,
+        let config_dir = self.config_dir.clone();
+        let filename = self.filename.clone();
+        let candidate = config.to_serializable();
+        tokio::task::spawn_blocking(move || {
+            let section = PermissionSection::open_with_filename(&config_dir, &filename)?;
+            let revision = section.snapshot().revision;
+            section.commit(revision, candidate).map_err(|source| {
+                PermissionStorageError::StoreError {
+                    path: config_dir.join(filename),
+                    source,
                 }
-            })?,
-        );
-
-        let data_dir = self.config_dir.clone();
-        tokio::task::spawn_blocking(move || root.save_to_dir(data_dir))
-            .await
-            .map_err(|e| PermissionStorageError::WriteError {
-                path: self.config_path(),
-                source: std::io::Error::other(e.to_string()),
-            })?
-            .map_err(|e| PermissionStorageError::WriteError {
-                path: self.config_path(),
-                source: std::io::Error::other(e.to_string()),
             })?;
-
+            Ok::<_, PermissionStorageError>(())
+        })
+        .await
+        .map_err(|source| PermissionStorageError::TaskError {
+            path: self.config_path(),
+            source,
+        })??;
         Ok(())
     }
 
-    /// Check if a configuration file exists
     pub fn exists(&self) -> bool {
         self.config_path().exists()
     }
 
-    /// Load permission configuration with project-level overrides.
-    ///
-    /// Merges three sources in priority order (highest → lowest):
-    /// 1. Local project settings (`<project>/.bamboo/` config.json["permissions"])
-    /// 2. Project settings (`<project>/.bamboo/` config.json["permissions"])
-    /// 3. User settings (`self.config_dir` config.json["permissions"])
-    ///
-    /// Returns `Ok(None)` if none of the sources have a config file.
     pub async fn load_with_project(
         &self,
-        project_dir: &std::path::Path,
+        project_dir: &Path,
     ) -> Result<Option<PermissionConfig>, PermissionStorageError> {
-        // Load user-level config (lowest priority)
         let user_config = self.load().await.unwrap_or(None);
-
-        // Load project-level config
         let project_storage = PermissionStorage::new(project_dir.join(".bamboo"));
         let project_config = project_storage.load().await.unwrap_or(None);
-
-        // Load local project-level config (highest priority)
-        let local_storage = PermissionStorage::new(project_dir.join(".bamboo"));
-        let local_config = local_storage.load().await.unwrap_or(None);
-
-        // Track if any source was present before we consume the Options
-        let has_any = user_config.is_some() || project_config.is_some() || local_config.is_some();
-
-        // Merge: local > project > user
-        let mut result: PermissionConfig = user_config.unwrap_or_default();
-        if let Some(proj) = project_config {
-            result = proj.merge(&result);
+        let has_any = user_config.is_some() || project_config.is_some();
+        let mut result = user_config.unwrap_or_default();
+        if let Some(project) = project_config {
+            result = project.merge(&result);
         }
-        if let Some(loc) = local_config {
-            result = loc.merge(&result);
-        }
-
-        if !has_any {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
+        Ok(has_any.then_some(result))
     }
 
-    /// Delete the configuration file
     pub async fn delete(&self) -> Result<(), PermissionStorageError> {
         let path = self.config_path();
-
         if path.exists() {
-            tokio::fs::remove_file(&path).await.map_err(|e| {
+            tokio::fs::remove_file(&path).await.map_err(|source| {
                 PermissionStorageError::WriteError {
                     path: path.clone(),
-                    source: e,
+                    source,
                 }
             })?;
         }
-
         Ok(())
     }
 }
 
-/// Error type for permission storage operations
+/// First-run posture: enabled, but only high-risk operations prompt.
+pub fn default_permission_document() -> SerializablePermissionConfig {
+    SerializablePermissionConfig {
+        confirm_threshold: Some(RiskLevel::High),
+        ..SerializablePermissionConfig::default()
+    }
+}
+
+pub fn validate_permission_document(
+    candidate: &SerializablePermissionConfig,
+) -> Result<(), String> {
+    if candidate.session_grant_duration_secs == 0 {
+        return Err("session grant duration must be greater than zero".to_string());
+    }
+    if candidate
+        .whitelist
+        .iter()
+        .any(|rule| rule.resource_pattern.trim().is_empty())
+    {
+        return Err("permission rule pattern must not be blank".to_string());
+    }
+    if candidate
+        .ask_rules
+        .iter()
+        .any(|rule| rule.trim().is_empty())
+    {
+        return Err("always-ask rule must not be blank".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MigrationDocument<'a> {
+    schema_version: u32,
+    revision: u64,
+    data: &'a SerializablePermissionConfig,
+}
+
+fn migrate_legacy_document(
+    config_dir: &Path,
+    canonical: &Path,
+) -> Result<(), PermissionStorageError> {
+    if canonical.exists() {
+        let bytes =
+            std::fs::read(canonical).map_err(|source| PermissionStorageError::ReadError {
+                path: canonical.to_path_buf(),
+                source,
+            })?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
+            PermissionStorageError::ParseError {
+                path: canonical.to_path_buf(),
+                source,
+            }
+        })?;
+        if value.get("schema_version").is_some()
+            && value.get("revision").is_some()
+            && value.get("data").is_some()
+        {
+            return Ok(());
+        }
+        let candidate: SerializablePermissionConfig =
+            serde_json::from_value(value).map_err(|source| PermissionStorageError::ParseError {
+                path: canonical.to_path_buf(),
+                source,
+            })?;
+        validate_permission_document(&candidate).map_err(|message| {
+            PermissionStorageError::ValidationError {
+                path: canonical.to_path_buf(),
+                message,
+            }
+        })?;
+        let backup = canonical.with_extension("json.legacy.bak");
+        if !backup.exists() {
+            std::fs::copy(canonical, &backup).map_err(|source| {
+                PermissionStorageError::WriteError {
+                    path: backup,
+                    source,
+                }
+            })?;
+        }
+        return install_migrated_document(canonical, &candidate);
+    }
+
+    let root_path = config_dir.join("config.json");
+    if !root_path.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&root_path).map_err(|source| PermissionStorageError::ReadError {
+        path: root_path.clone(),
+        source,
+    })?;
+    let root: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| PermissionStorageError::ParseError {
+            path: root_path.clone(),
+            source,
+        })?;
+    let Some(value) = root.get(LEGACY_ROOT_KEY).cloned() else {
+        return Ok(());
+    };
+    let candidate: SerializablePermissionConfig =
+        serde_json::from_value(value).map_err(|source| PermissionStorageError::ParseError {
+            path: root_path,
+            source,
+        })?;
+    validate_permission_document(&candidate).map_err(|message| {
+        PermissionStorageError::ValidationError {
+            path: canonical.to_path_buf(),
+            message,
+        }
+    })?;
+    install_migrated_document(canonical, &candidate)
+}
+
+fn install_migrated_document(
+    canonical: &Path,
+    candidate: &SerializablePermissionConfig,
+) -> Result<(), PermissionStorageError> {
+    let bytes = serde_json::to_vec_pretty(&MigrationDocument {
+        schema_version: PERMISSION_SCHEMA_VERSION,
+        revision: 1,
+        data: candidate,
+    })
+    .map_err(|source| PermissionStorageError::SerializationError {
+        path: canonical.to_path_buf(),
+        source,
+    })?;
+    AtomicFileStore::new(canonical)
+        .write_bytes_without_backup(&bytes)
+        .map_err(|source| PermissionStorageError::StoreError {
+            path: canonical.to_path_buf(),
+            source,
+        })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PermissionStorageError {
-    #[error("Failed to read permission config from {path}: {source}")]
+    #[error("failed to read permission config from {path}: {source}")]
     ReadError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-
-    #[error("Failed to write permission config to {path}: {source}")]
+    #[error("failed to write permission config to {path}: {source}")]
     WriteError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-
-    #[error("Failed to parse permission config from {path}: {source}")]
+    #[error("failed to parse permission config from {path}: {source}")]
     ParseError {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
-
-    #[error("Failed to serialize permission config for {path}: {source}")]
+    #[error("failed to serialize permission config for {path}: {source}")]
     SerializationError {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
+    #[error("permission config at {path} is invalid: {message}")]
+    ValidationError { path: PathBuf, message: String },
+    #[error("permission config at {path} has no valid primary or backup")]
+    InvalidDocument { path: PathBuf },
+    #[error("permission config store failed for {path}: {source}")]
+    StoreError {
+        path: PathBuf,
+        #[source]
+        source: ConfigStoreError,
+    },
+    #[error("permission config task failed for {path}: {source}")]
+    TaskError {
+        path: PathBuf,
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
-/// Get the default permission storage location for Tauri apps
-///
-/// Returns `None` if the Bamboo data directory cannot be determined.
 pub fn default_storage() -> Option<PermissionStorage> {
-    // Keep storage consistent with the unified config.json location:
-    // all persisted state lives under `paths::bamboo_dir()` (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
     Some(PermissionStorage::new(bamboo_config::paths::bamboo_dir()))
 }
 
-/// Get the default permission storage for a specific app name
 pub fn app_storage(app_name: &str) -> Option<PermissionStorage> {
-    // App-specific storage is a legacy escape hatch; prefer `default_storage()` to
-    // avoid splitting persisted config across multiple roots.
     Some(PermissionStorage::new(
         bamboo_config::paths::bamboo_dir().join(app_name),
     ))
@@ -297,59 +377,124 @@ pub fn app_storage(app_name: &str) -> Option<PermissionStorage> {
 mod tests {
     use super::*;
     use crate::config::{PermissionRule, PermissionType};
+    use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_save_and_load() {
-        let temp_dir = std::env::temp_dir().join("bamboo_permission_test");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
-        let storage = PermissionStorage::new(&temp_dir);
-
-        // Create a config with some rules
+    async fn save_and_load_use_independent_revisioned_sidecar() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("config.json");
+        std::fs::write(&root, r#"{"provider":{"custom":"preserve-me"}}"#).unwrap();
+        let storage = PermissionStorage::new(temp.path());
         let config = PermissionConfig::new();
         config.add_rule(PermissionRule::new(PermissionType::WriteFile, "*.rs", true));
-        config.add_rule(PermissionRule::new(
-            PermissionType::ExecuteCommand,
-            "cargo *",
-            true,
-        ));
 
-        // Save the config
         storage.save(&config).await.unwrap();
-
-        // Load it back
         let loaded = storage.load().await.unwrap().unwrap();
 
-        // Verify the rules were saved
-        let rules = loaded.get_rules();
-        assert_eq!(rules.len(), 2);
-
-        // Cleanup
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        assert_eq!(loaded.get_rules().len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(root).unwrap()).unwrap()
+                ["provider"]["custom"],
+            "preserve-me"
+        );
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(storage.config_path()).unwrap()).unwrap();
+        assert_eq!(sidecar["revision"], 1);
     }
 
-    #[tokio::test]
-    async fn test_load_nonexistent() {
-        let temp_dir = std::env::temp_dir().join("bamboo_permission_test_nonexistent");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    #[test]
+    fn migrates_root_permission_without_rewriting_root() {
+        let temp = tempdir().unwrap();
+        let candidate = default_permission_document();
+        let root = serde_json::json!({"permissions": candidate, "unknown": {"keep": true}});
+        std::fs::write(
+            temp.path().join("config.json"),
+            serde_json::to_vec(&root).unwrap(),
+        )
+        .unwrap();
 
-        let storage = PermissionStorage::new(&temp_dir);
-        let result = storage.load().await.unwrap();
-        assert!(result.is_none());
+        let section = PermissionSection::open(temp.path()).unwrap();
+
+        assert_eq!(section.snapshot().revision, 1);
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(after["unknown"]["keep"], true);
+        assert!(after.get("permissions").is_some());
     }
 
-    #[tokio::test]
-    async fn test_load_or_default() {
-        let temp_dir = std::env::temp_dir().join("bamboo_permission_test_default");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    #[test]
+    fn cas_conflict_does_not_publish_candidate() {
+        let temp = tempdir().unwrap();
+        let section = PermissionSection::open(temp.path()).unwrap();
+        let mut first = section.snapshot().data.as_ref().clone();
+        first.ask_rules = vec!["Bash(git push *)".to_string()];
+        section.commit(0, first).unwrap();
+        let mut stale = section.snapshot().data.as_ref().clone();
+        stale.ask_rules = vec!["Bash(rm -rf *)".to_string()];
 
-        let storage = PermissionStorage::new(&temp_dir);
+        let error = section.commit(0, stale).unwrap_err();
 
-        // Should return default when file doesn't exist
-        let config = storage.load_or_default().await.unwrap();
-        assert!(config.is_enabled());
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert_eq!(section.snapshot().data.ask_rules, vec!["Bash(git push *)"]);
+    }
 
-        // Cleanup
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    #[test]
+    fn invalid_candidate_does_not_publish_or_write() {
+        let temp = tempdir().unwrap();
+        let section = PermissionSection::open(temp.path()).unwrap();
+        let mut invalid = section.snapshot().data.as_ref().clone();
+        invalid.session_grant_duration_secs = 0;
+
+        let error = section.commit(0, invalid).unwrap_err();
+
+        assert!(matches!(error, ConfigStoreError::Validation(_)));
+        assert_eq!(section.snapshot().revision, 0);
+        assert!(!temp.path().join("permissions.json").exists());
+    }
+
+    #[test]
+    fn migrates_unversioned_permission_sidecar_and_keeps_backup() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("permissions.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&default_permission_document()).unwrap(),
+        )
+        .unwrap();
+
+        let section = PermissionSection::open(temp.path()).unwrap();
+
+        assert_eq!(section.snapshot().revision, 1);
+        assert!(temp.path().join("permissions.json.legacy.bak").exists());
+    }
+
+    #[test]
+    fn corrupt_primary_recovers_backup_and_remains_writable() {
+        let temp = tempdir().unwrap();
+        let section = PermissionSection::open(temp.path()).unwrap();
+        let mut first = section.snapshot().data.as_ref().clone();
+        first.ask_rules = vec!["Bash(first)".to_string()];
+        section.commit(0, first).unwrap();
+        let mut second = section.snapshot().data.as_ref().clone();
+        second.ask_rules = vec!["Bash(second)".to_string()];
+        section.commit(1, second).unwrap();
+        std::fs::write(temp.path().join("permissions.json"), b"not json").unwrap();
+
+        let recovered = PermissionSection::open(temp.path()).unwrap();
+        assert_eq!(recovered.snapshot().status, SectionStatus::Degraded);
+        assert_eq!(recovered.snapshot().revision, 1);
+        let mut repaired = recovered.snapshot().data.as_ref().clone();
+        repaired.ask_rules = vec!["Bash(repaired)".to_string()];
+        recovered.commit(1, repaired).unwrap();
+
+        assert_eq!(recovered.snapshot().revision, 2);
+        assert_eq!(recovered.snapshot().status, SectionStatus::Healthy);
     }
 }
