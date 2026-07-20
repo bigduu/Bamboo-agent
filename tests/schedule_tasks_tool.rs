@@ -178,6 +178,7 @@ fn build_manager(
         agent: agent.clone(),
         persistence: Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
         tools: Arc::new(NoopTools),
+        permission_config: None,
         sessions_cache: Arc::new(dashmap::DashMap::new()),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
         session_event_senders: Arc::new(RwLock::new(HashMap::<

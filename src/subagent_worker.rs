@@ -205,6 +205,10 @@ pub struct BambooRuntimeExecutor {
     /// AND it propagates to grandchildren (whose forced-ask actions then get the
     /// installed model-reviewer). Phase 6, Part B.
     bypass: bool,
+    /// Live policy updated from the host at every activation boundary. Keeping
+    /// the same Arc as the builtin executor lets warm and remote workers adopt
+    /// new durable revisions without rebuilding their tool surface.
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     /// #73: the off-loop model-reviewer to decide this run's OWN gated actions
     /// locally when the run has no interactive human approver (headless /
     /// scheduled / deployed). `Some` ⇒ the per-run `HostApprovalProxy` calls it
@@ -299,47 +303,55 @@ impl BambooRuntimeExecutor {
         let metrics_collector = MetricsCollector::spawn(metrics_storage, 90);
 
         let config = Arc::new(tokio::sync::RwLock::new(config));
-        let builtin: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
-            if spec.capabilities.enforce_permissions {
-                // Phase 6 (#69): enforce permissions so a sub-agent's GATED tools
-                // hit ConfirmationRequired and the per-run ApprovalProxy delegates
-                // the decision to the parent (escalate to the human, or — under
-                // bypass — the off-loop model-review). The threshold is HIGH so
-                // only DANGEROUS ops (execute command / delete / git write /
-                // terminal) and forced-ask rules (e.g. `rm -rf`) ask — a reviewed
-                // sub-agent is NOT flooded with approvals for every file write.
-                // NOTE: this HIGH gate only bites on the NON-bypass path — under
-                // bypass the executor skips non-forced ops before the checker
-                // runs, so only forced-ask actions reach review there.
-                let perm_config = bamboo_tools::permission::PermissionConfig::new();
-                perm_config.set_confirm_threshold(bamboo_tools::permission::RiskLevel::High);
-                let mut checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
-                    bamboo_tools::permission::ConfigPermissionChecker::new(Arc::new(perm_config)),
-                );
-                // #71: a READ-ONLY Guardian reviewer keeps `Bash` so it can fetch
-                // the diff and run tests, but its shell must NOT be able to mutate /
-                // push / exfiltrate. Wrap the checker so any `Bash`/`execute_command`
-                // whose command is not on the read-only allowlist is DENIED (fail
-                // closed — the reviewer has no human approver), while read-only
-                // commands (`cargo test`, `git diff | head`, `rg …`) run WITHOUT a
-                // gate. Other mutating tools are already stripped by the reviewer's
-                // denylist, so they never reach here.
-                if spec.capabilities.guardian_read_only {
-                    checker = Arc::new(bamboo_tools::permission::GuardianReadOnlyChecker::new(
-                        checker,
-                    ));
-                }
+        let (builtin, permission_config): (
+            Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+            Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+        ) = if spec.capabilities.enforce_permissions {
+            // Phase 6 (#69): enforce permissions so a sub-agent's GATED tools
+            // hit ConfirmationRequired and the per-run ApprovalProxy delegates
+            // the decision to the parent (escalate to the human, or — under
+            // bypass — the off-loop model-review). The threshold is HIGH so
+            // only DANGEROUS ops (execute command / delete / git write /
+            // terminal) and forced-ask rules (e.g. `rm -rf`) ask — a reviewed
+            // sub-agent is NOT flooded with approvals for every file write.
+            // NOTE: this HIGH gate only bites on the NON-bypass path — under
+            // bypass the executor skips non-forced ops before the checker
+            // runs, so only forced-ask actions reach review there.
+            let perm_config = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+            perm_config.set_confirm_threshold(bamboo_tools::permission::RiskLevel::High);
+            let mut checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
+                bamboo_tools::permission::ConfigPermissionChecker::new(perm_config.clone()),
+            );
+            // #71: a READ-ONLY Guardian reviewer keeps `Bash` so it can fetch
+            // the diff and run tests, but its shell must NOT be able to mutate /
+            // push / exfiltrate. Wrap the checker so any `Bash`/`execute_command`
+            // whose command is not on the read-only allowlist is DENIED (fail
+            // closed — the reviewer has no human approver), while read-only
+            // commands (`cargo test`, `git diff | head`, `rg …`) run WITHOUT a
+            // gate. Other mutating tools are already stripped by the reviewer's
+            // denylist, so they never reach here.
+            if spec.capabilities.guardian_read_only {
+                checker = Arc::new(bamboo_tools::permission::GuardianReadOnlyChecker::new(
+                    checker,
+                ));
+            }
+            (
                 Arc::new(
                     bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
                         config.clone(),
                         checker,
                     ),
-                )
-            } else {
+                ),
+                Some(perm_config),
+            )
+        } else {
+            (
                 Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_config(
                     config.clone(),
-                ))
-            };
+                )),
+                None,
+            )
+        };
         // MCP composition (absent for actor children → builtin-only, unchanged):
         //   1. mcp_proxy set → proxy ALL MCP to the orchestrator over the broker
         //      (it runs the host-bound servers like nova; P2).
@@ -461,72 +473,10 @@ impl BambooRuntimeExecutor {
                 .map_err(|e| format!("build agent runtime: {e}"))?,
         );
 
-        // A worker BELOW the depth cap orchestrates its OWN children directly: it
-        // builds its own external-child runner + scheduler + adapter and runs the
-        // REAL SubAgent tool against them (no host proxy). `nested_spawn` is set
-        // by the host's build_spec purely from depth (< MAX_SPAWN_DEPTH), so it
-        // auto-propagates down the tree and bottoms out at the cap.
-        type RunTools = Arc<dyn bamboo_agent_core::tools::ToolExecutor>;
-        type ChildRunner = Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>;
-        let (run_tools, child_runner): (Option<RunTools>, Option<ChildRunner>) =
-            if spec.capabilities.nested_spawn {
-                // Point the worker's own actor runner at the shared fabric so
-                // grandchildren are discoverable; the worker binary itself is
-                // found via `current_exe()` inside build_local_actor_runner.
-                {
-                    let mut cfg = config_for_stack.write().await;
-                    if cfg.subagents().fabric_dir.is_none() {
-                        cfg.subagents_mut().fabric_dir = Some(spec.fabric_dir.clone());
-                    }
-                }
-                let external_runner = {
-                    let cfg = config_for_stack.read().await;
-                    bamboo_engine::external_agents::runtime::build_external_child_runner(&cfg)
-                };
-                // #68: retain this exact runner so `run()` can bind its host
-                // bridge onto it per-run (the runner the scheduler drives is the
-                // one whose `ActorChildRunner`s capture the bridge at spawn).
-                let child_runner = external_runner.clone();
-                let scheduler = bamboo_server::app_state::init::build_spawn_scheduler(
-                    agent.clone(),
-                    default_tools.clone(),
-                    Arc::new(dashmap::DashMap::new()),
-                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                    external_runner,
-                    None,
-                    None,
-                    Some(storage_dir.clone()),
-                    None,
-                );
-                let adapter = Arc::new(bamboo_server::tools::ChildSessionAdapter::new(
-                    store_for_stack.clone(),
-                    store_for_stack.clone(),
-                    locked_store.clone(),
-                    scheduler,
-                    Arc::new(dashmap::DashMap::new()),
-                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                    None,
-                    config_for_stack.clone(),
-                ));
-                let sub_agent = Arc::new(bamboo_server::tools::SubAgentTool::new(
-                    adapter.clone(),
-                    adapter,
-                ));
-                let run_tools = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
-                    default_tools,
-                    sub_agent,
-                )) as RunTools;
-                (Some(run_tools), Some(child_runner))
-            } else {
-                (None, None)
-            };
-
-        // The off-loop model-reviewer (provider + model). Built once and shared:
-        // installed process-global for a BYPASSED nested parent (read by this
-        // worker's `drive()` when a CHILD forwards an ApprovalRequest), and held
-        // per-run for the no-human case below.
+        // The parent model is the automatic security reviewer for forced-ask
+        // requests from this worker and its descendants. It is wired directly
+        // into the nested runner (not a process-global slot), so no path falls
+        // back to an interactive human prompt.
         let reviewer: Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer> =
             Arc::new(ModelApprovalReviewer {
                 provider: provider_for_review,
@@ -537,13 +487,74 @@ impl BambooRuntimeExecutor {
                     .unwrap_or_default(),
             });
 
-        // Phase 6, Part B: a BYPASSED self-orchestrating worker installs the
-        // off-loop reviewer so its children's forced-ask (dangerous) actions —
-        // which still fire even under bypass — get an LLM reasonableness check
-        // instead of a blind pass.
-        if spec.capabilities.bypass && spec.capabilities.nested_spawn {
-            bamboo_engine::external_agents::set_child_approval_reviewer(reviewer.clone());
-        }
+        // A worker BELOW the depth cap orchestrates its OWN children directly: it
+        // builds its own external-child runner + scheduler + adapter and runs the
+        // REAL SubAgent tool against them (no host proxy). `nested_spawn` is set
+        // by the host's build_spec purely from depth (< MAX_SPAWN_DEPTH), so it
+        // auto-propagates down the tree and bottoms out at the cap.
+        type RunTools = Arc<dyn bamboo_agent_core::tools::ToolExecutor>;
+        type ChildRunner = Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>;
+        let (run_tools, child_runner): (Option<RunTools>, Option<ChildRunner>) = if spec
+            .capabilities
+            .nested_spawn
+        {
+            // Point the worker's own actor runner at the shared fabric so
+            // grandchildren are discoverable; the worker binary itself is
+            // found via `current_exe()` inside build_local_actor_runner.
+            {
+                let mut cfg = config_for_stack.write().await;
+                if cfg.subagents().fabric_dir.is_none() {
+                    cfg.subagents_mut().fabric_dir = Some(spec.fabric_dir.clone());
+                }
+            }
+            let external_runner = {
+                let cfg = config_for_stack.read().await;
+                bamboo_engine::external_agents::runtime::build_external_child_runner_with_registry_and_reviewer(
+                        &cfg,
+                        None,
+                        Some(reviewer.clone()),
+                        permission_config.clone(),
+                    )
+            };
+            // #68: retain this exact runner so `run()` can bind its host
+            // bridge onto it per-run (the runner the scheduler drives is the
+            // one whose `ActorChildRunner`s capture the bridge at spawn).
+            let child_runner = external_runner.clone();
+            let scheduler = bamboo_server::app_state::init::build_spawn_scheduler(
+                agent.clone(),
+                default_tools.clone(),
+                Arc::new(dashmap::DashMap::new()),
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                external_runner,
+                None,
+                None,
+                Some(storage_dir.clone()),
+                None,
+            );
+            let adapter = Arc::new(bamboo_server::tools::ChildSessionAdapter::new(
+                store_for_stack.clone(),
+                store_for_stack.clone(),
+                locked_store.clone(),
+                scheduler,
+                Arc::new(dashmap::DashMap::new()),
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                None,
+                config_for_stack.clone(),
+            ));
+            let sub_agent = Arc::new(bamboo_server::tools::SubAgentTool::new(
+                adapter.clone(),
+                adapter,
+            ));
+            let run_tools = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
+                default_tools,
+                sub_agent,
+            )) as RunTools;
+            (Some(run_tools), Some(child_runner))
+        } else {
+            (None, None)
+        };
 
         // #73: when this run has NO interactive human approver, the per-run
         // approval proxy decides a gated action with the SAME model-reviewer
@@ -567,6 +578,7 @@ impl BambooRuntimeExecutor {
             run_tools,
             spawn_depth: spec.identity.depth,
             bypass: spec.capabilities.bypass,
+            permission_config,
             no_human_review,
             child_runner,
         })
@@ -668,10 +680,11 @@ impl bamboo_tools::ApprovalProxy for HostApprovalProxy {
             "tool_name": ask.tool_name,
             "permission": ask.permission,
             "resource": ask.resource,
+            "permission_request": ask.permission_request,
         });
         // No human to ask → decide locally with the model-reviewer.
         if let Some(reviewer) = &self.reviewer {
-            return reviewer.review("", &body).await;
+            return reviewer.review("", "", &body).await;
         }
         let Some(host) = &self.host else {
             tracing::warn!("approval proxy: no host and no reviewer; denying (fail closed)");
@@ -744,7 +757,12 @@ struct ModelApprovalReviewer {
 
 #[async_trait]
 impl bamboo_engine::external_agents::ChildApprovalReviewer for ModelApprovalReviewer {
-    async fn review(&self, _child_session_id: &str, request: &serde_json::Value) -> bool {
+    async fn review(
+        &self,
+        _parent_session_id: &str,
+        _child_session_id: &str,
+        request: &serde_json::Value,
+    ) -> bool {
         if self.model.trim().is_empty() {
             // No model to judge with → fail closed. In an unattended (no-human)
             // run this denies EVERY gated action, so the sub-agent can't do gated
@@ -829,7 +847,47 @@ impl ChildExecutor for BambooRuntimeExecutor {
             format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4()),
             self.model.clone().unwrap_or_default(),
         );
-        session.workspace = self.workspace.clone();
+        let mut effective_bypass = self.bypass;
+        let mut effective_workspace = self.workspace.clone();
+        if let (Some(context), Some(config)) = (
+            run.permission_policy.as_ref(),
+            self.permission_config.as_ref(),
+        ) {
+            match serde_json::from_value::<bamboo_tools::permission::SerializablePermissionConfig>(
+                context.policy.clone(),
+            ) {
+                Ok(policy) => {
+                    config.publish_persistent_policy(context.revision, &policy);
+                    effective_bypass = context.bypass_permissions;
+                    effective_workspace = context.workspace_path.clone().or(effective_workspace);
+                    session.metadata.insert(
+                        "permission.policy_revision".to_string(),
+                        context.revision.to_string(),
+                    );
+                    session.metadata.insert(
+                        "permission.effective_mode".to_string(),
+                        format!("{:?}", config.mode()).to_ascii_lowercase(),
+                    );
+                    session.metadata.insert(
+                        "permission.session_grants_inherited".to_string(),
+                        context.inherit_session_grants.to_string(),
+                    );
+                }
+                Err(error) => {
+                    // Retain the last-known-good live policy and disable bypass
+                    // for this activation rather than broadening on corrupt wire
+                    // data.
+                    tracing::warn!(%error, "invalid permission policy update; retaining LKG and disabling bypass");
+                    effective_bypass = false;
+                }
+            }
+        }
+        session.workspace = effective_workspace;
+        if let (Some(config), Some(workspace)) =
+            (self.permission_config.as_ref(), session.workspace.as_ref())
+        {
+            config.register_session_workspace(session.id.clone(), workspace.clone());
+        }
         // Phase 6: re-establish this worker's nesting depth on its fresh run
         // session (Session::new starts at 0), so the depth cap accumulates across
         // the actor boundary and in-process children get spawn_depth = this + 1.
@@ -837,7 +895,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Phase 6, Part B: re-establish bypass on the fresh run session so the
         // worker's own tools honor it AND create_child_action propagates it to
         // grandchildren (whose forced-ask actions then reach the model-reviewer).
-        if self.bypass {
+        if effective_bypass {
             session
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
@@ -1092,7 +1150,12 @@ mod tests {
         struct FixedReviewer(bool);
         #[async_trait]
         impl bamboo_engine::external_agents::ChildApprovalReviewer for FixedReviewer {
-            async fn review(&self, _id: &str, _req: &serde_json::Value) -> bool {
+            async fn review(
+                &self,
+                _parent_id: &str,
+                _child_id: &str,
+                _req: &serde_json::Value,
+            ) -> bool {
                 self.0
             }
         }
@@ -1100,6 +1163,7 @@ mod tests {
             tool_name: "Bash".into(),
             permission: "execute".into(),
             resource: "rm -rf /tmp/x".into(),
+            permission_request: None,
         };
         // reviewer present (no_human_approver) → decided LOCALLY, host untouched.
         let approve = HostApprovalProxy {

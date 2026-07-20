@@ -7,5 +7,5 @@ mod handlers;
 mod session;
 mod types;
 
-pub use handlers::{get_pending_question, submit_response};
+pub use handlers::{get_pending_question, submit_permission_decision, submit_response};
 pub use types::RespondRequest;

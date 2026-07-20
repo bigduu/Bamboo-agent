@@ -1215,6 +1215,7 @@ mod tests {
         RunSpec {
             assignment: assignment.to_string(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: Vec::new(),
         }
     }
@@ -1223,6 +1224,7 @@ mod tests {
         RunSpec {
             assignment: assignment.to_string(),
             reasoning_effort: None,
+            permission_policy: None,
             messages,
         }
     }

@@ -247,6 +247,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/sessions/{session_id}/respond/pending",
             web::get().to(agent::respond::get_pending_question),
         )
+        .route(
+            "/sessions/{session_id}/permission-decisions",
+            web::post().to(agent::respond::submit_permission_decision),
+        )
         // Phase 2: deliver a human approval decision to a child sub-agent's
         // blocked gated tool (surfaced via AgentEvent::ChildApprovalRequested).
         .route(

@@ -149,7 +149,20 @@ pub(crate) fn make_disabled_filter_resolver(
     })
 }
 
-pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
+pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
+    if let Some(config) = args.state.permission_checker.permission_config() {
+        if let Some(workspace) = args.session.workspace.as_deref() {
+            config.register_session_workspace(args.session_id.clone(), workspace.to_string());
+        }
+        args.session.metadata.insert(
+            "permission.policy_revision".to_string(),
+            config.policy_revision().to_string(),
+        );
+        args.session.metadata.insert(
+            "permission.effective_mode".to_string(),
+            format!("{:?}", config.mode()).to_ascii_lowercase(),
+        );
+    }
     let tools_override = Some(tools_for_execution(
         args.state.as_ref(),
         args.is_child_session,

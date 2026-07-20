@@ -53,8 +53,11 @@ pub use config::{
 };
 pub use hierarchy::PermissionRuleSet;
 pub use policy::{
-    PermissionDecision, PermissionDecisionKind, PermissionMatcher, PermissionMatcherKind,
-    PermissionReasonCode, PermissionRequest,
+    conservative_matchers, DurablePermissionRule, EffectivePermissionPolicy, PermissionDecision,
+    PermissionDecisionKind, PermissionDecisionReceipt, PermissionDecisionSource,
+    PermissionDenyReason, PermissionEvaluation, PermissionMatcher, PermissionMatcherKind,
+    PermissionOutcome, PermissionReasonCode, PermissionRequest, PermissionRuleEffect,
+    PermissionRuleRef, PermissionRuleScope, PermissionRuleSource,
 };
 pub use rule_parser::ParsedRule;
 pub use storage::{

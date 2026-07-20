@@ -174,8 +174,9 @@ pub async fn load_permission_checker(
                 ))
             })?,
     );
-    let permission_config =
-        PermissionConfig::from_serializable(section.snapshot().data.as_ref().clone());
+    let snapshot = section.snapshot();
+    let permission_config = PermissionConfig::from_serializable(snapshot.data.as_ref().clone());
+    permission_config.set_policy_revision(snapshot.revision);
     permission_config.cleanup_expired_grants();
 
     // Wrap the config checker in a mode-aware checker so the active PermissionMode
@@ -400,6 +401,7 @@ pub fn build_schedule_manager(
     schedule_store: Arc<ScheduleStore>,
     agent: Arc<Agent>,
     tools_for_schedules: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -414,6 +416,7 @@ pub fn build_schedule_manager(
         schedule_store,
         agent,
         tools: tools_for_schedules,
+        permission_config,
         sessions_cache: sessions,
         agent_runners,
         session_event_senders,

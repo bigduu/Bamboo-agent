@@ -233,6 +233,7 @@ mod tests {
         link.send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: vec![],
         }))
         .await
@@ -363,6 +364,7 @@ mod tests {
         link.send(ParentFrame::Run(RunSpec {
             assignment: "go".into(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: vec![],
         }))
         .await
@@ -407,6 +409,7 @@ mod tests {
         link.send(ParentFrame::Run(RunSpec {
             assignment: "do the dangerous thing".into(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: vec![],
         }))
         .await

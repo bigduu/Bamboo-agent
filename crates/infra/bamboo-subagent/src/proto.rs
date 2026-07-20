@@ -29,6 +29,12 @@ pub struct RunSpec {
     pub assignment: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Effective permission policy captured by the host at this activation
+    /// boundary. Keeping it on `RunSpec` (rather than only provisioning) lets
+    /// warm, broker and remote workers observe policy revisions and bypass
+    /// changes on their next activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_policy: Option<PermissionPolicyContext>,
     /// Full prior conversation (serialized domain `Message`s, oldest first),
     /// INCLUDING the assignment's user message when present. The actor's
     /// durable state lives in the parent's store; each activation rehydrates
@@ -36,6 +42,22 @@ pub struct RunSpec {
     /// across one-shot actor processes. Empty = first activation, no history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<serde_json::Value>,
+}
+
+/// Host-computed permission state for one actor activation. The policy payload
+/// is opaque here so `bamboo-subagent` remains a transport leaf.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionPolicyContext {
+    pub revision: u64,
+    pub bypass_permissions: bool,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// Session grants are deliberately not inherited across an actor boundary;
+    /// a future opt-in protocol can set this and carry explicit scoped grants.
+    #[serde(default)]
+    pub inherit_session_grants: bool,
+    pub policy: serde_json::Value,
 }
 
 /// Parent → child control/in-band frames.
@@ -124,6 +146,7 @@ mod tests {
             ParentFrame::Run(RunSpec {
                 assignment: "do x".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }),
             ParentFrame::Cancel,
@@ -179,11 +202,36 @@ mod tests {
         let f = ParentFrame::Run(RunSpec {
             assignment: "a".into(),
             reasoning_effort: Some("high".into()),
+            permission_policy: None,
             messages: Vec::new(),
         });
         let v: serde_json::Value = serde_json::from_str(&f.to_text()).unwrap();
         assert_eq!(v["kind"], "run");
         assert_eq!(v["assignment"], "a");
+    }
+
+    #[test]
+    fn permission_policy_context_round_trips_at_run_boundary() {
+        let context = PermissionPolicyContext {
+            revision: 9,
+            bypass_permissions: true,
+            session_id: "child-1".into(),
+            workspace_path: Some("/workspace/project".into()),
+            inherit_session_grants: false,
+            policy: serde_json::json!({"enabled":true,"durable_rules":[]}),
+        };
+        let frame = ParentFrame::Run(RunSpec {
+            assignment: "work".into(),
+            reasoning_effort: None,
+            permission_policy: Some(context.clone()),
+            messages: Vec::new(),
+        });
+        let decoded = ParentFrame::from_text(&frame.to_text()).unwrap();
+        assert_eq!(decoded, frame);
+        let ParentFrame::Run(run) = decoded else {
+            panic!("expected run frame");
+        };
+        assert_eq!(run.permission_policy, Some(context));
     }
 
     #[test]

@@ -511,11 +511,18 @@ impl AppState {
                 });
             }
         }
-        let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner_with_registry(
-                &config_snapshot,
-                Some(approval_registry.clone()),
-            );
+        let parent_approval_reviewer = Arc::new(
+            crate::app_state::parent_approval_reviewer::ParentAgentApprovalReviewer::new(
+                session_repo.clone(),
+                provider_router.clone(),
+            ),
+        );
+        let external_runner = bamboo_engine::external_agents::runtime::build_external_child_runner_with_registry_and_reviewer(
+            &config_snapshot,
+            Some(approval_registry.clone()),
+            Some(parent_approval_reviewer),
+            permission_checker.permission_config(),
+        );
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
@@ -544,6 +551,7 @@ impl AppState {
             schedule_store.clone(),
             agent.clone(),
             tools_with_task.clone(),
+            permission_checker.permission_config(),
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
