@@ -115,7 +115,14 @@ impl GeminiProvider {
     /// `x-goog-api-key` header (see [`GeminiProvider::build_headers`]), so the
     /// API key never appears in this URL.
     fn stream_url(&self, model: &str) -> String {
-        format!("{}/models/{}:streamGenerateContent", self.base_url, model)
+        // Gemini returns a JSON array when `alt=sse` is omitted even though the
+        // endpoint name is `streamGenerateContent`. The downstream adapter is
+        // intentionally an SSE parser, so request the SSE representation
+        // explicitly instead of silently producing an empty assistant turn.
+        format!(
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, model
+        )
     }
 
     /// Build the `list_models` URL. Auth travels via the `x-goog-api-key`
@@ -466,7 +473,11 @@ mod tests {
         let stream_url = provider.stream_url("gemini-custom");
         assert_eq!(
             stream_url,
-            "https://test.api.com/v1beta/models/gemini-custom:streamGenerateContent"
+            "https://test.api.com/v1beta/models/gemini-custom:streamGenerateContent?alt=sse"
+        );
+        assert!(
+            stream_url.ends_with("?alt=sse"),
+            "streamGenerateContent must explicitly request SSE transport"
         );
         assert!(
             !stream_url.contains("key="),

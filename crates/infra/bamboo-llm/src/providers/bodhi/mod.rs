@@ -392,7 +392,10 @@ impl BodhiProvider {
         crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
 
         let headers = self.build_headers()?;
-        let url = self.proxy_url(&format!("v1beta/models/{}:streamGenerateContent", model));
+        let url = self.proxy_url(&format!(
+            "v1beta/models/{}:streamGenerateContent?alt=sse",
+            model
+        ));
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
