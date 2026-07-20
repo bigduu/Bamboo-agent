@@ -63,6 +63,7 @@ pub(super) async fn handle_streaming_chat(
                 session_id: None,
                 reasoning_effort,
                 parallel_tool_calls,
+                required_tool: None,
                 responses: None,
                 request_purpose: Some("openai_compat".to_string()),
                 cache: None,

@@ -207,6 +207,7 @@ pub async fn evaluate_gold(
         session_id: Some(session_id.to_string()),
         reasoning_effort: request_reasoning_effort,
         parallel_tool_calls: None,
+        required_tool: None,
         responses: None,
         request_purpose: Some("gold_evaluation".to_string()),
         cache: None,

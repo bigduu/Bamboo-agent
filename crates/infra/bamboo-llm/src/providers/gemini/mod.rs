@@ -9,7 +9,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, CONTENT_TYPE},
     Client,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::protocol::gemini::GeminiRequest;
 use crate::protocol::ToProvider;
@@ -20,6 +20,17 @@ use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
+
+pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option<&str>) {
+    if let Some(name) = required_tool {
+        body["toolConfig"] = json!({
+            "functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": [name]
+            }
+        });
+    }
+}
 use bamboo_domain::ToolSchema;
 
 /// Google Gemini API provider.
@@ -156,6 +167,7 @@ impl LLMProvider for GeminiProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let required_tool = crate::provider::required_tool_from_options(options, tools)?;
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -214,6 +226,7 @@ impl LLMProvider for GeminiProvider {
             request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
             Some(model),
         );
+        apply_required_tool_choice(&mut request_json, required_tool);
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
         tracing::info!(
@@ -274,6 +287,7 @@ impl LLMProvider for GeminiProvider {
                     request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
                     Some(model),
                 );
+                apply_required_tool_choice(&mut fallback_request_json, required_tool);
                 crate::masking::mask_outbound_body(
                     &mut fallback_request_json,
                     &self.masking_config,
@@ -390,6 +404,29 @@ impl LLMProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_tool_choice_uses_gemini_any_allowlist_shape() {
+        let mut body = json!({
+            "generationConfig": {
+                "thinkingConfig": {"thinkingBudget": 4096}
+            }
+        });
+        apply_required_tool_choice(&mut body, Some("load_skill"));
+        assert_eq!(
+            body["toolConfig"],
+            json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": ["load_skill"]
+                }
+            })
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4096
+        );
+    }
 
     #[test]
     fn test_new_provider() {

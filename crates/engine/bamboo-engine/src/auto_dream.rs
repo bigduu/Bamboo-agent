@@ -451,6 +451,7 @@ async fn collect_stream_text(
         session_id: Some(DREAM_RUNTIME_SESSION_ID.to_string()),
         reasoning_effort: Some(ReasoningEffort::High),
         parallel_tool_calls: None,
+        required_tool: None,
         responses: None,
         request_purpose: Some("auto_dream".to_string()),
         cache: None,

@@ -25,12 +25,62 @@ use serde_json::{json, Value};
 use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
 use crate::prompt_ir::PromptIR;
 use crate::provider::LLMRequestOptions;
-use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::provider::{required_tool_from_options, LLMError, LLMProvider, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::ReasoningEffort;
+
+pub(crate) fn reasoning_effort_for_required_tool(
+    configured: Option<ReasoningEffort>,
+    required_tool: Option<&str>,
+) -> Option<ReasoningEffort> {
+    if required_tool.is_some() {
+        None
+    } else {
+        configured
+    }
+}
+
+pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option<&str>) {
+    if let Some(name) = required_tool {
+        // Anthropic-compatible reasoning models (including DeepSeek through an
+        // Anthropic endpoint) reject forced named-tool choice while thinking is
+        // enabled. This is a request-scoped activation turn, so remove thinking
+        // after all request overrides and restore normal behavior next round.
+        if let Some(object) = body.as_object_mut() {
+            object.remove("thinking");
+        }
+        body["tool_choice"] = json!({
+            "type": "tool",
+            "name": name,
+            "disable_parallel_tool_use": true
+        });
+    }
+}
+
+pub(crate) fn apply_required_tool_auto_fallback(body: &mut Value, required_tool: Option<&str>) {
+    if required_tool.is_some() {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("thinking");
+        }
+        body["tool_choice"] = json!({
+            "type": "auto",
+            "disable_parallel_tool_use": true
+        });
+    }
+}
+
+pub(crate) fn looks_like_thinking_forced_tool_choice_error(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && body
+            .to_ascii_lowercase()
+            .contains("thinking mode does not support this tool_choice")
+}
 
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
@@ -226,16 +276,24 @@ impl AnthropicProvider {
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
-        let reasoning_effort = options
+        let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let required_tool = required_tool_from_options(options, tools)?;
+        let configured_reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
-        let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
-        let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let reasoning_effort =
+            reasoning_effort_for_required_tool(configured_reasoning_effort, required_tool);
+        let request_reasoning_effort = reasoning_effort_for_required_tool(
+            options.and_then(|o| o.reasoning_effort),
+            required_tool,
+        );
         let cache_plan = options.and_then(|o| o.cache.as_ref());
         let extended_cache_ttl = cache_plan
             .map(|plan| plan.ttl == CacheTtl::Extended)
             .unwrap_or(false);
-        let reasoning_source = if request_reasoning_effort.is_some() {
+        let reasoning_source = if required_tool.is_some() {
+            "required_tool_disabled"
+        } else if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
             "provider_default"
@@ -270,6 +328,7 @@ impl AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             Some(model),
         );
+        apply_required_tool_choice(&mut body, required_tool);
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
@@ -355,7 +414,59 @@ impl AnthropicProvider {
             let status = response.status();
             let text = response.text().await.map_err(LLMError::Http)?;
 
-            if reasoning_effort.is_some()
+            if required_tool.is_some()
+                && looks_like_thinking_forced_tool_choice_error(status, &text)
+            {
+                tracing::warn!(
+                    "[{}] Anthropic model '{}' rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
+                    session_log_id,
+                    model
+                );
+                let mut fallback_body = build_anthropic_request_with_cache_blocks(
+                    messages,
+                    system_blocks,
+                    tools,
+                    model,
+                    max_tokens,
+                    true,
+                    None,
+                    Some(false),
+                    cache_plan,
+                    false,
+                );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_MESSAGES,
+                    Some(model),
+                );
+                apply_required_tool_auto_fallback(&mut fallback_body, required_tool);
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                response =
+                    crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                        self.client
+                            .post(&messages_url)
+                            .headers(headers.clone())
+                            .json(&fallback_body)
+                    })
+                    .await
+                    .map_err(LLMError::Http)?;
+
+                if !response.status().is_success() {
+                    let fallback_status = response.status();
+                    let fallback_text = response.text().await.map_err(LLMError::Http)?;
+                    if fallback_status == 401 || fallback_status == 403 {
+                        return Err(LLMError::Auth(format!(
+                            "Anthropic authentication failed: {}. Please check your API key.",
+                            fallback_text
+                        )));
+                    }
+                    return Err(LLMError::Api(format!(
+                        "Anthropic API error after tool_choice=auto activation fallback: HTTP {}: {}",
+                        fallback_status, fallback_text
+                    )));
+                }
+            } else if reasoning_effort.is_some()
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
                 tracing::warn!(
@@ -381,6 +492,7 @@ impl AnthropicProvider {
                     request_overrides::ENDPOINT_MESSAGES,
                     Some(model),
                 );
+                apply_required_tool_choice(&mut fallback_body, required_tool);
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 applied_reasoning_effort = None;
                 thinking_enabled = false;
@@ -2906,6 +3018,100 @@ mod anthropic_request_building {
     }
 
     #[test]
+    fn required_tool_choice_uses_anthropic_named_tool_shape() {
+        assert_eq!(
+            super::reasoning_effort_for_required_tool(
+                Some(bamboo_domain::ReasoningEffort::High),
+                Some("load_skill"),
+            ),
+            None
+        );
+        let messages = vec![Message::user("activate")];
+        let tools = sample_tools();
+        let mut body = super::build_anthropic_request(
+            &messages,
+            &tools,
+            "deepseek-v4-pro",
+            8192,
+            false,
+            Some(bamboo_domain::ReasoningEffort::High),
+            Some(false),
+        );
+        assert!(body.get("thinking").is_some(), "test precondition");
+        super::apply_required_tool_choice(&mut body, Some("load_skill"));
+        assert!(
+            body.get("thinking").is_none(),
+            "forced named-tool request must disable thinking"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({
+                "type": "tool",
+                "name": "load_skill",
+                "disable_parallel_tool_use": true
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_forced_tool_error_detector_is_exact() {
+        assert!(super::looks_like_thinking_forced_tool_choice_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#,
+        ));
+        assert!(!super::looks_like_thinking_forced_tool_choice_error(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Thinking mode does not support this tool_choice",
+        ));
+        assert!(!super::looks_like_thinking_forced_tool_choice_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "tool_choice is invalid for this request",
+        ));
+    }
+
+    #[test]
+    fn thinking_forced_tool_fallback_uses_auto_and_disables_parallel() {
+        let mut body = serde_json::json!({
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "tool_choice": {"type": "tool", "name": "overridden"}
+        });
+        super::apply_required_tool_auto_fallback(&mut body, Some("load_skill"));
+
+        assert!(body.get("thinking").is_none());
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({
+                "type": "auto",
+                "disable_parallel_tool_use": true
+            })
+        );
+    }
+
+    #[test]
+    fn normal_anthropic_request_keeps_configured_thinking() {
+        assert_eq!(
+            super::reasoning_effort_for_required_tool(
+                Some(bamboo_domain::ReasoningEffort::High),
+                None,
+            ),
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+        let body = super::build_anthropic_request(
+            &[Message::user("answer normally")],
+            &sample_tools(),
+            "deepseek-v4-pro",
+            8192,
+            false,
+            Some(bamboo_domain::ReasoningEffort::High),
+            Some(true),
+        );
+
+        assert!(body.get("thinking").is_some());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
     fn parallel_tool_calls_false_disables_parallel_tool_use() {
         let messages = vec![Message::user("Hello")];
         let tools = sample_tools();
@@ -3820,6 +4026,83 @@ mod anthropic_request_building_edge_cases {
 #[cfg(test)]
 mod anthropic_provider_tests {
     use super::*;
+    use bamboo_domain::{FunctionSchema, ToolSchema};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const THINKING_TOOL_CHOICE_ERROR: &str =
+        r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#;
+    const ANTHROPIC_SSE_OK: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    struct ThinkingToolChoiceResponder;
+
+    impl Respond for ThinkingToolChoiceResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).expect("JSON request body");
+            if body["tool_choice"]["type"] == "tool" {
+                ResponseTemplate::new(400).set_body_string(THINKING_TOOL_CHOICE_ERROR)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK)
+            }
+        }
+    }
+
+    fn load_skill_tool() -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "load_skill".to_string(),
+                description: "Load one skill".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_named_tool_retries_exact_thinking_error_with_auto_choice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ThinkingToolChoiceResponder)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_reasoning_effort(Some(ReasoningEffort::High));
+        let tools = vec![load_skill_tool()];
+        let options = LLMRequestOptions {
+            required_tool: Some("load_skill".to_string()),
+            parallel_tool_calls: Some(false),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &tools,
+                Some(8192),
+                "deepseek-v4-pro",
+                Some(&options),
+            )
+            .await
+            .expect("exact incompatibility should retry with auto choice");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2);
+        let named: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let fallback: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(named.get("thinking").is_none());
+        assert_eq!(named["tool_choice"]["type"], "tool");
+        assert_eq!(named["tool_choice"]["name"], "load_skill");
+        assert!(fallback.get("thinking").is_none());
+        assert_eq!(fallback["tool_choice"]["type"], "auto");
+        assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
+        assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(fallback["tools"][0]["name"], "load_skill");
+    }
 
     #[test]
     fn test_new_provider() {

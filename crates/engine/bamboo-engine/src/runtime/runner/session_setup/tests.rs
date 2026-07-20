@@ -122,6 +122,47 @@ fn schema(name: &str) -> ToolSchema {
     }
 }
 
+fn mark_test_activation_current(session: &mut Session, skill_id: &str) {
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::LOADED_SKILL_IDS_METADATA_KEY.to_string(),
+        serde_json::json!([skill_id]).to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+        serde_json::json!({
+            "id": skill_id,
+            "source": "builtin",
+            "revision": 1,
+            "kind": "instruction",
+            "args": {},
+            "invoked_by": "user",
+            "activated_at": "2026-07-21T00:00:00Z",
+            "status": "active"
+        })
+        .to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY.to_string(),
+        "{}".to_string(),
+    );
+}
+
+fn record_test_activation_from_pinned_snapshot(session: &mut Session, skill_id: &str) {
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::LOADED_SKILL_IDS_METADATA_KEY.to_string(),
+        serde_json::json!([skill_id]).to_string(),
+    );
+    bamboo_skills::record_loaded_workflow_activation(
+        &mut session.metadata,
+        skill_id,
+        "test-context-fingerprint".to_string(),
+    )
+    .expect("record pinned test activation");
+    session
+        .metadata
+        .remove(bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY);
+}
+
 #[tokio::test]
 async fn pending_workflow_deactivation_is_published_and_acked_exactly_once() {
     let persistence = Arc::new(RecordingPersistence::default());
@@ -263,6 +304,10 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
     };
     let mut session = Session::new("selection-publish", "model");
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    session.metadata.insert(
+        "skill_runtime_loaded_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
 
     super::prepare_session_for_loop(
         &mut session,
@@ -315,6 +360,12 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
         .expect("metadata-only catalog publication");
     assert!(published_catalog.contains("review"));
     assert!(!published_catalog.contains("pinned instructions"));
+    assert!(
+        !session
+            .metadata
+            .contains_key("skill_runtime_loaded_skill_ids"),
+        "a new automatic selection must not inherit the previous run's activation"
+    );
     let saved = persistence.sessions.lock().expect("recording lock");
     let published = saved.last().expect("selection published");
     let ids = published
@@ -326,7 +377,7 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
 }
 
 #[tokio::test]
-async fn session_setup_preloads_one_explicit_skill_before_model_execution() {
+async fn session_setup_requires_model_issued_load_for_one_explicit_skill() {
     let directory = tempfile::tempdir().expect("tempdir");
     let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
         skills_dir: directory.path().join("skills"),
@@ -362,9 +413,98 @@ async fn session_setup_preloads_one_explicit_skill_before_model_execution() {
     .expect("session setup");
 
     let calls = tools.calls.lock().expect("recording tool lock");
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.name, "load_skill");
-    assert!(calls[0].function.arguments.contains("review"));
+    assert!(
+        calls.is_empty(),
+        "the runtime must not impersonate the model"
+    );
+    assert!(session.messages.iter().all(|message| {
+        !message.content.contains("## Explicit Workflow Activated")
+            && !message.content.contains("REPORT_ONLY_ACTIONABLE_FINDINGS")
+    }));
+    assert!(
+        super::prompt_envelope::build_active_workflow_context_block(&session).is_none(),
+        "the workflow is not active until the model-issued load_skill succeeds"
+    );
+    assert!(
+        event_rx.try_recv().is_err(),
+        "selection alone must not emit WorkflowActivated"
+    );
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_loaded_skill_ids"));
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+        .expect("system prompt")
+        .content
+        .as_str();
+    assert!(system_prompt.contains("## Required Explicit Workflow Activation"));
+    assert!(system_prompt.contains("first response step MUST be exactly one `load_skill` call"));
+    assert!(system_prompt.contains("review"));
+
+    let saved = persistence.sessions.lock().expect("recording lock");
+    assert!(saved.iter().all(|saved_session| !saved_session
+        .metadata
+        .contains_key("skill_runtime_loaded_skill_ids")));
+}
+
+#[tokio::test]
+async fn permission_style_second_prepare_preserves_unchanged_explicit_activation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize skills");
+    let persistence = Arc::new(RecordingPersistence::default());
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager),
+        selected_skill_ids: Some(vec!["review".to_string()]),
+        persistence: Some(persistence),
+        ..Default::default()
+    };
+    let tools = RecordingToolExecutor {
+        calls: Mutex::new(Vec::new()),
+        schemas: vec![schema("load_skill")],
+    };
+    let mut session = Session::new("explicit-review-resume", "model");
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+    super::prepare_session_for_loop(
+        &mut session,
+        "Review this change",
+        &config,
+        &tools,
+        None,
+        "explicit-review-resume",
+        &logger,
+        false,
+        &event_tx,
+    )
+    .await
+    .expect("initial explicit setup");
+    assert!(super::skill_context::explicit_activation_pending(&session));
+    record_test_activation_from_pinned_snapshot(&mut session, "review");
+    assert!(!super::skill_context::explicit_activation_pending(&session));
+
+    // Mirrors re-entry after a permission/tool suspension: same session, same
+    // explicit workflow, and a second prepare before the model continues.
+    super::prepare_session_for_loop(
+        &mut session,
+        "Review this change",
+        &config,
+        &tools,
+        None,
+        "explicit-review-resume",
+        &logger,
+        true,
+        &event_tx,
+    )
+    .await
+    .expect("resume explicit setup");
+
     assert_eq!(
         session
             .metadata
@@ -372,61 +512,61 @@ async fn session_setup_preloads_one_explicit_skill_before_model_execution() {
             .map(String::as_str),
         Some("[\"review\"]")
     );
-    assert_eq!(
-        session
-            .metadata
-            .get("skill_runtime_last_loaded_skill_id")
-            .map(String::as_str),
-        Some("review")
-    );
-    assert!(session.messages.iter().all(|message| {
-        !message.content.contains("## Explicit Workflow Activated")
-            && !message.content.contains("REPORT_ONLY_ACTIONABLE_FINDINGS")
-    }));
-    let workflow_block = super::prompt_envelope::build_active_workflow_context_block(&session)
-        .expect("dedicated active workflow context block");
-    assert_eq!(
-        workflow_block.block_type,
-        bamboo_agent_core::ContextBlockType::WorkflowRuntime
-    );
-    assert!(workflow_block.content.contains("workflow_id: review"));
-    assert!(workflow_block.content.contains("### Instructions"));
-    assert_eq!(
-        super::prompt_envelope::build_active_workflow_context_block(&session),
-        Some(workflow_block.clone()),
-        "each round must rebuild one deterministic workflow block"
-    );
-    let rendered = workflow_block.render_runtime_context_message();
-    assert!(rendered.never_compress);
-    assert_eq!(
-        session
-            .messages
-            .iter()
-            .filter(|message| message.content.contains("context_type: workflow_runtime"))
-            .count(),
-        0,
-        "runtime workflow context must not be appended to durable user history"
-    );
-    assert!(matches!(
-        event_rx.try_recv(),
-        Ok(bamboo_agent_core::AgentEvent::WorkflowActivated {
-            ref session_id,
-            ref workflow_id,
-            ..
-        }) if session_id == "explicit-review" && workflow_id == "review"
-    ));
+    assert!(!super::skill_context::explicit_activation_pending(&session));
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+        .expect("system prompt")
+        .content
+        .as_str();
+    assert!(!system_prompt.contains("## Required Explicit Workflow Activation"));
+    assert!(system_prompt.contains("## Explicit Workflow Already Activated"));
     assert!(
-        event_rx.try_recv().is_err(),
-        "activation must emit exactly once"
+        system_prompt.contains("Do not call `load_skill` again solely because execution resumed")
     );
+    assert!(tools.calls.lock().expect("recording tool lock").is_empty());
+}
 
-    let saved = persistence.sessions.lock().expect("recording lock");
-    assert!(saved.iter().any(|saved_session| {
-        saved_session
+#[test]
+fn activation_reset_preserves_same_explicit_and_clears_superseded_selection() {
+    let explicit_review = super::skill_context::SkillContextLoadResult {
+        selected_skill_ids: vec!["review".to_string()],
+        selection_source: Some("explicit".to_string()),
+        ..Default::default()
+    };
+    let mut session = Session::new("activation-reset", "model");
+    mark_test_activation_current(&mut session, "review");
+
+    super::skill_context::reset_activation_state_for_new_selection(&mut session, &explicit_review);
+    assert_eq!(
+        session
             .metadata
             .get("skill_runtime_loaded_skill_ids")
-            .is_some_and(|ids| ids == "[\"review\"]")
-    }));
+            .map(String::as_str),
+        Some("[\"review\"]")
+    );
+
+    let explicit_plan = super::skill_context::SkillContextLoadResult {
+        selected_skill_ids: vec!["plan".to_string()],
+        selection_source: Some("explicit".to_string()),
+        ..Default::default()
+    };
+    super::skill_context::reset_activation_state_for_new_selection(&mut session, &explicit_plan);
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_loaded_skill_ids"));
+
+    mark_test_activation_current(&mut session, "review");
+    let automatic_review = super::skill_context::SkillContextLoadResult {
+        selected_skill_ids: vec!["review".to_string()],
+        selection_source: Some("auto".to_string()),
+        ..Default::default()
+    };
+    super::skill_context::reset_activation_state_for_new_selection(&mut session, &automatic_review);
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_loaded_skill_ids"));
 }
 
 #[tokio::test]
@@ -615,6 +755,31 @@ fn resolve_available_tool_schemas_keeps_load_skill_for_new_automatic_selection()
 
     assert!(names.contains(&"load_skill"));
     assert!(names.contains(&"read_skill_resource"));
+}
+
+#[test]
+fn explicit_activation_state_becomes_current_only_after_successful_model_load() {
+    let mut session = Session::new("explicit-activation-state", "model");
+    session.metadata.insert(
+        "skill_runtime_selection_source".to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selected_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
+    assert!(super::skill_context::explicit_activation_pending(&session));
+
+    mark_test_activation_current(&mut session, "review");
+
+    assert!(!super::skill_context::explicit_activation_pending(&session));
+    assert_eq!(
+        session
+            .metadata
+            .get("skill_runtime_loaded_skill_ids")
+            .map(String::as_str),
+        Some("[\"review\"]")
+    );
 }
 
 #[test]

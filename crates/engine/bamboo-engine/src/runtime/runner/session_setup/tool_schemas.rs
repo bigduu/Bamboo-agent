@@ -67,10 +67,12 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
         });
     }
 
-    // One activation chooses one workflow. Once its detailed instructions have
-    // been loaded, stop offering load_skill so the model cannot redundantly
-    // reload the same workflow (or switch to another advertised candidate) on a
-    // later round. Resource reads remain available for the active workflow.
+    // Once a single explicitly selected workflow reaches a terminal activation
+    // result, stop advertising load_skill so the model-issued attempt occurs
+    // exactly once. A typed degraded result is terminal too: the main session
+    // continues without workflow instructions instead of retrying forever.
+    // Automatic catalogs keep the tool available until the model chooses a
+    // candidate.
     let loaded_skill_ids = session
         .metadata
         .get(LOADED_SKILL_IDS_METADATA_KEY)
@@ -81,13 +83,18 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
         .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
         .unwrap_or_default();
-    let explicit_activation_is_current = session
+    let explicit_selection = session
         .metadata
         .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
-        .is_some_and(|source| source == "explicit")
+        .is_some_and(|source| source == "explicit");
+    let explicit_activation_is_current = explicit_selection
         && !loaded_skill_ids.is_empty()
         && loaded_skill_ids == selected_skill_ids;
-    if explicit_activation_is_current {
+    let explicit_activation_degraded = explicit_selection
+        && session
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
+    if explicit_activation_is_current || explicit_activation_degraded {
         tool_schemas.retain(|schema| schema.function.name != "load_skill");
     }
 
@@ -135,7 +142,7 @@ mod live_disabled_tests {
             self.execute(call).await
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
-            ["alpha_tool", "beta_tool"]
+            ["alpha_tool", "beta_tool", "load_skill"]
                 .into_iter()
                 .map(|name| ToolSchema {
                     schema_type: "function".into(),
@@ -183,5 +190,30 @@ mod live_disabled_tests {
         // alpha_tool still offered. Re-enable would restore it (list rebuilt fresh).
         assert!(!offered(&config, &tools, &session, "beta_tool"));
         assert!(offered(&config, &tools, &session, "alpha_tool"));
+    }
+
+    #[test]
+    fn explicit_degraded_activation_hides_load_skill_after_one_attempt() {
+        let config = AgentLoopConfig::default();
+        let tools = TwoTools;
+        let mut session = Session::new("degraded", "m");
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            r#"["review"]"#.to_string(),
+        );
+
+        assert!(offered(&config, &tools, &session, "load_skill"));
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY.to_string(),
+            r#"{"code":"provider_failed"}"#.to_string(),
+        );
+        assert!(!offered(&config, &tools, &session, "load_skill"));
+        assert!(!super::super::skill_context::explicit_activation_pending(
+            &session
+        ));
     }
 }

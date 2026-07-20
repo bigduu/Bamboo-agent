@@ -104,6 +104,7 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
             session_id: None,
             reasoning_effort: None,
             parallel_tool_calls: None,
+            required_tool: None,
             responses: None,
             request_purpose: Some("mini_loop".to_string()),
             cache: None,
