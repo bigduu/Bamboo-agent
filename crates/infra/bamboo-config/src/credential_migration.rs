@@ -54,6 +54,8 @@ struct MigrationManifest {
     state: MigrationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exact_scope: Option<ExactTransactionScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration_scope: Option<MigrationScope>,
     files: Vec<StagedFile>,
 }
 
@@ -70,6 +72,12 @@ enum ExactTransactionScope {
     ProxyAuth,
     EnvVars,
     Notifications,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MigrationScope {
+    ClusterFabric,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +217,16 @@ pub fn migrate_external_broker_credentials(
     migrate_broker_inner(data_dir.as_ref(), None)
 }
 
+/// Extract cluster-fabric SSH credentials from the root configuration without
+/// coupling malformed optional cluster data to provider/MCP migration. The
+/// transaction uses the shared lock and recovery manifest, but carries an
+/// explicit scope so a committed config rebase reruns the cluster planner.
+pub fn migrate_cluster_credentials(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    migrate_cluster_inner(data_dir.as_ref(), None)
+}
+
 /// Fail-closed guard for every production reader of credential transaction
 /// members. A malformed manifest is treated like a pending one: callers must
 /// retain their existing runtime rather than guessing which files committed.
@@ -228,6 +246,12 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
         )
     })?;
     if manifest.state == MigrationState::Pending {
+        if manifest.migration_scope == Some(MigrationScope::ClusterFabric)
+            && provider_mcp_documents_are_migration_free(data_dir.as_ref())?
+            && pending_cluster_refs_are_exclusive(data_dir.as_ref())?
+        {
+            return Ok(());
+        }
         return Err(ConfigStoreError::Validation(
             "provider/MCP/broker credential migration is pending".to_string(),
         ));
@@ -778,6 +802,7 @@ fn persist_provider_credential_transaction_with_instances_inner(
         } else {
             None
         },
+        migration_scope: None,
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -980,6 +1005,7 @@ fn migrate_broker_inner(
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
         exact_scope: None,
+        migration_scope: None,
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -1007,6 +1033,214 @@ fn migrate_broker_inner(
     })
 }
 
+#[cfg(test)]
+fn migrate_cluster_with_fault(
+    data_dir: &Path,
+    fault: MigrationFault,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    migrate_cluster_inner(data_dir, Some(fault))
+}
+
+fn migrate_cluster_inner(
+    data_dir: &Path,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    std::fs::create_dir_all(data_dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join(LOCK_FILE))?;
+    lock.lock_exclusive()?;
+    let _lock = MigrationLock(lock);
+
+    cleanup_orphan_transaction_dirs(data_dir)?;
+    let resumed = recover_committed(
+        data_dir,
+        #[cfg(test)]
+        None,
+    )?
+    .is_some();
+    discard_uncommitted(data_dir)?;
+
+    let mut extracted = Vec::new();
+    let section = plan_cluster_section(data_dir, &mut extracted, 1, true)?;
+    let store = CredentialStore::open(data_dir);
+    if let Some(section) = section {
+        ensure_cluster_extractions_are_safe(
+            data_dir,
+            &extracted,
+            &[(section.bytes.as_slice(), true)],
+        )?;
+        let resolved = resolve_extracted_secrets(&store, extracted)?;
+        let prepared_credentials = store.prepare_migration(resolved)?;
+        let transaction_id = Uuid::new_v4().to_string();
+        let stage_dir_name = format!("{STAGE_PREFIX}{transaction_id}");
+        let stage_dir = data_dir.join(&stage_dir_name);
+        let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{transaction_id}"));
+        create_private_dir(&stage_dir)?;
+        create_private_dir(&backup_dir)?;
+        sync_dir(data_dir)?;
+
+        let mut staged = Vec::new();
+        stage_file(
+            &stage_dir,
+            &backup_dir,
+            CREDENTIALS_FILE,
+            &prepared_credentials.bytes,
+            std::fs::read(data_dir.join(CREDENTIALS_FILE))
+                .ok()
+                .as_deref(),
+            true,
+            None,
+            InstallMode::Migration,
+            None,
+            &mut staged,
+        )?;
+        stage_file(
+            &stage_dir,
+            &backup_dir,
+            CONFIG_FILE,
+            &section.bytes,
+            Some(&section.original),
+            false,
+            Some(section.migration_generation),
+            InstallMode::Migration,
+            None,
+            &mut staged,
+        )?;
+        restrict_directory_files_to_owner(&stage_dir)?;
+        restrict_directory_files_to_owner(&backup_dir)?;
+        sync_dir(&stage_dir)?;
+        sync_dir(&backup_dir)?;
+
+        let manifest = MigrationManifest {
+            version: MIGRATION_VERSION,
+            transaction_id,
+            stage_dir: stage_dir_name,
+            state: MigrationState::Pending,
+            exact_scope: None,
+            migration_scope: Some(MigrationScope::ClusterFabric),
+            files: staged,
+        };
+        write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
+        write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+        #[cfg(test)]
+        if fault == Some(MigrationFault::AfterManifest) {
+            return Err(injected_fault());
+        }
+        let mut manifest = manifest;
+        install_pending(
+            data_dir,
+            &mut manifest,
+            #[cfg(test)]
+            fault,
+        )?;
+        let added = prepared_credentials.added;
+        finish_transaction(data_dir, manifest)?;
+        return Ok(CredentialMigrationOutcome {
+            migrated_credentials: added,
+            resumed,
+        });
+    }
+
+    let migrated_credentials = scrub_cluster_credentials_from_backups(data_dir)?;
+    Ok(CredentialMigrationOutcome {
+        migrated_credentials,
+        resumed,
+    })
+}
+
+fn pending_cluster_migration(data_dir: &Path) -> ConfigStoreResult<bool> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(MANIFEST_FILE))? else {
+        return Ok(false);
+    };
+    let manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&manifest)?;
+    Ok(manifest.state == MigrationState::Pending
+        && manifest.migration_scope == Some(MigrationScope::ClusterFabric))
+}
+
+fn pending_cluster_refs_are_exclusive(data_dir: &Path) -> ConfigStoreResult<bool> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(MANIFEST_FILE))? else {
+        return Ok(false);
+    };
+    let manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&manifest)?;
+    if manifest.state != MigrationState::Pending
+        || manifest.migration_scope != Some(MigrationScope::ClusterFabric)
+    {
+        return Ok(false);
+    }
+    let config_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CONFIG_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed cluster credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let staged = std::fs::read(
+        validated_stage_dir(data_dir, &manifest.stage_dir)?.join(&config_file.staged_name),
+    )?;
+    if sha256(&staged) != config_file.sha256 {
+        return Err(ConfigStoreError::Validation(
+            "staged cluster configuration failed integrity validation".to_string(),
+        ));
+    }
+    let mut refs = cluster_refs_from_document(&staged)?;
+    refs.extend(cluster_refs_from_document(&read_target_or_empty(
+        &data_dir.join(CONFIG_FILE),
+    )?)?);
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let bytes = match std::fs::read(data_dir.join(format!("{CONFIG_FILE}.{suffix}"))) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if serde_json::from_slice::<Value>(&bytes).is_err() {
+            continue;
+        }
+        refs.extend(cluster_refs_from_document(&bytes)?);
+        let mut extracted = Vec::new();
+        if let Ok(Some(planned)) = plan_cluster_document(bytes, &mut extracted, 1) {
+            refs.extend(cluster_refs_from_document(&planned.bytes)?);
+            refs.extend(extracted.into_iter().map(|secret| secret.credential_ref));
+        }
+    }
+    ensure_cluster_refs_are_safe(data_dir, &refs, &[(staged.as_slice(), true)])?;
+    Ok(true)
+}
+
+fn provider_mcp_documents_are_migration_free(data_dir: &Path) -> ConfigStoreResult<bool> {
+    let mut extracted = Vec::new();
+    let providers = plan_provider_section(data_dir, &mut extracted, 1)?;
+    let mcp = plan_mcp_section(data_dir, &mut extracted, 1)?;
+    let root = plan_provider_instance_section(data_dir, &mut extracted, 1, true)?;
+    if providers.is_some() || mcp.is_some() || root.is_some() || !extracted.is_empty() {
+        return Ok(false);
+    }
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let bytes = match std::fs::read(data_dir.join(format!("{CONFIG_FILE}.{suffix}"))) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if serde_json::from_slice::<Value>(&bytes).is_err() {
+            continue;
+        }
+        let mut backup_extracted = Vec::new();
+        if plan_provider_instance_document(bytes, &mut backup_extracted, 1)?.is_some()
+            || !backup_extracted.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn migrate_inner(
     data_dir: &Path,
     #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
@@ -1023,12 +1257,29 @@ fn migrate_inner(
     let _lock = MigrationLock(lock);
 
     cleanup_orphan_transaction_dirs(data_dir)?;
-    if let Some(outcome) = recover_committed(
+    match recover_committed(
         data_dir,
         #[cfg(test)]
         fault,
-    )? {
-        return Ok(outcome);
+    ) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        Err(_error)
+            if pending_cluster_migration(data_dir)?
+                && provider_mcp_documents_are_migration_free(data_dir)?
+                && pending_cluster_refs_are_exclusive(data_dir)? =>
+        {
+            // A committed cluster transaction may be waiting on cluster-only
+            // backup repair. Provider/MCP readers can safely retain their
+            // already-isolated documents: the atomic credential envelope
+            // changes only canonical cluster refs, and no second provider
+            // migration manifest is started while this one is pending.
+            return Ok(CredentialMigrationOutcome {
+                migrated_credentials: 0,
+                resumed: false,
+            });
+        }
+        Err(error) => return Err(error),
     }
     discard_uncommitted(data_dir)?;
 
@@ -1119,6 +1370,7 @@ fn migrate_inner(
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
         exact_scope: None,
+        migration_scope: None,
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -1697,6 +1949,537 @@ fn notification_refs_from_document(
         refs.insert(channel.to_string(), CredentialRef::parse(raw.to_string())?);
     }
     Ok(refs)
+}
+
+fn plan_cluster_section(
+    data_dir: &Path,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+    tolerate_corrupt_root: bool,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let path = data_dir.join(CONFIG_FILE);
+    let original = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if tolerate_corrupt_root && error.kind() == std::io::ErrorKind::IsADirectory => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut planned_extracted = Vec::new();
+    match plan_cluster_document(original, &mut planned_extracted, minimum_generation) {
+        Ok(planned) => {
+            extracted.extend(planned_extracted);
+            Ok(planned)
+        }
+        Err(ConfigStoreError::Validation(message))
+            if message.starts_with("cluster ")
+                || message.starts_with("legacy cluster credential") =>
+        {
+            Err(ConfigStoreError::Validation(message))
+        }
+        Err(_) if tolerate_corrupt_root => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn plan_cluster_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let mut root: Value = serde_json::from_slice(&original)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("root configuration must be an object".to_string())
+    })?;
+    let Some(cluster) = root_object
+        .get_mut("cluster_fabric")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+    let credential_refs_value = cluster.remove("credential_refs");
+    let had_credential_refs = credential_refs_value.is_some();
+    let mut credential_refs = match credential_refs_value {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(value)) => value,
+        Some(_) => {
+            return Err(ConfigStoreError::Validation(
+                "cluster credential metadata must be an object".to_string(),
+            ));
+        }
+    };
+    let Some(nodes) = cluster.get_mut("nodes").and_then(Value::as_array_mut) else {
+        if !credential_refs.is_empty() {
+            return Err(ConfigStoreError::Validation(
+                "cluster credential metadata references an unknown node".to_string(),
+            ));
+        }
+        if had_credential_refs {
+            cluster.insert(
+                "credential_refs".to_string(),
+                Value::Object(credential_refs),
+            );
+        }
+        return Ok(None);
+    };
+
+    let mut changed = false;
+    let mut node_ids = BTreeSet::new();
+    for node in nodes {
+        let node = node.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("cluster node must be an object".to_string())
+        })?;
+        let node_id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ConfigStoreError::Validation("cluster node id is empty".to_string()))?
+            .to_string();
+        if !node_ids.insert(node_id.clone()) {
+            return Err(ConfigStoreError::Validation(
+                "cluster node ids must be unique".to_string(),
+            ));
+        }
+        let metadata_value = credential_refs.remove(&node_id);
+        let had_metadata = metadata_value.is_some();
+        let mut metadata = match metadata_value {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(value)) => value,
+            Some(_) => {
+                return Err(ConfigStoreError::Validation(
+                    "cluster node credential metadata must be an object".to_string(),
+                ));
+            }
+        };
+        let placement = node
+            .get_mut("placement")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("cluster node placement is invalid".to_string())
+            })?;
+        match placement.get("type").and_then(Value::as_str) {
+            Some("local") => ensure_cluster_metadata_empty(&metadata, "local cluster node")?,
+            Some("ssh") => {
+                let auth = placement
+                    .get_mut("auth")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        ConfigStoreError::Validation(
+                            "cluster SSH authentication is invalid".to_string(),
+                        )
+                    })?;
+                match auth.get("method").and_then(Value::as_str) {
+                    Some("system_ssh_config") => {
+                        ensure_cluster_metadata_empty(&metadata, "system SSH node")?
+                    }
+                    Some("password") => {
+                        ensure_cluster_metadata_fields_absent(
+                            &metadata,
+                            &[
+                                "private_key_credential_ref",
+                                "private_key_configured",
+                                "passphrase_credential_ref",
+                                "passphrase_configured",
+                            ],
+                            "password auth",
+                        )?;
+                        changed |= migrate_cluster_auth_field(
+                            auth,
+                            &mut metadata,
+                            &node_id,
+                            "password",
+                            "password_encrypted",
+                            "password_credential_ref",
+                            "password_configured",
+                            crate::cluster_password_credential_ref(&node_id)?,
+                            extracted,
+                            migration_generation,
+                        )?;
+                    }
+                    Some("private_key") => {
+                        ensure_cluster_metadata_fields_absent(
+                            &metadata,
+                            &["password_credential_ref", "password_configured"],
+                            "private-key auth",
+                        )?;
+                        changed |= migrate_cluster_auth_field(
+                            auth,
+                            &mut metadata,
+                            &node_id,
+                            "private_key",
+                            "private_key_encrypted",
+                            "private_key_credential_ref",
+                            "private_key_configured",
+                            crate::cluster_private_key_credential_ref(&node_id)?,
+                            extracted,
+                            migration_generation,
+                        )?;
+                        changed |= migrate_cluster_auth_field(
+                            auth,
+                            &mut metadata,
+                            &node_id,
+                            "passphrase",
+                            "passphrase_encrypted",
+                            "passphrase_credential_ref",
+                            "passphrase_configured",
+                            crate::cluster_passphrase_credential_ref(&node_id)?,
+                            extracted,
+                            migration_generation,
+                        )?;
+                    }
+                    _ => {
+                        return Err(ConfigStoreError::Validation(
+                            "cluster SSH authentication method is invalid".to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(ConfigStoreError::Validation(
+                    "cluster node placement is invalid".to_string(),
+                ));
+            }
+        }
+        if had_metadata || !metadata.is_empty() {
+            credential_refs.insert(node_id, Value::Object(metadata));
+        }
+    }
+    if !credential_refs
+        .keys()
+        .all(|node_id| node_ids.contains(node_id))
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster credential metadata references an unknown node".to_string(),
+        ));
+    }
+    if had_credential_refs || !credential_refs.is_empty() {
+        cluster.insert(
+            "credential_refs".to_string(),
+            Value::Object(credential_refs),
+        );
+    }
+    if !changed {
+        return Ok(None);
+    }
+    serde_json::from_value::<crate::ClusterFabricConfig>(
+        root.get("cluster_fabric").cloned().unwrap_or_default(),
+    )
+    .map_err(|_| ConfigStoreError::Validation("cluster configuration is invalid".to_string()))?;
+    Ok(Some(PlannedSection {
+        name: CONFIG_FILE,
+        bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation,
+    }))
+}
+
+fn ensure_cluster_metadata_empty(
+    metadata: &Map<String, Value>,
+    owner: &str,
+) -> ConfigStoreResult<()> {
+    ensure_cluster_metadata_fields_absent(
+        metadata,
+        &[
+            "password_credential_ref",
+            "password_configured",
+            "private_key_credential_ref",
+            "private_key_configured",
+            "passphrase_credential_ref",
+            "passphrase_configured",
+        ],
+        owner,
+    )
+}
+
+fn ensure_cluster_metadata_fields_absent(
+    metadata: &Map<String, Value>,
+    fields: &[&str],
+    owner: &str,
+) -> ConfigStoreResult<()> {
+    if fields.iter().any(|field| metadata.contains_key(*field)) {
+        return Err(ConfigStoreError::Validation(format!(
+            "cluster credential metadata does not match {owner}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn migrate_cluster_auth_field(
+    auth: &mut Map<String, Value>,
+    metadata: &mut Map<String, Value>,
+    _node_id: &str,
+    plaintext_key: &str,
+    ciphertext_key: &str,
+    reference_key: &str,
+    configured_key: &str,
+    canonical: CredentialRef,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    let had_plaintext = auth.contains_key(plaintext_key);
+    let had_ciphertext = auth.contains_key(ciphertext_key);
+    let plaintext = take_nonempty_string(auth, plaintext_key)?;
+    let ciphertext = take_nonempty_string(auth, ciphertext_key)?;
+    let secret = match (plaintext, ciphertext) {
+        (Some(plaintext), Some(ciphertext)) => {
+            let decrypted = crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                ConfigStoreError::Validation(
+                    "legacy cluster credential could not be decrypted".to_string(),
+                )
+            })?;
+            if plaintext != decrypted {
+                return Err(ConfigStoreError::Validation(
+                    "legacy cluster credential fields contain conflicting values".to_string(),
+                ));
+            }
+            Some(LegacySecret::Plaintext(plaintext))
+        }
+        (Some(plaintext), None) => Some(LegacySecret::Plaintext(plaintext)),
+        (None, Some(ciphertext)) => Some(LegacySecret::Ciphertext(ciphertext)),
+        (None, None) => None,
+    };
+    let previous_ref = metadata.get(reference_key).cloned();
+    let explicit_ref = previous_ref
+        .as_ref()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "cluster credential reference must be a string".to_string(),
+                )
+            })
+        })
+        .transpose()?
+        .map(|value| CredentialRef::parse(value.to_string()))
+        .transpose()?;
+    if explicit_ref
+        .as_ref()
+        .is_some_and(|value| value != &canonical)
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster credential reference is not canonical".to_string(),
+        ));
+    }
+    let previous_configured = metadata.get(configured_key).cloned();
+    let configured = previous_configured
+        .as_ref()
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "cluster credential configured metadata must be boolean".to_string(),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(false)
+        || explicit_ref.is_some()
+        || secret.is_some();
+    if configured {
+        metadata.insert(
+            reference_key.to_string(),
+            Value::String(canonical.as_str().to_string()),
+        );
+        metadata.insert(configured_key.to_string(), Value::Bool(true));
+    } else {
+        metadata.remove(reference_key);
+        metadata.remove(configured_key);
+    }
+    if let Some(secret) = secret {
+        extracted.push(ExtractedSecret {
+            credential_ref: canonical.clone(),
+            value: secret,
+            migration_generation,
+            kind: ExtractedSecretKind::Other,
+            env_owner: None,
+        });
+    }
+    Ok(had_plaintext
+        || had_ciphertext
+        || previous_ref.as_ref() != metadata.get(reference_key)
+        || previous_configured.as_ref() != metadata.get(configured_key))
+}
+
+fn cluster_refs_from_document(bytes: &[u8]) -> ConfigStoreResult<BTreeSet<CredentialRef>> {
+    if bytes.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let root: Value = serde_json::from_slice(bytes)?;
+    let Some(entries) = root
+        .get("cluster_fabric")
+        .and_then(|value| value.get("credential_refs"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let mut refs = BTreeSet::new();
+    for metadata in entries.values() {
+        let metadata = metadata.as_object().ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "cluster node credential metadata must be an object".to_string(),
+            )
+        })?;
+        for key in [
+            "password_credential_ref",
+            "private_key_credential_ref",
+            "passphrase_credential_ref",
+        ] {
+            let Some(value) = metadata.get(key) else {
+                continue;
+            };
+            let value = value.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "cluster credential reference must be a string".to_string(),
+                )
+            })?;
+            refs.insert(CredentialRef::parse(value.to_string())?);
+        }
+    }
+    Ok(refs)
+}
+
+fn strip_cluster_credential_metadata(value: &mut Value) {
+    if let Some(cluster) = value
+        .get_mut("cluster_fabric")
+        .and_then(Value::as_object_mut)
+    {
+        cluster.remove("credential_refs");
+    }
+}
+
+fn ensure_cluster_refs_are_safe(
+    data_dir: &Path,
+    refs: &BTreeSet<CredentialRef>,
+    prospective_documents: &[(&[u8], bool)],
+) -> ConfigStoreResult<()> {
+    for reference in refs {
+        for name in [PROVIDERS_FILE, MCP_FILE, BROKER_FILE, CONFIG_FILE] {
+            for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+                let bytes = read_target_or_empty(&data_dir.join(format!("{name}{suffix}")))?;
+                if bytes.is_empty() {
+                    continue;
+                }
+                let mut value: Value = match serde_json::from_slice(&bytes) {
+                    Ok(value) => value,
+                    Err(_) if !suffix.is_empty() => continue,
+                    Err(error) if name == CONFIG_FILE => return Err(error.into()),
+                    Err(_) => continue,
+                };
+                if name == CONFIG_FILE {
+                    strip_cluster_credential_metadata(&mut value);
+                }
+                if contains_credential_reference(&value, reference.as_str()) {
+                    return Err(ConfigStoreError::Validation(
+                        "cluster credential reference is shared by another consumer".to_string(),
+                    ));
+                }
+            }
+        }
+        for (bytes, config_root) in prospective_documents {
+            let mut value: Value = serde_json::from_slice(bytes)?;
+            if *config_root {
+                strip_cluster_credential_metadata(&mut value);
+            }
+            if contains_credential_reference(&value, reference.as_str()) {
+                return Err(ConfigStoreError::Validation(
+                    "cluster credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_cluster_extractions_are_safe(
+    data_dir: &Path,
+    extracted: &[ExtractedSecret],
+    prospective_documents: &[(&[u8], bool)],
+) -> ConfigStoreResult<()> {
+    let mut refs = extracted
+        .iter()
+        .map(|secret| secret.credential_ref.clone())
+        .collect::<BTreeSet<_>>();
+    for (bytes, _) in prospective_documents {
+        refs.extend(cluster_refs_from_document(bytes)?);
+    }
+    preflight_cluster_backups(data_dir, &mut refs)?;
+    ensure_cluster_refs_are_safe(data_dir, &refs, prospective_documents)
+}
+
+fn preflight_cluster_backups(
+    data_dir: &Path,
+    refs: &mut BTreeSet<CredentialRef>,
+) -> ConfigStoreResult<()> {
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let bytes = match std::fs::read(data_dir.join(format!("{CONFIG_FILE}.{suffix}"))) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if serde_json::from_slice::<Value>(&bytes).is_err() {
+            continue;
+        }
+        let mut extracted = Vec::new();
+        let planned = plan_cluster_document(bytes.clone(), &mut extracted, 1)?;
+        refs.extend(extracted.into_iter().map(|secret| secret.credential_ref));
+        refs.extend(cluster_refs_from_document(
+            planned
+                .as_ref()
+                .map(|section| section.bytes.as_slice())
+                .unwrap_or(bytes.as_slice()),
+        )?);
+    }
+    Ok(())
+}
+
+fn scrub_cluster_credentials_from_backups(data_dir: &Path) -> ConfigStoreResult<usize> {
+    let store = CredentialStore::open(data_dir);
+    let mut plans = Vec::<(PathBuf, Vec<u8>, Vec<ExtractedSecret>)>::new();
+    let mut refs = cluster_refs_from_document(&read_target_or_empty(&data_dir.join(CONFIG_FILE))?)?;
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let path = data_dir.join(format!("{CONFIG_FILE}.{suffix}"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if serde_json::from_slice::<Value>(&bytes).is_err() {
+            continue;
+        }
+        let mut extracted = Vec::new();
+        let planned = plan_cluster_document(bytes.clone(), &mut extracted, 1)?;
+        let candidate = planned
+            .as_ref()
+            .map(|section| section.bytes.clone())
+            .unwrap_or_else(|| bytes.clone());
+        refs.extend(cluster_refs_from_document(&candidate)?);
+        if planned.is_some() {
+            plans.push((path, candidate, extracted));
+        }
+    }
+    ensure_cluster_refs_are_safe(data_dir, &refs, &[])?;
+
+    let mut backup_secrets = Vec::new();
+    for (_, _, extracted) in &mut plans {
+        for secret in std::mem::take(extracted) {
+            if !store.status_unchecked(&secret.credential_ref)?.configured {
+                backup_secrets.push(secret);
+            }
+        }
+    }
+    let migrated_credentials = if backup_secrets.is_empty() {
+        0
+    } else {
+        let resolved = resolve_extracted_secrets(&store, backup_secrets)?;
+        let prepared = store.prepare_migration(resolved)?;
+        let added = prepared.added;
+        store.commit_migration(&prepared.bytes)?;
+        added
+    };
+    for (path, candidate, _) in plans {
+        AtomicFileStore::new(path).write_bytes_without_backup(&candidate)?;
+    }
+    Ok(migrated_credentials)
 }
 
 fn plan_provider_instance_section(
@@ -3155,6 +3938,9 @@ fn install_pending(
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
     validate_manifest(manifest)?;
+    if manifest.migration_scope == Some(MigrationScope::ClusterFabric) {
+        pending_cluster_refs_are_exclusive(data_dir)?;
+    }
     ensure_proxy_consumers_or_abort(data_dir, manifest)?;
     ensure_notification_consumers_or_abort(data_dir, manifest)?;
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
@@ -3953,6 +4739,9 @@ fn rebase_changed_section(
         PROVIDERS_FILE => plan_provider_section(data_dir, &mut extracted, minimum_generation)?,
         MCP_FILE => plan_mcp_section(data_dir, &mut extracted, minimum_generation)?,
         BROKER_FILE => plan_broker_section(data_dir, &mut extracted, minimum_generation)?,
+        CONFIG_FILE if manifest.migration_scope == Some(MigrationScope::ClusterFabric) => {
+            plan_cluster_section(data_dir, &mut extracted, minimum_generation, false)?
+        }
         CONFIG_FILE => {
             plan_provider_instance_section(data_dir, &mut extracted, minimum_generation, false)?
         }
@@ -3965,10 +4754,25 @@ fn rebase_changed_section(
     let Some(section) = section else {
         // A concurrent writer already produced a secret-free document. Treat
         // that newer revision as authoritative and remove the stale candidate.
+        if manifest.migration_scope == Some(MigrationScope::ClusterFabric) {
+            // Credentials install before config. Scrub recoverable cluster
+            // backups while the scoped manifest is still authoritative, then
+            // clear the scope so the remaining credentials-only completed
+            // manifest is valid and cannot poison every later reader.
+            scrub_cluster_credentials_from_backups(data_dir)?;
+            manifest.migration_scope = None;
+        }
         manifest.files.remove(file_index);
         write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
         return Ok(false);
     };
+    if manifest.migration_scope == Some(MigrationScope::ClusterFabric) {
+        ensure_cluster_extractions_are_safe(
+            data_dir,
+            &extracted,
+            &[(section.bytes.as_slice(), true)],
+        )?;
+    }
     let store = CredentialStore::open(data_dir);
     let resolved = resolve_extracted_secrets(&store, extracted)?;
     let prepared = store.prepare_migration(resolved)?;
@@ -4016,6 +4820,9 @@ fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> Confi
     }
     if contains_broker {
         scrub_broker_credentials_from_backups(data_dir)?;
+    }
+    if manifest.migration_scope == Some(MigrationScope::ClusterFabric) {
+        scrub_cluster_credentials_from_backups(data_dir)?;
     }
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
@@ -4537,6 +5344,15 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         .files
         .iter()
         .any(|file| file.install_mode == InstallMode::Exact);
+    let migration_scope_valid = match (exact_transaction, manifest.migration_scope) {
+        (true, None) | (false, None) => true,
+        (false, Some(MigrationScope::ClusterFabric)) => {
+            manifest.files.len() == 2
+                && unique.contains(CREDENTIALS_FILE)
+                && unique.contains(CONFIG_FILE)
+        }
+        (true, Some(_)) => false,
+    };
     let exact_scope_valid = match (exact_transaction, manifest.exact_scope) {
         (false, None) => true,
         (true, Some(ExactTransactionScope::ProxyAuth)) => {
@@ -4582,6 +5398,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         || manifest.files.is_empty()
         || unique.len() != manifest.files.len()
         || credential_count != 1
+        || !migration_scope_valid
         || !exact_scope_valid
         || !exact_shape_valid
         || manifest.files.iter().any(|file| {
@@ -6724,6 +7541,7 @@ mod tests {
             stage_dir: format!("{STAGE_PREFIX}{transaction_id}/../../outside"),
             state: MigrationState::Pending,
             exact_scope: None,
+            migration_scope: None,
             files: vec![file.clone()],
         };
         assert!(validate_manifest(&traversal).is_err());
@@ -6734,6 +7552,7 @@ mod tests {
             stage_dir: format!("{STAGE_PREFIX}{transaction_id}"),
             state: MigrationState::Pending,
             exact_scope: None,
+            migration_scope: None,
             files: vec![file.clone(), file],
         };
         assert!(validate_manifest(&duplicate).is_err());
@@ -9082,5 +9901,537 @@ mod tests {
         assert_eq!(std::fs::read(&config_backup_path).unwrap(), config_backup);
         assert!(!dir.path().join(CREDENTIALS_FILE).exists());
         assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn cluster_password_key_and_passphrase_migrate_and_hydrate() {
+        let _key = crate::encryption::set_test_encryption_key([0xc1; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let key_cipher = crate::encryption::encrypt("private-key-secret").unwrap();
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "cluster_fabric": {
+                "future_fabric_field": {"kept": true},
+                "nodes": [
+                    {
+                        "id": "password-node",
+                        "label": "password-node",
+                        "placement": {
+                            "type": "ssh",
+                            "host": "10.0.0.1",
+                            "username": "deploy",
+                            "auth": {"method": "password", "password": "password-secret"}
+                        },
+                        "future_node_field": "kept"
+                    },
+                    {
+                        "id": "key-node",
+                        "label": "key-node",
+                        "placement": {
+                            "type": "ssh",
+                            "host": "10.0.0.2",
+                            "username": "deploy",
+                            "auth": {
+                                "method": "private_key",
+                                "private_key_encrypted": key_cipher,
+                                "passphrase": "passphrase-secret"
+                            }
+                        }
+                    }
+                ]
+            },
+            "future_root_field": {"kept": true}
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
+
+        let outcome = migrate_cluster_credentials(dir.path()).unwrap();
+        assert_eq!(outcome.migrated_credentials, 3);
+        let migrated = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+        let migrated_text = String::from_utf8(migrated.clone()).unwrap();
+        for forbidden in [
+            "password-secret",
+            "private-key-secret",
+            "passphrase-secret",
+            "password_encrypted",
+            "private_key_encrypted",
+            "passphrase_encrypted",
+        ] {
+            assert!(!migrated_text.contains(forbidden), "leaked {forbidden}");
+        }
+        let root: Value = serde_json::from_slice(&migrated).unwrap();
+        assert_eq!(root["future_root_field"]["kept"], true);
+        assert_eq!(root["cluster_fabric"]["future_fabric_field"]["kept"], true);
+        assert_eq!(
+            root["cluster_fabric"]["nodes"][0]["future_node_field"],
+            "kept"
+        );
+        assert_eq!(
+            root["cluster_fabric"]["credential_refs"]["password-node"]["password_credential_ref"],
+            "cluster.password-node.password"
+        );
+        assert_eq!(
+            root["cluster_fabric"]["credential_refs"]["key-node"]["private_key_credential_ref"],
+            "cluster.key-node.private_key"
+        );
+        assert_eq!(
+            root["cluster_fabric"]["credential_refs"]["key-node"]["passphrase_credential_ref"],
+            "cluster.key-node.passphrase"
+        );
+
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let crate::NodePlacement::Ssh(password_target) = &loaded.cluster_fabric.nodes[0].placement
+        else {
+            panic!("expected SSH node")
+        };
+        let crate::SshAuth::Password { password, .. } = &password_target.auth else {
+            panic!("expected password auth")
+        };
+        assert_eq!(password, "password-secret");
+        let crate::NodePlacement::Ssh(key_target) = &loaded.cluster_fabric.nodes[1].placement
+        else {
+            panic!("expected SSH node")
+        };
+        let crate::SshAuth::PrivateKey {
+            private_key,
+            passphrase,
+            ..
+        } = &key_target.auth
+        else {
+            panic!("expected private-key auth")
+        };
+        assert_eq!(private_key, "private-key-secret");
+        assert_eq!(passphrase, "passphrase-secret");
+
+        loaded.save_to_dir(dir.path().to_path_buf()).unwrap();
+        for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+            let path = dir.path().join(format!("{CONFIG_FILE}{suffix}"));
+            let Ok(durable) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for forbidden in [
+                "password-secret",
+                "private-key-secret",
+                "passphrase-secret",
+                "password_encrypted",
+                "private_key_encrypted",
+                "passphrase_encrypted",
+            ] {
+                assert!(
+                    !durable.contains(forbidden),
+                    "saved {suffix} leaked {forbidden}"
+                );
+            }
+        }
+        let reloaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let crate::NodePlacement::Ssh(reloaded_target) =
+            &reloaded.cluster_fabric.nodes[0].placement
+        else {
+            panic!("expected SSH node")
+        };
+        let crate::SshAuth::Password {
+            password: reloaded_password,
+            ..
+        } = &reloaded_target.auth
+        else {
+            panic!("expected password auth")
+        };
+        assert_eq!(reloaded_password, "password-secret");
+
+        let saved = std::fs::read(dir.path().join(CONFIG_FILE)).unwrap();
+        migrate_cluster_credentials(dir.path()).unwrap();
+        assert_eq!(std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(), saved);
+    }
+
+    #[test]
+    fn backup_only_cluster_secret_commits_before_backup_scrub() {
+        let _key = crate::encryption::set_test_encryption_key([0xc2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), br#"{"unknown_root":true}"#).unwrap();
+        let backup_path = dir.path().join(format!("{CONFIG_FILE}.bak"));
+        std::fs::write(
+            &backup_path,
+            br#"{
+                "cluster_fabric": {
+                    "unknown_cluster": true,
+                    "nodes": [{
+                        "id": "backup-node",
+                        "label": "backup-node",
+                        "placement": {
+                            "type": "ssh",
+                            "host": "10.0.0.3",
+                            "username": "deploy",
+                            "auth": {"method": "password", "password": "backup-only-secret"}
+                        }
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = migrate_cluster_credentials(dir.path()).unwrap();
+        assert_eq!(outcome.migrated_credentials, 1);
+        let backup = std::fs::read_to_string(&backup_path).unwrap();
+        assert!(!backup.contains("backup-only-secret"));
+        assert!(backup.contains("cluster.backup-node.password"));
+        assert!(backup.contains("unknown_cluster"));
+        let reference = crate::cluster_password_credential_ref("backup-node").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "backup-only-secret"
+        );
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(root["unknown_root"], true);
+        assert!(root.get("cluster_fabric").is_none());
+    }
+
+    #[test]
+    fn conflicting_legacy_cluster_fields_fail_without_durable_changes() {
+        let _key = crate::encryption::set_test_encryption_key([0xc3; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ciphertext = crate::encryption::encrypt("ciphertext-winner").unwrap();
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "cluster_fabric": {"nodes": [{
+                "id": "node",
+                "label": "node",
+                "placement": {
+                    "type": "ssh",
+                    "host": "10.0.0.4",
+                    "username": "deploy",
+                    "auth": {
+                        "method": "password",
+                        "password": "plaintext-loser",
+                        "password_encrypted": ciphertext
+                    }
+                }
+            }]}
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
+
+        let error = migrate_cluster_credentials(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("conflicting values"));
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+        assert!(!dir.path().join(JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn noncanonical_cluster_backup_ref_rejects_primary_before_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0xc4; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let primary = br#"{
+            "cluster_fabric": {"nodes": [{
+                "id": "node", "label": "node",
+                "placement": {"type":"ssh","host":"h","username":"u",
+                    "auth":{"method":"password","password":"primary-secret"}}
+            }]}
+        }"#;
+        let backup = br#"{
+            "cluster_fabric": {
+                "nodes": [{
+                    "id": "node", "label": "node",
+                    "placement": {"type":"ssh","host":"h","username":"u",
+                        "auth":{"method":"password"}}
+                }],
+                "credential_refs": {"node": {
+                    "password_credential_ref": "cluster.other.password",
+                    "password_configured": true
+                }}
+            }
+        }"#;
+        let backup_path = dir.path().join(format!("{CONFIG_FILE}.bak"));
+        std::fs::write(dir.path().join(CONFIG_FILE), primary).unwrap();
+        std::fs::write(&backup_path, backup).unwrap();
+
+        let error = migrate_cluster_credentials(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("not canonical"));
+        assert_eq!(
+            std::fs::read(dir.path().join(CONFIG_FILE)).unwrap(),
+            primary
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), backup);
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+    }
+
+    #[test]
+    fn committed_cluster_migration_accepts_a_newer_secret_free_config() {
+        let _key = crate::encryption::set_test_encryption_key([0xc5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "cluster_fabric": {"nodes": [{
+                    "id": "node", "label": "node",
+                    "placement": {"type":"ssh","host":"old","username":"deploy",
+                        "auth":{"method":"password","password":"committed-secret"}}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(migrate_cluster_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "cluster_fabric": {
+                    "nodes": [{
+                        "id": "node", "label": "node",
+                        "placement": {"type":"ssh","host":"newer","username":"deploy",
+                            "auth":{"method":"password"}}
+                    }],
+                    "credential_refs": {"node": {
+                        "password_credential_ref": "cluster.node.password",
+                        "password_configured": true
+                    }}
+                },
+                "concurrent_unknown": true
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = migrate_cluster_credentials(dir.path()).unwrap();
+        assert!(outcome.resumed);
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+        let current: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(current["concurrent_unknown"], true);
+        assert_eq!(
+            current["cluster_fabric"]["nodes"][0]["placement"]["host"],
+            "newer"
+        );
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let crate::NodePlacement::Ssh(target) = &loaded.cluster_fabric.nodes[0].placement else {
+            panic!("expected SSH node")
+        };
+        let crate::SshAuth::Password { password, .. } = &target.auth else {
+            panic!("expected password auth")
+        };
+        assert_eq!(password, "committed-secret");
+    }
+
+    #[test]
+    fn cluster_recovery_failure_does_not_disable_stable_provider_hydration() {
+        let _key = crate::encryption::set_test_encryption_key([0xc6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let provider_ref = credential_ref("provider", "openai", "api_key").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                provider_ref.clone(),
+                "stable-provider-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "openai": {
+                    "credential_ref": provider_ref,
+                    "model": "stable-model"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "cluster_fabric": {"nodes": [{
+                    "id": "node", "label": "node",
+                    "placement": {"type":"ssh","host":"h","username":"u",
+                        "auth":{"method":"password","password":"cluster-secret"}}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(migrate_cluster_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+        std::fs::write(
+            dir.path().join(format!("{CONFIG_FILE}.bak")),
+            br#"{
+                "cluster_fabric": {
+                    "nodes": [{
+                        "id": "node", "label": "node",
+                        "placement": {"type":"ssh","host":"h","username":"u",
+                            "auth":{"method":"password"}}
+                    }],
+                    "credential_refs": {"node": {
+                        "password_credential_ref": "cluster.wrong.password",
+                        "password_configured": true
+                    }}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        migrate_provider_mcp_credentials(dir.path()).unwrap();
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+        assert!(pending_cluster_migration(dir.path()).unwrap());
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        let openai = loaded.providers.openai.as_ref().expect("provider loaded");
+        assert_eq!(openai.api_key, "stable-provider-secret");
+        assert_eq!(openai.model.as_deref(), Some("stable-model"));
+        assert!(loaded.cluster_fabric.nodes.iter().all(|node| {
+            let crate::NodePlacement::Ssh(target) = &node.placement else {
+                return true;
+            };
+            match &target.auth {
+                crate::SshAuth::Password { password, .. } => password.is_empty(),
+                _ => true,
+            }
+        }));
+    }
+
+    #[test]
+    fn cluster_pending_bypass_rejects_unsafe_provider_domain_backups() {
+        let _key = crate::encryption::set_test_encryption_key([0xc7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "cluster_fabric": {"nodes": [{
+                    "id": "node", "label": "node",
+                    "placement": {"type":"ssh","host":"h","username":"u",
+                        "auth":{"method":"password","password":"cluster-secret"}}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(migrate_cluster_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+        let conflicting = crate::encryption::encrypt("different-secret").unwrap();
+        std::fs::write(
+            dir.path().join(format!("{CONFIG_FILE}.bak")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "env_vars": [{
+                    "name": "UNSAFE_BACKUP",
+                    "secret": true,
+                    "value": "plaintext-secret",
+                    "value_encrypted": conflicting
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = migrate_provider_mcp_credentials(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("conflicting values"));
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(pending_cluster_migration(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn cluster_pending_bypass_rejects_cross_domain_metadata_ref() {
+        let _key = crate::encryption::set_test_encryption_key([0xc8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "cluster_fabric": {"nodes": [{
+                    "id": "node", "label": "node",
+                    "placement": {"type":"ssh","host":"h","username":"u",
+                        "auth":{"method":"password","password":"ssh-password"}}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(migrate_cluster_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            br#"{
+                "openai": {
+                    "credential_ref": "cluster.node.password",
+                    "model": "must-not-hydrate"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let error = migrate_provider_mcp_credentials(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("shared by another consumer"));
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(
+            !CredentialStore::open(dir.path())
+                .status_unchecked(&crate::cluster_password_credential_ref("node").unwrap())
+                .unwrap()
+                .configured
+        );
+        let loaded = crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert!(loaded
+            .providers
+            .openai
+            .as_ref()
+            .is_none_or(|provider| provider.api_key.is_empty()));
+    }
+
+    #[test]
+    fn cluster_pending_bypass_rejects_provider_ref_owned_only_by_backup_node() {
+        let _key = crate::encryption::set_test_encryption_key([0xc9; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let backup_ref = crate::cluster_password_credential_ref("backup-node").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(
+                backup_ref.clone(),
+                "backup-node-ssh-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+                "cluster_fabric": {"nodes": [{
+                    "id": "current-node", "label": "current-node",
+                    "placement": {"type":"ssh","host":"h","username":"u",
+                        "auth":{"method":"password","password":"current-secret"}}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(migrate_cluster_with_fault(dir.path(), MigrationFault::AfterManifest).is_err());
+        std::fs::write(
+            dir.path().join(format!("{CONFIG_FILE}.bak")),
+            br#"{
+                "cluster_fabric": {
+                    "nodes": [{
+                        "id": "backup-node", "label": "backup-node",
+                        "placement": {"type":"ssh","host":"old","username":"u",
+                            "auth":{"method":"password"}}
+                    }],
+                    "credential_refs": {"backup-node": {
+                        "password_credential_ref": "cluster.backup-node.password",
+                        "password_configured": true
+                    }}
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(PROVIDERS_FILE),
+            br#"{
+                "openai": {
+                    "credential_ref": "cluster.backup-node.password",
+                    "model": "must-not-hydrate"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let error = migrate_provider_mcp_credentials(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("shared by another consumer"));
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(
+            CredentialStore::open(dir.path())
+                .status_unchecked(&backup_ref)
+                .unwrap()
+                .configured
+        );
     }
 }

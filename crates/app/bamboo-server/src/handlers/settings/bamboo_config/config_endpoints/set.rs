@@ -58,6 +58,14 @@ pub async fn set_bamboo_config(
     let new_config = app_state
         .update_config_with_provider_credentials(
             move |config| {
+                if patch_obj.contains_key("cluster_fabric")
+                    && !config.cluster_fabric.credential_refs.is_empty()
+                {
+                    return Err(AppError::BadRequest(
+                        "cluster_fabric with isolated credentials must be changed through the dedicated node API"
+                            .to_string(),
+                    ));
+                }
                 let current = config.clone();
                 let mut patch_obj = patch_obj;
                 config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);

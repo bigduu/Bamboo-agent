@@ -16,7 +16,7 @@
 //! and stays `None` until a deploy runs. This module is purely the persisted
 //! registry + its crypto.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -331,12 +331,236 @@ pub enum NodeStatus {
 // ── Crypto: mirror the env-vars AES-256-GCM at-rest pattern ────────────────
 
 impl Config {
-    /// Decrypt SSH secrets into in-memory plaintext after loading config.
-    ///
-    /// Mirrors [`Config::hydrate_env_vars_from_encrypted`]: only fills a
-    /// plaintext field that is currently empty, from its `*_encrypted`
-    /// counterpart.
-    pub fn hydrate_cluster_fabric_from_encrypted(&mut self) {
+    /// Resolve isolated SSH credentials after the legacy migration has
+    /// completed. Metadata is server-owned: every reference must be the
+    /// canonical node-scoped reference for its auth field, must match the SSH
+    /// auth variant, and must not be shared with another configuration
+    /// consumer. Any validation or store failure leaves every cluster runtime
+    /// secret empty.
+    pub fn hydrate_cluster_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> ConfigStoreResult<()> {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Field {
+            Password,
+            PrivateKey,
+            Passphrase,
+        }
+        let mut prior_plaintext = BTreeMap::<(usize, Field), String>::new();
+        let legacy_ciphertext_present =
+            self.cluster_fabric
+                .nodes
+                .iter()
+                .enumerate()
+                .any(|(index, node)| {
+                    let NodePlacement::Ssh(target) = &node.placement else {
+                        return false;
+                    };
+                    match &target.auth {
+                        SshAuth::SystemSshConfig => false,
+                        SshAuth::Password {
+                            password,
+                            password_encrypted,
+                        } => {
+                            if !password.trim().is_empty() {
+                                prior_plaintext.insert((index, Field::Password), password.clone());
+                            }
+                            password_encrypted
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty())
+                        }
+                        SshAuth::PrivateKey {
+                            private_key,
+                            private_key_encrypted,
+                            passphrase,
+                            passphrase_encrypted,
+                            ..
+                        } => {
+                            if !private_key.trim().is_empty() {
+                                prior_plaintext
+                                    .insert((index, Field::PrivateKey), private_key.clone());
+                            }
+                            if !passphrase.trim().is_empty() {
+                                prior_plaintext
+                                    .insert((index, Field::Passphrase), passphrase.clone());
+                            }
+                            private_key_encrypted
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty())
+                                || passphrase_encrypted
+                                    .as_deref()
+                                    .is_some_and(|value| !value.trim().is_empty())
+                        }
+                    }
+                });
+        self.clear_cluster_runtime_credentials();
+        if legacy_ciphertext_present {
+            return Err(crate::ConfigStoreError::Validation(
+                "legacy cluster credential appeared after migration".to_string(),
+            ));
+        }
+
+        let mut node_ids = BTreeSet::new();
+        for node in &self.cluster_fabric.nodes {
+            if node.id.trim().is_empty() {
+                return Err(crate::ConfigStoreError::Validation(
+                    "cluster node id is empty".to_string(),
+                ));
+            }
+            if !node_ids.insert(node.id.as_str()) {
+                return Err(crate::ConfigStoreError::Validation(
+                    "cluster node ids must be unique".to_string(),
+                ));
+            }
+        }
+        for node_id in self.cluster_fabric.credential_refs.keys() {
+            if !node_ids.contains(node_id.as_str()) {
+                return Err(crate::ConfigStoreError::Validation(
+                    "cluster credential metadata references an unknown node".to_string(),
+                ));
+            }
+        }
+
+        let mut requested = Vec::<(usize, Field, CredentialRef)>::new();
+        let mut seen_refs = BTreeSet::new();
+        let other_counts = crate::credential_store::config_credential_ref_counts(self)?;
+        for (index, node) in self.cluster_fabric.nodes.iter().enumerate() {
+            let metadata = self.cluster_fabric.credential_refs.get(&node.id);
+            let empty = ClusterNodeCredentialRefs::default();
+            let metadata = metadata.unwrap_or(&empty);
+            let mut validate = |field: Field,
+                                reference: Option<&CredentialRef>,
+                                configured: bool,
+                                canonical: CredentialRef|
+             -> ConfigStoreResult<()> {
+                if configured != reference.is_some() {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "cluster credential configured metadata is inconsistent".to_string(),
+                    ));
+                }
+                let Some(reference) = reference else {
+                    return Ok(());
+                };
+                if reference != &canonical {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "cluster credential reference is not canonical".to_string(),
+                    ));
+                }
+                if other_counts.get(reference).copied().unwrap_or(0) != 0
+                    || !seen_refs.insert(reference.clone())
+                {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "cluster credential reference is shared by another config consumer"
+                            .to_string(),
+                    ));
+                }
+                requested.push((index, field, reference.clone()));
+                Ok(())
+            };
+
+            match &node.placement {
+                NodePlacement::Local => {
+                    if !metadata.is_empty() {
+                        return Err(crate::ConfigStoreError::Validation(
+                            "local cluster node carries SSH credential metadata".to_string(),
+                        ));
+                    }
+                }
+                NodePlacement::Ssh(target) => match &target.auth {
+                    SshAuth::SystemSshConfig => {
+                        if !metadata.is_empty() {
+                            return Err(crate::ConfigStoreError::Validation(
+                                "system SSH node carries stored credential metadata".to_string(),
+                            ));
+                        }
+                    }
+                    SshAuth::Password { .. } => {
+                        if metadata.private_key_credential_ref.is_some()
+                            || metadata.private_key_configured
+                            || metadata.passphrase_credential_ref.is_some()
+                            || metadata.passphrase_configured
+                        {
+                            return Err(crate::ConfigStoreError::Validation(
+                                "cluster credential metadata does not match password auth"
+                                    .to_string(),
+                            ));
+                        }
+                        validate(
+                            Field::Password,
+                            metadata.password_credential_ref.as_ref(),
+                            metadata.password_configured,
+                            cluster_password_credential_ref(&node.id)?,
+                        )?;
+                    }
+                    SshAuth::PrivateKey { .. } => {
+                        if metadata.password_credential_ref.is_some()
+                            || metadata.password_configured
+                        {
+                            return Err(crate::ConfigStoreError::Validation(
+                                "cluster credential metadata does not match private-key auth"
+                                    .to_string(),
+                            ));
+                        }
+                        validate(
+                            Field::PrivateKey,
+                            metadata.private_key_credential_ref.as_ref(),
+                            metadata.private_key_configured,
+                            cluster_private_key_credential_ref(&node.id)?,
+                        )?;
+                        validate(
+                            Field::Passphrase,
+                            metadata.passphrase_credential_ref.as_ref(),
+                            metadata.passphrase_configured,
+                            cluster_passphrase_credential_ref(&node.id)?,
+                        )?;
+                    }
+                },
+            }
+        }
+
+        let store = crate::CredentialStore::open(data_dir);
+        let mut resolved = Vec::with_capacity(requested.len());
+        for (index, field, reference) in requested {
+            let secret = store.resolve(&reference)?.ok_or_else(|| {
+                crate::ConfigStoreError::Validation(
+                    "referenced cluster credential is unavailable".to_string(),
+                )
+            })?;
+            let secret = secret.expose().to_string();
+            if let Some(previous) = prior_plaintext.remove(&(index, field)) {
+                if previous != secret {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "legacy cluster credential appeared after migration".to_string(),
+                    ));
+                }
+            }
+            resolved.push((index, field, secret));
+        }
+        if !prior_plaintext.is_empty() {
+            return Err(crate::ConfigStoreError::Validation(
+                "legacy cluster credential appeared after migration".to_string(),
+            ));
+        }
+        for (index, field, secret) in resolved {
+            let NodePlacement::Ssh(target) = &mut self.cluster_fabric.nodes[index].placement else {
+                unreachable!("validated SSH credential target")
+            };
+            match (&mut target.auth, field) {
+                (SshAuth::Password { password, .. }, Field::Password) => *password = secret,
+                (SshAuth::PrivateKey { private_key, .. }, Field::PrivateKey) => {
+                    *private_key = secret
+                }
+                (SshAuth::PrivateKey { passphrase, .. }, Field::Passphrase) => *passphrase = secret,
+                _ => unreachable!("validated cluster credential field"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove legacy/cached cluster secrets from a runtime snapshot. Used both
+    /// before store hydration and when migration readiness is unavailable.
+    pub(crate) fn clear_cluster_runtime_credentials(&mut self) {
         for node in &mut self.cluster_fabric.nodes {
             let NodePlacement::Ssh(target) = &mut node.placement else {
                 continue;
@@ -347,6 +571,47 @@ impl Config {
                     password,
                     password_encrypted,
                 } => {
+                    password.clear();
+                    *password_encrypted = None;
+                }
+                SshAuth::PrivateKey {
+                    private_key,
+                    private_key_encrypted,
+                    passphrase,
+                    passphrase_encrypted,
+                    ..
+                } => {
+                    private_key.clear();
+                    *private_key_encrypted = None;
+                    passphrase.clear();
+                    *passphrase_encrypted = None;
+                }
+            }
+        }
+    }
+
+    /// Decrypt SSH secrets into in-memory plaintext after loading config.
+    ///
+    /// Mirrors [`Config::hydrate_env_vars_from_encrypted`]: only fills a
+    /// plaintext field that is currently empty, from its `*_encrypted`
+    /// counterpart.
+    pub fn hydrate_cluster_fabric_from_encrypted(&mut self) {
+        let credential_refs = self.cluster_fabric.credential_refs.clone();
+        for node in &mut self.cluster_fabric.nodes {
+            let metadata = credential_refs.get(&node.id);
+            let NodePlacement::Ssh(target) = &mut node.placement else {
+                continue;
+            };
+            match &mut target.auth {
+                SshAuth::SystemSshConfig => {}
+                SshAuth::Password {
+                    password,
+                    password_encrypted,
+                } => {
+                    if metadata.is_some_and(|value| value.password_credential_ref.is_some()) {
+                        *password_encrypted = None;
+                        continue;
+                    }
                     hydrate_field(
                         password,
                         password_encrypted.as_deref(),
@@ -361,18 +626,26 @@ impl Config {
                     passphrase_encrypted,
                     ..
                 } => {
-                    hydrate_field(
-                        private_key,
-                        private_key_encrypted.as_deref(),
-                        &node.id,
-                        "private_key",
-                    );
-                    hydrate_field(
-                        passphrase,
-                        passphrase_encrypted.as_deref(),
-                        &node.id,
-                        "passphrase",
-                    );
+                    if metadata.is_some_and(|value| value.private_key_credential_ref.is_some()) {
+                        *private_key_encrypted = None;
+                    } else {
+                        hydrate_field(
+                            private_key,
+                            private_key_encrypted.as_deref(),
+                            &node.id,
+                            "private_key",
+                        );
+                    }
+                    if metadata.is_some_and(|value| value.passphrase_credential_ref.is_some()) {
+                        *passphrase_encrypted = None;
+                    } else {
+                        hydrate_field(
+                            passphrase,
+                            passphrase_encrypted.as_deref(),
+                            &node.id,
+                            "passphrase",
+                        );
+                    }
                 }
             }
         }
@@ -385,8 +658,10 @@ impl Config {
     /// (so a redacted round-trip where the client never re-sent the secret keeps
     /// it). To CLEAR a secret, the caller swaps the whole `auth` variant.
     pub fn refresh_cluster_fabric_encrypted(&mut self) -> Result<()> {
+        let credential_refs = self.cluster_fabric.credential_refs.clone();
         for node in &mut self.cluster_fabric.nodes {
             let node_id = node.id.clone();
+            let metadata = credential_refs.get(&node_id);
             let NodePlacement::Ssh(target) = &mut node.placement else {
                 continue;
             };
@@ -396,7 +671,11 @@ impl Config {
                     password,
                     password_encrypted,
                 } => {
-                    refresh_field(password, password_encrypted, &node_id, "password")?;
+                    if metadata.is_some_and(|value| value.password_credential_ref.is_some()) {
+                        *password_encrypted = None;
+                    } else {
+                        refresh_field(password, password_encrypted, &node_id, "password")?;
+                    }
                 }
                 SshAuth::PrivateKey {
                     private_key,
@@ -405,8 +684,16 @@ impl Config {
                     passphrase_encrypted,
                     ..
                 } => {
-                    refresh_field(private_key, private_key_encrypted, &node_id, "private_key")?;
-                    refresh_field(passphrase, passphrase_encrypted, &node_id, "passphrase")?;
+                    if metadata.is_some_and(|value| value.private_key_credential_ref.is_some()) {
+                        *private_key_encrypted = None;
+                    } else {
+                        refresh_field(private_key, private_key_encrypted, &node_id, "private_key")?;
+                    }
+                    if metadata.is_some_and(|value| value.passphrase_credential_ref.is_some()) {
+                        *passphrase_encrypted = None;
+                    } else {
+                        refresh_field(passphrase, passphrase_encrypted, &node_id, "passphrase")?;
+                    }
                 }
             }
         }
@@ -683,5 +970,182 @@ mod tests {
         config.sanitize_cluster_fabric_for_disk();
         config.hydrate_cluster_fabric_from_encrypted();
         assert_eq!(config.cluster_fabric.nodes.len(), 1);
+    }
+
+    #[test]
+    fn isolated_cluster_credentials_hydrate_only_from_canonical_refs() {
+        let _key = crate::encryption::set_test_encryption_key([0xb1; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let password_ref = cluster_password_credential_ref("password-node").unwrap();
+        let key_ref = cluster_private_key_credential_ref("key-node").unwrap();
+        let passphrase_ref = cluster_passphrase_credential_ref("key-node").unwrap();
+        let store = crate::CredentialStore::open(dir.path());
+        store
+            .replace(
+                password_ref.clone(),
+                "password-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        store
+            .replace(
+                key_ref.clone(),
+                "private-key-secret",
+                crate::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        store
+            .replace(
+                passphrase_ref.clone(),
+                "passphrase-secret",
+                crate::CredentialSource::User,
+                2,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.cluster_fabric.nodes.push(ssh_node(
+            "password-node",
+            SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        config.cluster_fabric.nodes.push(ssh_node(
+            "key-node",
+            SshAuth::PrivateKey {
+                private_key: String::new(),
+                private_key_encrypted: None,
+                private_key_path: None,
+                passphrase: String::new(),
+                passphrase_encrypted: None,
+            },
+        ));
+        config.cluster_fabric.credential_refs.insert(
+            "password-node".to_string(),
+            ClusterNodeCredentialRefs {
+                password_credential_ref: Some(password_ref),
+                password_configured: true,
+                ..ClusterNodeCredentialRefs::default()
+            },
+        );
+        config.cluster_fabric.credential_refs.insert(
+            "key-node".to_string(),
+            ClusterNodeCredentialRefs {
+                private_key_credential_ref: Some(key_ref),
+                private_key_configured: true,
+                passphrase_credential_ref: Some(passphrase_ref),
+                passphrase_configured: true,
+                ..ClusterNodeCredentialRefs::default()
+            },
+        );
+
+        config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap();
+        let NodePlacement::Ssh(password_target) = &config.cluster_fabric.nodes[0].placement else {
+            panic!("expected SSH node")
+        };
+        let SshAuth::Password { password, .. } = &password_target.auth else {
+            panic!("expected password auth")
+        };
+        assert_eq!(password, "password-secret");
+        let NodePlacement::Ssh(key_target) = &config.cluster_fabric.nodes[1].placement else {
+            panic!("expected SSH node")
+        };
+        let SshAuth::PrivateKey {
+            private_key,
+            passphrase,
+            ..
+        } = &key_target.auth
+        else {
+            panic!("expected private-key auth")
+        };
+        assert_eq!(private_key, "private-key-secret");
+        assert_eq!(passphrase, "passphrase-secret");
+
+        config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap();
+        config.refresh_cluster_fabric_encrypted().unwrap();
+        config.sanitize_cluster_fabric_for_disk();
+        let durable = serde_json::to_string(&config).unwrap();
+        for forbidden in [
+            "password-secret",
+            "private-key-secret",
+            "passphrase-secret",
+            "password_encrypted",
+            "private_key_encrypted",
+            "passphrase_encrypted",
+        ] {
+            assert!(!durable.contains(forbidden), "persisted {forbidden}");
+        }
+    }
+
+    #[test]
+    fn unavailable_or_shared_cluster_ref_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = cluster_password_credential_ref("node").unwrap();
+        let mut config = Config::default();
+        config.cluster_fabric.nodes.push(ssh_node(
+            "node",
+            SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        config.cluster_fabric.credential_refs.insert(
+            "node".to_string(),
+            ClusterNodeCredentialRefs {
+                password_credential_ref: Some(reference.clone()),
+                password_configured: true,
+                ..ClusterNodeCredentialRefs::default()
+            },
+        );
+
+        let error = config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
+
+        config.notifications.ntfy.credential_ref = Some(reference);
+        config.notifications.ntfy.configured = true;
+        let error = config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("shared"));
+    }
+
+    #[test]
+    fn late_legacy_cluster_secret_is_rejected_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let ciphertext = crate::encryption::encrypt("late-secret").unwrap();
+        let mut config = Config::default();
+        config.cluster_fabric.nodes.push(ssh_node(
+            "node",
+            SshAuth::Password {
+                password: "late-plaintext".to_string(),
+                password_encrypted: Some(ciphertext),
+            },
+        ));
+
+        let error = config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("appeared after migration"));
+        let NodePlacement::Ssh(target) = &config.cluster_fabric.nodes[0].placement else {
+            panic!("expected SSH node")
+        };
+        let SshAuth::Password {
+            password,
+            password_encrypted,
+        } = &target.auth
+        else {
+            panic!("expected password auth")
+        };
+        assert!(password.is_empty());
+        assert!(password_encrypted.is_none());
     }
 }

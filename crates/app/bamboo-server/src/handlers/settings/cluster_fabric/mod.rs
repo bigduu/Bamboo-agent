@@ -80,6 +80,22 @@ fn validate_node(req: &NodeUpsertRequest) -> Result<(), AppError> {
         if target.port == 0 {
             return Err(AppError::BadRequest("SSH port must be non-zero".into()));
         }
+        let carries_ciphertext = match &target.auth {
+            SshAuth::SystemSshConfig => false,
+            SshAuth::Password {
+                password_encrypted, ..
+            } => password_encrypted.is_some(),
+            SshAuth::PrivateKey {
+                private_key_encrypted,
+                passphrase_encrypted,
+                ..
+            } => private_key_encrypted.is_some() || passphrase_encrypted.is_some(),
+        };
+        if carries_ciphertext {
+            return Err(AppError::BadRequest(
+                "SSH credential ciphertext is server-managed".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -152,6 +168,46 @@ fn preserve_node_secrets(existing: &Node, incoming: &mut Node) {
             preserve_secret(passphrase, passphrase_encrypted, old_pp, old_pp_enc);
         }
         _ => {}
+    }
+}
+
+/// Until node CRUD is backed by the exact credential/config transaction, a
+/// node that already owns isolated refs may only receive metadata edits and a
+/// redacted keep round-trip. Accepting a real replacement, auth switch, or
+/// delete here would return success while leaving the old store value behind.
+fn ensure_managed_node_secret_unchanged(
+    existing: &Node,
+    incoming: &NodePlacement,
+) -> Result<(), AppError> {
+    let unchanged = match (&existing.placement, incoming) {
+        (NodePlacement::Ssh(old), NodePlacement::Ssh(new)) => match (&old.auth, &new.auth) {
+            (SshAuth::SystemSshConfig, SshAuth::SystemSshConfig) => true,
+            (SshAuth::Password { .. }, SshAuth::Password { password, .. }) => {
+                password.trim().is_empty() || password == SECRET_MASK
+            }
+            (
+                SshAuth::PrivateKey { .. },
+                SshAuth::PrivateKey {
+                    private_key,
+                    passphrase,
+                    ..
+                },
+            ) => {
+                (private_key.trim().is_empty() || private_key == SECRET_MASK)
+                    && (passphrase.trim().is_empty() || passphrase == SECRET_MASK)
+            }
+            _ => false,
+        },
+        (NodePlacement::Local, NodePlacement::Local) => true,
+        _ => false,
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "isolated cluster credentials cannot be changed until the revisioned node credential API is available"
+                .to_string(),
+        ))
     }
 }
 
@@ -264,6 +320,14 @@ pub async fn update_node(
                     .node(&id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("Node '{id}'")))?;
+                if cfg
+                    .cluster_fabric
+                    .credential_refs
+                    .get(&id)
+                    .is_some_and(|metadata| !metadata.is_empty())
+                {
+                    ensure_managed_node_secret_unchanged(&existing, &req.placement)?;
+                }
 
                 let mut node = Node {
                     id: existing.id.clone(),
@@ -304,6 +368,17 @@ pub async fn delete_node(
     app_state
         .update_config(
             move |cfg| {
+                if cfg
+                    .cluster_fabric
+                    .credential_refs
+                    .get(&id)
+                    .is_some_and(|metadata| !metadata.is_empty())
+                {
+                    return Err(AppError::BadRequest(
+                        "nodes with isolated credentials cannot be deleted until the revisioned node credential API is available"
+                            .to_string(),
+                    ));
+                }
                 let before = cfg.cluster_fabric.nodes.len();
                 cfg.cluster_fabric.nodes.retain(|n| n.id != id);
                 if cfg.cluster_fabric.nodes.len() == before {
@@ -627,5 +702,48 @@ mod tests {
             panic!()
         };
         assert!(matches!(t.auth, SshAuth::SystemSshConfig));
+    }
+
+    #[test]
+    fn isolated_password_update_accepts_only_redacted_keep() {
+        let existing = pw_node("stored-secret", None);
+        let masked = pw_node(SECRET_MASK, None);
+        ensure_managed_node_secret_unchanged(&existing, &masked.placement).unwrap();
+        let empty = pw_node("", None);
+        ensure_managed_node_secret_unchanged(&existing, &empty.placement).unwrap();
+
+        let replacement = pw_node("replacement-secret", None);
+        let error =
+            ensure_managed_node_secret_unchanged(&existing, &replacement.placement).unwrap_err();
+        assert!(error.to_string().contains("cannot be changed"));
+    }
+
+    #[test]
+    fn isolated_password_update_rejects_auth_switch() {
+        let existing = pw_node("stored-secret", None);
+        let switched = NodePlacement::Ssh(SshTarget {
+            host: "h".into(),
+            port: 22,
+            username: "u".into(),
+            auth: SshAuth::SystemSshConfig,
+            host_key_fingerprint: None,
+        });
+        assert!(ensure_managed_node_secret_unchanged(&existing, &switched).is_err());
+    }
+
+    #[test]
+    fn node_validation_rejects_client_ciphertext() {
+        let node = pw_node("", Some("client-ciphertext"));
+        let request = NodeUpsertRequest {
+            label: node.label,
+            placement: node.placement,
+            trust_level: node.trust_level,
+            deploy: node.deploy,
+            enabled: node.enabled,
+        };
+        assert!(validate_node(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("server-managed"));
     }
 }

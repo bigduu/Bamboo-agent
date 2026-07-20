@@ -2729,6 +2729,13 @@ impl Config {
                 error
             })
             .is_ok();
+        let cluster_ready = crate::migrate_cluster_credentials(&data_dir)
+            .and_then(|_| crate::ensure_provider_mcp_migration_ready(&data_dir))
+            .map_err(|error| {
+                tracing::warn!(error = %error, "cluster credential migration unavailable");
+                error
+            })
+            .is_ok();
 
         let config_path = data_dir.join("config.json");
 
@@ -2842,8 +2849,18 @@ impl Config {
                 }
             }
         }
-        // Decrypt encrypted cluster-fabric SSH secrets into in-memory plaintext.
-        config.hydrate_cluster_fabric_from_encrypted();
+        // Cluster migration is deliberately independent from provider/MCP
+        // readiness. A malformed optional fabric fails only cluster runtime
+        // authentication, while missing/corrupt refs never fall back to legacy
+        // ciphertext or an unauthenticated SSH attempt.
+        if cluster_ready {
+            if let Err(error) = config.hydrate_cluster_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "cluster credential hydration unavailable");
+                config.clear_cluster_runtime_credentials();
+            }
+        } else {
+            config.clear_cluster_runtime_credentials();
+        }
         // Decrypt the encrypted broker token into in-memory plaintext.
         config.hydrate_broker_token_from_encrypted();
         // Decrypt encrypted notification-channel secrets into in-memory plaintext.
