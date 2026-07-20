@@ -350,8 +350,17 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         initialize_loop_state(&mut session, "review", &review_config, &tools, &event_tx)
             .await
-            .expect("initial activation");
-        assert_eq!(tools.0.load(Ordering::SeqCst), 1);
+            .expect("initial selection");
+        assert_eq!(
+            tools.0.load(Ordering::SeqCst),
+            0,
+            "session setup must not execute load_skill on the model's behalf"
+        );
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &session
+            )
+        );
         let pinned_generation = session
             .metadata
             .get(SKILL_RUNTIME_ACTIVATION_GENERATION_KEY)
@@ -431,30 +440,18 @@ mod tests {
         assert!(!session
             .metadata
             .contains_key(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY));
+        assert!(!session.metadata.contains_key(LOADED_SKILL_IDS_METADATA_KEY));
         assert!(
-            !session.metadata.contains_key(LOADED_SKILL_IDS_METADATA_KEY),
-            "restored active workflow must not be loaded or evented twice"
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &session
+            ),
+            "resuming a pinned but not-yet-loaded selection must still require a model-issued activation"
         );
-        let retained_block = crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session)
-            .expect("fixed durable workflow context rebuilt without preload");
-        assert_eq!(
-            retained_block.block_type,
-            bamboo_agent_core::ContextBlockType::WorkflowRuntime
-        );
-        assert_eq!(
-            retained_block.priority,
-            bamboo_agent_core::ContextBlockPriority::Critical
-        );
-        assert_eq!(
-            retained_block.stability,
-            bamboo_agent_core::ContextBlockStability::SessionStable
-        );
-        assert!(retained_block.content.contains("review N"));
-        assert!(!retained_block.content.contains("review N+1"));
+        assert!(crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session).is_none());
         assert_eq!(
             tools.0.load(Ordering::SeqCst),
-            1,
-            "resume must not preload or activate twice"
+            0,
+            "resume must not preload or activate on the model's behalf"
         );
 
         let plan_config = AgentLoopConfig {
@@ -481,8 +478,8 @@ mod tests {
         assert_eq!(skills[0].id, "plan-demo");
         assert_eq!(
             tools.0.load(Ordering::SeqCst),
-            2,
-            "new explicit selection preloads exactly once"
+            0,
+            "a superseding explicit selection must also wait for the model-issued load_skill call"
         );
         assert_eq!(
             descriptor
@@ -492,9 +489,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["plan-demo"]
         );
-        let superseding_block = crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session)
-            .expect("superseding workflow context");
-        assert!(superseding_block.content.contains("plan N"));
-        assert!(!superseding_block.content.contains("review N"));
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &session
+            )
+        );
+        assert!(crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session).is_none());
     }
 }

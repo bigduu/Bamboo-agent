@@ -87,6 +87,7 @@ pub(crate) async fn evaluate_gold_auto_answer_question(
         session_id: Some(session_id.to_string()),
         reasoning_effort: normalize_lightweight_reasoning_effort(session.reasoning_effort),
         parallel_tool_calls: None,
+        required_tool: None,
         responses: None,
         request_purpose: Some("gold_auto_answer".to_string()),
         cache: None,

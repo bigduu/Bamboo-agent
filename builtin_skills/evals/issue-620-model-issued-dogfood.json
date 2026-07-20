@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "issue": "bigduu/Bamboo-agent#620",
+  "recorded_at": "2026-07-21",
+  "environment": {
+    "client": "Lotus origin/main via Vite",
+    "server": "Bamboo bamboo/fix/620-model-issued-activation built from source",
+    "provider": "Gemini/gemini-3.1-flash-lite",
+    "transport_observer": "transparent local proxy logging request and SSE structure only",
+    "data": "isolated temporary Bamboo data directory"
+  },
+  "explicit_runs": [
+    {
+      "session": "2b0dc2f1-558c-4cbd-a776-704d10a4389c",
+      "selection_source": "explicit",
+      "selected_skill_ids": ["review"],
+      "loaded_skill_ids": ["review"],
+      "model_tool_sequence": ["load_skill", "Read"],
+      "activation_assistant_text_chars": 0,
+      "final_answer_present": true,
+      "result": "pass"
+    },
+    {
+      "session": "a5d2dc94-5832-495c-aafe-9ddc07bbf589",
+      "selection_source": "explicit",
+      "selected_skill_ids": ["review"],
+      "loaded_skill_ids": ["review"],
+      "model_tool_sequence": ["load_skill", "Read"],
+      "activation_assistant_text_chars": 0,
+      "final_answer_present": true,
+      "result": "pass"
+    },
+    {
+      "session": "c636ca2c-0103-45ea-ad0b-51e8ef65b4d8",
+      "selection_source": "explicit",
+      "selected_skill_ids": ["review"],
+      "loaded_skill_ids": ["review"],
+      "model_tool_sequence": ["load_skill", "Read"],
+      "activation_assistant_text_chars": 0,
+      "final_answer_present": true,
+      "result": "pass"
+    }
+  ],
+  "automatic_run": {
+    "session": "3ab49dd5-5dfe-4007-a7fe-e955d0f9775b",
+    "selection_source": "auto",
+    "selected_skill_count": 10,
+    "first_request_required_tool": null,
+    "first_model_tool": "GetFileInfo",
+    "later_model_tool": "load_skill",
+    "result": "lazy_activation_pass"
+  },
+  "wire_evidence": {
+    "explicit_first_request_tools": ["load_skill"],
+    "explicit_first_request_function_calling_mode": "ANY",
+    "explicit_first_request_allowed_function_names": ["load_skill"],
+    "explicit_first_response_function_call": {
+      "name": "load_skill",
+      "args": {"skill_id": "review"}
+    },
+    "explicit_second_request_required_tool": null,
+    "stream_content_type": "text/event-stream",
+    "plain_text_tool_results_wrapped_as_object": true
+  },
+  "checks": {
+    "three_fresh_explicit_runs_passed": true,
+    "model_issued_load_skill_before_answer": true,
+    "explicit_selected_and_loaded_ids_match": true,
+    "automatic_multi_candidate_selection_remains_lazy": true,
+    "ordinary_bypass_and_parent_forced_ask_paths_preserved_by_regression_tests": true,
+    "workflow_workspace_writes": 0,
+    "browser_runtime_errors_after_final_run": 0
+  },
+  "local_artifacts_not_committed": [
+    "/tmp/zenith-620-model-issued.kTdzQ7/evidence/screenshots/run-8-explicit-model-issued-pass.png",
+    "/tmp/zenith-620-model-issued.kTdzQ7/evidence/screenshots/run-9-explicit-repeat-pass.png",
+    "/tmp/zenith-620-model-issued.kTdzQ7/evidence/videos/run-8-explicit-model-issued-pass.webm",
+    "/tmp/zenith-620-model-issued.kTdzQ7/evidence/videos/run-9-explicit-repeat-pass.webm"
+  ],
+  "notes": [
+    "The Gemini streamGenerateContent URL must include alt=sse; otherwise the API returns a JSON array that the SSE parser cannot consume.",
+    "Gemini functionResponse.response requires an object, so scalar, array, and plain-text tool outputs are wrapped under result.",
+    "Historical browser console fetch errors were caused by intentional local server restarts; the final browser error query was empty."
+  ]
+}

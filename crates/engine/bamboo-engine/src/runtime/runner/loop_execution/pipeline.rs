@@ -1354,6 +1354,88 @@ async fn handle_tool_calls_path(
 
 // ---- Core pipeline ----
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExplicitActivationAttempt {
+    call_id: String,
+    skill_id: String,
+}
+
+fn validate_explicit_activation_first_step(
+    session: &Session,
+    tool_calls: &[bamboo_agent_core::tools::ToolCall],
+) -> Result<Option<ExplicitActivationAttempt>, AgentError> {
+    if !crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session) {
+        return Ok(None);
+    }
+
+    let selected_skill_id = session
+        .metadata
+        .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .and_then(|ids| ids.into_iter().next())
+        .ok_or_else(|| {
+            AgentError::Tool(format!(
+                "[{}] explicit workflow activation is missing its selected skill",
+                session.id
+            ))
+        })?;
+    let valid_call = tool_calls.len() == 1
+        && bamboo_tools::normalize_tool_ref(&tool_calls[0].function.name)
+            .is_some_and(|name| name == "load_skill");
+    if !valid_call {
+        return Err(AgentError::Tool(format!(
+            "[{}] explicit workflow activation was not completed: the first model step must be exactly one load_skill call",
+            session.id
+        )));
+    }
+    let called_skill_id =
+        serde_json::from_str::<serde_json::Value>(&tool_calls[0].function.arguments)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get("skill_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .map(str::to_string)
+            });
+    if called_skill_id.as_deref() != Some(selected_skill_id.as_str()) {
+        return Err(AgentError::Tool(format!(
+            "[{}] explicit workflow activation must load selected skill '{}'",
+            session.id, selected_skill_id
+        )));
+    }
+
+    Ok(Some(ExplicitActivationAttempt {
+        call_id: tool_calls[0].id.clone(),
+        skill_id: selected_skill_id,
+    }))
+}
+
+fn apply_successful_explicit_activation(
+    session: &mut Session,
+    attempt: &ExplicitActivationAttempt,
+) -> Result<(), AgentError> {
+    let tool_succeeded = session.messages.iter().rev().any(|message| {
+        message.tool_call_id.as_deref() == Some(attempt.call_id.as_str())
+            && message.tool_success == Some(true)
+    });
+    // The #579 success path refreshes the complete workflow activation namespace
+    // from SessionRepository into this runner-owned Session before returning.
+    // Require both the successful tool result and that durable active snapshot;
+    // a provider/degraded/save failure must never unlock the answer round.
+    if !tool_succeeded
+        || crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+            session,
+        )
+    {
+        return Err(AgentError::Tool(format!(
+            "[{}] explicit workflow '{}' failed to activate; refusing to continue to a user-facing answer",
+            session.id, attempt.skill_id
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn run_pipeline(
     session: &mut Session,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -1670,12 +1752,17 @@ pub(super) async fn run_pipeline(
 
             // --- Handle LLM output ---
             let stream_output = llm_output.stream_output;
-
-            // Absorb this attempt's ACTUAL usage/activity before
-            // `stream_output` is consumed below — every successful LLM call in
-            // this round was billed, even if its post-LLM handling then fails
-            // and triggers a retry (issue #221 — see `RoundActivity`).
+            // Every successful provider call is billed, including an explicit
+            // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output);
+            let activation_attempt =
+                match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                };
 
             if stream_output.tool_calls.is_empty() {
                 // Safety net: if the model is about to finish but left background
@@ -1766,6 +1853,16 @@ pub(super) async fn run_pipeline(
             .await
             {
                 Ok(outcome) => {
+                    if let Some(attempt) = activation_attempt.as_ref() {
+                        if !outcome.should_break {
+                            if let Err(error) =
+                                apply_successful_explicit_activation(session, attempt)
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
                     turn_outcome = Some(outcome);
                     break;
                 }
@@ -2230,10 +2327,11 @@ fn heuristic_complexity(
 mod tests {
     use super::super::startup::OverflowRecoveryState;
     use super::{
-        build_guardian_review_prompt, check_run_budget_exceeded, is_overflow_recoverable,
-        is_subagent_create_call, is_terminal_child_status, map_turn_error_status,
-        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
-        maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
+        apply_successful_explicit_activation, build_guardian_review_prompt,
+        check_run_budget_exceeded, is_overflow_recoverable, is_subagent_create_call,
+        is_terminal_child_status, map_turn_error_status, maybe_spawn_guardian_review,
+        maybe_suspend_for_orphaned_children, maybe_suspend_for_outstanding_bash,
+        should_retry_turn_error, suspend_to_wait_for_bash, validate_explicit_activation_first_step,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
@@ -2256,6 +2354,161 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    fn pending_explicit_session() -> Session {
+        let mut session = Session::new("explicit-gate", "model");
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            "[\"review\"]".to_string(),
+        );
+        session
+    }
+
+    fn activation_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn explicit_activation_first_step_gate_rejects_missing_wrong_and_multiple_calls() {
+        let session = pending_explicit_session();
+        assert!(validate_explicit_activation_first_step(&session, &[]).is_err());
+        assert!(validate_explicit_activation_first_step(
+            &session,
+            &[activation_call("wrong", "Read", r#"{"file_path":"x"}"#)],
+        )
+        .is_err());
+        assert!(validate_explicit_activation_first_step(
+            &session,
+            &[
+                activation_call("load", "load_skill", r#"{"skill_id":"review"}"#),
+                activation_call("other", "Read", r#"{"file_path":"x"}"#),
+            ],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_activation_first_step_gate_accepts_only_matching_load_skill() {
+        let session = pending_explicit_session();
+        assert!(validate_explicit_activation_first_step(
+            &session,
+            &[activation_call(
+                "wrong-skill",
+                "load_skill",
+                r#"{"skill_id":"plan"}"#,
+            )],
+        )
+        .is_err());
+
+        let attempt = validate_explicit_activation_first_step(
+            &session,
+            &[activation_call(
+                "load-review",
+                "load_skill",
+                r#"{"skill_id":"review"}"#,
+            )],
+        )
+        .expect("matching load_skill should pass")
+        .expect("pending activation attempt");
+        assert_eq!(attempt.call_id, "load-review");
+        assert_eq!(attempt.skill_id, "review");
+    }
+
+    #[test]
+    fn explicit_activation_clears_pending_only_after_successful_tool_result() {
+        let call = activation_call("load-review", "load_skill", r#"{"skill_id":"review"}"#);
+
+        let mut failed = pending_explicit_session();
+        let attempt = validate_explicit_activation_first_step(&failed, std::slice::from_ref(&call))
+            .expect("valid first step")
+            .expect("activation attempt");
+        failed.add_message(Message::tool_result_with_status(
+            "load-review",
+            "durable save failed",
+            false,
+        ));
+        assert!(apply_successful_explicit_activation(&mut failed, &attempt).is_err());
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &failed
+            )
+        );
+
+        let mut succeeded = pending_explicit_session();
+        let attempt = validate_explicit_activation_first_step(&succeeded, &[call])
+            .expect("valid first step")
+            .expect("activation attempt");
+        succeeded.add_message(Message::tool_result_with_status(
+            "load-review",
+            "loaded",
+            true,
+        ));
+        succeeded.metadata.insert(
+            bamboo_skills::runtime_metadata::LOADED_SKILL_IDS_METADATA_KEY.to_string(),
+            "[\"review\"]".to_string(),
+        );
+        succeeded.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "id": "review",
+                "source": "builtin",
+                "revision": 1,
+                "kind": "instruction",
+                "args": {},
+                "invoked_by": "user",
+                "activated_at": "2026-07-21T00:00:00Z",
+                "status": "active"
+            })
+            .to_string(),
+        );
+        succeeded.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY.to_string(),
+            "{}".to_string(),
+        );
+        apply_successful_explicit_activation(&mut succeeded, &attempt)
+            .expect("successful tool result activates workflow");
+        assert!(
+            !crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &succeeded
+            )
+        );
+
+        let mut degraded = pending_explicit_session();
+        let call = activation_call("load-review", "load_skill", r#"{"skill_id":"review"}"#);
+        let attempt = validate_explicit_activation_first_step(&degraded, &[call])
+            .expect("valid first step")
+            .expect("activation attempt");
+        degraded.add_message(Message::tool_result_with_status(
+            "load-review",
+            r#"{"activation_status":"degraded"}"#,
+            true,
+        ));
+        degraded.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY.to_string(),
+            r#"{"code":"provider_failed"}"#.to_string(),
+        );
+        apply_successful_explicit_activation(&mut degraded, &attempt)
+            .expect("typed degraded activation lets the main session continue fail-closed");
+        assert!(!degraded
+            .metadata
+            .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+        assert!(
+            !crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &degraded
+            )
+        );
+    }
 
     /// A guardian spawner stub that returns a canned child id without touching
     /// any real spawn machinery — lets the gate's state machine be unit-tested.

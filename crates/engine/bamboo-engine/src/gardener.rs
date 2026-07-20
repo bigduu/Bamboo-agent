@@ -83,6 +83,7 @@ pub(crate) async fn collect_model_json(
         session_id: Some(GARDENER_RUNTIME_SESSION_ID.to_string()),
         reasoning_effort: Some(ReasoningEffort::High),
         parallel_tool_calls: None,
+        required_tool: None,
         responses: None,
         request_purpose: Some("memory_gardener".to_string()),
         cache: None,

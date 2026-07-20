@@ -233,6 +233,7 @@ RUNNER_RUNTIME_INSTRUCTIONS"#,
 #[tokio::test]
 async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_alive() {
     use bamboo_agent_core::storage::AttachmentReader;
+    use bamboo_agent_core::tools::FunctionCall;
     use bamboo_engine::{Agent, ExecuteRequestBuilder};
     use bamboo_llm::{LLMChunk, LLMProvider, LLMStream};
     use futures::stream;
@@ -252,6 +253,7 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
     }
     struct CapturingProvider {
         requests: AsyncMutex<Vec<Vec<bamboo_agent_core::Message>>>,
+        queue: AsyncMutex<Vec<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
     }
     #[async_trait::async_trait]
     impl LLMProvider for CapturingProvider {
@@ -263,10 +265,8 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
             _model: &str,
         ) -> bamboo_llm::provider::Result<LLMStream> {
             self.requests.lock().await.push(messages.to_vec());
-            Ok(Box::pin(stream::iter(vec![
-                Ok(LLMChunk::Token("main model continued".to_string())),
-                Ok(LLMChunk::Done),
-            ])))
+            let items = self.queue.lock().await.remove(0);
+            Ok(Box::pin(stream::iter(items)))
         }
     }
 
@@ -310,8 +310,40 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
             .expect("load tool")
             .build(),
     );
+    let activation_call = |id: &str, skill_id: &str| ToolCall {
+        id: id.to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "load_skill".to_string(),
+            arguments: serde_json::json!({"skill_id": skill_id}).to_string(),
+        },
+    };
+    let answer = || {
+        vec![
+            Ok(LLMChunk::Token("main model continued".to_string())),
+            Ok(LLMChunk::Done),
+        ]
+    };
     let llm = Arc::new(CapturingProvider {
         requests: AsyncMutex::new(Vec::new()),
+        queue: AsyncMutex::new(vec![
+            vec![
+                Ok(LLMChunk::ToolCalls(vec![activation_call(
+                    "load-dynamic-continue",
+                    "dynamic-continue",
+                )])),
+                Ok(LLMChunk::Done),
+            ],
+            answer(),
+            vec![
+                Ok(LLMChunk::ToolCalls(vec![activation_call(
+                    "load-dynamic-stop",
+                    "dynamic-stop",
+                )])),
+                Ok(LLMChunk::Done),
+            ],
+            answer(),
+        ]),
     });
     let metrics = bamboo_metrics::MetricsCollector::spawn(
         Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
@@ -368,7 +400,20 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
                 .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY),
             !stop
         );
-        let request = serde_json::to_string(&llm.requests.lock().await[index]).expect("request");
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter_map(|message| message.tool_calls.as_ref())
+                .flatten()
+                .filter(|call| call.function.name == "load_skill")
+                .count(),
+            1,
+            "explicit workflow activation must be model-issued exactly once"
+        );
+        let request_index = index * 2 + 1;
+        let request =
+            serde_json::to_string(&llm.requests.lock().await[request_index]).expect("request");
         if stop {
             assert!(!request.contains("context_type: workflow_runtime"));
         } else {

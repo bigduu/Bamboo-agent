@@ -583,6 +583,7 @@ impl CopilotProvider {
         reasoning_effort: Option<ReasoningEffort>,
         responses_options: Option<&ResponsesRequestOptions>,
         parallel_tool_calls: Option<bool>,
+        required_tool: Option<&str>,
         reasoning_source: &str,
         session_log_id: &str,
         request_purpose: &str,
@@ -617,6 +618,9 @@ impl CopilotProvider {
             request_overrides::ENDPOINT_RESPONSES,
             Some(model),
         );
+        if let Some(name) = required_tool {
+            body["tool_choice"] = json!({"type": "function", "name": name});
+        }
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
 
@@ -746,6 +750,9 @@ impl CopilotProvider {
                         request_overrides::ENDPOINT_RESPONSES,
                         Some(model),
                     );
+                    if let Some(name) = required_tool {
+                        fallback_body["tool_choice"] = json!({"type": "function", "name": name});
+                    }
                     crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                     let fallback_headers = self.build_llm_headers(
                         token,
@@ -1105,6 +1112,7 @@ impl LLMProvider for CopilotProvider {
         let session_log_id = options
             .and_then(|value| value.session_id.as_deref())
             .unwrap_or("unknown-session");
+        let required_tool = crate::provider::required_tool_from_options(options, tools)?;
         let token = self.get_token_for_request().await?;
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
@@ -1150,6 +1158,7 @@ impl LLMProvider for CopilotProvider {
                     reasoning_effort,
                     responses_options,
                     parallel_tool_calls,
+                    required_tool,
                     reasoning_source,
                     session_log_id,
                     request_purpose,
@@ -1166,7 +1175,10 @@ impl LLMProvider for CopilotProvider {
         // Only include tools and tool_choice if tools are provided
         if !tools.is_empty() {
             body["tools"] = json!(tools_to_openai_compat_json(tools));
-            body["tool_choice"] = json!("auto");
+            body["tool_choice"] = required_tool.map_or_else(
+                || json!("auto"),
+                |name| json!({"type": "function", "function": {"name": name}}),
+            );
         }
         if let Some(parallel_tool_calls) = parallel_tool_calls {
             body["parallel_tool_calls"] = json!(parallel_tool_calls);
@@ -1185,6 +1197,9 @@ impl LLMProvider for CopilotProvider {
             request_overrides::ENDPOINT_CHAT_COMPLETIONS,
             Some(upstream_model),
         );
+        if let Some(name) = required_tool {
+            body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
+        }
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
             "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
@@ -1314,7 +1329,10 @@ impl LLMProvider for CopilotProvider {
                     });
                     if !tools.is_empty() {
                         body_no_reasoning["tools"] = json!(tools_to_openai_compat_json(tools));
-                        body_no_reasoning["tool_choice"] = json!("auto");
+                        body_no_reasoning["tool_choice"] = required_tool.map_or_else(
+                            || json!("auto"),
+                            |name| json!({"type": "function", "function": {"name": name}}),
+                        );
                     }
                     if let Some(parallel_tool_calls) = parallel_tool_calls {
                         body_no_reasoning["parallel_tool_calls"] = json!(parallel_tool_calls);
@@ -1328,6 +1346,10 @@ impl LLMProvider for CopilotProvider {
                         request_overrides::ENDPOINT_CHAT_COMPLETIONS,
                         Some(upstream_model),
                     );
+                    if let Some(name) = required_tool {
+                        body_no_reasoning["tool_choice"] =
+                            json!({"type": "function", "function": {"name": name}});
+                    }
                     crate::masking::mask_outbound_body(
                         &mut body_no_reasoning,
                         &self.masking_config,
@@ -1415,6 +1437,7 @@ impl LLMProvider for CopilotProvider {
                             reasoning_effort,
                             responses_options,
                             parallel_tool_calls,
+                            required_tool,
                             reasoning_source,
                             session_log_id,
                             request_purpose,
@@ -1548,6 +1571,32 @@ mod tests {
 
         let provider = CopilotProvider::new();
         assert!(!provider.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn required_tool_missing_schema_fails_before_auth_resolution() {
+        let provider = CopilotProvider::new();
+        let options = LLMRequestOptions {
+            required_tool: Some("load_skill".to_string()),
+            ..Default::default()
+        };
+
+        let result = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &[],
+                Some(128),
+                "gpt-5",
+                Some(&options),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("missing required tool schema must fail before auth or network"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("required tool schema 'load_skill' was not offered"));
     }
 
     #[test]

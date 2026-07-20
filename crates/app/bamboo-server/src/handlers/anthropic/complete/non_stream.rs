@@ -45,6 +45,7 @@ pub(super) async fn handle_non_streaming_complete(
                 session_id: None,
                 reasoning_effort,
                 parallel_tool_calls: None,
+                required_tool: None,
                 responses: None,
                 request_purpose: Some("anthropic_compat".to_string()),
                 cache: None,

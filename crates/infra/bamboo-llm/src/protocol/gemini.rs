@@ -140,6 +140,14 @@ pub struct GeminiFunctionResponse {
     pub response: Value,
 }
 
+fn normalize_function_response(content: &str) -> Value {
+    match serde_json::from_str(content) {
+        Ok(Value::Object(response)) => Value::Object(response),
+        Ok(response) => serde_json::json!({ "result": response }),
+        Err(_) => serde_json::json!({ "result": content }),
+    }
+}
+
 /// Gemini tool definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiTool {
@@ -379,8 +387,10 @@ impl ToProvider<GeminiContent> for Message {
                     function_call: None,
                     function_response: Some(GeminiFunctionResponse {
                         name: tool_name,
-                        response: serde_json::from_str(&self.content)
-                            .unwrap_or_else(|_| Value::String(self.content.clone())),
+                        // Gemini's functionResponse.response field is a protobuf
+                        // Struct, so scalar, array, and plain-text tool results
+                        // must be wrapped in an object before serialization.
+                        response: normalize_function_response(&self.content),
                     }),
                 }],
             });
@@ -824,6 +834,33 @@ mod tests {
 
         let func_resp = gemini.parts[0].function_response.as_ref().unwrap();
         assert_eq!(func_resp.name, "search_tool");
+        assert_eq!(func_resp.response, serde_json::json!({ "result": "ok" }));
+    }
+
+    #[test]
+    fn test_plain_text_tool_response_is_wrapped_in_object() {
+        let internal = Message::tool_result("read_file", "plain text output");
+
+        let gemini: GeminiContent = internal.to_provider().unwrap();
+
+        let func_resp = gemini.parts[0].function_response.as_ref().unwrap();
+        assert_eq!(
+            func_resp.response,
+            serde_json::json!({ "result": "plain text output" })
+        );
+    }
+
+    #[test]
+    fn test_non_object_json_tool_response_is_wrapped_in_object() {
+        let internal = Message::tool_result("list_items", r#"["first", "second"]"#);
+
+        let gemini: GeminiContent = internal.to_provider().unwrap();
+
+        let func_resp = gemini.parts[0].function_response.as_ref().unwrap();
+        assert_eq!(
+            func_resp.response,
+            serde_json::json!({ "result": ["first", "second"] })
+        );
     }
 
     #[test]

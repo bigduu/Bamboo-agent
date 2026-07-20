@@ -660,7 +660,7 @@ async fn activation_metadata_persistence_failure_releases_pin_before_provider_ca
 }
 
 #[tokio::test]
-async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin() {
+async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_pin() {
     struct FailSecondSave(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
     impl bamboo_domain::RuntimeSessionPersistence for FailSecondSave {
@@ -673,26 +673,14 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
             }
         }
     }
-    struct SuccessfulLoad;
+    struct NeverExecutedLoad;
     #[async_trait]
-    impl bamboo_agent_core::tools::ToolExecutor for SuccessfulLoad {
+    impl bamboo_agent_core::tools::ToolExecutor for NeverExecutedLoad {
         async fn execute(
             &self,
             _call: &bamboo_agent_core::tools::ToolCall,
         ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                result: serde_json::json!({
-                    "skill_id": "review",
-                    "revision": 1,
-                    "instructions": "pinned instructions",
-                    "dynamic_context": [],
-                    "activation_status": "active"
-                })
-                .to_string(),
-                display_preference: None,
-                images: Vec::new(),
-            })
+            panic!("assistant tool-call checkpoint must persist before load_skill executes")
         }
         fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
             vec![bamboo_agent_core::tools::ToolSchema {
@@ -705,9 +693,9 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
             }]
         }
     }
-    struct NeverCalled;
+    struct ActivationProvider;
     #[async_trait]
-    impl LLMProvider for NeverCalled {
+    impl LLMProvider for ActivationProvider {
         async fn chat_stream(
             &self,
             _messages: &[Message],
@@ -715,7 +703,18 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> bamboo_llm::provider::Result<LLMStream> {
-            panic!("second persistence failure must stop before provider")
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: "load-review".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "load_skill".to_string(),
+                    arguments: r#"{"skill_id":"review"}"#.to_string(),
+                },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
     let directory = tempfile::tempdir().expect("tempdir");
@@ -726,15 +725,15 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
         },
     ));
     manager.initialize().await.expect("initialize");
-    let mut session = Session::new("post-preload-save-failure", "model");
+    let mut session = Session::new("activation-checkpoint-failure", "model");
     let save_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (event_tx, _event_rx) = mpsc::channel(4);
     let result = super::run_agent_loop_with_config(
         &mut session,
         "review".to_string(),
         event_tx,
-        Arc::new(NeverCalled),
-        Arc::new(SuccessfulLoad),
+        Arc::new(ActivationProvider),
+        Arc::new(NeverExecutedLoad),
         CancellationToken::new(),
         AgentLoopConfig {
             skill_manager: Some(manager.clone()),
@@ -746,13 +745,13 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
     )
     .await;
     assert!(result
-        .expect_err("post preload save must fail")
+        .expect_err("activation tool-call checkpoint must fail")
         .to_string()
-        .contains("loaded-state could not be published"));
+        .contains("assistant tool-call checkpoint could not be persisted"));
     assert_eq!(save_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(manager
         .store()
-        .activation_descriptor("post-preload-save-failure")
+        .activation_descriptor("activation-checkpoint-failure")
         .await
         .is_none());
     assert!(!session
@@ -764,7 +763,7 @@ async fn post_preload_persistence_failure_stops_before_provider_and_releases_pin
 }
 
 #[tokio::test]
-async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() {
+async fn unsuccessful_model_issued_explicit_activation_stops_before_answer_and_releases_pin() {
     struct UnsuccessfulLoad;
     #[async_trait]
     impl bamboo_agent_core::tools::ToolExecutor for UnsuccessfulLoad {
@@ -774,7 +773,7 @@ async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() 
         ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
             Ok(ToolResult {
                 success: false,
-                result: "injected preload failure".to_string(),
+                result: "injected activation failure".to_string(),
                 display_preference: None,
                 images: Vec::new(),
             })
@@ -790,9 +789,9 @@ async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() 
             }]
         }
     }
-    struct NeverCalled;
+    struct ActivationProvider;
     #[async_trait]
-    impl LLMProvider for NeverCalled {
+    impl LLMProvider for ActivationProvider {
         async fn chat_stream(
             &self,
             _messages: &[Message],
@@ -800,7 +799,18 @@ async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() 
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> bamboo_llm::provider::Result<LLMStream> {
-            panic!("unsuccessful explicit preload must stop before provider")
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: "load-review".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "load_skill".to_string(),
+                    arguments: r#"{"skill_id":"review"}"#.to_string(),
+                },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
     let directory = tempfile::tempdir().expect("tempdir");
@@ -811,13 +821,13 @@ async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() 
         },
     ));
     manager.initialize().await.expect("initialize");
-    let mut session = Session::new("unsuccessful-preload", "model");
-    let (event_tx, _event_rx) = mpsc::channel(4);
+    let mut session = Session::new("unsuccessful-model-activation", "model");
+    let (event_tx, _event_rx) = mpsc::channel(64);
     let result = super::run_agent_loop_with_config(
         &mut session,
         "review".to_string(),
         event_tx,
-        Arc::new(NeverCalled),
+        Arc::new(ActivationProvider),
         Arc::new(UnsuccessfulLoad),
         CancellationToken::new(),
         AgentLoopConfig {
@@ -829,12 +839,12 @@ async fn unsuccessful_explicit_preload_stops_before_provider_and_releases_pin() 
     )
     .await;
     assert!(result
-        .expect_err("preload must fail closed")
+        .expect_err("model-issued activation must fail closed")
         .to_string()
-        .contains("preload was unsuccessful"));
+        .contains("failed to activate; refusing to continue"));
     assert!(manager
         .store()
-        .activation_descriptor("unsuccessful-preload")
+        .activation_descriptor("unsuccessful-model-activation")
         .await
         .is_none());
 }

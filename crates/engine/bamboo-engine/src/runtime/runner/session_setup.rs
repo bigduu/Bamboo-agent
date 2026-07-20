@@ -158,7 +158,26 @@ pub(crate) async fn prepare_session_for_loop(
         }
     };
     session.metadata.remove(SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
-    let mut skill_context = skill_result.context.clone();
+    let explicit_activation_loaded = skill_result.restored_active_context
+        || skill_context::selection_matches_loaded_activation(session, &skill_result);
+    let skill_context = if explicit_activation_loaded {
+        format!(
+            "\n\n## Explicit Workflow Already Activated\n\
+The `{skill_id}` workflow was loaded successfully earlier in this session. Continue following the existing `load_skill` result and its workflow instructions. Do not call `load_skill` again solely because execution resumed.\n",
+            skill_id = skill_result.selected_skill_ids[0],
+        )
+    } else if skill_result.selection_source.as_deref() == Some("explicit")
+        && skill_result.selected_skill_ids.len() == 1
+    {
+        format!(
+            "\n\n## Required Explicit Workflow Activation\n\
+The user explicitly selected `{skill_id}`. Your first response step MUST be exactly one `load_skill` call for `{skill_id}`. Do not emit commentary, an answer, or any other tool call before it completes. If the tool reports `activation_status: degraded`, do not retry it; continue without workflow instructions. Otherwise, follow the loaded workflow instructions.\n{context}",
+            skill_id = skill_result.selected_skill_ids[0],
+            context = skill_result.context.as_str(),
+        )
+    } else {
+        skill_result.context.clone()
+    };
 
     if let Some(diagnostic) = skill_result.activation_diagnostic.as_ref() {
         session.metadata.insert(
@@ -263,7 +282,7 @@ pub(crate) async fn prepare_session_for_loop(
         }
 
         if !skill_result.restored_active_context {
-            skill_context::reset_explicit_activation_state(session, &skill_result);
+            skill_context::reset_activation_state_for_new_selection(session, &skill_result);
         }
 
         // Runtime tools authorize skill loads through the shared session repository.
@@ -280,71 +299,6 @@ pub(crate) async fn prepare_session_for_loop(
                 return Err(AgentError::Tool(format!(
                     "Workflow activation metadata could not be published before tool/model execution: {error}"
                 )));
-            }
-        }
-
-        let explicit_activation = if skill_result.restored_active_context {
-            None
-        } else {
-            match skill_context::activate_explicit_skill(
-                tools,
-                session,
-                session_id,
-                &skill_result,
-                event_tx,
-            )
-            .await
-            {
-                Ok(activation) => activation,
-                Err(error) => {
-                    if let Some(skill_manager) = config.skill_manager.as_ref() {
-                        let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
-                        let _ = skill_manager
-                            .release_activation_for_workspace(session_id, workspace.as_deref())
-                            .await;
-                    }
-                    return Err(AgentError::Tool(format!(
-                        "Explicit workflow activation failed before model execution: {error}"
-                    )));
-                }
-            }
-        };
-        if let Some(activated_context) = explicit_activation {
-            skill_context = activated_context;
-            if let Some(persistence) = config.persistence.as_ref() {
-                if let Err(error) = persistence.save_runtime_session(session).await {
-                    if let Some(skill_manager) = config.skill_manager.as_ref() {
-                        let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
-                        let _ = skill_manager
-                            .release_activation_for_workspace(session_id, workspace.as_deref())
-                            .await;
-                    }
-                    // The activation was never durably committed. Keep the caller's
-                    // in-memory session fail-closed as well, so a retry cannot observe
-                    // an active workflow whose immutable pin has already been released.
-                    session
-                        .metadata
-                        .remove(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY);
-                    session
-                        .metadata
-                        .remove(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY);
-                    session
-                        .metadata
-                        .remove(bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY);
-                    session.metadata.remove(SKILL_RUNTIME_PINNED_SNAPSHOT_KEY);
-                    session
-                        .metadata
-                        .remove(bamboo_skills::runtime_metadata::LOADED_SKILL_IDS_METADATA_KEY);
-                    session
-                        .metadata
-                        .remove(bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_ID_METADATA_KEY);
-                    session.metadata.remove(
-                        bamboo_skills::runtime_metadata::LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
-                    );
-                    return Err(AgentError::Tool(format!(
-                        "Explicit workflow loaded-state could not be published before model execution: {error}"
-                    )));
-                }
             }
         }
     }
