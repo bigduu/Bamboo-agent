@@ -25,6 +25,8 @@ hex = "0.4"
 base64 = "0.22"
 url = "2"
 uuid = { workspace = true }
+fs2 = "0.4"
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"
