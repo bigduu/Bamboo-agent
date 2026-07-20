@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use actix_web::{web, HttpResponse};
 use bamboo_config::{ConfigStoreError, SectionSnapshot, SectionSourceKind, SectionStatus};
-use bamboo_tools::permission::SerializablePermissionConfig;
+use bamboo_tools::permission::{
+    DurablePermissionRule, PermissionDecisionKind, PermissionEvaluation, PermissionOutcome,
+    PermissionType, SerializablePermissionConfig,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +99,7 @@ pub async fn update_permission_ask_rules(
             .map_err(map_store_error)?;
 
         let snapshot = section.snapshot();
-        config.set_ask_rules(snapshot.data.ask_rules.clone());
+        config.publish_persistent_policy(snapshot.revision, snapshot.data.as_ref());
         Ok::<_, AppError>(snapshot)
     });
 
@@ -117,9 +120,222 @@ fn map_store_error(error: ConfigStoreError) -> AppError {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct PermissionPolicyResponse {
+    pub revision: u64,
+    pub loaded_at: DateTime<Utc>,
+    pub source_path: PathBuf,
+    pub source_kind: SectionSourceKind,
+    pub status: SectionStatus,
+    pub last_error: Option<String>,
+    pub policy: SerializablePermissionConfig,
+}
+
+impl PermissionPolicyResponse {
+    fn from_snapshot(snapshot: &SectionSnapshot<SerializablePermissionConfig>) -> Self {
+        Self {
+            revision: snapshot.revision,
+            loaded_at: snapshot.loaded_at,
+            source_path: snapshot.source_path.clone(),
+            source_kind: snapshot.source_kind,
+            status: snapshot.status,
+            last_error: snapshot.last_error.clone(),
+            policy: snapshot.data.as_ref().clone(),
+        }
+    }
+}
+
+pub async fn get_permission_policy(
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let snapshot = app_state.permission_section.snapshot();
+    Ok(HttpResponse::Ok().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutPermissionRuleRequest {
+    pub expected_revision: u64,
+    pub rule: DurablePermissionRule,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeletePermissionRuleRequest {
+    pub expected_revision: u64,
+}
+
+async fn commit_permission_candidate(
+    app_state: &web::Data<AppState>,
+    expected_revision: u64,
+    candidate: SerializablePermissionConfig,
+) -> Result<Arc<SectionSnapshot<SerializablePermissionConfig>>, AppError> {
+    let Some(config) = app_state.permission_checker.permission_config() else {
+        return Err(AppError::InternalError(anyhow::anyhow!(
+            "permission checker does not support configurable rules"
+        )));
+    };
+    let section = Arc::clone(&app_state.permission_section);
+    let io_lock = Arc::clone(&app_state.permission_io_lock);
+    tokio::spawn(async move {
+        let _guard = io_lock.lock().await;
+        let writer = Arc::clone(&section);
+        tokio::task::spawn_blocking(move || writer.commit(expected_revision, candidate))
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!("permission commit task failed: {error}"))
+            })?
+            .map_err(map_store_error)?;
+        let snapshot = section.snapshot();
+        config.publish_persistent_policy(snapshot.revision, snapshot.data.as_ref());
+        Ok::<_, AppError>(snapshot)
+    })
+    .await
+    .map_err(|error| {
+        AppError::InternalError(anyhow::anyhow!("permission mutation task failed: {error}"))
+    })?
+}
+
+pub async fn create_permission_rule(
+    app_state: web::Data<AppState>,
+    payload: web::Json<PutPermissionRuleRequest>,
+) -> Result<HttpResponse, AppError> {
+    let request = payload.into_inner();
+    request.rule.validate().map_err(AppError::BadRequest)?;
+    let snapshot = app_state.permission_section.snapshot();
+    if snapshot
+        .data
+        .durable_rules
+        .iter()
+        .any(|rule| rule.id == request.rule.id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "permission rule '{}' already exists",
+            request.rule.id
+        )));
+    }
+    let mut candidate = snapshot.data.as_ref().clone();
+    candidate.durable_rules.push(request.rule);
+    let snapshot =
+        commit_permission_candidate(&app_state, request.expected_revision, candidate).await?;
+    Ok(HttpResponse::Created().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+}
+
+pub async fn update_permission_rule(
+    app_state: web::Data<AppState>,
+    rule_id: web::Path<String>,
+    payload: web::Json<PutPermissionRuleRequest>,
+) -> Result<HttpResponse, AppError> {
+    let rule_id = rule_id.into_inner();
+    let request = payload.into_inner();
+    if request.rule.id != rule_id {
+        return Err(AppError::BadRequest(
+            "rule id in path and body must match".to_string(),
+        ));
+    }
+    request.rule.validate().map_err(AppError::BadRequest)?;
+    let snapshot = app_state.permission_section.snapshot();
+    let mut candidate = snapshot.data.as_ref().clone();
+    let Some(existing) = candidate
+        .durable_rules
+        .iter_mut()
+        .find(|rule| rule.id == rule_id)
+    else {
+        return Err(AppError::NotFound(format!("permission rule '{rule_id}'")));
+    };
+    *existing = request.rule;
+    let snapshot =
+        commit_permission_candidate(&app_state, request.expected_revision, candidate).await?;
+    Ok(HttpResponse::Ok().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+}
+
+pub async fn delete_permission_rule(
+    app_state: web::Data<AppState>,
+    rule_id: web::Path<String>,
+    query: web::Query<DeletePermissionRuleRequest>,
+) -> Result<HttpResponse, AppError> {
+    let rule_id = rule_id.into_inner();
+    let snapshot = app_state.permission_section.snapshot();
+    let mut candidate = snapshot.data.as_ref().clone();
+    let before = candidate.durable_rules.len();
+    candidate.durable_rules.retain(|rule| rule.id != rule_id);
+    if candidate.durable_rules.len() == before {
+        return Err(AppError::NotFound(format!("permission rule '{rule_id}'")));
+    }
+    let snapshot =
+        commit_permission_candidate(&app_state, query.expected_revision, candidate).await?;
+    Ok(HttpResponse::Ok().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiagnosePermissionRequest {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_args: serde_json::Value,
+    pub permission_type: PermissionType,
+    pub resource: String,
+    #[serde(default)]
+    pub operation_summary: String,
+    #[serde(default)]
+    pub bypass_requested: bool,
+    #[serde(default)]
+    pub platform_hard_deny: Option<String>,
+}
+
+pub async fn diagnose_permission(
+    app_state: web::Data<AppState>,
+    payload: web::Json<DiagnosePermissionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let request = payload.into_inner();
+    let Some(config) = app_state.permission_checker.permission_config() else {
+        return Err(AppError::InternalError(anyhow::anyhow!(
+            "permission checker does not expose typed policy"
+        )));
+    };
+    let outcome: PermissionOutcome = config.evaluate(PermissionEvaluation {
+        request_id: request.request_id,
+        session_id: request.session_id,
+        workspace_path: request.workspace_path,
+        tool_name: request.tool_name,
+        tool_args: request.tool_args,
+        permission_type: request.permission_type,
+        resource: request.resource,
+        operation_summary: request.operation_summary,
+        risk_level: request.permission_type.risk_level(),
+        bypass_requested: request.bypass_requested,
+        platform_hard_deny: request.platform_hard_deny,
+        consume_once: false,
+        supported_decisions: PermissionDecisionKind::all_supported(),
+    });
+    Ok(HttpResponse::Ok().json(outcome))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn global_rule(
+        effect: bamboo_tools::permission::PermissionRuleEffect,
+    ) -> DurablePermissionRule {
+        DurablePermissionRule {
+            id: "rule-1".to_string(),
+            permission_type: PermissionType::ExecuteCommand,
+            effect,
+            scope: bamboo_tools::permission::PermissionRuleScope::Global,
+            workspace_path: None,
+            matcher: bamboo_tools::permission::PermissionMatcher {
+                id: "git-status".to_string(),
+                kind: bamboo_tools::permission::PermissionMatcherKind::CommandPrefix,
+                value: "git status".to_string(),
+            },
+            source: bamboo_tools::permission::PermissionRuleSource::User,
+            expires_at: None,
+        }
+    }
 
     #[tokio::test]
     async fn conflict_leaves_live_policy_and_disk_unchanged_then_valid_cas_publishes() {
@@ -177,5 +393,91 @@ mod tests {
         let reopened = bamboo_tools::permission::PermissionSection::open(temp.path()).unwrap();
         assert_eq!(reopened.snapshot().revision, 1);
         assert_eq!(reopened.snapshot().data.ask_rules, vec!["Bash(git push *)"]);
+    }
+
+    #[tokio::test]
+    async fn durable_rule_crud_is_cas_guarded_and_published_after_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(temp.path().to_path_buf())
+                .await
+                .expect("app state should initialize"),
+        );
+
+        let created = create_permission_rule(
+            state.clone(),
+            web::Json(PutPermissionRuleRequest {
+                expected_revision: 0,
+                rule: global_rule(bamboo_tools::permission::PermissionRuleEffect::Allow),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), actix_web::http::StatusCode::CREATED);
+        assert_eq!(
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .durable_rules()[0]
+                .effect,
+            bamboo_tools::permission::PermissionRuleEffect::Allow
+        );
+
+        update_permission_rule(
+            state.clone(),
+            web::Path::from("rule-1".to_string()),
+            web::Json(PutPermissionRuleRequest {
+                expected_revision: 1,
+                rule: global_rule(bamboo_tools::permission::PermissionRuleEffect::Deny),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stale = delete_permission_rule(
+            state.clone(),
+            web::Path::from("rule-1".to_string()),
+            web::Query(DeletePermissionRuleRequest {
+                expected_revision: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stale,
+            AppError::ConfigConflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        assert_eq!(
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .durable_rules()[0]
+                .effect,
+            bamboo_tools::permission::PermissionRuleEffect::Deny
+        );
+
+        delete_permission_rule(
+            state.clone(),
+            web::Path::from("rule-1".to_string()),
+            web::Query(DeletePermissionRuleRequest {
+                expected_revision: 2,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .durable_rules()
+            .is_empty());
+        let reopened = bamboo_tools::permission::PermissionSection::open(temp.path()).unwrap();
+        assert_eq!(reopened.snapshot().revision, 3);
+        assert!(reopened.snapshot().data.durable_rules.is_empty());
     }
 }

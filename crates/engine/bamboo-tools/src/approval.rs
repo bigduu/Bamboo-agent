@@ -33,6 +33,9 @@ pub struct ApprovalAsk {
     pub permission: String,
     /// The concrete resource the action targets (path, command, …).
     pub resource: String,
+    /// Full machine-readable request. `None` is accepted only for legacy custom
+    /// proxies; Bamboo's worker relay always sends it.
+    pub permission_request: Option<crate::permission::PermissionRequest>,
 }
 
 /// Forwards a gated-tool approval decision to an out-of-process host (parent).
@@ -107,6 +110,7 @@ mod tests {
                     tool_name: "Write".into(),
                     permission: "write".into(),
                     resource: "/tmp/x".into(),
+                    permission_request: None,
                 })
                 .await
             );

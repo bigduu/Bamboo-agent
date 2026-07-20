@@ -452,6 +452,7 @@ mod agent_session_context;
 mod builder;
 mod config_runtime;
 pub mod init;
+pub mod parent_approval_reviewer;
 mod persistence;
 mod provider_api;
 pub mod resume_adapter;

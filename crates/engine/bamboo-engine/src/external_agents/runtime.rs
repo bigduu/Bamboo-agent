@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::a2a_adapter::A2AExternalChildRunner;
-use super::actor_adapter::ActorChildRunner;
+use super::actor_adapter::{ActorChildRunner, ChildApprovalReviewer};
 use super::config::{parse_external_agents, ExternalAgentProtocol};
 
 /// Composite router that delegates to the first matching external child runner.
@@ -81,6 +81,17 @@ pub fn build_external_child_runner_with_registry(
     config: &Config,
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
 ) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_with_registry_and_reviewer(config, approval_registry, None, None)
+}
+
+/// Build the child runner with durable approval state and an optional
+/// parent-agent model reviewer for forced-ask requests.
+pub fn build_external_child_runner_with_registry_and_reviewer(
+    config: &Config,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
@@ -88,7 +99,12 @@ pub fn build_external_child_runner_with_registry(
     // The built-in local actor worker is the default runtime for every
     // sub-agent. Always build it; a build failure here is logged and leaves the
     // composite without a default handler (dispatch then errors clearly).
-    match build_local_actor_runner(config, approval_registry.clone()) {
+    match build_local_actor_runner(
+        config,
+        approval_registry.clone(),
+        approval_reviewer.clone(),
+        permission_config.clone(),
+    ) {
         Ok(runner) => runners.push(runner),
         Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
     }
@@ -149,6 +165,12 @@ pub fn build_external_child_runner_with_registry(
             );
             if let Some(registry) = approval_registry.clone() {
                 runner = runner.with_approval_registry(registry);
+            }
+            if let Some(reviewer) = approval_reviewer.clone() {
+                runner = runner.with_approval_reviewer(reviewer);
+            }
+            if let Some(config) = permission_config.clone() {
+                runner = runner.with_permission_config(config);
             }
             runners.push(Arc::new(runner));
             continue;
@@ -216,6 +238,8 @@ pub fn build_external_child_runner_with_registry(
 fn build_local_actor_runner(
     config: &Config,
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = config.subagents();
 
@@ -281,6 +305,12 @@ fn build_local_actor_runner(
     }));
     if let Some(registry) = approval_registry {
         runner = runner.with_approval_registry(registry);
+    }
+    if let Some(reviewer) = approval_reviewer {
+        runner = runner.with_approval_reviewer(reviewer);
+    }
+    if let Some(config) = permission_config {
+        runner = runner.with_permission_config(config);
     }
     Ok(Arc::new(runner))
 }

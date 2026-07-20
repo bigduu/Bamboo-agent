@@ -14,4 +14,7 @@ pub use config::{
     parse_external_agents, parse_subagent_routing, resolve_runtime_metadata, ExternalAgentProfile,
     ExternalAgentProtocol, SubagentRouting,
 };
-pub use runtime::{build_external_child_runner, build_external_child_runner_with_registry};
+pub use runtime::{
+    build_external_child_runner, build_external_child_runner_with_registry,
+    build_external_child_runner_with_registry_and_reviewer,
+};

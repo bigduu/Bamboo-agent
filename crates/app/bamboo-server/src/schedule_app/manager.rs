@@ -55,6 +55,7 @@ pub struct ScheduleContext {
     pub agent: Arc<bamboo_engine::Agent>,
     pub persistence: Arc<LockedSessionStore>,
     pub tools: Arc<dyn ToolExecutor>,
+    pub permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     pub sessions_cache: bamboo_engine::SessionCache,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -339,6 +340,19 @@ async fn run_schedule_job(
         resolved.reasoning_effort,
     );
     let session_id = session.id.clone();
+    if let Some(config) = ctx.permission_config.as_ref() {
+        if let Some(workspace) = session.workspace.as_ref() {
+            config.register_session_workspace(session_id.clone(), workspace.clone());
+        }
+        session.metadata.insert(
+            "permission.policy_revision".to_string(),
+            config.policy_revision().to_string(),
+        );
+        session.metadata.insert(
+            "permission.effective_mode".to_string(),
+            format!("{:?}", config.mode()).to_ascii_lowercase(),
+        );
+    }
 
     // #73: a scheduled run has no interactive human approver — mark the root so
     // its sub-agents (which inherit the flag) decide gated actions with the
@@ -622,6 +636,7 @@ pub fn build_schedule_context(
         schedule_store: base.schedule_store,
         agent: base.agent,
         tools: base.tools,
+        permission_config: base.permission_config,
         sessions_cache: base.sessions_cache,
         agent_runners: base.agent_runners,
         session_event_senders: base.session_event_senders,
