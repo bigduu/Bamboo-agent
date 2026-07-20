@@ -120,7 +120,7 @@ content-derived value in the quarantine filename.
 | user environment entry with `secret=true` | `env.<name>.value` |
 | ntfy token | `notification.ntfy.token` |
 | Bark device key | `notification.bark.device_key` |
-| cluster password/private key/passphrase | `cluster.<host>.<field>` |
+| cluster password/private key/passphrase | `cluster.<node-id>.<field>`; ordinary config stores these refs and configured metadata in `cluster_fabric.credential_refs` |
 | external broker bearer token | `broker.external.bearer_token` |
 | access password/device token | verifier only; plaintext is never persisted |
 | Copilot OAuth cache | stays in its existing OAuth cache until a platform keychain adapter exists; it must not migrate into ordinary config |

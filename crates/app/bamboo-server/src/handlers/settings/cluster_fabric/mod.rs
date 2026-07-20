@@ -313,6 +313,7 @@ pub async fn delete_node(
                 for cluster in &mut cfg.cluster_fabric.clusters {
                     cluster.node_ids.retain(|nid| nid != &id);
                 }
+                cfg.cluster_fabric.credential_refs.remove(&id);
                 Ok(())
             },
             ConfigUpdateEffects::default(),

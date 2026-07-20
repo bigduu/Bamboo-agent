@@ -16,10 +16,14 @@
 //! and stays `None` until a deploy runs. This module is purely the persisted
 //! registry + its crypto.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::config_store::ConfigStoreResult;
+use crate::credential_store::{credential_ref, CredentialRef};
 
 /// The persisted cluster fabric: clusters (groups) + nodes (machines).
 ///
@@ -33,6 +37,14 @@ pub struct ClusterFabricConfig {
     /// The registered machines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<Node>,
+    /// Stable references to SSH secrets, keyed by the node's immutable id.
+    ///
+    /// Runtime plaintext remains in [`SshAuth`], while ordinary configuration
+    /// persists only these references and truthful configured metadata. The
+    /// legacy `*_encrypted` fields remain readable during migration but are not
+    /// the authority for newly isolated credentials.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credential_refs: BTreeMap<String, ClusterNodeCredentialRefs>,
     /// Seconds between background health probes of Running/Unreachable nodes.
     /// Omitted → the built-in default (30s); `0` disables the health monitor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,7 +57,7 @@ pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 30;
 impl ClusterFabricConfig {
     /// True when there are no clusters and no nodes (the serialize-skip gate).
     pub fn is_empty(&self) -> bool {
-        self.clusters.is_empty() && self.nodes.is_empty()
+        self.clusters.is_empty() && self.nodes.is_empty() && self.credential_refs.is_empty()
     }
 
     /// Resolve the health-monitor cadence: `None` when disabled (`0`), else the
@@ -72,6 +84,67 @@ impl ClusterFabricConfig {
     pub fn cluster(&self, name: &str) -> Option<&Cluster> {
         self.clusters.iter().find(|c| c.name == name)
     }
+
+    /// Drop metadata for nodes that no longer exist. Credential refs remain an
+    /// inert persistence seam until the cluster exact transaction is wired;
+    /// callers must prune them whenever a node collection is replaced.
+    pub fn prune_orphaned_credential_refs(&mut self) {
+        let node_ids = self
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.credential_refs
+            .retain(|node_id, _| node_ids.contains(node_id.as_str()));
+    }
+}
+
+/// Metadata for one node's isolated SSH credentials.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterNodeCredentialRefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_credential_ref: Option<CredentialRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_credential_ref: Option<CredentialRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private_key_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase_credential_ref: Option<CredentialRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub passphrase_configured: bool,
+}
+
+impl ClusterNodeCredentialRefs {
+    pub fn references(&self) -> impl Iterator<Item = &CredentialRef> {
+        [
+            self.password_credential_ref.as_ref(),
+            self.private_key_credential_ref.as_ref(),
+            self.passphrase_credential_ref.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.references().next().is_none()
+            && !self.password_configured
+            && !self.private_key_configured
+            && !self.passphrase_configured
+    }
+}
+
+pub fn cluster_password_credential_ref(node_id: &str) -> ConfigStoreResult<CredentialRef> {
+    credential_ref("cluster", node_id, "password")
+}
+
+pub fn cluster_private_key_credential_ref(node_id: &str) -> ConfigStoreResult<CredentialRef> {
+    credential_ref("cluster", node_id, "private_key")
+}
+
+pub fn cluster_passphrase_credential_ref(node_id: &str) -> ConfigStoreResult<CredentialRef> {
+    credential_ref("cluster", node_id, "passphrase")
 }
 
 /// A named group of node ids. Clusters carry no credentials — they are pure
@@ -420,6 +493,73 @@ mod tests {
     fn empty_fabric_is_skipped_on_serialize() {
         let cfg = ClusterFabricConfig::default();
         assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn credential_metadata_round_trips_without_secret_material() {
+        let mut fabric = ClusterFabricConfig::default();
+        fabric.credential_refs.insert(
+            "node/with unsafe id".to_string(),
+            ClusterNodeCredentialRefs {
+                password_credential_ref: Some(
+                    cluster_password_credential_ref("node/with unsafe id").unwrap(),
+                ),
+                password_configured: true,
+                private_key_credential_ref: Some(
+                    cluster_private_key_credential_ref("node/with unsafe id").unwrap(),
+                ),
+                private_key_configured: true,
+                passphrase_credential_ref: Some(
+                    cluster_passphrase_credential_ref("node/with unsafe id").unwrap(),
+                ),
+                passphrase_configured: true,
+            },
+        );
+
+        let encoded = serde_json::to_string(&fabric).unwrap();
+        assert!(encoded.contains("password_credential_ref"));
+        assert!(encoded.contains("private_key_credential_ref"));
+        assert!(encoded.contains("passphrase_credential_ref"));
+        assert!(!encoded.contains("password_encrypted"));
+        assert!(!encoded.contains("private_key_encrypted"));
+        assert!(!encoded.contains("passphrase_encrypted"));
+        let decoded: ClusterFabricConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, fabric);
+    }
+
+    #[test]
+    fn canonical_cluster_refs_are_node_scoped_and_injective() {
+        let slash = cluster_password_credential_ref("node/a").unwrap();
+        let dot = cluster_password_credential_ref("node.a").unwrap();
+        assert_ne!(slash, dot);
+        assert!(slash.as_str().starts_with("cluster."));
+        assert!(slash.as_str().ends_with(".password"));
+        assert_ne!(
+            cluster_private_key_credential_ref("node/a").unwrap(),
+            cluster_passphrase_credential_ref("node/a").unwrap()
+        );
+    }
+
+    #[test]
+    fn pruning_nodes_drops_orphaned_credential_metadata() {
+        let mut fabric = ClusterFabricConfig::default();
+        fabric
+            .nodes
+            .push(ssh_node("kept", SshAuth::SystemSshConfig));
+        for id in ["kept", "deleted"] {
+            fabric.credential_refs.insert(
+                id.to_string(),
+                ClusterNodeCredentialRefs {
+                    password_credential_ref: Some(cluster_password_credential_ref(id).unwrap()),
+                    password_configured: true,
+                    ..ClusterNodeCredentialRefs::default()
+                },
+            );
+        }
+
+        fabric.prune_orphaned_credential_refs();
+        assert!(fabric.credential_refs.contains_key("kept"));
+        assert!(!fabric.credential_refs.contains_key("deleted"));
     }
 
     #[test]

@@ -206,6 +206,34 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     // the permissive root PATCH surface.
     patch_obj.remove("env_vars");
 
+    // Cluster credential refs/configured state are server-owned metadata. Keep
+    // ordinary node edits compatible, but refuse client-selected references or
+    // legacy ciphertext injection through the permissive root PATCH surface.
+    if let Some(cluster_fabric) = patch_obj
+        .get_mut("cluster_fabric")
+        .and_then(|value| value.as_object_mut())
+    {
+        cluster_fabric.remove("credential_refs");
+        if let Some(nodes) = cluster_fabric
+            .get_mut("nodes")
+            .and_then(|value| value.as_array_mut())
+        {
+            for node in nodes {
+                let Some(auth) = node
+                    .get_mut("placement")
+                    .and_then(|value| value.as_object_mut())
+                    .and_then(|placement| placement.get_mut("auth"))
+                    .and_then(|value| value.as_object_mut())
+                else {
+                    continue;
+                };
+                auth.remove("password_encrypted");
+                auth.remove("private_key_encrypted");
+                auth.remove("passphrase_encrypted");
+            }
+        }
+    }
+
     // Never allow clients to set encrypted key material directly.
     if let Some(providers) = patch_obj
         .get_mut("providers")
@@ -1435,6 +1463,45 @@ mod tests {
         assert!(!obj.contains_key("proxy_auth"));
         assert!(!obj.contains_key("proxy_auth_encrypted"));
         assert!(!obj.contains_key("proxy_auth_credential_ref"));
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_cluster_storage_metadata_and_ciphertext() {
+        let mut patch = json!({
+            "cluster_fabric": {
+                "credential_refs": {
+                    "node-a": {
+                        "password_credential_ref": "attacker.chosen.ref",
+                        "password_configured": true
+                    }
+                },
+                "nodes": [{
+                    "id": "node-a",
+                    "placement": {
+                        "type": "ssh",
+                        "auth": {
+                            "method": "private_key",
+                            "private_key": "new-user-value",
+                            "private_key_encrypted": "client-ciphertext",
+                            "passphrase": "new-passphrase",
+                            "passphrase_encrypted": "client-ciphertext"
+                        }
+                    }
+                }]
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        let cluster = obj["cluster_fabric"].as_object().unwrap();
+        assert!(!cluster.contains_key("credential_refs"));
+        let auth = cluster["nodes"][0]["placement"]["auth"]
+            .as_object()
+            .unwrap();
+        assert_eq!(auth["private_key"], "new-user-value");
+        assert_eq!(auth["passphrase"], "new-passphrase");
+        assert!(!auth.contains_key("private_key_encrypted"));
+        assert!(!auth.contains_key("passphrase_encrypted"));
     }
 
     #[test]
