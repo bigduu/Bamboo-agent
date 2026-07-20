@@ -72,6 +72,7 @@ enum ExactTransactionScope {
     ProxyAuth,
     EnvVars,
     Notifications,
+    ClusterFabric,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,6 +443,33 @@ pub fn persist_notification_credential_transaction_at_revision_with_reset(
     )
 }
 
+/// Persist node metadata and every explicitly touched SSH credential through
+/// the same recoverable credential/config exact transaction used by the other
+/// root credential domains.
+pub fn persist_cluster_fabric_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    node_intents: &BTreeSet<String>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        Some((node_intents, expected_revision)),
+        #[cfg(test)]
+        None,
+    )
+}
+
 /// Persist built-in and provider-instance API-key updates as one recoverable
 /// credential/config transaction. Instance deletes are represented by an
 /// intent whose id is absent from `config`; the prior durable credential ref
@@ -532,6 +560,40 @@ fn persist_provider_credential_transaction_with_instances_inner(
     notification_expected_revision: Option<u64>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
+    persist_exact_credential_transaction_inner(
+        data_dir,
+        config,
+        provider_intents,
+        provider_instance_intents,
+        proxy_expected_revision,
+        env_intents,
+        env_expected_revision,
+        notification_transaction,
+        notification_intents,
+        notification_reset,
+        notification_expected_revision,
+        None,
+        #[cfg(test)]
+        fault,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_exact_credential_transaction_inner(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    proxy_expected_revision: Option<u64>,
+    env_intents: &BTreeSet<String>,
+    env_expected_revision: Option<u64>,
+    notification_transaction: bool,
+    notification_intents: &BTreeSet<String>,
+    notification_reset: bool,
+    notification_expected_revision: Option<u64>,
+    cluster_transaction: Option<(&BTreeSet<String>, u64)>,
+    #[cfg(test)] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<u64> {
     let proxy_only = provider_intents.len() == 1
         && provider_intents.contains("__proxy_auth")
         && provider_instance_intents.is_empty();
@@ -541,7 +603,13 @@ fn persist_provider_credential_transaction_with_instances_inner(
     let notification_only = provider_intents.is_empty()
         && provider_instance_intents.is_empty()
         && env_intents.is_empty()
-        && notification_transaction;
+        && notification_transaction
+        && cluster_transaction.is_none();
+    let cluster_only = provider_intents.is_empty()
+        && provider_instance_intents.is_empty()
+        && env_intents.is_empty()
+        && !notification_transaction
+        && cluster_transaction.is_some();
     if !env_intents.is_empty() && !env_only {
         return Err(ConfigStoreError::Validation(
             "env credentials must be updated in their own transaction".to_string(),
@@ -550,6 +618,11 @@ fn persist_provider_credential_transaction_with_instances_inner(
     if !notification_intents.is_empty() && !notification_only {
         return Err(ConfigStoreError::Validation(
             "notification credentials must be updated in their own transaction".to_string(),
+        ));
+    }
+    if cluster_transaction.is_some() && !cluster_only {
+        return Err(ConfigStoreError::Validation(
+            "cluster credentials must be updated in their own transaction".to_string(),
         ));
     }
     std::fs::create_dir_all(data_dir)?;
@@ -576,6 +649,11 @@ fn persist_provider_credential_transaction_with_instances_inner(
     let persisted_instance_refs = provider_instance_refs_from_document(&config_original)?;
     let persisted_env_refs = env_refs_from_document(&config_original)?;
     let persisted_notification_refs = notification_refs_from_document(&config_original)?;
+    let persisted_cluster_refs = if cluster_transaction.is_some() {
+        cluster_node_refs_from_document(&config_original)?
+    } else {
+        BTreeMap::new()
+    };
     if env_only {
         for name in env_intents {
             if let Some(reference) = persisted_env_refs.get(name) {
@@ -612,6 +690,18 @@ fn persist_provider_credential_transaction_with_instances_inner(
             ensure_notification_ref_exclusive(data_dir, reference.as_str(), channel)?;
         }
     }
+    if let Some((node_intents, _)) = cluster_transaction {
+        let mut refs = BTreeSet::new();
+        for node_id in node_intents {
+            refs.insert(crate::cluster_password_credential_ref(node_id)?);
+            refs.insert(crate::cluster_private_key_credential_ref(node_id)?);
+            refs.insert(crate::cluster_passphrase_credential_ref(node_id)?);
+            if let Some(metadata) = persisted_cluster_refs.get(node_id) {
+                refs.extend(metadata.references().cloned());
+            }
+        }
+        ensure_cluster_refs_are_safe(data_dir, &refs, &[])?;
+    }
     let store = CredentialStore::open(data_dir);
     let prepared = if env_only {
         store.prepare_env_var_intents(config, env_intents, &persisted_env_refs)?
@@ -622,6 +712,8 @@ fn persist_provider_credential_transaction_with_instances_inner(
             &persisted_notification_refs,
             notification_reset,
         )?
+    } else if let Some((node_intents, _)) = cluster_transaction {
+        store.prepare_cluster_node_intents(config, node_intents, &persisted_cluster_refs)?
     } else {
         store.prepare_provider_api_key_intents(
             config,
@@ -672,6 +764,14 @@ fn persist_provider_credential_transaction_with_instances_inner(
             });
         }
     }
+    if let Some((_, expected)) = cluster_transaction {
+        if prepared.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: prepared.expected_revision,
+            });
+        }
+    }
     let (config_bytes, provider_bytes) = if proxy_only {
         (
             prepare_proxy_auth_config_document(&config_original, config)?,
@@ -687,6 +787,11 @@ fn persist_provider_credential_transaction_with_instances_inner(
             prepare_notification_config_document(&config_original, config, notification_reset)?,
             providers_original.clone(),
         )
+    } else if cluster_only {
+        (
+            prepare_cluster_fabric_config_document(&config_original, config)?,
+            providers_original.clone(),
+        )
     } else {
         config
             .prepare_provider_transaction_documents(&providers_original)
@@ -695,7 +800,9 @@ fn persist_provider_credential_transaction_with_instances_inner(
     let env_domain_changed = env_only && env_var_domain_changed(&config_original, &config_bytes)?;
     let notification_domain_changed =
         notification_only && notification_domain_changed(&config_original, &config_bytes)?;
-    if env_domain_changed || notification_domain_changed {
+    let cluster_domain_changed =
+        cluster_only && cluster_fabric_domain_changed(&config_original, &config_bytes)?;
+    if env_domain_changed || notification_domain_changed || cluster_domain_changed {
         prepared.advance_revision_for_domain_change()?;
     }
     if store.revision_unchecked()? != prepared.expected_revision {
@@ -707,7 +814,9 @@ fn persist_provider_credential_transaction_with_instances_inner(
     // A true env-domain no-op keeps the CAS revision and avoids publishing an
     // event or rewriting either durable member. Any credential or config
     // semantic change advances the one shared revision exactly once.
-    if (env_only && !env_domain_changed || notification_only && !notification_domain_changed)
+    if (env_only && !env_domain_changed
+        || notification_only && !notification_domain_changed
+        || cluster_only && !cluster_domain_changed)
         && prepared.revision == prepared.expected_revision
     {
         return Ok(prepared.revision);
@@ -747,7 +856,7 @@ fn persist_provider_credential_transaction_with_instances_inner(
         .map(|reference| reference.as_str().to_string())
         .collect();
     credential_file.transaction_base_sha256 = credential_file.original_sha256.clone();
-    if !proxy_only && !env_only && !notification_only {
+    if !proxy_only && !env_only && !notification_only && !cluster_only {
         stage_file(
             &stage_dir,
             &backup_dir,
@@ -799,6 +908,8 @@ fn persist_provider_credential_transaction_with_instances_inner(
             Some(ExactTransactionScope::EnvVars)
         } else if notification_only {
             Some(ExactTransactionScope::Notifications)
+        } else if cluster_only {
+            Some(ExactTransactionScope::ClusterFabric)
         } else {
             None
         },
@@ -3490,6 +3601,151 @@ fn notification_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreR
     Ok(current.get("notifications") != candidate.get("notifications"))
 }
 
+fn cluster_node_refs_from_document(
+    bytes: &[u8],
+) -> ConfigStoreResult<BTreeMap<String, crate::ClusterNodeCredentialRefs>> {
+    let root = parse_config_root_object(
+        bytes,
+        "config.json is invalid during cluster credential transaction",
+    )?;
+    let Some(value) = root
+        .get("cluster_fabric")
+        .and_then(Value::as_object)
+        .and_then(|cluster| cluster.get("credential_refs"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    serde_json::from_value(value.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "cluster credential metadata is invalid during credential transaction".to_string(),
+        )
+    })
+}
+
+fn prepare_cluster_fabric_config_document(
+    current: &[u8],
+    candidate: &crate::Config,
+) -> ConfigStoreResult<Vec<u8>> {
+    let mut root = parse_config_root_object(
+        current,
+        "config.json is invalid during cluster credential transaction",
+    )?;
+    let mut candidate = candidate.clone();
+    candidate.sanitize_cluster_fabric_for_disk();
+    let candidate_cluster = serde_json::to_value(&candidate.cluster_fabric)?;
+    let candidate_cluster = candidate_cluster.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation("cluster config transaction document is invalid".to_string())
+    })?;
+    let mut cluster = root
+        .remove("cluster_fabric")
+        .unwrap_or_else(|| Value::Object(Map::new()))
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "cluster_fabric must be an object during credential transaction".to_string(),
+            )
+        })?;
+
+    // Replace the typed domain while retaining unknown/future cluster fields.
+    for key in [
+        "clusters",
+        "nodes",
+        "credential_refs",
+        "health_interval_secs",
+    ] {
+        let current_value = cluster.get(key).cloned();
+        cluster.remove(key);
+        if let Some(value) = candidate_cluster.get(key) {
+            let value = if key == "nodes" {
+                merge_cluster_named_array(
+                    current_value.as_ref(),
+                    Some(value),
+                    "id",
+                    "cluster node",
+                )?
+            } else if key == "clusters" {
+                merge_cluster_named_array(current_value.as_ref(), Some(value), "name", "cluster")?
+            } else {
+                Some(value.clone())
+            };
+            if let Some(value) = value {
+                cluster.insert(key.to_string(), value);
+            }
+        }
+    }
+    if cluster.is_empty() {
+        root.remove("cluster_fabric");
+    } else {
+        root.insert("cluster_fabric".to_string(), Value::Object(cluster));
+    }
+    let document = Value::Object(root);
+    serde_json::from_value::<crate::Config>(document.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json is invalid during cluster credential transaction".to_string(),
+        )
+    })?;
+    Ok(serde_json::to_vec_pretty(&document)?)
+}
+
+fn merge_cluster_named_array(
+    current: Option<&Value>,
+    candidate: Option<&Value>,
+    identity_key: &str,
+    label: &str,
+) -> ConfigStoreResult<Option<Value>> {
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let candidate = candidate
+        .as_array()
+        .ok_or_else(|| ConfigStoreError::Validation(format!("{label} collection is invalid")))?;
+    let mut prior = BTreeMap::<String, Map<String, Value>>::new();
+    if let Some(current) = current {
+        let current = current.as_array().ok_or_else(|| {
+            ConfigStoreError::Validation(format!("{label} collection is invalid"))
+        })?;
+        for item in current {
+            let object = item
+                .as_object()
+                .ok_or_else(|| ConfigStoreError::Validation(format!("{label} entry is invalid")))?;
+            let identity = object
+                .get(identity_key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ConfigStoreError::Validation(format!("{label} identity is invalid"))
+                })?;
+            prior.insert(identity.to_string(), object.clone());
+        }
+    }
+    let mut merged = Vec::with_capacity(candidate.len());
+    for item in candidate {
+        let object = item
+            .as_object()
+            .ok_or_else(|| ConfigStoreError::Validation(format!("{label} entry is invalid")))?;
+        let identity = object
+            .get(identity_key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| ConfigStoreError::Validation(format!("{label} identity is invalid")))?;
+        let mut merged_object = prior.remove(identity).unwrap_or_default();
+        merged_object.extend(object.clone());
+        merged.push(Value::Object(merged_object));
+    }
+    Ok(Some(Value::Array(merged)))
+}
+
+fn cluster_fabric_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult<bool> {
+    let current = parse_config_root_object(
+        current,
+        "config.json is invalid during cluster credential transaction",
+    )?;
+    let candidate = parse_config_root_object(
+        candidate,
+        "config.json is invalid during cluster credential transaction",
+    )?;
+    Ok(current.get("cluster_fabric") != candidate.get("cluster_fabric"))
+}
+
 fn parse_config_root_object(
     bytes: &[u8],
     invalid_message: &str,
@@ -3654,7 +3910,7 @@ fn rollback_proxy_config_member(
     ))
 }
 
-fn rollback_proxy_credential_member(
+fn rollback_exact_credential_member(
     data_dir: &Path,
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<()> {
@@ -3701,8 +3957,15 @@ fn rollback_proxy_credential_member(
         }
     }
     Err(ConfigStoreError::Validation(
-        "proxy credential transaction rollback could not obtain a stable revision".to_string(),
+        "credential transaction rollback could not obtain a stable revision".to_string(),
     ))
+}
+
+fn rollback_proxy_credential_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    rollback_exact_credential_member(data_dir, manifest)
 }
 
 fn abort_proxy_exact_transaction(
@@ -3853,6 +4116,77 @@ fn abort_notification_exact_transaction(
     sync_dir(data_dir)
 }
 
+fn rollback_cluster_config_member(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let (_initial_file, initial_staged) =
+        initial_exact_transaction_member(data_dir, manifest, CONFIG_FILE)?;
+    let staged = parse_config_root_object(
+        &initial_staged,
+        "staged cluster config transaction document is invalid",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    let target = data_dir.join(CONFIG_FILE);
+    for _ in 0..16 {
+        let current = read_target_or_empty(&target)?;
+        let current_hash = sha256(&current);
+        let mut object = parse_config_root_object(
+            &current,
+            "config.json changed to an invalid document during cluster rollback",
+        )?;
+        if object.get("cluster_fabric") != staged.get("cluster_fabric") {
+            return Ok(());
+        }
+        match original.get("cluster_fabric").cloned() {
+            Some(value) => {
+                object.insert("cluster_fabric".to_string(), value);
+            }
+            None => {
+                object.remove("cluster_fabric");
+            }
+        }
+        let rolled_back = Value::Object(object);
+        serde_json::from_value::<crate::Config>(rolled_back.clone()).map_err(|_| {
+            ConfigStoreError::Validation(
+                "config.json is invalid after cluster transaction rollback".to_string(),
+            )
+        })?;
+        let rolled_back = serde_json::to_vec_pretty(&rolled_back)?;
+        if AtomicFileStore::new(&target)
+            .write_bytes_if_hash_with_backup(&current_hash, &rolled_back)?
+        {
+            return Ok(());
+        }
+    }
+    Err(ConfigStoreError::Validation(
+        "cluster config transaction rollback could not obtain a stable document".to_string(),
+    ))
+}
+
+fn abort_cluster_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric) {
+        return Ok(());
+    }
+    rollback_cluster_config_member(data_dir, manifest)?;
+    rollback_exact_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
+}
+
 fn ensure_proxy_consumers_or_abort(
     data_dir: &Path,
     manifest: &MigrationManifest,
@@ -3932,6 +4266,35 @@ fn ensure_notification_consumers_or_abort(
     Ok(())
 }
 
+fn ensure_cluster_consumers_or_abort(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric) {
+        return Ok(());
+    }
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let refs = credential_file
+        .touched_credential_refs
+        .iter()
+        .chain(credential_file.required_credential_refs.iter())
+        .map(|reference| CredentialRef::parse(reference.clone()))
+        .collect::<ConfigStoreResult<BTreeSet<_>>>()?;
+    if let Err(error) = ensure_cluster_refs_are_safe(data_dir, &refs, &[]) {
+        abort_cluster_exact_transaction(data_dir, manifest)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn install_pending(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
@@ -3943,6 +4306,7 @@ fn install_pending(
     }
     ensure_proxy_consumers_or_abort(data_dir, manifest)?;
     ensure_notification_consumers_or_abort(data_dir, manifest)?;
+    ensure_cluster_consumers_or_abort(data_dir, manifest)?;
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let names = manifest
         .files
@@ -4073,6 +4437,9 @@ fn install_rebased_exact_config_member(
     if manifest.exact_scope == Some(ExactTransactionScope::Notifications) {
         return install_rebased_notification_config_member(data_dir, manifest, file_index);
     }
+    if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric) {
+        return install_rebased_cluster_config_member(data_dir, manifest, file_index);
+    }
     install_rebased_proxy_config_member(
         data_dir,
         manifest,
@@ -4080,6 +4447,71 @@ fn install_rebased_exact_config_member(
         #[cfg(test)]
         fault,
     )
+}
+
+fn install_rebased_cluster_config_member(
+    data_dir: &Path,
+    manifest: &mut MigrationManifest,
+    file_index: usize,
+) -> ConfigStoreResult<bool> {
+    let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
+    let file = manifest.files[file_index].clone();
+    let staged_bytes = std::fs::read(stage_dir.join(&file.staged_name))?;
+    let staged = parse_config_root_object(
+        &staged_bytes,
+        "staged cluster config transaction document is invalid",
+    )?;
+    let target = data_dir.join(CONFIG_FILE);
+    let current = read_target_or_empty(&target)?;
+    let current_hash = sha256(&current);
+    let mut current_object = parse_config_root_object(
+        &current,
+        "config.json changed to an invalid document during committed cluster transaction",
+    )?;
+    let backup_dir = validated_backup_dir(data_dir, &manifest.transaction_id)?;
+    let original = read_encrypted_migration_backup(&backup_dir.join(CONFIG_FILE))?;
+    let original_object = parse_config_root_object(
+        &original,
+        "config transaction backup is not a valid document",
+    )?;
+    if current_object.get("cluster_fabric") != original_object.get("cluster_fabric")
+        && current_object.get("cluster_fabric") != staged.get("cluster_fabric")
+    {
+        abort_cluster_exact_transaction(data_dir, manifest)?;
+        return Err(ConfigStoreError::Validation(
+            "cluster metadata changed during committed transaction".to_string(),
+        ));
+    }
+    match staged.get("cluster_fabric").cloned() {
+        Some(value) => {
+            current_object.insert("cluster_fabric".to_string(), value);
+        }
+        None => {
+            current_object.remove("cluster_fabric");
+        }
+    }
+    let rebased = Value::Object(current_object);
+    serde_json::from_value::<crate::Config>(rebased.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json changed to an invalid document during committed cluster transaction"
+                .to_string(),
+        )
+    })?;
+    let rebased = serde_json::to_vec_pretty(&rebased)?;
+    let staged_name = format!("{CONFIG_FILE}.rebase.{}", Uuid::new_v4());
+    AtomicFileStore::new(stage_dir.join(&staged_name)).write_bytes_without_backup(&rebased)?;
+    sync_dir(&stage_dir)?;
+    let file = &mut manifest.files[file_index];
+    file.staged_name = staged_name;
+    file.sha256 = sha256(&rebased);
+    file.original_sha256 = Some(current_hash.clone());
+    write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
+    if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
+        return Err(ConfigStoreError::Validation(
+            "config.json changed repeatedly during committed cluster transaction".to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 fn install_rebased_notification_config_member(
@@ -4637,6 +5069,7 @@ fn install_exact_credential_member(
         }
         if file.touched_credential_refs.is_empty()
             && manifest.exact_scope != Some(ExactTransactionScope::Notifications)
+            && manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
         {
             return Err(ConfigStoreError::Validation(
                 "committed credential transaction cannot be safely rebased".to_string(),
@@ -5375,6 +5808,11 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         }
         (true, Some(ExactTransactionScope::Notifications)) => {
             manifest.files.len() == 2 && unique.contains(CONFIG_FILE)
+        }
+        (true, Some(ExactTransactionScope::ClusterFabric)) => {
+            manifest.files.len() == 2
+                && unique.contains(CONFIG_FILE)
+                && unique.contains(CREDENTIALS_FILE)
         }
         (true, None) => manifest.files.len() == 3 && unique.contains(PROVIDERS_FILE),
         (false, Some(_)) => false,

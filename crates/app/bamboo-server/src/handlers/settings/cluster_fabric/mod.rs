@@ -40,6 +40,7 @@ pub struct FabricListResponse {
 /// Create/replace payload for a node. `id`/`state` are server-owned and ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeUpsertRequest {
+    pub expected_revision: u64,
     pub label: String,
     pub placement: NodePlacement,
     #[serde(default)]
@@ -48,6 +49,12 @@ pub struct NodeUpsertRequest {
     pub deploy: DeployProfile,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDeleteQuery {
+    pub expected_revision: u64,
 }
 
 fn default_true() -> bool {
@@ -273,6 +280,8 @@ pub async fn create_node(
     let req = payload.into_inner();
     validate_node(&req)?;
 
+    let expected_revision = req.expected_revision;
+
     let node = Node {
         id: Uuid::new_v4().to_string(),
         label: req.label,
@@ -285,20 +294,26 @@ pub async fn create_node(
     let node_id = node.id.clone();
 
     let updated = app_state
-        .update_config(
+        .update_cluster_fabric_credentials(
+            expected_revision,
+            std::iter::once(node_id.clone()).collect(),
             move |cfg| {
                 cfg.cluster_fabric.nodes.push(node.clone());
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
+
+    let (updated, revision) = updated;
 
     let created = updated
         .cluster_fabric
         .node(&node_id)
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("created node missing")))?;
-    Ok(HttpResponse::Created().json(redact_node_value(created)))
+    Ok(HttpResponse::Created().json(json!({
+        "revision": revision,
+        "node": redact_node_value(created),
+    })))
 }
 
 /// `PUT /v1/bamboo/settings/nodes/{id}` — update a node (secret-preserving).
@@ -310,26 +325,20 @@ pub async fn update_node(
     let id = path.into_inner();
     let req = payload.into_inner();
     validate_node(&req)?;
+    let expected_revision = req.expected_revision;
     let id_for_response = id.clone();
 
     let updated = app_state
-        .update_config(
+        .update_cluster_fabric_credentials(
+            expected_revision,
+            std::iter::once(id.clone()).collect(),
             move |cfg| {
                 let existing = cfg
                     .cluster_fabric
                     .node(&id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("Node '{id}'")))?;
-                if cfg
-                    .cluster_fabric
-                    .credential_refs
-                    .get(&id)
-                    .is_some_and(|metadata| !metadata.is_empty())
-                {
-                    ensure_managed_node_secret_unchanged(&existing, &req.placement)?;
-                }
-
-                let mut node = Node {
+                let node = Node {
                     id: existing.id.clone(),
                     label: req.label.clone(),
                     placement: req.placement.clone(),
@@ -338,7 +347,6 @@ pub async fn update_node(
                     state: existing.state.clone(), // engine-owned: preserve
                     enabled: req.enabled,
                 };
-                preserve_node_secrets(&existing, &mut node);
 
                 let slot = cfg
                     .cluster_fabric
@@ -347,38 +355,35 @@ pub async fn update_node(
                 *slot = node;
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
+
+    let (updated, revision) = updated;
 
     let node = updated
         .cluster_fabric
         .node(&id_for_response)
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("updated node missing")))?;
-    Ok(HttpResponse::Ok().json(redact_node_value(node)))
+    Ok(HttpResponse::Ok().json(json!({
+        "revision": revision,
+        "node": redact_node_value(node),
+    })))
 }
 
 /// `DELETE /v1/bamboo/settings/nodes/{id}` — remove a node.
 pub async fn delete_node(
     app_state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<NodeDeleteQuery>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
+    let expected_revision = query.expected_revision;
 
-    app_state
-        .update_config(
+    let (_, revision) = app_state
+        .update_cluster_fabric_credentials(
+            expected_revision,
+            std::iter::once(id.clone()).collect(),
             move |cfg| {
-                if cfg
-                    .cluster_fabric
-                    .credential_refs
-                    .get(&id)
-                    .is_some_and(|metadata| !metadata.is_empty())
-                {
-                    return Err(AppError::BadRequest(
-                        "nodes with isolated credentials cannot be deleted until the revisioned node credential API is available"
-                            .to_string(),
-                    ));
-                }
                 let before = cfg.cluster_fabric.nodes.len();
                 cfg.cluster_fabric.nodes.retain(|n| n.id != id);
                 if cfg.cluster_fabric.nodes.len() == before {
@@ -391,11 +396,10 @@ pub async fn delete_node(
                 cfg.cluster_fabric.credential_refs.remove(&id);
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
 
-    Ok(HttpResponse::Ok().json(json!({ "success": true })))
+    Ok(HttpResponse::Ok().json(json!({ "success": true, "revision": revision })))
 }
 
 // ─── Cluster handlers ──────────────────────────────────────────────────
@@ -735,6 +739,7 @@ mod tests {
     fn node_validation_rejects_client_ciphertext() {
         let node = pw_node("", Some("client-ciphertext"));
         let request = NodeUpsertRequest {
+            expected_revision: 0,
             label: node.label,
             placement: node.placement,
             trust_level: node.trust_level,

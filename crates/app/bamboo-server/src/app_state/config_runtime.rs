@@ -1675,6 +1675,82 @@ impl AppState {
         })?
     }
 
+    /// Mutate cluster-fabric node metadata and SSH credentials through the
+    /// recoverable credentials.json + config.json exact transaction. The
+    /// detached task owns durable commit, committed-root reload, and live
+    /// publication so request cancellation cannot leave runtime behind disk.
+    pub async fn update_cluster_fabric_credentials<F>(
+        &self,
+        expected_revision: u64,
+        node_intents: std::collections::BTreeSet<String>,
+        update: F,
+    ) -> Result<(Config, u64), AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
+    {
+        let config_io_lock = self.config_io_lock.clone();
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let account_sink = self.account_sink.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = config_io_lock.lock().await;
+            let mut candidate = {
+                let current = config.read().await;
+                reject_if_recovery_pending(&current)?;
+                let mut candidate = current.clone();
+                update(&mut candidate)?;
+                candidate
+            };
+            let transaction_dir = app_data_dir.clone();
+            let (candidate, revision) = tokio::task::spawn_blocking(move || {
+                let revision =
+                    bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                        &transaction_dir,
+                        &mut candidate,
+                        &node_intents,
+                        expected_revision,
+                    )?;
+                let committed = Config::from_data_dir_without_publish(Some(transaction_dir));
+                Ok::<_, ConfigStoreError>((committed, revision))
+            })
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "cluster credential transaction task failed: {error}"
+                ))
+            })?
+            .map_err(|error| match error {
+                ConfigStoreError::Conflict { expected, actual } => {
+                    AppError::ConfigConflict { expected, actual }
+                }
+                ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::Io(error) => AppError::StorageError(error),
+                ConfigStoreError::Json(_) => {
+                    AppError::BadRequest("configuration document is invalid".to_string())
+                }
+                ConfigStoreError::Watch(error) => {
+                    AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
+                }
+            })?;
+            *config.write().await = candidate.clone();
+            if revision != expected_revision {
+                account_sink.record(
+                    None,
+                    &AgentEvent::ConfigChanged {
+                        section: "cluster_fabric".to_string(),
+                        revision,
+                    },
+                );
+            }
+            Ok::<_, AppError>((candidate, revision))
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "cluster credential transaction task failed: {error}"
+            ))
+        })?
+    }
+
     /// Persist proxy authentication through the isolated credential store and
     /// publish the detached runtime candidate only after the exact transaction
     /// has durably committed.

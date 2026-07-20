@@ -961,6 +961,279 @@ impl CredentialStore {
         }))
     }
 
+    /// Prepare one or more node credential mutations without publishing them.
+    /// The caller commits the returned credential envelope together with the
+    /// narrowed `cluster_fabric` root domain through the exact transaction
+    /// manifest. Empty/masked required secrets keep an existing value;
+    /// an empty private-key passphrase is an explicit clear.
+    pub(crate) fn prepare_cluster_node_intents(
+        &self,
+        config: &mut crate::Config,
+        node_intents: &BTreeSet<String>,
+        persisted_refs: &BTreeMap<String, crate::ClusterNodeCredentialRefs>,
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        if node_intents.is_empty() {
+            return Ok(None);
+        }
+        let mut node_ids = BTreeSet::new();
+        if config
+            .cluster_fabric
+            .nodes
+            .iter()
+            .any(|node| node.id.trim().is_empty() || !node_ids.insert(node.id.clone()))
+        {
+            return Err(ConfigStoreError::Validation(
+                "cluster node ids must be nonempty and unique".to_string(),
+            ));
+        }
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for cluster update".to_string(),
+            ));
+        }
+        let mut touched_refs = BTreeSet::new();
+        let mut required_refs = BTreeSet::new();
+        let mut changed = false;
+
+        for node_id in node_intents {
+            let password_ref = crate::cluster_password_credential_ref(node_id)?;
+            let private_key_ref = crate::cluster_private_key_credential_ref(node_id)?;
+            let passphrase_ref = crate::cluster_passphrase_credential_ref(node_id)?;
+            let persisted = persisted_refs.get(node_id).cloned().unwrap_or_default();
+            for (actual, canonical) in [
+                (persisted.password_credential_ref.as_ref(), &password_ref),
+                (
+                    persisted.private_key_credential_ref.as_ref(),
+                    &private_key_ref,
+                ),
+                (
+                    persisted.passphrase_credential_ref.as_ref(),
+                    &passphrase_ref,
+                ),
+            ] {
+                if actual.is_some_and(|actual| actual != canonical) {
+                    return Err(ConfigStoreError::Validation(
+                        "cluster credential reference is not canonical".to_string(),
+                    ));
+                }
+            }
+            if let Some(candidate) = config.cluster_fabric.credential_refs.get(node_id) {
+                if candidate != &persisted {
+                    return Err(ConfigStoreError::Validation(
+                        "cluster credential references are server-managed".to_string(),
+                    ));
+                }
+            }
+
+            enum Action {
+                Keep,
+                Replace(String),
+                Clear,
+            }
+            let (password, private_key, passphrase) = match config
+                .cluster_fabric
+                .node(node_id)
+                .map(|node| &node.placement)
+            {
+                Some(crate::NodePlacement::Ssh(target)) => match &target.auth {
+                    crate::SshAuth::SystemSshConfig => {
+                        (Action::Clear, Action::Clear, Action::Clear)
+                    }
+                    crate::SshAuth::Password { password, .. } => {
+                        let password =
+                            if password.is_empty() || crate::patch::is_masked_api_key(password) {
+                                if persisted.password_configured {
+                                    Action::Keep
+                                } else {
+                                    return Err(ConfigStoreError::Validation(
+                                        "SSH password is required".to_string(),
+                                    ));
+                                }
+                            } else {
+                                Action::Replace(password.clone())
+                            };
+                        (password, Action::Clear, Action::Clear)
+                    }
+                    crate::SshAuth::PrivateKey {
+                        private_key,
+                        private_key_path,
+                        passphrase,
+                        ..
+                    } => {
+                        let private_key = if private_key.is_empty()
+                            || crate::patch::is_masked_api_key(private_key)
+                        {
+                            if persisted.private_key_configured {
+                                Action::Keep
+                            } else if private_key_path
+                                .as_deref()
+                                .is_some_and(|path| !path.trim().is_empty())
+                            {
+                                Action::Clear
+                            } else {
+                                return Err(ConfigStoreError::Validation(
+                                    "an inline private key or private key path is required"
+                                        .to_string(),
+                                ));
+                            }
+                        } else {
+                            Action::Replace(private_key.clone())
+                        };
+                        let passphrase = if crate::patch::is_masked_api_key(passphrase) {
+                            if persisted.passphrase_configured {
+                                Action::Keep
+                            } else {
+                                return Err(ConfigStoreError::Validation(
+                                    "SSH passphrase mask has no stored value".to_string(),
+                                ));
+                            }
+                        } else if passphrase.is_empty() {
+                            Action::Clear
+                        } else {
+                            Action::Replace(passphrase.clone())
+                        };
+                        (Action::Clear, private_key, passphrase)
+                    }
+                },
+                Some(crate::NodePlacement::Local) | None => {
+                    (Action::Clear, Action::Clear, Action::Clear)
+                }
+            };
+
+            let mut metadata = crate::ClusterNodeCredentialRefs::default();
+            for (action, canonical, existing, reference_slot, configured_slot) in [
+                (
+                    password,
+                    password_ref,
+                    persisted.password_credential_ref,
+                    &mut metadata.password_credential_ref,
+                    &mut metadata.password_configured,
+                ),
+                (
+                    private_key,
+                    private_key_ref,
+                    persisted.private_key_credential_ref,
+                    &mut metadata.private_key_credential_ref,
+                    &mut metadata.private_key_configured,
+                ),
+                (
+                    passphrase,
+                    passphrase_ref,
+                    persisted.passphrase_credential_ref,
+                    &mut metadata.passphrase_credential_ref,
+                    &mut metadata.passphrase_configured,
+                ),
+            ] {
+                let reference = existing.clone().unwrap_or(canonical);
+                match action {
+                    Action::Keep => {
+                        if !document.entries.contains_key(&reference) {
+                            return Err(ConfigStoreError::Validation(
+                                "configured cluster credential is unavailable".to_string(),
+                            ));
+                        }
+                        touched_refs.insert(reference.clone());
+                        required_refs.insert(reference.clone());
+                        *reference_slot = Some(reference);
+                        *configured_slot = true;
+                    }
+                    Action::Replace(value) => {
+                        if existing.is_none() && document.entries.contains_key(&reference) {
+                            return Err(ConfigStoreError::Validation(
+                                "canonical cluster credential reference is already in use"
+                                    .to_string(),
+                            ));
+                        }
+                        let same_value = document.entries.get(&reference).is_some_and(|entry| {
+                            crate::encryption::decrypt(&entry.ciphertext)
+                                .is_ok_and(|current| current == value)
+                        });
+                        if !same_value {
+                            let ciphertext = crate::encryption::encrypt(&value).map_err(|_| {
+                                ConfigStoreError::Validation(
+                                    "credential encryption failed".to_string(),
+                                )
+                            })?;
+                            document.entries.insert(
+                                reference.clone(),
+                                CredentialEntry {
+                                    ciphertext,
+                                    source: CredentialSource::User,
+                                    updated_at: Utc::now(),
+                                    key_version: ENCRYPTION_KEY_VERSION,
+                                    migration_generation: None,
+                                },
+                            );
+                            changed = true;
+                        }
+                        touched_refs.insert(reference.clone());
+                        required_refs.insert(reference.clone());
+                        *reference_slot = Some(reference);
+                        *configured_slot = true;
+                    }
+                    Action::Clear => {
+                        if let Some(reference) = existing {
+                            touched_refs.insert(reference.clone());
+                            changed |= document.entries.remove(&reference).is_some();
+                        }
+                    }
+                }
+            }
+            if metadata.is_empty() {
+                config.cluster_fabric.credential_refs.remove(node_id);
+            } else {
+                config
+                    .cluster_fabric
+                    .credential_refs
+                    .insert(node_id.clone(), metadata);
+            }
+            if let Some(node) = config.cluster_fabric.node_mut(node_id) {
+                if let crate::NodePlacement::Ssh(target) = &mut node.placement {
+                    match &mut target.auth {
+                        crate::SshAuth::SystemSshConfig => {}
+                        crate::SshAuth::Password {
+                            password_encrypted, ..
+                        } => *password_encrypted = None,
+                        crate::SshAuth::PrivateKey {
+                            private_key_encrypted,
+                            passphrase_encrypted,
+                            ..
+                        } => {
+                            *private_key_encrypted = None;
+                            *passphrase_encrypted = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(
+            &document,
+            &required_refs.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision,
+            touched_refs: touched_refs.into_iter().collect(),
+            required_refs: required_refs.into_iter().collect(),
+        }))
+    }
+
     pub fn resolve(
         &self,
         credential_ref: &CredentialRef,
