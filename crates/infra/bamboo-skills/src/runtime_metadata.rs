@@ -11,6 +11,8 @@ pub const SKILL_RUNTIME_ACTIVATION_GENERATION_KEY: &str = "skill_runtime_activat
 pub const SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY: &str =
     "skill_runtime_selected_skill_revisions";
 pub const SKILL_RUNTIME_ACTIVATION_ERROR_KEY: &str = "skill_runtime_activation_error";
+pub const SKILL_RUNTIME_PINNED_SNAPSHOT_KEY: &str = "skill_runtime_pinned_snapshot_v1";
+pub const SKILL_RUNTIME_SELECTED_CATALOG_KEY: &str = "skill_runtime_selected_catalog_v1";
 
 pub const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
 pub const SELECTED_SKILL_MODE_METADATA_KEY: &str = "skill_mode";

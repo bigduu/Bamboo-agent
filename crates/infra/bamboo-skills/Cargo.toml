@@ -13,9 +13,12 @@ bamboo-config = { path = "../../infra/bamboo-config" }
 serde = { workspace = true }
 serde_json = "1"
 serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 thiserror = "2"
+sha2 = "0.11"
+hex = "0.4"
 async-trait = "0.1"
 walkdir = "2"
 notify = "8"

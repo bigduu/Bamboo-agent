@@ -65,6 +65,7 @@ fn snapshot(run_id: &str, status: WorkflowRunStatus, sequence: u64) -> WorkflowR
         publication_revision: 1,
         root_id: definition.id.clone(),
         root_revision: definition.revision,
+        root_invocation_policy: json!({"explicit": true, "automatic": true}),
         definitions: BTreeMap::from([(
             WorkflowDefinitionBundle::key(&definition.id, definition.revision),
             definition.clone(),
@@ -801,6 +802,7 @@ impl WorkflowDefinitionPort for MutableDefinitions {
             publication_revision: 10,
             root_id: root.id.clone(),
             root_revision: root.revision,
+            root_invocation_policy: json!({"explicit": true, "automatic": true}),
             definitions,
         })
     }
@@ -834,6 +836,7 @@ impl WorkflowDefinitionPort for MockDefinitions {
             publication_revision: 1,
             root_id: root.id.clone(),
             root_revision: root.revision,
+            root_invocation_policy: json!({"explicit": true, "automatic": true}),
             definitions,
         })
     }
@@ -2015,6 +2018,87 @@ async fn agent_and_actual_usage_limits_are_persisted_before_failure() {
     assert_eq!(failed.usage.cost_micros, 2);
     let persisted = engine.progress(&failed.run_id, 0).await.unwrap().snapshot;
     assert_eq!(persisted.usage, failed.usage);
+}
+
+#[tokio::test]
+async fn zero_token_or_cost_budget_fails_before_agent_dispatch() {
+    struct ExecutionCountingAgents(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl AgentStepPort for ExecutionCountingAgents {
+        async fn resolve(&self, name: &str) -> Result<Option<NamedAgentSpec>, String> {
+            Ok(Some(NamedAgentSpec {
+                name: name.to_string(),
+                allowed_capabilities: BTreeSet::from(["read".to_string()]),
+            }))
+        }
+
+        async fn execute(
+            &self,
+            _spec: &NamedAgentSpec,
+            _prompt: Value,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+            _capabilities: &BTreeSet<String>,
+            _session_id: &str,
+        ) -> Result<AgentStepResult, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(AgentStepResult {
+                output: json!({"unexpected": true}),
+                tokens: 1,
+                cost_micros: 1,
+            })
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let engine = WorkflowRunEngine::new(
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap()),
+        Arc::new(MockTools),
+        Arc::new(ExecutionCountingAgents(executions.clone())),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    let agent_step = WorkflowStepDefinition {
+        id: "agent".to_string(),
+        kind: WorkflowStepKind::Agent {
+            agent: "reviewer".to_string(),
+            prompt: json!({}),
+            model: None,
+            effort: None,
+            capabilities: vec!["read".to_string()],
+            structured_output_attempts: 1,
+        },
+        failure: FailurePolicy::FailFast,
+        output_schema: None,
+    };
+
+    for (max_tokens, max_cost_micros) in [(Some(0), Some(10)), (Some(10), Some(0))] {
+        let mut workflow = definition(
+            vec![agent_step.clone()],
+            WorkflowPlan::Step {
+                step: "agent".to_string(),
+            },
+        );
+        workflow.budgets.max_tokens = max_tokens;
+        workflow.budgets.max_cost_micros = max_cost_micros;
+        let failed = engine.run(request(workflow, json!({}))).await.unwrap();
+        assert_eq!(failed.status, WorkflowRunStatus::Failed);
+        assert_eq!(
+            failed.failure.as_ref().unwrap().code,
+            WorkflowFailureCode::BudgetExceeded
+        );
+        assert_eq!(failed.usage.tokens, 0);
+        assert_eq!(failed.usage.cost_micros, 0);
+    }
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "an exhausted zero budget must fail closed before external agent execution"
+    );
 }
 
 #[tokio::test]

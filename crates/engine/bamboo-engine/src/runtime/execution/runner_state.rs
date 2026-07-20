@@ -144,6 +144,28 @@ impl AgentRunner {
     ///
     /// If the cache is full, the oldest entry is evicted.
     pub fn push_critical_event(&mut self, event: AgentEvent) {
+        let lifecycle_id = match &event {
+            AgentEvent::WorkflowActivated { event_id, .. }
+            | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
+            _ => None,
+        };
+        if lifecycle_id.is_some_and(|event_id| {
+            self.last_critical_events
+                .iter()
+                .any(|existing| match existing {
+                    AgentEvent::WorkflowActivated {
+                        event_id: existing_id,
+                        ..
+                    }
+                    | AgentEvent::WorkflowDeactivated {
+                        event_id: existing_id,
+                        ..
+                    } => existing_id == event_id,
+                    _ => false,
+                })
+        }) {
+            return;
+        }
         if self.last_critical_events.len() >= Self::CRITICAL_EVENTS_CAPACITY {
             self.last_critical_events.remove(0);
         }

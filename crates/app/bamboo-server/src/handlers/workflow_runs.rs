@@ -13,8 +13,14 @@ use crate::workflow::public_workflow_snapshot;
 pub struct StartWorkflowRunRequest {
     pub workflow_id: String,
     pub revision: u64,
-    #[serde(default)]
+    #[serde(default = "empty_object")]
     pub args: Value,
+    #[serde(default)]
+    pub budget: Option<bamboo_domain::WorkflowBudgets>,
+}
+
+fn empty_object() -> Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,10 +42,23 @@ pub async fn start(
             &body.workflow_id,
             body.revision,
             body.args.clone(),
+            body.budget.clone(),
         )
         .await
     {
         Ok(snapshot) => HttpResponse::Accepted().json(public_workflow_snapshot(snapshot)),
+        Err(error) => workflow_error(error),
+    }
+}
+
+pub async fn list(state: web::Data<AppState>, session_id: web::Path<String>) -> HttpResponse {
+    match state.workflow_runs.list_for_session(&session_id).await {
+        Ok(snapshots) => HttpResponse::Ok().json(
+            snapshots
+                .into_iter()
+                .map(public_workflow_snapshot)
+                .collect::<Vec<_>>(),
+        ),
         Err(error) => workflow_error(error),
     }
 }
@@ -108,14 +127,36 @@ fn workflow_error(error: WorkflowRunError) -> HttpResponse {
         WorkflowRunError::Terminal => {
             HttpResponse::Conflict().json(serde_json::json!({"error": message}))
         }
-        WorkflowRunError::Storage(_) => HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": "workflow storage unavailable"})),
+        WorkflowRunError::Storage(details) => {
+            let recovery_run_id = recovery_run_id_from_storage_details(&details);
+            HttpResponse::InternalServerError().json(match recovery_run_id {
+                Some(run_id) => serde_json::json!({
+                    "error": "workflow storage unavailable; run recovery is required",
+                    "recovery_run_id": run_id,
+                }),
+                None => serde_json::json!({"error": "workflow storage unavailable"}),
+            })
+        }
         WorkflowRunError::Compile(_)
         | WorkflowRunError::InvalidInput(_)
         | WorkflowRunError::Preflight(_) => {
             HttpResponse::BadRequest().json(serde_json::json!({"error": message}))
         }
     }
+}
+
+fn recovery_run_id_from_storage_details(details: &str) -> Option<&str> {
+    details
+        .split("orphan run ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
 }
 
 #[cfg(test)]
@@ -140,5 +181,30 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[actix_web::test]
+    async fn orphan_storage_error_returns_safe_recovery_handle() {
+        let response = workflow_error(WorkflowRunError::Storage(
+            "run index persistence failed; orphan run 123e4567-e89b-12d3-a456-426614174000 could not be cancelled (failure)"
+                .to_string(),
+        ));
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["recovery_run_id"],
+            "123e4567-e89b-12d3-a456-426614174000"
+        );
+        assert!(!value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failure"));
+        assert_eq!(recovery_run_id_from_storage_details("disk /secret"), None);
     }
 }

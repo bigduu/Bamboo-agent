@@ -29,6 +29,12 @@ pub struct ChatRequest {
     pub workspace_path: Option<String>,
     #[serde(default)]
     pub selected_skill_ids: Option<Vec<String>>,
+    /// Authoritative typed workflow selection. Bamboo resolves instructions.
+    #[serde(default)]
+    pub workflow_selection: Option<bamboo_skills::WorkflowSelection>,
+    /// Explicit session opt-in for model-started orchestration workflows.
+    #[serde(default)]
+    pub orchestration_opt_in: Option<bool>,
     /// Optional image attachments (data URLs) associated with this message.
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
@@ -156,6 +162,8 @@ mod tests {
             copilot_conclusion_with_options_enhancement_enabled: None,
             workspace_path: None,
             selected_skill_ids: None,
+            workflow_selection: None,
+            orchestration_opt_in: None,
             images: None,
             model: Some("gpt-4".to_string()),
             provider: None,

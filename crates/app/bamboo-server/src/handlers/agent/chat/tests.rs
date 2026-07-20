@@ -66,6 +66,8 @@ fn chat_request_blank_model_trims_to_empty() {
         copilot_conclusion_with_options_enhancement_enabled: None,
         workspace_path: None,
         selected_skill_ids: None,
+        workflow_selection: None,
+        orchestration_opt_in: None,
         images: None,
         model: Some("   ".to_string()),
         provider: None,

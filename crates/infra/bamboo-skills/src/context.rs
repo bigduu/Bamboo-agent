@@ -1,12 +1,63 @@
 use crate::types::SkillDefinition;
+use crate::{
+    WorkflowCatalogDiagnostic, WorkflowCatalogEntry, WorkflowKind, WorkflowSource, WorkflowStatus,
+};
 
 /// Build system prompt context text from available skills.
 /// Only includes metadata (id, name, description, allowed tools).
 /// The detailed skill content (SKILL.md body) is NOT included to save context space.
 /// When a user's request matches a skill's description, load detailed instructions on demand.
 pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
+    let entries = skills
+        .iter()
+        .map(|skill| WorkflowCatalogEntry {
+            id: skill.id.clone(),
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            kind: WorkflowKind::Instruction,
+            source: WorkflowSource::User,
+            revision: 0,
+            version: "1".to_string(),
+            invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
+            argument_schema: serde_json::json!({"type":"object"}),
+            status: WorkflowStatus::Valid,
+            last_error: None,
+            winner: true,
+            shadowed_candidates: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let chars = crate::DEFAULT_WORKFLOW_CATALOG_MAX_CHARS;
+    build_workflow_catalog_context(
+        skills,
+        &entries,
+        &WorkflowCatalogDiagnostic {
+            total_candidates: skills.len(),
+            advertised_candidates: skills.len(),
+            initial_chars: 0,
+            final_chars: 0,
+            char_budget: chars,
+            token_budget: chars / 4,
+            compressed_descriptions: false,
+            shortlisted: false,
+            omitted_ids: Vec::new(),
+        },
+    )
+}
+
+/// Render the metadata-only, policy-aware workflow catalog from one immutable
+/// publication. Full instructions/resources are intentionally absent.
+pub fn build_workflow_catalog_context(
+    skills: &[SkillDefinition],
+    entries: &[WorkflowCatalogEntry],
+    diagnostic: &WorkflowCatalogDiagnostic,
+) -> String {
     if skills.is_empty() {
-        tracing::debug!("No skills available, returning empty context");
+        if diagnostic.total_candidates == 0 {
+            tracing::debug!("No skills available, returning empty context");
+            return String::new();
+        }
+        // The structured diagnostic is persisted in session metadata. Do not
+        // violate a tiny prompt budget merely to explain that nothing fitted.
         return String::new();
     }
 
@@ -20,6 +71,21 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
             .join(", ")
     );
 
+    let mut context = workflow_catalog_prefix();
+    for skill in skills {
+        let Some(entry) = entries.iter().find(|entry| entry.id == skill.id) else {
+            continue;
+        };
+        context.push_str(&render_workflow_catalog_entry(skill, entry));
+    }
+    context.push_str(&workflow_catalog_suffix(diagnostic));
+
+    tracing::info!("Skill metadata context built: {} chars", context.len());
+
+    context
+}
+
+pub(crate) fn workflow_catalog_prefix() -> String {
     let mut context = String::from("\n\n## Skill System\n");
     context.push_str(
         "Before producing any user-facing response, you MUST perform a skill applicability check.\n\n",
@@ -32,13 +98,13 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     context.push_str("2. Decide whether at least one skill clearly and unambiguously applies.\n");
     context.push_str("3. Do NOT skip this check.\n\n");
 
-    context.push_str("### If A Skill Applies\n");
-    context.push_str("1. Select EXACTLY ONE skill (prefer the most specific match).\n");
+    context.push_str("### If A Workflow Applies\n");
+    context.push_str("1. Select EXACTLY ONE workflow (prefer the most specific match).\n");
     context.push_str(
-        "2. Call `load_skill` with the selected `skill_id` BEFORE producing your response.\n",
+        "2. For `kind: instruction`, call `load_skill` with `skill_id` before responding.\n",
     );
-    context.push_str("3. Follow the loaded SKILL.md instructions precisely.\n");
-    context.push_str("4. Do NOT respond outside the selected skill's defined workflow unless the instructions explicitly allow it.\n\n");
+    context.push_str("3. For `kind: orchestration`, never call `load_skill`; use `workflow_run` with the advertised fixed revision. The server will deny automatic starts unless policy allows them and the session explicitly opted in.\n");
+    context.push_str("4. Follow loaded instruction workflows precisely; inspect orchestration status through workflow_run get/list/events.\n\n");
 
     context.push_str("### If No Skill Applies\n");
     context.push_str("1. Proceed normally without loading any skill.\n");
@@ -60,38 +126,46 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     context.push_str("3. When execution fails, diagnose the concrete failure first and only ask follow-up questions for information that remains genuinely missing after using the injected context and available tools.\n");
     context.push_str("4. Do NOT ask the user to re-send env var values that Bamboo has already injected by name unless the value is clearly missing, malformed, or the user must change it.\n\n");
 
-    context.push_str("### Available Skills\n");
+    context.push_str("### Available Workflows\n");
+    context
+}
 
-    for skill in skills {
-        tracing::debug!(
-            "Adding skill metadata '{}' with {} tool(s)",
-            skill.id,
-            skill.tool_refs.len(),
-        );
+pub(crate) fn render_workflow_catalog_entry(
+    skill: &SkillDefinition,
+    entry: &WorkflowCatalogEntry,
+) -> String {
+    let mut context = String::new();
+    tracing::debug!("Adding workflow catalog metadata '{}'", skill.id);
 
-        // Only metadata - minimal token usage
-        context.push_str(&format!("\n**{}** (`{}`)\n", skill.name, skill.id));
-        context.push_str(&format!("- skill_id: `{}`\n", skill.id));
-        context.push_str(&format!("- Description: {}\n", skill.description));
+    // Only metadata - minimal token usage
+    context.push_str(&format!("\n**{}** (`{}`)\n", skill.name, skill.id));
+    context.push_str(&format!("- skill_id: `{}`\n", skill.id));
+    context.push_str(&format!("- Description: {}\n", skill.description));
+    context.push_str(&format!("- Kind: {:?}\n", entry.kind).to_ascii_lowercase());
+    context.push_str(&format!("- Source: {:?}\n", entry.source).to_ascii_lowercase());
+    context.push_str(&format!("- Revision: {}\n", entry.revision));
+    context.push_str(&format!(
+        "- Invocation policy: {}\n",
+        entry.invocation_policy
+    ));
 
-        if !skill.tool_refs.is_empty() {
-            context.push_str(&format!(
-                "- Provides tools: {}\n",
-                skill.tool_refs.join(", ")
-            ));
-        }
+    context
+}
 
-        if skill.compatibility.is_some() {
-            context.push_str("- Compatibility details are available in the loaded skill payload\n");
-        }
-    }
-
+pub(crate) fn workflow_catalog_suffix(diagnostic: &WorkflowCatalogDiagnostic) -> String {
+    let mut context = String::new();
     context.push_str("\n### Internal Verification\n");
     context.push_str(
         "Internally confirm `skill_check_completed=true` before each user-facing response.\n",
     );
-
-    tracing::info!("Skill metadata context built: {} chars", context.len());
+    context.push_str(&format!(
+        "\nCatalog budget: advertised {}/{} candidates; char_budget={}; compressed={}; shortlisted={}.\n",
+        diagnostic.advertised_candidates,
+        diagnostic.total_candidates,
+        diagnostic.char_budget,
+        diagnostic.compressed_descriptions,
+        diagnostic.shortlisted,
+    ));
 
     context
 }
@@ -123,7 +197,7 @@ mod tests {
         // Should contain instructions for AI
         assert!(context.contains("## Skill System"));
         assert!(context.contains("Mandatory Skill Check"));
-        assert!(context.contains("Select EXACTLY ONE skill"));
+        assert!(context.contains("Select EXACTLY ONE workflow"));
         assert!(context.contains("load_skill"));
         assert!(context.contains("read_skill_resource"));
         assert!(context.contains("skill_check_completed=true"));
@@ -136,10 +210,32 @@ mod tests {
         assert!(context.contains("demo-skill"));
         assert!(context.contains("skill_id: `demo-skill`"));
         assert!(context.contains("A demo skill for testing"));
-        assert!(context.contains("Provides tools: read_file"));
-        assert!(context.contains("Compatibility details are available in the loaded skill payload"));
-
-        // Should NOT contain the detailed prompt
+        // The initial catalog has a strict metadata allowlist. Tool details,
+        // compatibility, body, references and scripts are load-time only.
+        let entry = context
+            .split("**Demo Skill**")
+            .nth(1)
+            .expect("catalog entry rendered");
+        let rendered_labels = entry
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .filter_map(|line| line.split(':').next())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered_labels,
+            vec![
+                "skill_id",
+                "Description",
+                "kind",
+                "source",
+                "Revision",
+                "Invocation policy"
+            ]
+        );
+        assert!(!context.contains("read_file"));
+        assert!(!context.contains("Requires Read and Write tools"));
         assert!(!context.contains("This detailed prompt should NOT appear"));
+        assert!(!context.contains("references/"));
+        assert!(!context.contains("scripts/"));
     }
 }

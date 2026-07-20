@@ -5,7 +5,7 @@ use crate::runtime::runner::task_lifecycle::{
 };
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
 use bamboo_metrics::MetricsCollector;
 
@@ -103,6 +103,7 @@ pub(super) async fn initialize_loop_state(
     initial_message: &str,
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
+    event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> super::super::Result<LoopRunState> {
     let debug_logger = DebugLogger::new(tracing::enabled!(tracing::Level::DEBUG));
     let session_id = session.id.clone();
@@ -176,6 +177,7 @@ pub(super) async fn initialize_loop_state(
         &session_id,
         &debug_logger,
         must_resume_pinned_activation,
+        event_tx,
     )
     .await?;
 
@@ -210,9 +212,11 @@ mod tests {
     };
     use bamboo_skills::{SkillManager, SkillStoreConfig};
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    struct SuccessfulLoadSkill;
+    #[derive(Default)]
+    struct SuccessfulLoadSkill(AtomicUsize);
 
     #[async_trait]
     impl ToolExecutor for SuccessfulLoadSkill {
@@ -220,6 +224,7 @@ mod tests {
             &self,
             _call: &ToolCall,
         ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult {
                 success: true,
                 result: serde_json::json!({"instructions": "pinned"}).to_string(),
@@ -334,7 +339,7 @@ mod tests {
             ..Default::default()
         }));
         manager.initialize().await.expect("initialize");
-        let tools = SuccessfulLoadSkill;
+        let tools = SuccessfulLoadSkill::default();
         let review_config = AgentLoopConfig {
             skill_manager: Some(manager.clone()),
             selected_skill_ids: Some(vec!["review-demo".to_string()]),
@@ -342,9 +347,11 @@ mod tests {
             ..Default::default()
         };
         let mut session = Session::new("retained-session", "model");
-        initialize_loop_state(&mut session, "review", &review_config, &tools)
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        initialize_loop_state(&mut session, "review", &review_config, &tools, &event_tx)
             .await
             .expect("initial activation");
+        assert_eq!(tools.0.load(Ordering::SeqCst), 1);
         let pinned_generation = session
             .metadata
             .get(SKILL_RUNTIME_ACTIVATION_GENERATION_KEY)
@@ -387,6 +394,7 @@ mod tests {
             "plain clarification reply",
             &continuation_config,
             &tools,
+            &event_tx,
         )
         .await
         .expect("suspended continuation");
@@ -423,13 +431,30 @@ mod tests {
         assert!(!session
             .metadata
             .contains_key(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY));
+        assert!(
+            !session.metadata.contains_key(LOADED_SKILL_IDS_METADATA_KEY),
+            "restored active workflow must not be loaded or evented twice"
+        );
+        let retained_block = crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session)
+            .expect("fixed durable workflow context rebuilt without preload");
         assert_eq!(
-            session
-                .metadata
-                .get(LOADED_SKILL_IDS_METADATA_KEY)
-                .map(String::as_str),
-            Some("[\"review-demo\"]"),
-            "retained explicit activation must deterministically preload again"
+            retained_block.block_type,
+            bamboo_agent_core::ContextBlockType::WorkflowRuntime
+        );
+        assert_eq!(
+            retained_block.priority,
+            bamboo_agent_core::ContextBlockPriority::Critical
+        );
+        assert_eq!(
+            retained_block.stability,
+            bamboo_agent_core::ContextBlockStability::SessionStable
+        );
+        assert!(retained_block.content.contains("review N"));
+        assert!(!retained_block.content.contains("review N+1"));
+        assert_eq!(
+            tools.0.load(Ordering::SeqCst),
+            1,
+            "resume must not preload or activate twice"
         );
 
         let plan_config = AgentLoopConfig {
@@ -438,9 +463,15 @@ mod tests {
             disabled_skill_ids: BTreeSet::new(),
             ..Default::default()
         };
-        initialize_loop_state(&mut session, "plan instead", &plan_config, &tools)
-            .await
-            .expect("superseding activation");
+        initialize_loop_state(
+            &mut session,
+            "plan instead",
+            &plan_config,
+            &tools,
+            &event_tx,
+        )
+        .await
+        .expect("superseding activation");
         let (skills, descriptor) = manager
             .store()
             .pinned_activation_skills("retained-session")
@@ -449,6 +480,11 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].id, "plan-demo");
         assert_eq!(
+            tools.0.load(Ordering::SeqCst),
+            2,
+            "new explicit selection preloads exactly once"
+        );
+        assert_eq!(
             descriptor
                 .skill_revisions
                 .keys()
@@ -456,5 +492,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["plan-demo"]
         );
+        let superseding_block = crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session)
+            .expect("superseding workflow context");
+        assert!(superseding_block.content.contains("plan N"));
+        assert!(!superseding_block.content.contains("review N"));
     }
 }
