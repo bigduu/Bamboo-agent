@@ -1,9 +1,10 @@
-//! Recoverable provider/MCP credential extraction.
+//! Recoverable provider/MCP/external-broker credential extraction.
 //!
-//! The migration treats `credentials.json`, `providers.json`, and `mcp.json`
-//! as one manifest-gated transaction. Candidate bytes are staged and fsynced
-//! before the manifest commit point. Startup always finishes a committed
-//! manifest before any configuration document is read.
+//! Provider/MCP/root and external-broker planners are independent so a bad
+//! optional broker document cannot disable the main configuration. Both use
+//! one lock and manifest protocol: candidate bytes are staged and fsynced
+//! before the commit point, and every reader recovers a committed transaction
+//! before reading any credential transaction member.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -28,6 +29,7 @@ const STAGE_PREFIX: &str = ".config-credential-stage-v1-";
 const BACKUP_PREFIX: &str = "config-credential-migration-backup-v1-";
 const PROVIDERS_FILE: &str = "providers.json";
 const MCP_FILE: &str = "mcp.json";
+const BROKER_FILE: &str = "broker.json";
 const CREDENTIALS_FILE: &str = "credentials.json";
 const CONFIG_FILE: &str = "config.json";
 const PROXY_AUTH_DOMAIN_KEYS: [&str; 5] = [
@@ -138,6 +140,7 @@ enum ExtractedSecretKind {
     EnvVar,
     NotificationNtfy,
     NotificationBark,
+    ExternalBroker,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -150,6 +153,7 @@ enum MigrationFault {
     AfterCredentials,
     AfterProviders,
     AfterMcp,
+    AfterBroker,
     AfterConfig,
     AfterRebaseCredentialCommit,
     AfterRebaseStageWrite,
@@ -179,7 +183,7 @@ pub fn set_env_transaction_test_hook(hook: impl FnOnce(&Path) + Send + 'static) 
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
 }
 
-/// Extract provider/MCP sidecar secrets into the isolated credential store.
+/// Extract provider/MCP/root secrets into the isolated credential store.
 /// Calling this on every load is intentional: it is idempotent and also
 /// catches legacy ciphertext written later by an older binary.
 pub fn migrate_provider_mcp_credentials(
@@ -191,7 +195,21 @@ pub fn migrate_provider_mcp_credentials(
     migrate_inner(data_dir.as_ref(), None)
 }
 
-/// Fail-closed guard for every production reader of provider/MCP transaction
+/// Extract the external broker bearer token without coupling a malformed
+/// `broker.json` to provider/MCP/root configuration loading. This uses the
+/// same migration lock and manifest as every other credential transaction, so
+/// an already committed partial transaction still blocks all readers until it
+/// is recovered.
+pub fn migrate_external_broker_credentials(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    #[cfg(test)]
+    return migrate_broker_with_fault(data_dir.as_ref(), MigrationFault::None);
+    #[cfg(not(test))]
+    migrate_broker_inner(data_dir.as_ref(), None)
+}
+
+/// Fail-closed guard for every production reader of credential transaction
 /// members. A malformed manifest is treated like a pending one: callers must
 /// retain their existing runtime rather than guessing which files committed.
 pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> ConfigStoreResult<()> {
@@ -200,20 +218,24 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
         return Ok(());
     };
     let manifest: MigrationManifest = serde_json::from_slice(&bytes).map_err(|_| {
-        ConfigStoreError::Validation("provider/MCP credential migration is pending".to_string())
+        ConfigStoreError::Validation(
+            "provider/MCP/broker credential migration is pending".to_string(),
+        )
     })?;
     validate_manifest(&manifest).map_err(|_| {
-        ConfigStoreError::Validation("provider/MCP credential migration is pending".to_string())
+        ConfigStoreError::Validation(
+            "provider/MCP/broker credential migration is pending".to_string(),
+        )
     })?;
     if manifest.state == MigrationState::Pending {
         return Err(ConfigStoreError::Validation(
-            "provider/MCP credential migration is pending".to_string(),
+            "provider/MCP/broker credential migration is pending".to_string(),
         ));
     }
     Ok(())
 }
 
-/// Serialize public credential access with provider/MCP exact transactions.
+/// Serialize public credential access with provider/MCP/broker transactions.
 /// Keeping `ensure -> load/decrypt` (and mutation CAS) under this lock closes
 /// windows where a reader could observe a transaction member with stale
 /// metadata or a writer could commit after the durable transaction point.
@@ -861,6 +883,130 @@ fn migrate_with_fault(
     migrate_inner(data_dir, Some(fault))
 }
 
+#[cfg(test)]
+fn migrate_broker_with_fault(
+    data_dir: &Path,
+    fault: MigrationFault,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    migrate_broker_inner(data_dir, Some(fault))
+}
+
+fn migrate_broker_inner(
+    data_dir: &Path,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    std::fs::create_dir_all(data_dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join(LOCK_FILE))?;
+    lock.lock_exclusive()?;
+    let _lock = MigrationLock(lock);
+
+    cleanup_orphan_transaction_dirs(data_dir)?;
+    if let Some(outcome) = recover_committed(
+        data_dir,
+        #[cfg(test)]
+        fault,
+    )? {
+        return Ok(outcome);
+    }
+    discard_uncommitted(data_dir)?;
+
+    let mut extracted = Vec::new();
+    let broker = plan_broker_section(data_dir, &mut extracted, 1)?;
+    if broker.is_none() {
+        let migrated_credentials = scrub_broker_credentials_from_backups(data_dir)?;
+        return Ok(CredentialMigrationOutcome {
+            migrated_credentials,
+            resumed: false,
+        });
+    }
+
+    let store = CredentialStore::open(data_dir);
+    let resolved = resolve_extracted_secrets(&store, extracted)?;
+    let prepared_credentials = store.prepare_migration(resolved)?;
+    let broker = broker.expect("checked above");
+
+    let transaction_id = Uuid::new_v4().to_string();
+    let stage_dir_name = format!("{STAGE_PREFIX}{transaction_id}");
+    let stage_dir = data_dir.join(&stage_dir_name);
+    let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{transaction_id}"));
+    create_private_dir(&stage_dir)?;
+    create_private_dir(&backup_dir)?;
+    sync_dir(data_dir)?;
+
+    let mut staged = Vec::new();
+    stage_file(
+        &stage_dir,
+        &backup_dir,
+        CREDENTIALS_FILE,
+        &prepared_credentials.bytes,
+        std::fs::read(data_dir.join(CREDENTIALS_FILE))
+            .ok()
+            .as_deref(),
+        true,
+        None,
+        InstallMode::Migration,
+        None,
+        &mut staged,
+    )?;
+    stage_file(
+        &stage_dir,
+        &backup_dir,
+        broker.name,
+        &broker.bytes,
+        Some(&broker.original),
+        false,
+        Some(broker.migration_generation),
+        InstallMode::Migration,
+        None,
+        &mut staged,
+    )?;
+    restrict_directory_files_to_owner(&stage_dir)?;
+    restrict_directory_files_to_owner(&backup_dir)?;
+    sync_dir(&stage_dir)?;
+    sync_dir(&backup_dir)?;
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterStaging) {
+        return Err(injected_fault());
+    }
+
+    let manifest = MigrationManifest {
+        version: MIGRATION_VERSION,
+        transaction_id,
+        stage_dir: stage_dir_name,
+        state: MigrationState::Pending,
+        exact_scope: None,
+        files: staged,
+    };
+    write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterJournal) {
+        return Err(injected_fault());
+    }
+    write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterManifest) {
+        return Err(injected_fault());
+    }
+
+    let mut manifest = manifest;
+    install_pending(
+        data_dir,
+        &mut manifest,
+        #[cfg(test)]
+        fault,
+    )?;
+    finish_transaction(data_dir, manifest)?;
+    Ok(CredentialMigrationOutcome {
+        migrated_credentials: prepared_credentials.added,
+        resumed: false,
+    })
+}
+
 fn migrate_inner(
     data_dir: &Path,
     #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
@@ -1133,6 +1279,86 @@ fn ensure_legacy_notification_extractions_are_safe(
         }
     }
     Ok(())
+}
+
+fn ensure_broker_ref_exclusive(
+    data_dir: &Path,
+    reference: &CredentialRef,
+) -> ConfigStoreResult<()> {
+    for name in [PROVIDERS_FILE, MCP_FILE, CONFIG_FILE] {
+        for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+            let path = data_dir.join(format!("{name}{suffix}"));
+            let bytes = read_target_or_empty(&path)?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) if !suffix.is_empty() => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if contains_credential_reference(&value, reference.as_str()) {
+                return Err(ConfigStoreError::Validation(
+                    "broker credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+    }
+    let broker_bytes = read_target_or_empty(&data_dir.join(BROKER_FILE))?;
+    if !broker_bytes.is_empty() {
+        let mut broker: Value = serde_json::from_slice(&broker_bytes)?;
+        if let Some(object) = broker.as_object_mut() {
+            object.remove("credential_ref");
+        }
+        if contains_credential_reference(&broker, reference.as_str()) {
+            return Err(ConfigStoreError::Validation(
+                "broker credential reference is shared inside broker configuration".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_broker_backup_ownership(
+    data_dir: &Path,
+    preferred_ref: &CredentialRef,
+) -> ConfigStoreResult<()> {
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let bytes = match std::fs::read(data_dir.join(format!("{BROKER_FILE}.{suffix}"))) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        broker_backup_candidate(&bytes, Some(preferred_ref))?;
+        let mut value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.remove("credential_ref");
+        }
+        if contains_credential_reference(&value, preferred_ref.as_str()) {
+            return Err(ConfigStoreError::Validation(
+                "broker credential reference is shared inside broker backup".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contains_credential_reference(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, child)| {
+            ((key == "credential_ref" || key.ends_with("_credential_ref"))
+                && child.as_str() == Some(expected))
+                || (key.ends_with("_credential_refs") && contains_string_value(child, expected))
+                || contains_credential_reference(child, expected)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|child| contains_credential_reference(child, expected)),
+        _ => false,
+    }
 }
 
 fn notification_document_has_other_consumer(
@@ -1878,6 +2104,107 @@ fn plan_mcp_section(
         bytes: serde_json::to_vec_pretty(&root)?,
         original,
         migration_generation,
+    }))
+}
+
+fn plan_broker_section(
+    data_dir: &Path,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let path = data_dir.join(BROKER_FILE);
+    let original = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut root: Value = serde_json::from_slice(&original)?;
+    let object = root.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("broker configuration must be an object".to_string())
+    })?;
+    let had_plaintext = object.contains_key("token");
+    let had_ciphertext = object.contains_key("token_encrypted");
+    if !had_plaintext && !had_ciphertext {
+        let config: crate::BrokerClientConfig = serde_json::from_value(root).map_err(|_| {
+            ConfigStoreError::Validation("broker configuration is invalid".to_string())
+        })?;
+        if let Some(reference) = config.credential_ref.as_ref() {
+            ensure_broker_ref_exclusive(data_dir, reference)?;
+            ensure_broker_backup_ownership(data_dir, reference)?;
+        }
+        return Ok(None);
+    }
+
+    let plaintext = take_nonempty_string(object, "token")?;
+    let ciphertext = take_nonempty_string(object, "token_encrypted")?;
+    let secret = match (plaintext, ciphertext) {
+        (Some(plaintext), Some(ciphertext)) => {
+            let decrypted = crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                ConfigStoreError::Validation(
+                    "legacy broker credential could not be decrypted".to_string(),
+                )
+            })?;
+            if plaintext != decrypted {
+                return Err(ConfigStoreError::Validation(
+                    "legacy broker credential fields contain conflicting values".to_string(),
+                ));
+            }
+            Some(LegacySecret::Plaintext(plaintext))
+        }
+        (Some(plaintext), None) => Some(LegacySecret::Plaintext(plaintext)),
+        (None, Some(ciphertext)) => Some(LegacySecret::Ciphertext(ciphertext)),
+        (None, None) => None,
+    };
+
+    let previous_ref = object.get("credential_ref").cloned();
+    let previous_configured = object.get("configured").cloned();
+    let configured = secret.is_some()
+        || object
+            .get("configured")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if secret.is_some() || previous_ref.is_some() || configured {
+        let reference = existing_or_generated_ref(
+            object.get("credential_ref"),
+            "broker",
+            "external",
+            "bearer_token",
+        )?;
+        ensure_broker_ref_exclusive(data_dir, &reference)?;
+        ensure_broker_backup_ownership(data_dir, &reference)?;
+        object.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        object.insert("configured".to_string(), Value::Bool(configured));
+        if let Some(secret) = secret {
+            extracted.push(ExtractedSecret {
+                credential_ref: reference,
+                value: secret,
+                migration_generation: minimum_generation,
+                kind: ExtractedSecretKind::ExternalBroker,
+                env_owner: None,
+            });
+        }
+    } else {
+        object.remove("credential_ref");
+        object.remove("configured");
+    }
+
+    serde_json::from_value::<crate::BrokerClientConfig>(root.clone())
+        .map_err(|_| ConfigStoreError::Validation("broker configuration is invalid".to_string()))?;
+    let changed = had_plaintext
+        || had_ciphertext
+        || previous_ref != root.get("credential_ref").cloned()
+        || previous_configured != root.get("configured").cloned();
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(PlannedSection {
+        name: BROKER_FILE,
+        bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation: minimum_generation,
     }))
 }
 
@@ -2939,6 +3266,7 @@ fn install_pending(
             (Some(MigrationFault::AfterCredentials), CREDENTIALS_FILE)
                 | (Some(MigrationFault::AfterProviders), PROVIDERS_FILE)
                 | (Some(MigrationFault::AfterMcp), MCP_FILE)
+                | (Some(MigrationFault::AfterBroker), BROKER_FILE)
                 | (Some(MigrationFault::AfterConfig), CONFIG_FILE)
         ) {
             return Err(injected_fault());
@@ -3624,6 +3952,7 @@ fn rebase_changed_section(
     let section = match name.as_str() {
         PROVIDERS_FILE => plan_provider_section(data_dir, &mut extracted, minimum_generation)?,
         MCP_FILE => plan_mcp_section(data_dir, &mut extracted, minimum_generation)?,
+        BROKER_FILE => plan_broker_section(data_dir, &mut extracted, minimum_generation)?,
         CONFIG_FILE => {
             plan_provider_instance_section(data_dir, &mut extracted, minimum_generation, false)?
         }
@@ -3669,19 +3998,194 @@ fn rebase_changed_section(
 }
 
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
-    let proxy_clear_tombstones = proxy_clear_tombstones_from_manifest(&manifest);
-    let env_clear_tombstones = env_clear_tombstones_from_manifest(&manifest);
-    let notification_clear_tombstones = notification_clear_tombstones_from_manifest(&manifest);
-    scrub_provider_instance_credentials_from_backups(
-        data_dir,
-        &proxy_clear_tombstones,
-        &env_clear_tombstones,
-        &notification_clear_tombstones,
-    )?;
+    let contains_broker = manifest.files.iter().any(|file| file.name == BROKER_FILE);
+    let contains_non_broker_config = manifest
+        .files
+        .iter()
+        .any(|file| matches!(file.name.as_str(), PROVIDERS_FILE | MCP_FILE | CONFIG_FILE));
+    if contains_non_broker_config {
+        let proxy_clear_tombstones = proxy_clear_tombstones_from_manifest(&manifest);
+        let env_clear_tombstones = env_clear_tombstones_from_manifest(&manifest);
+        let notification_clear_tombstones = notification_clear_tombstones_from_manifest(&manifest);
+        scrub_provider_instance_credentials_from_backups(
+            data_dir,
+            &proxy_clear_tombstones,
+            &env_clear_tombstones,
+            &notification_clear_tombstones,
+        )?;
+    }
+    if contains_broker {
+        scrub_broker_credentials_from_backups(data_dir)?;
+    }
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
     cleanup_transaction_dirs(data_dir, &manifest)
+}
+
+fn scrub_broker_credentials_from_backups(data_dir: &Path) -> ConfigStoreResult<usize> {
+    let mut reference = match std::fs::read(data_dir.join(BROKER_FILE)) {
+        Ok(bytes) => serde_json::from_slice::<crate::BrokerClientConfig>(&bytes)
+            .ok()
+            .and_then(|primary| primary.credential_ref),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let store = CredentialStore::open(data_dir);
+    let mut backup_secret = None;
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let path = data_dir.join(format!("{BROKER_FILE}.{suffix}"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let (candidate_ref, candidate_secret) =
+            broker_backup_candidate(&bytes, reference.as_ref())?;
+        if reference.is_none() {
+            reference = candidate_ref;
+        }
+        let Some(current_ref) = reference.as_ref() else {
+            continue;
+        };
+        let mut root: Value = match serde_json::from_slice(&bytes) {
+            Ok(root) => root,
+            Err(_) => continue,
+        };
+        if let Some(object) = root.as_object_mut() {
+            object.remove("credential_ref");
+        }
+        if contains_credential_reference(&root, current_ref.as_str()) {
+            return Err(ConfigStoreError::Validation(
+                "broker credential reference is shared inside broker backup".to_string(),
+            ));
+        }
+        if backup_secret.is_none()
+            && !store.status_unchecked(current_ref)?.configured
+            && candidate_secret.is_some()
+        {
+            backup_secret = candidate_secret;
+        }
+    }
+    let Some(reference) = reference else {
+        return Ok(0);
+    };
+    ensure_broker_ref_exclusive(data_dir, &reference)?;
+    let migrated_credentials = if let Some(secret) = backup_secret {
+        let resolved = resolve_extracted_secrets(
+            &store,
+            vec![ExtractedSecret {
+                credential_ref: reference.clone(),
+                value: secret,
+                migration_generation: 1,
+                kind: ExtractedSecretKind::ExternalBroker,
+                env_owner: None,
+            }],
+        )?;
+        let prepared = store.prepare_migration(resolved)?;
+        let added = prepared.added;
+        store.commit_migration(&prepared.bytes)?;
+        added
+    } else {
+        0
+    };
+    let configured = store.status_unchecked(&reference)?.configured;
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let path = data_dir.join(format!("{BROKER_FILE}.{suffix}"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut root: Value = match serde_json::from_slice(&bytes) {
+            Ok(root) => root,
+            Err(_) => continue,
+        };
+        let Some(object) = root.as_object_mut() else {
+            continue;
+        };
+        let mut changed = object.remove("token").is_some();
+        changed |= object.remove("token_encrypted").is_some();
+        changed |= object.get("credential_ref").and_then(Value::as_str) != Some(reference.as_str());
+        changed |= object.get("configured").and_then(Value::as_bool) != Some(configured);
+        if !changed {
+            continue;
+        }
+        object.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        object.insert("configured".to_string(), Value::Bool(configured));
+        AtomicFileStore::new(path)
+            .write_bytes_without_backup(&serde_json::to_vec_pretty(&root)?)?;
+    }
+    Ok(migrated_credentials)
+}
+
+fn broker_backup_candidate(
+    bytes: &[u8],
+    preferred_ref: Option<&CredentialRef>,
+) -> ConfigStoreResult<(Option<CredentialRef>, Option<LegacySecret>)> {
+    let mut root: Value = match serde_json::from_slice(bytes) {
+        Ok(root) => root,
+        Err(_) => return Ok((None, None)),
+    };
+    let Some(object) = root.as_object_mut() else {
+        return Ok((None, None));
+    };
+    let plaintext = take_nonempty_string(object, "token")?;
+    let ciphertext = take_nonempty_string(object, "token_encrypted")?;
+    let secret = match (plaintext, ciphertext) {
+        (Some(plaintext), Some(ciphertext)) => {
+            let decrypted = crate::encryption::decrypt(&ciphertext).map_err(|_| {
+                ConfigStoreError::Validation(
+                    "legacy broker backup credential could not be decrypted".to_string(),
+                )
+            })?;
+            if plaintext != decrypted {
+                return Err(ConfigStoreError::Validation(
+                    "legacy broker backup credential fields contain conflicting values".to_string(),
+                ));
+            }
+            Some(LegacySecret::Plaintext(plaintext))
+        }
+        (Some(plaintext), None) => Some(LegacySecret::Plaintext(plaintext)),
+        (None, Some(ciphertext)) => Some(LegacySecret::Ciphertext(ciphertext)),
+        (None, None) => None,
+    };
+    let configured = object
+        .get("configured")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let explicit_ref = object
+        .get("credential_ref")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "broker backup credential reference must be a string".to_string(),
+                )
+            })
+        })
+        .transpose()?
+        .map(|value| CredentialRef::parse(value.to_string()))
+        .transpose()?;
+    if let (Some(preferred), Some(explicit)) = (preferred_ref, explicit_ref.as_ref()) {
+        if preferred != explicit {
+            return Err(ConfigStoreError::Validation(
+                "broker backup credential reference conflicts with primary configuration"
+                    .to_string(),
+            ));
+        }
+    }
+    let reference = match preferred_ref {
+        Some(reference) => Some(reference.clone()),
+        None if explicit_ref.is_some() => explicit_ref,
+        None if secret.is_some() || configured => {
+            Some(credential_ref("broker", "external", "bearer_token")?)
+        }
+        None => None,
+    };
+    Ok((reference, secret))
 }
 
 fn proxy_clear_tombstones_from_manifest(manifest: &MigrationManifest) -> BTreeSet<String> {
@@ -4083,7 +4587,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         || manifest.files.iter().any(|file| {
             !matches!(
                 file.name.as_str(),
-                PROVIDERS_FILE | MCP_FILE | CREDENTIALS_FILE | CONFIG_FILE
+                PROVIDERS_FILE | MCP_FILE | BROKER_FILE | CREDENTIALS_FILE | CONFIG_FILE
             ) || file.sha256.len() != 64
                 || !valid_staged_name(file)
                 || (file.name != CREDENTIALS_FILE
@@ -8233,5 +8737,350 @@ mod tests {
                 .expose(),
             "bark-transaction-secret"
         );
+    }
+
+    #[test]
+    fn broker_plaintext_migrates_to_ref_only_and_hydrates_idempotently() {
+        let _key = crate::encryption::set_test_encryption_key([0xb1; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(BROKER_FILE),
+            br#"{
+                "endpoint": "wss://broker.example/ws",
+                "token": "broker-secret",
+                "future_metadata": {"kept": true}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(format!("{BROKER_FILE}.bak")),
+            br#"{
+                "endpoint": "wss://old-broker.example/ws",
+                "token": "stale-backup-secret",
+                "backup_metadata": true
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(outcome.migrated_credentials, 1);
+        let durable = std::fs::read_to_string(dir.path().join(BROKER_FILE)).unwrap();
+        assert!(!durable.contains("broker-secret"));
+        assert!(!durable.contains("\"token\""));
+        assert!(!durable.contains("token_encrypted"));
+        let root: Value = serde_json::from_str(&durable).unwrap();
+        assert_eq!(root["credential_ref"], "broker.external.bearer_token");
+        assert_eq!(root["configured"], true);
+        assert_eq!(root["future_metadata"]["kept"], true);
+        let backup =
+            std::fs::read_to_string(dir.path().join(format!("{BROKER_FILE}.bak"))).unwrap();
+        assert!(!backup.contains("stale-backup-secret"));
+        assert!(!backup.contains("\"token\""));
+        let backup: Value = serde_json::from_str(&backup).unwrap();
+        assert_eq!(backup["credential_ref"], "broker.external.bearer_token");
+        assert_eq!(backup["backup_metadata"], true);
+
+        let reference = credential_ref("broker", "external", "bearer_token").unwrap();
+        let store = CredentialStore::open(dir.path());
+        assert_eq!(
+            store.resolve(&reference).unwrap().unwrap().expose(),
+            "broker-secret"
+        );
+        let status = store.status(&reference).unwrap();
+        assert!(status.configured);
+        assert_eq!(status.source, crate::CredentialSource::Migrated);
+        let mut runtime: crate::BrokerClientConfig = serde_json::from_str(&durable).unwrap();
+        runtime.hydrate_credential_from_store(dir.path()).unwrap();
+        assert_eq!(runtime.token, "broker-secret");
+        assert!(runtime.configured);
+        assert!(!serde_json::to_string(&runtime)
+            .unwrap()
+            .contains("broker-secret"));
+        assert!(!format!("{runtime:?}").contains("broker-secret"));
+
+        let second = migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert_eq!(second.migrated_credentials, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(BROKER_FILE)).unwrap(),
+            durable
+        );
+    }
+
+    #[test]
+    fn broker_conflicting_legacy_fields_fail_without_partial_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0xb2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ciphertext = crate::encryption::encrypt("cipher-winner").unwrap();
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "endpoint": "wss://broker.example/ws",
+            "token": "plain-winner",
+            "token_encrypted": ciphertext,
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(BROKER_FILE), &original).unwrap();
+
+        let error = migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("conflicting values"));
+        assert_eq!(
+            std::fs::read(dir.path().join(BROKER_FILE)).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn broker_ciphertext_only_migrates_without_persisting_ciphertext() {
+        let _key = crate::encryption::set_test_encryption_key([0xb5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ciphertext = crate::encryption::encrypt("encrypted-broker-secret").unwrap();
+        std::fs::write(
+            dir.path().join(BROKER_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "endpoint": "wss://broker.example/ws",
+                "token_encrypted": ciphertext,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap();
+        let durable = std::fs::read_to_string(dir.path().join(BROKER_FILE)).unwrap();
+        assert!(!durable.contains("token_encrypted"));
+        assert!(!durable.contains(&ciphertext));
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&credential_ref("broker", "external", "bearer_token").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "encrypted-broker-secret"
+        );
+    }
+
+    #[test]
+    fn backup_only_broker_secret_is_committed_before_backup_is_scrubbed() {
+        let _key = crate::encryption::set_test_encryption_key([0xb6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join(format!("{BROKER_FILE}.bak"));
+        std::fs::write(
+            &backup_path,
+            br#"{
+                "endpoint": "wss://recover.example/ws",
+                "token": "backup-only-broker-secret",
+                "recovery_metadata": true
+            }"#,
+        )
+        .unwrap();
+
+        migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(!dir.path().join(BROKER_FILE).exists());
+        let backup = std::fs::read_to_string(&backup_path).unwrap();
+        assert!(!backup.contains("backup-only-broker-secret"));
+        assert!(!backup.contains("\"token\""));
+        let backup: Value = serde_json::from_str(&backup).unwrap();
+        assert_eq!(backup["credential_ref"], "broker.external.bearer_token");
+        assert_eq!(backup["configured"], true);
+        assert_eq!(backup["recovery_metadata"], true);
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&credential_ref("broker", "external", "bearer_token").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "backup-only-broker-secret"
+        );
+    }
+
+    #[test]
+    fn committed_broker_migration_rebases_external_metadata_and_recovers() {
+        let _key = crate::encryption::set_test_encryption_key([0xb3; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(BROKER_FILE),
+            br#"{"endpoint":"wss://old.example/ws","token":"broker-secret"}"#,
+        )
+        .unwrap();
+        let error = migrate_broker_with_fault(dir.path(), MigrationFault::AfterBroker).unwrap_err();
+        assert!(matches!(error, ConfigStoreError::Io(_)));
+        std::fs::write(
+            dir.path().join(BROKER_FILE),
+            br#"{
+                "endpoint":"wss://new.example/ws",
+                "token":"broker-secret",
+                "external_generation": 2
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(BROKER_FILE)).unwrap()).unwrap();
+        assert_eq!(root["endpoint"], "wss://new.example/ws");
+        assert_eq!(root["external_generation"], 2);
+        assert_eq!(root["credential_ref"], "broker.external.bearer_token");
+        assert!(root.get("token").is_none());
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&credential_ref("broker", "external", "bearer_token").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "broker-secret"
+        );
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn broker_migration_rejects_cross_domain_shared_reference() {
+        let _key = crate::encryption::set_test_encryption_key([0xb4; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = "shared.cross_domain.secret";
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "env_vars": [{
+                    "name": "TOKEN",
+                    "secret": true,
+                    "credential_ref": shared,
+                    "configured": true
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "endpoint": "wss://broker.example/ws",
+            "token": "broker-secret",
+            "credential_ref": shared,
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join(BROKER_FILE), &original).unwrap();
+
+        let error = migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("shared by another consumer"));
+        assert_eq!(
+            std::fs::read(dir.path().join(BROKER_FILE)).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+
+        std::fs::write(
+            dir.path().join(BROKER_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "endpoint": "wss://broker.example/ws",
+                "credential_ref": shared,
+                "configured": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let metadata_only =
+            migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(metadata_only
+            .to_string()
+            .contains("shared by another consumer"));
+    }
+
+    #[test]
+    fn malformed_broker_does_not_block_provider_migration_or_loading() {
+        let _key = crate::encryption::set_test_encryption_key([0xb7; 32]);
+        for invalid_broker in [
+            b"{ definitely-not-valid-json".as_slice(),
+            br#"{"endpoint":42,"credential_ref":false}"#.as_slice(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(BROKER_FILE), invalid_broker).unwrap();
+            std::fs::write(
+                dir.path().join(PROVIDERS_FILE),
+                br#"{
+                    "openai": {
+                        "api_key": "provider-isolated-secret",
+                        "model": "provider-isolated-model"
+                    }
+                }"#,
+            )
+            .unwrap();
+
+            let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+            assert_eq!(outcome.migrated_credentials, 1);
+            assert_eq!(
+                std::fs::read(dir.path().join(BROKER_FILE)).unwrap(),
+                invalid_broker
+            );
+            let loaded =
+                crate::Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+            let openai = loaded.providers.openai.as_ref().expect("provider loaded");
+            assert_eq!(openai.api_key, "provider-isolated-secret");
+            assert_eq!(openai.model.as_deref(), Some("provider-isolated-model"));
+        }
+    }
+
+    #[test]
+    fn broker_primary_and_backup_refs_must_match_before_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0xb8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let primary = serde_json::to_vec_pretty(&serde_json::json!({
+            "endpoint": "wss://broker.example/ws",
+            "token": "primary-secret",
+            "credential_ref": "broker.external.primary_token",
+        }))
+        .unwrap();
+        let backup = serde_json::to_vec_pretty(&serde_json::json!({
+            "endpoint": "wss://old-broker.example/ws",
+            "token": "backup-secret",
+            "credential_ref": "broker.external.backup_token",
+        }))
+        .unwrap();
+        let backup_path = dir.path().join(format!("{BROKER_FILE}.bak"));
+        std::fs::write(dir.path().join(BROKER_FILE), &primary).unwrap();
+        std::fs::write(&backup_path, &backup).unwrap();
+
+        let error = migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("conflicts with primary"));
+        assert_eq!(
+            std::fs::read(dir.path().join(BROKER_FILE)).unwrap(),
+            primary
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), backup);
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn backup_only_broker_ref_rejects_config_backup_consumer_before_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0xb9; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = "shared.backup.broker_token";
+        let broker_backup = serde_json::to_vec_pretty(&serde_json::json!({
+            "endpoint": "wss://recover.example/ws",
+            "token": "backup-only-secret",
+            "credential_ref": shared,
+        }))
+        .unwrap();
+        let config_backup = serde_json::to_vec_pretty(&serde_json::json!({
+            "provider_instances": {
+                "work": {"credential_ref": shared, "configured": true}
+            },
+            "env_vars": [{
+                "name": "SHARED_TOKEN",
+                "secret": true,
+                "credential_ref": shared,
+                "configured": true
+            }]
+        }))
+        .unwrap();
+        let broker_backup_path = dir.path().join(format!("{BROKER_FILE}.bak"));
+        let config_backup_path = dir.path().join(format!("{CONFIG_FILE}.bak"));
+        std::fs::write(&broker_backup_path, &broker_backup).unwrap();
+        std::fs::write(&config_backup_path, &config_backup).unwrap();
+
+        let error = migrate_broker_with_fault(dir.path(), MigrationFault::None).unwrap_err();
+        assert!(error.to_string().contains("shared by another consumer"));
+        assert_eq!(std::fs::read(&broker_backup_path).unwrap(), broker_backup);
+        assert_eq!(std::fs::read(&config_backup_path).unwrap(), config_backup);
+        assert!(!dir.path().join(CREDENTIALS_FILE).exists());
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
     }
 }

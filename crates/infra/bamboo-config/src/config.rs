@@ -678,19 +678,38 @@ pub struct RemoteActorPlacement {
 }
 
 /// How to reach the central sub-agent message broker (`bamboo broker serve`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BrokerClientConfig {
     /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
     pub endpoint: String,
     /// Bearer token presented in the broker handshake.
     ///
-    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
-    /// empty on disk and hydrated in memory on load (mirrors [`EnvVarEntry`]).
-    #[serde(default)]
+    /// Runtime-only plaintext hydrated from the isolated credential store.
+    /// Legacy `broker.json` files may still deserialize this field so the
+    /// manifest migration can extract it, but serializers never emit it.
+    #[serde(default, skip_serializing)]
     pub token: String,
-    /// Encrypted ciphertext of `token` (the at-rest representation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy inline ciphertext accepted only for credential migration.
+    #[serde(default, skip_serializing)]
     pub token_encrypted: Option<String>,
+    /// Stable reference to the external broker bearer token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Durable configured metadata. Runtime hydration still verifies that the
+    /// referenced credential exists and decrypts successfully.
+    #[serde(default)]
+    pub configured: bool,
+}
+
+impl std::fmt::Debug for BrokerClientConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerClientConfig")
+            .field("endpoint", &self.endpoint)
+            .field("credential_ref", &self.credential_ref)
+            .field("configured", &self.configured)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Native desktop (OS-notification) delivery channel.
@@ -2699,13 +2718,14 @@ impl Config {
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(default_data_dir);
 
-        // Finish any manifest-committed provider/MCP credential extraction
-        // before reading even one member of the transaction. An uncommitted
-        // stage is discarded and safely replanned.
+        // Finish any shared manifest-committed credential extraction before
+        // reading even one member of the transaction, then plan only the
+        // provider/MCP/root domains. The optional broker has its own planner so
+        // malformed broker metadata cannot suppress main configuration loading.
         let provider_mcp_ready = crate::migrate_provider_mcp_credentials(&data_dir)
             .and_then(|_| crate::ensure_provider_mcp_migration_ready(&data_dir))
             .map_err(|error| {
-                tracing::warn!(error = %error, "provider/MCP credential migration unavailable");
+                tracing::warn!(error = %error, "provider/MCP/root credential migration unavailable");
                 error
             })
             .is_ok();
@@ -7928,6 +7948,8 @@ mod tests {
             endpoint: "ws://127.0.0.1:9600".to_string(),
             token: "super-secret-token".to_string(),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         });
 
         // Persist path: encrypt then sanitize (what save_to_dir does).
@@ -7957,6 +7979,8 @@ mod tests {
             endpoint: "ws://h:9600".to_string(),
             token: String::new(),
             token_encrypted: Some("existing-cipher".to_string()),
+            credential_ref: None,
+            configured: false,
         });
         config.refresh_broker_token_encrypted().unwrap();
         assert_eq!(

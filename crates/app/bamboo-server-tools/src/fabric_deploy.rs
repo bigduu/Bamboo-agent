@@ -1377,6 +1377,8 @@ mod presence_verify_tests {
             endpoint: endpoint.to_string(),
             token: "t".into(),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         }
     }
 
@@ -1490,6 +1492,8 @@ mod health_check_tests {
             endpoint: endpoint.into(),
             token: "t".into(),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         });
         Arc::new(FabricDeployer::new(
             Arc::new(RwLock::new(cfg)),

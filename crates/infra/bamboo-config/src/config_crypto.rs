@@ -33,6 +33,37 @@ fn hydrate_header_credentials(
     Ok(())
 }
 
+impl crate::BrokerClientConfig {
+    /// Resolve an external broker bearer-token reference into runtime-only
+    /// plaintext. A configured reference that is missing or unreadable fails
+    /// closed so startup never silently dials the broker unauthenticated.
+    pub fn hydrate_credential_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        self.token_encrypted = None;
+        let Some(reference) = self.credential_ref.as_ref() else {
+            if self.configured {
+                return Err(crate::ConfigStoreError::Validation(
+                    "configured broker credential reference is missing".to_string(),
+                ));
+            }
+            self.token.clear();
+            return Ok(());
+        };
+        match crate::CredentialStore::open(data_dir).resolve(reference)? {
+            Some(secret) => {
+                self.token = secret.expose().to_string();
+                self.configured = true;
+                Ok(())
+            }
+            None => Err(crate::ConfigStoreError::Validation(
+                "referenced broker credential is unavailable".to_string(),
+            )),
+        }
+    }
+}
+
 impl Config {
     // ── Proxy auth ─────────────────────────────────────────────────────
 

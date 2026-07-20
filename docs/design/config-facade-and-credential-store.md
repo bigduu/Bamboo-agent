@@ -138,9 +138,10 @@ Migration must be idempotent and manifest-gated:
 1. acquire the migration/advisory lock and encrypt parseable legacy inputs into
    an owner-only, transaction-scoped backup (directory `0700`, files `0600` on
    Unix); delete both stage and backup after completion;
-2. parse legacy root, broker and current sidecars as raw JSON so flattened and
-   unknown fields remain attached to their owning section (unclassified fields go
-   to the core section's `extra` map);
+2. use independent provider/MCP/root and external-broker planners, parsing each
+   legacy input as raw JSON so flattened and unknown fields remain attached to
+   their owning section (unclassified fields go to the core section's `extra`
+   map); a malformed optional broker document cannot block main configuration;
 3. extract the credential inventory into encrypted records and replace ordinary
    values with references/configured metadata;
 4. stage every candidate file and validate the complete candidate set;
@@ -149,17 +150,18 @@ Migration must be idempotent and manifest-gated:
 6. on restart, discard an uncommitted stage or resume from the manifest; never
    infer completion from the presence of one section file.
 
-Provider, provider-instance, MCP, proxy, secret env and notification credentials
-now use the manifest-gated
-migration slice. It stages and fsyncs `credentials.json` plus each affected member
-of `providers.json`, `mcp.json`, and `config.json`, installs a pending manifest as
-the commit point, and finishes or resumes every member before `Config` reads any
-of them. Built-in/instance API keys, MCP stdio env values, and MCP HTTP headers
-become stable credential refs; plaintext and legacy ciphertext are removed from
-ordinary documents and parseable root backup generations. Unknown fields remain
-attached to the raw JSON candidate. A concurrent editor/API write is compared
-under the section file lock and rebased with a higher migration generation instead
-of overwritten. User-written credentials always outrank migration replay.
+Provider, provider-instance, MCP, proxy, secret env, notification and external
+broker credentials now use the shared manifest-gated migration protocol. The
+main and broker planners run independently under the same lock, stage and fsync
+`credentials.json` plus only their affected members, install a pending manifest
+as the commit point, and finish or resume any committed domain before runtime
+readers use transaction members. Built-in/instance API keys, MCP stdio env values,
+MCP HTTP headers, and the external broker bearer token become stable credential refs;
+plaintext and legacy ciphertext are removed from ordinary documents and parseable
+root/broker backup generations. Unknown fields remain attached to the raw JSON
+candidate. A concurrent editor/API write is compared under the section file lock
+and rebased with a higher migration generation instead of overwritten.
+User-written credentials always outrank migration replay.
 Backup generations are processed newest first: a backup-only instance is committed
 to the credential store before that backup is rewritten, while an already configured
 same ref remains authoritative over an older backup value. Unparseable root backups
@@ -170,7 +172,7 @@ resolved legacy value with an existing migrated credential: equal values are a
 no-op, while a different value advances the stored migration generation. This
 keeps old committed-stage replay from rolling the credential back while still
 accepting genuinely newer legacy input. Pending or malformed manifests are a
-fail-closed state: provider/MCP loaders, startup health, watchers and typed writes
+fail-closed state: provider/MCP/broker loaders, startup health, watchers and typed writes
 retain their current snapshot until recovery finishes; they never read a partial
 transaction member.
 Only `NotFound` means migration metadata is absent; permission, directory and
@@ -197,8 +199,15 @@ credential revision, uses omission/clear/replace semantics, and rejects masks or
 client-owned ref/configured metadata; the metadata GET never exposes secret
 material.
 
-This is intentionally not the full legacy-root migration. Broker and cluster
-secrets and the remaining section split still require the broader inventory
+The external broker loader completes/rechecks migration before reading
+`broker.json`, then resolves `broker.external.bearer_token` through the credential
+store. Missing, corrupt or configured-but-unbound references fail closed and fall
+back to an embedded broker instead of dialing an external endpoint without its
+bearer. Generic credential status/replace/clear APIs retain revision/CAS semantics;
+the ordinary broker file remains metadata-only.
+
+This is intentionally not the full legacy-root migration. Cluster secrets and
+the remaining section split still require the broader inventory
 transaction. Compatibility PATCH and dot-path operations must not claim that all
 secrets have moved.
 
