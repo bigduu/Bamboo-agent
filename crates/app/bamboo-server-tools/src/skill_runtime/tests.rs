@@ -529,7 +529,7 @@ Use the dynamic context."#,
         .await
         .expect("save production session");
     let production_tool = LoadSkillTool::new(
-        manager,
+        manager.clone(),
         Arc::new(RwLock::new(Config::default())),
         repo.clone(),
     )
@@ -576,6 +576,64 @@ Use the dynamic context."#,
     assert!(!production_saved
         .metadata
         .contains_key(bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY));
+
+    let typed_session_id = "dynamic-context-typed-authority";
+    let mut typed_session = Session::new(typed_session_id, "model");
+    typed_session.set_workspace_path_meta(temp_dir.path().to_string_lossy().into_owned());
+    typed_session.metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        r#"["dynamic-demo"]"#.to_string(),
+    );
+    repo.save(&mut typed_session)
+        .await
+        .expect("save typed-authority session");
+    let permission_config = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+    permission_config.set_policy_revision(41);
+    let permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
+        bamboo_tools::permission::ConfigPermissionChecker::new(permission_config.clone()),
+    );
+    let runtime_config = Arc::new(RwLock::new(Config::default()));
+    let context_tools: Arc<dyn ToolExecutor> = Arc::new(
+        bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+            runtime_config.clone(),
+            permission_checker,
+        ),
+    );
+    let typed_tool = LoadSkillTool::new(manager, runtime_config, repo.clone())
+        .with_permission_checked_context_registry(context_tools, Some(permission_config.clone()));
+    let typed_context = ToolExecutionContext {
+        session_id: Some(typed_session_id),
+        tool_call_id: "typed-authority-load",
+        event_tx: None,
+        available_tool_schemas: None,
+        // The outer load_skill call may run under bypass. Its dynamic provider
+        // must still dispatch with bypass disabled through the #601 checker.
+        bypass_permissions: true,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+    let ToolOutcome::Completed(typed) = typed_tool
+        .invoke(
+            serde_json::json!({"skill_id":"dynamic-demo"}),
+            typed_context.to_tool_ctx(),
+        )
+        .await
+        .expect("typed permission authority executes the provider")
+    else {
+        panic!("typed authority load completes")
+    };
+    let typed: serde_json::Value =
+        serde_json::from_str(&typed.result).expect("typed authority payload");
+    assert_eq!(typed["activation_status"], "active");
+    assert_eq!(
+        typed["dynamic_context"][0]["provenance"],
+        "registered_tool_permission_checked"
+    );
+    assert!(typed["dynamic_context"][0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("workspace input")));
+    assert_eq!(permission_config.policy_revision(), 41);
 }
 
 #[tokio::test]

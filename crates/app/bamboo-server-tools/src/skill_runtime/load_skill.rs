@@ -47,7 +47,7 @@ const LOAD_SKILL_OWNED_METADATA_KEYS: &[&str] = &[
 pub struct LoadSkillTool {
     access: SkillToolAccess,
     context_tools: Option<Arc<dyn ToolExecutor>>,
-    dynamic_context_authority_available: bool,
+    dynamic_context_permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
 }
 
 impl LoadSkillTool {
@@ -59,7 +59,7 @@ impl LoadSkillTool {
         Self {
             access: SkillToolAccess::new(skill_manager, config, session_repo),
             context_tools: None,
-            dynamic_context_authority_available: false,
+            dynamic_context_permission_config: None,
         }
     }
 
@@ -71,12 +71,25 @@ impl LoadSkillTool {
         self
     }
 
-    /// Test-only injection seam for provider behavior while #601's typed
-    /// permission/trust authority is not available in production.
+    /// Register the same permission-wrapped tool surface and typed policy used
+    /// by normal tool dispatch. A missing typed config deliberately leaves the
+    /// fail-closed registry above inactive.
+    pub fn with_permission_checked_context_registry(
+        mut self,
+        tools: Arc<dyn ToolExecutor>,
+        permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    ) -> Self {
+        self.context_tools = Some(tools);
+        self.dynamic_context_permission_config = permission_config;
+        self
+    }
+
+    /// Test-only injection seam for provider behavior.
     #[cfg(test)]
     pub(crate) fn with_test_context_tools(mut self, tools: Arc<dyn ToolExecutor>) -> Self {
         self.context_tools = Some(tools);
-        self.dynamic_context_authority_available = true;
+        self.dynamic_context_permission_config =
+            Some(Arc::new(bamboo_tools::permission::PermissionConfig::new()));
         self
     }
 
@@ -172,7 +185,7 @@ impl LoadSkillTool {
                 "workflow declares too many dynamic context providers",
             ));
         }
-        if !self.dynamic_context_authority_available {
+        let Some(permission_config) = self.dynamic_context_permission_config.as_ref() else {
             return Ok(declarations
                 .into_iter()
                 .map(|declaration| bamboo_skills::DynamicContextBlock {
@@ -191,7 +204,7 @@ impl LoadSkillTool {
                     }),
                 })
                 .collect());
-        }
+        };
         let Some(tools) = self.context_tools.as_ref() else {
             return Ok(degraded_metadata(
                 "dynamic context provider registry is unavailable",
@@ -276,6 +289,7 @@ impl LoadSkillTool {
                 "input": provider_input,
                 "workspace": workspace_scope,
                 "permission_scope": "strict_no_bypass",
+                "permission_policy_revision": permission_config.policy_revision(),
             });
             let cache_key = hex::encode(Sha256::digest(cache_material.to_string().as_bytes()));
             // Cached content is never injected without re-running the concrete
