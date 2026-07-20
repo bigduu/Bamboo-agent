@@ -371,180 +371,170 @@ impl ToolExecutor for BuiltinToolExecutor {
         if let Some(contexts) =
             check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
         {
-            // "Always ask" rules (configured patterns + built-in dangerous
-            // commands) force a confirmation even under bypass. Everything
-            // else is skipped when this session is in "bypass permissions"
-            // mode (scoped per-session via its runtime state).
-            let force_ask = permission_checker.requires_forced_confirmation(&tool_name, &args);
             for context in contexts {
-                // Explicit deny is a non-overridable policy outcome. Evaluate it
-                // before forced confirmation, remembered grants, and bypass.
-                if permission_checker
-                    .permission_config()
-                    .is_some_and(|config| {
-                        config.is_whitelist_allowed(context.permission_type, &context.resource)
-                            == Some(false)
-                    })
-                {
-                    return Err(ToolError::Execution(format!(
-                        "Permission denied by explicit policy for: {}",
-                        context.resource
-                    )));
-                }
-                if ctx.session_id.is_some_and(|session_id| {
-                    permission_checker.consume_once(
-                        session_id,
-                        &call.id,
-                        context.permission_type,
-                        &context.resource,
-                    )
-                }) {
-                    continue;
-                }
-                if ctx.bypass_permissions && !force_ask {
-                    continue;
-                }
                 let resource = context.resource.clone();
                 let operation_summary = context.operation_description.clone();
                 let risk_level = context.risk_level();
-                // Forced confirmations route through `check_or_request_forced`
-                // so the active mode/bypass cannot suppress the prompt.
-                let decision = if force_ask {
-                    permission_checker.check_or_request_forced(context).await
-                } else if let Some(session_id) = ctx.session_id {
-                    permission_checker
-                        .check_or_request_for_session(session_id, context)
-                        .await
-                } else {
-                    permission_checker.check_or_request(context).await
-                };
-                match decision {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(ToolError::Execution(format!(
-                            "Permission denied for: {}",
-                            resource
-                        )));
-                    }
-                    Err(PermissionError::ConfirmationRequired {
+                let permission_type = context.permission_type;
+                let config = permission_checker.permission_config();
+                let proxy = crate::approval::current_approval_proxy();
+                let request = if let Some(config) = config.as_ref() {
+                    // A boolean approval relay can only honor one-shot choices.
+                    // Interactive local sessions support all typed scopes; the
+                    // evaluator omits workspace when no stable identity is known.
+                    let supported_decisions = if proxy.is_some() {
+                        crate::permission::PermissionRequest::forced_decisions()
+                    } else {
+                        crate::permission::PermissionRequest::ordinary_decisions(true)
+                    };
+                    let workspace_path = args
+                        .get("workspace_path")
+                        .or_else(|| args.get("cwd"))
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            ctx.session_id
+                                .and_then(|session_id| config.session_workspace(session_id))
+                        });
+                    match config.evaluate(crate::permission::PermissionEvaluation {
+                        request_id: call.id.clone(),
+                        session_id: ctx.session_id.unwrap_or_default().to_string(),
+                        workspace_path,
+                        tool_name: tool_name.clone(),
+                        tool_args: args.clone(),
                         permission_type,
-                        resource: _,
-                    }) => {
-                        // Phase 2 (cross-process): a subagent worker installs a
-                        // task-local `ApprovalProxy` for the duration of its run.
-                        // When present, forward the decision to the worker's host
-                        // (parent) and block this tool inline for the reply —
-                        // approve proceeds (treated like a granted context), deny
-                        // fails closed. Checked BEFORE the interactive sink below
-                        // so a worker (which also has an `event_tx`) proxies to its
-                        // parent instead of trying to prompt a human itself. The
-                        // proxy is unset on every non-worker path, so the behavior
-                        // there is unchanged.
-                        if let Some(proxy) = crate::approval::current_approval_proxy() {
-                            let approved = proxy
-                                .request_approval(crate::approval::ApprovalAsk {
-                                    tool_name: tool_name.clone(),
-                                    permission: permission_type.description().to_string(),
-                                    resource: resource.clone(),
-                                })
-                                .await;
-                            if approved {
-                                // Treat as a granted context: check any remaining
-                                // contexts, then fall through to execution.
-                                continue;
-                            }
+                        resource: resource.clone(),
+                        operation_summary: operation_summary.clone(),
+                        risk_level,
+                        bypass_requested: ctx.bypass_permissions,
+                        platform_hard_deny: None,
+                        consume_once: true,
+                        supported_decisions,
+                    }) {
+                        crate::permission::PermissionOutcome::Allow { .. } => continue,
+                        crate::permission::PermissionOutcome::Deny { reason, .. } => {
+                            return Err(ToolError::Execution(reason.message));
+                        }
+                        crate::permission::PermissionOutcome::Ask(request) => request,
+                    }
+                } else {
+                    // Compatibility path for custom checkers that do not expose a
+                    // typed config. It remains one-shot only and fail-closed.
+                    let force_ask =
+                        permission_checker.requires_forced_confirmation(&tool_name, &args);
+                    if ctx.bypass_permissions && !force_ask {
+                        continue;
+                    }
+                    let decision = if force_ask {
+                        permission_checker.check_or_request_forced(context).await
+                    } else if let Some(session_id) = ctx.session_id {
+                        permission_checker
+                            .check_or_request_for_session(session_id, context)
+                            .await
+                    } else {
+                        permission_checker.check_or_request(context).await
+                    };
+                    match decision {
+                        Ok(true) => continue,
+                        Ok(false) => {
                             return Err(ToolError::Execution(format!(
-                                "Permission denied by host for: {}",
+                                "Permission denied for: {}",
                                 resource
                             )));
                         }
-
-                        // Interactive sessions pause for approval by reusing the
-                        // same pending-question pipeline as `request_permissions`:
-                        // synthesize an "awaiting_permission_approval" result that
-                        // the engine recognizes (via display_preference) and turns
-                        // into a NeedClarification pause. On approval the respond
-                        // handler records a session grant so the re-attempt passes.
-                        if let Some(tx) = ctx.event_tx {
-                            // Keep emitting the structured approval event for observers.
-                            let _ = tx
-                                .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
-                                    tool_call_id: call.id.clone(),
-                                    tool_name: tool_name.clone(),
-                                    parameters: args.clone(),
-                                })
-                                .await;
-
-                            let question = format!(
-                                "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
-                                tool_name,
-                                permission_type.description(),
-                                resource
-                            );
-                            let effective_mode = permission_checker
-                                .permission_config()
-                                .map(|config| config.mode())
-                                .unwrap_or(bamboo_config::settings::PermissionMode::Default);
-                            let permission_request = crate::permission::PermissionRequest {
+                        Err(PermissionError::ConfirmationRequired { .. }) => {
+                            crate::permission::PermissionRequest {
                                 request_id: call.id.clone(),
                                 session_id: ctx.session_id.unwrap_or_default().to_string(),
                                 workspace_path: None,
                                 tool_name: tool_name.clone(),
                                 permission_type,
                                 resource: resource.clone(),
-                                operation_summary,
+                                operation_summary: operation_summary.clone(),
                                 risk_level,
-                                reason_code: if permission_checker.permission_config().is_some_and(
-                                    |config| config.is_hard_dangerous(&tool_name, &args),
-                                ) {
-                                    crate::permission::PermissionReasonCode::HardDangerous
-                                } else if force_ask {
+                                reason_code: if force_ask {
                                     crate::permission::PermissionReasonCode::ConfiguredAlwaysAsk
                                 } else {
                                     crate::permission::PermissionReasonCode::RiskThreshold
                                 },
-                                effective_mode,
+                                effective_mode: bamboo_config::settings::PermissionMode::Default,
                                 bypass_requested: ctx.bypass_permissions,
                                 policy_revision: 0,
+                                matched_rule: None,
                                 allowed_decisions:
-                                    crate::permission::PermissionRequest::migration_decisions(),
-                                suggested_matchers: vec![crate::permission::PermissionMatcher {
-                                    id: "exact_resource".to_string(),
-                                    kind: crate::permission::PermissionMatcherKind::ExactResource,
-                                    value: resource.clone(),
-                                }],
-                            };
-                            let payload = serde_json::json!({
-                                "status": "awaiting_permission_approval",
-                                "question": question,
-                                "permission_type": permission_type,
-                                "resource": resource,
-                                "options": ["Approve", "Deny"],
-                                "allow_custom": false,
-                                "permission_request": permission_request,
-                            });
-                            // Permission-gate synthesized question stays on
-                            // the Completed→sniff path for now (a later Phase B
-                            // step converts this to ToolOutcome::NeedsHuman).
-                            return Ok(Some(ToolOutcome::Completed(ToolResult {
-                                success: true,
-                                result: payload.to_string(),
-                                display_preference: Some("request_permissions".to_string()),
-                                images: Vec::new(),
-                            })));
+                                    crate::permission::PermissionRequest::forced_decisions(),
+                                suggested_matchers: crate::permission::conservative_matchers(
+                                    permission_type,
+                                    &resource,
+                                ),
+                            }
                         }
+                        Err(other) => return Err(permission_error_to_tool_error(other)),
+                    }
+                };
 
-                        // Non-interactive (no event sink to surface the prompt):
-                        // fail closed rather than silently proceeding.
-                        return Err(ToolError::Execution(format!(
-                            "Permission approval required for: {}",
-                            resource
-                        )));
+                // A worker/external relay gets the same typed request but only
+                // one-shot decisions are advertised until its protocol supports
+                // a stronger scope. No boolean downgrade can create a grant.
+                if let Some(proxy) = proxy {
+                    let approved = proxy
+                        .request_approval(crate::approval::ApprovalAsk {
+                            tool_name: tool_name.clone(),
+                            permission: permission_type.description().to_string(),
+                            resource: resource.clone(),
+                            permission_request: Some(request.clone()),
+                        })
+                        .await;
+                    if approved {
+                        continue;
                     }
-                    Err(other) => {
-                        return Err(permission_error_to_tool_error(other));
-                    }
+                    return Err(ToolError::Execution(format!(
+                        "Permission denied by host for: {}",
+                        resource
+                    )));
                 }
+
+                // Interactive sessions pause through the legacy question shape
+                // while carrying the complete typed request alongside it.
+                if let Some(tx) = ctx.event_tx {
+                    let _ = tx
+                        .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
+                            tool_call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            parameters: args.clone(),
+                        })
+                        .await;
+
+                    let question = format!(
+                        "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
+                        tool_name,
+                        permission_type.description(),
+                        resource
+                    );
+                    if let Some(config) = config {
+                        config.register_pending_request(request.clone());
+                    }
+                    let payload = serde_json::json!({
+                        "status": "awaiting_permission_approval",
+                        "question": question,
+                        "permission_type": permission_type,
+                        "resource": resource,
+                        "options": ["Approve", "Deny"],
+                        "allow_custom": false,
+                        "permission_request": request,
+                    });
+                    return Ok(Some(ToolOutcome::Completed(ToolResult {
+                        success: true,
+                        result: payload.to_string(),
+                        display_preference: Some("request_permissions".to_string()),
+                        images: Vec::new(),
+                    })));
+                }
+
+                return Err(ToolError::Execution(format!(
+                    "Permission approval required for: {}",
+                    resource
+                )));
             }
         }
 
@@ -1304,6 +1294,7 @@ mod tests {
         // preserve as `Ok(Some(outcome))` rather than collapse to an `Err`.
         let config = Arc::new(crate::permission::PermissionConfig::new());
         config.set_ask_rules(["Write(/etc/**)".to_string()]);
+        config.register_session_workspace("s-interactive", "/workspace/project");
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = make_executor(Some(checker));
 
@@ -1338,6 +1329,7 @@ mod tests {
         let request = &payload["permission_request"];
         assert_eq!(request["request_id"], call.id);
         assert_eq!(request["session_id"], "s-interactive");
+        assert_eq!(request["workspace_path"], "/workspace/project");
         assert_eq!(request["reason_code"], "configured_always_ask");
         assert_eq!(
             request["allowed_decisions"],

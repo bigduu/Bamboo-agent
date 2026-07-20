@@ -22,7 +22,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::fleet::{spawn_worker_on_bus, SpawnedChild};
-use bamboo_subagent::proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
+use bamboo_subagent::proto::{
+    AgentRecord, ChildFrame, ParentFrame, PermissionPolicyContext, RunSpec, TerminalStatus,
+};
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
 };
@@ -111,6 +113,7 @@ enum PlacementKind {
 /// Spawns and drives a child session as an independent actor: a `bamboo-subagent` worker process.
 pub struct ActorChildRunner {
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     agent_id: String,
     worker_bin: PathBuf,
     worker_args: Vec<String>,
@@ -139,6 +142,10 @@ pub struct ActorChildRunner {
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
     approval_decider: Option<Arc<dyn ChildApprovalDecider>>,
+    /// Off-loop parent-agent reviewer for forced-ask requests. The root server
+    /// wires a session-aware reviewer; nested workers wire their owning model
+    /// reviewer directly into the per-run runner.
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
     /// Per-run escalation host bridge for non-bypass child-approval routing (#68;
     /// Phase 6, Part B). The owning worker's `run()` installs its OWN host bridge
     /// here via `set_escalation_bridge`; `execute_external_child` CAPTURES it at
@@ -231,7 +238,12 @@ fn approval_request_fields(body: &serde_json::Value) -> (String, String, String)
 pub trait ChildApprovalReviewer: Send + Sync {
     /// Judge whether the gated action `request` (`{tool_name, permission,
     /// resource}`) is reasonable for `child_session_id`'s task. `true` = approve.
-    async fn review(&self, child_session_id: &str, request: &serde_json::Value) -> bool;
+    async fn review(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        request: &serde_json::Value,
+    ) -> bool;
 }
 
 fn child_approval_reviewer_slot() -> &'static std::sync::OnceLock<Arc<dyn ChildApprovalReviewer>> {
@@ -263,6 +275,7 @@ impl ActorChildRunner {
     ) -> Self {
         Self {
             approval_registry: None,
+            permission_config: None,
             agent_id,
             worker_bin,
             worker_args,
@@ -275,6 +288,7 @@ impl ActorChildRunner {
             pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
             approval_decider: None,
+            approval_reviewer: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
             remote_placements: HashMap::new(),
             schedulable_placements: HashMap::new(),
@@ -287,6 +301,14 @@ impl ActorChildRunner {
         registry: super::approval_registry::SharedApprovalRegistry,
     ) -> Self {
         self.approval_registry = Some(registry);
+        self
+    }
+
+    pub fn with_permission_config(
+        mut self,
+        config: Arc<bamboo_tools::permission::PermissionConfig>,
+    ) -> Self {
+        self.permission_config = Some(config);
         self
     }
 
@@ -303,6 +325,11 @@ impl ActorChildRunner {
     /// (Phase 2). Without this the host fail-closed DENYs every request.
     pub fn with_approval_decider(mut self, decider: Arc<dyn ChildApprovalDecider>) -> Self {
         self.approval_decider = Some(decider);
+        self
+    }
+
+    pub fn with_approval_reviewer(mut self, reviewer: Arc<dyn ChildApprovalReviewer>) -> Self {
+        self.approval_reviewer = Some(reviewer);
         self
     }
 
@@ -698,6 +725,25 @@ impl ExternalChildRunner for ActorChildRunner {
             .iter()
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect();
+        // Policy is captured per activation (not only when a worker is
+        // provisioned), so reused local workers and resident remote/broker
+        // workers observe the latest durable revision and bypass flag at the
+        // next run boundary. Session grants are intentionally not inherited.
+        let permission_policy = self.permission_config.as_ref().and_then(|config| {
+            serde_json::to_value(config.to_serializable())
+                .ok()
+                .map(|policy| PermissionPolicyContext {
+                    revision: config.policy_revision(),
+                    bypass_permissions: session
+                        .agent_runtime_state
+                        .as_ref()
+                        .is_some_and(|state| state.bypass_permissions),
+                    session_id: session.id.clone(),
+                    workspace_path: session.workspace.clone(),
+                    inherit_session_grants: false,
+                    policy,
+                })
+        });
 
         // Backpressure: hold a concurrency slot for the lifetime of the *run*
         // (cancellation still proceeds — the cancel branch in drive() runs while
@@ -886,6 +932,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                     assignment: assignment.clone(),
                     reasoning_effort: None,
+                    permission_policy: permission_policy.clone(),
                     messages: messages.clone(),
                 }))
                 .await
@@ -914,6 +961,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 attempt as u32,
                 self.approval_registry.as_ref(),
                 self.approval_decider.as_ref(),
+                self.approval_reviewer.as_ref(),
                 escalation.clone(),
                 &event_tx,
                 &cancel_token,
@@ -1048,6 +1096,7 @@ async fn drive(
     child_attempt: u32,
     approval_registry: Option<&super::approval_registry::SharedApprovalRegistry>,
     approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
+    approval_reviewer: Option<&Arc<dyn ChildApprovalReviewer>>,
     escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
@@ -1103,7 +1152,10 @@ async fn drive(
                         // a per-run task-local `ApprovalProxy` (subagent_worker.rs)
                         // that calls `host.approval_call`, so this frame arrives
                         // when a child hits `ConfirmationRequired`.
-                        if let Some(reviewer) = child_approval_reviewer() {
+                        if let Some(reviewer) = approval_reviewer
+                            .cloned()
+                            .or_else(child_approval_reviewer)
+                        {
                             // Phase 6, Part B: a BYPASSED parent worker
                             // model-reviews its children's forced-ask (dangerous)
                             // actions. The review is an LLM call, so run it OFF
@@ -1112,13 +1164,14 @@ async fn drive(
                             // forwarding events and the agent loop never blocks. A
                             // timeout denies a hung review so the child can't hang.
                             let child = child_session_id.to_string();
+                            let parent = parent_session_id.to_string();
                             let req_id = id.clone();
                             let body = body.clone();
                             let registry = approval_registry.cloned();
                             tokio::spawn(async move {
                                 let approved = tokio::time::timeout(
                                     CHILD_APPROVAL_TIMEOUT,
-                                    reviewer.review(&child, &body),
+                                    reviewer.review(&parent, &child, &body),
                                 )
                                 .await
                                 .unwrap_or(false);
@@ -1494,6 +1547,20 @@ mod tests {
         }
     }
 
+    struct RecordingReviewer {
+        reviewed: mpsc::UnboundedSender<(String, String, serde_json::Value)>,
+    }
+
+    #[async_trait]
+    impl ChildApprovalReviewer for RecordingReviewer {
+        async fn review(&self, parent: &str, child: &str, request: &serde_json::Value) -> bool {
+            let _ = self
+                .reviewed
+                .send((parent.to_string(), child.to_string(), request.clone()));
+            true
+        }
+    }
+
     // ---- first-frame watchdog (dead-pooled-worker recovery) -----------------
 
     /// A link that never yields a frame — models a worker that died (or never
@@ -1512,6 +1579,84 @@ mod tests {
     /// A link that immediately yields one terminal frame (a healthy fast worker).
     struct InstantTerminalLink {
         done: bool,
+    }
+
+    struct ApprovalThenTerminalLink {
+        step: u8,
+    }
+
+    #[async_trait]
+    impl bamboo_subagent::ChildLink for ApprovalThenTerminalLink {
+        async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            Ok(())
+        }
+
+        async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+            self.step += 1;
+            match self.step {
+                1 => Ok(Some(ChildFrame::ApprovalRequest {
+                    id: "approval-1".into(),
+                    body: serde_json::json!({
+                        "tool_name": "Bash",
+                        "permission": "execute",
+                        "resource": "rm -rf target",
+                        "permission_request": {"reason_code": "hard_dangerous"}
+                    }),
+                })),
+                2 => Ok(Some(ChildFrame::Terminal {
+                    status: TerminalStatus::Completed,
+                    result: Some("done".into()),
+                    error: None,
+                    transcript: vec![],
+                })),
+                _ => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_routes_forced_ask_to_parent_reviewer_without_human_event() {
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let reviewer: Arc<dyn ChildApprovalReviewer> = Arc::new(RecordingReviewer {
+            reviewed: review_tx,
+        });
+        let cancel = CancellationToken::new();
+        let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let mut link = ApprovalThenTerminalLink { step: 0 };
+
+        let result = drive(
+            &mut link,
+            "parent-reviewer",
+            "child-reviewer",
+            0,
+            None,
+            None,
+            Some(&reviewer),
+            None,
+            &event_tx,
+            &cancel,
+            &mut live_rx,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.ok().flatten().as_deref(), Some("done"));
+        let (parent, child, body) = tokio::time::timeout(Duration::from_secs(1), review_rx.recv())
+            .await
+            .expect("reviewer should be invoked off-loop")
+            .expect("review channel should remain open");
+        assert_eq!(parent, "parent-reviewer");
+        assert_eq!(child, "child-reviewer");
+        assert_eq!(
+            body.pointer("/permission_request/reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("hard_dangerous")
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must not emit a human-review event"
+        );
     }
     #[async_trait]
     impl bamboo_subagent::ChildLink for InstantTerminalLink {
@@ -1547,6 +1692,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &event_tx,
             &cancel,
             &mut live_rx,
@@ -1572,6 +1718,7 @@ mod tests {
             "parent-y",
             "child-y",
             0,
+            None,
             None,
             None,
             None,

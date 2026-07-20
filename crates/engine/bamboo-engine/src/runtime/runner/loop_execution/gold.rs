@@ -119,6 +119,11 @@ pub(super) async fn evaluate_gold_terminal(
             event_tx,
             session_id,
             model: model_name,
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::new(
+                config.stream_timeout,
+                config.provider_name.as_deref(),
+                Some(model_name),
+            ),
             reasoning_effort,
             checkpoint: GoldCheckpoint::Terminal,
             iteration,
@@ -476,6 +481,11 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         config.reasoning_effort,
         GoldCheckpoint::PostRound,
         gold_config,
+        crate::runtime::stream::handler::StreamTimeoutContext::new(
+            config.stream_timeout,
+            config.provider_name.as_deref(),
+            eval_model,
+        ),
     )?;
     let Some(request) = request else {
         return Ok(());

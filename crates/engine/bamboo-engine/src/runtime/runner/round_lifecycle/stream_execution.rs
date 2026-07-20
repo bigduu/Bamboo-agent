@@ -821,11 +821,17 @@ pub(super) async fn execute_llm_stream(
         );
     }
 
-    let stream_output = crate::runtime::stream::handler::consume_llm_stream(
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+        config.stream_timeout,
+        provider_name,
+        Some(model),
+    );
+    let stream_output = crate::runtime::stream::handler::consume_llm_stream_with_context(
         stream,
         event_tx,
         cancel_token,
         session_id,
+        &timeout_context,
     )
     .await?;
 

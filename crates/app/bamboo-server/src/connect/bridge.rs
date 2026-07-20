@@ -761,6 +761,19 @@ impl ConnectBridge {
 
         session.add_message(Message::user(text.to_string()));
         let session_id = session.id.clone();
+        if let Some(config) = self.ctx.permission_checker.permission_config() {
+            if let Some(workspace) = session.workspace.as_ref() {
+                config.register_session_workspace(session_id.clone(), workspace.clone());
+            }
+            session.metadata.insert(
+                "permission.policy_revision".to_string(),
+                config.policy_revision().to_string(),
+            );
+            session.metadata.insert(
+                "permission.effective_mode".to_string(),
+                format!("{:?}", config.mode()).to_ascii_lowercase(),
+            );
+        }
         self.ctx.session_repo.save_and_cache(&mut session).await;
 
         let session_tx =

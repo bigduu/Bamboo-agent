@@ -698,6 +698,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "one two".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await
@@ -748,6 +749,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "go".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await
@@ -799,6 +801,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await
@@ -879,6 +882,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "start".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await
@@ -955,6 +959,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "go".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await
@@ -1006,6 +1011,7 @@ mod tests {
                 .send(ParentFrame::Run(RunSpec {
                     assignment: "__sleep_ms:300 alpha only".into(),
                     reasoning_effort: None,
+                    permission_policy: None,
                     messages: Vec::new(),
                 }))
                 .await
@@ -1021,6 +1027,7 @@ mod tests {
                 .send(ParentFrame::Run(RunSpec {
                     assignment: "beta only".into(),
                     reasoning_effort: None,
+                    permission_policy: None,
                     messages: Vec::new(),
                 }))
                 .await
@@ -1122,6 +1129,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "first".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await
@@ -1139,6 +1147,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "second".into(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: Vec::new(),
             }))
             .await

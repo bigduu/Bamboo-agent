@@ -294,6 +294,7 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
         .send(ParentFrame::Run(RunSpec {
             assignment: prompt.to_string(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: Vec::new(),
         }))
         .await

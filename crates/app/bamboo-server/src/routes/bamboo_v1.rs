@@ -150,6 +150,30 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::put().to(settings::update_permission_ask_rules),
         )
         .route(
+            "/bamboo/permission/policy",
+            web::get().to(settings::get_permission_policy),
+        )
+        .route(
+            "/bamboo/permission/rules",
+            web::get().to(settings::get_permission_policy),
+        )
+        .route(
+            "/bamboo/permission/rules",
+            web::post().to(settings::create_permission_rule),
+        )
+        .route(
+            "/bamboo/permission/rules/{rule_id}",
+            web::put().to(settings::update_permission_rule),
+        )
+        .route(
+            "/bamboo/permission/rules/{rule_id}",
+            web::delete().to(settings::delete_permission_rule),
+        )
+        .route(
+            "/bamboo/permission/diagnose",
+            web::post().to(settings::diagnose_permission),
+        )
+        .route(
             "/bamboo/settings/provider",
             web::get().to(settings::get_provider_config),
         )
