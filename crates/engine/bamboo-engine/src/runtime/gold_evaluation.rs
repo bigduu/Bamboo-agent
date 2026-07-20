@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::GoldConfig;
-use crate::runtime::stream::handler::consume_llm_stream_silent;
+use crate::runtime::stream::handler::{
+    consume_llm_stream_silent_with_context, StreamTimeoutContext,
+};
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -23,6 +25,7 @@ pub struct GoldEvalFrame<'a> {
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub session_id: &'a str,
     pub model: &'a str,
+    pub timeout_context: StreamTimeoutContext,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub checkpoint: GoldCheckpoint,
     pub iteration: u32,
@@ -49,6 +52,7 @@ pub(crate) struct AsyncGoldEvaluationRequest {
     pub(crate) session_id: String,
     pub(crate) round_number: usize,
     pub(crate) model_name: String,
+    pub(crate) timeout_context: StreamTimeoutContext,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) checkpoint: GoldCheckpoint,
     pub(crate) session_snapshot: Session,
@@ -103,6 +107,7 @@ pub(crate) fn build_async_gold_evaluation_request(
     reasoning_effort: Option<ReasoningEffort>,
     checkpoint: GoldCheckpoint,
     gold_config: &GoldConfig,
+    timeout_context: StreamTimeoutContext,
 ) -> Result<Option<AsyncGoldEvaluationRequest>, AgentError> {
     if !gold_config.enabled {
         return Ok(None);
@@ -118,6 +123,7 @@ pub(crate) fn build_async_gold_evaluation_request(
         session_id: session_id.to_string(),
         round_number,
         model_name: model_name.to_string(),
+        timeout_context,
         reasoning_effort,
         checkpoint,
         session_snapshot: session.clone(),
@@ -140,6 +146,7 @@ pub(crate) async fn execute_async_gold_evaluation(
             event_tx: &event_tx,
             session_id: &request.session_id,
             model: &request.model_name,
+            timeout_context: request.timeout_context.clone(),
             reasoning_effort: request.reasoning_effort,
             checkpoint: request.checkpoint,
             iteration: request.round_number as u32,
@@ -216,10 +223,13 @@ pub async fn evaluate_gold(
         .await
     {
         Ok(stream) => {
-            let stream_output =
-                consume_llm_stream_silent(stream, &CancellationToken::new(), session_id)
-                    .await
-                    .map_err(|error| AgentError::LLM(error.to_string()))?;
+            let stream_output = consume_llm_stream_silent_with_context(
+                stream,
+                &CancellationToken::new(),
+                session_id,
+                &frame.timeout_context,
+            )
+            .await?;
 
             let result = parse_gold_evaluation(
                 &stream_output.content,

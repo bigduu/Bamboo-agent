@@ -70,6 +70,113 @@ use crate::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
 use bamboo_domain::tool_names::normalize_tool_ref;
 use bamboo_domain::ReasoningEffort;
 
+/// Minimum accepted watchdog deadline. Zero would turn scheduling jitter into
+/// an immediate stream failure, so it is rejected at the configuration boundary.
+pub const MIN_STREAM_TIMEOUT_SECS: u64 = 1;
+/// Maximum accepted watchdog deadline. This keeps a typo from disabling hung
+/// stream detection for days while still allowing operators to accommodate
+/// exceptionally slow reasoning models.
+pub const MAX_STREAM_TIMEOUT_SECS: u64 = 86_400;
+
+fn default_transport_idle_timeout_secs() -> u64 {
+    120
+}
+
+fn default_first_semantic_timeout_secs() -> u64 {
+    600
+}
+
+fn default_semantic_idle_timeout_secs() -> u64 {
+    600
+}
+
+fn deserialize_stream_timeout_secs<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = u64::deserialize(deserializer)?;
+    if (MIN_STREAM_TIMEOUT_SECS..=MAX_STREAM_TIMEOUT_SECS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(D::Error::custom(format!(
+            "stream timeout must be between {MIN_STREAM_TIMEOUT_SECS} and \
+             {MAX_STREAM_TIMEOUT_SECS} seconds, got {value}"
+        )))
+    }
+}
+
+/// LLM stream watchdog policy shared by the main response path and auxiliary
+/// silent consumers.
+///
+/// Transport and semantic progress are deliberately separate. Valid SSE
+/// lifecycle/keepalive frames refresh `transport_idle_timeout_secs` without
+/// hiding a model that never produces semantic output. The first semantic
+/// deadline starts at request dispatch; after the first token/reasoning/tool
+/// delta, `semantic_idle_timeout_secs` becomes the semantic deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamTimeoutConfig {
+    /// Maximum gap between valid transport frames, including SSE keepalives.
+    #[serde(
+        default = "default_transport_idle_timeout_secs",
+        deserialize_with = "deserialize_stream_timeout_secs"
+    )]
+    pub transport_idle_timeout_secs: u64,
+    /// Maximum time from request dispatch to the first semantic chunk.
+    #[serde(
+        default = "default_first_semantic_timeout_secs",
+        deserialize_with = "deserialize_stream_timeout_secs"
+    )]
+    pub first_semantic_timeout_secs: u64,
+    /// Maximum gap between semantic chunks after semantic output has started.
+    #[serde(
+        default = "default_semantic_idle_timeout_secs",
+        deserialize_with = "deserialize_stream_timeout_secs"
+    )]
+    pub semantic_idle_timeout_secs: u64,
+}
+
+impl Default for StreamTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            transport_idle_timeout_secs: default_transport_idle_timeout_secs(),
+            first_semantic_timeout_secs: default_first_semantic_timeout_secs(),
+            semantic_idle_timeout_secs: default_semantic_idle_timeout_secs(),
+        }
+    }
+}
+
+impl StreamTimeoutConfig {
+    /// Validate values created programmatically (serde performs the same check
+    /// while loading `config.json`).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (name, value) in [
+            (
+                "transport_idle_timeout_secs",
+                self.transport_idle_timeout_secs,
+            ),
+            (
+                "first_semantic_timeout_secs",
+                self.first_semantic_timeout_secs,
+            ),
+            (
+                "semantic_idle_timeout_secs",
+                self.semantic_idle_timeout_secs,
+            ),
+        ] {
+            if !(MIN_STREAM_TIMEOUT_SECS..=MAX_STREAM_TIMEOUT_SECS).contains(&value) {
+                return Err(format!(
+                    "{name} must be between {MIN_STREAM_TIMEOUT_SECS} and \
+                     {MAX_STREAM_TIMEOUT_SECS} seconds, got {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A user-managed environment variable that is injected into Bash tool processes.
 ///
 /// Secret entries are encrypted at rest: `value` is empty on disk and populated
@@ -1257,6 +1364,10 @@ pub struct ConfigValues {
     #[serde(default)]
     pub run_budget: RunBudgetConfig,
 
+    /// LLM stream liveness and semantic-progress watchdog policy.
+    #[serde(default)]
+    pub stream_timeout: StreamTimeoutConfig,
+
     /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
     /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
     /// ⇒ empty. SSH secrets are encrypted at rest (see [`crate::cluster_fabric`]).
@@ -1312,6 +1423,7 @@ impl Default for ConfigValues {
             proxy_auth_encrypted: None,
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
+            stream_timeout: StreamTimeoutConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
             provider_instances: HashMap::new(),
@@ -1416,6 +1528,8 @@ struct ExecutionConfigSection {
     features: FeatureFlags,
     #[serde(default)]
     run_budget: RunBudgetConfig,
+    #[serde(default)]
+    stream_timeout: StreamTimeoutConfig,
     #[serde(
         default,
         skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty"
@@ -1525,6 +1639,7 @@ impl From<ConfigValues> for ConfigRoot {
             access_control,
             features,
             run_budget,
+            stream_timeout,
             cluster_fabric,
             mcp,
             notifications,
@@ -1563,6 +1678,7 @@ impl From<ConfigValues> for ConfigRoot {
             execution: ExecutionConfigSection {
                 features,
                 run_budget,
+                stream_timeout,
                 cluster_fabric,
             },
             integrations: IntegrationConfigSection {
@@ -1619,6 +1735,7 @@ impl From<ConfigRoot> for ConfigValues {
         let ExecutionConfigSection {
             features,
             run_budget,
+            stream_timeout,
             cluster_fabric,
         } = execution;
         let IntegrationConfigSection {
@@ -1649,6 +1766,7 @@ impl From<ConfigRoot> for ConfigValues {
             access_control,
             features,
             run_budget,
+            stream_timeout,
             cluster_fabric,
             mcp,
             notifications,
@@ -3521,6 +3639,7 @@ impl Config {
                 proxy_auth_encrypted: None,
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
+                stream_timeout: StreamTimeoutConfig::default(),
                 cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
                 provider: default_provider(),
                 provider_instances: HashMap::new(),
@@ -4124,6 +4243,68 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn stream_timeout_defaults_are_safe_and_back_compatible() {
+        let root: ConfigRoot = serde_json::from_value(serde_json::json!({}))
+            .expect("legacy config without stream_timeout should load");
+        let values = ConfigValues::from(root);
+
+        assert_eq!(
+            values.stream_timeout,
+            StreamTimeoutConfig {
+                transport_idle_timeout_secs: 120,
+                first_semantic_timeout_secs: 600,
+                semantic_idle_timeout_secs: 600,
+            }
+        );
+        values
+            .stream_timeout
+            .validate()
+            .expect("defaults are valid");
+    }
+
+    #[test]
+    fn stream_timeout_round_trips_through_persistence_dto() {
+        let values = ConfigValues {
+            stream_timeout: StreamTimeoutConfig {
+                transport_idle_timeout_secs: 45,
+                first_semantic_timeout_secs: 900,
+                semantic_idle_timeout_secs: 300,
+            },
+            ..ConfigValues::default()
+        };
+
+        let json = serde_json::to_value(ConfigRoot::from(values)).expect("serialize config root");
+        assert_eq!(json["stream_timeout"]["transport_idle_timeout_secs"], 45);
+        assert_eq!(json["stream_timeout"]["first_semantic_timeout_secs"], 900);
+        assert_eq!(json["stream_timeout"]["semantic_idle_timeout_secs"], 300);
+
+        let root: ConfigRoot = serde_json::from_value(json).expect("deserialize config root");
+        assert_eq!(
+            ConfigValues::from(root).stream_timeout,
+            StreamTimeoutConfig {
+                transport_idle_timeout_secs: 45,
+                first_semantic_timeout_secs: 900,
+                semantic_idle_timeout_secs: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_timeout_rejects_zero_and_unbounded_values() {
+        for (field, invalid) in [
+            ("transport_idle_timeout_secs", 0),
+            ("first_semantic_timeout_secs", MAX_STREAM_TIMEOUT_SECS + 1),
+            ("semantic_idle_timeout_secs", 0),
+        ] {
+            let mut timeout = serde_json::json!({});
+            timeout[field] = serde_json::json!(invalid);
+            let error = serde_json::from_value::<StreamTimeoutConfig>(timeout)
+                .expect_err("invalid timeout must be rejected");
+            assert!(error.to_string().contains("stream timeout must be between"));
+        }
+    }
 
     struct EnvVarGuard {
         key: &'static str,

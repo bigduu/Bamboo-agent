@@ -38,7 +38,8 @@ fn to_stream_error(err: LLMError) -> LLMError {
 ///
 /// `handler` receives the SSE event name and data payload for each event, and can either:
 /// - return `Ok(Some(chunk))` to emit a chunk
-/// - return `Ok(None)` to skip an event
+/// - return `Ok(None)` when an event has no semantic chunk; the adapter emits
+///   an internal [`LLMChunk::TransportActivity`] marker so liveness is retained
 /// - return `Err(_)` to emit a stream error (mapped to `LLMError::Stream`)
 ///
 /// This is the common case where each SSE event yields at most one chunk.
@@ -55,7 +56,9 @@ where
 }
 
 /// Like [`llm_stream_from_sse`], but the handler may emit **zero or more**
-/// chunks per SSE event; they are flattened into the stream in order.
+/// chunks per SSE event; they are flattened into the stream in order. A valid
+/// event producing zero chunks becomes one [`LLMChunk::TransportActivity`]
+/// marker rather than disappearing from the transport watchdog.
 ///
 /// This is required for providers where a single SSE event must surface
 /// multiple logical chunks. The motivating case is Gemini: a final
@@ -78,6 +81,7 @@ where
         })
         .flat_map(|result| {
             stream::iter(match result {
+                Ok(chunks) if chunks.is_empty() => vec![Ok(LLMChunk::TransportActivity)],
                 Ok(chunks) => chunks.into_iter().map(Ok).collect::<Vec<_>>(),
                 Err(err) => vec![Err(err)],
             })
@@ -89,6 +93,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::anthropic::{parse_anthropic_sse_event, AnthropicStreamState};
+    use crate::providers::common::openai_responses::ResponsesSseParser;
     use futures::StreamExt;
     use serde_json::json;
     // use http; // TODO: add http crate if needed
@@ -113,7 +119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_stream_from_sse_filters_none_and_passes_event_name_and_data() {
+    async fn llm_stream_from_sse_preserves_filtered_event_as_transport_activity() {
         let sse_body = concat!(
             "event: token\n",
             "data: hello\n",
@@ -143,11 +149,58 @@ mod tests {
             out.push(item.expect("chunk"));
         }
 
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         match &out[0] {
             LLMChunk::Token(token) => assert_eq!(token, "token:hello"),
             other => panic!("expected LLMChunk::Token, got {other:?}"),
         }
+        assert!(matches!(out[1], LLMChunk::TransportActivity));
+    }
+
+    #[tokio::test]
+    async fn anthropic_ping_is_preserved_as_transport_activity() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body("event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string())
+                .expect("http response"),
+        );
+        let mut state = AnthropicStreamState::default();
+        let mut stream = llm_stream_from_sse(response, move |event, data| {
+            parse_anthropic_sse_event(&mut state, event, data)
+        });
+
+        let chunk = stream
+            .next()
+            .await
+            .expect("ping should yield a liveness marker")
+            .expect("ping should not fail the stream");
+        assert!(matches!(chunk, LLMChunk::TransportActivity));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_responses_keepalive_is_preserved_as_transport_activity() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body("event: ping\ndata: keep-alive\n\n".to_string())
+                .expect("http response"),
+        );
+        let mut parser = ResponsesSseParser::new();
+        let mut stream = llm_stream_from_sse(response, move |event, data| {
+            parser.handle_event(event, data)
+        });
+
+        let chunk = stream
+            .next()
+            .await
+            .expect("keepalive should yield a liveness marker")
+            .expect("keepalive should not fail the stream");
+        assert!(matches!(chunk, LLMChunk::TransportActivity));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
