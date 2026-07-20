@@ -683,6 +683,7 @@ mod tests {
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::tool_names::{normalize_tool_ref, BUILTIN_TOOL_NAMES};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::fs;
     use tokio::sync::mpsc;
@@ -724,6 +725,18 @@ mod tests {
         };
 
         builder.build()
+    }
+
+    struct RecordingApprovalProxy {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::approval::ApprovalProxy for RecordingApprovalProxy {
+        async fn request_approval(&self, _ask: crate::approval::ApprovalAsk) -> bool {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            true
+        }
     }
 
     #[test]
@@ -1156,29 +1169,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_bypass_permissions_skips_checker() {
-        // Even with a deny-all checker, a context flagged `bypass_permissions`
-        // must skip the permission check entirely and let the write through.
+        // Model the worker side of a child whose parent bypass flag was inherited:
+        // an ordinary tool must execute directly. Even though both a parent
+        // approval proxy and a human-event sink are installed, neither path may
+        // be touched. Forced-ask still takes the proxy path in the separate
+        // approval regression below.
         let checker = Arc::new(crate::permission::DenyDangerousPermissionChecker);
         let executor = make_executor(Some(checker));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bypass_allows_write.txt");
         let path_str = path.to_str().unwrap();
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(RecordingApprovalProxy {
+            requests: approval_requests.clone(),
+        });
+        let (event_tx, mut event_rx) = mpsc::channel(8);
 
         let call = make_tool_call("Write", json!({"file_path": path_str, "content": "ok"}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-bypass"),
             tool_call_id: &call.id,
-            event_tx: None,
+            event_tx: Some(&event_tx),
             available_tool_schemas: None,
             bypass_permissions: true,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
         };
-        let result = executor.execute_with_context(&call, ctx).await;
+        let result = crate::approval::with_approval_proxy(
+            Some(proxy),
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
 
         assert!(result.is_ok(), "bypass should allow the write: {result:?}");
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "ok");
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            0,
+            "ordinary bypassed child command must not invoke the parent reviewer"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "ordinary bypassed child command must not emit a human approval event"
+        );
     }
 
     #[tokio::test]

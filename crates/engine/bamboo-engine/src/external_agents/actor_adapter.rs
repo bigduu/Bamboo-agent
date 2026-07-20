@@ -1858,6 +1858,28 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_preserves_inherited_bypass_for_child_worker() {
+        // `create_child_action` copies a bypassed parent's posture onto the child
+        // session. Lock down the next actor-boundary hop too: the provisioned
+        // worker must receive that inherited flag so ordinary child tools can
+        // execute directly instead of raising an approval frame.
+        let runner = bogus_runner(HashMap::new());
+        let mut child = session_of_role("explorer", "run an ordinary command");
+        child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .bypass_permissions = true;
+
+        let spec = runner.build_spec(&child, &job_for("child-1"));
+
+        assert!(spec.capabilities.bypass, "child worker must inherit bypass");
+        assert!(
+            spec.capabilities.enforce_permissions,
+            "forced-ask evaluation must remain active under bypass"
+        );
+    }
+
+    #[test]
     fn placement_metadata_stamps_remote_and_schedulable_not_local() {
         // Local children carry no stamp — the DTO defaults them to the backend host.
         assert_eq!(placement_metadata(&Placement::Local, None), None);
