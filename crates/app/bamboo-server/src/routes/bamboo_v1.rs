@@ -43,6 +43,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(workflow_runs::start),
         )
         .route(
+            "/sessions/{session_id}/workflow-runs",
+            web::get().to(workflow_runs::list),
+        )
+        .route(
             "/sessions/{session_id}/workflow-runs/{run_id}",
             web::get().to(workflow_runs::get),
         )
@@ -184,6 +188,30 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
         .route(
             "/bamboo/permission/ask-rules",
             web::put().to(settings::update_permission_ask_rules),
+        )
+        .route(
+            "/bamboo/permission/policy",
+            web::get().to(settings::get_permission_policy),
+        )
+        .route(
+            "/bamboo/permission/rules",
+            web::get().to(settings::get_permission_policy),
+        )
+        .route(
+            "/bamboo/permission/rules",
+            web::post().to(settings::create_permission_rule),
+        )
+        .route(
+            "/bamboo/permission/rules/{rule_id}",
+            web::put().to(settings::update_permission_rule),
+        )
+        .route(
+            "/bamboo/permission/rules/{rule_id}",
+            web::delete().to(settings::delete_permission_rule),
+        )
+        .route(
+            "/bamboo/permission/diagnose",
+            web::post().to(settings::diagnose_permission),
         )
         .route(
             "/bamboo/settings/provider",

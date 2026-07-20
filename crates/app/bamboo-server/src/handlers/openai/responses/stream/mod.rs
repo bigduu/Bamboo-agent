@@ -46,6 +46,7 @@ pub(super) async fn handle_streaming_response(
         session_id: None,
         reasoning_effort: prepared.reasoning_effort,
         parallel_tool_calls: prepared.parallel_tool_calls,
+        required_tool: None,
         responses: Some(prepared.responses_options.clone()),
         request_purpose: Some("openai_compat".to_string()),
         cache: None,

@@ -282,6 +282,13 @@ pub struct AppState {
     /// executors use. Retained so request handlers can record session grants
     /// when the user approves a permission prompt (see the respond handler).
     pub permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
+
+    /// Durable, revisioned authority for permission policy. The checker is
+    /// updated only after a successful commit to this section.
+    pub permission_section: Arc<bamboo_tools::permission::PermissionSection>,
+
+    /// Serializes the complete permission commit + live-checker publication.
+    pub permission_io_lock: Arc<tokio::sync::Mutex<()>>,
     pub approval_registry:
         bamboo_engine::external_agents::approval_registry::SharedApprovalRegistry,
 
@@ -459,6 +466,7 @@ mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
 pub(crate) use config_runtime::ConfigSectionMutationError;
 pub mod init;
+pub mod parent_approval_reviewer;
 mod persistence;
 mod provider_api;
 pub mod resume_adapter;

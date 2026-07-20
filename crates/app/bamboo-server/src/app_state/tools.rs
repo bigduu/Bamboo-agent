@@ -44,7 +44,7 @@ pub(super) fn build_base_tools(
     let builtin_executor = Arc::new(
         bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
             config.clone(),
-            permission_checker,
+            permission_checker.clone(),
         ),
     );
     let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor;
@@ -80,11 +80,17 @@ pub(super) fn build_base_tools(
         ledger_tool,
     ));
 
-    let load_skill_tool = Arc::new(crate::tools::LoadSkillTool::new(
-        skill_manager.clone(),
-        config.clone(),
-        session_repo.clone(),
-    ));
+    let load_skill_tool = Arc::new(
+        crate::tools::LoadSkillTool::new(
+            skill_manager.clone(),
+            config.clone(),
+            session_repo.clone(),
+        )
+        .with_permission_checked_context_registry(
+            with_ledger.clone(),
+            permission_checker.permission_config(),
+        ),
+    );
     let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_ledger,
         load_skill_tool,

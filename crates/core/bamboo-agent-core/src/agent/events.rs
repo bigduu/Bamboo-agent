@@ -660,6 +660,23 @@ pub enum AgentEvent {
     #[serde(rename = "config.recovered")]
     ConfigRecovered { section: String, revision: u64 },
 
+    /// An instruction workflow became the session's fixed active revision.
+    WorkflowActivated {
+        event_id: String,
+        session_id: String,
+        workflow_id: String,
+        revision: u64,
+        invoked_by: String,
+    },
+
+    /// The previously active instruction workflow was explicitly superseded.
+    WorkflowDeactivated {
+        event_id: String,
+        session_id: String,
+        workflow_id: String,
+        revision: u64,
+    },
+
     /// A user-facing notification derived from agent activity by the backend
     /// notification policy. Clients render this (e.g. an OS desktop notification)
     /// after applying their own presence checks (window focus). The decision of
@@ -720,6 +737,8 @@ impl AgentEvent {
             | AgentEvent::MessageAppended { session_id, .. }
             | AgentEvent::ExecutionStarted { session_id, .. }
             | AgentEvent::BudgetExceeded { session_id, .. }
+            | AgentEvent::WorkflowActivated { session_id, .. }
+            | AgentEvent::WorkflowDeactivated { session_id, .. }
             | AgentEvent::Notification { session_id, .. } => Some(session_id.as_str()),
             AgentEvent::SubAgentStarted {
                 parent_session_id, ..
@@ -784,6 +803,8 @@ impl AgentEvent {
                 | AgentEvent::ConfigInvalid { .. }
                 | AgentEvent::ConfigRecovered { .. }
                 | AgentEvent::WorkflowRecovered { .. }
+                | AgentEvent::WorkflowActivated { .. }
+                | AgentEvent::WorkflowDeactivated { .. }
         )
     }
 }

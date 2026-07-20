@@ -15,6 +15,14 @@ use super::TaskEvaluationResult;
 
 mod outcomes;
 
+pub struct TaskEvaluationFrame<'a> {
+    pub event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub session_id: &'a str,
+    pub model: &'a str,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub timeout_context: &'a crate::runtime::stream::handler::StreamTimeoutContext,
+}
+
 fn skipped_evaluation(reasoning: &str) -> TaskEvaluationResult {
     TaskEvaluationResult {
         needs_evaluation: false,
@@ -39,12 +47,15 @@ pub async fn evaluate_task_progress(
     ctx: &TaskLoopContext,
     session: &Session,
     llm: Arc<dyn LLMProvider>,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    session_id: &str,
-    model: &str,
-    reasoning_effort: Option<ReasoningEffort>,
+    frame: &TaskEvaluationFrame<'_>,
 ) -> Result<TaskEvaluationResult, AgentError> {
-    use crate::runtime::stream::handler::consume_llm_stream_silent;
+    use crate::runtime::stream::handler::consume_llm_stream_silent_with_context;
+
+    let event_tx = frame.event_tx;
+    let session_id = frame.session_id;
+    let model = frame.model;
+    let reasoning_effort = frame.reasoning_effort;
+    let timeout_context = frame.timeout_context;
 
     let in_progress_count = ctx
         .items
@@ -94,6 +105,7 @@ pub async fn evaluate_task_progress(
         session_id: Some(session_id.to_string()),
         reasoning_effort: request_reasoning_effort,
         parallel_tool_calls: None,
+        required_tool: None,
         responses: None,
         request_purpose: Some("task_evaluation".to_string()),
         cache: None,
@@ -103,13 +115,13 @@ pub async fn evaluate_task_progress(
         .await
     {
         Ok(stream) => {
-            let stream_output = consume_llm_stream_silent(
+            let stream_output = consume_llm_stream_silent_with_context(
                 stream,
                 &tokio_util::sync::CancellationToken::new(),
                 session_id,
+                timeout_context,
             )
-            .await
-            .map_err(|error| AgentError::LLM(error.to_string()))?;
+            .await?;
 
             Ok(outcomes::build_success_result(
                 stream_output,

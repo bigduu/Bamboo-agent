@@ -52,6 +52,7 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
         .send(ParentFrame::Run(RunSpec {
             assignment: "ping pong".into(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: Vec::new(),
         }))
         .await

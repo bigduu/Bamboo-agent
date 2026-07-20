@@ -11,9 +11,10 @@ use crate::runtime::runner::prompt_context::{
     strip_existing_task_list,
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    assemble_prompt_envelope, build_conversation_summary_context_block,
-    build_external_memory_context_block, build_goal_context_block, build_plan_mode_context_block,
-    build_plan_runtime_context_block, build_task_list_context_block,
+    assemble_prompt_envelope, build_active_workflow_context_block,
+    build_conversation_summary_context_block, build_external_memory_context_block,
+    build_goal_context_block, build_plan_mode_context_block, build_plan_runtime_context_block,
+    build_task_list_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -288,6 +289,9 @@ fn build_request_envelope(
     // it is cache-friendly there and gets its own (mostly stable) breakpoint.
     let mut front_blocks = Vec::new();
     let mut volatile_blocks = Vec::new();
+    if let Some(block) = build_active_workflow_context_block(session) {
+        front_blocks.push(block);
+    }
     if let Some(block) = build_external_memory_context_block(session) {
         volatile_blocks.push(block);
     }
@@ -627,6 +631,7 @@ fn plan_llm_request(
     session_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
     tool_count: usize,
+    required_tool: Option<&str>,
 ) -> LlmRequestPlan {
     let is_continuation = envelope.ir.continuation.is_some();
 
@@ -638,7 +643,8 @@ fn plan_llm_request(
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
         reasoning_effort,
-        parallel_tool_calls: Some(true),
+        parallel_tool_calls: Some(required_tool.is_none()),
+        required_tool: required_tool.map(str::to_string),
         responses: Some(responses_options),
         request_purpose: Some("agent_loop".to_string()),
         cache: Some(envelope.ir.cache.clone()),
@@ -704,6 +710,20 @@ pub(super) async fn execute_llm_stream(
     let session_id = frame.session_id;
 
     let llm_started_at = std::time::Instant::now();
+    let required_tool =
+        crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
+            .then_some("load_skill");
+    let restricted_tool_schemas;
+    let tool_schemas = if let Some(required_tool) = required_tool {
+        restricted_tool_schemas = tool_schemas
+            .iter()
+            .filter(|schema| schema.function.name == required_tool)
+            .cloned()
+            .collect::<Vec<_>>();
+        restricted_tool_schemas.as_slice()
+    } else {
+        tool_schemas
+    };
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -755,6 +775,7 @@ pub(super) async fn execute_llm_stream(
         session_id,
         reasoning_effort,
         tool_schemas.len(),
+        required_tool,
     );
     if !continuation_enabled {
         tracing::debug!(
@@ -817,13 +838,37 @@ pub(super) async fn execute_llm_stream(
         );
     }
 
-    let stream_output = crate::runtime::stream::handler::consume_llm_stream(
-        stream,
-        event_tx,
-        cancel_token,
-        session_id,
-    )
-    .await?;
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+        config.stream_timeout,
+        provider_name,
+        Some(model),
+    );
+    // A single structured explicit workflow has a fail-closed first step: the
+    // model must call load_skill before any answer tokens become user-visible.
+    // Keep that first stream silent; the pipeline verifies and executes the
+    // model-issued call, then later rounds stream normally once activation is
+    // mirrored into the runner-owned Session.
+    let stream_output =
+        if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+            session,
+        ) {
+            crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
+                stream,
+                cancel_token,
+                session_id,
+                &timeout_context,
+            )
+            .await?
+        } else {
+            crate::runtime::stream::handler::consume_llm_stream_with_context(
+                stream,
+                event_tx,
+                cancel_token,
+                session_id,
+                &timeout_context,
+            )
+            .await?
+        };
 
     // Update session token usage with actual output/thinking/cache stats from the LLM response.
     if let Some(ref mut usage) = session.token_usage {

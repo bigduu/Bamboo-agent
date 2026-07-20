@@ -116,6 +116,7 @@ impl LLMProvider for BodhiProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let required_tool = crate::provider::required_tool_from_options(options, tools)?;
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
@@ -140,16 +141,31 @@ impl LLMProvider for BodhiProvider {
                     model,
                     reasoning_effort,
                     parallel_tool_calls,
+                    required_tool,
                 )
                 .await
             }
             "anthropic" => {
-                self.proxy_anthropic(messages, tools, max_output_tokens, model, reasoning_effort)
-                    .await
+                self.proxy_anthropic(
+                    messages,
+                    tools,
+                    max_output_tokens,
+                    model,
+                    reasoning_effort,
+                    required_tool,
+                )
+                .await
             }
             "gemini" => {
-                self.proxy_gemini(messages, tools, max_output_tokens, model, reasoning_effort)
-                    .await
+                self.proxy_gemini(
+                    messages,
+                    tools,
+                    max_output_tokens,
+                    model,
+                    reasoning_effort,
+                    required_tool,
+                )
+                .await
             }
             other => Err(LLMError::Auth(format!(
                 "Unknown bodhi target provider: {}",
@@ -179,6 +195,7 @@ impl LLMProvider for BodhiProvider {
 }
 
 impl BodhiProvider {
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_openai(
         &self,
         messages: &[Message],
@@ -187,12 +204,13 @@ impl BodhiProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         parallel_tool_calls: Option<bool>,
+        required_tool: Option<&str>,
     ) -> Result<LLMStream> {
         let mut body = build_openai_compat_body(
             model,
             messages,
             tools,
-            None,
+            required_tool.map(|name| json!({"type": "function", "function": {"name": name}})),
             max_output_tokens,
             reasoning_effort,
             parallel_tool_calls,
@@ -240,12 +258,16 @@ impl BodhiProvider {
         max_output_tokens: Option<u32>,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
+        required_tool: Option<&str>,
     ) -> Result<LLMStream> {
         use crate::providers::anthropic::{
-            build_anthropic_request, parse_anthropic_sse_event, AnthropicStreamState,
+            apply_required_tool_auto_fallback, apply_required_tool_choice, build_anthropic_request,
+            looks_like_thinking_forced_tool_choice_error, parse_anthropic_sse_event,
+            reasoning_effort_for_required_tool, AnthropicStreamState,
         };
 
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let reasoning_effort = reasoning_effort_for_required_tool(reasoning_effort, required_tool);
 
         let mut body = build_anthropic_request(
             messages,
@@ -256,6 +278,7 @@ impl BodhiProvider {
             reasoning_effort,
             None,
         );
+        apply_required_tool_choice(&mut body, required_tool);
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
 
         let headers = self.build_headers()?;
@@ -263,7 +286,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let mut response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
             self.client.post(&url).headers(headers.clone()).json(&body)
         })
         .await?;
@@ -271,10 +294,45 @@ impl BodhiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await?;
-            return Err(LLMError::Api(format!(
-                "Bodhi/Anthropic proxy HTTP {}: {}",
-                status, text
-            )));
+            if required_tool.is_some()
+                && looks_like_thinking_forced_tool_choice_error(status, &text)
+            {
+                tracing::warn!(
+                    "Bodhi/Anthropic model '{}' rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
+                    model
+                );
+                let mut fallback_body = build_anthropic_request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    true,
+                    None,
+                    Some(false),
+                );
+                apply_required_tool_auto_fallback(&mut fallback_body, required_tool);
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+                    self.client
+                        .post(&url)
+                        .headers(headers.clone())
+                        .json(&fallback_body)
+                })
+                .await?;
+                if !response.status().is_success() {
+                    let fallback_status = response.status();
+                    let fallback_text = response.text().await?;
+                    return Err(LLMError::Api(format!(
+                        "Bodhi/Anthropic proxy after tool_choice=auto activation fallback HTTP {}: {}",
+                        fallback_status, fallback_text
+                    )));
+                }
+            } else {
+                return Err(LLMError::Api(format!(
+                    "Bodhi/Anthropic proxy HTTP {}: {}",
+                    status, text
+                )));
+            }
         }
 
         let mut state = AnthropicStreamState::default();
@@ -292,10 +350,13 @@ impl BodhiProvider {
         max_output_tokens: Option<u32>,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
+        required_tool: Option<&str>,
     ) -> Result<LLMStream> {
         use crate::protocol::gemini::GeminiRequest;
         use crate::protocol::ToProvider;
-        use crate::providers::gemini::{parse_gemini_sse_event, GeminiStreamState};
+        use crate::providers::gemini::{
+            apply_required_tool_choice, parse_gemini_sse_event, GeminiStreamState,
+        };
 
         let messages_vec: Vec<Message> = messages.to_vec();
         let mut request: GeminiRequest = messages_vec.to_provider()?;
@@ -327,10 +388,14 @@ impl BodhiProvider {
 
         // Serialize then run the last-moment scan over the body Value before send.
         let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        apply_required_tool_choice(&mut request_json, required_tool);
         crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
 
         let headers = self.build_headers()?;
-        let url = self.proxy_url(&format!("v1beta/models/{}:streamGenerateContent", model));
+        let url = self.proxy_url(&format!(
+            "v1beta/models/{}:streamGenerateContent?alt=sse",
+            model
+        ));
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
@@ -370,5 +435,85 @@ impl BodhiProvider {
             ReasoningEffort::High => Some(4096),
             ReasoningEffort::Xhigh | ReasoningEffort::Max => Some(8192),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_domain::FunctionSchema;
+    use serde_json::Value;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    struct ThinkingToolChoiceResponder;
+
+    impl Respond for ThinkingToolChoiceResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).expect("JSON request body");
+            if body["tool_choice"]["type"] == "tool" {
+                ResponseTemplate::new(400).set_body_string(
+                    r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#,
+                )
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            }
+        }
+    }
+
+    fn load_skill_tool() -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "load_skill".to_string(),
+                description: "Load one skill".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_retries_exact_thinking_error_with_auto_choice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/anthropic/v1/messages"))
+            .respond_with(ThinkingToolChoiceResponder)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = BodhiProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic")
+            .with_reasoning_effort(Some(ReasoningEffort::High));
+        let tools = vec![load_skill_tool()];
+        let options = LLMRequestOptions {
+            required_tool: Some("load_skill".to_string()),
+            parallel_tool_calls: Some(false),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &tools,
+                Some(8192),
+                "deepseek-v4-pro",
+                Some(&options),
+            )
+            .await
+            .expect("Bodhi Anthropic proxy should retry with auto choice");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2);
+        let named: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let fallback: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(named["tool_choice"]["type"], "tool");
+        assert_eq!(named["tool_choice"]["name"], "load_skill");
+        assert_eq!(fallback["tool_choice"]["type"], "auto");
+        assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
+        assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(fallback["tools"][0]["name"], "load_skill");
     }
 }

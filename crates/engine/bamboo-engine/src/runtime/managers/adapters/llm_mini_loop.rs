@@ -13,11 +13,34 @@ use crate::runtime::managers::mini_loop::{MiniLoopDecision, MiniLoopExecutor};
 pub struct LLMMiniLoopExecutor {
     provider: std::sync::Arc<dyn LLMProvider>,
     model: String,
+    timeout_context: crate::runtime::stream::handler::StreamTimeoutContext,
 }
 
 impl LLMMiniLoopExecutor {
     pub fn new(provider: std::sync::Arc<dyn LLMProvider>, model: String) -> Self {
-        Self { provider, model }
+        Self {
+            provider,
+            model,
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        }
+    }
+
+    pub fn with_timeout_policy(
+        provider: std::sync::Arc<dyn LLMProvider>,
+        model: String,
+        policy: bamboo_config::StreamTimeoutConfig,
+        provider_name: Option<&str>,
+    ) -> Self {
+        let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+            policy,
+            provider_name,
+            Some(&model),
+        );
+        Self {
+            provider,
+            model,
+            timeout_context,
+        }
     }
 }
 
@@ -81,6 +104,7 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
             session_id: None,
             reasoning_effort: None,
             parallel_tool_calls: None,
+            required_tool: None,
             responses: None,
             request_purpose: Some("mini_loop".to_string()),
             cache: None,
@@ -91,13 +115,13 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
             .await
             .map_err(|e| AgentError::LLM(e.to_string()))?;
 
-        let output = crate::runtime::stream::handler::consume_llm_stream_silent(
+        let output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
             stream,
             &tokio_util::sync::CancellationToken::new(),
             "mini-loop",
+            &self.timeout_context,
         )
-        .await
-        .map_err(|e| AgentError::LLM(e.to_string()))?;
+        .await?;
 
         Ok(MiniLoopDecision {
             answer: output.content.trim().to_string(),

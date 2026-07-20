@@ -7,14 +7,31 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{AgentError, AgentEvent};
+use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::provider::LLMError;
 use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::consume::consume_llm_stream_internal;
-use super::{consume_llm_stream, consume_llm_stream_silent};
+use super::{consume_llm_stream, consume_llm_stream_silent, StreamTimeoutContext};
 
 fn build_stream(items: Vec<bamboo_llm::provider::Result<LLMChunk>>) -> LLMStream {
     Box::pin(stream::iter(items))
+}
+
+fn timeout_context(
+    transport_secs: u64,
+    first_semantic_secs: u64,
+    semantic_secs: u64,
+) -> StreamTimeoutContext {
+    StreamTimeoutContext::new(
+        StreamTimeoutConfig {
+            transport_idle_timeout_secs: transport_secs,
+            first_semantic_timeout_secs: first_semantic_secs,
+            semantic_idle_timeout_secs: semantic_secs,
+        },
+        Some("test-provider"),
+        Some("test-model"),
+    )
 }
 
 #[tokio::test]
@@ -195,95 +212,184 @@ async fn consume_llm_stream_interrupts_blocked_next_on_mid_stream_cancel() {
     assert!(matches!(result, Err(AgentError::Cancelled)));
 }
 
-#[tokio::test]
-async fn consume_llm_stream_times_out_when_stream_stalls_after_first_chunk() {
-    // Issue #28: a stream that yields one chunk, then never yields again and
-    // never closes, models a provider connection that stalls mid-stream. The
-    // inter-chunk idle deadline must trip and return a StreamTimeout error
-    // instead of hanging forever.
+#[tokio::test(start_paused = true)]
+async fn truly_silent_transport_times_out_with_actionable_diagnostic() {
+    let stream: LLMStream = Box::pin(stream::pending());
+    let context = timeout_context(2, 20, 20);
+
+    let result = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-transport-timeout",
+        &context,
+    )
+    .await;
+
+    let message = match result {
+        Err(AgentError::StreamTimeout(message)) => message,
+        Err(other) => panic!("expected transport StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected transport StreamTimeout, got success"),
+    };
+    assert!(message.contains("phase=transport_idle"));
+    assert!(message.contains("deadline_ms=2000"));
+    assert!(message.contains("provider=test-provider"));
+    assert!(message.contains("model=test-model"));
+    assert!(message.contains("last_transport_ms_ago=2000"));
+    assert!(message.contains("last_semantic_ms_ago=never"));
+    assert!(message.contains("semantic_output_started=false"));
+    assert!(message.contains("retry_safe=true"));
+    assert!(!message.contains("prompt"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_stall_after_semantic_output_is_not_retry_safe() {
     let stream: LLMStream = Box::pin(
         stream::once(async { Ok::<_, LLMError>(LLMChunk::Token("first".to_string())) })
             .chain(stream::pending()),
     );
+    let context = timeout_context(2, 20, 20);
 
-    let idle_timeout = Duration::from_millis(80);
-    let started = std::time::Instant::now();
-
-    let result = tokio::time::timeout(
-        // Generous outer bound; the idle timeout must trip well before this.
-        Duration::from_secs(2),
-        consume_llm_stream_internal(
-            stream,
-            None,
-            &CancellationToken::new(),
-            "session-timeout",
-            idle_timeout,
-        ),
+    let result = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-timeout",
+        &context,
     )
-    .await
-    .expect("idle timeout must interrupt the stalled stream, not hang");
+    .await;
 
-    let elapsed = started.elapsed();
-    match result {
-        Err(AgentError::StreamTimeout(_)) => {}
-        Err(other) => panic!("expected AgentError::StreamTimeout, got Err({other:?})"),
-        Ok(_) => panic!("expected AgentError::StreamTimeout, got Ok(_)"),
-    }
-
-    // The first chunk arrives immediately, so the idle timer effectively starts
-    // after it. The timeout should fire ~80ms later. A mild lower bound guards
-    // against an "instant timeout" regression; the upper bound guards against
-    // the timeout being ignored.
-    assert!(
-        elapsed >= Duration::from_millis(50),
-        "timeout fired too early ({elapsed:?}): the first chunk should reset the idle timer"
-    );
-    assert!(
-        elapsed < Duration::from_millis(800),
-        "timeout fired too late ({elapsed:?}): the stalled stream was not interrupted in time"
-    );
+    let message = match result {
+        Err(AgentError::StreamTimeout(message)) => message,
+        Err(other) => panic!("expected transport StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected transport StreamTimeout, got success"),
+    };
+    assert!(message.contains("phase=transport_idle"));
+    assert!(message.contains("semantic_output_started=true"));
+    assert!(message.contains("retry_safe=false"));
 }
 
-#[tokio::test]
-async fn consume_llm_stream_idle_timeout_does_not_affect_healthy_stream() {
-    // Issue #28: each chunk arrives well within the idle window (25ms << 80ms),
-    // but the *total* stream duration (~150ms) far exceeds the idle timeout.
-    // Because the deadline resets on every received chunk, a legitimately long
-    // stream that keeps producing data must complete normally — the idle
-    // timeout only fires on a true stall (no chunk at all).
-    let idle_timeout = Duration::from_millis(80);
-    let per_chunk_delay = Duration::from_millis(25);
-    let chunk_count: u32 = 6;
-
-    let stream: LLMStream = Box::pin(stream::unfold(0u32, move |i| async move {
-        if i >= chunk_count {
-            return None;
+#[tokio::test(start_paused = true)]
+async fn transport_keepalives_allow_first_semantic_output_after_120_seconds() {
+    let stream: LLMStream = Box::pin(stream::unfold(0u8, |step| async move {
+        match step {
+            0..=4 => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Some((Ok::<_, LLMError>(LLMChunk::TransportActivity), step + 1))
+            }
+            5 => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Some((Ok::<_, LLMError>(LLMChunk::Token("late".to_string())), 6))
+            }
+            6 => Some((Ok::<_, LLMError>(LLMChunk::Done), 7)),
+            _ => None,
         }
-        tokio::time::sleep(per_chunk_delay).await;
-        Some((
-            Ok::<_, LLMError>(LLMChunk::Token(format!("chunk-{i}"))),
-            i + 1,
-        ))
     }));
+    let context = timeout_context(60, 240, 60);
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(3),
-        consume_llm_stream_internal(
-            stream,
-            None,
-            &CancellationToken::new(),
-            "session-healthy",
-            idle_timeout,
-        ),
+    let output = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-keepalive",
+        &context,
     )
     .await
-    .expect("healthy stream must complete without timing out")
     .expect("stream should succeed");
 
-    assert_eq!(output.content, "chunk-0chunk-1chunk-2chunk-3chunk-4chunk-5");
-    // `token_count` is the total character count of the stream, not the chunk
-    // count: 6 chunks × 7 chars ("chunk-N") = 42.
-    assert_eq!(output.token_count, output.content.chars().count());
+    assert_eq!(output.content, "late");
+}
+
+#[tokio::test(start_paused = true)]
+async fn transport_keepalives_allow_midstream_semantic_gap_after_120_seconds() {
+    let stream: LLMStream = Box::pin(
+        stream::once(async { Ok::<_, LLMError>(LLMChunk::Token("first".to_string())) }).chain(
+            stream::unfold(0u8, |step| async move {
+                match step {
+                    0..=4 => {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Some((Ok::<_, LLMError>(LLMChunk::TransportActivity), step + 1))
+                    }
+                    5 => {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Some((Ok::<_, LLMError>(LLMChunk::Token("second".to_string())), 6))
+                    }
+                    6 => Some((Ok::<_, LLMError>(LLMChunk::Done), 7)),
+                    _ => None,
+                }
+            }),
+        ),
+    );
+    let context = timeout_context(60, 240, 240);
+
+    let output = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-midstream-keepalive",
+        &context,
+    )
+    .await
+    .expect("live stream should survive a 180-second semantic gap");
+
+    assert_eq!(output.content, "firstsecond");
+}
+
+#[tokio::test(start_paused = true)]
+async fn keepalives_do_not_make_first_semantic_deadline_unbounded() {
+    let stream: LLMStream = Box::pin(stream::unfold((), |_| async {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        Some((Ok::<_, LLMError>(LLMChunk::TransportActivity), ()))
+    }));
+    let context = timeout_context(60, 120, 120);
+
+    let result = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-first-semantic",
+        &context,
+    )
+    .await;
+
+    let message = match result {
+        Err(AgentError::StreamTimeout(message)) => message,
+        Err(other) => panic!("expected first-semantic StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected first-semantic StreamTimeout, got success"),
+    };
+    assert!(message.contains("phase=first_semantic"));
+    assert!(message.contains("semantic_output_started=false"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn keepalives_do_not_hide_midstream_semantic_stall() {
+    let stream: LLMStream = Box::pin(
+        stream::once(async { Ok::<_, LLMError>(LLMChunk::Token("first".to_string())) }).chain(
+            stream::unfold((), |_| async {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                Some((Ok::<_, LLMError>(LLMChunk::TransportActivity), ()))
+            }),
+        ),
+    );
+    let context = timeout_context(60, 120, 90);
+
+    let result = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-semantic-stall",
+        &context,
+    )
+    .await;
+
+    let message = match result {
+        Err(AgentError::StreamTimeout(message)) => message,
+        Err(other) => panic!("expected semantic-idle StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected semantic-idle StreamTimeout, got success"),
+    };
+    assert!(message.contains("phase=semantic_idle"));
+    assert!(message.contains("semantic_output_started=true"));
+    assert!(message.contains("retry_safe=false"));
 }
 
 #[tokio::test]

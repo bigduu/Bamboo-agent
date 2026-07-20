@@ -2,6 +2,13 @@ use bamboo_domain::ToolCall;
 
 #[derive(Debug, Clone)]
 pub enum LLMChunk {
+    /// A valid provider transport frame that intentionally carried no semantic
+    /// model output (for example an SSE ping or lifecycle event).
+    ///
+    /// Consumers must not expose or persist this marker. It exists so stream
+    /// watchdogs can distinguish a live connection from a silent socket even
+    /// when provider parsers filter the frame's payload (#618).
+    TransportActivity,
     ResponseId(String),
     Token(String),
     ReasoningToken(String),
@@ -44,6 +51,25 @@ pub enum LLMChunk {
     Done,
 }
 
+impl LLMChunk {
+    /// Whether this chunk advances model-authored content or tool state.
+    /// Protocol metadata, usage, completion, and transport-only markers are
+    /// deliberately excluded from semantic-progress deadlines.
+    pub fn is_semantic_progress(&self) -> bool {
+        match self {
+            Self::Token(value) | Self::ReasoningToken(value) => !value.is_empty(),
+            Self::ToolCalls(calls) => !calls.is_empty(),
+            Self::ToolCallsIndexed(calls) => !calls.is_empty(),
+            Self::TransportActivity
+            | Self::ResponseId(_)
+            | Self::ReasoningSignature(_)
+            | Self::CacheUsage { .. }
+            | Self::UsageSummary { .. }
+            | Self::Done => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +81,13 @@ mod tests {
             LLMChunk::Token(s) => assert_eq!(s, "Hello"),
             _ => panic!("Expected Token variant"),
         }
+    }
+
+    #[test]
+    fn transport_activity_is_not_semantic_progress() {
+        assert!(!LLMChunk::TransportActivity.is_semantic_progress());
+        assert!(!LLMChunk::ResponseId("resp_123".to_string()).is_semantic_progress());
+        assert!(LLMChunk::ReasoningToken("thinking".to_string()).is_semantic_progress());
     }
 
     #[test]

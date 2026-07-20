@@ -316,6 +316,7 @@ async fn rerank_candidate_ids(
         session_id: context.session_id.clone(),
         reasoning_effort: Some(ReasoningEffort::High),
         parallel_tool_calls: None,
+        required_tool: None,
         responses: None,
         request_purpose: Some("memory_rerank".to_string()),
         cache: None,

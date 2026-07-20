@@ -57,6 +57,7 @@ pub(super) async fn handle_non_streaming_chat(
                 session_id: None,
                 reasoning_effort,
                 parallel_tool_calls,
+                required_tool: None,
                 responses: None,
                 request_purpose: Some("openai_compat".to_string()),
                 cache: None,
@@ -85,6 +86,7 @@ pub(super) async fn handle_non_streaming_chat(
                     calls.into_iter().map(|(_, call)| call).collect(),
                 ));
             }
+            Ok(bamboo_llm::types::LLMChunk::TransportActivity) => {}
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. }) => {}
             Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}

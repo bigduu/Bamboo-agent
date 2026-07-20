@@ -42,6 +42,7 @@ pub(super) async fn handle_non_streaming_messages(
                 session_id: None,
                 reasoning_effort: prepared.reasoning_effort,
                 parallel_tool_calls: None,
+                required_tool: None,
                 responses: None,
                 request_purpose: Some("anthropic_compat".to_string()),
                 cache: None,
@@ -88,7 +89,8 @@ pub(super) async fn handle_non_streaming_messages(
                 ));
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
-            Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
+            Ok(bamboo_llm::types::LLMChunk::TransportActivity)
+            | Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
             | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {

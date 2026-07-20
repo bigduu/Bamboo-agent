@@ -5,7 +5,7 @@ use crate::runtime::runner::task_lifecycle::{
 };
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
 use bamboo_metrics::MetricsCollector;
 
@@ -103,6 +103,7 @@ pub(super) async fn initialize_loop_state(
     initial_message: &str,
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
+    event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> super::super::Result<LoopRunState> {
     let debug_logger = DebugLogger::new(tracing::enabled!(tracing::Level::DEBUG));
     let session_id = session.id.clone();
@@ -176,6 +177,7 @@ pub(super) async fn initialize_loop_state(
         &session_id,
         &debug_logger,
         must_resume_pinned_activation,
+        event_tx,
     )
     .await?;
 
@@ -210,9 +212,11 @@ mod tests {
     };
     use bamboo_skills::{SkillManager, SkillStoreConfig};
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    struct SuccessfulLoadSkill;
+    #[derive(Default)]
+    struct SuccessfulLoadSkill(AtomicUsize);
 
     #[async_trait]
     impl ToolExecutor for SuccessfulLoadSkill {
@@ -220,6 +224,7 @@ mod tests {
             &self,
             _call: &ToolCall,
         ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult {
                 success: true,
                 result: serde_json::json!({"instructions": "pinned"}).to_string(),
@@ -334,7 +339,7 @@ mod tests {
             ..Default::default()
         }));
         manager.initialize().await.expect("initialize");
-        let tools = SuccessfulLoadSkill;
+        let tools = SuccessfulLoadSkill::default();
         let review_config = AgentLoopConfig {
             skill_manager: Some(manager.clone()),
             selected_skill_ids: Some(vec!["review-demo".to_string()]),
@@ -342,9 +347,20 @@ mod tests {
             ..Default::default()
         };
         let mut session = Session::new("retained-session", "model");
-        initialize_loop_state(&mut session, "review", &review_config, &tools)
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        initialize_loop_state(&mut session, "review", &review_config, &tools, &event_tx)
             .await
-            .expect("initial activation");
+            .expect("initial selection");
+        assert_eq!(
+            tools.0.load(Ordering::SeqCst),
+            0,
+            "session setup must not execute load_skill on the model's behalf"
+        );
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &session
+            )
+        );
         let pinned_generation = session
             .metadata
             .get(SKILL_RUNTIME_ACTIVATION_GENERATION_KEY)
@@ -387,6 +403,7 @@ mod tests {
             "plain clarification reply",
             &continuation_config,
             &tools,
+            &event_tx,
         )
         .await
         .expect("suspended continuation");
@@ -423,13 +440,18 @@ mod tests {
         assert!(!session
             .metadata
             .contains_key(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY));
+        assert!(!session.metadata.contains_key(LOADED_SKILL_IDS_METADATA_KEY));
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &session
+            ),
+            "resuming a pinned but not-yet-loaded selection must still require a model-issued activation"
+        );
+        assert!(crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session).is_none());
         assert_eq!(
-            session
-                .metadata
-                .get(LOADED_SKILL_IDS_METADATA_KEY)
-                .map(String::as_str),
-            Some("[\"review-demo\"]"),
-            "retained explicit activation must deterministically preload again"
+            tools.0.load(Ordering::SeqCst),
+            0,
+            "resume must not preload or activate on the model's behalf"
         );
 
         let plan_config = AgentLoopConfig {
@@ -438,9 +460,15 @@ mod tests {
             disabled_skill_ids: BTreeSet::new(),
             ..Default::default()
         };
-        initialize_loop_state(&mut session, "plan instead", &plan_config, &tools)
-            .await
-            .expect("superseding activation");
+        initialize_loop_state(
+            &mut session,
+            "plan instead",
+            &plan_config,
+            &tools,
+            &event_tx,
+        )
+        .await
+        .expect("superseding activation");
         let (skills, descriptor) = manager
             .store()
             .pinned_activation_skills("retained-session")
@@ -449,6 +477,11 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].id, "plan-demo");
         assert_eq!(
+            tools.0.load(Ordering::SeqCst),
+            0,
+            "a superseding explicit selection must also wait for the model-issued load_skill call"
+        );
+        assert_eq!(
             descriptor
                 .skill_revisions
                 .keys()
@@ -456,5 +489,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["plan-demo"]
         );
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
+                &session
+            )
+        );
+        assert!(crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session).is_none());
     }
 }

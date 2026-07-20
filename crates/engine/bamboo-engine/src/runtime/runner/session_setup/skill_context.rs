@@ -1,11 +1,9 @@
 use crate::runtime::config::AgentLoopConfig;
-use bamboo_agent_core::tools::{
-    FunctionCall, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor,
-};
 use bamboo_agent_core::Session;
 use bamboo_skills::runtime_metadata::{
     LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
-    LOADED_SKILL_IDS_METADATA_KEY,
+    LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +16,29 @@ pub(super) struct SkillContextLoadResult {
     pub(super) request_hint_present: bool,
     pub(super) catalog_revision: Option<u64>,
     pub(super) skill_revisions: BTreeMap<String, u64>,
+    pub(super) catalog_entries: Vec<bamboo_skills::WorkflowCatalogEntry>,
+    pub(super) catalog_diagnostic: Option<bamboo_skills::WorkflowCatalogDiagnostic>,
+    pub(super) durable_snapshot: Option<bamboo_skills::SkillActivationSnapshot>,
+    pub(super) activation_diagnostic: Option<bamboo_skills::WorkflowActivationDiagnostic>,
+    pub(super) restored_active_context: bool,
+}
+
+fn degraded_activation_result(
+    code: bamboo_skills::WorkflowActivationErrorCode,
+    message: impl Into<String>,
+) -> SkillContextLoadResult {
+    let message = message.into();
+    SkillContextLoadResult {
+        context: format!(
+            "\n\n## Workflow Activation Degraded\nBamboo could not restore or activate the selected workflow: {message}\nContinue the main session without workflow instructions; do not guess or load a newer revision.\n"
+        ),
+        activation_diagnostic: Some(bamboo_skills::WorkflowActivationDiagnostic {
+            code,
+            message,
+            recoverable: true,
+        }),
+        ..Default::default()
+    }
 }
 
 pub(super) async fn load_skill_context(
@@ -41,19 +62,83 @@ pub(super) async fn load_skill_context(
             .pinned_activation_for_workspace(session_id, workspace.as_deref())
             .await
             .map_err(|error| format!("Failed to inspect retained workflow activation: {error}"))?;
-        let persisted_selection_requires_snapshot = session
+        let persisted_selection_requires_snapshot = retained_selection_source.as_deref()
+            == Some("explicit")
+            && session
+                .metadata
+                .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY)
+                .and_then(|raw| serde_json::from_str::<BTreeMap<String, u64>>(raw).ok())
+                .is_some_and(|revisions| !revisions.is_empty());
+        let has_active_workflow = session
             .metadata
-            .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY)
-            .and_then(|raw| serde_json::from_str::<BTreeMap<String, u64>>(raw).ok())
-            .is_some_and(|revisions| !revisions.is_empty());
-        if must_resume_pinned_activation
-            && persisted_selection_requires_snapshot
-            && retained_activation.is_none()
+            .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+            .is_some_and(|active| active.status == bamboo_skills::WorkflowActivationStatus::Active);
+        if retained_activation.is_none()
+            && (has_active_workflow
+                || (must_resume_pinned_activation && persisted_selection_requires_snapshot))
         {
-            return Err(
-                "Suspended workflow snapshot is unavailable after restart; retry as a new activation"
-                    .to_string(),
-            );
+            let restored = async {
+                let snapshot = if has_active_workflow {
+                    let durable = session
+                        .metadata
+                        .get(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+                        .ok_or("durable workflow snapshot metadata is missing")
+                        .and_then(|raw| {
+                            serde_json::from_str::<bamboo_skills::DurableWorkflowActivation>(raw)
+                                .map_err(|_| "durable workflow snapshot metadata is invalid")
+                        })?;
+                    if durable.active.status != bamboo_skills::WorkflowActivationStatus::Active {
+                        return Err("durable workflow snapshot is not active");
+                    }
+                    let entry = durable
+                        .snapshot
+                        .skills
+                        .get(&durable.active.id)
+                        .ok_or("durable workflow snapshot root is missing")?;
+                    if durable.snapshot.skills.len() != 1
+                        || entry.revision != durable.active.revision
+                        || entry.catalog_entry.source != durable.active.source
+                        || entry.catalog_entry.kind != durable.active.kind
+                    {
+                        return Err(
+                            "durable workflow snapshot identity does not match active metadata",
+                        );
+                    }
+                    durable.snapshot
+                } else {
+                    session
+                        .metadata
+                        .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
+                        .ok_or("in-flight workflow candidate snapshot is missing")
+                        .and_then(|raw| {
+                            serde_json::from_str::<bamboo_skills::SkillActivationSnapshot>(raw)
+                                .map_err(|_| "in-flight workflow candidate snapshot is invalid")
+                        })?
+                };
+                let store = skill_manager
+                    .store_for_workspace(workspace.as_deref())
+                    .await
+                    .map_err(|_| "durable workflow workspace is unavailable")?;
+                store
+                    .restore_activation_snapshot(session_id, snapshot)
+                    .await
+                    .map_err(|_| "durable workflow snapshot failed validation")?;
+                Ok::<(), &str>(())
+            }
+            .await;
+            if let Err(error) = restored {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::SnapshotUnavailable,
+                    error,
+                ));
+            }
+            retained_activation = skill_manager
+                .pinned_activation_for_workspace(session_id, workspace.as_deref())
+                .await
+                .map_err(|error| {
+                    format!("Failed to inspect restored workflow activation: {error}")
+                })?;
         }
         if let Some(retained) = retained_activation.as_ref() {
             let requested_mode = config
@@ -97,17 +182,23 @@ pub(super) async fn load_skill_context(
             }
         }
         let continues_retained_activation = retained_activation.is_some();
+        let max_context_tokens = config
+            .token_budget
+            .as_ref()
+            .map(|budget| budget.max_context_tokens as usize)
+            .unwrap_or(bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS);
         let activation = if let Some(activation) = retained_activation {
             Some(activation)
         } else if let Some(workspace_path) = workspace.as_deref() {
             match skill_manager
-                .resolve_and_pin_activation_in_workspace_with_mode(
+                .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
                     workspace_path,
                     session_id,
                     &config.disabled_skill_ids,
                     config.selected_skill_ids.as_deref(),
                     config.selected_skill_mode.as_deref(),
                     Some(request_hint),
+                    max_context_tokens,
                 )
                 .await
             {
@@ -130,12 +221,13 @@ pub(super) async fn load_skill_context(
             }
         } else {
             match skill_manager
-                .resolve_and_pin_activation_for_request_with_mode(
+                .resolve_and_pin_activation_for_request_with_mode_and_budget(
                     session_id,
                     &config.disabled_skill_ids,
                     config.selected_skill_ids.as_deref(),
                     config.selected_skill_mode.as_deref(),
                     Some(request_hint),
+                    max_context_tokens,
                 )
                 .await
             {
@@ -177,6 +269,69 @@ pub(super) async fn load_skill_context(
             .iter()
             .map(|skill| skill.id.clone())
             .collect::<Vec<_>>();
+        let catalog_entries = activation
+            .as_ref()
+            .map(|activation| activation.catalog_entries.clone())
+            .unwrap_or_default();
+        let catalog_diagnostic = activation
+            .as_ref()
+            .map(|activation| activation.catalog_diagnostic.clone());
+        if let Some(selection) = session
+            .metadata
+            .get(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<bamboo_skills::WorkflowSelection>(raw).ok())
+        {
+            let Some(entry) = catalog_entries
+                .iter()
+                .find(|entry| entry.id == selection.id)
+            else {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::RevisionMissing,
+                    "selected workflow revision is unavailable and no matching LKG snapshot exists",
+                ));
+            };
+            if entry.revision != selection.revision {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::RevisionMismatch,
+                    "selected workflow revision does not match the pinned catalog revision",
+                ));
+            }
+            if entry.source != selection.source {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::SourceMismatch,
+                    "selected workflow source does not match the pinned catalog source",
+                ));
+            }
+            if entry.kind != bamboo_skills::WorkflowKind::Instruction {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::InvalidSelection,
+                    "orchestration workflows must be started through workflow_run/API, not instruction activation",
+                ));
+            }
+            if entry.invocation_policy["explicit"].as_bool() != Some(true) {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::ManualOnly,
+                    "workflow does not allow explicit instruction activation",
+                ));
+            }
+            if let Err(error) =
+                bamboo_domain::validate_schema(&entry.argument_schema, &selection.args)
+            {
+                return Ok(degraded_activation_result(
+                    bamboo_skills::WorkflowActivationErrorCode::InvalidSelection,
+                    format!("workflow arguments do not match the pinned schema: {error}"),
+                ));
+            }
+        }
+        if config.selected_skill_ids.is_some()
+            && catalog_entries.len() == 1
+            && catalog_entries[0].kind == bamboo_skills::WorkflowKind::Orchestration
+        {
+            return Ok(degraded_activation_result(
+                bamboo_skills::WorkflowActivationErrorCode::InvalidSelection,
+                "orchestration workflows must be started through workflow_run/API, not load_skill",
+            ));
+        }
         let configured_selection_source = if config.selected_skill_ids.is_some() {
             "explicit".to_string()
         } else {
@@ -200,7 +355,67 @@ pub(super) async fn load_skill_context(
             !request_hint.trim().is_empty(),
         );
 
-        let context = bamboo_skills::context::build_skill_context(&selected_skills);
+        let durable_active = session
+            .metadata
+            .get(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+            .and_then(|raw| {
+                serde_json::from_str::<bamboo_skills::DurableWorkflowActivation>(raw).ok()
+            })
+            .filter(|durable| {
+                durable.active.status == bamboo_skills::WorkflowActivationStatus::Active
+                    && selected_ids.len() == 1
+                    && selected_ids[0] == durable.active.id
+                    && catalog_entries.iter().any(|entry| {
+                        entry.id == durable.active.id
+                            && entry.revision == durable.active.revision
+                            && entry.source == durable.active.source
+                            && entry.kind == durable.active.kind
+                    })
+            });
+        let (context, restored_active_context) = if durable_active.is_some() {
+            (String::new(), true)
+        } else {
+            (
+                catalog_diagnostic
+                    .as_ref()
+                    .map(|diagnostic| {
+                        bamboo_skills::context::build_workflow_catalog_context(
+                            &selected_skills,
+                            &catalog_entries,
+                            diagnostic,
+                        )
+                    })
+                    .unwrap_or_default(),
+                false,
+            )
+        };
+        // Automatic selection only advertises metadata. Keep its immutable candidate
+        // pin in process for load_skill, but do not serialize every candidate's
+        // resource tree into the session. The tool exports and narrows the pin to the
+        // one workflow the model actually activates. Explicit selection needs the
+        // candidate snapshot before the model invokes load_skill, while an
+        // already-active LKG remains durable across restarts.
+        let durable_snapshot = if activation.is_some()
+            && (selection_source.as_deref() == Some("explicit") || durable_active.is_some())
+        {
+            let store = skill_manager
+                .store_for_workspace(workspace.as_deref())
+                .await
+                .map_err(|error| format!("Failed to resolve workflow snapshot store: {error}"))?;
+            store.export_activation_snapshot(session_id).await
+        } else {
+            None
+        };
+        if durable_snapshot
+            .as_ref()
+            .and_then(|snapshot| serde_json::to_vec(snapshot).ok())
+            .is_some_and(|bytes| bytes.len() > 512 * 1024)
+        {
+            return Ok(degraded_activation_result(
+                bamboo_skills::WorkflowActivationErrorCode::SnapshotTooLarge,
+                "selected workflow snapshot exceeds the durable session limit",
+            ));
+        }
         if !context.is_empty() {
             tracing::info!(
                 "[{}] Skill context loaded, length: {} chars",
@@ -224,6 +439,11 @@ pub(super) async fn load_skill_context(
                 .as_ref()
                 .map(|activation| activation.descriptor.skill_revisions.clone())
                 .unwrap_or_default(),
+            catalog_entries,
+            catalog_diagnostic,
+            durable_snapshot,
+            activation_diagnostic: None,
+            restored_active_context,
         })
     } else {
         tracing::info!("[{}] No skill manager configured", session_id);
@@ -231,109 +451,83 @@ pub(super) async fn load_skill_context(
     }
 }
 
-/// A new explicit activation supersedes any workflow loaded on an earlier run.
-/// Clear the old activation before publishing the current selection so tool
-/// authorization cannot briefly observe a stale loaded workflow.
-pub(super) fn reset_explicit_activation_state(
-    session: &mut Session,
+pub(super) fn selection_matches_loaded_activation(
+    session: &Session,
     selection: &SkillContextLoadResult,
-) {
-    if selection.selection_source.as_deref() == Some("explicit")
-        && selection.selected_skill_ids.len() == 1
-    {
-        session.metadata.remove(LOADED_SKILL_IDS_METADATA_KEY);
-        session.metadata.remove(LAST_LOADED_SKILL_ID_METADATA_KEY);
-        session
-            .metadata
-            .remove(LAST_LOADED_SKILL_SUMMARY_METADATA_KEY);
-    }
-}
-
-/// Deterministically activate a single explicitly selected workflow before the
-/// first model round. Automatic selection remains metadata-only because it can
-/// advertise several candidates and the model still has to choose one.
-pub(super) async fn activate_explicit_skill(
-    tools: &dyn ToolExecutor,
-    session: &mut Session,
-    session_id: &str,
-    selection: &SkillContextLoadResult,
-) -> Result<Option<String>, String> {
+) -> bool {
     if selection.selection_source.as_deref() != Some("explicit")
         || selection.selected_skill_ids.len() != 1
     {
-        return Ok(None);
+        return false;
     }
-
     let skill_id = selection.selected_skill_ids[0].as_str();
-    let available_tool_schemas = tools.list_tools();
-    if !available_tool_schemas
-        .iter()
-        .any(|schema| schema.function.name == "load_skill")
+    let loaded_matches = session
+        .metadata
+        .get(LOADED_SKILL_IDS_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .is_some_and(|loaded| loaded == selection.selected_skill_ids);
+    let active_matches = session
+        .metadata
+        .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+        .is_some_and(|active| {
+            active.id == skill_id
+                && active.status == bamboo_skills::WorkflowActivationStatus::Active
+        });
+    loaded_matches
+        && active_matches
+        && session
+            .metadata
+            .contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+}
+
+/// Clear a prior activation only when a newly resolved selection supersedes it.
+/// The new candidate pin is kept so the model-issued `load_skill` call can load
+/// the exact catalog revision selected during this setup pass.
+pub(super) fn reset_activation_state_for_new_selection(
+    session: &mut Session,
+    selection: &SkillContextLoadResult,
+) {
+    if selection.selection_source.is_none()
+        || selection_matches_loaded_activation(session, selection)
     {
-        return Err(format!(
-            "Explicit workflow '{skill_id}' cannot start because load_skill is unavailable"
-        ));
+        return;
     }
+    for key in [
+        LOADED_SKILL_IDS_METADATA_KEY,
+        LAST_LOADED_SKILL_ID_METADATA_KEY,
+        LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+        bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
+        bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
+        bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+    ] {
+        session.metadata.remove(key);
+    }
+}
 
-    let call_id = format!("runtime-explicit-skill-{session_id}");
-    let arguments = serde_json::json!({ "skill_id": skill_id });
-    let call = ToolCall {
-        id: call_id.clone(),
-        tool_type: "function".to_string(),
-        function: FunctionCall {
-            name: "load_skill".to_string(),
-            arguments: arguments.to_string(),
-        },
+pub(crate) fn explicit_activation_pending(session: &Session) -> bool {
+    let selected_skill_ids = session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    if session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+        .is_none_or(|source| source != "explicit")
+        || selected_skill_ids.len() != 1
+        || session
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
+    {
+        return false;
+    }
+    let selection = SkillContextLoadResult {
+        selected_skill_ids,
+        selection_source: Some("explicit".to_string()),
+        ..Default::default()
     };
-    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
-    let context = ToolExecutionContext::for_dispatch(
-        session_id,
-        &call_id,
-        &event_tx,
-        &available_tool_schemas,
-        ToolExecutionSessionFlags::from_session(session),
-        false,
-        None,
-        Some(&arguments),
-    );
-
-    let result = match tools.execute_with_context(&call, context).await {
-        Ok(result) if result.success => result,
-        Ok(result) => {
-            return Err(format!(
-                "Explicit workflow '{skill_id}' preload was unsuccessful: {}",
-                result.result
-            ));
-        }
-        Err(error) => {
-            return Err(format!(
-                "Explicit workflow '{skill_id}' preload failed: {error}"
-            ));
-        }
-    };
-
-    session.metadata.insert(
-        LOADED_SKILL_IDS_METADATA_KEY.to_string(),
-        serde_json::json!([skill_id]).to_string(),
-    );
-    session.metadata.insert(
-        LAST_LOADED_SKILL_ID_METADATA_KEY.to_string(),
-        skill_id.to_string(),
-    );
-    session.metadata.insert(
-        LAST_LOADED_SKILL_SUMMARY_METADATA_KEY.to_string(),
-        serde_json::json!({
-            "skill_id": skill_id,
-            "loaded_ids": [skill_id],
-            "selected_skill_mode": selection.selected_skill_mode,
-            "loaded_count": 1
-        })
-        .to_string(),
-    );
-
-    Ok(Some(format!(
-        "\n\n## Explicit Workflow Activated\n\
-The user explicitly selected the `{skill_id}` workflow. Bamboo loaded its detailed instructions before model execution. Follow the payload below as the active workflow; do not call `load_skill` again for this activation.\n\n{payload}\n",
-        payload = result.result
-    )))
+    !selection_matches_loaded_activation(session, &selection)
 }

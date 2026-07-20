@@ -102,6 +102,35 @@ impl SessionRepository {
         Ok(())
     }
 
+    /// Atomically mutate the latest durable runtime session and refresh the
+    /// cache with the saved value. This is the safe path for narrow metadata
+    /// indexes that can be updated concurrently with runner message writes.
+    pub async fn update_runtime_session<F>(
+        &self,
+        session_id: &str,
+        metadata_keys: &[&str],
+        mutate: F,
+    ) -> std::io::Result<Option<Session>>
+    where
+        F: FnOnce(&mut Session),
+    {
+        let saved = self
+            .persistence
+            .update_runtime_config(session_id, mutate)
+            .await?;
+        if let (Some(saved), Some(cached)) = (saved.as_ref(), self.cache.get(session_id)) {
+            let mut cached = cached.write();
+            for key in metadata_keys {
+                if let Some(value) = saved.metadata.get(*key) {
+                    cached.metadata.insert((*key).to_string(), value.clone());
+                } else {
+                    cached.metadata.remove(*key);
+                }
+            }
+        }
+        Ok(saved)
+    }
+
     /// Load a session, creating a fresh `Session::new(id, model)` if absent.
     pub async fn load_or_create(&self, session_id: &str, model: &str) -> Session {
         if let Some(session) = self.load(session_id).await {
@@ -229,6 +258,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         result
     }
 
+    async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        self.try_load(session_id).await
+    }
+
     async fn append_token_usage_record(
         &self,
         session_id: &str,
@@ -299,6 +332,73 @@ mod tests {
         repo.cache().insert(
             session.id.clone(),
             Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+    }
+
+    #[tokio::test]
+    async fn narrow_runtime_metadata_transaction_preserves_live_and_durable_non_owned_state() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "narrow-metadata";
+        let mut durable = Session::new(id, "durable-model");
+        durable.add_message(bamboo_agent_core::Message::user("durable user turn"));
+        durable
+            .metadata
+            .insert("external.durable".to_string(), "keep".to_string());
+        storage.save_session(&durable).await.expect("seed durable");
+
+        let mut live = durable.clone();
+        live.add_message(bamboo_agent_core::Message::assistant(
+            "in-flight assistant tool call",
+            None,
+        ));
+        live.model = "live-model".to_string();
+        live.metadata
+            .insert("external.live".to_string(), "keep".to_string());
+        cache_put(&repo, &live);
+
+        repo.update_runtime_session(id, &["workflow.owned"], |latest| {
+            latest
+                .metadata
+                .insert("workflow.owned".to_string(), "active".to_string());
+        })
+        .await
+        .expect("transaction")
+        .expect("session exists");
+
+        let saved = storage
+            .load_session(id)
+            .await
+            .expect("load durable")
+            .expect("durable exists");
+        assert_eq!(
+            saved.messages.len(),
+            1,
+            "transaction never writes stale live messages"
+        );
+        assert_eq!(
+            saved.metadata.get("external.durable").map(String::as_str),
+            Some("keep")
+        );
+        assert_eq!(
+            saved.metadata.get("workflow.owned").map(String::as_str),
+            Some("active")
+        );
+
+        let cached = read_cached_session(repo.cache(), id).expect("live cache");
+        assert_eq!(
+            cached.messages.len(),
+            2,
+            "cache live tool call is not replaced"
+        );
+        assert_eq!(cached.model, "live-model");
+        assert_eq!(
+            cached.metadata.get("external.live").map(String::as_str),
+            Some("keep")
+        );
+        assert_eq!(
+            cached.metadata.get("workflow.owned").map(String::as_str),
+            Some("active")
         );
     }
 

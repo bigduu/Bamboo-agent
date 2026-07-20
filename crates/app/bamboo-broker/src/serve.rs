@@ -637,6 +637,7 @@ where
             RunSpec {
                 assignment: question.clone(),
                 reasoning_effort: None,
+                permission_policy: None,
                 messages: prior,
             },
             sink,
@@ -1226,6 +1227,7 @@ mod tests {
         let spec = RunSpec {
             assignment: "ping pong".into(),
             reasoning_effort: None,
+            permission_policy: None,
             messages: vec![],
         };
         let run = InboxMessage {

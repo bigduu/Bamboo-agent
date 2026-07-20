@@ -35,6 +35,7 @@ fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, ev
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

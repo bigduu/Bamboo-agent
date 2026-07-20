@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 // Re-export PermissionMode from the shared location in bamboo-infrastructure
 pub use bamboo_config::settings::PermissionMode;
 
+use crate::policy::{
+    conservative_matchers, DurablePermissionRule, EffectivePermissionPolicy, PermissionDecision,
+    PermissionDecisionReceipt, PermissionDecisionSource, PermissionDenyReason,
+    PermissionEvaluation, PermissionOutcome, PermissionReasonCode, PermissionRequest,
+    PermissionRuleEffect, PermissionRuleRef, PermissionRuleScope, PermissionRuleSource,
+};
 use crate::rule_parser::ParsedRule;
 
 /// Types of permissions that can be granted
@@ -674,6 +680,7 @@ pub struct PermissionConfig {
     /// Grants keyed by stable session id. New interactive approvals use this
     /// map; the unscoped map above remains only for API compatibility.
     scoped_session_grants: DashMap<String, DashMap<PermissionType, HashMap<String, SessionGrant>>>,
+    scoped_session_denies: DashMap<String, DashMap<PermissionType, HashMap<String, SessionGrant>>>,
     one_shot_grants: DashMap<(String, String), Vec<(PermissionType, String)>>,
     /// Default session grant duration (default: 30 minutes)
     session_grant_duration: Duration,
@@ -692,6 +699,21 @@ pub struct PermissionConfig {
     /// (`bash_security` Deny verdict) is layered on top of these. See
     /// [`PermissionConfig::requires_forced_confirmation`].
     ask_rules: RwLock<Vec<ParsedRule>>,
+    /// Versioned durable rules used by the typed evaluator. Legacy whitelist and
+    /// ask-rule strings remain readable during migration but new scoped writes
+    /// land here.
+    durable_rules: DashMap<String, DurablePermissionRule>,
+    /// Revision of the durable permission section that produced this live
+    /// policy. Included in every outcome/request and updated only after commit.
+    policy_revision: AtomicU64,
+    /// Pending typed requests and immutable decision receipts. Keys include the
+    /// session id so model/tool-call ids cannot collide across sessions.
+    pending_requests: DashMap<(String, String), PermissionRequest>,
+    decision_receipts: DashMap<(String, String), PermissionDecisionReceipt>,
+    /// Stable workspace identity registered by the execution boundary. This is
+    /// non-durable runtime context, keyed by session to prevent workspace rules
+    /// from leaking across sessions when tool arguments omit `cwd`.
+    session_workspaces: DashMap<String, String>,
 }
 
 impl Default for PermissionConfig {
@@ -707,12 +729,18 @@ impl PermissionConfig {
             whitelist: DashMap::new(),
             session_grants: DashMap::new(),
             scoped_session_grants: DashMap::new(),
+            scoped_session_denies: DashMap::new(),
             one_shot_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(30 * 60), // 30 minutes
             enabled: AtomicBool::new(true),
             mode: RwLock::new(PermissionMode::Default),
             confirm_threshold: RwLock::new(RiskLevel::Low),
             ask_rules: RwLock::new(Vec::new()),
+            durable_rules: DashMap::new(),
+            policy_revision: AtomicU64::new(0),
+            pending_requests: DashMap::new(),
+            decision_receipts: DashMap::new(),
+            session_workspaces: DashMap::new(),
         }
     }
 
@@ -722,12 +750,18 @@ impl PermissionConfig {
             whitelist: DashMap::new(),
             session_grants: DashMap::new(),
             scoped_session_grants: DashMap::new(),
+            scoped_session_denies: DashMap::new(),
             one_shot_grants: DashMap::new(),
             session_grant_duration: session_duration,
             enabled: AtomicBool::new(enabled),
             mode: RwLock::new(PermissionMode::Default),
             confirm_threshold: RwLock::new(RiskLevel::Low),
             ask_rules: RwLock::new(Vec::new()),
+            durable_rules: DashMap::new(),
+            policy_revision: AtomicU64::new(0),
+            pending_requests: DashMap::new(),
+            decision_receipts: DashMap::new(),
+            session_workspaces: DashMap::new(),
         }
     }
 
@@ -763,6 +797,129 @@ impl PermissionConfig {
     /// high-risk operations (execute command, delete, git write, terminal) ask.
     pub fn set_confirm_threshold(&self, threshold: RiskLevel) {
         *self.confirm_threshold.write().recover_poison() = threshold;
+    }
+
+    pub fn policy_revision(&self) -> u64 {
+        self.policy_revision.load(Ordering::Acquire)
+    }
+
+    pub fn register_session_workspace(
+        &self,
+        session_id: impl Into<String>,
+        workspace_path: impl Into<String>,
+    ) {
+        self.session_workspaces
+            .insert(session_id.into(), workspace_path.into());
+    }
+
+    pub fn session_workspace(&self, session_id: &str) -> Option<String> {
+        self.session_workspaces
+            .get(session_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn set_policy_revision(&self, revision: u64) {
+        self.policy_revision.store(revision, Ordering::Release);
+    }
+
+    pub fn register_pending_request(&self, request: PermissionRequest) {
+        let key = (request.session_id.clone(), request.request_id.clone());
+        if self.decision_receipts.contains_key(&key) {
+            return;
+        }
+        self.pending_requests.insert(key, request);
+    }
+
+    pub fn pending_request(&self, session_id: &str, request_id: &str) -> Option<PermissionRequest> {
+        self.pending_requests
+            .get(&(session_id.to_string(), request_id.to_string()))
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn decision_receipt(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<PermissionDecisionReceipt> {
+        self.decision_receipts
+            .get(&(session_id.to_string(), request_id.to_string()))
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Record a decision idempotently. `Ok(true)` is a replay of the same
+    /// decision, `Ok(false)` is the first application, and a different replay
+    /// fails closed.
+    pub fn record_decision(
+        &self,
+        session_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<bool, String> {
+        let key = (session_id.to_string(), decision.request_id.clone());
+        match self.decision_receipts.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => {
+                if existing.get().decision == decision {
+                    Ok(true)
+                } else {
+                    Err("request already resolved with a different decision".to_string())
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(PermissionDecisionReceipt {
+                    session_id: session_id.to_string(),
+                    decision,
+                    decided_at: chrono::Utc::now(),
+                });
+                self.pending_requests.remove(&key);
+                Ok(false)
+            }
+        }
+    }
+
+    pub fn durable_rules(&self) -> Vec<DurablePermissionRule> {
+        let mut rules: Vec<_> = self
+            .durable_rules
+            .iter()
+            .map(|entry| entry.value().clone())
+            .filter(|rule| !rule.is_expired())
+            .collect();
+        rules.sort_by(|left, right| left.id.cmp(&right.id));
+        rules
+    }
+
+    pub fn replace_durable_rules(&self, rules: impl IntoIterator<Item = DurablePermissionRule>) {
+        self.durable_rules.clear();
+        for rule in rules {
+            self.durable_rules.insert(rule.id.clone(), rule);
+        }
+    }
+
+    pub fn add_durable_rule(&self, rule: DurablePermissionRule) -> Result<(), String> {
+        rule.validate()?;
+        self.durable_rules.insert(rule.id.clone(), rule);
+        Ok(())
+    }
+
+    pub fn remove_durable_rule(&self, id: &str) -> bool {
+        self.durable_rules.remove(id).is_some()
+    }
+
+    /// Publish an already-durable snapshot to the live checker without touching
+    /// temporary once/session grants.
+    pub fn publish_persistent_policy(
+        &self,
+        revision: u64,
+        candidate: &SerializablePermissionConfig,
+    ) {
+        self.clear_rules();
+        for rule in &candidate.whitelist {
+            self.add_rule(rule.clone());
+        }
+        self.set_enabled(candidate.enabled);
+        self.set_mode(candidate.mode.unwrap_or_default());
+        self.set_confirm_threshold(candidate.confirm_threshold.unwrap_or(RiskLevel::Low));
+        self.set_ask_rules(candidate.ask_rules.clone());
+        self.replace_durable_rules(candidate.durable_rules.clone());
+        self.set_policy_revision(revision);
     }
 
     /// Replace the "always ask" rules from a list of pattern strings (e.g.
@@ -962,6 +1119,39 @@ impl PermissionConfig {
             })
     }
 
+    pub fn deny_scoped_session_permission(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource_pattern: impl Into<String>,
+    ) {
+        let grant = SessionGrant::new(resource_pattern, self.session_grant_duration);
+        let pattern = grant.resource_pattern.clone();
+        let session = self
+            .scoped_session_denies
+            .entry(session_id.to_string())
+            .or_default();
+        let mut denies = session.entry(perm_type).or_default();
+        denies.retain(|_, deny| !deny.is_expired());
+        denies.insert(pattern, grant);
+    }
+
+    pub fn is_scoped_session_denied(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        self.scoped_session_denies
+            .get(session_id)
+            .and_then(|session| session.get(&perm_type).map(|denies| denies.clone()))
+            .is_some_and(|denies| {
+                denies
+                    .values()
+                    .any(|deny| !deny.is_expired() && deny.matches(perm_type, resource))
+            })
+    }
+
     /// Consume a one-shot grant bound to one session. Legacy `Approve` maps to
     /// this path and therefore authorizes only the parked re-execution.
     pub fn consume_scoped_session_grant(
@@ -1032,6 +1222,7 @@ impl PermissionConfig {
     pub fn clear_session_grants(&self) {
         self.session_grants.clear();
         self.scoped_session_grants.clear();
+        self.scoped_session_denies.clear();
         self.one_shot_grants.clear();
     }
 
@@ -1066,6 +1257,256 @@ impl PermissionConfig {
         allowed
     }
 
+    /// Evaluate one operation through the single typed precedence chain.
+    ///
+    /// A request-bound one-shot authorization is checked after hard/explicit
+    /// deny but before forced confirmation. It is the receipt for the exact
+    /// parked invocation that was already confirmed; unrelated remembered
+    /// grants are intentionally evaluated only after hard-dangerous and
+    /// always-ask rules.
+    pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
+        let configured_mode = self.mode();
+        let effective_mode = if input.bypass_requested {
+            PermissionMode::BypassPermissions
+        } else {
+            configured_mode
+        };
+        let effective_policy = EffectivePermissionPolicy {
+            revision: self.policy_revision(),
+            mode: effective_mode,
+            bypass_requested: input.bypass_requested,
+        };
+
+        let deny = |code, message: String, matched_rule| PermissionOutcome::Deny {
+            reason: PermissionDenyReason {
+                code,
+                message,
+                matched_rule,
+            },
+            effective_policy: effective_policy.clone(),
+        };
+
+        if let Some(message) = input.platform_hard_deny.clone() {
+            return deny(PermissionReasonCode::PlatformHardDeny, message, None);
+        }
+
+        if let Some(rule) = self.matching_durable_rule(&input, PermissionRuleEffect::Deny) {
+            return deny(
+                PermissionReasonCode::ExplicitDeny,
+                format!("permission denied by durable rule '{}'", rule.id),
+                Some(PermissionRuleRef::from(&rule)),
+            );
+        }
+        if self.is_scoped_session_denied(&input.session_id, input.permission_type, &input.resource)
+        {
+            return deny(
+                PermissionReasonCode::ExplicitDeny,
+                "permission denied by a remembered session decision".to_string(),
+                None,
+            );
+        }
+        if self.is_whitelist_allowed(input.permission_type, &input.resource) == Some(false) {
+            return deny(
+                PermissionReasonCode::ExplicitDeny,
+                "permission denied by explicit policy (legacy rule)".to_string(),
+                Some(legacy_rule_ref("legacy-deny", PermissionRuleEffect::Deny)),
+            );
+        }
+
+        if input.consume_once
+            && self.consume_once(
+                &input.session_id,
+                &input.request_id,
+                input.permission_type,
+                &input.resource,
+            )
+        {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::OneShot,
+                effective_policy,
+            };
+        }
+
+        let hard_dangerous = self.is_hard_dangerous(&input.tool_name, &input.tool_args);
+        let typed_always_ask = self
+            .matching_durable_rule(&input, PermissionRuleEffect::AlwaysAsk)
+            .map(|rule| PermissionRuleRef::from(&rule));
+        let configured_always_ask = typed_always_ask.is_some()
+            || self
+                .ask_rules
+                .read()
+                .recover_poison()
+                .iter()
+                .any(|rule| rule.matches_tool_call(&input.tool_name, &input.tool_args));
+        if hard_dangerous || configured_always_ask {
+            let reason_code = if hard_dangerous {
+                PermissionReasonCode::HardDangerous
+            } else {
+                PermissionReasonCode::ConfiguredAlwaysAsk
+            };
+            return PermissionOutcome::Ask(self.build_request(
+                &input,
+                effective_mode,
+                reason_code,
+                typed_always_ask.or_else(|| {
+                    configured_always_ask.then(|| {
+                        legacy_rule_ref("legacy-always-ask", PermissionRuleEffect::AlwaysAsk)
+                    })
+                }),
+                true,
+            ));
+        }
+
+        if self.is_scoped_session_granted(&input.session_id, input.permission_type, &input.resource)
+        {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedSession,
+                effective_policy,
+            };
+        }
+        if let Some(rule) = self.matching_durable_rule(&input, PermissionRuleEffect::Allow) {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedRule {
+                    rule: PermissionRuleRef::from(&rule),
+                },
+                effective_policy,
+            };
+        }
+        if self.is_whitelist_allowed(input.permission_type, &input.resource) == Some(true) {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedRule {
+                    rule: legacy_rule_ref("legacy-allow", PermissionRuleEffect::Allow),
+                },
+                effective_policy,
+            };
+        }
+
+        if !self.is_enabled() {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::PermissionChecksDisabled,
+                effective_policy,
+            };
+        }
+
+        if input.bypass_requested || configured_mode == PermissionMode::BypassPermissions {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Bypass,
+                effective_policy,
+            };
+        }
+
+        match configured_mode {
+            PermissionMode::Plan if input.risk_level != RiskLevel::Low => {
+                return deny(
+                    PermissionReasonCode::ModeDenied,
+                    "operation denied by plan mode".to_string(),
+                    None,
+                );
+            }
+            PermissionMode::DontAsk => {
+                return deny(
+                    PermissionReasonCode::ModeDenied,
+                    "operation denied by dont-ask mode without an explicit allow".to_string(),
+                    None,
+                );
+            }
+            PermissionMode::AcceptEdits
+                if input.permission_type == PermissionType::WriteFile
+                    || (input.permission_type == PermissionType::ExecuteCommand
+                        && crate::checker::is_safe_edit_command(&input.resource)) =>
+            {
+                return PermissionOutcome::Allow {
+                    source: PermissionDecisionSource::Mode,
+                    effective_policy,
+                };
+            }
+            _ => {}
+        }
+
+        if input.risk_level < self.confirm_threshold() {
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::BelowRiskThreshold,
+                effective_policy,
+            }
+        } else {
+            PermissionOutcome::Ask(self.build_request(
+                &input,
+                effective_mode,
+                PermissionReasonCode::RiskThreshold,
+                None,
+                false,
+            ))
+        }
+    }
+
+    fn matching_durable_rule(
+        &self,
+        input: &PermissionEvaluation,
+        effect: PermissionRuleEffect,
+    ) -> Option<DurablePermissionRule> {
+        let mut matches: Vec<_> = self
+            .durable_rules
+            .iter()
+            .map(|entry| entry.value().clone())
+            .filter(|rule| {
+                rule.effect == effect
+                    && rule.matches(
+                        input.permission_type,
+                        &input.resource,
+                        input.workspace_path.as_deref(),
+                    )
+            })
+            .collect();
+        // Workspace is narrower than global. A stable id tie-break makes
+        // diagnostics deterministic without changing effect precedence.
+        matches.sort_by_key(|rule| {
+            (
+                match rule.scope {
+                    PermissionRuleScope::Workspace => 0,
+                    PermissionRuleScope::Global => 1,
+                },
+                rule.id.clone(),
+            )
+        });
+        matches.into_iter().next()
+    }
+
+    fn build_request(
+        &self,
+        input: &PermissionEvaluation,
+        effective_mode: PermissionMode,
+        reason_code: PermissionReasonCode,
+        matched_rule: Option<PermissionRuleRef>,
+        forced: bool,
+    ) -> PermissionRequest {
+        let offered = if forced {
+            PermissionRequest::forced_decisions()
+        } else {
+            PermissionRequest::ordinary_decisions(input.workspace_path.is_some())
+        };
+        let allowed_decisions = offered
+            .into_iter()
+            .filter(|decision| input.supported_decisions.contains(decision))
+            .collect();
+        PermissionRequest {
+            request_id: input.request_id.clone(),
+            session_id: input.session_id.clone(),
+            workspace_path: input.workspace_path.clone(),
+            tool_name: input.tool_name.clone(),
+            permission_type: input.permission_type,
+            resource: input.resource.clone(),
+            operation_summary: input.operation_summary.clone(),
+            risk_level: input.risk_level,
+            reason_code,
+            effective_mode,
+            bypass_requested: input.bypass_requested,
+            policy_revision: self.policy_revision(),
+            matched_rule,
+            allowed_decisions,
+            suggested_matchers: conservative_matchers(input.permission_type, &input.resource),
+        }
+    }
+
     /// Check if permission is required for an operation
     ///
     /// Returns true if the operation requires user confirmation
@@ -1098,6 +1539,7 @@ impl PermissionConfig {
             mode: Some(self.mode()),
             confirm_threshold: Some(self.confirm_threshold()),
             ask_rules: self.ask_rule_patterns(),
+            durable_rules: self.durable_rules(),
         }
     }
 
@@ -1116,17 +1558,27 @@ impl PermissionConfig {
             .iter()
             .map(|p| ParsedRule::parse(p))
             .collect();
+        let durable_rules = DashMap::new();
+        for rule in config.durable_rules {
+            durable_rules.insert(rule.id.clone(), rule);
+        }
 
         Self {
             whitelist,
             session_grants: DashMap::new(),
             scoped_session_grants: DashMap::new(),
+            scoped_session_denies: DashMap::new(),
             one_shot_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(config.session_grant_duration_secs),
             enabled: AtomicBool::new(config.enabled),
             mode: RwLock::new(mode),
             confirm_threshold: RwLock::new(confirm_threshold),
             ask_rules: RwLock::new(ask_rules),
+            durable_rules,
+            policy_revision: AtomicU64::new(0),
+            pending_requests: DashMap::new(),
+            decision_receipts: DashMap::new(),
+            session_workspaces: DashMap::new(),
         }
     }
 
@@ -1171,9 +1623,37 @@ impl PermissionConfig {
         ask_rules.extend(other.ask_rules.read().recover_poison().iter().cloned());
         *merged.ask_rules.write().recover_poison() = ask_rules;
 
+        for rule in self.durable_rules() {
+            merged.durable_rules.insert(rule.id.clone(), rule);
+        }
+        for rule in other.durable_rules() {
+            merged.durable_rules.insert(rule.id.clone(), rule);
+        }
+        for entry in self.session_workspaces.iter() {
+            merged
+                .session_workspaces
+                .insert(entry.key().clone(), entry.value().clone());
+        }
+        for entry in other.session_workspaces.iter() {
+            merged
+                .session_workspaces
+                .insert(entry.key().clone(), entry.value().clone());
+        }
+        merged.set_policy_revision(other.policy_revision());
+
         merged
     }
 }
+
+fn legacy_rule_ref(id: &str, effect: PermissionRuleEffect) -> PermissionRuleRef {
+    PermissionRuleRef {
+        id: id.to_string(),
+        effect,
+        scope: PermissionRuleScope::Global,
+        source: PermissionRuleSource::Legacy,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializablePermissionConfig {
     pub whitelist: Vec<PermissionRule>,
@@ -1187,6 +1667,10 @@ pub struct SerializablePermissionConfig {
     /// even under bypass. See [`PermissionConfig::requires_forced_confirmation`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ask_rules: Vec<String>,
+    /// Versioned typed rules. Legacy whitelist/ask-rule fields remain readable
+    /// and are evaluated without broadening during the migration window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub durable_rules: Vec<DurablePermissionRule>,
 }
 
 impl Default for SerializablePermissionConfig {
@@ -1198,6 +1682,7 @@ impl Default for SerializablePermissionConfig {
             mode: None,
             confirm_threshold: None,
             ask_rules: Vec::new(),
+            durable_rules: Vec::new(),
         }
     }
 }
@@ -2277,5 +2762,158 @@ mod integration_tests {
             canonicalize_path_pattern_for_matching("/**").as_deref(),
             Some("/**")
         );
+    }
+
+    fn evaluation(
+        session_id: &str,
+        request_id: &str,
+        resource: &str,
+        bypass_requested: bool,
+    ) -> PermissionEvaluation {
+        PermissionEvaluation {
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            workspace_path: None,
+            tool_name: "Bash".to_string(),
+            tool_args: serde_json::json!({"command": resource}),
+            permission_type: PermissionType::ExecuteCommand,
+            resource: resource.to_string(),
+            operation_summary: format!("execute {resource}"),
+            risk_level: RiskLevel::High,
+            bypass_requested,
+            platform_hard_deny: None,
+            consume_once: true,
+            supported_decisions: crate::policy::PermissionDecisionKind::all_supported(),
+        }
+    }
+
+    #[test]
+    fn typed_precedence_deny_and_forced_ask_beat_bypass_and_remembered_allow() {
+        let config = PermissionConfig::new();
+        config.grant_scoped_session_permission(
+            "a",
+            PermissionType::ExecuteCommand,
+            "sudo rm -rf /tmp/target",
+        );
+        let hard = evaluation("a", "hard", "sudo rm -rf /tmp/target", true);
+        assert!(matches!(
+            config.evaluate(hard),
+            PermissionOutcome::Ask(PermissionRequest {
+                reason_code: PermissionReasonCode::HardDangerous,
+                ..
+            })
+        ));
+
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "sudo rm -rf /tmp/target",
+            false,
+        ));
+        assert!(matches!(
+            config.evaluate(evaluation("a", "denied", "sudo rm -rf /tmp/target", true)),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ExplicitDeny,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_one_shot_authorizes_only_the_parked_forced_invocation() {
+        let config = PermissionConfig::new();
+        config.grant_once(
+            "a",
+            "call-1",
+            PermissionType::ExecuteCommand,
+            "rm -rf /tmp/target".to_string(),
+        );
+        assert!(matches!(
+            config.evaluate(evaluation("a", "call-1", "rm -rf /tmp/target", false)),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::OneShot,
+                ..
+            }
+        ));
+        assert!(matches!(
+            config.evaluate(evaluation("a", "call-2", "rm -rf /tmp/target", false)),
+            PermissionOutcome::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn remembered_session_allow_isolated_from_sibling_session() {
+        let config = PermissionConfig::new();
+        config.grant_scoped_session_permission("a", PermissionType::ExecuteCommand, "cargo test");
+        assert!(matches!(
+            config.evaluate(evaluation("a", "a-1", "cargo test", false)),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedSession,
+                ..
+            }
+        ));
+        assert!(matches!(
+            config.evaluate(evaluation("b", "b-1", "cargo test", false)),
+            PermissionOutcome::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn workspace_rule_requires_same_canonical_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let rule = DurablePermissionRule {
+            id: "workspace-cargo".to_string(),
+            permission_type: PermissionType::ExecuteCommand,
+            effect: PermissionRuleEffect::Allow,
+            scope: PermissionRuleScope::Workspace,
+            workspace_path: Some(workspace_path.clone()),
+            matcher: crate::policy::PermissionMatcher {
+                id: "cargo-test".to_string(),
+                kind: crate::policy::PermissionMatcherKind::CommandPrefix,
+                value: "cargo test".to_string(),
+            },
+            source: PermissionRuleSource::User,
+            expires_at: None,
+        };
+        let config = PermissionConfig::new();
+        config.add_durable_rule(rule).unwrap();
+        let mut own = evaluation("a", "own", "cargo test -p bamboo", false);
+        own.workspace_path = Some(workspace_path);
+        assert!(matches!(
+            config.evaluate(own),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedRule { .. },
+                ..
+            }
+        ));
+        let mut other = evaluation("b", "other", "cargo test -p bamboo", false);
+        other.workspace_path = Some(sibling.path().to_string_lossy().to_string());
+        assert!(matches!(config.evaluate(other), PermissionOutcome::Ask(_)));
+    }
+
+    #[test]
+    fn decision_receipt_is_idempotent_and_conflicting_replay_fails() {
+        let config = PermissionConfig::new();
+        let allow = PermissionDecision {
+            request_id: "req".to_string(),
+            decision: crate::policy::PermissionDecisionKind::AllowOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+        assert_eq!(config.record_decision("a", allow.clone()), Ok(false));
+        assert_eq!(config.record_decision("a", allow), Ok(true));
+        let deny = PermissionDecision {
+            request_id: "req".to_string(),
+            decision: crate::policy::PermissionDecisionKind::DenyOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+        assert!(config.record_decision("a", deny).is_err());
     }
 }

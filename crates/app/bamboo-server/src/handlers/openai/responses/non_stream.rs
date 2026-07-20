@@ -40,6 +40,7 @@ pub(super) async fn handle_non_streaming_response(
         session_id: None,
         reasoning_effort: prepared.reasoning_effort,
         parallel_tool_calls: prepared.parallel_tool_calls,
+        required_tool: None,
         responses: Some(prepared.responses_options.clone()),
         request_purpose: Some("openai_compat".to_string()),
         cache: None,
@@ -75,7 +76,8 @@ pub(super) async fn handle_non_streaming_response(
                 tool_calls.extend_indexed(calls)
             }
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
-            Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
+            Ok(bamboo_llm::types::LLMChunk::TransportActivity)
+            | Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
             | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {

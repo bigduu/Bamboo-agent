@@ -8,10 +8,11 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
     Client,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::provider::{
-    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
+    required_tool_from_options, LLMError, LLMProvider, LLMRequestOptions, LLMStream,
+    ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
@@ -158,6 +159,7 @@ impl OpenAIProvider {
         reasoning_effort: Option<ReasoningEffort>,
         responses_options: Option<&ResponsesRequestOptions>,
         parallel_tool_calls: Option<bool>,
+        required_tool: Option<&str>,
         reasoning_source: &str,
         request_purpose: &str,
         session_log_id: &str,
@@ -182,6 +184,9 @@ impl OpenAIProvider {
             request_overrides::ENDPOINT_RESPONSES,
             Some(model),
         );
+        if let Some(name) = required_tool {
+            body["tool_choice"] = json!({"type": "function", "name": name});
+        }
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
@@ -256,6 +261,9 @@ impl OpenAIProvider {
                     request_overrides::ENDPOINT_RESPONSES,
                     Some(model),
                 );
+                if let Some(name) = required_tool {
+                    fallback_body["tool_choice"] = json!({"type": "function", "name": name});
+                }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
@@ -313,6 +321,9 @@ impl OpenAIProvider {
                     request_overrides::ENDPOINT_RESPONSES,
                     Some(model),
                 );
+                if let Some(name) = required_tool {
+                    fallback_body["tool_choice"] = json!({"type": "function", "name": name});
+                }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
@@ -391,6 +402,7 @@ impl LLMProvider for OpenAIProvider {
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let required_tool = required_tool_from_options(options, tools)?;
         let responses_options = options.and_then(|o| o.responses.as_ref());
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
@@ -416,6 +428,7 @@ impl LLMProvider for OpenAIProvider {
                     reasoning_effort,
                     responses_options,
                     parallel_tool_calls,
+                    required_tool,
                     reasoning_source,
                     request_purpose,
                     session_log_id,
@@ -438,6 +451,9 @@ impl LLMProvider for OpenAIProvider {
             request_overrides::ENDPOINT_CHAT_COMPLETIONS,
             Some(model),
         );
+        if let Some(name) = required_tool {
+            body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
+        }
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
             "[{}] OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
@@ -494,6 +510,10 @@ impl LLMProvider for OpenAIProvider {
                     request_overrides::ENDPOINT_CHAT_COMPLETIONS,
                     Some(model),
                 );
+                if let Some(name) = required_tool {
+                    fallback_body["tool_choice"] =
+                        json!({"type": "function", "function": {"name": name}});
+                }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
@@ -546,6 +566,7 @@ impl LLMProvider for OpenAIProvider {
                         reasoning_effort,
                         responses_options,
                         parallel_tool_calls,
+                        required_tool,
                         reasoning_source,
                         request_purpose,
                         session_log_id,
@@ -954,6 +975,28 @@ mod tests {
     const PREVIOUS_RESPONSE_NOT_FOUND_BODY: &str = r#"{"error":{"message":"Previous response with id 'resp_stale' not found.","type":"invalid_request_error","param":"previous_response_id","code":"previous_response_not_found"}}"#;
 
     const RESPONSES_SSE_OK: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\"}}\n\n";
+    const CHAT_SSE_OK: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+
+    fn load_skill_tool() -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "load_skill".to_string(),
+                description: "Load one skill".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    fn require_load_skill_options() -> LLMRequestOptions {
+        LLMRequestOptions {
+            required_tool: Some("load_skill".to_string()),
+            parallel_tool_calls: Some(false),
+            reasoning_effort: Some(bamboo_domain::ReasoningEffort::High),
+            ..Default::default()
+        }
+    }
 
     /// Emulates the real OpenAI contract: a request chaining a stale (or never
     /// stored) `previous_response_id` fails with 400
@@ -978,6 +1021,106 @@ mod tests {
         OpenAIProvider::new("test-key")
             .with_base_url(server.uri())
             .with_responses_only_models(vec!["gpt-5*".to_string()])
+    }
+
+    #[tokio::test]
+    async fn chat_completions_forces_named_required_tool_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CHAT_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAIProvider::new("test-key").with_base_url(server.uri());
+        let tools = vec![load_skill_tool()];
+        let options = require_load_skill_options();
+
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &tools,
+                None,
+                "deepseek-v4-pro",
+                Some(&options),
+            )
+            .await
+            .expect("forced chat request");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "load_skill"}
+            })
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn responses_forces_named_required_tool_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = responses_provider(&server);
+        let tools = vec![load_skill_tool()];
+        let options = require_load_skill_options();
+
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &tools,
+                None,
+                "gpt-5.2",
+                Some(&options),
+            )
+            .await
+            .expect("forced Responses request");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type": "function", "name": "load_skill"})
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn required_tool_missing_from_schemas_fails_before_network() {
+        let provider = OpenAIProvider::new("test-key");
+        let result = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &[],
+                None,
+                "deepseek-v4-pro",
+                Some(&require_load_skill_options()),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("missing required schema must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("required tool schema 'load_skill' was not offered"));
     }
 
     fn options_with_previous_response_id(id: Option<&str>) -> LLMRequestOptions {

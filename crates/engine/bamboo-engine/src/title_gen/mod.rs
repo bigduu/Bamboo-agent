@@ -251,6 +251,11 @@ async fn try_llm_title(
     let messages: Vec<Message> = build_title_messages(first_user_text);
     let model_name = resolved.model_name.clone();
     let provider = resolved.provider;
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+        config_snapshot.stream_timeout,
+        Some(&provider_name),
+        Some(&model_name),
+    );
 
     let fut = async move {
         let options = bamboo_llm::provider::LLMRequestOptions {
@@ -261,10 +266,11 @@ async fn try_llm_title(
             .chat_stream_with_options(&messages, &[], Some(64), &model_name, Some(&options))
             .await
             .map_err(|e| format!("chat_stream: {e}"))?;
-        let output = crate::runtime::stream::handler::consume_llm_stream_silent(
+        let output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
             stream,
             &CancellationToken::new(),
             "title-gen",
+            &timeout_context,
         )
         .await
         .map_err(|e| format!("consume_llm_stream_silent: {e}"))?;

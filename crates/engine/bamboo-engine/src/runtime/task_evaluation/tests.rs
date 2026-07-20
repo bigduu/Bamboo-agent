@@ -146,15 +146,19 @@ async fn task_evaluation_uses_explicit_model_parameter_for_provider_request() {
     let provider = Arc::new(RecordingFailingProvider::default());
     let llm: Arc<dyn LLMProvider> = provider.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::default();
 
     let result = evaluate_task_progress(
         &context,
         &session,
         llm,
-        &event_tx,
-        "test-session",
-        "evaluation-model",
-        None,
+        &super::TaskEvaluationFrame {
+            event_tx: &event_tx,
+            session_id: "test-session",
+            model: "evaluation-model",
+            reasoning_effort: None,
+            timeout_context: &timeout_context,
+        },
     )
     .await
     .expect("evaluation should gracefully handle provider failure");
@@ -227,15 +231,19 @@ async fn task_evaluation_caps_reasoning_effort_to_high_for_lightweight_request()
     let provider = Arc::new(RecordingRequestOptionsProvider::default());
     let llm: Arc<dyn LLMProvider> = provider.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::default();
 
     let _ = evaluate_task_progress(
         &context,
         &session,
         llm,
-        &event_tx,
-        "test-session",
-        "gpt-5-mini",
-        Some(ReasoningEffort::Xhigh),
+        &super::TaskEvaluationFrame {
+            event_tx: &event_tx,
+            session_id: "test-session",
+            model: "gpt-5-mini",
+            reasoning_effort: Some(ReasoningEffort::Xhigh),
+            timeout_context: &timeout_context,
+        },
     )
     .await
     .expect("evaluation request should succeed");
@@ -253,15 +261,19 @@ async fn task_evaluation_sufficient_max_tokens_for_high_reasoning() {
     let provider = Arc::new(RecordingRequestOptionsProvider::default());
     let llm: Arc<dyn LLMProvider> = provider.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::default();
 
     let _ = evaluate_task_progress(
         &context,
         &session,
         llm,
-        &event_tx,
-        "test-session",
-        "gpt-5-mini",
-        Some(ReasoningEffort::High),
+        &super::TaskEvaluationFrame {
+            event_tx: &event_tx,
+            session_id: "test-session",
+            model: "gpt-5-mini",
+            reasoning_effort: Some(ReasoningEffort::High),
+            timeout_context: &timeout_context,
+        },
     )
     .await
     .expect("evaluation request should succeed");

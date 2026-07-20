@@ -148,31 +148,35 @@ pub fn build_provider_handles(provider: Arc<dyn LLMProvider>) -> ProviderHandles
 /// Load permission configuration from disk.
 ///
 /// Falls back to disabled permissions if no config exists or loading fails.
-pub async fn load_permission_checker(bamboo_home_dir: &Path) -> Arc<PermissionChecker> {
-    use bamboo_tools::permission::{PermissionConfig, RiskLevel};
+pub async fn load_permission_checker(
+    bamboo_home_dir: &Path,
+) -> Result<
+    (
+        Arc<PermissionChecker>,
+        Arc<bamboo_tools::permission::PermissionSection>,
+    ),
+    AppError,
+> {
+    use bamboo_tools::permission::{PermissionConfig, PermissionSection};
 
-    let storage = bamboo_tools::permission::storage::PermissionStorage::new(bamboo_home_dir);
-    let permission_config = match storage.load().await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            // First run, no saved config: default posture is "ask on high-risk".
-            // Checks are enabled (PermissionConfig::new defaults to enabled +
-            // Default mode); only high-risk operations (execute command, delete,
-            // git write, terminal session) require confirmation. Lower-risk ops
-            // (file writes, HTTP) auto-allow.
-            let cfg = PermissionConfig::new();
-            cfg.set_confirm_threshold(RiskLevel::High);
-            cfg
-        }
-        Err(error) => {
-            tracing::warn!(
-                "Failed to load permission config; defaulting to ask-on-high-risk: {error}"
-            );
-            let cfg = PermissionConfig::new();
-            cfg.set_confirm_threshold(RiskLevel::High);
-            cfg
-        }
-    };
+    let data_dir = bamboo_home_dir.to_path_buf();
+    let section = Arc::new(
+        tokio::task::spawn_blocking(move || PermissionSection::open(data_dir))
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "permission section initialization task failed: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "permission section initialization failed: {error}"
+                ))
+            })?,
+    );
+    let snapshot = section.snapshot();
+    let permission_config = PermissionConfig::from_serializable(snapshot.data.as_ref().clone());
+    permission_config.set_policy_revision(snapshot.revision);
     permission_config.cleanup_expired_grants();
 
     // Wrap the config checker in a mode-aware checker so the active PermissionMode
@@ -183,9 +187,10 @@ pub async fn load_permission_checker(bamboo_home_dir: &Path) -> Arc<PermissionCh
     let inner: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
         bamboo_tools::permission::ConfigPermissionChecker::new(config.clone()),
     );
-    Arc::new(bamboo_tools::permission::ModeAwarePermissionChecker::new(
+    let checker = Arc::new(bamboo_tools::permission::ModeAwarePermissionChecker::new(
         inner, config,
-    ))
+    ));
+    Ok((checker, section))
 }
 
 /// Initialize MCP server manager. A pre-existing revisioned `mcp.json` is the
@@ -472,6 +477,7 @@ pub fn build_schedule_manager(
     schedule_store: Arc<ScheduleStore>,
     agent: Arc<Agent>,
     tools_for_schedules: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -486,6 +492,7 @@ pub fn build_schedule_manager(
         schedule_store,
         agent,
         tools: tools_for_schedules,
+        permission_config,
         sessions_cache: sessions,
         agent_runners,
         session_event_senders,

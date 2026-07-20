@@ -11,6 +11,7 @@
 //! order == seq order" holds trivially without scattering the invariant across
 //! concurrent callers.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,6 +64,11 @@ impl AccountEventSink {
         if let Err(e) = super::journal::prune(&events_dir, RETAINED_FILES) {
             tracing::warn!("change-feed journal prune failed: {e}");
         }
+        let delivered_lifecycle_ids = super::journal::read_since(&events_dir, 0)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|change| lifecycle_event_id(&change.event).map(str::to_string))
+            .collect::<HashSet<_>>();
         let (journal, max_seq) = EventJournal::open(events_dir.clone())?;
         let seq = Arc::new(AtomicU64::new(max_seq));
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
@@ -76,7 +82,7 @@ impl AccountEventSink {
             dropped: Arc::new(AtomicU64::new(0)),
         });
 
-        tokio::spawn(writer_loop(rx, journal, seq, btx));
+        tokio::spawn(writer_loop(rx, journal, seq, btx, delivered_lifecycle_ids));
         Ok(sink)
     }
 
@@ -130,13 +136,28 @@ impl AccountEventSink {
     }
 }
 
+fn lifecycle_event_id(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::WorkflowActivated { event_id, .. }
+        | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
+        _ => None,
+    }
+}
+
 async fn writer_loop(
     mut rx: mpsc::Receiver<PendingEvent>,
     mut journal: EventJournal,
     seq: Arc<AtomicU64>,
     broadcast: broadcast::Sender<Arc<ChangeEvent>>,
+    mut delivered_lifecycle_ids: HashSet<String>,
 ) {
     while let Some((session_id, event)) = rx.recv().await {
+        if lifecycle_event_id(&event)
+            .is_some_and(|event_id| !delivered_lifecycle_ids.insert(event_id.to_string()))
+        {
+            tracing::debug!("duplicate workflow lifecycle event suppressed");
+            continue;
+        }
         // Single writer → fetch_add is the seq allocator. 1-based.
         let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
         let ce = ChangeEvent {
@@ -163,6 +184,52 @@ mod tests {
         AgentEvent::SessionDeleted {
             session_id: id.to_string(),
         }
+    }
+
+    fn activation(event_id: &str) -> AgentEvent {
+        AgentEvent::WorkflowActivated {
+            event_id: event_id.to_string(),
+            session_id: "session".to_string(),
+            workflow_id: "review".to_string(),
+            revision: 7,
+            invoked_by: "model".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ids_are_deduped_live_and_after_sink_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let mut rx = sink.subscribe();
+        let event = activation("stable-activation-id");
+        sink.record(Some("session"), &event);
+        sink.record(Some("session"), &event);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first event")
+            .expect("broadcast");
+        assert_eq!(
+            lifecycle_event_id(&first.event),
+            Some("stable-activation-id")
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
+        );
+        drop(rx);
+        drop(sink);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let mut restarted_rx = restarted.subscribe();
+        restarted.record(Some("session"), &event);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), restarted_rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(restarted.latest_seq(), 1);
     }
 
     #[tokio::test]

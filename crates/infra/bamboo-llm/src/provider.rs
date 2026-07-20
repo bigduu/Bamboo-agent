@@ -111,6 +111,10 @@ pub struct LLMRequestOptions {
     /// - OpenAI/Copilot: maps to `parallel_tool_calls`
     /// - Anthropic: maps to `tool_choice.disable_parallel_tool_use` (inverse)
     pub parallel_tool_calls: Option<bool>,
+    /// Require the model to issue this specific tool call when the provider
+    /// supports request-level tool choice. Providers translate this to their
+    /// native forced-function form; `None` preserves normal automatic choice.
+    pub required_tool: Option<String>,
     /// Responses API specific overrides.
     pub responses: Option<ResponsesRequestOptions>,
     /// Purpose of this request for observability (e.g., "agent_loop", "task_evaluation").
@@ -120,6 +124,28 @@ pub struct LLMRequestOptions {
     /// (Anthropic `cache_control` breakpoints; OpenAI/Gemini rely on the stable
     /// prefix automatically). `None` means "no explicit cache hints".
     pub cache: Option<crate::cache::PromptCachePlan>,
+}
+
+/// Resolve a forced named-tool request and fail before network I/O when the
+/// requested schema is not actually offered to the provider.
+pub(crate) fn required_tool_from_options<'a>(
+    options: Option<&'a LLMRequestOptions>,
+    tools: &[ToolSchema],
+) -> Result<Option<&'a str>> {
+    let Some(name) = options
+        .and_then(|options| options.required_tool.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(None);
+    };
+    if tools.iter().any(|tool| tool.function.name == name) {
+        Ok(Some(name))
+    } else {
+        Err(LLMError::Api(format!(
+            "required tool schema '{name}' was not offered"
+        )))
+    }
 }
 
 /// Trait for LLM provider implementations

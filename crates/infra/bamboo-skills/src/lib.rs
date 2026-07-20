@@ -1,6 +1,7 @@
 //! Agent skill management (re-exported from bamboo-agent-skill crate).
 
 pub mod access_control;
+pub mod activation;
 pub mod catalog;
 pub mod context;
 pub mod legacy;
@@ -11,19 +12,26 @@ pub mod session_port;
 pub mod store;
 pub mod types;
 
+pub use activation::*;
 pub use catalog::{
     ShadowedWorkflowCandidate, WorkflowCatalogEntry, WorkflowCatalogEvent,
     WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource,
     WorkflowStatus,
 };
-pub use store::{SkillActivationDescriptor, SkillStore, SkillUpdate};
+pub use store::{
+    SkillActivationDescriptor, SkillActivationSnapshot, SkillActivationSnapshotEntry, SkillStore,
+    SkillUpdate,
+};
 pub use types::*;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-const MAX_UNSELECTED_SKILLS_IN_CONTEXT: usize = 24;
+pub const DEFAULT_WORKFLOW_CATALOG_MAX_CHARS: usize = 10_240;
+pub const DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS: usize = 128_000;
+const ESTIMATED_CHARS_PER_TOKEN: usize = 4;
+const MAX_COMPRESSED_DESCRIPTION_CHARS: usize = 180;
 
 fn tokenize_request_hint(request_hint: &str) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -78,25 +86,72 @@ fn skill_match_score(skill: &SkillDefinition, tokens: &[String]) -> usize {
         .sum()
 }
 
-fn shortlist_skills_for_context(
-    mut skills: Vec<SkillDefinition>,
+fn budget_skills_for_context(
+    skills: Vec<SkillDefinition>,
+    catalog: &WorkflowCatalogSnapshot,
     request_hint: Option<&str>,
-) -> Vec<SkillDefinition> {
-    if skills.len() <= MAX_UNSELECTED_SKILLS_IN_CONTEXT {
-        return skills;
+    max_context_tokens: usize,
+) -> (
+    Vec<SkillDefinition>,
+    Vec<WorkflowCatalogEntry>,
+    WorkflowCatalogDiagnostic,
+) {
+    let entries_by_id = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.winner)
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let total_candidates = skills.len();
+    let char_budget = DEFAULT_WORKFLOW_CATALOG_MAX_CHARS.min(
+        max_context_tokens
+            .saturating_mul(2)
+            .saturating_div(100)
+            .saturating_mul(ESTIMATED_CHARS_PER_TOKEN),
+    );
+    let char_budget = char_budget.max(1);
+    let token_budget = char_budget / ESTIMATED_CHARS_PER_TOKEN;
+    let static_chars = context::workflow_catalog_prefix().chars().count();
+    const DIAGNOSTIC_RESERVE_CHARS: usize = 512;
+    if char_budget < static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS) {
+        return (
+            Vec::new(),
+            Vec::new(),
+            WorkflowCatalogDiagnostic {
+                total_candidates,
+                advertised_candidates: 0,
+                initial_chars: 0,
+                final_chars: 0,
+                char_budget,
+                token_budget,
+                compressed_descriptions: false,
+                shortlisted: total_candidates > 0,
+                omitted_ids: skills.into_iter().map(|skill| skill.id).collect(),
+            },
+        );
     }
+    let initial_chars = skills
+        .iter()
+        .filter_map(|skill| {
+            entries_by_id
+                .get(skill.id.as_str())
+                .map(|entry| (skill, *entry))
+        })
+        .map(|(skill, entry)| {
+            context::render_workflow_catalog_entry(skill, entry)
+                .chars()
+                .count()
+        })
+        .sum::<usize>()
+        .saturating_add(static_chars)
+        .saturating_add(DIAGNOSTIC_RESERVE_CHARS);
+    let compressed_descriptions = initial_chars > char_budget;
 
     let hint_tokens = request_hint
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(tokenize_request_hint)
         .unwrap_or_default();
-
-    if hint_tokens.is_empty() {
-        skills.sort_by_key(|s| s.id.clone());
-        skills.truncate(MAX_UNSELECTED_SKILLS_IN_CONTEXT);
-        return skills;
-    }
 
     let mut ranked: Vec<(usize, SkillDefinition)> = skills
         .into_iter()
@@ -110,29 +165,68 @@ fn shortlist_skills_for_context(
     });
 
     let mut selected = Vec::new();
-    let mut selected_ids = HashSet::new();
-
-    for (score, skill) in ranked.iter().cloned() {
-        if score == 0 || selected.len() >= MAX_UNSELECTED_SKILLS_IN_CONTEXT {
-            break;
+    let mut used = static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS);
+    for (_, mut skill) in ranked {
+        let Some(entry) = entries_by_id.get(skill.id.as_str()).copied() else {
+            continue;
+        };
+        if compressed_descriptions
+            && skill.description.chars().count() > MAX_COMPRESSED_DESCRIPTION_CHARS
+        {
+            skill.description = format!(
+                "{}…",
+                skill
+                    .description
+                    .chars()
+                    .take(MAX_COMPRESSED_DESCRIPTION_CHARS.saturating_sub(1))
+                    .collect::<String>()
+            );
         }
-        selected_ids.insert(skill.id.clone());
+        let cost = context::render_workflow_catalog_entry(&skill, entry)
+            .chars()
+            .count();
+        if used.saturating_add(cost) > char_budget {
+            continue;
+        }
+        used = used.saturating_add(cost);
         selected.push(skill);
     }
-
-    if selected.len() < MAX_UNSELECTED_SKILLS_IN_CONTEXT {
-        let mut fallback: Vec<SkillDefinition> = ranked
-            .into_iter()
-            .map(|(_, skill)| skill)
-            .filter(|skill| !selected_ids.contains(&skill.id))
-            .collect();
-        fallback.sort_by_key(|s| s.id.clone());
-        let remaining = MAX_UNSELECTED_SKILLS_IN_CONTEXT - selected.len();
-        selected.extend(fallback.into_iter().take(remaining));
-    }
-
-    selected.sort_by_key(|s| s.id.clone());
-    selected
+    let selected_ids = selected
+        .iter()
+        .map(|skill| skill.id.as_str())
+        .collect::<HashSet<_>>();
+    let selected_entries = selected
+        .iter()
+        .filter_map(|skill| {
+            entries_by_id
+                .get(skill.id.as_str())
+                .map(|entry| (*entry).clone())
+        })
+        .collect::<Vec<_>>();
+    let omitted_ids = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.winner && !selected_ids.contains(entry.id.as_str()))
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    let selected_len = selected.len();
+    let mut diagnostic = WorkflowCatalogDiagnostic {
+        total_candidates,
+        advertised_candidates: selected_len,
+        initial_chars,
+        final_chars: 0,
+        char_budget,
+        token_budget,
+        compressed_descriptions,
+        shortlisted: selected_len < total_candidates,
+        omitted_ids,
+    };
+    diagnostic.final_chars =
+        context::build_workflow_catalog_context(&selected, &selected_entries, &diagnostic)
+            .chars()
+            .count();
+    debug_assert!(diagnostic.final_chars <= diagnostic.char_budget);
+    (selected, selected_entries, diagnostic)
 }
 
 fn filter_disabled_skills(
@@ -171,6 +265,8 @@ pub struct SkillManager {
 #[derive(Debug, Clone)]
 pub struct SkillActivationSelection {
     pub skills: Vec<SkillDefinition>,
+    pub catalog_entries: Vec<WorkflowCatalogEntry>,
+    pub catalog_diagnostic: WorkflowCatalogDiagnostic,
     pub descriptor: SkillActivationDescriptor,
 }
 
@@ -251,11 +347,9 @@ impl SkillManager {
             .filter(|id| !id.is_empty())
             .collect();
         if selected_set.is_empty() {
-            let automatic_ids = invocation_allowed_skill_ids(catalog, "automatic");
-            return skills
-                .into_iter()
-                .filter(|skill| automatic_ids.contains(skill.id.as_str()))
-                .collect();
+            // An explicitly supplied empty selection is a deactivation, not a
+            // request to silently fall back to automatic candidates.
+            return Vec::new();
         }
 
         let explicit_ids = invocation_allowed_skill_ids(catalog, "explicit");
@@ -321,6 +415,7 @@ impl SkillManager {
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
+        max_context_tokens: usize,
     ) -> SkillResult<SkillActivationSelection> {
         // All four values are cloned under the store's publication read lock.
         // A watcher may publish after this await, but this activation only consumes
@@ -328,15 +423,46 @@ impl SkillManager {
         let (skills, roots, resources, catalog) = store
             .activation_source_for_mode(selected_skill_mode)
             .await?;
-        let mut selected = Self::filter_skills_for_selection(
+        let selected = Self::filter_skills_for_selection(
             skills,
             &catalog,
             disabled_skill_ids,
             selected_skill_ids,
         );
-        if selected_skill_ids.is_none() {
-            selected = shortlist_skills_for_context(selected, request_hint);
-        }
+        let (selected, catalog_entries, catalog_diagnostic) = if selected_skill_ids.is_none() {
+            budget_skills_for_context(selected, &catalog, request_hint, max_context_tokens)
+        } else {
+            let selected_ids = selected
+                .iter()
+                .map(|skill| skill.id.as_str())
+                .collect::<HashSet<_>>();
+            let entries = catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.winner && selected_ids.contains(entry.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let chars = selected
+                .iter()
+                .map(|skill| skill.description.len() + skill.name.len() + skill.id.len() + 160)
+                .sum();
+            let count = selected.len();
+            (
+                selected,
+                entries,
+                WorkflowCatalogDiagnostic {
+                    total_candidates: count,
+                    advertised_candidates: count,
+                    initial_chars: chars,
+                    final_chars: chars,
+                    char_budget: DEFAULT_WORKFLOW_CATALOG_MAX_CHARS,
+                    token_budget: DEFAULT_WORKFLOW_CATALOG_MAX_CHARS / ESTIMATED_CHARS_PER_TOKEN,
+                    compressed_descriptions: false,
+                    shortlisted: false,
+                    omitted_ids: Vec::new(),
+                },
+            )
+        };
         let descriptor = store
             .pin_activation_from_source(
                 activation_id,
@@ -349,6 +475,8 @@ impl SkillManager {
             .await?;
         Ok(SkillActivationSelection {
             skills: selected,
+            catalog_entries,
+            catalog_diagnostic,
             descriptor,
         })
     }
@@ -412,7 +540,13 @@ impl SkillManager {
 
         if selected_skill_ids.is_none() {
             let original_len = skills.len();
-            skills = shortlist_skills_for_context(skills, request_hint);
+            skills = budget_skills_for_context(
+                skills,
+                &self.store.workflow_catalog_snapshot().await,
+                request_hint,
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .0;
             if skills.len() < original_len {
                 tracing::info!(
                     "Skill context shortlisted from {} to {} entries (request_hint_present={})",
@@ -438,6 +572,26 @@ impl SkillManager {
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
     ) -> SkillResult<SkillActivationSelection> {
+        self.resolve_and_pin_activation_for_request_with_mode_and_budget(
+            activation_id,
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            request_hint,
+            DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        )
+        .await
+    }
+
+    pub async fn resolve_and_pin_activation_for_request_with_mode_and_budget(
+        &self,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+        max_context_tokens: usize,
+    ) -> SkillResult<SkillActivationSelection> {
         let _scope_guard = self.activation_scope_coordinator.lock().await;
         self.prepare_activation_scope(activation_id, &self.store)
             .await;
@@ -448,6 +602,7 @@ impl SkillManager {
             selected_skill_ids,
             selected_skill_mode,
             request_hint,
+            max_context_tokens,
         )
         .await
     }
@@ -472,7 +627,14 @@ impl SkillManager {
         .await;
 
         if selected_skill_ids.is_none() {
-            skills = shortlist_skills_for_context(skills, request_hint);
+            let catalog = store.workflow_catalog_snapshot().await;
+            skills = budget_skills_for_context(
+                skills,
+                &catalog,
+                request_hint,
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .0;
         }
         Ok(skills)
     }
@@ -486,6 +648,29 @@ impl SkillManager {
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
     ) -> SkillResult<SkillActivationSelection> {
+        self.resolve_and_pin_activation_in_workspace_with_mode_and_budget(
+            workspace,
+            activation_id,
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            request_hint,
+            DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_and_pin_activation_in_workspace_with_mode_and_budget(
+        &self,
+        workspace: &Path,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+        max_context_tokens: usize,
+    ) -> SkillResult<SkillActivationSelection> {
         let store = self.store.skill_store_for_workspace(workspace).await?;
         let _scope_guard = self.activation_scope_coordinator.lock().await;
         self.prepare_activation_scope(activation_id, &store).await;
@@ -496,6 +681,7 @@ impl SkillManager {
             selected_skill_ids,
             selected_skill_mode,
             request_hint,
+            max_context_tokens,
         )
         .await
     }
@@ -555,10 +741,33 @@ impl SkillManager {
         workspace: Option<&Path>,
     ) -> SkillResult<Option<SkillActivationSelection>> {
         let store = self.store_for_workspace(workspace).await?;
-        Ok(store
-            .pinned_activation_skills(activation_id)
-            .await
-            .map(|(skills, descriptor)| SkillActivationSelection { skills, descriptor }))
+        let pinned = store.pinned_activation_skills(activation_id).await;
+        let catalog_entries = store.pinned_activation_catalog_entries(activation_id).await;
+        Ok(pinned
+            .zip(catalog_entries)
+            .map(|((skills, descriptor), catalog_entries)| {
+                let chars = skills
+                    .iter()
+                    .map(|skill| skill.id.len() + skill.name.len() + skill.description.len() + 160)
+                    .sum();
+                SkillActivationSelection {
+                    skills,
+                    catalog_entries,
+                    catalog_diagnostic: WorkflowCatalogDiagnostic {
+                        total_candidates: descriptor.skill_revisions.len(),
+                        advertised_candidates: descriptor.skill_revisions.len(),
+                        initial_chars: chars,
+                        final_chars: chars,
+                        char_budget: DEFAULT_WORKFLOW_CATALOG_MAX_CHARS,
+                        token_budget: DEFAULT_WORKFLOW_CATALOG_MAX_CHARS
+                            / ESTIMATED_CHARS_PER_TOKEN,
+                        compressed_descriptions: false,
+                        shortlisted: false,
+                        omitted_ids: Vec::new(),
+                    },
+                    descriptor,
+                }
+            }))
     }
 
     pub async fn release_activation_for_workspace(
@@ -695,8 +904,9 @@ mod tests {
     use tokio::fs;
 
     use super::{
-        filter_disabled_skills, shortlist_skills_for_context, tokenize_request_hint,
-        SkillDefinition, SkillManager, SkillStoreConfig, WorkflowStatus,
+        budget_skills_for_context, filter_disabled_skills, tokenize_request_hint, SkillDefinition,
+        SkillManager, SkillStoreConfig, WorkflowCatalogEntry, WorkflowCatalogSnapshot,
+        WorkflowKind, WorkflowSource, WorkflowStatus, DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
     };
 
     fn demo_skill(id: &str, description: &str) -> SkillDefinition {
@@ -726,11 +936,68 @@ mod tests {
         }
         skills.push(demo_skill("react-optimizer", "react vite optimization"));
 
-        let shortlisted = shortlist_skills_for_context(skills, Some("optimize react vite build"));
-        assert!(shortlisted.len() <= 24);
+        let catalog = WorkflowCatalogSnapshot {
+            revision: 1,
+            entries: skills
+                .iter()
+                .map(|skill| WorkflowCatalogEntry {
+                    id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    kind: WorkflowKind::Instruction,
+                    source: WorkflowSource::User,
+                    revision: 1,
+                    version: "1".to_string(),
+                    invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
+                    argument_schema: serde_json::json!({"type": "object"}),
+                    status: WorkflowStatus::Valid,
+                    last_error: None,
+                    winner: true,
+                    shadowed_candidates: Vec::new(),
+                })
+                .collect(),
+        };
+        let (shortlisted, _, diagnostic) = budget_skills_for_context(
+            skills,
+            &catalog,
+            Some("optimize react vite build"),
+            DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        );
         assert!(shortlisted
             .iter()
             .any(|skill| skill.id == "react-optimizer"));
+        assert!(diagnostic.final_chars <= diagnostic.char_budget);
+    }
+
+    #[test]
+    fn workflow_catalog_never_exceeds_two_percent_of_tiny_context() {
+        let skill = demo_skill("large", &"description ".repeat(2_000));
+        let catalog = WorkflowCatalogSnapshot {
+            revision: 1,
+            entries: vec![WorkflowCatalogEntry {
+                id: skill.id.clone(),
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                kind: WorkflowKind::Instruction,
+                source: WorkflowSource::User,
+                revision: 1,
+                version: "1".to_string(),
+                invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
+                argument_schema: serde_json::json!({"type": "object"}),
+                status: WorkflowStatus::Valid,
+                last_error: None,
+                winner: true,
+                shadowed_candidates: Vec::new(),
+            }],
+        };
+        let (skills, entries, diagnostic) =
+            budget_skills_for_context(vec![skill], &catalog, None, 100);
+        let rendered =
+            crate::context::build_workflow_catalog_context(&skills, &entries, &diagnostic);
+        assert!(diagnostic.char_budget <= 8);
+        assert!(rendered.chars().count() <= diagnostic.char_budget);
+        assert_eq!(diagnostic.final_chars, rendered.chars().count());
+        assert!(diagnostic.shortlisted);
     }
 
     #[test]

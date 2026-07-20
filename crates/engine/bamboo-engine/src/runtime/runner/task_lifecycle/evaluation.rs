@@ -110,6 +110,8 @@ pub(in crate::runtime::runner) struct AsyncTaskEvaluationRequest {
     pub(in crate::runtime::runner) based_on_task_context_version: u64,
     pub(in crate::runtime::runner) task_list_title: Option<String>,
     pub(in crate::runtime::runner) model_name: String,
+    pub(in crate::runtime::runner) timeout_context:
+        crate::runtime::stream::handler::StreamTimeoutContext,
     pub(in crate::runtime::runner) reasoning_effort: Option<ReasoningEffort>,
     pub(in crate::runtime::runner) task_context_snapshot: TaskLoopContext,
     pub(in crate::runtime::runner) session_snapshot: Session,
@@ -132,6 +134,7 @@ pub(in crate::runtime::runner) fn build_async_task_evaluation_request(
     round_number: usize,
     model_name: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
+    timeout_context: crate::runtime::stream::handler::StreamTimeoutContext,
 ) -> Result<Option<AsyncTaskEvaluationRequest>, AgentError> {
     let Some(task_context_snapshot) = task_context.clone() else {
         return Ok(None);
@@ -155,6 +158,7 @@ pub(in crate::runtime::runner) fn build_async_task_evaluation_request(
             .as_ref()
             .map(|task_list| task_list.title.clone()),
         model_name: model_name.to_string(),
+        timeout_context,
         reasoning_effort,
         task_context_snapshot,
         session_snapshot: session.clone(),
@@ -170,10 +174,13 @@ pub(in crate::runtime::runner) async fn execute_async_task_evaluation(
         &request.task_context_snapshot,
         &request.session_snapshot,
         llm,
-        &event_tx,
-        &request.session_id,
-        &request.model_name,
-        request.reasoning_effort,
+        &crate::runtime::task_evaluation::TaskEvaluationFrame {
+            event_tx: &event_tx,
+            session_id: &request.session_id,
+            model: &request.model_name,
+            reasoning_effort: request.reasoning_effort,
+            timeout_context: &request.timeout_context,
+        },
     )
     .await
     {

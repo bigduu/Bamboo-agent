@@ -85,6 +85,8 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             .map(String::from),
         workspace_path: workspace_path.map(String::from),
         selected_skill_ids: req.selected_skill_ids.clone(),
+        workflow_selection: req.workflow_selection.clone(),
+        orchestration_opt_in: req.orchestration_opt_in,
         copilot_conclusion_with_options_enhancement_enabled: req
             .copilot_conclusion_with_options_enhancement_enabled,
         data_dir,
@@ -99,6 +101,11 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     .await
     {
         Ok(session) => session,
+        Err(bamboo_engine::session_app::errors::ChatError::InvalidWorkflowSelection(error)) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value(error)
+            }));
+        }
         Err(error) => {
             tracing::error!("Chat turn preparation failed: {error}");
             return HttpResponse::InternalServerError().json(serde_json::json!({

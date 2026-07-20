@@ -432,6 +432,9 @@ pub struct AgentLoopConfig {
     pub(crate) per_tool_timeout_secs: u64,
     /// Parallel batch execution timeout in seconds (default: 300).
     pub(crate) parallel_batch_timeout_secs: u64,
+    /// Resolved LLM stream transport/semantic watchdog policy. The same value
+    /// is passed to main response streams and auxiliary silent streams.
+    pub(crate) stream_timeout: bamboo_config::StreamTimeoutConfig,
     /// Permission mode for this execution (default: None = use PermissionConfig's mode).
     pub(crate) permission_mode: Option<PermissionMode>,
     /// Optional Gold observe-only evaluator configuration.
@@ -537,6 +540,7 @@ impl Default for AgentLoopConfig {
             max_consecutive_failures_per_tool: 3,
             per_tool_timeout_secs: 120,
             parallel_batch_timeout_secs: 300,
+            stream_timeout: bamboo_config::StreamTimeoutConfig::default(),
             permission_mode: None,
             gold_config: None,
             guardian_config: None,

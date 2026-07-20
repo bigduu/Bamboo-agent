@@ -33,6 +33,9 @@ struct MockLlmProvider {
     requested_include: Mutex<Option<Vec<String>>>,
     requested_text_verbosity: Mutex<Option<String>>,
     requested_instructions: Mutex<Option<String>>,
+    requested_required_tool: Mutex<Option<String>>,
+    requested_parallel_tool_calls: Mutex<Option<bool>>,
+    requested_tool_names: Mutex<Vec<String>>,
     /// Set when the engine routed this request through the canonical
     /// `chat_stream_ir` entry point.
     ir_invoked: Mutex<bool>,
@@ -84,7 +87,7 @@ impl LLMProvider for MockLlmProvider {
     async fn chat_stream_with_options(
         &self,
         messages: &[Message],
-        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
         _max_output_tokens: Option<u32>,
         _model: &str,
         options: Option<&LLMRequestOptions>,
@@ -122,6 +125,19 @@ impl LLMProvider for MockLlmProvider {
             .expect("instructions lock") = options
             .and_then(|value| value.responses.as_ref())
             .and_then(|value| value.instructions.clone());
+        *self
+            .requested_required_tool
+            .lock()
+            .expect("required_tool lock") = options.and_then(|value| value.required_tool.clone());
+        *self
+            .requested_parallel_tool_calls
+            .lock()
+            .expect("parallel_tool_calls lock") =
+            options.and_then(|value| value.parallel_tool_calls);
+        *self.requested_tool_names.lock().expect("tool names lock") = tools
+            .iter()
+            .map(|schema| schema.function.name.clone())
+            .collect();
 
         let items = self
             .chunks
@@ -143,6 +159,9 @@ fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
         requested_include: Mutex::new(None),
         requested_text_verbosity: Mutex::new(None),
         requested_instructions: Mutex::new(None),
+        requested_required_tool: Mutex::new(None),
+        requested_parallel_tool_calls: Mutex::new(None),
+        requested_tool_names: Mutex::new(Vec::new()),
         ir_invoked: Mutex::new(false),
     })
 }
@@ -331,6 +350,92 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             .as_deref(),
         Some("session-stream-1")
     );
+}
+
+#[tokio::test]
+async fn explicit_activation_pending_suppresses_answer_tokens() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-explicit-guard", "test-model");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        "[\"review\"]".to_string(),
+    );
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm = mock_llm(vec![
+        LLMChunk::Token("answer must remain hidden".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let tool_schemas = ["load_skill", "Read"]
+        .into_iter()
+        .map(|name| bamboo_agent_core::tools::ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let (stream_output, _) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &tool_schemas,
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-explicit-guard",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+    )
+    .await
+    .expect("execute guarded stream");
+
+    assert_eq!(stream_output.content, "answer must remain hidden");
+    assert_eq!(
+        llm.requested_required_tool
+            .lock()
+            .expect("required_tool lock")
+            .as_deref(),
+        Some("load_skill")
+    );
+    assert_eq!(
+        *llm.requested_parallel_tool_calls
+            .lock()
+            .expect("parallel_tool_calls lock"),
+        Some(false)
+    );
+    assert_eq!(
+        *llm.requested_tool_names.lock().expect("tool names lock"),
+        vec!["load_skill".to_string()]
+    );
+    drop(event_tx);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| matches!(event, AgentEvent::TokenBudgetUpdated { .. })));
 }
 
 #[tokio::test]
@@ -1037,7 +1142,7 @@ fn plan_llm_request_lanes_path_records_observability() {
     };
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
-    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3);
+    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None);
 
     // No continuation set on the IR → the canonical lanes wire.
     assert!(envelope.ir.continuation.is_none());
@@ -1078,7 +1183,7 @@ fn plan_llm_request_continuation_path_builds_delta() {
         "resp_prev",
     );
 
-    let planned = super::plan_llm_request(&envelope, "session-plan-cont", None, 0);
+    let planned = super::plan_llm_request(&envelope, "session-plan-cont", None, 0, None);
 
     assert_eq!(planned.render.wire, "responses_continuation");
     // Delta is the tool result after the last assistant turn — NOT the full convo.
@@ -1333,7 +1438,7 @@ fn responses_continuation_uses_full_input_not_the_delta() {
         super::build_request_envelope(&session, &prepared_context, &config, &[]),
         "resp_prev",
     );
-    let planned = super::plan_llm_request(&envelope, "session-resp-cont", None, 0);
+    let planned = super::plan_llm_request(&envelope, "session-resp-cont", None, 0, None);
 
     // The adapter derives the Responses wire view from the IR + the engine's request
     // POLICY (planned.request_options.responses).
@@ -1376,7 +1481,7 @@ fn ir_cache_matches_request_options_cache() {
     };
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
-    let planned = super::plan_llm_request(&envelope, "session-cache-dup", None, 0);
+    let planned = super::plan_llm_request(&envelope, "session-cache-dup", None, 0, None);
     let options_cache = planned
         .request_options
         .cache
