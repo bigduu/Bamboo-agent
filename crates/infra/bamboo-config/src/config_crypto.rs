@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{Config, ProxyAuth};
+use crate::patch::ProviderApiKeyIntents;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AccessVerifierRecord {
@@ -1161,6 +1162,36 @@ impl Config {
         restore_env_key!(openai);
         restore_env_key!(anthropic);
         restore_env_key!(gemini);
+    }
+
+    /// Preserve freshly-created provider-instance plaintext keys that are lost
+    /// during the compatibility JSON round-trip.
+    ///
+    /// Provider instance `api_key` fields are `#[serde(skip_serializing)]`, so a
+    /// round-trip through `to_compatibility_value()` / `from_value()` in
+    /// `config_manager::build_merged_config` drops them. If no ciphertext was
+    /// persisted yet (newly created instance), copy key material from the live
+    /// `previous` config for instances not explicitly touched by the patch so
+    /// the key is not silently cleared before the next save.
+    pub fn preserve_provider_instance_plaintext_keys(
+        &mut self,
+        previous: &Config,
+        intents: &ProviderApiKeyIntents,
+    ) {
+        for (id, instance) in self.provider_instances.iter_mut() {
+            if intents.provider_instances.contains(id) {
+                continue;
+            }
+            if !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some() {
+                continue;
+            }
+            if let Some(previous) = previous.provider_instances.get(id) {
+                if !previous.api_key.trim().is_empty() || previous.api_key_encrypted.is_some() {
+                    instance.api_key = previous.api_key.clone();
+                    instance.api_key_encrypted = previous.api_key_encrypted.clone();
+                }
+            }
+        }
     }
 
     /// Re-encrypt every secret domain's `*_encrypted` field from current
