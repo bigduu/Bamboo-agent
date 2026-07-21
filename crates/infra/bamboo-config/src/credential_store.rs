@@ -166,6 +166,52 @@ pub struct CredentialStore {
     store: AtomicJsonStore<CredentialDocument>,
 }
 
+/// Immutable encrypted document retained by the section facade as its
+/// last-known-good mutation base. The document is deliberately opaque outside
+/// this module so neither ciphertext nor plaintext can escape through section
+/// APIs.
+#[derive(Clone)]
+pub(crate) struct CredentialDocumentLkg {
+    revision: u64,
+    document: CredentialDocument,
+}
+
+impl CredentialDocumentLkg {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+pub(crate) struct CredentialMutation {
+    pub revision: u64,
+    pub status: CredentialStatus,
+    pub statuses: Vec<CredentialStatus>,
+    pub lkg: CredentialDocumentLkg,
+}
+
+#[derive(Clone, Copy)]
+enum CredentialCommitAuthority<'a> {
+    RevisionOnly,
+    LiveSnapshot(&'a CredentialDocumentLkg),
+    RepairLkg(&'a CredentialDocumentLkg),
+}
+
+impl CredentialCommitAuthority<'_> {
+    fn document(self, expected_revision: u64) -> ConfigStoreResult<Option<CredentialDocument>> {
+        let lkg = match self {
+            Self::RevisionOnly => return Ok(None),
+            Self::LiveSnapshot(lkg) | Self::RepairLkg(lkg) => lkg,
+        };
+        if lkg.revision != expected_revision {
+            return Err(ConfigStoreError::Conflict {
+                expected: expected_revision,
+                actual: lkg.revision,
+            });
+        }
+        Ok(Some(lkg.document.clone()))
+    }
+}
+
 impl CredentialStore {
     pub fn open(data_dir: impl AsRef<Path>) -> Self {
         Self {
@@ -253,18 +299,60 @@ impl CredentialStore {
     ) -> ConfigStoreResult<(Vec<CredentialStatus>, CredentialStoreHealth)> {
         self.with_transaction_lock(|| {
             let (document, health) = self.load_document_with_health()?;
-            let statuses = document
-                .entries
-                .into_iter()
-                .map(|(credential_ref, entry)| CredentialStatus {
-                    credential_ref,
-                    configured: true,
-                    source: entry.source,
-                    updated_at: Some(entry.updated_at),
-                })
-                .collect();
+            let statuses = credential_statuses(&document);
             Ok((statuses, health))
         })
+    }
+
+    pub(crate) fn snapshot_with_health(
+        &self,
+    ) -> ConfigStoreResult<(
+        CredentialDocumentLkg,
+        Vec<CredentialStatus>,
+        CredentialStoreHealth,
+    )> {
+        self.with_transaction_lock(|| self.snapshot_with_health_unchecked())
+    }
+
+    /// Snapshot variant for callers that already hold the shared credential
+    /// migration lock. Keeping this separate avoids recursively acquiring the
+    /// process-wide transaction lock while a facade establishes its stable
+    /// open barrier.
+    pub(crate) fn snapshot_with_health_unchecked(
+        &self,
+    ) -> ConfigStoreResult<(
+        CredentialDocumentLkg,
+        Vec<CredentialStatus>,
+        CredentialStoreHealth,
+    )> {
+        let (document, health) = self.load_document_with_health()?;
+        let statuses = credential_statuses(&document);
+        let lkg = CredentialDocumentLkg {
+            revision: health.revision,
+            document,
+        };
+        Ok((lkg, statuses, health))
+    }
+
+    pub(crate) fn snapshot_from_section_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<(
+        CredentialDocumentLkg,
+        Vec<CredentialStatus>,
+        CredentialStoreHealth,
+    )> {
+        let envelope = Self::parse_transaction_document(bytes, false)?;
+        let statuses = credential_statuses(&envelope.data);
+        let health = CredentialStoreHealth::committed(envelope.revision);
+        Ok((
+            CredentialDocumentLkg {
+                revision: envelope.revision,
+                document: envelope.data,
+            },
+            statuses,
+            health,
+        ))
     }
 
     pub fn replace(
@@ -286,12 +374,67 @@ impl CredentialStore {
         source: CredentialSource,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.replace_with_commit(
+            credential_ref,
+            secret,
+            source,
+            expected_revision,
+            CredentialCommitAuthority::RevisionOnly,
+        )
+        .map(|mutation| (mutation.revision, mutation.status))
+    }
+
+    pub(crate) fn replace_from_live_snapshot_unchecked(
+        &self,
+        live_lkg: &CredentialDocumentLkg,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<CredentialMutation> {
+        self.replace_with_commit(
+            credential_ref,
+            secret,
+            source,
+            expected_revision,
+            CredentialCommitAuthority::LiveSnapshot(live_lkg),
+        )
+    }
+
+    pub(crate) fn replace_from_live_lkg_unchecked(
+        &self,
+        live_lkg: &CredentialDocumentLkg,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<CredentialMutation> {
+        self.replace_with_commit(
+            credential_ref,
+            secret,
+            source,
+            expected_revision,
+            CredentialCommitAuthority::RepairLkg(live_lkg),
+        )
+    }
+
+    fn replace_with_commit(
+        &self,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+        expected_revision: u64,
+        authority: CredentialCommitAuthority<'_>,
+    ) -> ConfigStoreResult<CredentialMutation> {
         if secret.trim().is_empty() || crate::patch::is_masked_api_key(secret) {
             return Err(ConfigStoreError::Validation(
                 "credential value must not be empty or a mask; use clear instead".to_string(),
             ));
         }
-        let mut document = self.load_document()?;
+        let mut document = match authority.document(expected_revision)? {
+            Some(document) => document,
+            None => self.load_document()?,
+        };
         let updated_at = Utc::now();
         let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
             ConfigStoreError::Validation("credential encryption failed".to_string())
@@ -306,18 +449,38 @@ impl CredentialStore {
                 migration_generation: None,
             },
         );
-        let revision = self
-            .store
-            .commit(expected_revision, document, validate_document)?;
-        Ok((
+        let committed_document = document.clone();
+        let revision = match authority {
+            CredentialCommitAuthority::RevisionOnly => {
+                self.store
+                    .commit(expected_revision, document, validate_document)?
+            }
+            CredentialCommitAuthority::LiveSnapshot(lkg) => self.store.commit_from_live_snapshot(
+                expected_revision,
+                &lkg.document,
+                document,
+                validate_document,
+            )?,
+            CredentialCommitAuthority::RepairLkg(_) => {
+                self.store
+                    .commit_from_live_lkg(expected_revision, document, validate_document)?
+            }
+        };
+        let statuses = credential_statuses(&committed_document);
+        Ok(CredentialMutation {
             revision,
-            CredentialStatus {
+            status: CredentialStatus {
                 credential_ref,
                 configured: true,
                 source,
                 updated_at: Some(updated_at),
             },
-        ))
+            statuses,
+            lkg: CredentialDocumentLkg {
+                revision,
+                document: committed_document,
+            },
+        })
     }
 
     pub fn clear(
@@ -333,20 +496,83 @@ impl CredentialStore {
         credential_ref: &CredentialRef,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
-        let mut document = self.load_document()?;
+        self.clear_with_commit(
+            credential_ref,
+            expected_revision,
+            CredentialCommitAuthority::RevisionOnly,
+        )
+        .map(|mutation| (mutation.revision, mutation.status))
+    }
+
+    pub(crate) fn clear_from_live_snapshot_unchecked(
+        &self,
+        live_lkg: &CredentialDocumentLkg,
+        credential_ref: &CredentialRef,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<CredentialMutation> {
+        self.clear_with_commit(
+            credential_ref,
+            expected_revision,
+            CredentialCommitAuthority::LiveSnapshot(live_lkg),
+        )
+    }
+
+    pub(crate) fn clear_from_live_lkg_unchecked(
+        &self,
+        live_lkg: &CredentialDocumentLkg,
+        credential_ref: &CredentialRef,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<CredentialMutation> {
+        self.clear_with_commit(
+            credential_ref,
+            expected_revision,
+            CredentialCommitAuthority::RepairLkg(live_lkg),
+        )
+    }
+
+    fn clear_with_commit(
+        &self,
+        credential_ref: &CredentialRef,
+        expected_revision: u64,
+        authority: CredentialCommitAuthority<'_>,
+    ) -> ConfigStoreResult<CredentialMutation> {
+        let mut document = match authority.document(expected_revision)? {
+            Some(document) => document,
+            None => self.load_document()?,
+        };
         document.entries.remove(credential_ref);
-        let revision = self
-            .store
-            .commit(expected_revision, document, validate_document)?;
-        Ok((
+        let committed_document = document.clone();
+        let revision = match authority {
+            CredentialCommitAuthority::RevisionOnly => {
+                self.store
+                    .commit(expected_revision, document, validate_document)?
+            }
+            CredentialCommitAuthority::LiveSnapshot(lkg) => self.store.commit_from_live_snapshot(
+                expected_revision,
+                &lkg.document,
+                document,
+                validate_document,
+            )?,
+            CredentialCommitAuthority::RepairLkg(_) => {
+                self.store
+                    .commit_from_live_lkg(expected_revision, document, validate_document)?
+            }
+        };
+        let statuses = credential_statuses(&committed_document);
+        Ok(CredentialMutation {
             revision,
-            CredentialStatus {
+            status: CredentialStatus {
                 credential_ref: credential_ref.clone(),
                 configured: false,
                 source: CredentialSource::User,
                 updated_at: None,
             },
-        ))
+            statuses,
+            lkg: CredentialDocumentLkg {
+                revision,
+                document: committed_document,
+            },
+        })
     }
 
     /// Atomically route explicitly updated built-in provider API keys into the
@@ -1266,6 +1492,83 @@ impl CredentialStore {
         &self,
         secrets: Vec<(CredentialRef, String, u64)>,
     ) -> ConfigStoreResult<PreparedCredentialMigration> {
+        let (document, health) = self.load_document_with_health()?;
+        Self::prepare_migration_from_document(secrets, document, health)
+    }
+
+    /// Build the same migration candidate from already-captured durable bytes
+    /// without opening AtomicJsonStore's lock file. Facade security preflights
+    /// use this to remain byte-for-byte zero-write.
+    pub(crate) fn prepare_migration_from_snapshot(
+        primary: Option<&[u8]>,
+        backup: Option<&[u8]>,
+        secrets: Vec<(CredentialRef, String, u64)>,
+    ) -> ConfigStoreResult<PreparedCredentialMigration> {
+        let (document, health) = Self::migration_document_from_snapshot(primary, backup)?;
+        Self::prepare_migration_from_document(secrets, document, health)
+    }
+
+    pub(crate) fn migration_sources_from_snapshot(
+        primary: Option<&[u8]>,
+        backup: Option<&[u8]>,
+    ) -> ConfigStoreResult<BTreeMap<CredentialRef, CredentialSource>> {
+        let (document, health) = Self::migration_document_from_snapshot(primary, backup)?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for migration".to_string(),
+            ));
+        }
+        Ok(document
+            .entries
+            .into_iter()
+            .map(|(reference, entry)| (reference, entry.source))
+            .collect())
+    }
+
+    fn migration_document_from_snapshot(
+        primary: Option<&[u8]>,
+        backup: Option<&[u8]>,
+    ) -> ConfigStoreResult<(CredentialDocument, CredentialStoreHealth)> {
+        if let Some(primary) = primary {
+            match Self::parse_transaction_document(primary, false) {
+                Ok(envelope) => {
+                    return Ok((
+                        envelope.data,
+                        CredentialStoreHealth::committed(envelope.revision),
+                    ));
+                }
+                Err(primary_error) => {
+                    if backup.is_some_and(|backup| {
+                        Self::parse_transaction_document(backup, false).is_ok()
+                    }) {
+                        return Err(ConfigStoreError::Validation(
+                            "credential document is unavailable for migration".to_string(),
+                        ));
+                    }
+                    return Err(primary_error);
+                }
+            }
+        }
+        // AtomicJsonStore treats a missing primary as an empty store and does
+        // not resurrect a backup on its own. Match that exact authority rule;
+        // backups are consulted only when a present primary is invalid.
+        let _ = backup;
+        Ok((
+            CredentialDocument::default(),
+            CredentialStoreHealth {
+                revision: 0,
+                status: SectionStatus::Missing,
+                source: SectionSourceKind::Default,
+                last_error: None,
+            },
+        ))
+    }
+
+    fn prepare_migration_from_document(
+        secrets: Vec<(CredentialRef, String, u64)>,
+        mut document: CredentialDocument,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<PreparedCredentialMigration> {
         let mut unique_secrets = BTreeMap::<CredentialRef, (String, u64)>::new();
         for (credential_ref, secret, input_generation) in secrets {
             if secret.trim().is_empty() || crate::patch::is_masked_api_key(&secret) {
@@ -1287,7 +1590,6 @@ impl CredentialStore {
                 }
             }
         }
-        let (mut document, health) = self.load_document_with_health()?;
         if health.status == SectionStatus::Degraded {
             return Err(ConfigStoreError::Validation(
                 "credential document is unavailable for migration".to_string(),
@@ -1418,6 +1720,22 @@ impl CredentialStore {
         ))
     }
 
+    /// Materialize the empty credential section when a full modular-layout
+    /// transaction needs every section to have a durable document. The caller
+    /// holds the shared credential migration lock; ordinary status reads keep
+    /// treating an absent store as the revision-zero default.
+    pub(crate) fn ensure_initialized_for_section_layout(&self) -> ConfigStoreResult<()> {
+        let (document, health) = self.load_document_with_health()?;
+        if health.status != SectionStatus::Missing {
+            return Ok(());
+        }
+        match self.store.commit(0, document, validate_document) {
+            Ok(_) => Ok(()),
+            Err(ConfigStoreError::Conflict { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Three-way merge an exact provider transaction after another credential
     /// writer won its CAS. Unrelated current entries are always retained. For
     /// each touched ref, a current value different from the transaction base
@@ -1540,6 +1858,28 @@ impl CredentialStore {
         Ok((bytes, expected_revision, true))
     }
 
+    pub(crate) fn changed_refs_between_documents(
+        original: &[u8],
+        staged: &[u8],
+    ) -> ConfigStoreResult<Vec<String>> {
+        let original = Self::parse_transaction_document(original, true)?;
+        let staged = Self::parse_transaction_document(staged, false)?;
+        let refs = original
+            .data
+            .entries
+            .keys()
+            .chain(staged.data.entries.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        Ok(refs
+            .into_iter()
+            .filter(|reference| {
+                original.data.entries.get(reference) != staged.data.entries.get(reference)
+            })
+            .map(|reference| reference.as_str().to_string())
+            .collect())
+    }
+
     pub(crate) fn ensure_required_refs_in_bytes(
         bytes: &[u8],
         required_refs: &[String],
@@ -1547,6 +1887,12 @@ impl CredentialStore {
         let document = Self::parse_transaction_document(bytes, false)?;
         let required_refs = parse_credential_ref_list(required_refs)?;
         ensure_required_entries(&document.data, &required_refs)
+    }
+
+    /// Validate the durable credential-section envelope used by the modular
+    /// layout completion attestation and return its monotonic revision.
+    pub(crate) fn validate_section_document_revision(bytes: &[u8]) -> ConfigStoreResult<u64> {
+        Ok(Self::parse_transaction_document(bytes, false)?.revision)
     }
 
     fn parse_transaction_document(
@@ -1586,7 +1932,7 @@ impl CredentialStore {
             .unwrap_or_else(|| Path::new("."))
     }
 
-    fn with_transaction_lock<T>(
+    pub(crate) fn with_transaction_lock<T>(
         &self,
         operation: impl FnOnce() -> ConfigStoreResult<T>,
     ) -> ConfigStoreResult<T> {
@@ -1627,6 +1973,19 @@ impl CredentialStore {
             ),
         })
     }
+}
+
+fn credential_statuses(document: &CredentialDocument) -> Vec<CredentialStatus> {
+    document
+        .entries
+        .iter()
+        .map(|(credential_ref, entry)| CredentialStatus {
+            credential_ref: credential_ref.clone(),
+            configured: true,
+            source: entry.source,
+            updated_at: Some(entry.updated_at),
+        })
+        .collect()
 }
 
 pub(crate) fn config_credential_ref_counts(
@@ -1781,6 +2140,39 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn pure_migration_snapshot_matches_primary_and_backup_authority_matrix() {
+        let valid = serde_json::to_vec(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": 1,
+            "data": {"entries": {}}
+        }))
+        .unwrap();
+        let empty = b"".as_slice();
+        let invalid = b"{ invalid".as_slice();
+
+        for backup in [None, Some(empty), Some(valid.as_slice())] {
+            assert!(CredentialStore::migration_sources_from_snapshot(None, backup).is_ok());
+        }
+        for backup in [None, Some(empty), Some(valid.as_slice())] {
+            assert!(CredentialStore::migration_sources_from_snapshot(Some(empty), backup).is_err());
+            assert!(
+                CredentialStore::migration_sources_from_snapshot(Some(invalid), backup).is_err()
+            );
+            assert!(CredentialStore::migration_sources_from_snapshot(
+                Some(valid.as_slice()),
+                backup
+            )
+            .is_ok());
+        }
+        assert!(CredentialStore::prepare_migration_from_snapshot(
+            None,
+            Some(valid.as_slice()),
+            Vec::new(),
+        )
+        .is_ok());
+    }
 
     #[test]
     fn replace_resolve_status_and_clear_never_expose_secret_metadata() {
@@ -2104,5 +2496,73 @@ mod tests {
             recovered.last_error.as_deref(),
             Some("primary credential document invalid; using last-known-good backup")
         );
+    }
+
+    #[test]
+    fn degraded_backup_revision_can_repair_replace_and_clear() {
+        let _key = crate::encryption::set_test_encryption_key([0x34; 32]);
+        let reference = credential_ref("provider", "openai", "api_key").unwrap();
+
+        let replace_dir = TempDir::new().unwrap();
+        let replace_store = CredentialStore::open(replace_dir.path());
+        replace_store
+            .replace(reference.clone(), "first", CredentialSource::User, 0)
+            .unwrap();
+        replace_store
+            .replace(reference.clone(), "second", CredentialSource::User, 1)
+            .unwrap();
+        std::fs::write(replace_store.path(), b"{corrupt").unwrap();
+        let (_, health) = replace_store.status_with_health(&reference).unwrap();
+        assert_eq!(health.status, SectionStatus::Degraded);
+        assert_eq!(health.revision, 1);
+        let (revision, _) = replace_store
+            .replace(
+                reference.clone(),
+                "repaired",
+                CredentialSource::User,
+                health.revision,
+            )
+            .unwrap();
+        assert_eq!(revision, 3);
+        assert_eq!(
+            replace_store.resolve(&reference).unwrap().unwrap().expose(),
+            "repaired"
+        );
+        assert!(matches!(
+            replace_store.replace(reference.clone(), "stale", CredentialSource::User, 2,),
+            Err(ConfigStoreError::Conflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(
+            replace_store.resolve(&reference).unwrap().unwrap().expose(),
+            "repaired"
+        );
+
+        let clear_dir = TempDir::new().unwrap();
+        let clear_store = CredentialStore::open(clear_dir.path());
+        clear_store
+            .replace(reference.clone(), "first", CredentialSource::User, 0)
+            .unwrap();
+        clear_store
+            .replace(reference.clone(), "second", CredentialSource::User, 1)
+            .unwrap();
+        std::fs::write(clear_store.path(), b"{corrupt").unwrap();
+        let (_, health) = clear_store.status_with_health(&reference).unwrap();
+        assert_eq!(health.status, SectionStatus::Degraded);
+        assert_eq!(health.revision, 1);
+        let (revision, status) = clear_store.clear(&reference, health.revision).unwrap();
+        assert_eq!(revision, 3);
+        assert!(!status.configured);
+        assert!(clear_store.resolve(&reference).unwrap().is_none());
+        assert!(matches!(
+            clear_store.replace(reference.clone(), "stale", CredentialSource::User, 2,),
+            Err(ConfigStoreError::Conflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert!(clear_store.resolve(&reference).unwrap().is_none());
     }
 }

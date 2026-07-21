@@ -46,13 +46,12 @@ impl ProviderConfigsModule {
         Ok(false)
     }
     pub(crate) fn save_sync(&self, data_dir: &Path) -> Result<()> {
-        crate::migrate_provider_mcp_credentials(data_dir)?;
-        crate::ensure_provider_mcp_migration_ready(data_dir)?;
         // The sidecar is metadata-only after credential-ref migration. Runtime
         // plaintext is skipped by serde and legacy ciphertext is explicitly
         // cleared. A new non-environment secret must be written through the
         // credential API so the credential + section transaction is explicit.
         let mut providers = self.0.clone();
+        let mut candidate_has_legacy_secret = false;
         macro_rules! sanitize {
             ($field:ident) => {
                 if let Some(provider) = providers.$field.as_mut() {
@@ -64,6 +63,10 @@ impl ProviderConfigsModule {
                             "provider secret requires credential API before section persistence"
                         );
                     }
+                    candidate_has_legacy_secret |= provider
+                        .api_key_encrypted
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
                     provider.api_key_encrypted = None;
                 }
             };
@@ -75,29 +78,105 @@ impl ProviderConfigsModule {
             if !provider.api_key.trim().is_empty() && provider.credential_ref.is_none() {
                 anyhow::bail!("provider secret requires credential API before section persistence");
             }
+            candidate_has_legacy_secret |= provider
+                .api_key_encrypted
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
             provider.api_key_encrypted = None;
         }
         let path = data_dir.join(FILE_NAME);
-        let has_envelope_marker = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| value.as_object().cloned())
-            .is_some_and(|object| {
-                object.contains_key("schema_version")
-                    || object.contains_key("revision")
-                    || object.contains_key("data")
-            });
-        if has_envelope_marker {
-            let store = AtomicJsonStore::new(path, 1);
-            let revision = store
-                .load_validated_allowing_unversioned(|_| Ok(()))?
-                .map_or(0, |stored| stored.revision);
-            store.commit_allowing_unversioned(revision, providers, |_| Ok(()))?;
+
+        // A legacy secret must remain on disk until the credential migration
+        // has durably committed it. Metadata-only candidates have no such
+        // dependency, so publish them first: if an unrelated root migration
+        // then fails, the independently owned sidecar remains durable.
+        let migration_first =
+            candidate_has_legacy_secret || existing_sidecar_has_legacy_provider_secret(&path)?;
+        if migration_first {
+            crate::migrate_provider_mcp_credentials(data_dir)?;
+            crate::ensure_provider_mcp_migration_ready(data_dir)?;
+            persist_provider_sidecar(&path, providers)?;
         } else {
-            save_sidecar_with_sanitized_backup(&path, &providers)?;
+            persist_provider_sidecar(&path, providers)?;
+            crate::migrate_provider_mcp_credentials(data_dir)?;
+            crate::ensure_provider_mcp_migration_ready(data_dir)?;
         }
         Ok(())
     }
+}
+
+fn persist_provider_sidecar(path: &Path, mut providers: ProviderConfigs) -> Result<()> {
+    let existing = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let is_complete_envelope = existing
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(is_complete_envelope_object);
+    if is_complete_envelope {
+        let store = AtomicJsonStore::new(path, 1);
+        let revision = store
+            .load_validated_allowing_unversioned(|_| Ok(()))?
+            .map_or(0, |stored| stored.revision);
+        store.commit_allowing_unversioned(revision, providers, |_| Ok(()))?;
+    } else {
+        // Partial envelope markers are ordinary forward-compatible provider
+        // keys. Preserve them instead of treating the object as an envelope
+        // or silently deleting fields this runtime does not own.
+        if let Some(existing) =
+            existing.and_then(|value| serde_json::from_value::<ProviderConfigs>(value).ok())
+        {
+            for (key, value) in existing.extra {
+                providers.extra.entry(key).or_insert(value);
+            }
+        }
+        save_sidecar_with_sanitized_backup(path, &providers)?;
+    }
+    Ok(())
+}
+
+fn existing_sidecar_has_legacy_provider_secret(path: &Path) -> Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        // Preserve malformed/unsupported documents by letting migration fail
+        // closed before the save path can replace them.
+        Err(_) => return Ok(true),
+    };
+    let Some(mut data) = value.as_object() else {
+        return Ok(true);
+    };
+    if is_complete_envelope_object(data) {
+        let Some(enveloped) = data.get("data").and_then(serde_json::Value::as_object) else {
+            return Ok(true);
+        };
+        data = enveloped;
+    }
+    if serde_json::from_value::<ProviderConfigs>(serde_json::Value::Object(data.clone())).is_err() {
+        return Ok(true);
+    }
+    Ok(["openai", "anthropic", "gemini", "bodhi"]
+        .into_iter()
+        .filter_map(|provider| data.get(provider).and_then(serde_json::Value::as_object))
+        .any(|provider| {
+            ["api_key", "api_key_encrypted"]
+                .into_iter()
+                .any(|field| match provider.get(field) {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+                    Some(_) => true,
+                })
+        }))
+}
+
+fn is_complete_envelope_object(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object.contains_key("schema_version")
+        && object.contains_key("revision")
+        && object.contains_key("data")
 }
 
 #[async_trait]
@@ -129,17 +208,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn save_never_overwrites_partial_or_future_revision_envelopes() {
+    fn validation_runs_before_migration_or_sidecar_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ProviderConfigsModule(ProviderConfigs {
+            openai: Some(crate::OpenAIConfig {
+                api_key: "must-use-credential-api".to_string(),
+                ..crate::OpenAIConfig::default()
+            }),
+            ..ProviderConfigs::default()
+        });
+
+        assert!(module.save_sync(dir.path()).is_err());
+        assert!(!dir.path().join(FILE_NAME).exists());
+        assert!(!dir
+            .path()
+            .join(".config-credential-migration.lock")
+            .exists());
+    }
+
+    #[test]
+    fn migration_failure_preserves_existing_legacy_ciphertext_sidecar() {
+        let _key = crate::encryption::set_test_encryption_key([0x51; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "openai": {
+                "api_key_encrypted": crate::encryption::encrypt("legacy-secret").unwrap(),
+                "model": "legacy-model"
+            }
+        }))
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        // Force migration's root source read to fail before it can commit the
+        // provider credential transaction.
+        std::fs::create_dir(dir.path().join("config.json")).unwrap();
+        let module = ProviderConfigsModule(ProviderConfigs {
+            openai: Some(crate::OpenAIConfig {
+                model: Some("new-metadata".to_string()),
+                ..crate::OpenAIConfig::default()
+            }),
+            ..ProviderConfigs::default()
+        });
+
+        assert!(module.save_sync(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!dir.path().join("providers.json.bak").exists());
+    }
+
+    #[test]
+    fn save_never_overwrites_future_revision_envelopes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
         let module = ProviderConfigsModule::default();
+        let original = br#"{"schema_version":99,"revision":7,"data":{}}"#;
+        std::fs::write(&path, original).unwrap();
+        assert!(module.save_sync(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn partial_envelope_markers_remain_ordinary_preserved_provider_data() {
         for original in [
-            br#"{"schema_version":1,"data":{}}"#.as_slice(),
-            br#"{"schema_version":99,"revision":7,"data":{}}"#.as_slice(),
+            serde_json::json!({"schema_version": 7, "future": "schema-only"}),
+            serde_json::json!({"revision": 7, "future": "revision-only"}),
+            serde_json::json!({"data": {"nested": true}, "future": "data-only"}),
+            serde_json::json!({"schema_version": 1, "revision": 7, "future": "no-data"}),
+            serde_json::json!({"schema_version": 1, "data": {}, "future": "no-revision"}),
+            serde_json::json!({"revision": 7, "data": {}, "future": "no-schema"}),
         ] {
-            std::fs::write(&path, original).unwrap();
-            assert!(module.save_sync(dir.path()).is_err());
-            assert_eq!(std::fs::read(&path).unwrap(), original);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(FILE_NAME);
+            std::fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+            // The metadata-only save is durable before migration readiness;
+            // regardless of whether a compatibility migration is needed, it
+            // must preserve every ordinary unknown key.
+            let _ = ProviderConfigsModule::default().save_sync(dir.path());
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(persisted, original);
         }
     }
 }

@@ -1045,6 +1045,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "notify",
  "rand 0.10.2",
  "regex",
@@ -1057,6 +1058,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

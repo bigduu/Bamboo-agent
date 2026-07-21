@@ -2751,6 +2751,24 @@ impl Config {
         }
     }
 
+    /// Crate-internal seam used by the modular section facade.
+    ///
+    /// Keeping this conversion here lets the facade exhaustively destructure
+    /// [`ConfigValues`] in both directions without exposing the compatibility
+    /// facade's private storage to downstream crates.
+    pub(crate) fn section_values(&self) -> ConfigValues {
+        self.values.clone()
+    }
+
+    pub(crate) fn from_section_parts(
+        values: ConfigValues,
+        memory: Option<MemoryConfig>,
+        subagents: SubagentsConfig,
+        providers: ProviderConfigs,
+    ) -> Self {
+        Self::from_parts(values, memory, subagents, providers)
+    }
+
     /// Compatibility accessor for independently persisted memory settings.
     pub fn memory(&self) -> &Option<MemoryConfig> {
         &self.memory.0

@@ -4,9 +4,10 @@ use crate::{
     error::AppError,
 };
 use actix_web::{web, HttpResponse};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
+use super::super::super::redaction::redact_config_for_api;
 use super::common::{redacted_config_json, take_model_limits_patch, write_model_limits_file};
 
 /// Updates the Bamboo application configuration.
@@ -68,6 +69,7 @@ pub async fn set_bamboo_config(
                 }
                 let current = config.clone();
                 let mut patch_obj = patch_obj;
+                remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
                 config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
                 config_manager::preserve_masked_notification_secrets(&mut patch_obj, &current);
                 config_manager::preserve_masked_connect_secrets(&mut patch_obj, &current);
@@ -111,6 +113,40 @@ pub async fn set_bamboo_config(
     }
 
     Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
+}
+
+pub(super) fn remove_unchanged_access_control_echo(
+    current: &bamboo_llm::Config,
+    patch_obj: &mut Map<String, Value>,
+) -> Result<(), AppError> {
+    let Some(incoming) = patch_obj.get("access_control") else {
+        return Ok(());
+    };
+    if incoming.is_null() {
+        return Err(access_control_patch_error());
+    }
+
+    let current_value = current.to_compatibility_value()?;
+    let redacted_current = redact_config_for_api(current_value, current);
+    if redacted_current.get("access_control") != Some(incoming) {
+        return Err(access_control_patch_error());
+    }
+
+    // This helper is called inside update_config_with_provider_credentials'
+    // config write lock. Compatibility clients POST the full redacted GET
+    // payload; the echoed metadata is safe to ignore only when it is exactly
+    // the lock-time redacted projection. Never merge it because verifier
+    // fields are intentionally absent and arrays would otherwise replace the
+    // durable device records.
+    patch_obj.remove("access_control");
+    Ok(())
+}
+
+fn access_control_patch_error() -> AppError {
+    AppError::BadRequest(
+        "access_control must be changed through the dedicated password, pairing, and device APIs"
+            .to_string(),
+    )
 }
 
 async fn notification_payload_is_unchanged(

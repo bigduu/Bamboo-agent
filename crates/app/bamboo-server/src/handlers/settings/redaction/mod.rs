@@ -63,6 +63,18 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     {
         access_control.remove("password_hash");
         access_control.remove("password_salt");
+        if let Some(devices) = access_control
+            .get_mut("devices")
+            .and_then(|v| v.as_array_mut())
+        {
+            for device in devices {
+                let Some(device) = device.as_object_mut() else {
+                    continue;
+                };
+                device.remove("token_hash");
+                device.remove("token_salt");
+            }
+        }
     }
 
     // Redact secret env var values.

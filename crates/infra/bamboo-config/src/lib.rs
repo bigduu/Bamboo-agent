@@ -27,6 +27,7 @@ pub mod patch;
 pub mod paths;
 pub mod provider_configs;
 pub mod provider_instance;
+pub mod section_facade;
 pub mod settings;
 pub mod settings_loader;
 pub mod subagents_config;
@@ -44,6 +45,7 @@ pub use model_mapping::*;
 pub use paths::*;
 pub use provider_configs::ProviderConfigsModule;
 pub use provider_instance::synthesize_legacy_instances;
+pub use section_facade::*;
 pub use settings::PermissionMode;
 pub use subagents_config::SubagentsConfigModule;
 

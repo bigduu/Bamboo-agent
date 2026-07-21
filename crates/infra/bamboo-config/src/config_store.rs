@@ -38,6 +38,18 @@ pub enum ConfigStoreError {
 
 pub type ConfigStoreResult<T> = Result<T, ConfigStoreError>;
 
+pub(crate) fn repairable_live_lkg_error(error: &ConfigStoreError) -> bool {
+    match error {
+        ConfigStoreError::Json(_) => true,
+        ConfigStoreError::Validation(message) => {
+            message != "document schema is newer than this runtime"
+        }
+        ConfigStoreError::Io(_)
+        | ConfigStoreError::Conflict { .. }
+        | ConfigStoreError::Watch(_) => false,
+    }
+}
+
 /// Low-level atomic file writer shared by versioned stores and legacy JSON
 /// sidecars. It serializes writers across processes with an advisory lock.
 #[derive(Debug, Clone)]
@@ -105,6 +117,24 @@ impl AtomicFileStore {
             return Ok(false);
         }
         self.install_bytes(bytes)?;
+        Ok(true)
+    }
+
+    /// Remove the target only when it still matches the caller's expected
+    /// contents. Used by transaction rollback so an external edit can never be
+    /// deleted between validation and cleanup.
+    pub(crate) fn remove_if_hash(&self, expected_sha256: &str) -> ConfigStoreResult<bool> {
+        let _lock = self.lock()?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        if hex::encode(Sha256::digest(&current)) != expected_sha256 {
+            return Ok(false);
+        }
+        std::fs::remove_file(&self.path)?;
+        sync_parent(self.path.parent().unwrap_or_else(|| Path::new(".")))?;
         Ok(true)
     }
 
@@ -294,6 +324,20 @@ struct RevisionedDocument<T> {
     data: T,
 }
 
+fn structurally_observed_revision(bytes: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
+    if !object.contains_key("schema_version")
+        || !object.contains_key("revision")
+        || !object.contains_key("data")
+    {
+        return None;
+    }
+    let schema_version = object.get("schema_version")?.as_u64()?;
+    u32::try_from(schema_version).ok()?;
+    object.get("revision")?.as_u64()
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredValue<T> {
     pub data: T,
@@ -307,12 +351,63 @@ pub struct StoredValue<T> {
     pub normalized_external_revision: bool,
 }
 
+type RawValidatorFn = dyn Fn(&serde_json::Value) -> Result<(), String> + Send + Sync;
+
+#[derive(Clone)]
+struct RawDataValidator(Arc<RawValidatorFn>);
+
+impl std::fmt::Debug for RawDataValidator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RawDataValidator(..)")
+    }
+}
+
+enum DocumentDecodeError {
+    Store(ConfigStoreError),
+    RawValidation(String),
+}
+
+impl DocumentDecodeError {
+    fn into_store_error(self) -> ConfigStoreError {
+        match self {
+            Self::Store(error) => error,
+            Self::RawValidation(message) => ConfigStoreError::Validation(message),
+        }
+    }
+}
+
 /// A versioned JSON store with compare-and-swap writes.
 #[derive(Debug, Clone)]
 pub struct AtomicJsonStore<T> {
     file: AtomicFileStore,
     schema_version: u32,
+    raw_validator: Option<RawDataValidator>,
     _marker: std::marker::PhantomData<T>,
+}
+
+enum CommitAuthority<'a, T> {
+    RevisionOnly,
+    LiveSnapshot(&'a T),
+    LiveLkg(u64),
+    RetainedLiveSnapshot { revision: u64, data: &'a T },
+}
+
+impl<T> CommitAuthority<'_, T> {
+    fn repair_revision(&self) -> Option<u64> {
+        match self {
+            Self::LiveLkg(revision) | Self::RetainedLiveSnapshot { revision, .. } => {
+                Some(*revision)
+            }
+            Self::RevisionOnly | Self::LiveSnapshot(_) => None,
+        }
+    }
+
+    fn retained_data(&self) -> Option<&T> {
+        match self {
+            Self::RetainedLiveSnapshot { data, .. } => Some(data),
+            _ => None,
+        }
+    }
 }
 
 impl<T> AtomicJsonStore<T>
@@ -323,12 +418,23 @@ where
         Self {
             file: AtomicFileStore::new(path),
             schema_version,
+            raw_validator: None,
             _marker: std::marker::PhantomData,
         }
     }
 
     pub fn sensitive(mut self, sensitive: bool) -> Self {
         self.file = self.file.sensitive(sensitive);
+        self
+    }
+
+    /// Validate the exact serialized `data` value before it is materialized as
+    /// `T` or committed. The validator runs while the store's file lock is held.
+    pub fn with_raw_validator<F>(mut self, validate: F) -> Self
+    where
+        F: Fn(&serde_json::Value) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.raw_validator = Some(RawDataValidator(Arc::new(validate)));
         self
     }
 
@@ -374,10 +480,12 @@ where
         }
         let primary = std::fs::read(self.path())?;
         match self
-            .read_compatible_document_bytes(&primary)
+            .decode_compatible_document_bytes(&primary)
             .and_then(|document| {
                 validate(&document.data)
-                    .map_err(ConfigStoreError::Validation)
+                    .map_err(|message| {
+                        DocumentDecodeError::Store(ConfigStoreError::Validation(message))
+                    })
                     .map(|_| document)
             }) {
             Ok(document) => Ok(Some(StoredValue {
@@ -388,16 +496,23 @@ where
                 quarantine_path: None,
                 normalized_external_revision: false,
             })),
-            Err(primary_error) => {
+            Err(DocumentDecodeError::RawValidation(message)) => {
+                Err(ConfigStoreError::Validation(message))
+            }
+            Err(DocumentDecodeError::Store(primary_error)) => {
                 let quarantine_path = Some(self.file.quarantine_primary_locked(&primary)?);
                 for generation in 0..self.file.backup_generations {
                     let backup = self.file.backup_path(generation);
                     if let Ok(document) = std::fs::read(&backup)
-                        .map_err(ConfigStoreError::Io)
-                        .and_then(|bytes| self.read_compatible_document_bytes(&bytes))
+                        .map_err(|error| DocumentDecodeError::Store(ConfigStoreError::Io(error)))
+                        .and_then(|bytes| self.decode_compatible_document_bytes(&bytes))
                         .and_then(|document| {
                             validate(&document.data)
-                                .map_err(ConfigStoreError::Validation)
+                                .map_err(|message| {
+                                    DocumentDecodeError::Store(ConfigStoreError::Validation(
+                                        message,
+                                    ))
+                                })
                                 .map(|_| document)
                         })
                     {
@@ -424,9 +539,11 @@ where
             return Ok(None);
         }
         let primary = std::fs::read(self.path())?;
-        match self.read_document_bytes(&primary).and_then(|document| {
+        match self.decode_document_bytes(&primary).and_then(|document| {
             validate(&document.data)
-                .map_err(ConfigStoreError::Validation)
+                .map_err(|message| {
+                    DocumentDecodeError::Store(ConfigStoreError::Validation(message))
+                })
                 .map(|_| document)
         }) {
             Ok(document) => Ok(Some(StoredValue {
@@ -437,15 +554,26 @@ where
                 quarantine_path: None,
                 normalized_external_revision: false,
             })),
-            Err(primary_error) => {
+            Err(DocumentDecodeError::RawValidation(message)) => {
+                Err(ConfigStoreError::Validation(message))
+            }
+            Err(DocumentDecodeError::Store(primary_error)) => {
                 let quarantine_path = Some(self.file.quarantine_primary_locked(&primary)?);
                 for generation in 0..self.file.backup_generations {
                     let backup = self.file.backup_path(generation);
-                    if let Ok(document) = self.read_document(&backup).and_then(|document| {
-                        validate(&document.data)
-                            .map_err(ConfigStoreError::Validation)
-                            .map(|_| document)
-                    }) {
+                    if let Ok(document) = std::fs::read(&backup)
+                        .map_err(|error| DocumentDecodeError::Store(ConfigStoreError::Io(error)))
+                        .and_then(|bytes| self.decode_document_bytes(&bytes))
+                        .and_then(|document| {
+                            validate(&document.data)
+                                .map_err(|message| {
+                                    DocumentDecodeError::Store(ConfigStoreError::Validation(
+                                        message,
+                                    ))
+                                })
+                                .map(|_| document)
+                        })
+                    {
                         return Ok(Some(StoredValue {
                             data: document.data,
                             revision: document.revision,
@@ -489,16 +617,7 @@ where
             let revision = current_revision.checked_add(1).ok_or_else(|| {
                 ConfigStoreError::Validation("revision counter exhausted".to_string())
             })?;
-            let document = RevisionedDocument {
-                schema_version: self.schema_version,
-                revision,
-                data: stored.data.clone(),
-            };
-            let bytes = serde_json::to_vec_pretty(&document)?;
-            self.file.commit_bytes_locked(&bytes, |previous| {
-                let parsed: RevisionedDocument<T> = serde_json::from_slice(previous)?;
-                Ok(serde_json::to_vec_pretty(&parsed)?)
-            })?;
+            self.commit_document_locked(revision, stored.data.clone(), false)?;
             stored.revision = revision;
             stored.normalized_external_revision = true;
         }
@@ -547,35 +666,15 @@ where
         validate: F,
     ) -> ConfigStoreResult<u64>
     where
-        F: FnOnce(&T) -> Result<(), String>,
+        F: Fn(&T) -> Result<(), String>,
     {
-        validate(&candidate).map_err(ConfigStoreError::Validation)?;
-        let _lock = self.file.lock()?;
-        let actual = if self.path().exists() {
-            self.read_document(self.path())?.revision
-        } else {
-            0
-        };
-        if actual != expected_revision {
-            return Err(ConfigStoreError::Conflict {
-                expected: expected_revision,
-                actual,
-            });
-        }
-        let revision = actual.checked_add(1).ok_or_else(|| {
-            ConfigStoreError::Validation("revision counter exhausted".to_string())
-        })?;
-        let document = RevisionedDocument {
-            schema_version: self.schema_version,
-            revision,
-            data: candidate,
-        };
-        let bytes = serde_json::to_vec_pretty(&document)?;
-        self.file.commit_bytes_locked(&bytes, |previous| {
-            let parsed: RevisionedDocument<T> = serde_json::from_slice(previous)?;
-            Ok(serde_json::to_vec_pretty(&parsed)?)
-        })?;
-        Ok(revision)
+        self.commit_validated(
+            expected_revision,
+            candidate,
+            validate,
+            false,
+            CommitAuthority::RevisionOnly,
+        )
     }
 
     /// CAS commit that treats an existing pre-envelope raw `T` document as
@@ -587,15 +686,163 @@ where
         validate: F,
     ) -> ConfigStoreResult<u64>
     where
-        F: FnOnce(&T) -> Result<(), String>,
+        F: Fn(&T) -> Result<(), String>,
+    {
+        self.commit_validated(
+            expected_revision,
+            candidate,
+            validate,
+            true,
+            CommitAuthority::RevisionOnly,
+        )
+    }
+
+    /// CAS commit for a live section. In addition to the public revision token,
+    /// the durable primary must still contain the immutable data snapshot from
+    /// which the caller derived `candidate`. This closes the watcher race where
+    /// an external editor reuses a revision with different content.
+    pub(crate) fn commit_from_live_snapshot<F>(
+        &self,
+        expected_revision: u64,
+        expected_data: &T,
+        candidate: T,
+        validate: F,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        self.commit_validated(
+            expected_revision,
+            candidate,
+            validate,
+            false,
+            CommitAuthority::LiveSnapshot(expected_data),
+        )
+    }
+
+    /// Repair a missing or invalid primary from a caller-owned in-memory LKG.
+    /// The caller must hold its publication lock and prove that
+    /// `expected_revision` is still the currently published trusted snapshot.
+    /// A valid primary always remains authoritative; missing/invalid durable
+    /// state may be replaced only above both the live and observed floors.
+    pub(crate) fn commit_from_live_lkg<F>(
+        &self,
+        expected_revision: u64,
+        candidate: T,
+        validate: F,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        self.commit_validated(
+            expected_revision,
+            candidate,
+            validate,
+            false,
+            CommitAuthority::LiveLkg(expected_revision),
+        )
+    }
+
+    /// Repair a missing or invalid primary from a process-local immutable
+    /// snapshot that was previously loaded from a validated durable document.
+    /// The caller serializes publication and decides whether the snapshot still
+    /// carries explicit repair authority.
+    fn commit_from_retained_live_snapshot<F>(
+        &self,
+        expected_revision: u64,
+        expected_data: &T,
+        candidate: T,
+        validate: F,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        self.commit_validated(
+            expected_revision,
+            candidate,
+            validate,
+            false,
+            CommitAuthority::RetainedLiveSnapshot {
+                revision: expected_revision,
+                data: expected_data,
+            },
+        )
+    }
+
+    fn commit_validated<F>(
+        &self,
+        expected_revision: u64,
+        candidate: T,
+        validate: F,
+        allow_unversioned: bool,
+        authority: CommitAuthority<'_, T>,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: Fn(&T) -> Result<(), String>,
     {
         validate(&candidate).map_err(ConfigStoreError::Validation)?;
+        if let Some(retained_data) = authority.retained_data() {
+            // Force the immutable repair base through the same serializable
+            // representation used for content-authority comparisons. The
+            // private API is intentionally unavailable without this snapshot.
+            serde_json::to_value(retained_data)?;
+        }
         let _lock = self.file.lock()?;
-        let actual = if self.path().exists() {
-            let bytes = std::fs::read(self.path())?;
-            self.read_compatible_document_bytes(&bytes)?.revision
+        let candidate_data = serde_json::to_value(&candidate)?;
+        self.validate_raw_data(&candidate_data)
+            .map_err(ConfigStoreError::Validation)?;
+        // Capture structurally issued revisions before the recovery loader may
+        // quarantine an invalid primary. The result matters only when recovery
+        // actually selects a backup; a healthy primary remains the sole CAS
+        // authority and is not blocked by an unrelated unreadable backup.
+        let repair_revision = authority.repair_revision();
+        let observed_revision_floor = if repair_revision.is_some() {
+            Ok(self.observed_revision_floor_locked()?)
         } else {
-            0
+            self.observed_revision_floor_locked()
+        };
+        let loaded = if allow_unversioned {
+            self.load_validated_compatible_locked(&validate)
+        } else {
+            self.load_validated_locked(&validate)
+        };
+        let stored = match loaded {
+            Ok(stored) => stored,
+            Err(error) if repair_revision.is_some() && repairable_live_lkg_error(&error) => None,
+            Err(error) => return Err(error),
+        };
+        let durable_revision = stored.as_ref().map_or(0, |stored| stored.revision);
+        if repair_revision.is_some()
+            && stored
+                .as_ref()
+                .is_some_and(|stored| !stored.recovered_from_backup)
+        {
+            return Err(ConfigStoreError::Conflict {
+                expected: expected_revision,
+                actual: durable_revision,
+            });
+        }
+        if let (CommitAuthority::LiveSnapshot(expected_data), Some(stored)) =
+            (&authority, stored.as_ref())
+        {
+            if !stored.recovered_from_backup
+                && stored.revision == expected_revision
+                && serde_json::to_value(&stored.data)? != serde_json::to_value(expected_data)?
+            {
+                return Err(ConfigStoreError::Conflict {
+                    expected: expected_revision,
+                    actual: durable_revision,
+                });
+            }
+        }
+        let actual = match (stored.as_ref(), repair_revision) {
+            (Some(stored), Some(live_revision))
+                if stored.recovered_from_backup && durable_revision <= live_revision =>
+            {
+                live_revision
+            }
+            (None, Some(live_revision)) => live_revision,
+            _ => durable_revision,
         };
         if actual != expected_revision {
             return Err(ConfigStoreError::Conflict {
@@ -603,11 +850,73 @@ where
                 actual,
             });
         }
-        let revision = actual.checked_add(1).ok_or_else(|| {
+        // A recovered backup is necessarily older than every unusable
+        // generation in front of it. Keep accepting the revision that reads
+        // reported to the caller for CAS, but allocate above those already
+        // issued generations so a stale client can never match a repaired
+        // document through revision ABA.
+        let revision_floor = match stored.as_ref() {
+            Some(stored) if stored.recovered_from_backup => {
+                self.revision_floor(stored)?.max(observed_revision_floor?)
+            }
+            Some(stored) => stored.revision,
+            None if repair_revision.is_some() => observed_revision_floor?,
+            None => 0,
+        }
+        .max(actual);
+        let revision = revision_floor.checked_add(1).ok_or_else(|| {
             ConfigStoreError::Validation("revision counter exhausted".to_string())
         })?;
-        self.commit_document_locked(revision, candidate, true)?;
+        self.commit_document_value_locked(revision, candidate_data, allow_unversioned)?;
         Ok(revision)
+    }
+
+    fn revision_floor(&self, stored: &StoredValue<T>) -> ConfigStoreResult<u64> {
+        if !stored.recovered_from_backup {
+            return Ok(stored.revision);
+        }
+        let generation = (0..self.file.backup_generations)
+            .find(|generation| self.file.backup_path(*generation) == stored.source_path)
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "recovered configuration source is not a managed backup".to_string(),
+                )
+            })?;
+        let unusable_generations = u64::try_from(generation)
+            .ok()
+            .and_then(|generation| generation.checked_add(1))
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("revision counter exhausted".to_string())
+            })?;
+        stored
+            .revision
+            .checked_add(unusable_generations)
+            .ok_or_else(|| ConfigStoreError::Validation("revision counter exhausted".to_string()))
+    }
+
+    /// Return the greatest revision carried by a complete revision envelope in
+    /// the primary or a managed backup. This deliberately inspects only the
+    /// envelope shape: a document whose typed data or semantic validation is
+    /// invalid may still contain a revision already observed by a client.
+    ///
+    /// The caller holds the store lock. Partial marker objects and malformed
+    /// JSON are ignored so arbitrary garbage cannot manufacture a revision
+    /// floor during backup recovery.
+    fn observed_revision_floor_locked(&self) -> ConfigStoreResult<u64> {
+        let mut floor = 0;
+        for path in std::iter::once(self.path().to_path_buf()).chain(
+            (0..self.file.backup_generations).map(|generation| self.file.backup_path(generation)),
+        ) {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(revision) = structurally_observed_revision(&bytes) {
+                floor = floor.max(revision);
+            }
+        }
+        Ok(floor)
     }
 
     fn commit_document_locked(
@@ -616,10 +925,22 @@ where
         candidate: T,
         allow_unversioned_backup: bool,
     ) -> ConfigStoreResult<()> {
+        let candidate_data = serde_json::to_value(candidate)?;
+        self.validate_raw_data(&candidate_data)
+            .map_err(ConfigStoreError::Validation)?;
+        self.commit_document_value_locked(revision, candidate_data, allow_unversioned_backup)
+    }
+
+    fn commit_document_value_locked(
+        &self,
+        revision: u64,
+        candidate_data: serde_json::Value,
+        allow_unversioned_backup: bool,
+    ) -> ConfigStoreResult<()> {
         let document = RevisionedDocument {
             schema_version: self.schema_version,
             revision,
-            data: candidate,
+            data: candidate_data,
         };
         let bytes = serde_json::to_vec_pretty(&document)?;
         self.file.commit_bytes_locked(&bytes, |previous| {
@@ -633,39 +954,90 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     fn read_document(&self, path: &Path) -> ConfigStoreResult<RevisionedDocument<T>> {
         let bytes = std::fs::read(path)?;
         self.read_document_bytes(&bytes)
     }
 
     fn read_document_bytes(&self, bytes: &[u8]) -> ConfigStoreResult<RevisionedDocument<T>> {
-        let document: RevisionedDocument<T> = serde_json::from_slice(bytes)?;
+        self.decode_document_bytes(bytes)
+            .map_err(DocumentDecodeError::into_store_error)
+    }
+
+    fn decode_document_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<RevisionedDocument<T>, DocumentDecodeError> {
+        let value = serde_json::from_slice(bytes)
+            .map_err(ConfigStoreError::Json)
+            .map_err(DocumentDecodeError::Store)?;
+        self.decode_document_value(value)
+    }
+
+    fn decode_document_value(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<RevisionedDocument<T>, DocumentDecodeError> {
+        let document: RevisionedDocument<serde_json::Value> = serde_json::from_value(value)
+            .map_err(ConfigStoreError::Json)
+            .map_err(DocumentDecodeError::Store)?;
+        self.validate_raw_data(&document.data)
+            .map_err(DocumentDecodeError::RawValidation)?;
         if document.schema_version > self.schema_version {
-            return Err(ConfigStoreError::Validation(
+            return Err(DocumentDecodeError::Store(ConfigStoreError::Validation(
                 "document schema is newer than this runtime".to_string(),
-            ));
+            )));
         }
-        Ok(document)
+        let data = serde_json::from_value(document.data)
+            .map_err(ConfigStoreError::Json)
+            .map_err(DocumentDecodeError::Store)?;
+        Ok(RevisionedDocument {
+            schema_version: document.schema_version,
+            revision: document.revision,
+            data,
+        })
     }
 
     fn read_compatible_document_bytes(
         &self,
         bytes: &[u8],
     ) -> ConfigStoreResult<RevisionedDocument<T>> {
-        let shape: serde_json::Value = serde_json::from_slice(bytes)?;
+        self.decode_compatible_document_bytes(bytes)
+            .map_err(DocumentDecodeError::into_store_error)
+    }
+
+    fn decode_compatible_document_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<RevisionedDocument<T>, DocumentDecodeError> {
+        let shape: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(ConfigStoreError::Json)
+            .map_err(DocumentDecodeError::Store)?;
         let has_envelope_marker = shape.as_object().is_some_and(|object| {
             object.contains_key("schema_version")
                 || object.contains_key("revision")
                 || object.contains_key("data")
         });
         if has_envelope_marker {
-            self.read_document_bytes(bytes)
+            self.decode_document_value(shape)
         } else {
+            self.validate_raw_data(&shape)
+                .map_err(DocumentDecodeError::RawValidation)?;
             Ok(RevisionedDocument {
                 schema_version: self.schema_version,
                 revision: 0,
-                data: serde_json::from_slice(bytes)?,
+                data: serde_json::from_value(shape)
+                    .map_err(ConfigStoreError::Json)
+                    .map_err(DocumentDecodeError::Store)?,
             })
+        }
+    }
+
+    fn validate_raw_data(&self, value: &serde_json::Value) -> Result<(), String> {
+        match &self.raw_validator {
+            Some(validate) => (validate.0)(value),
+            None => Ok(()),
         }
     }
 }
@@ -736,12 +1108,27 @@ pub enum ConfigSectionEvent {
 
 type Validator<T> = Arc<dyn Fn(&T) -> Result<(), String> + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveRepairAuthority {
+    None,
+    DegradedBackup,
+    MissingAfterGood,
+    InvalidAfterGood,
+}
+
+impl LiveRepairAuthority {
+    fn can_repair(self) -> bool {
+        self != Self::None
+    }
+}
+
 /// A section's immutable, last-known-good process snapshot.
 pub struct LiveSection<T> {
     name: String,
     store: AtomicJsonStore<T>,
     operation_lock: Mutex<()>,
     snapshot: RwLock<Arc<SectionSnapshot<T>>>,
+    repair_authority: RwLock<LiveRepairAuthority>,
     validate: Validator<T>,
 }
 
@@ -758,8 +1145,81 @@ where
     where
         F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
     {
+        Self::open_configured(name, store, default, validate)
+    }
+
+    /// Open a live section whose persisted JSON must pass a raw-data policy
+    /// before unknown fields can be discarded by typed deserialization.
+    pub fn open_with_raw_validator<F, R>(
+        name: impl Into<String>,
+        store: AtomicJsonStore<T>,
+        default: T,
+        validate: F,
+        validate_raw: R,
+    ) -> ConfigStoreResult<Self>
+    where
+        F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
+        R: Fn(&serde_json::Value) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Self::open_configured(
+            name,
+            store.with_raw_validator(validate_raw),
+            default,
+            validate,
+        )
+    }
+
+    /// Materialize a live section from bytes captured by a caller-owned
+    /// stable-layout barrier. The same raw and typed validators run, but the
+    /// store is not re-read, so the snapshot is cryptographically bound to the
+    /// caller's captured member rather than a later filesystem epoch.
+    pub(crate) fn open_from_bytes_with_raw_validator<F, R>(
+        name: impl Into<String>,
+        store: AtomicJsonStore<T>,
+        bytes: &[u8],
+        validate: F,
+        validate_raw: R,
+    ) -> ConfigStoreResult<Self>
+    where
+        F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
+        R: Fn(&serde_json::Value) -> Result<(), String> + Send + Sync + 'static,
+    {
+        let store = store.with_raw_validator(validate_raw);
         let validate: Validator<T> = Arc::new(validate);
-        let (data, revision, source_kind, status, last_error) =
+        let document = store
+            .decode_document_bytes(bytes)
+            .map_err(DocumentDecodeError::into_store_error)?;
+        validate(&document.data).map_err(ConfigStoreError::Validation)?;
+        let snapshot = SectionSnapshot {
+            data: Arc::new(document.data),
+            revision: document.revision,
+            loaded_at: Utc::now(),
+            source_path: store.path().to_path_buf(),
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Healthy,
+            last_error: None,
+        };
+        Ok(Self {
+            name: name.into(),
+            store,
+            operation_lock: Mutex::new(()),
+            snapshot: RwLock::new(Arc::new(snapshot)),
+            repair_authority: RwLock::new(LiveRepairAuthority::None),
+            validate,
+        })
+    }
+
+    fn open_configured<F>(
+        name: impl Into<String>,
+        store: AtomicJsonStore<T>,
+        default: T,
+        validate: F,
+    ) -> ConfigStoreResult<Self>
+    where
+        F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
+    {
+        let validate: Validator<T> = Arc::new(validate);
+        let (data, revision, source_kind, status, last_error, repair_authority) =
             match store.load_validated(|value| validate(value)) {
                 Ok(Some(stored)) => {
                     let kind = if stored.recovered_from_backup {
@@ -775,7 +1235,19 @@ where
                     let error = stored.recovered_from_backup.then(|| {
                         "primary document invalid; using last-known-good backup".to_string()
                     });
-                    (stored.data, stored.revision, kind, status, error)
+                    let repair_authority = if stored.recovered_from_backup {
+                        LiveRepairAuthority::DegradedBackup
+                    } else {
+                        LiveRepairAuthority::None
+                    };
+                    (
+                        stored.data,
+                        stored.revision,
+                        kind,
+                        status,
+                        error,
+                        repair_authority,
+                    )
                 }
                 Ok(None) => (
                     default,
@@ -783,6 +1255,7 @@ where
                     SectionSourceKind::Default,
                     SectionStatus::Missing,
                     None,
+                    LiveRepairAuthority::None,
                 ),
                 Err(_) => (
                     default,
@@ -790,6 +1263,7 @@ where
                     SectionSourceKind::Default,
                     SectionStatus::Invalid,
                     Some("section could not be parsed or read".to_string()),
+                    LiveRepairAuthority::None,
                 ),
             };
         let snapshot = SectionSnapshot {
@@ -806,6 +1280,7 @@ where
             store,
             operation_lock: Mutex::new(()),
             snapshot: RwLock::new(Arc::new(snapshot)),
+            repair_authority: RwLock::new(repair_authority),
             validate,
         })
     }
@@ -838,21 +1313,42 @@ where
             .operation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let revision = self
-            .store
-            .commit(expected_revision, candidate.clone(), |value| {
-                (self.validate)(value)
-            })?;
+        let current = self.snapshot();
+        let repair_authority = self.repair_authority();
+        let revision = if repair_authority.can_repair() {
+            if current.revision != expected_revision {
+                return Err(ConfigStoreError::Conflict {
+                    expected: expected_revision,
+                    actual: current.revision,
+                });
+            }
+            self.store.commit_from_retained_live_snapshot(
+                expected_revision,
+                current.data.as_ref(),
+                candidate.clone(),
+                |value| (self.validate)(value),
+            )?
+        } else {
+            self.store.commit_from_live_snapshot(
+                expected_revision,
+                current.data.as_ref(),
+                candidate.clone(),
+                |value| (self.validate)(value),
+            )?
+        };
         before_publish();
-        self.publish(SectionSnapshot {
-            data: Arc::new(candidate),
-            revision,
-            loaded_at: Utc::now(),
-            source_path: self.store.path().to_path_buf(),
-            source_kind: SectionSourceKind::File,
-            status: SectionStatus::Healthy,
-            last_error: None,
-        });
+        self.publish(
+            SectionSnapshot {
+                data: Arc::new(candidate),
+                revision,
+                loaded_at: Utc::now(),
+                source_path: self.store.path().to_path_buf(),
+                source_kind: SectionSourceKind::File,
+                status: SectionStatus::Healthy,
+                last_error: None,
+            },
+            LiveRepairAuthority::None,
+        );
         Ok(ConfigSectionEvent::Changed {
             section: self.name.clone(),
             revision,
@@ -865,6 +1361,9 @@ where
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.snapshot();
+        let current_authority = self.repair_authority();
+        let has_trusted_lkg =
+            current.status == SectionStatus::Healthy || current_authority.can_repair();
         match self.store.load_validated_for_reload(
             current.revision,
             current.data.as_ref(),
@@ -872,27 +1371,52 @@ where
         ) {
             Ok(Some(stored)) => {
                 if stored.recovered_from_backup {
-                    self.publish_error(
-                        SectionStatus::Degraded,
-                        "primary document invalid; retaining last-known-good snapshot",
-                    );
+                    let revision = if has_trusted_lkg {
+                        self.publish_error(
+                            SectionStatus::Degraded,
+                            "primary document invalid; retaining last-known-good snapshot",
+                            LiveRepairAuthority::DegradedBackup,
+                        );
+                        current.revision
+                    } else {
+                        let revision = stored.revision;
+                        self.publish(
+                            SectionSnapshot {
+                                data: Arc::new(stored.data),
+                                revision,
+                                loaded_at: Utc::now(),
+                                source_path: stored.source_path,
+                                source_kind: SectionSourceKind::Backup,
+                                status: SectionStatus::Degraded,
+                                last_error: Some(
+                                    "primary document invalid; using last-known-good backup"
+                                        .to_string(),
+                                ),
+                            },
+                            LiveRepairAuthority::DegradedBackup,
+                        );
+                        revision
+                    };
                     return ConfigSectionEvent::Invalid {
                         section: self.name.clone(),
-                        revision: current.revision,
+                        revision,
                     };
                 }
                 let recovered = current.status != SectionStatus::Healthy;
                 let status = SectionStatus::Healthy;
                 let source_kind = SectionSourceKind::File;
-                self.publish(SectionSnapshot {
-                    data: Arc::new(stored.data),
-                    revision: stored.revision,
-                    loaded_at: Utc::now(),
-                    source_path: self.store.path().to_path_buf(),
-                    source_kind,
-                    status,
-                    last_error: None,
-                });
+                self.publish(
+                    SectionSnapshot {
+                        data: Arc::new(stored.data),
+                        revision: stored.revision,
+                        loaded_at: Utc::now(),
+                        source_path: self.store.path().to_path_buf(),
+                        source_kind,
+                        status,
+                        last_error: None,
+                    },
+                    LiveRepairAuthority::None,
+                );
                 if recovered && status == SectionStatus::Healthy {
                     ConfigSectionEvent::Recovered {
                         section: self.name.clone(),
@@ -906,16 +1430,31 @@ where
                 }
             }
             Ok(None) => {
-                self.publish_error(SectionStatus::Missing, "section file is missing");
+                let repair_authority = if has_trusted_lkg {
+                    LiveRepairAuthority::MissingAfterGood
+                } else {
+                    LiveRepairAuthority::None
+                };
+                self.publish_error(
+                    SectionStatus::Missing,
+                    "section file is missing",
+                    repair_authority,
+                );
                 ConfigSectionEvent::Invalid {
                     section: self.name.clone(),
                     revision: current.revision,
                 }
             }
-            _ => {
+            Err(error) => {
+                let repair_authority = if has_trusted_lkg && repairable_live_lkg_error(&error) {
+                    LiveRepairAuthority::InvalidAfterGood
+                } else {
+                    LiveRepairAuthority::None
+                };
                 self.publish_error(
                     SectionStatus::Invalid,
                     "section could not be parsed or read",
+                    repair_authority,
                 );
                 ConfigSectionEvent::Invalid {
                     section: self.name.clone(),
@@ -925,24 +1464,43 @@ where
         }
     }
 
-    fn publish_error(&self, status: SectionStatus, message: &str) {
-        let current = self.snapshot();
-        self.publish(SectionSnapshot {
-            data: current.data.clone(),
-            revision: current.revision,
-            loaded_at: Utc::now(),
-            source_path: current.source_path.clone(),
-            source_kind: current.source_kind,
-            status,
-            last_error: Some(message.to_string()),
-        });
+    fn repair_authority(&self) -> LiveRepairAuthority {
+        *self
+            .repair_authority
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn publish(&self, snapshot: SectionSnapshot<T>) {
+    fn publish_error(
+        &self,
+        status: SectionStatus,
+        message: &str,
+        repair_authority: LiveRepairAuthority,
+    ) {
+        let current = self.snapshot();
+        self.publish(
+            SectionSnapshot {
+                data: current.data.clone(),
+                revision: current.revision,
+                loaded_at: Utc::now(),
+                source_path: current.source_path.clone(),
+                source_kind: current.source_kind,
+                status,
+                last_error: Some(message.to_string()),
+            },
+            repair_authority,
+        );
+    }
+
+    fn publish(&self, snapshot: SectionSnapshot<T>, repair_authority: LiveRepairAuthority) {
         *self
             .snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(snapshot);
+        *self
+            .repair_authority
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = repair_authority;
     }
 }
 
@@ -1085,6 +1643,8 @@ fn create_dir(path: &Path, sensitive: bool) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = sensitive;
     Ok(())
 }
 
@@ -1123,31 +1683,41 @@ fn replace_path(from: &Path, to: &Path) -> std::io::Result<()> {
         // Same-filesystem rename atomically replaces the destination on Unix.
         std::fs::rename(from, to)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        match std::fs::rename(from, to) {
-            Ok(()) => Ok(()),
-            Err(error) if to.exists() => {
-                let file_name = to
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("config.json");
-                let displaced =
-                    to.with_file_name(format!(".{file_name}.replace-old.{}", Uuid::new_v4()));
-                std::fs::rename(to, &displaced)?;
-                match std::fs::rename(from, to) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(displaced);
-                        Ok(())
-                    }
-                    Err(_) => {
-                        std::fs::rename(displaced, to)?;
-                        Err(error)
-                    }
-                }
-            }
-            Err(error) => Err(error),
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let from = from
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let to = to
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both buffers are stable, NUL-terminated UTF-16 strings for
+        // the duration of the call. MoveFileExW does not retain their pointers.
+        let result = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::rename(from, to)
     }
 }
 
@@ -1169,6 +1739,101 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Example {
         value: String,
+    }
+
+    fn store_with_two_revisions(dir: &TempDir) -> (PathBuf, AtomicJsonStore<Example>) {
+        let path = dir.path().join("example.json");
+        let store = AtomicJsonStore::new(&path, 1);
+        store
+            .commit(
+                0,
+                Example {
+                    value: "one".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        store
+            .commit(
+                1,
+                Example {
+                    value: "two".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        (path, store)
+    }
+
+    fn open_example_live_section(path: &Path, backup_generations: usize) -> LiveSection<Example> {
+        let mut store = AtomicJsonStore::new(path, 1);
+        store.file.backup_generations = backup_generations;
+        LiveSection::open(
+            "example",
+            store,
+            Example {
+                value: "default".into(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap()
+    }
+
+    fn commit_two_live_revisions(section: &LiveSection<Example>) {
+        section
+            .commit(
+                0,
+                Example {
+                    value: "one".into(),
+                },
+            )
+            .unwrap();
+        section
+            .commit(
+                1,
+                Example {
+                    value: "two".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn reject_test_secrets(value: &serde_json::Value) -> Result<(), String> {
+        fn walk(value: &serde_json::Value) -> Result<(), String> {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, value) in object {
+                        if matches!(key.as_str(), "password" | "token")
+                            && !value.is_null()
+                            && value.as_str().is_none_or(|value| !value.is_empty())
+                        {
+                            return Err(format!("raw secret in {key}"));
+                        }
+                        walk(value)?;
+                    }
+                    Ok(())
+                }
+                serde_json::Value::Array(values) => values.iter().try_for_each(walk),
+                serde_json::Value::String(value) if crate::patch::is_masked_api_key(value) => {
+                    Err("raw masked placeholder".to_string())
+                }
+                _ => Ok(()),
+            }
+        }
+
+        walk(value)
+    }
+
+    fn has_example_quarantine(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("example.json.corrupt."))
+            })
     }
 
     #[test]
@@ -1204,6 +1869,357 @@ mod tests {
             }
         ));
         assert_eq!(store.load().unwrap().unwrap().data.value, "one");
+    }
+
+    #[test]
+    fn commit_repairs_corrupt_primary_from_reported_backup_revision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let store = AtomicJsonStore::new(&path, 1);
+        store
+            .commit(
+                0,
+                Example {
+                    value: "one".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        store
+            .commit(
+                1,
+                Example {
+                    value: "two".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let corrupt = b"{broken primary";
+        std::fs::write(&path, corrupt).unwrap();
+        let recovered = store.load().unwrap().unwrap();
+        assert!(recovered.recovered_from_backup);
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(recovered.data.value, "one");
+        let quarantine = recovered.quarantine_path.unwrap();
+
+        assert_eq!(
+            store
+                .commit(
+                    recovered.revision,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            3
+        );
+        let repaired = store.load().unwrap().unwrap();
+        assert!(!repaired.recovered_from_backup);
+        assert_eq!(repaired.revision, 3);
+        assert_eq!(repaired.data.value, "repaired");
+        assert_eq!(std::fs::read(quarantine).unwrap(), corrupt);
+        assert!(matches!(
+            store.commit(
+                2,
+                Example {
+                    value: "stale".into(),
+                },
+                |_| Ok(()),
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(store.load().unwrap().unwrap().data.value, "repaired");
+    }
+
+    #[test]
+    fn compatible_commit_repairs_corrupt_primary_from_reported_backup_revision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let store = AtomicJsonStore::new(&path, 1);
+        std::fs::write(&path, br#"{"value":"legacy"}"#).unwrap();
+        store
+            .commit_allowing_unversioned(
+                0,
+                Example {
+                    value: "one".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        store
+            .commit_allowing_unversioned(
+                1,
+                Example {
+                    value: "two".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        std::fs::write(&path, b"{broken primary").unwrap();
+        let recovered = store
+            .load_validated_allowing_unversioned(|_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(recovered.recovered_from_backup);
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(recovered.data.value, "one");
+        assert_eq!(
+            store
+                .commit_allowing_unversioned(
+                    recovered.revision,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            3
+        );
+        let repaired = store
+            .load_validated_allowing_unversioned(|_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(!repaired.recovered_from_backup);
+        assert_eq!(repaired.revision, 3);
+        assert_eq!(repaired.data.value, "repaired");
+        assert!(matches!(
+            store.commit_allowing_unversioned(
+                2,
+                Example {
+                    value: "stale".into(),
+                },
+                |_| Ok(()),
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(
+            store
+                .load_validated_allowing_unversioned(|_| Ok(()))
+                .unwrap()
+                .unwrap()
+                .data
+                .value,
+            "repaired"
+        );
+    }
+
+    #[test]
+    fn live_lkg_repair_allocates_above_validation_invalid_primary_revision() {
+        fn reject_invalid(value: &Example) -> Result<(), String> {
+            if value.value == "invalid" {
+                Err("invalid test value".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let (path, store) = store_with_two_revisions(&dir);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 100,
+                "data": {"value": "invalid"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recovered = store.load_validated(reject_invalid).unwrap().unwrap();
+        assert!(recovered.recovered_from_backup);
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(recovered.data.value, "one");
+        assert_eq!(
+            store
+                .commit_from_live_lkg(
+                    2,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                    reject_invalid,
+                )
+                .unwrap(),
+            101
+        );
+
+        for expected in [1, 2, 3, 100] {
+            assert!(matches!(
+                store.commit(
+                    expected,
+                    Example {
+                        value: format!("stale-{expected}"),
+                    },
+                    reject_invalid,
+                ),
+                Err(ConfigStoreError::Conflict {
+                    expected: conflict_expected,
+                    actual: 101,
+                }) if conflict_expected == expected
+            ));
+        }
+        assert_eq!(store.load().unwrap().unwrap().revision, 101);
+    }
+
+    #[test]
+    fn compatible_repair_counts_complete_envelope_with_wrong_typed_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let store = AtomicJsonStore::new(&path, 1);
+        std::fs::write(&path, br#"{"value":"legacy"}"#).unwrap();
+        store
+            .commit_allowing_unversioned(
+                0,
+                Example {
+                    value: "one".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        store
+            .commit_allowing_unversioned(
+                1,
+                Example {
+                    value: "two".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 100,
+                "data": {"value": 42}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recovered = store
+            .load_validated_allowing_unversioned(|_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(recovered.recovered_from_backup);
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(
+            store
+                .commit_allowing_unversioned(
+                    recovered.revision,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            101
+        );
+    }
+
+    #[test]
+    fn complete_envelope_revision_overflow_fails_without_repair_write() {
+        fn reject_invalid(value: &Example) -> Result<(), String> {
+            if value.value == "invalid" {
+                Err("invalid test value".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let (path, store) = store_with_two_revisions(&dir);
+        let invalid = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "revision": u64::MAX,
+            "data": {"value": "invalid"}
+        }))
+        .unwrap();
+        std::fs::write(&path, &invalid).unwrap();
+
+        assert!(matches!(
+            store.commit_from_live_lkg(
+                2,
+                Example {
+                    value: "must-not-persist".into(),
+                },
+                reject_invalid,
+            ),
+            Err(ConfigStoreError::Validation(message)) if message == "revision counter exhausted"
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn garbage_and_partial_envelopes_cannot_forge_repair_revision_floor() {
+        let invalid_primaries = [
+            br#"{"garbage":"revision=18446744073709551615"}"#.to_vec(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "revision": u64::MAX,
+                "data": {"value": "partial"}
+            }))
+            .unwrap(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": u64::MAX
+            }))
+            .unwrap(),
+        ];
+
+        for invalid in invalid_primaries {
+            let dir = TempDir::new().unwrap();
+            let (path, store) = store_with_two_revisions(&dir);
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                store
+                    .commit_from_live_lkg(
+                        2,
+                        Example {
+                            value: "repaired".into(),
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn valid_primary_remains_authoritative_over_higher_backup_revision() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store) = store_with_two_revisions(&dir);
+        std::fs::write(
+            store.file.backup_path(0),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 100,
+                "data": {"value": 42}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .commit(
+                    2,
+                    Example {
+                        value: "three".into(),
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -1274,6 +2290,169 @@ mod tests {
             store.load_validated_allowing_unversioned(|_| Ok(())),
             Err(ConfigStoreError::Json(_))
         ));
+    }
+
+    #[test]
+    fn raw_validator_rejects_primary_without_typed_materialization_or_quarantine() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let store = AtomicJsonStore::new(&path, 1);
+        store
+            .commit(
+                0,
+                Example {
+                    value: "backup".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        store
+            .commit(
+                1,
+                Example {
+                    value: "previous-primary".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let raw_invalid = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "revision": 3,
+            "data": {
+                "value": "typed-fields-are-valid",
+                "future": {"password": "must-not-enter-the-snapshot"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&path, &raw_invalid).unwrap();
+
+        let section = LiveSection::open_with_raw_validator(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "default".into(),
+            },
+            |_| Ok(()),
+            reject_test_secrets,
+        )
+        .unwrap();
+
+        let snapshot = section.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Invalid);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.data.value, "default");
+        assert_eq!(std::fs::read(&path).unwrap(), raw_invalid);
+        assert!(!has_example_quarantine(dir.path()));
+    }
+
+    #[test]
+    fn raw_validator_reload_retains_lkg_as_invalid_without_backup_fallback() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open_with_raw_validator(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "default".into(),
+            },
+            |_| Ok(()),
+            reject_test_secrets,
+        )
+        .unwrap();
+        commit_two_live_revisions(&section);
+        let raw_invalid = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "revision": 3,
+            "data": {
+                "value": "typed-fields-are-valid",
+                "future": {"token": "must-not-enter-the-snapshot"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&path, &raw_invalid).unwrap();
+
+        assert!(matches!(
+            section.reload(),
+            ConfigSectionEvent::Invalid { revision: 2, .. }
+        ));
+        let snapshot = section.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Invalid);
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.data.value, "two");
+        assert_eq!(
+            section.repair_authority(),
+            LiveRepairAuthority::InvalidAfterGood
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), raw_invalid);
+        assert!(!has_example_quarantine(dir.path()));
+
+        assert!(matches!(
+            section
+                .commit(
+                    2,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed { revision: 4, .. }
+        ));
+        assert_eq!(section.snapshot().status, SectionStatus::Healthy);
+        assert_eq!(section.snapshot().data.value, "repaired");
+        assert!(!has_example_quarantine(dir.path()));
+    }
+
+    #[test]
+    fn raw_validator_rejects_serialized_commit_candidate_without_publication() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open_with_raw_validator(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            serde_json::json!({"value": "default"}),
+            |_| Ok(()),
+            reject_test_secrets,
+        )
+        .unwrap();
+        section
+            .commit(0, serde_json::json!({"value": "published"}))
+            .unwrap();
+        let durable_before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            section.commit(
+                1,
+                serde_json::json!({
+                    "value": "candidate",
+                    "display": "********"
+                })
+            ),
+            Err(ConfigStoreError::Validation(message)) if message == "raw masked placeholder"
+        ));
+        let snapshot = section.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Healthy);
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.data["value"], "published");
+        assert_eq!(std::fs::read(&path).unwrap(), durable_before);
+        assert!(!has_example_quarantine(dir.path()));
+    }
+
+    #[test]
+    fn raw_validator_scans_legacy_compatible_data_from_the_same_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let raw_invalid =
+            br#"{"value":"typed-fields-are-valid","future":{"token":"legacy-secret"}}"#;
+        std::fs::write(&path, raw_invalid).unwrap();
+        let store: AtomicJsonStore<Example> =
+            AtomicJsonStore::new(&path, 1).with_raw_validator(reject_test_secrets);
+
+        assert!(matches!(
+            store.load_validated_allowing_unversioned(|_| Ok(())),
+            Err(ConfigStoreError::Validation(message)) if message == "raw secret in token"
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), raw_invalid);
+        assert!(!has_example_quarantine(dir.path()));
     }
 
     #[test]
@@ -1430,6 +2609,575 @@ mod tests {
             ConfigSectionEvent::Recovered { revision: 3, .. }
         ));
         assert_eq!(section.snapshot().data.value, "fixed");
+    }
+
+    #[test]
+    fn degraded_live_section_repairs_from_its_published_lkg_revision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "default".into(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        section
+            .commit(
+                0,
+                Example {
+                    value: "one".into(),
+                },
+            )
+            .unwrap();
+        section
+            .commit(
+                1,
+                Example {
+                    value: "two".into(),
+                },
+            )
+            .unwrap();
+
+        std::fs::write(&path, b"{broken primary").unwrap();
+        assert!(matches!(
+            section.reload(),
+            ConfigSectionEvent::Invalid { revision: 2, .. }
+        ));
+        let degraded = section.snapshot();
+        assert_eq!(degraded.status, SectionStatus::Degraded);
+        assert_eq!(degraded.revision, 2);
+        assert_eq!(degraded.data.value, "two");
+
+        assert!(matches!(
+            section
+                .commit(
+                    2,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed { revision: 3, .. }
+        ));
+        let repaired = section.snapshot();
+        assert_eq!(repaired.status, SectionStatus::Healthy);
+        assert_eq!(repaired.revision, 3);
+        assert_eq!(repaired.data.value, "repaired");
+        let durable = section.store.load().unwrap().unwrap();
+        assert_eq!(durable.revision, 3);
+        assert_eq!(durable.data.value, "repaired");
+        assert!(matches!(
+            section.commit(
+                2,
+                Example {
+                    value: "stale".into(),
+                },
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn retained_live_snapshot_repairs_deleted_primary_above_live_revision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 3);
+        commit_two_live_revisions(&section);
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            section.reload(),
+            ConfigSectionEvent::Invalid { revision: 2, .. }
+        ));
+        let missing = section.snapshot();
+        assert_eq!(missing.status, SectionStatus::Missing);
+        assert_eq!(missing.revision, 2);
+        assert_eq!(missing.data.value, "two");
+        assert_eq!(
+            section.repair_authority(),
+            LiveRepairAuthority::MissingAfterGood
+        );
+
+        assert!(matches!(
+            section
+                .commit(
+                    2,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed { revision: 3, .. }
+        ));
+        let durable = section.store.load().unwrap().unwrap();
+        assert_eq!(durable.revision, 3);
+        assert_eq!(durable.data.value, "repaired");
+        assert_eq!(section.repair_authority(), LiveRepairAuthority::None);
+    }
+
+    #[test]
+    fn retained_live_snapshot_repairs_typed_invalid_primary_without_backup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 0);
+        commit_two_live_revisions(&section);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 2,
+                "data": {"value": 42}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            section.reload(),
+            ConfigSectionEvent::Invalid { revision: 2, .. }
+        ));
+        assert_eq!(section.snapshot().status, SectionStatus::Invalid);
+        assert_eq!(
+            section.repair_authority(),
+            LiveRepairAuthority::InvalidAfterGood
+        );
+        assert!(matches!(
+            section
+                .commit(
+                    2,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed { revision: 3, .. }
+        ));
+        let durable = section.store.load().unwrap().unwrap();
+        assert_eq!(durable.revision, 3);
+        assert_eq!(durable.data.value, "repaired");
+    }
+
+    #[test]
+    fn retained_live_snapshot_repairs_semantically_invalid_primary_without_backup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let mut store = AtomicJsonStore::new(&path, 1);
+        store.file.backup_generations = 0;
+        let section = LiveSection::open(
+            "example",
+            store,
+            Example {
+                value: "default".into(),
+            },
+            |value| {
+                if value.value == "invalid" {
+                    Err("invalid test value".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        commit_two_live_revisions(&section);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&RevisionedDocument {
+                schema_version: 1,
+                revision: 2,
+                data: Example {
+                    value: "invalid".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            section.reload(),
+            ConfigSectionEvent::Invalid { revision: 2, .. }
+        ));
+        assert_eq!(
+            section.repair_authority(),
+            LiveRepairAuthority::InvalidAfterGood
+        );
+        assert!(matches!(
+            section
+                .commit(
+                    2,
+                    Example {
+                        value: "repaired".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed { revision: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn retained_live_repair_rejects_valid_primary_that_appears_before_commit() {
+        for (durable_revision, durable_value) in [(1, "rollback"), (2, "same-revision-edit")] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("example.json");
+            let section = open_example_live_section(&path, 0);
+            commit_two_live_revisions(&section);
+            std::fs::remove_file(&path).unwrap();
+            section.reload();
+            assert_eq!(
+                section.repair_authority(),
+                LiveRepairAuthority::MissingAfterGood
+            );
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&RevisionedDocument {
+                    schema_version: 1,
+                    revision: durable_revision,
+                    data: Example {
+                        value: durable_value.into(),
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                section.commit(
+                    2,
+                    Example {
+                        value: "must-not-overwrite".into(),
+                    },
+                ),
+                Err(ConfigStoreError::Conflict {
+                    expected: 2,
+                    actual,
+                }) if actual == durable_revision
+            ));
+            let durable = section.store.load().unwrap().unwrap();
+            assert_eq!(durable.revision, durable_revision);
+            assert_eq!(durable.data.value, durable_value);
+        }
+    }
+
+    #[test]
+    fn retained_live_repair_overflow_does_not_partially_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 0);
+        commit_two_live_revisions(&section);
+        let invalid = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "revision": u64::MAX,
+            "data": {"value": 42}
+        }))
+        .unwrap();
+        std::fs::write(&path, &invalid).unwrap();
+        section.reload();
+        assert_eq!(
+            section.repair_authority(),
+            LiveRepairAuthority::InvalidAfterGood
+        );
+
+        assert!(matches!(
+            section.commit(
+                2,
+                Example {
+                    value: "must-not-persist".into(),
+                },
+            ),
+            Err(ConfigStoreError::Validation(message)) if message == "revision counter exhausted"
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+        let snapshot = section.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Invalid);
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.data.value, "two");
+    }
+
+    #[test]
+    fn initial_invalid_default_has_no_live_repair_authority() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let invalid = b"{initially invalid".to_vec();
+        std::fs::write(&path, &invalid).unwrap();
+        let section = open_example_live_section(&path, 0);
+        assert_eq!(section.snapshot().status, SectionStatus::Invalid);
+        assert_eq!(section.snapshot().revision, 0);
+        assert_eq!(section.repair_authority(), LiveRepairAuthority::None);
+
+        assert!(section
+            .commit(
+                0,
+                Example {
+                    value: "must-not-persist".into(),
+                },
+            )
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn newer_schema_does_not_gain_live_repair_authority() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 0);
+        commit_two_live_revisions(&section);
+        let newer = serde_json::to_vec_pretty(&RevisionedDocument {
+            schema_version: 2,
+            revision: 3,
+            data: Example {
+                value: "future".into(),
+            },
+        })
+        .unwrap();
+        std::fs::write(&path, &newer).unwrap();
+
+        section.reload();
+        assert_eq!(section.snapshot().status, SectionStatus::Invalid);
+        assert_eq!(section.repair_authority(), LiveRepairAuthority::None);
+        assert!(section
+            .commit(
+                2,
+                Example {
+                    value: "must-not-persist".into(),
+                },
+            )
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), newer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn io_invalidated_snapshot_does_not_gain_repair_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = open_example_live_section(&path, 3);
+        commit_two_live_revisions(&section);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let event = section.reload();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            event,
+            ConfigSectionEvent::Invalid { revision: 2, .. }
+        ));
+        assert_eq!(section.snapshot().status, SectionStatus::Invalid);
+        assert_eq!(section.repair_authority(), LiveRepairAuthority::None);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            section.commit(
+                2,
+                Example {
+                    value: "must-not-persist".into(),
+                },
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 2,
+                actual: 0,
+            })
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn healthy_live_commit_rejects_same_revision_external_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "default".into(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        section
+            .commit(
+                0,
+                Example {
+                    value: "published".into(),
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&RevisionedDocument {
+                schema_version: 1,
+                revision: 1,
+                data: Example {
+                    value: "external".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            section.commit(
+                1,
+                Example {
+                    value: "candidate".into(),
+                },
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 1,
+                actual: 1,
+            })
+        ));
+        assert_eq!(section.snapshot().data.value, "published");
+        let durable = section.store.load().unwrap().unwrap();
+        assert_eq!(durable.revision, 1);
+        assert_eq!(durable.data.value, "external");
+    }
+
+    #[test]
+    fn degraded_live_repair_rejects_any_reappeared_valid_primary() {
+        for reappeared_value in ["external", "published"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("example.json");
+            let section = LiveSection::open(
+                "example",
+                AtomicJsonStore::new(&path, 1),
+                Example {
+                    value: "default".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            section
+                .commit(
+                    0,
+                    Example {
+                        value: "first".into(),
+                    },
+                )
+                .unwrap();
+            section
+                .commit(
+                    1,
+                    Example {
+                        value: "published".into(),
+                    },
+                )
+                .unwrap();
+            std::fs::write(&path, b"{broken primary").unwrap();
+            assert!(matches!(
+                section.reload(),
+                ConfigSectionEvent::Invalid { revision: 2, .. }
+            ));
+            assert_eq!(section.snapshot().status, SectionStatus::Degraded);
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&RevisionedDocument {
+                    schema_version: 1,
+                    revision: 2,
+                    data: Example {
+                        value: reappeared_value.into(),
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                section.commit(
+                    2,
+                    Example {
+                        value: "candidate".into(),
+                    },
+                ),
+                Err(ConfigStoreError::Conflict {
+                    expected: 2,
+                    actual: 2,
+                })
+            ));
+            let snapshot = section.snapshot();
+            assert_eq!(snapshot.status, SectionStatus::Degraded);
+            assert_eq!(snapshot.revision, 2);
+            assert_eq!(snapshot.data.value, "published");
+            let durable = section.store.load().unwrap().unwrap();
+            assert_eq!(durable.revision, 2);
+            assert_eq!(durable.data.value, reappeared_value);
+        }
+    }
+
+    #[test]
+    fn healthy_live_commit_accepts_same_revision_same_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "default".into(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        section
+            .commit(
+                0,
+                Example {
+                    value: "published".into(),
+                },
+            )
+            .unwrap();
+        // Deliberately rewrite equivalent content with a different byte layout.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&RevisionedDocument {
+                schema_version: 1,
+                revision: 1,
+                data: Example {
+                    value: "published".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            section
+                .commit(
+                    1,
+                    Example {
+                        value: "candidate".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed { revision: 2, .. }
+        ));
+        assert_eq!(section.snapshot().data.value, "candidate");
+        assert_eq!(section.store.load().unwrap().unwrap().revision, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_existing_is_atomic_without_displaced_artifact() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("example.json");
+        let staging = dir.path().join(".example.json.tmp.test");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&staging, b"new").unwrap();
+
+        replace_path(&staging, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!staging.exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".replace-old.")
+        }));
     }
 
     #[test]

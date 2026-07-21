@@ -459,6 +459,12 @@ mod tests {
             Some("durable-before-root")
         );
         assert!(dir.path().join("subagents.json").exists());
-        assert!(dir.path().join("providers.json").exists());
+        let providers: ProviderConfigs =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert!(providers.openai.is_none());
+        assert!(providers.anthropic.is_none());
+        assert!(providers.gemini.is_none());
+        assert!(providers.bodhi.is_none());
     }
 }

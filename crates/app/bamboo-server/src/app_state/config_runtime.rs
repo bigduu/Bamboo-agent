@@ -12,6 +12,49 @@ use bamboo_mcp::{McpConfig, McpServerManager, TransportConfig};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+fn load_committed_effective_config(data_dir: &Path) -> Result<Config, ConfigStoreError> {
+    if bamboo_config::section_layout_is_active(data_dir)? {
+        let mut config = bamboo_config::ConfigFacade::open(data_dir)?.effective_config();
+        if let Err(error) = config.hydrate_proxy_auth_from_store(data_dir) {
+            tracing::warn!(error = %error, "proxy auth credential hydration unavailable");
+            config.proxy_auth = None;
+        }
+        if let Err(error) = config.hydrate_provider_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "provider credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_mcp_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "MCP credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_env_var_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "env credential hydration unavailable");
+            for entry in &mut config.env_vars {
+                if entry.secret {
+                    entry.value.clear();
+                }
+            }
+        }
+        if let Err(error) = config.hydrate_cluster_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "cluster credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_notification_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "notification credential hydration unavailable");
+            config.notifications.ntfy.token = None;
+            config.notifications.bark.device_key = None;
+        }
+        if let Some(broker) = config.subagents_mut().broker.as_mut() {
+            if let Err(error) = broker.hydrate_credential_from_store(data_dir) {
+                tracing::warn!(error = %error, "external broker credential hydration unavailable");
+                broker.token.clear();
+            }
+        }
+        Ok(config)
+    } else {
+        Ok(Config::from_data_dir_without_publish(Some(
+            data_dir.to_path_buf(),
+        )))
+    }
+}
+
 /// Health metadata for the server-owned effective/provider configuration view.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigLiveHealth {
@@ -1552,10 +1595,9 @@ impl AppState {
                     &env_intents,
                     expected_revision,
                 )?;
-                // Reload the complete committed root after manifest recovery or
-                // rebase. Publishing the pre-commit candidate would discard an
-                // unrelated external root edit that won during the transaction.
-                let committed = Config::from_data_dir_without_publish(Some(transaction_dir));
+                // Reload from the durable authority selected by the layout.
+                // Active modular layouts never publish stale config.json.
+                let committed = load_committed_effective_config(&transaction_dir)?;
                 Ok::<_, ConfigStoreError>((committed, revision))
             })
             .await
@@ -1634,7 +1676,7 @@ impl AppState {
                             reset_domain,
                             expected_revision,
                         )?;
-                let committed = Config::from_data_dir_without_publish(Some(transaction_dir));
+                let committed = load_committed_effective_config(&transaction_dir)?;
                 Ok::<_, ConfigStoreError>((committed, revision))
             })
             .await
@@ -1710,7 +1752,7 @@ impl AppState {
                         &node_intents,
                         expected_revision,
                     )?;
-                let committed = Config::from_data_dir_without_publish(Some(transaction_dir));
+                let committed = load_committed_effective_config(&transaction_dir)?;
                 Ok::<_, ConfigStoreError>((committed, revision))
             })
             .await
@@ -1795,15 +1837,24 @@ impl AppState {
                 candidate
             };
             let transaction_dir = app_data_dir.clone();
-            let candidate = tokio::task::spawn_blocking(move || {
+            let status_reference =
+                candidate
+                    .proxy_auth_credential_ref
+                    .clone()
+                    .unwrap_or_else(|| {
+                        bamboo_config::CredentialRef::parse("proxy.default.auth")
+                            .expect("canonical proxy credential reference is valid")
+                    });
+            let (candidate, reference) = tokio::task::spawn_blocking(move || {
                 bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
                     &transaction_dir,
                     &mut candidate,
                     expected_revision,
                 )?;
-                Ok::<_, ConfigStoreError>(Config::from_data_dir_without_publish(Some(
-                    transaction_dir,
-                )))
+                Ok::<_, ConfigStoreError>((
+                    load_committed_effective_config(&transaction_dir)?,
+                    status_reference,
+                ))
             })
             .await
             .map_err(|error| {
@@ -1828,7 +1879,6 @@ impl AppState {
             // No fallible metadata read occurs before publication. Once the
             // transaction commits, a response error can no longer leave live
             // config behind its durable credential/config pair.
-            let reference = candidate.proxy_auth_credential_ref.clone();
             candidate.publish_env_vars();
             *config.write().await = candidate.clone();
 
@@ -1860,11 +1910,6 @@ impl AppState {
                 mcp_manager.reconcile_from_config(&candidate.mcp).await;
             }
 
-            let reference = reference.ok_or_else(|| {
-                AppError::InternalError(anyhow::anyhow!(
-                    "proxy credential transaction did not publish its reference"
-                ))
-            })?;
             let (status, health) =
                 credential_store
                     .status_with_health(&reference)

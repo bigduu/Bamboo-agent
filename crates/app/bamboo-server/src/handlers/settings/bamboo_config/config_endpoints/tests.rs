@@ -11,6 +11,76 @@ use super::common::{
 };
 use super::reset::remove_config_file_if_exists;
 
+fn access_control_fixture() -> bamboo_config::AccessControlConfig {
+    bamboo_config::AccessControlConfig {
+        password_enabled: true,
+        password_hash: Some("password-verifier".to_string()),
+        password_salt: Some("password-salt".to_string()),
+        updated_at: Some("2026-07-21T00:00:00Z".to_string()),
+        devices: vec![
+            bamboo_config::DeviceCredential {
+                device_id: "bamboo_first".to_string(),
+                label: "Phone".to_string(),
+                token_hash: "first-device-verifier".to_string(),
+                token_salt: "first-device-salt".to_string(),
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+                last_used_at: Some("2026-07-21T00:00:00Z".to_string()),
+                revoked: false,
+            },
+            bamboo_config::DeviceCredential {
+                device_id: "bamboo_second".to_string(),
+                label: "Laptop".to_string(),
+                token_hash: "second-device-verifier".to_string(),
+                token_salt: "second-device-salt".to_string(),
+                created_at: "2026-07-19T00:00:00Z".to_string(),
+                last_used_at: None,
+                revoked: true,
+            },
+        ],
+    }
+}
+
+#[test]
+fn access_control_echo_is_checked_against_lock_time_config() {
+    let mut original = Config::default();
+    original.access_control = Some(access_control_fixture());
+    let redacted = crate::handlers::settings::redaction::redact_config_for_api(
+        original
+            .to_compatibility_value()
+            .expect("config should serialize"),
+        &original,
+    );
+    let stale_echo = redacted["access_control"].clone();
+
+    let mut exact_patch = serde_json::json!({
+        "access_control": stale_echo.clone(),
+        "model": "safe-update"
+    });
+    super::set::remove_unchanged_access_control_echo(
+        &original,
+        exact_patch.as_object_mut().unwrap(),
+    )
+    .expect("an exact lock-time echo should be ignored");
+    assert!(exact_patch.get("access_control").is_none());
+    assert_eq!(exact_patch["model"], "safe-update");
+
+    let mut lock_time_current = original;
+    lock_time_current.access_control.as_mut().unwrap().devices[0].revoked = true;
+    let mut stale_patch = serde_json::json!({
+        "access_control": stale_echo,
+        "model": "must-not-be-applied"
+    });
+    assert!(matches!(
+        super::set::remove_unchanged_access_control_echo(
+            &lock_time_current,
+            stale_patch.as_object_mut().unwrap(),
+        ),
+        Err(crate::error::AppError::BadRequest(_))
+    ));
+    assert!(stale_patch.get("access_control").is_some());
+    assert_eq!(stale_patch["model"], "must-not-be-applied");
+}
+
 #[test]
 fn config_file_path_appends_config_json_filename() {
     let dir = tempdir().expect("temp dir should be created");
@@ -69,6 +139,243 @@ async fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_a
         .expect("redacted config should serialize");
     assert_eq!(value["providers"]["openai"]["api_key"], "****...****");
     assert!(value.get("proxy_auth_encrypted").is_none());
+}
+
+#[actix_web::test]
+async fn compatibility_config_get_hides_all_access_control_verifiers() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app_state = web::Data::new(state);
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(access_control_fixture());
+    }
+    // The compatibility GET intentionally returns an empty object before the
+    // first config file exists. Create that marker without persisting the
+    // verifier-bearing in-memory fixture through an unrelated save path.
+    tokio::fs::write(temp_dir.path().join("config.json"), "{}")
+        .await
+        .expect("config marker should be written");
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state)
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config)),
+    )
+    .await;
+    let response: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/bamboo/config").to_request(),
+    )
+    .await;
+
+    let access = response["access_control"]
+        .as_object()
+        .expect("safe access-control metadata should remain visible");
+    assert!(!access.contains_key("password_hash"));
+    assert!(!access.contains_key("password_salt"));
+    assert_eq!(access["password_enabled"], true);
+    let devices = access["devices"]
+        .as_array()
+        .expect("safe device metadata should remain visible");
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        let device = device.as_object().expect("device should be an object");
+        assert!(!device.contains_key("token_hash"));
+        assert!(!device.contains_key("token_salt"));
+    }
+    assert_eq!(devices[0]["device_id"], "bamboo_first");
+    assert_eq!(devices[0]["label"], "Phone");
+    assert_eq!(devices[1]["device_id"], "bamboo_second");
+    assert_eq!(devices[1]["revoked"], true);
+}
+
+#[actix_web::test]
+async fn redacted_full_payload_update_preserves_access_control_and_rejects_mutation() {
+    use crate::app_state::AppState;
+    use actix_web::{http::StatusCode, test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+    let expected_access_control = access_control_fixture();
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(expected_access_control.clone());
+        config
+            .save_to_dir(data_dir.clone())
+            .expect("access-control fixture should persist");
+    }
+    let persisted_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(data_dir.join("config.json")).expect("config should be readable"),
+    )
+    .expect("config should be valid JSON");
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let mut full_payload: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/bamboo/config").to_request(),
+    )
+    .await;
+    assert!(full_payload["access_control"]
+        .get("password_hash")
+        .is_none());
+    assert!(full_payload["access_control"]["devices"][0]
+        .get("token_hash")
+        .is_none());
+    full_payload["model"] = serde_json::json!("unrelated-model-update");
+
+    let update = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(full_payload)
+            .to_request(),
+    )
+    .await;
+    let status = update.status();
+    let body = String::from_utf8(test::read_body(update).await.to_vec()).unwrap();
+    assert!(
+        status.is_success(),
+        "full update failed with {status}: {body}"
+    );
+    assert_eq!(
+        app_state
+            .config
+            .read()
+            .await
+            .to_compatibility_value()
+            .expect("updated config should serialize")["model"],
+        serde_json::json!("unrelated-model-update")
+    );
+    assert_eq!(
+        app_state.config.read().await.access_control.as_ref(),
+        Some(&expected_access_control)
+    );
+    let persisted_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(data_dir.join("config.json")).expect("config should be readable"),
+    )
+    .expect("config should be valid JSON");
+    assert_eq!(
+        persisted_after.get("access_control"),
+        persisted_before.get("access_control"),
+        "unrelated full-payload update must preserve every access-control verifier"
+    );
+
+    let baseline_files = transaction_file_snapshot(&data_dir);
+    let baseline_live = app_state
+        .config
+        .read()
+        .await
+        .to_compatibility_value()
+        .expect("live config should serialize");
+    let mut malicious: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/bamboo/config").to_request(),
+    )
+    .await;
+    malicious["model"] = serde_json::json!("must-not-be-applied");
+    malicious["access_control"]["devices"][0]["revoked"] = serde_json::json!(true);
+    let rejected = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(malicious)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(transaction_file_snapshot(&data_dir), baseline_files);
+    assert_eq!(
+        app_state
+            .config
+            .read()
+            .await
+            .to_compatibility_value()
+            .expect("live config should serialize"),
+        baseline_live,
+        "changed access-control metadata and unrelated fields must both be rejected"
+    );
+}
+
+#[actix_web::test]
+async fn generic_config_patch_rejects_access_control_without_partial_mutation() {
+    use crate::app_state::AppState;
+    use actix_web::{http::StatusCode, test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+    let baseline_files = transaction_file_snapshot(&data_dir);
+    let baseline_live = app_state
+        .config
+        .read()
+        .await
+        .to_compatibility_value()
+        .expect("baseline config should serialize");
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "model": "must-not-be-applied",
+                "access_control": {
+                    "password_enabled": true,
+                    "password_hash": "attacker-password-verifier",
+                    "password_salt": "attacker-password-salt",
+                    "devices": [
+                        {
+                            "device_id": "bamboo_attacker",
+                            "label": "Injected device",
+                            "token_hash": "attacker-device-verifier",
+                            "token_salt": "attacker-device-salt",
+                            "created_at": "2026-07-21T00:00:00Z",
+                            "revoked": false
+                        }
+                    ]
+                }
+            }))
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(transaction_file_snapshot(&data_dir), baseline_files);
+    assert_eq!(
+        app_state
+            .config
+            .read()
+            .await
+            .to_compatibility_value()
+            .expect("live config should serialize"),
+        baseline_live,
+        "neither access_control nor the unrelated model field may be partially applied"
+    );
 }
 
 #[actix_web::test]

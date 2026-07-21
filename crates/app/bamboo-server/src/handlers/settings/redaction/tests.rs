@@ -69,6 +69,64 @@ fn redact_config_masks_configured_provider_and_removes_proxy_encrypted_keys() {
 }
 
 #[test]
+fn redact_config_removes_all_access_control_verifiers_but_keeps_safe_device_metadata() {
+    let config = Config::default();
+    let input = json!({
+        "access_control": {
+            "password_enabled": true,
+            "password_hash": "password-verifier",
+            "password_salt": "password-salt",
+            "updated_at": "2026-07-21T00:00:00Z",
+            "devices": [
+                {
+                    "device_id": "bamboo_first",
+                    "label": "Phone",
+                    "token_hash": "first-device-verifier",
+                    "token_salt": "first-device-salt",
+                    "created_at": "2026-07-20T00:00:00Z",
+                    "last_used_at": "2026-07-21T00:00:00Z",
+                    "revoked": false
+                },
+                {
+                    "device_id": "bamboo_second",
+                    "label": "Laptop",
+                    "token_hash": "second-device-verifier",
+                    "token_salt": "second-device-salt",
+                    "created_at": "2026-07-19T00:00:00Z",
+                    "revoked": true
+                }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    let access = redacted["access_control"]
+        .as_object()
+        .expect("access-control metadata should remain visible");
+    assert!(!access.contains_key("password_hash"));
+    assert!(!access.contains_key("password_salt"));
+    assert_eq!(access["password_enabled"], true);
+    assert_eq!(access["updated_at"], "2026-07-21T00:00:00Z");
+
+    let devices = access["devices"]
+        .as_array()
+        .expect("safe device metadata should remain visible");
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        let device = device.as_object().expect("device should remain an object");
+        assert!(!device.contains_key("token_hash"));
+        assert!(!device.contains_key("token_salt"));
+    }
+    assert_eq!(devices[0]["device_id"], "bamboo_first");
+    assert_eq!(devices[0]["label"], "Phone");
+    assert_eq!(devices[0]["created_at"], "2026-07-20T00:00:00Z");
+    assert_eq!(devices[0]["last_used_at"], "2026-07-21T00:00:00Z");
+    assert_eq!(devices[0]["revoked"], false);
+    assert_eq!(devices[1]["device_id"], "bamboo_second");
+    assert_eq!(devices[1]["revoked"], true);
+}
+
+#[test]
 fn redact_providers_removes_unconfigured_api_key_fields() {
     let config = test_config! {
         providers: ProviderConfigs::default(),
